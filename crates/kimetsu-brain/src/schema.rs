@@ -75,7 +75,8 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             source_event_ids_json TEXT NOT NULL,
             status TEXT NOT NULL,
             decided_at TEXT,
-            decided_by TEXT
+            decided_by TEXT,
+            decided_reason TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_memory_proposals_status_run
@@ -113,6 +114,12 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
         ",
     )?;
 
+    // In-place column additions for v0.1 brain.db files predating each
+    // column. Each ALTER is idempotent: we ignore the duplicate-column error
+    // so an upgraded binary opens an older brain.db without forcing a
+    // `kimetsu brain rebuild`.
+    add_column_if_missing(conn, "memory_proposals", "decided_reason TEXT")?;
+
     let schema_version: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
         [],
@@ -126,5 +133,28 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
         .into());
     }
 
+    Ok(())
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column_def: &str) -> KimetsuResult<()> {
+    let column_name = column_def
+        .split_whitespace()
+        .next()
+        .ok_or("empty column definition")?;
+    let exists: bool = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for row in rows {
+            if row? == column_name {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column_def};"))?;
+    }
     Ok(())
 }

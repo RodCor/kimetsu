@@ -96,9 +96,9 @@ struct ContextArgs {
 enum MemoryCommand {
     Add(MemoryAddArgs),
     List,
-    Proposals,
-    Accept { proposal_id: String },
-    Reject { proposal_id: String },
+    Proposals(ProposalsArgs),
+    Accept(AcceptArgs),
+    Reject(RejectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -108,6 +108,47 @@ struct MemoryAddArgs {
     #[arg(long, default_value = "fact")]
     kind: String,
     text: String,
+}
+
+#[derive(Debug, Args)]
+struct ProposalsArgs {
+    /// Restrict to a single scope (global_user|project|repo|run).
+    #[arg(long)]
+    scope: Option<String>,
+    /// Restrict to a single kind (preference|convention|failure_pattern|fact|...).
+    #[arg(long)]
+    kind: Option<String>,
+    /// Restrict to proposals from a specific run.
+    #[arg(long)]
+    from_run: Option<String>,
+    /// Drop proposals whose proposed_confidence is below this value.
+    #[arg(long)]
+    min_confidence: Option<f32>,
+    /// Restrict to a single status (pending|accepted|rejected). Default: pending.
+    #[arg(long, default_value = "pending")]
+    status: String,
+    /// Hard cap on rows returned.
+    #[arg(long, default_value_t = 50)]
+    limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct AcceptArgs {
+    proposal_id: String,
+    /// Override the proposal's scope when promoting it to an accepted memory.
+    #[arg(long)]
+    scope: Option<String>,
+    /// Override the proposed_confidence (clamped to 0..1).
+    #[arg(long)]
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Args)]
+struct RejectArgs {
+    proposal_id: String,
+    /// Optional short note; persisted on the memory_proposals row for triage.
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -380,8 +421,18 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
             }
             Ok(())
         }
-        MemoryCommand::Proposals => {
-            let proposals = project::list_proposals(&env::current_dir()?)?;
+        MemoryCommand::Proposals(args) => {
+            let proposals = project::list_proposals(
+                &env::current_dir()?,
+                project::ProposalFilter {
+                    scope: args.scope,
+                    kind: args.kind,
+                    from_run: args.from_run,
+                    min_confidence: args.min_confidence,
+                    status: Some(args.status),
+                    limit: args.limit,
+                },
+            )?;
             if proposals.is_empty() {
                 println!("no memory proposals");
                 return Ok(());
@@ -401,17 +452,37 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
                 if !proposal.rationale.is_empty() {
                     println!("  rationale: {}", proposal.rationale);
                 }
+                if let Some(reason) = proposal.decided_reason.as_deref() {
+                    if !reason.is_empty() {
+                        println!("  decided_reason: {reason}");
+                    }
+                }
             }
             Ok(())
         }
-        MemoryCommand::Accept { proposal_id } => {
-            let memory_id = project::accept_proposal(&env::current_dir()?, &proposal_id)?;
+        MemoryCommand::Accept(args) => {
+            let memory_id = project::accept_proposal(
+                &env::current_dir()?,
+                &args.proposal_id,
+                project::AcceptOverrides {
+                    scope: args.scope,
+                    confidence: args.confidence,
+                },
+            )?;
             println!("memory_id: {memory_id}");
             Ok(())
         }
-        MemoryCommand::Reject { proposal_id } => {
-            project::reject_proposal(&env::current_dir()?, &proposal_id)?;
-            println!("rejected proposal: {proposal_id}");
+        MemoryCommand::Reject(args) => {
+            project::reject_proposal(
+                &env::current_dir()?,
+                &args.proposal_id,
+                args.reason.as_deref(),
+            )?;
+            if let Some(reason) = args.reason.as_deref() {
+                println!("rejected proposal: {} (reason: {reason})", args.proposal_id);
+            } else {
+                println!("rejected proposal: {}", args.proposal_id);
+            }
             Ok(())
         }
     }

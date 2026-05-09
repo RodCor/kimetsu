@@ -58,6 +58,23 @@ pub struct ProposalRow {
     pub rationale: String,
     pub proposed_confidence: f32,
     pub status: String,
+    pub decided_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProposalFilter {
+    pub scope: Option<String>,
+    pub kind: Option<String>,
+    pub from_run: Option<String>,
+    pub min_confidence: Option<f32>,
+    pub status: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AcceptOverrides {
+    pub scope: Option<String>,
+    pub confidence: Option<f32>,
 }
 
 pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
@@ -267,19 +284,52 @@ pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
     Ok(memories)
 }
 
-pub fn list_proposals(start: &Path) -> KimetsuResult<Vec<ProposalRow>> {
+pub fn list_proposals(
+    start: &Path,
+    filter: ProposalFilter,
+) -> KimetsuResult<Vec<ProposalRow>> {
     let (_paths, _config, conn) = load_project(start)?;
-    let mut stmt = conn.prepare(
+    let mut sql = String::from(
         "
         SELECT proposal_id, run_id, scope, kind, text, rationale,
-               proposed_confidence, status
+               proposed_confidence, status, decided_reason
         FROM memory_proposals
-        ORDER BY rowid DESC
-        LIMIT 100
         ",
-    )?;
+    );
+    let mut clauses = Vec::<String>::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(scope) = filter.scope.as_deref() {
+        clauses.push("scope = ?".to_string());
+        params.push(Box::new(scope.to_string()));
+    }
+    if let Some(kind) = filter.kind.as_deref() {
+        clauses.push("kind = ?".to_string());
+        params.push(Box::new(kind.to_string()));
+    }
+    if let Some(run_id) = filter.from_run.as_deref() {
+        clauses.push("run_id = ?".to_string());
+        params.push(Box::new(run_id.to_string()));
+    }
+    if let Some(min_conf) = filter.min_confidence {
+        clauses.push("proposed_confidence >= ?".to_string());
+        params.push(Box::new(min_conf as f64));
+    }
+    if let Some(status) = filter.status.as_deref() {
+        if !status.eq_ignore_ascii_case("any") {
+            clauses.push("status = ?".to_string());
+            params.push(Box::new(status.to_string()));
+        }
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    let limit = if filter.limit == 0 { 100 } else { filter.limit };
+    sql.push_str(&format!(" ORDER BY rowid DESC LIMIT {limit}"));
 
-    let rows = stmt.query_map([], |row| {
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(ProposalRow {
             proposal_id: row.get(0)?,
             run_id: row.get(1)?,
@@ -289,6 +339,7 @@ pub fn list_proposals(start: &Path) -> KimetsuResult<Vec<ProposalRow>> {
             rationale: row.get(5)?,
             proposed_confidence: row.get(6)?,
             status: row.get(7)?,
+            decided_reason: row.get(8)?,
         })
     })?;
 
@@ -367,7 +418,11 @@ pub fn retrieve_context(
     )
 }
 
-pub fn accept_proposal(start: &Path, proposal_id: &str) -> KimetsuResult<String> {
+pub fn accept_proposal(
+    start: &Path,
+    proposal_id: &str,
+    overrides: AcceptOverrides,
+) -> KimetsuResult<String> {
     let (paths, config, conn) = load_project(start)?;
     let proposal = load_pending_proposal(&conn, proposal_id)?;
     let run_id = RunId::new();
@@ -375,6 +430,15 @@ pub fn accept_proposal(start: &Path, proposal_id: &str) -> KimetsuResult<String>
     let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let memory_id = Ulid::new().to_string();
     let normalized = normalize_memory_text(&proposal.text);
+
+    let resolved_scope = match overrides.scope.as_deref() {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => proposal.scope.clone(),
+    };
+    let resolved_confidence = overrides
+        .confidence
+        .map(|c| c.clamp(0.0, 1.0))
+        .unwrap_or(proposal.proposed_confidence);
 
     let started = admin_started_event(&paths, &config, run_id, "memory accept")?;
     writer.append(&started, true)?;
@@ -385,15 +449,17 @@ pub fn accept_proposal(start: &Path, proposal_id: &str) -> KimetsuResult<String>
         serde_json::json!({
             "proposal_id": proposal.proposal_id,
             "memory_id": memory_id,
-            "scope": proposal.scope,
+            "scope": resolved_scope,
             "kind": proposal.kind,
             "text": proposal.text,
             "normalized_text": normalized,
-            "confidence": proposal.proposed_confidence,
+            "confidence": resolved_confidence,
             "provenance_snapshot": {
                 "source": "memory_proposal",
                 "proposal_id": proposal.proposal_id,
                 "source_run_id": proposal.run_id,
+                "scope_override": overrides.scope.clone(),
+                "confidence_override": overrides.confidence,
             }
         }),
     );
@@ -422,12 +488,27 @@ pub fn accept_proposal(start: &Path, proposal_id: &str) -> KimetsuResult<String>
     Ok(memory_id)
 }
 
-pub fn reject_proposal(start: &Path, proposal_id: &str) -> KimetsuResult<()> {
+pub fn reject_proposal(
+    start: &Path,
+    proposal_id: &str,
+    reason: Option<&str>,
+) -> KimetsuResult<()> {
     let (paths, config, conn) = load_project(start)?;
     let _proposal = load_pending_proposal(&conn, proposal_id)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory reject", Some(run_id))?;
     let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
+
+    let resolved_reason = reason
+        .and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| "rejected_by_cli".to_string());
 
     let started = admin_started_event(&paths, &config, run_id, "memory reject")?;
     writer.append(&started, true)?;
@@ -437,7 +518,7 @@ pub fn reject_proposal(start: &Path, proposal_id: &str) -> KimetsuResult<()> {
         "memory.rejected",
         serde_json::json!({
             "proposal_id": proposal_id,
-            "reason": "rejected_by_cli",
+            "reason": resolved_reason,
         }),
     );
     writer.append(&rejected, true)?;
@@ -485,6 +566,7 @@ fn load_pending_proposal(conn: &Connection, proposal_id: &str) -> KimetsuResult<
         rationale: row.get(5)?,
         proposed_confidence: row.get(6)?,
         status: row.get(7)?,
+        decided_reason: None,
     };
 
     if proposal.status != "pending" {
@@ -645,6 +727,108 @@ mod tests {
                 .any(|capsule| capsule.expansion_handle == "file:src/lib.rs"),
             "repo index should survive event-only rebuild: {matches:?}"
         );
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn list_proposals_filters_and_reject_records_reason() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+
+        // Inject three proposals straight via memory.proposed events.
+        let proposals = [
+            ("p1", "global_user", "preference", 0.9_f32, "Prefer rg over grep"),
+            ("p2", "repo", "convention", 0.8, "Use find_* for fallible lookups"),
+            ("p3", "repo", "convention", 0.4, "Use let-else where possible"),
+        ];
+        {
+            let (paths, _config, conn) = load_project(&root).expect("load");
+            let run_id = RunId::new();
+            let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id).expect("trace");
+            for (proposal_id, scope, kind, conf, text) in &proposals {
+                let event = Event::new(
+                    run_id,
+                    "memory.proposed",
+                    serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "scope": scope,
+                        "kind": kind,
+                        "text": text,
+                        "rationale": "test rationale",
+                        "proposed_confidence": conf,
+                        "source_event_ids": [],
+                    }),
+                );
+                writer.append(&event, true).expect("append proposal");
+                projector::apply_events(&conn, &[event]).expect("project");
+            }
+        }
+
+        // Filter by scope.
+        let global = list_proposals(
+            &root,
+            ProposalFilter {
+                scope: Some("global_user".into()),
+                status: Some("pending".into()),
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list proposals");
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].proposal_id, "p1");
+
+        // Filter by min_confidence.
+        let strong = list_proposals(
+            &root,
+            ProposalFilter {
+                min_confidence: Some(0.7),
+                status: Some("pending".into()),
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list strong");
+        assert_eq!(strong.len(), 2);
+        for row in &strong {
+            assert!(row.proposed_confidence >= 0.7);
+        }
+
+        // Reject one with a reason and confirm it persists on the projected row.
+        reject_proposal(&root, "p3", Some("not specific to the user"))
+            .expect("reject with reason");
+        let rejected = list_proposals(
+            &root,
+            ProposalFilter {
+                status: Some("rejected".into()),
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list rejected");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].proposal_id, "p3");
+        assert_eq!(
+            rejected[0].decided_reason.as_deref(),
+            Some("not specific to the user")
+        );
+
+        // Accept with a confidence override and confirm the resulting memory
+        // carries the overridden value.
+        let memory_id = accept_proposal(
+            &root,
+            "p1",
+            AcceptOverrides {
+                scope: None,
+                confidence: Some(0.55),
+            },
+        )
+        .expect("accept");
+        let memories = list_memories(&root).expect("list memories");
+        let promoted = memories
+            .into_iter()
+            .find(|m| m.memory_id == memory_id)
+            .expect("promoted memory present");
+        assert!((promoted.confidence - 0.55).abs() < f32::EPSILON);
 
         fs::remove_dir_all(root).expect("remove temp project");
     }

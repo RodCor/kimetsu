@@ -265,16 +265,22 @@ fn apply_memory_rejected(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     else {
         return Ok(());
     };
+    let reason = event
+        .payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string());
 
     conn.execute(
         "
         UPDATE memory_proposals
         SET status = 'rejected',
             decided_at = ?2,
-            decided_by = 'cli'
+            decided_by = 'cli',
+            decided_reason = ?3
         WHERE proposal_id = ?1
         ",
-        params![proposal_id, ts_text(event)?],
+        params![proposal_id, ts_text(event)?, reason],
     )?;
     Ok(())
 }
