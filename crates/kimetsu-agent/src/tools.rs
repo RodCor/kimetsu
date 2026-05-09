@@ -57,6 +57,7 @@ impl ToolPatchPlan {
 pub struct ToolRuntime {
     repo_root: PathBuf,
     run_id: RunId,
+    stage: String,
     trace_writer: Option<TraceWriter>,
     run_paths: Option<RunPaths>,
     active_plan: Option<ToolPatchPlan>,
@@ -68,6 +69,7 @@ impl ToolRuntime {
         Ok(Self {
             repo_root: repo_root.as_ref().canonicalize()?,
             run_id,
+            stage: "tool_test".to_string(),
             trace_writer: None,
             run_paths: None,
             active_plan: None,
@@ -84,6 +86,18 @@ impl ToolRuntime {
     pub fn with_config(mut self, config: ToolRuntimeConfig) -> Self {
         self.config = config;
         self
+    }
+
+    pub fn with_stage(mut self, stage: impl Into<String>) -> Self {
+        self.stage = stage.into();
+        self
+    }
+
+    pub fn into_trace(self) -> Option<(TraceWriter, RunPaths)> {
+        match (self.trace_writer, self.run_paths) {
+            (Some(writer), Some(run_paths)) => Some((writer, run_paths)),
+            _ => None,
+        }
     }
 
     pub fn set_patch_plan(&mut self, plan: ToolPatchPlan) {
@@ -201,7 +215,7 @@ impl ToolRuntime {
             self.run_id,
             "tool.called",
             serde_json::json!({
-                "stage": "tool_test",
+                "stage": &self.stage,
                 "tool_call_id": tool_call_id,
                 "tool": tool,
                 "input_json": redact_value(input_json, self.config.redact_secrets),
@@ -262,6 +276,7 @@ impl ToolRuntime {
 
     fn read_file_inner(&self, input: &ReadFileInput) -> KimetsuResult<ReadFileOutput> {
         let path = normalize_repo_path(&input.path)?;
+        reject_protected_repo_path(&path)?;
         let full_path = self.resolve_existing(&path)?;
         let bytes = fs::read(&full_path)?;
         if looks_binary(&bytes) {
@@ -284,6 +299,7 @@ impl ToolRuntime {
 
     fn list_files_inner(&self, input: &ListFilesInput) -> KimetsuResult<ListFilesOutput> {
         let dir = normalize_repo_path(input.dir.as_deref().unwrap_or("."))?;
+        reject_protected_repo_path(&dir)?;
         let root = if dir == "." {
             self.repo_root.clone()
         } else {
@@ -430,6 +446,7 @@ impl ToolRuntime {
 
         for change in &input.changes {
             let path = normalize_repo_path(&change.path)?;
+            reject_protected_repo_path(&path)?;
             validate_plan_allows(plan, &path, change.op)?;
             let full_path = self.resolve_for_write(&path)?;
 
@@ -544,6 +561,9 @@ impl ToolRuntime {
             }
             let metadata = entry.metadata()?;
             let rel = path_to_repo_rel(&self.repo_root, &path)?;
+            if is_protected_repo_path(&rel) {
+                continue;
+            }
             let kind = if metadata.is_dir() { "dir" } else { "file" };
             entries.push(FileEntry {
                 path: rel,
@@ -590,6 +610,9 @@ impl ToolRuntime {
                 continue;
             }
             let rel = path_to_repo_rel(&self.repo_root, &path)?;
+            if is_protected_repo_path(&rel) {
+                continue;
+            }
             if let Some(glob) = glob
                 && !simple_glob_match(&rel, glob)
             {
@@ -819,6 +842,33 @@ fn ensure_inside(repo_root: &Path, path: &Path) -> KimetsuResult<()> {
         return Err("path_outside_repo".into());
     }
     Ok(())
+}
+
+fn reject_protected_repo_path(path: &str) -> KimetsuResult<()> {
+    if is_protected_repo_path(path) {
+        return Err(format!("protected_path: {path}").into());
+    }
+    Ok(())
+}
+
+fn is_protected_repo_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let mut parts = normalized.split('/');
+    let first = parts.next().unwrap_or("");
+    if matches!(first, ".git" | ".kimetsu") {
+        return true;
+    }
+
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .to_ascii_lowercase();
+    file_name == ".env"
+        || file_name.starts_with(".env.")
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+        || file_name.starts_with("id_rsa")
 }
 
 fn nearest_existing_parent(path: &Path) -> KimetsuResult<PathBuf> {
@@ -1100,6 +1150,7 @@ mod tests {
     fn file_tools_and_apply_patch_emit_trace_events() {
         let root = temp_project();
         fs::write(root.join("src.txt"), "hello TOKEN=secret\nworld\n").expect("write file");
+        fs::write(root.join(".env"), "TOKEN=secret\n").expect("write env");
         init_project(&root, false).expect("init project");
         let paths = ProjectPaths::discover(&root).expect("paths");
         let run_id = RunId::new();
@@ -1115,6 +1166,26 @@ mod tests {
             })
             .expect("read file");
         assert!(read.content.contains("hello"));
+        assert!(
+            runtime
+                .read_file(ReadFileInput {
+                    path: ".env".to_string(),
+                    max_bytes: None,
+                })
+                .is_err(),
+            "tool runtime must not expose .env contents"
+        );
+        let listed = runtime
+            .list_files(ListFilesInput {
+                dir: None,
+                depth: Some(1),
+                glob: None,
+            })
+            .expect("list files");
+        assert!(
+            listed.entries.iter().all(|entry| entry.path != ".env"),
+            "list_files must hide protected secret paths"
+        );
 
         let search = runtime
             .search_files(SearchFilesInput {

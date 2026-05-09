@@ -6,22 +6,32 @@ use kimetsu_brain::context::ContextCapsule;
 use kimetsu_brain::project;
 use kimetsu_brain::trace::read_trace;
 use kimetsu_core::KimetsuResult;
+use kimetsu_core::config::ProjectConfig;
+use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::ids::new_id;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
+use kimetsu_core::paths::ProjectPaths;
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::{CodingRunOptions, PatchPlan, run_coding_dry_run};
+
+const MIN_MODEL_BENCH_REMAINING_USD: f32 = 0.01;
 
 #[derive(Debug, Clone)]
 pub struct BenchOptions {
     pub repo: PathBuf,
     pub keep_fixtures: bool,
+    pub model_backed: bool,
+    pub limit: Option<usize>,
+    pub max_cost_usd: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchRunResult {
     pub bench_run_id: String,
     pub task_count: usize,
+    pub model_backed: bool,
+    pub total_cost_usd: f32,
     pub report_path: PathBuf,
     pub results_path: PathBuf,
     pub summaries: Vec<BenchModeSummary>,
@@ -44,6 +54,8 @@ pub struct BenchModeSummary {
     pub verification_attempts: u32,
     pub planned_relevant_files: u32,
     pub unrelated_planned_files: u32,
+    pub invalid_planned_files: u32,
+    pub avg_patch_plan_quality: f32,
     pub total_cost_usd: f32,
     pub total_duration_ms: f32,
     pub avg_duration_ms: f32,
@@ -63,6 +75,10 @@ pub struct StageTimeSummary {
 struct BenchReport {
     bench_run_id: String,
     task_count: usize,
+    model_backed: bool,
+    max_cost_usd: f32,
+    total_cost_usd: f32,
+    stopped_reason: Option<String>,
     summaries: Vec<BenchModeSummary>,
     results: Vec<BenchTaskResult>,
 }
@@ -102,6 +118,8 @@ struct DryRunBenchMetrics {
     planned_files_to_modify: u32,
     planned_relevant_files: u32,
     unrelated_planned_files: u32,
+    invalid_planned_files: u32,
+    patch_plan_quality_score: f32,
     risk_level: String,
 }
 
@@ -132,6 +150,18 @@ struct FixtureFile {
     content: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PatchPlanQuality {
+    invalid_planned_files: u32,
+    score: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ModelBenchConfig {
+    config: ProjectConfig,
+    model_key: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchMode {
     BrainOff,
@@ -155,7 +185,15 @@ impl BenchMode {
 
 pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
     let bench_run_id = new_id().to_string();
-    let tasks = bench_tasks();
+    let mut tasks = bench_tasks();
+    if let Some(limit) = options.limit {
+        tasks.truncate(limit.min(tasks.len()));
+    }
+    let model_config = if options.model_backed {
+        Some(load_model_bench_config(&options)?)
+    } else {
+        None
+    };
     let output_dir = options
         .repo
         .canonicalize()
@@ -172,10 +210,41 @@ pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
     fs::create_dir_all(&fixture_root)?;
 
     let mut results = Vec::new();
+    let mut total_cost_usd = 0.0_f32;
+    let mut stopped_reason = None;
     let run_result = (|| -> KimetsuResult<()> {
-        for task in &tasks {
+        'tasks: for task in &tasks {
             for mode in BenchMode::all() {
-                results.push(run_task_mode(&fixture_root, &output_dir, task, mode)?);
+                let remaining_cost_usd = if model_config.is_some() {
+                    (options.max_cost_usd - total_cost_usd).max(0.0)
+                } else {
+                    options.max_cost_usd
+                };
+                if model_config.is_some()
+                    && mode != BenchMode::BrainOff
+                    && remaining_cost_usd < MIN_MODEL_BENCH_REMAINING_USD
+                {
+                    stopped_reason = Some(format!(
+                        "stopped before {} {} because remaining budget ${:.4} is below ${:.2}",
+                        task.id,
+                        mode.as_str(),
+                        remaining_cost_usd,
+                        MIN_MODEL_BENCH_REMAINING_USD
+                    ));
+                    break 'tasks;
+                }
+                let result = run_task_mode(
+                    &fixture_root,
+                    &output_dir,
+                    task,
+                    mode,
+                    model_config.as_ref(),
+                    remaining_cost_usd,
+                )?;
+                if let Some(metrics) = result.dry_run.as_ref() {
+                    total_cost_usd += metrics.total_cost_usd;
+                }
+                results.push(result);
             }
         }
         Ok(())
@@ -189,10 +258,15 @@ pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
     }
     run_result?;
 
+    total_cost_usd = clean_zero(total_cost_usd);
     let summaries = summarize_results(&results);
     let report = BenchReport {
         bench_run_id: bench_run_id.clone(),
         task_count: tasks.len(),
+        model_backed: options.model_backed,
+        max_cost_usd: options.max_cost_usd,
+        total_cost_usd,
+        stopped_reason,
         summaries: summaries.clone(),
         results,
     };
@@ -205,6 +279,8 @@ pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
     Ok(BenchRunResult {
         bench_run_id,
         task_count: tasks.len(),
+        model_backed: options.model_backed,
+        total_cost_usd,
         report_path,
         results_path,
         summaries,
@@ -216,6 +292,8 @@ fn run_task_mode(
     output_dir: &Path,
     task: &BenchTask,
     mode: BenchMode,
+    model_config: Option<&ModelBenchConfig>,
+    remaining_cost_usd: f32,
 ) -> KimetsuResult<BenchTaskResult> {
     if mode == BenchMode::BrainOff {
         return Ok(evaluate_capsules(task, mode, Vec::new(), None));
@@ -224,6 +302,9 @@ fn run_task_mode(
     let repo = fixture_root.join(format!("{}-{}", task.id, mode.as_str()));
     write_fixture_repo(&repo, task)?;
     project::init_project(&repo, false)?;
+    if let Some(model_config) = model_config {
+        configure_fixture_model(&repo, model_config, remaining_cost_usd)?;
+    }
     if mode == BenchMode::BrainOnWarm {
         project::add_memory(
             &repo,
@@ -239,7 +320,8 @@ fn run_task_mode(
         task: task.followup_task.to_string(),
         dry_run: true,
         allow_high_risk: true,
-        disable_model: true,
+        disable_model: model_config.is_none(),
+        model_key_override: model_config.map(|model| model.model_key.clone()),
     })?;
     let dry_run_metrics = dry_run_metrics(output_dir, task, mode, &dry_run.trace_path)?;
     Ok(evaluate_capsules(
@@ -248,6 +330,52 @@ fn run_task_mode(
         context.capsules,
         Some(dry_run_metrics),
     ))
+}
+
+fn load_model_bench_config(options: &BenchOptions) -> KimetsuResult<ModelBenchConfig> {
+    if options.max_cost_usd < MIN_MODEL_BENCH_REMAINING_USD {
+        return Err(format!(
+            "--max-cost-usd must be at least {:.2} for --model-backed",
+            MIN_MODEL_BENCH_REMAINING_USD
+        )
+        .into());
+    }
+
+    let (paths, config, _conn) = project::load_project(&options.repo)?;
+    if !matches!(config.model.provider.as_str(), "anthropic" | "claude_code") {
+        return Err(format!(
+            "unsupported model provider for benchmark: {}",
+            config.model.provider
+        )
+        .into());
+    }
+
+    let Some(model_key) = resolve_env_value(&paths.repo_root, &config.model.api_key_env) else {
+        return Err(format!(
+            "model-backed benchmark requires {} in the environment or source repo .env",
+            config.model.api_key_env
+        )
+        .into());
+    };
+
+    Ok(ModelBenchConfig { config, model_key })
+}
+
+fn configure_fixture_model(
+    repo: &Path,
+    model_config: &ModelBenchConfig,
+    remaining_cost_usd: f32,
+) -> KimetsuResult<()> {
+    let paths = ProjectPaths::discover(repo)?;
+    let mut config = project::load_config(&paths)?;
+    config.model = model_config.config.model.clone();
+    config.run.max_total_cost_usd = model_config
+        .config
+        .run
+        .max_total_cost_usd
+        .min(remaining_cost_usd);
+    fs::write(&paths.project_toml, config.to_toml()?)?;
+    Ok(())
 }
 
 fn evaluate_capsules(
@@ -407,6 +535,12 @@ fn dry_run_metrics(
         .chain(patch_plan.files_to_delete.iter())
         .filter(|planned| !relevant_paths.iter().any(|path| path == &planned.as_str()))
         .count() as u32;
+    let quality = patch_plan_quality(
+        task,
+        &patch_plan,
+        planned_relevant_files,
+        unrelated_planned_files,
+    );
 
     Ok(DryRunBenchMetrics {
         run_id,
@@ -427,8 +561,57 @@ fn dry_run_metrics(
         planned_files_to_modify: patch_plan.files_to_modify.len() as u32,
         planned_relevant_files,
         unrelated_planned_files,
+        invalid_planned_files: quality.invalid_planned_files,
+        patch_plan_quality_score: quality.score,
         risk_level: format!("{:?}", patch_plan.risk_level).to_ascii_lowercase(),
     })
+}
+
+fn patch_plan_quality(
+    task: &BenchTask,
+    patch_plan: &PatchPlan,
+    planned_relevant_files: u32,
+    unrelated_planned_files: u32,
+) -> PatchPlanQuality {
+    let mut fixture_paths = task.files.iter().map(|file| file.path).collect::<Vec<_>>();
+    fixture_paths.push("README.md");
+    let invalid_existing = patch_plan
+        .files_to_read
+        .iter()
+        .chain(patch_plan.files_to_modify.iter())
+        .chain(patch_plan.files_to_delete.iter())
+        .filter(|planned| !fixture_paths.iter().any(|path| path == &planned.as_str()))
+        .count() as u32;
+    let invalid_creates = patch_plan
+        .files_to_create
+        .iter()
+        .filter(|planned| fixture_paths.iter().any(|path| path == &planned.as_str()))
+        .count() as u32;
+    let invalid_planned_files = invalid_existing + invalid_creates;
+
+    let relevance_score = if planned_relevant_files > 0 { 1.0 } else { 0.0 };
+    let validity_score = if invalid_planned_files == 0 { 1.0 } else { 0.0 };
+    let unrelated_score = 1.0 / (1.0 + unrelated_planned_files as f32);
+    let verification_score = if patch_plan.verification_commands.is_empty() {
+        0.0
+    } else {
+        1.0
+    };
+    let risk_score = match patch_plan.risk_level {
+        crate::pipeline::RiskLevel::Low => 1.0,
+        crate::pipeline::RiskLevel::Medium => 0.8,
+        crate::pipeline::RiskLevel::High => 0.3,
+    };
+    let score = 0.40 * relevance_score
+        + 0.25 * validity_score
+        + 0.20 * unrelated_score
+        + 0.10 * verification_score
+        + 0.05 * risk_score;
+
+    PatchPlanQuality {
+        invalid_planned_files,
+        score,
+    }
 }
 
 fn stage_time_profiles(events: &[kimetsu_core::event::Event]) -> Vec<StageTimeProfile> {
@@ -522,10 +705,25 @@ fn summarize_results(results: &[BenchTaskResult]) -> Vec<BenchModeSummary> {
                     .iter()
                     .map(|metrics| metrics.unrelated_planned_files)
                     .sum(),
-                total_cost_usd: dry_metrics
+                invalid_planned_files: dry_metrics
                     .iter()
-                    .map(|metrics| metrics.total_cost_usd)
+                    .map(|metrics| metrics.invalid_planned_files)
                     .sum(),
+                avg_patch_plan_quality: if dry_run_count == 0 {
+                    0.0
+                } else {
+                    dry_metrics
+                        .iter()
+                        .map(|metrics| metrics.patch_plan_quality_score)
+                        .sum::<f32>()
+                        / dry_run_count as f32
+                },
+                total_cost_usd: clean_zero(
+                    dry_metrics
+                        .iter()
+                        .map(|metrics| metrics.total_cost_usd)
+                        .sum(),
+                ),
                 total_duration_ms: total_duration_us as f32 / 1_000.0,
                 avg_duration_ms: if dry_run_count == 0 {
                     0.0
@@ -577,6 +775,10 @@ fn ratio(count: usize, total: usize) -> f32 {
     }
 }
 
+fn clean_zero(value: f32) -> f32 {
+    if value.abs() < 0.000_001 { 0.0 } else { value }
+}
+
 fn write_fixture_repo(repo: &Path, task: &BenchTask) -> KimetsuResult<()> {
     fs::create_dir_all(repo)?;
     fs::write(
@@ -601,15 +803,26 @@ fn render_report(report: &BenchReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Kimetsu Bench {}\n\n", report.bench_run_id));
     out.push_str(&format!("Tasks: {}\n\n", report.task_count));
-    out.push_str("This Phase 6 slice benchmarks context and memory retrieval, then runs deterministic dry-run PatchPlan traces for brain_on_cold and brain_on_warm with the model disabled. Implementation edits and verification commands are not executed yet.\n\n");
+    out.push_str(&format!(
+        "Model-backed: {}. Cost cap: ${:.4}. Observed model cost: ${:.4}.\n\n",
+        report.model_backed, report.max_cost_usd, report.total_cost_usd
+    ));
+    if let Some(reason) = &report.stopped_reason {
+        out.push_str(&format!("Stopped early: {reason}.\n\n"));
+    }
+    if report.model_backed {
+        out.push_str("This benchmark runs PatchPlan dry-runs through the configured model provider for brain_on_cold and brain_on_warm. brain_off remains a retrieval baseline with no model call. Implementation edits and verification commands are not executed yet.\n\n");
+    } else {
+        out.push_str("This benchmark measures context and memory retrieval, then runs deterministic dry-run PatchPlan traces for brain_on_cold and brain_on_warm with the model disabled. Implementation edits and verification commands are not executed yet.\n\n");
+    }
     out.push_str("## Summary\n\n");
-    out.push_str("| mode | success | relevant_signal | memories | context | irrelevant_context | dry_runs | avg_ms | trace_events | model_turns | model_skips | planned_relevant | unrelated_planned |\n");
+    out.push_str("| mode | success | relevant_signal | memories | context | irrelevant_context | dry_runs | avg_ms | cost_usd | plan_quality | invalid_planned | trace_events | model_turns | model_skips | planned_relevant | unrelated_planned |\n");
     out.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for summary in &report.summaries {
         out.push_str(&format!(
-            "| {} | {:.0}% | {:.0}% | {} | {} | {} | {} | {:.2} | {} | {} | {} | {} | {} |\n",
+            "| {} | {:.0}% | {:.0}% | {} | {} | {} | {} | {:.2} | {:.4} | {:.2} | {} | {} | {} | {} | {} | {} |\n",
             summary.mode,
             summary.success_rate * 100.0,
             summary.relevant_signal_rate * 100.0,
@@ -618,6 +831,9 @@ fn render_report(report: &BenchReport) -> String {
             summary.irrelevant_context_loaded,
             summary.dry_runs,
             summary.avg_duration_ms,
+            summary.total_cost_usd,
+            summary.avg_patch_plan_quality,
+            summary.invalid_planned_files,
             summary.trace_events,
             summary.model_turns,
             summary.model_skips,
@@ -627,14 +843,14 @@ fn render_report(report: &BenchReport) -> String {
     }
 
     out.push_str("\n## Tasks\n\n");
-    out.push_str("| task | category | mode | success | memories | context | irrelevant | run | duration_ms | trace_events | planned_relevant | unrelated_planned |\n");
+    out.push_str("| task | category | mode | success | memories | context | irrelevant | run | duration_ms | cost_usd | plan_quality | invalid_planned | trace_events | model_turns | planned_relevant | unrelated_planned |\n");
     out.push_str(
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
         let dry_run = result.dry_run.as_ref();
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.2} | {} | {} | {} | {} | {} |\n",
             result.task_id,
             result.category,
             result.mode,
@@ -648,7 +864,15 @@ fn render_report(report: &BenchReport) -> String {
             dry_run
                 .map(|metrics| metrics.duration_us as f32 / 1_000.0)
                 .unwrap_or(0.0),
+            dry_run.map(|metrics| metrics.total_cost_usd).unwrap_or(0.0),
+            dry_run
+                .map(|metrics| metrics.patch_plan_quality_score)
+                .unwrap_or(0.0),
+            dry_run
+                .map(|metrics| metrics.invalid_planned_files)
+                .unwrap_or(0),
             dry_run.map(|metrics| metrics.trace_events).unwrap_or(0),
+            dry_run.map(|metrics| metrics.model_turns).unwrap_or(0),
             dry_run
                 .map(|metrics| metrics.planned_relevant_files)
                 .unwrap_or(0),
@@ -984,6 +1208,9 @@ mod tests {
         let report = run_benchmark(BenchOptions {
             repo: repo.clone(),
             keep_fixtures: false,
+            model_backed: false,
+            limit: None,
+            max_cost_usd: 1.0,
         })
         .expect("run benchmark");
 

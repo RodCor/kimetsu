@@ -1,8 +1,9 @@
 pub mod agent_loop;
 pub mod anthropic;
 pub mod bench;
+pub mod claude_code;
 pub mod model;
 pub mod pipeline;
 pub mod tools;
 
-pub const AGENT_PHASE: &str = "phase-6-anthropic-patch-plan";
+pub const AGENT_PHASE: &str = "phase-7-claude-code-provider";

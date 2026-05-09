@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     ModelMessage, ModelProvider, ModelRequest, ModelResponse, StopReason, TokenUsage, ToolChoice,
-    default_tool_definitions,
+    ToolDefinition, default_tool_definitions,
 };
 use crate::tools::ToolRuntime;
 
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
     pub stage: String,
+    pub tools: Vec<ToolDefinition>,
     pub max_model_turns: u32,
     pub max_tool_calls: u32,
     pub max_cost_usd: f32,
@@ -23,6 +24,7 @@ impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
             stage: "tool_loop".to_string(),
+            tools: default_tool_definitions(),
             max_model_turns: 30,
             max_tool_calls: 60,
             max_cost_usd: 5.0,
@@ -68,7 +70,7 @@ impl<P: ModelProvider> AgentLoop<P> {
 
             let request = ModelRequest {
                 messages: messages.clone(),
-                tools: default_tool_definitions(),
+                tools: self.config.tools.clone(),
                 tool_choice: ToolChoice::Auto,
                 max_output_tokens: self.config.max_output_tokens,
                 temperature: self.config.temperature,
@@ -132,6 +134,10 @@ impl<P: ModelProvider> AgentLoop<P> {
                 usage,
             });
         }
+    }
+
+    pub fn into_runtime(self) -> ToolRuntime {
+        self.runtime
     }
 
     fn write_model_requested(&mut self, request: &ModelRequest) -> KimetsuResult<()> {
@@ -210,7 +216,7 @@ mod tests {
 
     use super::*;
     use crate::model::{MockProvider, ModelResponse, ToolCall};
-    use crate::tools::{ToolPatchPlan, ToolRuntime};
+    use crate::tools::{PatchChange, PatchOp, ToolPatchPlan, ToolRuntime};
 
     #[test]
     fn loop_executes_tool_calls_and_writes_model_artifacts() {
@@ -303,6 +309,65 @@ mod tests {
 
         let result = loop_runner.run(vec![ModelMessage::user_text("Read note.txt")]);
         assert!(result.is_err());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn loop_applies_patch_under_active_plan() {
+        let root = temp_project();
+        fs::write(root.join("src.txt"), "hello\nworld\n").expect("write source");
+        init_project(&root, false).expect("init project");
+        let paths = ProjectPaths::discover(&root).expect("paths");
+        let run_id = RunId::new();
+        let (writer, run_paths) = TraceWriter::create(&paths, run_id).expect("trace writer");
+        let mut runtime = ToolRuntime::new(&root, run_id)
+            .expect("runtime")
+            .with_stage("implementation")
+            .with_trace(writer, run_paths.clone());
+        runtime.set_patch_plan(ToolPatchPlan::allow_modify(["src.txt"]));
+
+        let expected_hash = blake3::hash(b"hello\nworld\n").to_hex().to_string();
+        let provider = MockProvider::new([
+            ModelResponse::tool_call(
+                "call_read",
+                "read_file",
+                serde_json::json!({ "path": "src.txt" }),
+            ),
+            ModelResponse::tool_call(
+                "call_patch",
+                "apply_patch",
+                serde_json::to_value(crate::tools::ApplyPatchInput {
+                    changes: vec![PatchChange {
+                        path: "src.txt".to_string(),
+                        op: PatchOp::Modify,
+                        content: Some("hello\nkimetsu\n".to_string()),
+                        expected_hash: Some(expected_hash),
+                    }],
+                })
+                .expect("patch input"),
+            ),
+            ModelResponse::text("patched src.txt"),
+        ]);
+        let mut loop_runner = AgentLoop::new(provider, runtime, AgentLoopConfig::default());
+        let outcome = loop_runner
+            .run(vec![ModelMessage::user_text("Patch src.txt")])
+            .expect("agent loop");
+
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(
+            fs::read_to_string(root.join("src.txt")).expect("read patched"),
+            "hello\nkimetsu\n"
+        );
+        let events = read_trace(&run_paths.trace_jsonl).expect("trace");
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "tool.called"
+                    && event.payload.get("stage").and_then(|value| value.as_str())
+                        == Some("implementation")
+            }),
+            "tool events should carry implementation stage"
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

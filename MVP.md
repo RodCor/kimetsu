@@ -484,6 +484,20 @@ max_total_cost_usd    = 5.0
 
 API keys are never stored in `project.toml`. The `api_key_env` field names an environment variable; the value is read at runtime and never echoed to the trace.
 
+Provider values in v0.1:
+
+```text
+anthropic    Direct Claude API calls. Uses api_key_env as x-api-key.
+claude_code  Claude Code CLI bridge. Uses api_key_env as CLAUDE_CODE_OAUTH_TOKEN-style OAuth.
+```
+
+`claude_code` is intentionally PatchPlan-only in v0.1. It runs `claude -p` in an isolated temporary working directory with Claude Code tools disabled and session persistence off. Full implementation remains gated to the direct `anthropic` provider until Kimetsu can wrap Claude Code edits behind the PatchPlan diff gate.
+
+When `provider = "claude_code"` and `api_key_env = "ANTHROPIC_API_KEY"`,
+Kimetsu runs Claude Code with `--bare` and passes the key as
+`ANTHROPIC_API_KEY`. OAuth-backed Claude Code tokens use the non-bare path
+because Claude Code bare mode does not read OAuth or keychain credentials.
+
 Multi-repo project membership in v0.1 is by convention only: set the same `project_id` in each repo's `project.toml`. Cross-repo project memory sync is deferred.
 
 ## Brain Tables
@@ -1357,6 +1371,7 @@ API keys are read from environment variables only. The variable name is given by
 
 ```text
 ANTHROPIC_API_KEY (default for the anthropic provider)
+CLAUDE_CODE_OAUTH_TOKEN (for the claude_code provider)
 ```
 
 Behavior:
@@ -1713,6 +1728,12 @@ Phase 6 starts with a broker-only benchmark slice:
 kimetsu bench run --repo .
 ```
 
+A model-backed PatchPlan slice is opt-in:
+
+```text
+kimetsu bench run --repo . --model-backed --limit 2 --max-cost-usd 1.00
+```
+
 This benchmark is deterministic by default. It creates temporary fixture
 repos for 12 curated seed/follow-up pairs, runs `brain_off`,
 `brain_on_cold`, and `brain_on_warm`, then writes:
@@ -1729,6 +1750,13 @@ deterministic dry-run PatchPlan traces for `brain_on_cold` and
 `brain_on_warm`; model calls are disabled during this benchmark path so it
 cannot depend on local API key state.
 
+With `--model-backed`, `brain_on_cold` and `brain_on_warm` use the source
+repo's configured model provider for PatchPlan only. The model secret is read
+from the source repo environment or `.env` and passed directly to the provider;
+it is not written into fixture repos. `brain_off` remains a no-model retrieval
+baseline. `--limit` controls how many curated task pairs run, and
+`--max-cost-usd` caps the aggregate model budget for the benchmark.
+
 The report measures:
 
 ```text
@@ -1739,6 +1767,9 @@ context loads
 irrelevant context loaded
 dry-run trace event count
 per-stage time profile from trace stage events
+model cost
+PatchPlan quality score
+invalid planned files
 model turns and model skips
 tool calls
 verification attempts

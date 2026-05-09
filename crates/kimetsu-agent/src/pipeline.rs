@@ -6,7 +6,7 @@ use kimetsu_brain::ingest;
 use kimetsu_brain::lock::ProjectLock;
 use kimetsu_brain::project;
 use kimetsu_brain::projector;
-use kimetsu_brain::trace::{RunPaths, TraceWriter};
+use kimetsu_brain::trace::{RunPaths, TraceWriter, read_trace};
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::event::Event;
@@ -14,13 +14,14 @@ use kimetsu_core::ids::{RunId, new_id};
 use kimetsu_core::paths::ProjectPaths;
 use serde::{Deserialize, Serialize};
 
-use crate::agent_loop::parse_structured_json;
+use crate::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopOutcome, parse_structured_json};
 use crate::anthropic::AnthropicProvider;
+use crate::claude_code::ClaudeCodeProvider;
 use crate::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
-    ToolChoice,
+    TokenUsage, ToolChoice, default_tool_definitions,
 };
-use crate::tools::CommandSpec;
+use crate::tools::{CommandSpec, ToolPatchPlan, ToolRuntime, ToolRuntimeConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +62,7 @@ pub struct CodingRunOptions {
     pub dry_run: bool,
     pub allow_high_risk: bool,
     pub disable_model: bool,
+    pub model_key_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,11 +117,23 @@ struct PatchPlanDraft {
     risk_level: serde_json::Value,
 }
 
-pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
-    if !options.dry_run {
-        return Err("full coding implementation is not wired yet; rerun with --dry-run".into());
-    }
+struct SelectedTextProvider {
+    provider_name: String,
+    model_name: String,
+    provider: Box<dyn ModelProvider>,
+}
 
+impl SelectedTextProvider {
+    fn complete(&mut self, request: ModelRequest) -> KimetsuResult<ModelResponse> {
+        self.provider.complete(request)
+    }
+}
+
+pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
+    run_coding(options)
+}
+
+pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
     let (paths, config, conn) = project::load_project(&options.repo)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "run coding", Some(run_id))?;
@@ -141,7 +155,7 @@ pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunR
                 "platform": std::env::consts::OS,
                 "kimetsu_version": env!("CARGO_PKG_VERSION"),
                 "config_hash": config_hash(&paths.project_toml)?,
-                "dry_run": true,
+                "dry_run": options.dry_run,
             }),
         ),
     )?;
@@ -153,7 +167,11 @@ pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunR
         run_id,
         CodingStage::Intake,
         serde_json::json!({
-            "summary": "Task accepted for dry-run patch planning.",
+            "summary": if options.dry_run {
+                "Task accepted for dry-run patch planning."
+            } else {
+                "Task accepted for implementation."
+            },
             "task": options.task,
             "allow_high_risk": options.allow_high_risk,
         }),
@@ -269,20 +287,24 @@ pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunR
             &run_paths,
             &paths,
             &config,
+            options.model_key_override.as_deref(),
             run_id,
             &options.task,
             &files_to_read,
             &patch_context,
         )
     };
-    let patch_plan = match model_patch_plan {
-        Ok(Some(patch_plan)) => patch_plan,
-        Ok(None) => build_dry_run_patch_plan(
-            &paths,
-            run_id,
-            &options.task,
-            &files_to_read,
-            &patch_context,
+    let (patch_plan, patch_plan_usage) = match model_patch_plan {
+        Ok(Some((patch_plan, usage))) => (patch_plan, Some(usage)),
+        Ok(None) => (
+            build_dry_run_patch_plan(
+                &paths,
+                run_id,
+                &options.task,
+                &files_to_read,
+                &patch_context,
+            ),
+            None,
         ),
         Err(err) => {
             emit(
@@ -360,12 +382,201 @@ pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunR
             "files_to_modify": patch_plan.files_to_modify,
             "verification_commands": patch_plan.verification_commands,
             "risk_level": patch_plan.risk_level,
+            "model_usage": patch_plan_usage,
         }),
     )?;
 
+    let mut implementation_outcome = None;
+    if !options.dry_run {
+        stage_entered(
+            &mut writer,
+            &mut events,
+            run_id,
+            CodingStage::Implementation,
+        )?;
+        if options.disable_model {
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "model.skipped",
+                    serde_json::json!({
+                        "stage": CodingStage::Implementation.as_str(),
+                        "provider": config.model.provider,
+                        "model": config.model.model,
+                        "reason": "disabled_by_options",
+                        "api_key_env": config.model.api_key_env,
+                    }),
+                ),
+            )?;
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "run.failed",
+                    serde_json::json!({
+                        "category": "Model",
+                        "message": "implementation requires model access; remove --no-model or use --dry-run",
+                        "failed_stage": CodingStage::Implementation.as_str(),
+                    }),
+                ),
+            )?;
+            projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+            return Err(
+                "implementation requires model access; remove --no-model or use --dry-run".into(),
+            );
+        }
+        if config.model.provider != "anthropic" {
+            let message = format!(
+                "provider `{}` supports PatchPlan only in v0.1; use --dry-run or configure provider = \"anthropic\" for implementation",
+                config.model.provider
+            );
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "run.failed",
+                    serde_json::json!({
+                        "category": "Model",
+                        "message": message.clone(),
+                        "failed_stage": CodingStage::Implementation.as_str(),
+                    }),
+                ),
+            )?;
+            projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+            return Err(message.into());
+        }
+        let provider = match AnthropicProvider::from_config_with_key(
+            &paths.repo_root,
+            &config,
+            options.model_key_override.as_deref(),
+        ) {
+            Ok(Some(provider)) => provider,
+            Ok(None) => {
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "model.skipped",
+                        serde_json::json!({
+                            "stage": CodingStage::Implementation.as_str(),
+                            "provider": config.model.provider,
+                            "model": config.model.model,
+                            "reason": "missing_api_key",
+                            "api_key_env": config.model.api_key_env,
+                        }),
+                    ),
+                )?;
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "run.failed",
+                        serde_json::json!({
+                            "category": "Model",
+                            "message": "implementation requires a configured model API key",
+                            "failed_stage": CodingStage::Implementation.as_str(),
+                        }),
+                    ),
+                )?;
+                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                return Err("implementation requires a configured model API key".into());
+            }
+            Err(err) => {
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "run.failed",
+                        serde_json::json!({
+                            "category": "Model",
+                            "message": err.to_string(),
+                            "failed_stage": CodingStage::Implementation.as_str(),
+                        }),
+                    ),
+                )?;
+                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                return Err(err);
+            }
+        };
+
+        let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
+            .with_stage(CodingStage::Implementation.as_str())
+            .with_config(tool_runtime_config(&config))
+            .with_trace(writer, run_paths.clone());
+        runtime.set_patch_plan(tool_patch_plan(&patch_plan));
+        let loop_config = AgentLoopConfig {
+            stage: CodingStage::Implementation.as_str().to_string(),
+            tools: implementation_tool_definitions(),
+            max_model_turns: config.run.max_total_model_turns,
+            max_tool_calls: config.run.max_total_tool_calls,
+            max_cost_usd: config.run.max_total_cost_usd,
+            max_output_tokens: config.model.max_output_tokens,
+            temperature: config.model.temperature,
+        };
+        let mut loop_runner = AgentLoop::new(provider, runtime, loop_config);
+        let loop_result = loop_runner.run(build_implementation_messages(
+            &options.task,
+            &patch_plan,
+            &patch_context,
+        )?);
+        let runtime = loop_runner.into_runtime();
+        let Some((restored_writer, _)) = runtime.into_trace() else {
+            return Err("implementation runtime lost trace writer".into());
+        };
+        writer = restored_writer;
+
+        match loop_result {
+            Ok(outcome) => {
+                stage_completed(
+                    &mut writer,
+                    &mut events,
+                    run_id,
+                    CodingStage::Implementation,
+                    serde_json::json!({
+                        "summary": "Implementation agent loop completed.",
+                        "model_turns": outcome.model_turns,
+                        "tool_calls": outcome.tool_calls,
+                        "usage": outcome.usage,
+                    }),
+                )?;
+                implementation_outcome = Some(outcome);
+            }
+            Err(err) => {
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "run.failed",
+                        serde_json::json!({
+                            "category": "Implementation",
+                            "message": err.to_string(),
+                            "failed_stage": CodingStage::Implementation.as_str(),
+                        }),
+                    ),
+                )?;
+                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                return Err(err);
+            }
+        }
+    }
+
     stage_entered(&mut writer, &mut events, run_id, CodingStage::FinalReport)?;
-    let final_report =
-        render_dry_run_report(&options.task, run_id, &patch_plan, &run_paths.trace_jsonl);
+    let final_report = render_coding_report(
+        &options.task,
+        run_id,
+        options.dry_run,
+        &patch_plan,
+        implementation_outcome.as_ref(),
+        &run_paths.trace_jsonl,
+    );
     fs::write(&run_paths.final_report, final_report)?;
     stage_completed(
         &mut writer,
@@ -386,22 +597,61 @@ pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunR
             serde_json::json!({
                 "status": "success",
                 "final_report_path": "final_report.md",
-                "total_cost_usd": 0.0,
-                "total_tool_calls": 0,
-                "dry_run": true,
+                "total_cost_usd": patch_plan_usage
+                    .map(|usage| usage.cost_usd)
+                    .unwrap_or(0.0)
+                    + implementation_outcome
+                    .as_ref()
+                    .map(|outcome| outcome.usage.cost_usd)
+                    .unwrap_or(0.0),
+                "total_tool_calls": implementation_outcome
+                    .as_ref()
+                    .map(|outcome| outcome.tool_calls)
+                    .unwrap_or(0),
+                "dry_run": options.dry_run,
             }),
         ),
     )?;
 
-    projector::apply_events(&conn, &events)?;
+    projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
 
     Ok(CodingRunResult {
         run_id,
-        dry_run: true,
+        dry_run: options.dry_run,
         patch_plan_id: patch_plan.patch_plan_id,
         final_report_path: run_paths.final_report,
         trace_path: run_paths.trace_jsonl,
     })
+}
+
+fn load_text_provider(
+    repo_root: &Path,
+    config: &ProjectConfig,
+    model_key_override: Option<&str>,
+) -> KimetsuResult<Option<SelectedTextProvider>> {
+    match config.model.provider.as_str() {
+        "anthropic" => {
+            Ok(
+                AnthropicProvider::from_config_with_key(repo_root, config, model_key_override)?
+                    .map(|provider| SelectedTextProvider {
+                        provider_name: "anthropic".to_string(),
+                        model_name: provider.model_name().to_string(),
+                        provider: Box::new(provider),
+                    }),
+            )
+        }
+        "claude_code" => {
+            Ok(
+                ClaudeCodeProvider::from_config_with_key(repo_root, config, model_key_override)?
+                    .map(|provider| SelectedTextProvider {
+                        provider_name: "claude_code".to_string(),
+                        model_name: provider.model_name().to_string(),
+                        provider: Box::new(provider),
+                    }),
+            )
+        }
+        other => Err(format!("unsupported model provider: {other}").into()),
+    }
 }
 
 fn try_model_patch_plan(
@@ -410,16 +660,18 @@ fn try_model_patch_plan(
     run_paths: &RunPaths,
     paths: &ProjectPaths,
     config: &ProjectConfig,
+    model_key_override: Option<&str>,
     run_id: RunId,
     task: &str,
     files_to_read: &[String],
     patch_context: &ContextBundle,
-) -> KimetsuResult<Option<PatchPlan>> {
+) -> KimetsuResult<Option<(PatchPlan, TokenUsage)>> {
     if cfg!(test) {
         return Ok(None);
     }
 
-    let Some(mut provider) = AnthropicProvider::from_config(&paths.repo_root, config)? else {
+    let Some(mut provider) = load_text_provider(&paths.repo_root, config, model_key_override)?
+    else {
         emit(
             writer,
             events,
@@ -444,28 +696,33 @@ fn try_model_patch_plan(
         events,
         run_paths,
         run_id,
-        provider.model_name(),
+        &provider.provider_name,
+        &provider.model_name,
         &request,
     )?;
     let response = provider.complete(request)?;
-    record_model_responded(writer, events, run_paths, run_id, &response)?;
+    record_model_responded(
+        writer,
+        events,
+        run_paths,
+        run_id,
+        &provider.provider_name,
+        &response,
+    )?;
 
     if !response.tool_calls.is_empty() {
         return Err("PatchPlan model unexpectedly requested tools".into());
     }
 
+    let usage = response.usage;
     let text = response
         .text
         .as_deref()
         .ok_or("PatchPlan model response did not include text")?;
     let draft: PatchPlanDraft = parse_structured_json(text)?;
-    Ok(Some(patch_plan_from_draft(
-        paths,
-        run_id,
-        task,
-        files_to_read,
-        patch_context,
-        draft,
+    Ok(Some((
+        patch_plan_from_draft(paths, run_id, task, files_to_read, patch_context, draft),
+        usage,
     )))
 }
 
@@ -525,6 +782,7 @@ fn record_model_requested(
     events: &mut Vec<Event>,
     run_paths: &RunPaths,
     run_id: RunId,
+    provider_name: &str,
     model: &str,
     request: &ModelRequest,
 ) -> KimetsuResult<()> {
@@ -533,7 +791,7 @@ fn record_model_requested(
         "model.requested",
         serde_json::json!({
             "stage": CodingStage::PatchPlan.as_str(),
-            "provider": "anthropic",
+            "provider": provider_name,
             "model": model,
             "request_artifact": null,
             "tool_names": request.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
@@ -554,6 +812,7 @@ fn record_model_responded(
     events: &mut Vec<Event>,
     run_paths: &RunPaths,
     run_id: RunId,
+    provider_name: &str,
     response: &ModelResponse,
 ) -> KimetsuResult<()> {
     let mut event = Event::new(
@@ -561,6 +820,7 @@ fn record_model_responded(
         "model.responded",
         serde_json::json!({
             "stage": CodingStage::PatchPlan.as_str(),
+            "provider": provider_name,
             "response_artifact": null,
             "stop_reason": response.stop_reason,
             "usage": response.usage,
@@ -660,6 +920,60 @@ fn patch_plan_from_draft(
             draft.expected_outcome.trim().to_string()
         },
         risk_level,
+    }
+}
+
+fn build_implementation_messages(
+    task: &str,
+    patch_plan: &PatchPlan,
+    patch_context: &ContextBundle,
+) -> KimetsuResult<Vec<ModelMessage>> {
+    let system = ModelMessage {
+        role: MessageRole::System,
+        content: vec![MessageContent::Text {
+            text: "You are the Implementation stage of Kimetsu, a conservative coding harness. Use tools to inspect files and apply the minimal patch. Do not invent tool results. Do not modify files outside the active PatchPlan.".to_string(),
+        }],
+    };
+    let patch_plan_json = serde_json::to_string_pretty(patch_plan)?;
+    let user = ModelMessage::user_text(format!(
+        "Task:\n{task}\n\n\
+         Active PatchPlan:\n{patch_plan_json}\n\n\
+         Context capsules:\n{capsules}\n\n\
+         Rules:\n\
+         - Read a file before modifying or deleting it.\n\
+         - For modify/delete, pass the exact hash from read_file as expected_hash.\n\
+         - Use apply_patch for all file edits.\n\
+         - Only files declared in files_to_modify, files_to_create, or files_to_delete may be changed.\n\
+         - Keep edits minimal and directly tied to expected_outcome.\n\
+         - Finish with a concise summary of changed files and remaining verification work.",
+        capsules = render_context_capsules(patch_context, 12),
+    ));
+    Ok(vec![system, user])
+}
+
+fn implementation_tool_definitions() -> Vec<crate::model::ToolDefinition> {
+    default_tool_definitions()
+        .into_iter()
+        .filter(|tool| tool.name != "shell_command")
+        .collect()
+}
+
+fn tool_patch_plan(patch_plan: &PatchPlan) -> ToolPatchPlan {
+    ToolPatchPlan {
+        files_to_modify: patch_plan.files_to_modify.iter().cloned().collect(),
+        files_to_create: patch_plan.files_to_create.iter().cloned().collect(),
+        files_to_delete: patch_plan.files_to_delete.iter().cloned().collect(),
+    }
+}
+
+fn tool_runtime_config(config: &ProjectConfig) -> ToolRuntimeConfig {
+    ToolRuntimeConfig {
+        default_timeout_secs: config.shell.default_timeout_secs,
+        max_timeout_secs: config.shell.max_timeout_secs,
+        model_output_cap_bytes: ToolRuntimeConfig::default().model_output_cap_bytes,
+        disk_output_cap_bytes: ToolRuntimeConfig::default().disk_output_cap_bytes,
+        redact_secrets: config.shell.redact_secrets,
+        env_allowlist_extra: config.shell.env_allowlist_extra.clone(),
     }
 }
 
@@ -986,24 +1300,52 @@ fn command<const N: usize>(program: &str, args: [&str; N]) -> CommandSpec {
     }
 }
 
-fn render_dry_run_report(
+fn render_coding_report(
     task: &str,
     run_id: RunId,
+    dry_run: bool,
     patch_plan: &PatchPlan,
+    implementation: Option<&AgentLoopOutcome>,
     trace_path: &Path,
 ) -> String {
+    let mode_summary = if dry_run {
+        "Dry-run completed through PatchPlan. No files were modified.".to_string()
+    } else {
+        format!(
+            "Implementation completed with {} model turns and {} tool calls.",
+            implementation
+                .map(|outcome| outcome.model_turns)
+                .unwrap_or_default(),
+            implementation
+                .map(|outcome| outcome.tool_calls)
+                .unwrap_or_default()
+        )
+    };
+    let changed_files = changed_files_summary(patch_plan);
+    let implementation_summary = implementation
+        .map(|outcome| outcome.final_text.trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("None.");
+    let known_risks = if dry_run {
+        "Model-backed implementation and verification are not wired yet."
+    } else {
+        "Verification, review, and memory proposal stages are not wired yet."
+    };
+
     format!(
         "# {task}\n\n\
          ## Summary\n\
-         Dry-run completed through PatchPlan. No files were modified.\n\n\
+         {mode_summary}\n\n\
          ## Changed files\n\
-         None.\n\n\
+         {changed_files}\n\n\
          ## Verification\n\
-         Not run in dry-run mode. Planned commands: {commands}\n\n\
+         Not run in this slice. Planned commands: {commands}\n\n\
+         ## Implementation output\n\
+         {implementation_summary}\n\n\
          ## Memory proposals\n\
          None.\n\n\
          ## Known risks\n\
-         Model-backed implementation and verification are not wired yet.\n\n\
+         {known_risks}\n\n\
          ## Trace\n\
          run_id: {run_id}\n\
          trace path: {trace}\n\
@@ -1015,6 +1357,33 @@ fn render_dry_run_report(
         patch_plan_id = patch_plan.patch_plan_id,
         version = env!("CARGO_PKG_VERSION"),
     )
+}
+
+fn changed_files_summary(patch_plan: &PatchPlan) -> String {
+    let mut lines = Vec::new();
+    lines.extend(
+        patch_plan
+            .files_to_modify
+            .iter()
+            .map(|path| format!("- modify `{path}`")),
+    );
+    lines.extend(
+        patch_plan
+            .files_to_create
+            .iter()
+            .map(|path| format!("- create `{path}`")),
+    );
+    lines.extend(
+        patch_plan
+            .files_to_delete
+            .iter()
+            .map(|path| format!("- delete `{path}`")),
+    );
+    if lines.is_empty() {
+        "None.".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn config_hash(path: &Path) -> KimetsuResult<String> {
@@ -1051,6 +1420,7 @@ mod tests {
             dry_run: true,
             allow_high_risk: false,
             disable_model: true,
+            model_key_override: None,
         })
         .expect("dry run");
 

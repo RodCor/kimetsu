@@ -25,11 +25,23 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn from_config(repo_root: &Path, config: &ProjectConfig) -> KimetsuResult<Option<Self>> {
+        Self::from_config_with_key(repo_root, config, None)
+    }
+
+    pub fn from_config_with_key(
+        repo_root: &Path,
+        config: &ProjectConfig,
+        api_key_override: Option<&str>,
+    ) -> KimetsuResult<Option<Self>> {
         if config.model.provider != "anthropic" {
             return Err(format!("unsupported model provider: {}", config.model.provider).into());
         }
 
-        let Some(api_key) = resolve_env_value(repo_root, &config.model.api_key_env) else {
+        let api_key = api_key_override
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| resolve_env_value(repo_root, &config.model.api_key_env));
+        let Some(api_key) = api_key else {
             return Ok(None);
         };
 

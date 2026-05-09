@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 use kimetsu_agent::bench::{BenchOptions, run_benchmark};
-use kimetsu_agent::pipeline::{CodingRunOptions, run_coding_dry_run};
+use kimetsu_agent::pipeline::{CodingRunOptions, run_coding};
 use kimetsu_brain::project;
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
@@ -126,6 +126,12 @@ struct BenchRunArgs {
     repo: PathBuf,
     #[arg(long)]
     keep_fixtures: bool,
+    #[arg(long)]
+    model_backed: bool,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long, default_value_t = 1.0)]
+    max_cost_usd: f32,
 }
 
 #[derive(Debug, Args)]
@@ -382,12 +388,13 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
 fn run_command(command: RunCommand) -> KimetsuResult<()> {
     match command {
         RunCommand::Coding(args) => {
-            let result = run_coding_dry_run(CodingRunOptions {
+            let result = run_coding(CodingRunOptions {
                 repo: args.repo,
                 task: args.task,
                 dry_run: args.dry_run,
                 allow_high_risk: args.allow_high_risk,
                 disable_model: args.no_model,
+                model_key_override: None,
             })?;
             println!("run_id: {}", result.run_id);
             println!("dry_run: {}", result.dry_run);
@@ -406,14 +413,19 @@ fn bench(command: BenchCommand) -> KimetsuResult<()> {
             let result = run_benchmark(BenchOptions {
                 repo: args.repo,
                 keep_fixtures: args.keep_fixtures,
+                model_backed: args.model_backed,
+                limit: args.limit,
+                max_cost_usd: args.max_cost_usd,
             })?;
             println!("bench_run_id: {}", result.bench_run_id);
             println!("tasks: {}", result.task_count);
+            println!("model_backed: {}", result.model_backed);
+            println!("total_cost_usd: {:.4}", result.total_cost_usd);
             println!("report: {}", result.report_path.display());
             println!("results: {}", result.results_path.display());
             for summary in result.summaries {
                 println!(
-                    "{} success={:.0}% relevant_signal={:.0}% memories={} context_loads={} irrelevant_context={} dry_runs={} avg_ms={:.2} trace_events={} model_turns={} model_skips={}",
+                    "{} success={:.0}% relevant_signal={:.0}% memories={} context_loads={} irrelevant_context={} dry_runs={} avg_ms={:.2} cost_usd={:.4} plan_quality={:.2} invalid_planned={} trace_events={} model_turns={} model_skips={}",
                     summary.mode,
                     summary.success_rate * 100.0,
                     summary.relevant_signal_rate * 100.0,
@@ -422,6 +434,9 @@ fn bench(command: BenchCommand) -> KimetsuResult<()> {
                     summary.irrelevant_context_loaded,
                     summary.dry_runs,
                     summary.avg_duration_ms,
+                    summary.total_cost_usd,
+                    summary.avg_patch_plan_quality,
+                    summary.invalid_planned_files,
                     summary.trace_events,
                     summary.model_turns,
                     summary.model_skips,
