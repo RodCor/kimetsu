@@ -182,6 +182,16 @@ pub trait ModelProvider {
     }
 }
 
+impl ModelProvider for Box<dyn ModelProvider> {
+    fn complete(&mut self, request: ModelRequest) -> KimetsuResult<ModelResponse> {
+        (**self).complete(request)
+    }
+
+    fn estimate_tokens(&self, text: &str) -> u32 {
+        (**self).estimate_tokens(text)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MockProvider {
     responses: VecDeque<ModelResponse>,

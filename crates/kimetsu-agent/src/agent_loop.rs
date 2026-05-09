@@ -185,7 +185,7 @@ pub fn parse_structured_json<T: DeserializeOwned>(text: &str) -> KimetsuResult<T
     Ok(serde_json::from_str(json)?)
 }
 
-fn extract_json_object(text: &str) -> Option<&str> {
+pub(crate) fn extract_json_object(text: &str) -> Option<&str> {
     let trimmed = text.trim();
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         return Some(trimmed);

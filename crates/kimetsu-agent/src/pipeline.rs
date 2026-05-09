@@ -62,6 +62,7 @@ pub struct CodingRunOptions {
     pub dry_run: bool,
     pub allow_high_risk: bool,
     pub disable_model: bool,
+    pub disable_broker: bool,
     pub model_key_override: Option<String>,
 }
 
@@ -217,33 +218,53 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         .canonicalize()?
         .to_string_lossy()
         .to_string();
-    let localization_context = context::retrieve_context(
-        &conn,
-        &repo_root,
-        &config.broker.weights,
-        ContextRequest {
+    let (localization_context, patch_context, broker_summary) = if options.disable_broker {
+        let empty_loc = ContextBundle {
             stage: CodingStage::Localization.as_str().to_string(),
-            query: options.task.clone(),
-            budget_tokens: config.broker.default_budget_tokens,
-        },
-    )?;
-    let patch_context = context::retrieve_context(
-        &conn,
-        &repo_root,
-        &config.broker.weights,
-        ContextRequest {
+            budget_tokens: 0,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: Vec::new(),
+        };
+        let empty_plan = ContextBundle {
             stage: CodingStage::PatchPlan.as_str().to_string(),
-            query: options.task.clone(),
-            budget_tokens: config.broker.default_budget_tokens,
-        },
-    )?;
+            budget_tokens: 0,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: Vec::new(),
+        };
+        (empty_loc, empty_plan, "Broker disabled (brain_off).")
+    } else {
+        let localization_context = context::retrieve_context(
+            &conn,
+            &repo_root,
+            &config.broker.weights,
+            ContextRequest {
+                stage: CodingStage::Localization.as_str().to_string(),
+                query: options.task.clone(),
+                budget_tokens: config.broker.default_budget_tokens,
+            },
+        )?;
+        let patch_context = context::retrieve_context(
+            &conn,
+            &repo_root,
+            &config.broker.weights,
+            ContextRequest {
+                stage: CodingStage::PatchPlan.as_str().to_string(),
+                query: options.task.clone(),
+                budget_tokens: config.broker.default_budget_tokens,
+            },
+        )?;
+        (localization_context, patch_context, "Context capsules retrieved.")
+    };
     stage_completed(
         &mut writer,
         &mut events,
         run_id,
         CodingStage::ContextRetrieval,
         serde_json::json!({
-            "summary": "Context capsules retrieved.",
+            "summary": broker_summary,
+            "broker_disabled": options.disable_broker,
             "localization_capsules": localization_context.capsules.len(),
             "patch_plan_capsules": patch_context.capsules.len(),
         }),
@@ -387,7 +408,15 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
     )?;
 
     let mut implementation_outcome = None;
+    let mut verification_summary: Option<serde_json::Value> = None;
+    let mut verification_tool_calls: u32 = 0;
+    let mut last_failure_context: Option<String> = None;
+    let mut last_failure_fingerprint: Option<String> = None;
+    let mut attempt: u32 = 0;
+    const MAX_VERIFICATION_ATTEMPTS: u32 = 3;
     if !options.dry_run {
+        'attempts: loop {
+        attempt = attempt.saturating_add(1);
         stage_entered(
             &mut writer,
             &mut events,
@@ -428,32 +457,26 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 "implementation requires model access; remove --no-model or use --dry-run".into(),
             );
         }
-        if config.model.provider != "anthropic" {
-            let message = format!(
-                "provider `{}` supports PatchPlan only in v0.1; use --dry-run or configure provider = \"anthropic\" for implementation",
-                config.model.provider
-            );
-            emit(
-                &mut writer,
-                &mut events,
-                Event::new(
-                    run_id,
-                    "run.failed",
-                    serde_json::json!({
-                        "category": "Model",
-                        "message": message.clone(),
-                        "failed_stage": CodingStage::Implementation.as_str(),
-                    }),
-                ),
-            )?;
-            projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
-            return Err(message.into());
-        }
-        let provider = match AnthropicProvider::from_config_with_key(
-            &paths.repo_root,
-            &config,
-            options.model_key_override.as_deref(),
-        ) {
+        let provider_selection: KimetsuResult<Option<Box<dyn ModelProvider>>> =
+            match config.model.provider.as_str() {
+                "anthropic" => AnthropicProvider::from_config_with_key(
+                    &paths.repo_root,
+                    &config,
+                    options.model_key_override.as_deref(),
+                )
+                .map(|opt| opt.map(|p| Box::new(p) as Box<dyn ModelProvider>)),
+                "claude_code" => ClaudeCodeProvider::from_config_with_key(
+                    &paths.repo_root,
+                    &config,
+                    options.model_key_override.as_deref(),
+                )
+                .map(|opt| opt.map(|p| Box::new(p) as Box<dyn ModelProvider>)),
+                other => Err(format!(
+                    "unsupported model provider for implementation: `{other}`; configure `anthropic` or `claude_code`"
+                )
+                .into()),
+            };
+        let provider = match provider_selection {
             Ok(Some(provider)) => provider,
             Ok(None) => {
                 emit(
@@ -525,6 +548,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             &options.task,
             &patch_plan,
             &patch_context,
+            last_failure_context.as_deref(),
         )?);
         let runtime = loop_runner.into_runtime();
         let Some((restored_writer, _)) = runtime.into_trace() else {
@@ -566,6 +590,169 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 return Err(err);
             }
         }
+
+        // === Verification stage (inside retry loop) ===
+        if patch_plan.verification_commands.is_empty() {
+            break 'attempts;
+        }
+        stage_entered(&mut writer, &mut events, run_id, CodingStage::Verification)?;
+
+        let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
+            .with_stage(CodingStage::Verification.as_str())
+            .with_config(tool_runtime_config(&config))
+            .with_trace(writer, run_paths.clone());
+
+        let mut failures: u32 = 0;
+        let mut command_results: Vec<serde_json::Value> = Vec::new();
+        let mut first_failure_payload: Option<serde_json::Value> = None;
+
+        for command in &patch_plan.verification_commands {
+            let expected = command.expected_exit.unwrap_or(0);
+            let label = if command.args.is_empty() {
+                command.program.clone()
+            } else {
+                format!("{} {}", command.program, command.args.join(" "))
+            };
+            verification_tool_calls = verification_tool_calls.saturating_add(1);
+            match runtime.shell_command(command.clone()) {
+                Ok(output) => {
+                    let passed = output.exit_code == expected
+                        && !output.timed_out
+                        && !output.killed_for_policy;
+                    let payload = serde_json::json!({
+                        "kind": "verification",
+                        "command": label,
+                        "exit_code": output.exit_code,
+                        "expected_exit": expected,
+                        "duration_ms": output.duration_ms,
+                        "timed_out": output.timed_out,
+                        "killed_for_policy": output.killed_for_policy,
+                        "stdout_summary": output.stdout_summary,
+                        "stderr_summary": output.stderr_summary,
+                    });
+                    let kind = if passed { "gate.passed" } else { "gate.failed" };
+                    runtime
+                        .append_trace_event(&Event::new(run_id, kind, payload.clone()), true)?;
+                    if !passed {
+                        failures = failures.saturating_add(1);
+                        if first_failure_payload.is_none() {
+                            first_failure_payload = Some(payload.clone());
+                        }
+                    }
+                    command_results.push(payload);
+                }
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "kind": "verification",
+                        "command": label,
+                        "error": err.to_string(),
+                    });
+                    runtime.append_trace_event(
+                        &Event::new(run_id, "gate.failed", payload.clone()),
+                        true,
+                    )?;
+                    failures = failures.saturating_add(1);
+                    if first_failure_payload.is_none() {
+                        first_failure_payload = Some(payload.clone());
+                    }
+                    command_results.push(payload);
+                }
+            }
+        }
+
+        let Some((restored_writer, _)) = runtime.into_trace() else {
+            return Err("verification runtime lost trace writer".into());
+        };
+        writer = restored_writer;
+
+        let summary_payload = serde_json::json!({
+            "summary": format!(
+                "Ran {} verification command(s); {} failure(s) on attempt {}.",
+                patch_plan.verification_commands.len(),
+                failures,
+                attempt
+            ),
+            "attempt": attempt,
+            "commands_run": patch_plan.verification_commands.len(),
+            "failures": failures,
+            "results": command_results.clone(),
+        });
+        stage_completed(
+            &mut writer,
+            &mut events,
+            run_id,
+            CodingStage::Verification,
+            summary_payload.clone(),
+        )?;
+        verification_summary = Some(summary_payload);
+
+        if failures == 0 {
+            break 'attempts;
+        }
+
+        let current_fingerprint = first_failure_payload
+            .as_ref()
+            .map(verification_failure_fingerprint);
+        let same_fingerprint_twice = match (
+            last_failure_fingerprint.as_ref(),
+            current_fingerprint.as_ref(),
+        ) {
+            (Some(prev), Some(curr)) => prev == curr,
+            _ => false,
+        };
+
+        if attempt < MAX_VERIFICATION_ATTEMPTS && !same_fingerprint_twice {
+            last_failure_fingerprint = current_fingerprint;
+            last_failure_context = Some(render_retry_context(
+                attempt,
+                &command_results,
+                first_failure_payload.as_ref(),
+            ));
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "verification.retry",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "fingerprint": last_failure_fingerprint,
+                        "failures": failures,
+                    }),
+                ),
+            )?;
+            continue 'attempts;
+        }
+
+        let stop_reason = if same_fingerprint_twice {
+            "same_failure_fingerprint_twice"
+        } else {
+            "retry_budget_exhausted"
+        };
+        emit(
+            &mut writer,
+            &mut events,
+            Event::new(
+                run_id,
+                "run.failed",
+                serde_json::json!({
+                    "category": "Verification",
+                    "message": format!(
+                        "{failures} verification command(s) failed on attempt {attempt}; stop_reason: {stop_reason}"
+                    ),
+                    "failed_stage": CodingStage::Verification.as_str(),
+                    "attempts_used": attempt,
+                    "stop_reason": stop_reason,
+                }),
+            ),
+        )?;
+        projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+        return Err(format!(
+            "verification gate failed after {attempt} attempt(s): {stop_reason}"
+        )
+        .into());
+        }
     }
 
     stage_entered(&mut writer, &mut events, run_id, CodingStage::FinalReport)?;
@@ -575,6 +762,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         options.dry_run,
         &patch_plan,
         implementation_outcome.as_ref(),
+        verification_summary.as_ref(),
         &run_paths.trace_jsonl,
     );
     fs::write(&run_paths.final_report, final_report)?;
@@ -584,10 +772,19 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         run_id,
         CodingStage::FinalReport,
         serde_json::json!({
-            "summary": "Dry-run final report written.",
+            "summary": if options.dry_run {
+                "Dry-run final report written."
+            } else {
+                "Final report written."
+            },
             "final_report_path": "final_report.md",
         }),
     )?;
+    let total_tool_calls = implementation_outcome
+        .as_ref()
+        .map(|outcome| outcome.tool_calls)
+        .unwrap_or(0)
+        .saturating_add(verification_tool_calls);
     emit(
         &mut writer,
         &mut events,
@@ -604,10 +801,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                     .as_ref()
                     .map(|outcome| outcome.usage.cost_usd)
                     .unwrap_or(0.0),
-                "total_tool_calls": implementation_outcome
-                    .as_ref()
-                    .map(|outcome| outcome.tool_calls)
-                    .unwrap_or(0),
+                "total_tool_calls": total_tool_calls,
+                "verification_tool_calls": verification_tool_calls,
                 "dry_run": options.dry_run,
             }),
         ),
@@ -927,6 +1122,7 @@ fn build_implementation_messages(
     task: &str,
     patch_plan: &PatchPlan,
     patch_context: &ContextBundle,
+    retry_context: Option<&str>,
 ) -> KimetsuResult<Vec<ModelMessage>> {
     let system = ModelMessage {
         role: MessageRole::System,
@@ -935,10 +1131,16 @@ fn build_implementation_messages(
         }],
     };
     let patch_plan_json = serde_json::to_string_pretty(patch_plan)?;
+    let retry_block = match retry_context {
+        Some(text) if !text.trim().is_empty() => format!(
+            "\n\nPrevious verification failed. Use this context to repair the patch:\n{text}\n"
+        ),
+        _ => String::new(),
+    };
     let user = ModelMessage::user_text(format!(
         "Task:\n{task}\n\n\
          Active PatchPlan:\n{patch_plan_json}\n\n\
-         Context capsules:\n{capsules}\n\n\
+         Context capsules:\n{capsules}{retry_block}\n\n\
          Rules:\n\
          - Read a file before modifying or deleting it.\n\
          - For modify/delete, pass the exact hash from read_file as expected_hash.\n\
@@ -952,10 +1154,9 @@ fn build_implementation_messages(
 }
 
 fn implementation_tool_definitions() -> Vec<crate::model::ToolDefinition> {
+    // Shell access is permitted in Implementation; the strict diff gate and
+    // shell policy in `tools::ToolRuntime` are the actual safety boundary.
     default_tool_definitions()
-        .into_iter()
-        .filter(|tool| tool.name != "shell_command")
-        .collect()
 }
 
 fn tool_patch_plan(patch_plan: &PatchPlan) -> ToolPatchPlan {
@@ -1306,6 +1507,7 @@ fn render_coding_report(
     dry_run: bool,
     patch_plan: &PatchPlan,
     implementation: Option<&AgentLoopOutcome>,
+    verification: Option<&serde_json::Value>,
     trace_path: &Path,
 ) -> String {
     let mode_summary = if dry_run {
@@ -1326,10 +1528,13 @@ fn render_coding_report(
         .map(|outcome| outcome.final_text.trim())
         .filter(|text| !text.is_empty())
         .unwrap_or("None.");
+    let verification_section = render_verification_section(dry_run, patch_plan, verification);
     let known_risks = if dry_run {
-        "Model-backed implementation and verification are not wired yet."
+        "Model-backed implementation and verification are not wired in dry-run."
+    } else if verification.is_none() && patch_plan.verification_commands.is_empty() {
+        "PatchPlan declared no verification commands; outcome is unverified."
     } else {
-        "Verification, review, and memory proposal stages are not wired yet."
+        "Review and memory proposal stages are not wired yet."
     };
 
     format!(
@@ -1339,7 +1544,7 @@ fn render_coding_report(
          ## Changed files\n\
          {changed_files}\n\n\
          ## Verification\n\
-         Not run in this slice. Planned commands: {commands}\n\n\
+         {verification_section}\n\n\
          ## Implementation output\n\
          {implementation_summary}\n\n\
          ## Memory proposals\n\
@@ -1351,12 +1556,210 @@ fn render_coding_report(
          trace path: {trace}\n\
          patch_plan_id: {patch_plan_id}\n\n\
          Generated by kimetsu {version}\n",
-        commands = serde_json::to_string(&patch_plan.verification_commands)
-            .unwrap_or_else(|_| "[]".to_string()),
         trace = trace_path.display(),
         patch_plan_id = patch_plan.patch_plan_id,
         version = env!("CARGO_PKG_VERSION"),
     )
+}
+
+fn verification_failure_fingerprint(payload: &serde_json::Value) -> String {
+    let exit_code = payload
+        .get("exit_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let command = payload
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let stderr = payload
+        .get("stderr_summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let normalized = stderr
+        .lines()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+        .map(normalize_for_fingerprint)
+        .unwrap_or_default();
+    let raw = format!("{exit_code}\u{1f}{command}\u{1f}{normalized}");
+    blake3::hash(raw.as_bytes()).to_hex().to_string()
+}
+
+fn normalize_for_fingerprint(line: &str) -> String {
+    // Strip ANSI escape sequences (CSI: ESC [ ... letter; OSC: ESC ] ... BEL/ST).
+    let mut without_ansi = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // Drop ESC and consume the following control sequence.
+            if let Some(&next) = chars.peek() {
+                chars.next();
+                if next == '[' {
+                    while let Some(c) = chars.next() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else if next == ']' {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            chars.next(); // consume terminating ST byte.
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            without_ansi.push(ch);
+        }
+    }
+
+    // Replace native paths and unix-ish absolute paths with a placeholder so
+    // identical errors from different tempdirs share a fingerprint. The path
+    // body deliberately excludes `:` so that `:line:col` suffixes (Windows or
+    // Unix style) are left for the digit-collapsing step below.
+    let path_re = regex::Regex::new(r#"(?x)
+        (?:
+            [a-zA-Z]:[\\/][^\s'"`<>:]*
+          | /(?:[a-zA-Z0-9._\-]+/)+[a-zA-Z0-9._\-]+
+        )
+    "#)
+    .expect("path regex compiles");
+    let no_paths = path_re.replace_all(&without_ansi, "<path>");
+
+    // Collapse runs of digits to '#' so line/column numbers don't differ.
+    let mut out = String::with_capacity(no_paths.len());
+    let mut in_digits = false;
+    for ch in no_paths.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+
+    // Whitespace-collapse, then cap to a stable length so very long stderr
+    // lines do not blow up the hash input.
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() > 512 {
+        collapsed.chars().take(512).collect()
+    } else {
+        collapsed
+    }
+}
+
+fn render_retry_context(
+    attempt: u32,
+    results: &[serde_json::Value],
+    first_failure: Option<&serde_json::Value>,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Verification attempt {attempt} failed. Re-implement to make all commands pass."
+    ));
+    if let Some(fail) = first_failure {
+        let command = fail
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let exit = fail
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let stderr = fail
+            .get("stderr_summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let stderr_excerpt = if stderr.is_empty() {
+            "<empty>".to_string()
+        } else {
+            truncate_text(stderr, 800)
+        };
+        lines.push(format!("First failing command: {command}"));
+        lines.push(format!("exit_code: {exit}"));
+        lines.push(format!("stderr (capped):\n{stderr_excerpt}"));
+    }
+    let other_failures: Vec<_> = results
+        .iter()
+        .skip(1)
+        .filter(|r| {
+            r.get("error").is_some()
+                || r.get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .zip(r.get("expected_exit").and_then(|v| v.as_i64()))
+                    .map(|(actual, expected)| actual != expected)
+                    .unwrap_or(false)
+        })
+        .filter_map(|r| r.get("command").and_then(|v| v.as_str()))
+        .collect();
+    if !other_failures.is_empty() {
+        lines.push(format!("Also failing: {}", other_failures.join(", ")));
+    }
+    lines.join("\n")
+}
+
+fn render_verification_section(
+    dry_run: bool,
+    patch_plan: &PatchPlan,
+    verification: Option<&serde_json::Value>,
+) -> String {
+    if dry_run {
+        let commands = serde_json::to_string(&patch_plan.verification_commands)
+            .unwrap_or_else(|_| "[]".to_string());
+        return format!("Skipped (dry-run). Planned commands: {commands}");
+    }
+    if patch_plan.verification_commands.is_empty() {
+        return "No verification commands were declared in the PatchPlan.".to_string();
+    }
+    let Some(summary) = verification else {
+        return "Verification stage did not record a summary.".to_string();
+    };
+
+    let commands_run = summary
+        .get("commands_run")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let failures = summary
+        .get("failures")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+    lines.push(format!("Ran {commands_run} command(s); {failures} failure(s)."));
+
+    if let Some(results) = summary.get("results").and_then(|v| v.as_array()) {
+        for result in results {
+            let command = result
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                lines.push(format!("- error `{command}`: {error}"));
+                continue;
+            }
+            let exit_code = result
+                .get("exit_code")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            let expected = result
+                .get("expected_exit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let status = if exit_code == expected { "pass" } else { "fail" };
+            lines.push(format!("- {status} `{command}` exit={exit_code} expected={expected}"));
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn changed_files_summary(patch_plan: &PatchPlan) -> String {
@@ -1420,6 +1823,7 @@ mod tests {
             dry_run: true,
             allow_high_risk: false,
             disable_model: true,
+            disable_broker: false,
             model_key_override: None,
         })
         .expect("dry run");
@@ -1457,7 +1861,180 @@ mod tests {
                 .any(|event| event.kind == "patch.plan.created")
         );
         assert!(events.iter().any(|event| event.kind == "run.finished"));
+        // Dry-run skips Verification.
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "stage.entered"
+                    && event.payload.get("stage").and_then(|s| s.as_str())
+                        == Some("verification"))
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn verification_section_skipped_in_dry_run() {
+        let plan = sample_patch_plan(vec![CommandSpec {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            cwd_relative: None,
+            timeout_secs: None,
+            expected_exit: None,
+        }]);
+        let rendered = render_verification_section(true, &plan, None);
+        assert!(rendered.starts_with("Skipped (dry-run)"));
+        assert!(rendered.contains("cargo"));
+    }
+
+    #[test]
+    fn verification_section_reports_no_commands() {
+        let plan = sample_patch_plan(Vec::new());
+        let rendered = render_verification_section(false, &plan, None);
+        assert!(rendered.contains("No verification commands"));
+    }
+
+    #[test]
+    fn verification_section_renders_pass_and_fail_results() {
+        let plan = sample_patch_plan(vec![
+            CommandSpec {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+                cwd_relative: None,
+                timeout_secs: None,
+                expected_exit: None,
+            },
+            CommandSpec {
+                program: "cargo".to_string(),
+                args: vec!["clippy".to_string()],
+                cwd_relative: None,
+                timeout_secs: None,
+                expected_exit: None,
+            },
+        ]);
+        let summary = serde_json::json!({
+            "summary": "Ran 2 verification command(s); 1 failure(s).",
+            "commands_run": 2,
+            "failures": 1,
+            "results": [
+                {
+                    "kind": "verification",
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "expected_exit": 0,
+                    "duration_ms": 1234,
+                    "timed_out": false,
+                    "killed_for_policy": false,
+                    "stdout_summary": "ok",
+                    "stderr_summary": ""
+                },
+                {
+                    "kind": "verification",
+                    "command": "cargo clippy",
+                    "exit_code": 101,
+                    "expected_exit": 0,
+                    "duration_ms": 222,
+                    "timed_out": false,
+                    "killed_for_policy": false,
+                    "stdout_summary": "",
+                    "stderr_summary": "error: warning treated"
+                }
+            ]
+        });
+        let rendered = render_verification_section(false, &plan, Some(&summary));
+        assert!(rendered.contains("Ran 2 command(s); 1 failure(s)."));
+        assert!(rendered.contains("- pass `cargo test`"));
+        assert!(rendered.contains("- fail `cargo clippy`"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_across_paths_and_line_numbers() {
+        let a = serde_json::json!({
+            "exit_code": 101,
+            "command": "cargo test",
+            "stderr_summary": "thread 'tests::area_of_3_by_4_is_12' panicked at C:\\Users\\rodri\\AppData\\Local\\Temp\\kimetsu-bench-1\\rust_area_bug-brain_on_cold\\src\\lib.rs:15:9:\nassertion `left == right` failed",
+        });
+        let b = serde_json::json!({
+            "exit_code": 101,
+            "command": "cargo test",
+            "stderr_summary": "thread 'tests::area_of_3_by_4_is_12' panicked at /tmp/different-path-here/src/lib.rs:42:7:\nassertion `left == right` failed",
+        });
+        assert_eq!(
+            verification_failure_fingerprint(&a),
+            verification_failure_fingerprint(&b),
+            "fingerprints must collapse paths and line numbers"
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_for_different_errors() {
+        let pass_assertion = serde_json::json!({
+            "exit_code": 101,
+            "command": "cargo test",
+            "stderr_summary": "thread 'foo' panicked at src/lib.rs:1:1:\nassertion `left == right` failed",
+        });
+        let other_panic = serde_json::json!({
+            "exit_code": 101,
+            "command": "cargo test",
+            "stderr_summary": "thread 'bar' panicked at src/lib.rs:2:1:\nindex out of bounds",
+        });
+        assert_ne!(
+            verification_failure_fingerprint(&pass_assertion),
+            verification_failure_fingerprint(&other_panic),
+        );
+    }
+
+    #[test]
+    fn fingerprint_strips_ansi_escapes() {
+        let plain = serde_json::json!({
+            "exit_code": 1,
+            "command": "cargo build",
+            "stderr_summary": "error: cannot find function `foo` in this scope",
+        });
+        let with_ansi = serde_json::json!({
+            "exit_code": 1,
+            "command": "cargo build",
+            "stderr_summary": "\u{1b}[31merror\u{1b}[0m: cannot find function `foo` in this scope",
+        });
+        assert_eq!(
+            verification_failure_fingerprint(&plain),
+            verification_failure_fingerprint(&with_ansi),
+        );
+    }
+
+    #[test]
+    fn render_retry_context_includes_command_and_stderr_excerpt() {
+        let first = serde_json::json!({
+            "command": "cargo test",
+            "exit_code": 101,
+            "expected_exit": 0,
+            "stderr_summary": "assertion `left == right` failed",
+        });
+        let other = serde_json::json!({
+            "command": "cargo clippy",
+            "exit_code": 101,
+            "expected_exit": 0,
+        });
+        let rendered = render_retry_context(2, &[first.clone(), other], Some(&first));
+        assert!(rendered.contains("attempt 2"));
+        assert!(rendered.contains("cargo test"));
+        assert!(rendered.contains("assertion"));
+        assert!(rendered.contains("cargo clippy"));
+    }
+
+    fn sample_patch_plan(commands: Vec<CommandSpec>) -> PatchPlan {
+        PatchPlan {
+            patch_plan_id: "patch_test".to_string(),
+            run_id: "run_test".to_string(),
+            revision_of: None,
+            rationale: "test".to_string(),
+            files_to_read: Vec::new(),
+            files_to_modify: Vec::new(),
+            files_to_create: Vec::new(),
+            files_to_delete: Vec::new(),
+            verification_commands: commands,
+            expected_outcome: "n/a".to_string(),
+            risk_level: RiskLevel::Low,
+        }
     }
 }

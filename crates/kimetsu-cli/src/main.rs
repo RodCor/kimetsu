@@ -5,6 +5,7 @@ use std::str::FromStr;
 use clap::{Args, Parser, Subcommand};
 use kimetsu_agent::bench::{BenchOptions, run_benchmark};
 use kimetsu_agent::pipeline::{CodingRunOptions, run_coding};
+use kimetsu_agent::swe_bench::{SweBenchOptions, run_swe_bench};
 use kimetsu_brain::project;
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
@@ -118,6 +119,30 @@ enum RunCommand {
 #[derive(Debug, Subcommand)]
 enum BenchCommand {
     Run(BenchRunArgs),
+    Swe(SweArgs),
+}
+
+#[derive(Debug, Args)]
+struct SweArgs {
+    /// JSONL file of SWE-bench task records.
+    #[arg(long)]
+    tasks: PathBuf,
+    /// Caller-prepared repo path. Kimetsu does NOT clone or apply test_patch
+    /// in v0.1 — see SWEBENCH.md for the full integration plan.
+    #[arg(long)]
+    repo: PathBuf,
+    /// Run a single instance by id (default: every task).
+    #[arg(long)]
+    instance_id: Option<String>,
+    /// Skip Implementation+Verification; stop at PatchPlan.
+    #[arg(long)]
+    dry_run: bool,
+    /// Disable the broker (broker_off equivalent).
+    #[arg(long)]
+    no_broker: bool,
+    /// Hard cap on tasks executed.
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -144,6 +169,8 @@ struct CodingArgs {
     allow_high_risk: bool,
     #[arg(long)]
     no_model: bool,
+    #[arg(long)]
+    no_broker: bool,
     #[arg(long)]
     no_redact: bool,
     #[arg(long)]
@@ -394,6 +421,7 @@ fn run_command(command: RunCommand) -> KimetsuResult<()> {
                 dry_run: args.dry_run,
                 allow_high_risk: args.allow_high_risk,
                 disable_model: args.no_model,
+                disable_broker: args.no_broker,
                 model_key_override: None,
             })?;
             println!("run_id: {}", result.run_id);
@@ -409,6 +437,28 @@ fn run_command(command: RunCommand) -> KimetsuResult<()> {
 
 fn bench(command: BenchCommand) -> KimetsuResult<()> {
     match command {
+        BenchCommand::Swe(args) => {
+            let results = run_swe_bench(SweBenchOptions {
+                tasks: args.tasks,
+                repo: args.repo,
+                instance_id: args.instance_id,
+                dry_run: args.dry_run,
+                disable_broker: args.no_broker,
+                limit: args.limit,
+            })?;
+            println!("instances: {}", results.len());
+            for instance in results {
+                println!(
+                    "{} run={} dry_run={} no_broker={} trace={}",
+                    instance.instance_id,
+                    instance.run_id,
+                    instance.dry_run,
+                    instance.disable_broker,
+                    instance.trace_path.display(),
+                );
+            }
+            return Ok(());
+        }
         BenchCommand::Run(args) => {
             let result = run_benchmark(BenchOptions {
                 repo: args.repo,

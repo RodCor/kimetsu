@@ -142,6 +142,10 @@ struct BenchTask {
     warm_memory: &'static str,
     relevant_handles: Vec<&'static str>,
     files: Vec<FixtureFile>,
+    /// When true the bench drives only PatchPlan; when false it runs the full
+    /// pipeline including Implementation and Verification. Real-fix fixtures
+    /// must set this to false; retrieval-only fixtures keep the default.
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -220,10 +224,7 @@ pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
                 } else {
                     options.max_cost_usd
                 };
-                if model_config.is_some()
-                    && mode != BenchMode::BrainOff
-                    && remaining_cost_usd < MIN_MODEL_BENCH_REMAINING_USD
-                {
+                if model_config.is_some() && remaining_cost_usd < MIN_MODEL_BENCH_REMAINING_USD {
                     stopped_reason = Some(format!(
                         "stopped before {} {} because remaining budget ${:.4} is below ${:.2}",
                         task.id,
@@ -295,10 +296,6 @@ fn run_task_mode(
     model_config: Option<&ModelBenchConfig>,
     remaining_cost_usd: f32,
 ) -> KimetsuResult<BenchTaskResult> {
-    if mode == BenchMode::BrainOff {
-        return Ok(evaluate_capsules(task, mode, Vec::new(), None));
-    }
-
     let repo = fixture_root.join(format!("{}-{}", task.id, mode.as_str()));
     write_fixture_repo(&repo, task)?;
     project::init_project(&repo, false)?;
@@ -314,21 +311,62 @@ fn run_task_mode(
         )?;
     }
     project::ingest_repo(&repo)?;
-    let context = project::retrieve_context(&repo, "patch_plan", task.followup_task, 420)?;
-    let dry_run = run_coding_dry_run(CodingRunOptions {
+    // For evaluate_capsules: BrainOff measures retrieval-as-zero so we don't query the broker.
+    let measured_capsules = if mode == BenchMode::BrainOff {
+        Vec::new()
+    } else {
+        project::retrieve_context(&repo, "patch_plan", task.followup_task, 420)?.capsules
+    };
+    let pipeline_result = run_coding_dry_run(CodingRunOptions {
         repo: repo.clone(),
         task: task.followup_task.to_string(),
-        dry_run: true,
+        dry_run: task.dry_run,
         allow_high_risk: true,
         disable_model: model_config.is_none(),
+        disable_broker: mode == BenchMode::BrainOff,
         model_key_override: model_config.map(|model| model.model_key.clone()),
-    })?;
-    let dry_run_metrics = dry_run_metrics(output_dir, task, mode, &dry_run.trace_path)?;
+    });
+    let pipeline_result = match pipeline_result {
+        Ok(result) => result,
+        Err(err) => {
+            // Even when run_coding errored (e.g. verification gate failed), the
+            // trace was already finalized by the pipeline. Try to surface the
+            // metrics anyway by walking the most recent run directory.
+            let kimetsu_dir = repo.join(".kimetsu");
+            let runs_dir = kimetsu_dir.join("runs");
+            let last_run = fs::read_dir(&runs_dir)
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| path.is_dir())
+                        .max_by_key(|path| {
+                            path.metadata().and_then(|m| m.modified()).ok()
+                        })
+                });
+            let Some(run_dir) = last_run else {
+                return Err(err);
+            };
+            let trace_path = run_dir.join("trace.jsonl");
+            if !trace_path.exists() {
+                return Err(err);
+            }
+            crate::pipeline::CodingRunResult {
+                run_id: kimetsu_core::ids::RunId::new(),
+                dry_run: task.dry_run,
+                patch_plan_id: String::new(),
+                final_report_path: run_dir.join("final_report.md"),
+                trace_path,
+            }
+        }
+    };
+    let metrics = dry_run_metrics(output_dir, task, mode, &pipeline_result.trace_path)?;
     Ok(evaluate_capsules(
         task,
         mode,
-        context.capsules,
-        Some(dry_run_metrics),
+        measured_capsules,
+        Some(metrics),
     ))
 }
 
@@ -416,11 +454,25 @@ fn evaluate_capsules(
         })
         .count() as u32;
 
+    // For real-fix tasks (`task.dry_run == false`) success means the pipeline
+    // reached `run.finished`, which implies the Verification gate passed all
+    // declared verification commands. For retrieval-only tasks we keep the
+    // legacy "did relevant capsules load" definition so existing fixtures stay
+    // comparable across modes.
+    let success = if task.dry_run {
+        relevant_signal_loaded
+    } else {
+        dry_run
+            .as_ref()
+            .map(|metrics| metrics.terminal_kind == "run.finished")
+            .unwrap_or(false)
+    };
+
     BenchTaskResult {
         task_id: task.id.to_string(),
         category: task.category.to_string(),
         mode: mode.as_str().to_string(),
-        success: relevant_signal_loaded,
+        success,
         relevant_signal_loaded,
         relevant_files_loaded,
         accepted_memories_used,
@@ -799,6 +851,136 @@ fn write_fixture_repo(repo: &Path, task: &BenchTask) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// Per-task per-mode metrics rolled up for the warm-vs-off comparison.
+struct PairedMetric<'a> {
+    off: &'a BenchTaskResult,
+    warm: &'a BenchTaskResult,
+}
+
+fn pair_warm_against_off<'a>(report: &'a BenchReport) -> Vec<PairedMetric<'a>> {
+    let mut by_task: BTreeMap<&str, BTreeMap<&str, &BenchTaskResult>> = BTreeMap::new();
+    for result in &report.results {
+        by_task
+            .entry(result.task_id.as_str())
+            .or_default()
+            .insert(result.mode.as_str(), result);
+    }
+    let mut out = Vec::new();
+    for (_, modes) in by_task {
+        if let (Some(off), Some(warm)) = (modes.get("brain_off"), modes.get("brain_on_warm")) {
+            out.push(PairedMetric { off, warm });
+        }
+    }
+    out
+}
+
+fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
+    let pairs = pair_warm_against_off(report);
+    if pairs.is_empty() {
+        return String::new();
+    }
+
+    // Headline metric inputs.
+    let mut warm_successes = 0u32;
+    let mut off_successes = 0u32;
+    let mut warm_tool_calls_sum = 0u64;
+    let mut off_tool_calls_sum = 0u64;
+    let mut warm_retries_sum = 0u64;
+    let mut off_retries_sum = 0u64;
+    let mut paired_real_fix = 0u32;
+
+    for PairedMetric { off, warm, .. } in &pairs {
+        if off.success {
+            off_successes += 1;
+        }
+        if warm.success {
+            warm_successes += 1;
+        }
+        let off_metrics = off.dry_run.as_ref();
+        let warm_metrics = warm.dry_run.as_ref();
+        if let (Some(off_m), Some(warm_m)) = (off_metrics, warm_metrics) {
+            warm_tool_calls_sum += warm_m.tool_calls as u64;
+            off_tool_calls_sum += off_m.tool_calls as u64;
+            // Treat verification_attempts as the proxy for retries.
+            let off_retries = off_m.verification_attempts.saturating_sub(1);
+            let warm_retries = warm_m.verification_attempts.saturating_sub(1);
+            warm_retries_sum += warm_retries as u64;
+            off_retries_sum += off_retries as u64;
+            // A "real-fix paired task" is one whose Verification stage
+            // actually executed in at least one mode.
+            if off_m.verification_attempts > 0 || warm_m.verification_attempts > 0 {
+                paired_real_fix += 1;
+            }
+        }
+    }
+
+    let total = pairs.len() as u32;
+    let success_rate_off = ratio(off_successes as usize, total as usize);
+    let success_rate_warm = ratio(warm_successes as usize, total as usize);
+    let success_uplift_pp = (success_rate_warm - success_rate_off) * 100.0;
+    let tool_calls_ratio = if off_tool_calls_sum == 0 {
+        f32::NAN
+    } else {
+        warm_tool_calls_sum as f32 / off_tool_calls_sum as f32
+    };
+    let tool_calls_pct_drop = if tool_calls_ratio.is_nan() {
+        f32::NAN
+    } else {
+        (1.0 - tool_calls_ratio) * 100.0
+    };
+    let retries_delta = off_retries_sum as i64 - warm_retries_sum as i64;
+
+    // Threshold checks per MVP.md: ≥20% fewer tool calls, ≥15 pp success uplift,
+    // or strictly fewer verification retries.
+    let tool_call_pass = !tool_calls_pct_drop.is_nan() && tool_calls_pct_drop >= 20.0;
+    let success_pass = success_uplift_pp >= 15.0;
+    let retries_pass = retries_delta > 0;
+    let any_pass = tool_call_pass || success_pass || retries_pass;
+
+    let mut out = String::new();
+    out.push_str("## Falsifiable Claim — warm vs off\n\n");
+    out.push_str("MVP.md threshold: warm beats off on **at least one** of\n");
+    out.push_str("- ≥20% fewer total tool calls\n");
+    out.push_str("- ≥15 pp success-rate uplift\n");
+    out.push_str("- strictly fewer verification retries\n\n");
+    out.push_str(&format!(
+        "Paired tasks: {total} (real-fix subset where Verification ran: {paired_real_fix}).\n\n"
+    ));
+    out.push_str(
+        "| metric | brain_off | brain_on_warm | delta | threshold | pass |\n\
+         | --- | ---: | ---: | ---: | --- | :---: |\n",
+    );
+    out.push_str(&format!(
+        "| success rate | {:.0}% | {:.0}% | {:+.0} pp | ≥15 pp | {} |\n",
+        success_rate_off * 100.0,
+        success_rate_warm * 100.0,
+        success_uplift_pp,
+        if success_pass { "✓" } else { "✗" },
+    ));
+    let tool_off_str = format!("{off_tool_calls_sum}");
+    let tool_warm_str = format!("{warm_tool_calls_sum}");
+    let tool_delta_str = if tool_calls_pct_drop.is_nan() {
+        "n/a".to_string()
+    } else {
+        format!("{:+.0}%", -tool_calls_pct_drop)
+    };
+    out.push_str(&format!(
+        "| total tool calls | {tool_off_str} | {tool_warm_str} | {tool_delta_str} | -20% or better | {} |\n",
+        if tool_call_pass { "✓" } else { "✗" },
+    ));
+    out.push_str(&format!(
+        "| verification retries | {off_retries_sum} | {warm_retries_sum} | {:+} | strictly fewer | {} |\n\n",
+        -retries_delta,
+        if retries_pass { "✓" } else { "✗" },
+    ));
+    out.push_str(&format!(
+        "**Falsifiable claim {}**: at least one threshold {}.\n\n",
+        if any_pass { "passes" } else { "fails" },
+        if any_pass { "cleared" } else { "NOT cleared" },
+    ));
+    out
+}
+
 fn render_report(report: &BenchReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Kimetsu Bench {}\n\n", report.bench_run_id));
@@ -811,10 +993,11 @@ fn render_report(report: &BenchReport) -> String {
         out.push_str(&format!("Stopped early: {reason}.\n\n"));
     }
     if report.model_backed {
-        out.push_str("This benchmark runs PatchPlan dry-runs through the configured model provider for brain_on_cold and brain_on_warm. brain_off remains a retrieval baseline with no model call. Implementation edits and verification commands are not executed yet.\n\n");
+        out.push_str("This benchmark runs the full pipeline through the configured model provider for every mode. brain_off disables the broker (no memory or prior_run capsules); brain_on_cold uses the broker with no warm seed; brain_on_warm uses the broker plus a warm-seeded memory. Real-fix fixtures (dry_run=false) execute Implementation and Verification end-to-end with the failure-fingerprint retry loop; retrieval-only fixtures (dry_run=true) stop after PatchPlan and measure broker quality.\n\n");
     } else {
-        out.push_str("This benchmark measures context and memory retrieval, then runs deterministic dry-run PatchPlan traces for brain_on_cold and brain_on_warm with the model disabled. Implementation edits and verification commands are not executed yet.\n\n");
+        out.push_str("This benchmark measures context and memory retrieval and runs deterministic dry-run PatchPlan traces with the model disabled. Implementation and Verification stages are skipped.\n\n");
     }
+    out.push_str(&render_falsifiable_claim_summary(report));
     out.push_str("## Summary\n\n");
     out.push_str("| mode | success | relevant_signal | memories | context | irrelevant_context | dry_runs | avg_ms | cost_usd | plan_quality | invalid_planned | trace_events | model_turns | model_skips | planned_relevant | unrelated_planned |\n");
     out.push_str(
@@ -931,6 +1114,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "pub fn command_timeout_policy() { /* shell timeout and kill tree */ }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "rust_capsule_scoring",
@@ -958,6 +1142,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "pub fn normalize_memory_text() { /* lowercase whitespace collapse */ }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "rust_secret_redaction",
@@ -985,6 +1170,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "pub fn render_final_report() { /* markdown report */ }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "rust_project_lock",
@@ -1012,6 +1198,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "pub fn init_project() { /* project toml */ }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "rust_manifest_ingest",
@@ -1033,6 +1220,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                 file("src/schema.rs", "pub fn create_repo_manifests_table() {}\n"),
                 file("src/context.rs", "pub fn manifest_candidates() {}\n"),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "ts_debounce",
@@ -1057,6 +1245,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "export function parseJson(value: string) { return JSON.parse(value); }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "ts_route_config",
@@ -1081,6 +1270,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                 ),
                 file("src/debounce.ts", "export function debounce() {}\n"),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "ts_json_parse",
@@ -1105,6 +1295,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "export function readEnv() { return process.env; }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "memory_rg_preference",
@@ -1128,6 +1319,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "pub fn search_files() { /* ripgrep-like search abstraction */ }\n",
                 ),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "memory_windows_shell",
@@ -1148,6 +1340,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                 ),
                 file("src/shell.rs", "pub fn validate_delete_policy() {}\n"),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "context_mvp_benchmark",
@@ -1168,6 +1361,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                 ),
                 file("src/context.rs", "pub fn retrieve_context() {}\n"),
             ],
+            dry_run: true,
         },
         BenchTask {
             id: "context_skip_dirs",
@@ -1188,6 +1382,128 @@ fn bench_tasks() -> Vec<BenchTask> {
                 ),
                 file("src/ingest.rs", "pub fn skip_dirs() {}\n"),
             ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "rust_area_bug",
+            category: "rust",
+            seed_task: "Add a `rectangle::area` helper.",
+            followup_task: "Fix the failing tests in src/lib.rs so cargo test passes.",
+            memory_kind: MemoryKind::FailurePattern,
+            warm_memory: "rectangle::area in src/lib.rs is supposed to return width * height; the failing tests in tests::area_of_3_by_4_is_12 and tests::area_of_5_by_5_is_25 document the bug.",
+            relevant_handles: vec!["file:src/lib.rs"],
+            files: vec![
+                file(
+                    "Cargo.toml",
+                    "[package]\nname = \"kimetsu-bench-area\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+                ),
+                file(
+                    "src/lib.rs",
+                    "/// Returns the rectangle area for the given dimensions.\n///\n/// BUG: this implementation returns `width + height` instead of `width * height`.\n/// The failing tests in this module document the desired behavior.\npub fn area(width: u32, height: u32) -> u32 {\n    width + height\n}\n\n#[cfg(test)]\nmod tests {\n    use super::area;\n\n    #[test]\n    fn area_of_3_by_4_is_12() {\n        assert_eq!(area(3, 4), 12);\n    }\n\n    #[test]\n    fn area_of_5_by_5_is_25() {\n        assert_eq!(area(5, 5), 25);\n    }\n}\n",
+                ),
+            ],
+            dry_run: false,
+        },
+        // Memory-dependent: failing test imports `crate::v2::compute`, only `v1`
+        // exists. The fix can be either renaming v1 to v2 or adding a v2
+        // re-export module. The warm memory says re-export through v2 to keep
+        // v1 available; without it the agent has no way to know which choice
+        // matches the project convention.
+        BenchTask {
+            id: "rust_module_namespacing",
+            category: "rust",
+            seed_task: "Set up versioned public API modules under v1 and v2.",
+            followup_task: "Make cargo test pass without removing the existing v1 module.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Public API convention: v2 is the current namespace. Always re-export v1 helpers through src/v2/mod.rs as `pub use crate::v1::compute;`. Never delete v1; never edit tests to dodge the missing v2.",
+            relevant_handles: vec!["file:src/v2/mod.rs", "file:src/lib.rs"],
+            files: vec![
+                file(
+                    "Cargo.toml",
+                    "[package]\nname = \"kimetsu-bench-namespacing\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+                ),
+                file(
+                    "src/lib.rs",
+                    "//! Versioned public API for the kimetsu-bench-namespacing crate.\n//!\n//! Convention: v2 is the current namespace; v1 stays around for compatibility.\npub mod v1;\n",
+                ),
+                file(
+                    "src/v1/mod.rs",
+                    "/// Doubles its argument. v1 of the public compute helper.\npub fn compute(x: u32) -> u32 {\n    x * 2\n}\n",
+                ),
+                file(
+                    "tests/api.rs",
+                    "use kimetsu_bench_namespacing::v2::compute;\n\n#[test]\nfn v2_compute_is_re_exported_from_v1() {\n    assert_eq!(compute(21), 42);\n}\n",
+                ),
+            ],
+            dry_run: false,
+        },
+        // Memory-dependent: the test calls `find_user`, the impl exposes
+        // `get_user`. Two equally valid fixes (rename impl, or rename test).
+        // The warm memory says rename `get_*` to `find_*` for fallible
+        // lookups; without it the agent can't pick the convention.
+        BenchTask {
+            id: "rust_function_renamed",
+            category: "rust",
+            seed_task: "Add a fallible user lookup helper.",
+            followup_task: "Make cargo test compile and pass without changing the test file.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Naming convention: fallible lookups are `find_*` (returning Option/Result), infallible lookups are `get_*`. Existing `get_user` in src/users.rs returns Option<User> and must be renamed to `find_user`. Tests are the source of truth for public names.",
+            relevant_handles: vec!["file:src/users.rs", "file:src/lib.rs"],
+            files: vec![
+                file(
+                    "Cargo.toml",
+                    "[package]\nname = \"kimetsu-bench-rename\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+                ),
+                file(
+                    "src/lib.rs",
+                    "pub mod users;\n",
+                ),
+                file(
+                    "src/users.rs",
+                    "#[derive(Debug, PartialEq, Eq)]\npub struct User {\n    pub id: u32,\n    pub name: String,\n}\n\npub fn get_user(id: u32) -> Option<User> {\n    if id == 1 {\n        Some(User { id, name: \"alice\".to_string() })\n    } else {\n        None\n    }\n}\n",
+                ),
+                file(
+                    "tests/users.rs",
+                    "use kimetsu_bench_rename::users::{find_user, User};\n\n#[test]\nfn find_user_returns_alice() {\n    assert_eq!(\n        find_user(1),\n        Some(User { id: 1, name: \"alice\".to_string() })\n    );\n}\n\n#[test]\nfn find_user_returns_none_for_unknown() {\n    assert_eq!(find_user(99), None);\n}\n",
+                ),
+            ],
+            dry_run: false,
+        },
+        // Retry-stress: two correlated bugs across two files; only one is
+        // surfaced per failing test. The agent that fixes only one will see
+        // the other test fail on Verification and need to retry. The warm
+        // memory hints both files are bugged.
+        BenchTask {
+            id: "rust_two_file_bug",
+            category: "rust",
+            seed_task: "Add area and perimeter helpers for rectangles.",
+            followup_task: "Make cargo test pass.",
+            memory_kind: MemoryKind::FailurePattern,
+            warm_memory: "Both src/area.rs and src/perimeter.rs ship with off-by-operator bugs. area returns sum instead of product; perimeter returns product instead of `2 * (width + height)`. Fix both before re-running cargo test.",
+            relevant_handles: vec!["file:src/area.rs", "file:src/perimeter.rs"],
+            files: vec![
+                file(
+                    "Cargo.toml",
+                    "[package]\nname = \"kimetsu-bench-two-file\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+                ),
+                file(
+                    "src/lib.rs",
+                    "pub mod area;\npub mod perimeter;\n",
+                ),
+                file(
+                    "src/area.rs",
+                    "/// BUG: returns width + height instead of width * height.\npub fn area(width: u32, height: u32) -> u32 {\n    width + height\n}\n",
+                ),
+                file(
+                    "src/perimeter.rs",
+                    "/// BUG: returns width * height instead of 2 * (width + height).\npub fn perimeter(width: u32, height: u32) -> u32 {\n    width * height\n}\n",
+                ),
+                file(
+                    "tests/geom.rs",
+                    "use kimetsu_bench_two_file::{area::area, perimeter::perimeter};\n\n#[test]\nfn area_of_3_by_4_is_12() {\n    assert_eq!(area(3, 4), 12);\n}\n\n#[test]\nfn perimeter_of_3_by_4_is_14() {\n    assert_eq!(perimeter(3, 4), 14);\n}\n",
+                ),
+            ],
+            dry_run: false,
         },
     ]
 }
@@ -1214,7 +1530,7 @@ mod tests {
         })
         .expect("run benchmark");
 
-        assert_eq!(report.task_count, 12);
+        assert_eq!(report.task_count, 16);
         assert!(report.report_path.exists());
         assert!(report.results_path.exists());
         let warm = report
