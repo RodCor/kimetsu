@@ -180,10 +180,16 @@ pub struct RunSection {
 
 impl Default for RunSection {
     fn default() -> Self {
+        // `max_total_cost_usd` is treated as advisory under subscription-based
+        // providers (e.g. Claude Code OAuth). The agent loop still enforces it
+        // when it does fire, but the default is set high enough that it
+        // functions as a runaway-prevention safety net rather than a per-run
+        // budget. Tighten in `project.toml` when running against a metered
+        // provider.
         Self {
             max_total_tool_calls: 60,
             max_total_model_turns: 30,
-            max_total_cost_usd: 5.0,
+            max_total_cost_usd: 250.0,
         }
     }
 }

@@ -5,3 +5,5 @@
 !.env.example
 *.log
 **/*.rs.bk
+
+.git-commit-msg.tmp

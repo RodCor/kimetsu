@@ -155,7 +155,12 @@ struct BenchRunArgs {
     model_backed: bool,
     #[arg(long)]
     limit: Option<usize>,
-    #[arg(long, default_value_t = 1.0)]
+    /// Soft cost cap; bench stops scheduling new tasks once cumulative model
+    /// cost exceeds this. Defaults high because Claude Code OAuth is on a
+    /// subscription — cost is reported as a metric, not a hard constraint.
+    /// Pass a smaller value if you want the bench to stop early on metered
+    /// providers.
+    #[arg(long, default_value_t = 250.0)]
     max_cost_usd: f32,
 }
 
