@@ -171,11 +171,21 @@ enum BenchMode {
     BrainOff,
     BrainOnCold,
     BrainOnWarm,
+    /// MP-3: run the seed pipeline first, auto-accept high-confidence personal
+    /// proposals from its trace, reset the source files, then run the
+    /// follow-up pipeline. Memories carried across phases are *only* what the
+    /// agent itself proposed -- no hand-curated warm seed.
+    BrainOnAutoWarm,
 }
 
 impl BenchMode {
-    fn all() -> [Self; 3] {
-        [Self::BrainOff, Self::BrainOnCold, Self::BrainOnWarm]
+    fn all() -> [Self; 4] {
+        [
+            Self::BrainOff,
+            Self::BrainOnCold,
+            Self::BrainOnWarm,
+            Self::BrainOnAutoWarm,
+        ]
     }
 
     fn as_str(self) -> &'static str {
@@ -183,6 +193,7 @@ impl BenchMode {
             Self::BrainOff => "brain_off",
             Self::BrainOnCold => "brain_on_cold",
             Self::BrainOnWarm => "brain_on_warm",
+            Self::BrainOnAutoWarm => "brain_on_auto_warm",
         }
     }
 }
@@ -311,14 +322,49 @@ fn run_task_mode(
         )?;
     }
     project::ingest_repo(&repo)?;
-    // For evaluate_capsules: BrainOff measures retrieval-as-zero so we don't query the broker.
+
+    // BrainOnAutoWarm: run the followup task once as the seed phase, auto-
+    // accept any high-confidence personal proposals it produced, reset the
+    // source files so the agent has a clean surface, and then run the
+    // followup task again. Only the second run's trace contributes to bench
+    // metrics; the first run is setup.
+    let mut auto_accepted: u32 = 0;
+    if mode == BenchMode::BrainOnAutoWarm {
+        let _seed = run_pipeline_phase(&repo, task, mode, model_config)?;
+        auto_accepted = auto_accept_pending_proposals(&repo)?;
+        // Reset source files so the followup phase has a fresh surface.
+        write_fixture_repo(&repo, task)?;
+        project::ingest_repo(&repo)?;
+    }
+
     let measured_capsules = if mode == BenchMode::BrainOff {
         Vec::new()
     } else {
         project::retrieve_context(&repo, "patch_plan", task.followup_task, 420)?.capsules
     };
+    let pipeline_result = run_pipeline_phase(&repo, task, mode, model_config)?;
+    let metrics = dry_run_metrics(output_dir, task, mode, &pipeline_result.trace_path)?;
+    let mut result = evaluate_capsules(task, mode, measured_capsules, Some(metrics));
+    if mode == BenchMode::BrainOnAutoWarm {
+        // Surface how many proposals the seed phase yielded, so the operator
+        // can tell whether a flat warm-vs-cold delta is the model's fault or
+        // because no proposals survived auto-accept.
+        result.accepted_memories_used = result.accepted_memories_used.max(auto_accepted);
+    }
+    Ok(result)
+}
+
+/// Run a single pipeline phase. On a hard error the trace was still finalized
+/// by `run_coding`, so we recover the most recent run directory and let the
+/// metric layer parse what it can.
+fn run_pipeline_phase(
+    repo: &Path,
+    task: &BenchTask,
+    mode: BenchMode,
+    model_config: Option<&ModelBenchConfig>,
+) -> KimetsuResult<crate::pipeline::CodingRunResult> {
     let pipeline_result = run_coding_dry_run(CodingRunOptions {
-        repo: repo.clone(),
+        repo: repo.to_path_buf(),
         task: task.followup_task.to_string(),
         dry_run: task.dry_run,
         allow_high_risk: true,
@@ -326,12 +372,9 @@ fn run_task_mode(
         disable_broker: mode == BenchMode::BrainOff,
         model_key_override: model_config.map(|model| model.model_key.clone()),
     });
-    let pipeline_result = match pipeline_result {
-        Ok(result) => result,
+    match pipeline_result {
+        Ok(result) => Ok(result),
         Err(err) => {
-            // Even when run_coding errored (e.g. verification gate failed), the
-            // trace was already finalized by the pipeline. Try to surface the
-            // metrics anyway by walking the most recent run directory.
             let kimetsu_dir = repo.join(".kimetsu");
             let runs_dir = kimetsu_dir.join("runs");
             let last_run = fs::read_dir(&runs_dir)
@@ -341,9 +384,7 @@ fn run_task_mode(
                         .filter_map(Result::ok)
                         .map(|entry| entry.path())
                         .filter(|path| path.is_dir())
-                        .max_by_key(|path| {
-                            path.metadata().and_then(|m| m.modified()).ok()
-                        })
+                        .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
                 });
             let Some(run_dir) = last_run else {
                 return Err(err);
@@ -352,22 +393,61 @@ fn run_task_mode(
             if !trace_path.exists() {
                 return Err(err);
             }
-            crate::pipeline::CodingRunResult {
+            Ok(crate::pipeline::CodingRunResult {
                 run_id: kimetsu_core::ids::RunId::new(),
                 dry_run: task.dry_run,
                 patch_plan_id: String::new(),
                 final_report_path: run_dir.join("final_report.md"),
                 trace_path,
-            }
+            })
         }
-    };
-    let metrics = dry_run_metrics(output_dir, task, mode, &pipeline_result.trace_path)?;
-    Ok(evaluate_capsules(
-        task,
-        mode,
-        measured_capsules,
-        Some(metrics),
-    ))
+    }
+}
+
+/// Apply the MEMORY-PROPOSALS.md auto-accept heuristics to whatever pending
+/// proposals are sitting in the project's brain.db, accepting those that pass
+/// and ignoring the rest. Returns the number accepted.
+fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<u32> {
+    let pending = project::list_proposals(
+        repo,
+        project::ProposalFilter {
+            status: Some("pending".into()),
+            limit: 100,
+            ..project::ProposalFilter::default()
+        },
+    )?;
+    let mut accepted: u32 = 0;
+    for proposal in pending {
+        if !auto_accept_policy_allows(&proposal) {
+            continue;
+        }
+        match project::accept_proposal(
+            repo,
+            &proposal.proposal_id,
+            project::AcceptOverrides::default(),
+        ) {
+            Ok(_) => accepted = accepted.saturating_add(1),
+            Err(_) => continue,
+        }
+    }
+    Ok(accepted)
+}
+
+/// Auto-accept policy from MEMORY-PROPOSALS.md. failure_pattern always
+/// requires a human; preference auto-accepts only at global_user/>=0.8;
+/// convention auto-accepts at repo or project/>=0.7.
+pub(crate) fn auto_accept_policy_allows(proposal: &project::ProposalRow) -> bool {
+    let kind = proposal.kind.to_lowercase();
+    let scope = proposal.scope.to_lowercase();
+    let conf = proposal.proposed_confidence;
+    if proposal.text.trim().is_empty() {
+        return false;
+    }
+    match (kind.as_str(), scope.as_str()) {
+        ("preference", "global_user") => conf >= 0.8,
+        ("convention", "repo") | ("convention", "project") => conf >= 0.7,
+        _ => false,
+    }
 }
 
 fn load_model_bench_config(options: &BenchOptions) -> KimetsuResult<ModelBenchConfig> {
@@ -851,13 +931,13 @@ fn write_fixture_repo(repo: &Path, task: &BenchTask) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// Per-task per-mode metrics rolled up for the warm-vs-off comparison.
+/// Per-task per-mode metrics rolled up for warm-vs-off comparisons.
 struct PairedMetric<'a> {
     off: &'a BenchTaskResult,
-    warm: &'a BenchTaskResult,
+    other: &'a BenchTaskResult,
 }
 
-fn pair_warm_against_off<'a>(report: &'a BenchReport) -> Vec<PairedMetric<'a>> {
+fn pair_mode_against_off<'a>(report: &'a BenchReport, other_mode: &str) -> Vec<PairedMetric<'a>> {
     let mut by_task: BTreeMap<&str, BTreeMap<&str, &BenchTaskResult>> = BTreeMap::new();
     for result in &report.results {
         by_task
@@ -867,48 +947,61 @@ fn pair_warm_against_off<'a>(report: &'a BenchReport) -> Vec<PairedMetric<'a>> {
     }
     let mut out = Vec::new();
     for (_, modes) in by_task {
-        if let (Some(off), Some(warm)) = (modes.get("brain_off"), modes.get("brain_on_warm")) {
-            out.push(PairedMetric { off, warm });
+        if let (Some(off), Some(other)) = (modes.get("brain_off"), modes.get(other_mode)) {
+            out.push(PairedMetric { off, other });
         }
     }
     out
 }
 
 fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
-    let pairs = pair_warm_against_off(report);
-    if pairs.is_empty() {
+    let warm_pairs = pair_mode_against_off(report, "brain_on_warm");
+    let auto_pairs = pair_mode_against_off(report, "brain_on_auto_warm");
+    if warm_pairs.is_empty() && auto_pairs.is_empty() {
         return String::new();
     }
 
-    // Headline metric inputs.
-    let mut warm_successes = 0u32;
+    let mut out = String::new();
+    out.push_str("## Falsifiable Claim — warm vs off\n\n");
+    out.push_str("MVP.md threshold: a warm mode beats off on **at least one** of\n");
+    out.push_str("- ≥20% fewer total tool calls\n");
+    out.push_str("- ≥15 pp success-rate uplift\n");
+    out.push_str("- strictly fewer verification retries\n\n");
+    out.push_str(
+        "`brain_on_warm` is hand-curated; `brain_on_auto_warm` carries only memories the agent itself proposed and survived auto-accept. The auto-warm row is the un-cooked test of the brain's value.\n\n",
+    );
+
+    if !warm_pairs.is_empty() {
+        out.push_str(&render_paired_block("brain_on_warm", &warm_pairs));
+    }
+    if !auto_pairs.is_empty() {
+        out.push_str(&render_paired_block("brain_on_auto_warm", &auto_pairs));
+    }
+    out
+}
+
+fn render_paired_block(mode_label: &str, pairs: &[PairedMetric<'_>]) -> String {
+    let mut other_successes = 0u32;
     let mut off_successes = 0u32;
-    let mut warm_tool_calls_sum = 0u64;
-    let mut off_tool_calls_sum = 0u64;
-    let mut warm_retries_sum = 0u64;
-    let mut off_retries_sum = 0u64;
+    let mut other_tool_calls = 0u64;
+    let mut off_tool_calls = 0u64;
+    let mut other_retries = 0u64;
+    let mut off_retries = 0u64;
     let mut paired_real_fix = 0u32;
 
-    for PairedMetric { off, warm, .. } in &pairs {
+    for PairedMetric { off, other } in pairs {
         if off.success {
             off_successes += 1;
         }
-        if warm.success {
-            warm_successes += 1;
+        if other.success {
+            other_successes += 1;
         }
-        let off_metrics = off.dry_run.as_ref();
-        let warm_metrics = warm.dry_run.as_ref();
-        if let (Some(off_m), Some(warm_m)) = (off_metrics, warm_metrics) {
-            warm_tool_calls_sum += warm_m.tool_calls as u64;
-            off_tool_calls_sum += off_m.tool_calls as u64;
-            // Treat verification_attempts as the proxy for retries.
-            let off_retries = off_m.verification_attempts.saturating_sub(1);
-            let warm_retries = warm_m.verification_attempts.saturating_sub(1);
-            warm_retries_sum += warm_retries as u64;
-            off_retries_sum += off_retries as u64;
-            // A "real-fix paired task" is one whose Verification stage
-            // actually executed in at least one mode.
-            if off_m.verification_attempts > 0 || warm_m.verification_attempts > 0 {
+        if let (Some(off_m), Some(other_m)) = (off.dry_run.as_ref(), other.dry_run.as_ref()) {
+            off_tool_calls += off_m.tool_calls as u64;
+            other_tool_calls += other_m.tool_calls as u64;
+            off_retries += off_m.verification_attempts.saturating_sub(1) as u64;
+            other_retries += other_m.verification_attempts.saturating_sub(1) as u64;
+            if off_m.verification_attempts > 0 || other_m.verification_attempts > 0 {
                 paired_real_fix += 1;
             }
         }
@@ -916,65 +1009,57 @@ fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
 
     let total = pairs.len() as u32;
     let success_rate_off = ratio(off_successes as usize, total as usize);
-    let success_rate_warm = ratio(warm_successes as usize, total as usize);
-    let success_uplift_pp = (success_rate_warm - success_rate_off) * 100.0;
-    let tool_calls_ratio = if off_tool_calls_sum == 0 {
+    let success_rate_other = ratio(other_successes as usize, total as usize);
+    let success_uplift_pp = (success_rate_other - success_rate_off) * 100.0;
+    let tool_calls_ratio = if off_tool_calls == 0 {
         f32::NAN
     } else {
-        warm_tool_calls_sum as f32 / off_tool_calls_sum as f32
+        other_tool_calls as f32 / off_tool_calls as f32
     };
     let tool_calls_pct_drop = if tool_calls_ratio.is_nan() {
         f32::NAN
     } else {
         (1.0 - tool_calls_ratio) * 100.0
     };
-    let retries_delta = off_retries_sum as i64 - warm_retries_sum as i64;
+    let retries_delta = off_retries as i64 - other_retries as i64;
 
-    // Threshold checks per MVP.md: ≥20% fewer tool calls, ≥15 pp success uplift,
-    // or strictly fewer verification retries.
     let tool_call_pass = !tool_calls_pct_drop.is_nan() && tool_calls_pct_drop >= 20.0;
     let success_pass = success_uplift_pp >= 15.0;
     let retries_pass = retries_delta > 0;
     let any_pass = tool_call_pass || success_pass || retries_pass;
 
     let mut out = String::new();
-    out.push_str("## Falsifiable Claim — warm vs off\n\n");
-    out.push_str("MVP.md threshold: warm beats off on **at least one** of\n");
-    out.push_str("- ≥20% fewer total tool calls\n");
-    out.push_str("- ≥15 pp success-rate uplift\n");
-    out.push_str("- strictly fewer verification retries\n\n");
+    out.push_str(&format!("### {mode_label} vs brain_off\n\n"));
     out.push_str(&format!(
         "Paired tasks: {total} (real-fix subset where Verification ran: {paired_real_fix}).\n\n"
     ));
-    out.push_str(
-        "| metric | brain_off | brain_on_warm | delta | threshold | pass |\n\
-         | --- | ---: | ---: | ---: | --- | :---: |\n",
-    );
+    out.push_str(&format!(
+        "| metric | brain_off | {mode_label} | delta | threshold | pass |\n\
+         | --- | ---: | ---: | ---: | --- | :---: |\n"
+    ));
     out.push_str(&format!(
         "| success rate | {:.0}% | {:.0}% | {:+.0} pp | ≥15 pp | {} |\n",
         success_rate_off * 100.0,
-        success_rate_warm * 100.0,
+        success_rate_other * 100.0,
         success_uplift_pp,
         if success_pass { "✓" } else { "✗" },
     ));
-    let tool_off_str = format!("{off_tool_calls_sum}");
-    let tool_warm_str = format!("{warm_tool_calls_sum}");
     let tool_delta_str = if tool_calls_pct_drop.is_nan() {
         "n/a".to_string()
     } else {
         format!("{:+.0}%", -tool_calls_pct_drop)
     };
     out.push_str(&format!(
-        "| total tool calls | {tool_off_str} | {tool_warm_str} | {tool_delta_str} | -20% or better | {} |\n",
+        "| total tool calls | {off_tool_calls} | {other_tool_calls} | {tool_delta_str} | -20% or better | {} |\n",
         if tool_call_pass { "✓" } else { "✗" },
     ));
     out.push_str(&format!(
-        "| verification retries | {off_retries_sum} | {warm_retries_sum} | {:+} | strictly fewer | {} |\n\n",
+        "| verification retries | {off_retries} | {other_retries} | {:+} | strictly fewer | {} |\n\n",
         -retries_delta,
         if retries_pass { "✓" } else { "✗" },
     ));
     out.push_str(&format!(
-        "**Falsifiable claim {}**: at least one threshold {}.\n\n",
+        "**{mode_label}: claim {}**: at least one threshold {}.\n\n",
         if any_pass { "passes" } else { "fails" },
         if any_pass { "cleared" } else { "NOT cleared" },
     ));
@@ -1547,5 +1632,82 @@ mod tests {
         );
 
         fs::remove_dir_all(repo).expect("cleanup");
+    }
+
+    #[test]
+    fn auto_accept_policy_matches_documented_thresholds() {
+        // preference / global_user accepts at >= 0.8
+        let strong_pref = project::ProposalRow {
+            proposal_id: "p1".into(),
+            run_id: "r".into(),
+            scope: "global_user".into(),
+            kind: "preference".into(),
+            text: "Prefer rg over grep.".into(),
+            rationale: String::new(),
+            proposed_confidence: 0.85,
+            status: "pending".into(),
+            decided_reason: None,
+        };
+        assert!(auto_accept_policy_allows(&strong_pref));
+
+        let weak_pref = project::ProposalRow {
+            proposed_confidence: 0.6,
+            ..strong_pref.clone()
+        };
+        assert!(!auto_accept_policy_allows(&weak_pref));
+
+        // preference at non-global_user scope: never auto-accept
+        let scoped_pref = project::ProposalRow {
+            scope: "repo".into(),
+            ..strong_pref.clone()
+        };
+        assert!(!auto_accept_policy_allows(&scoped_pref));
+
+        // convention at repo or project scope >= 0.7 accepts
+        let repo_conv = project::ProposalRow {
+            proposal_id: "p2".into(),
+            run_id: "r".into(),
+            scope: "repo".into(),
+            kind: "convention".into(),
+            text: "Use find_* for fallible lookups.".into(),
+            rationale: String::new(),
+            proposed_confidence: 0.7,
+            status: "pending".into(),
+            decided_reason: None,
+        };
+        assert!(auto_accept_policy_allows(&repo_conv));
+
+        let project_conv = project::ProposalRow {
+            scope: "project".into(),
+            ..repo_conv.clone()
+        };
+        assert!(auto_accept_policy_allows(&project_conv));
+
+        let weak_conv = project::ProposalRow {
+            proposed_confidence: 0.69,
+            ..repo_conv.clone()
+        };
+        assert!(!auto_accept_policy_allows(&weak_conv));
+
+        // failure_pattern is always rejected for auto-accept
+        let failure = project::ProposalRow {
+            proposal_id: "p3".into(),
+            run_id: "r".into(),
+            scope: "repo".into(),
+            kind: "failure_pattern".into(),
+            text: "Same fingerprint twice means restart implementation.".into(),
+            rationale: String::new(),
+            proposed_confidence: 0.99,
+            status: "pending".into(),
+            decided_reason: None,
+        };
+        assert!(!auto_accept_policy_allows(&failure));
+
+        // Empty text is never accepted regardless of category.
+        let empty = project::ProposalRow {
+            text: "   ".into(),
+            ..strong_pref
+        };
+        assert!(!auto_accept_policy_allows(&empty));
     }
 }
