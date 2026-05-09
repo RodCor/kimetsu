@@ -17,22 +17,10 @@ use crate::model::{
 
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeProvider {
-    auth: ClaudeCodeAuth,
+    api_key: String,
     model: String,
     timeout: Duration,
     max_budget_usd: f32,
-}
-
-#[derive(Debug, Clone)]
-struct ClaudeCodeAuth {
-    kind: ClaudeCodeAuthKind,
-    secret: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeCodeAuthKind {
-    OAuth,
-    AnthropicApiKey,
 }
 
 impl ClaudeCodeProvider {
@@ -58,10 +46,7 @@ impl ClaudeCodeProvider {
         };
 
         Ok(Some(Self {
-            auth: ClaudeCodeAuth {
-                kind: auth_kind_for_env(&config.model.api_key_env),
-                secret,
-            },
+            api_key: secret,
             model: config.model.model.clone(),
             timeout: Duration::from_secs(config.model.request_timeout_secs),
             max_budget_usd: config.run.max_total_cost_usd,
@@ -92,9 +77,12 @@ impl ModelProvider for ClaudeCodeProvider {
             .current_dir(work_dir.path())
             .env("CLAUDE_CONFIG_DIR", &config_dir)
             .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
+            .env("ANTHROPIC_API_KEY", &self.api_key)
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
             .arg("-p")
             .arg(&prompt)
+            .arg("--bare")
             .arg("--output-format")
             .arg("json")
             .arg("--model")
@@ -109,24 +97,10 @@ impl ModelProvider for ClaudeCodeProvider {
             .arg("--system-prompt")
             .arg(&system_prompt);
 
-        match self.auth.kind {
-            ClaudeCodeAuthKind::OAuth => {
-                command
-                    .env("CLAUDE_CODE_OAUTH_TOKEN", &self.auth.secret)
-                    .env_remove("ANTHROPIC_API_KEY");
-            }
-            ClaudeCodeAuthKind::AnthropicApiKey => {
-                command
-                    .env("ANTHROPIC_API_KEY", &self.auth.secret)
-                    .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-                    .arg("--bare");
-            }
-        }
-
         let output = run_with_timeout(command, self.timeout).map_err(|err| {
             redact_token(
                 &format!("claude_code provider failed: {err}"),
-                &self.auth.secret,
+                &self.api_key,
             )
         })?;
         if !output.status.success() {
@@ -140,20 +114,12 @@ impl ModelProvider for ClaudeCodeProvider {
                         .unwrap_or_else(|| "signal".to_string()),
                     output_summary(&output)
                 ),
-                &self.auth.secret,
+                &self.api_key,
             )
             .into());
         }
 
         parse_claude_code_output(&output.stdout)
-    }
-}
-
-fn auth_kind_for_env(env_name: &str) -> ClaudeCodeAuthKind {
-    if env_name == "ANTHROPIC_API_KEY" {
-        ClaudeCodeAuthKind::AnthropicApiKey
-    } else {
-        ClaudeCodeAuthKind::OAuth
     }
 }
 
@@ -391,10 +357,7 @@ mod tests {
     #[test]
     fn rejects_tool_config() {
         let mut provider = ClaudeCodeProvider {
-            auth: ClaudeCodeAuth {
-                kind: ClaudeCodeAuthKind::OAuth,
-                secret: "secret".to_string(),
-            },
+            api_key: "secret".to_string(),
             model: "claude-opus-4-7".to_string(),
             timeout: Duration::from_secs(1),
             max_budget_usd: 1.0,
@@ -416,17 +379,5 @@ mod tests {
             .complete(request)
             .expect_err("tool config should be rejected");
         assert!(err.to_string().contains("text-only"));
-    }
-
-    #[test]
-    fn anthropic_api_key_env_uses_bare_auth_kind() {
-        assert_eq!(
-            auth_kind_for_env("ANTHROPIC_API_KEY"),
-            ClaudeCodeAuthKind::AnthropicApiKey
-        );
-        assert_eq!(
-            auth_kind_for_env("CLAUDE_CODE_OAUTH_TOKEN"),
-            ClaudeCodeAuthKind::OAuth
-        );
     }
 }

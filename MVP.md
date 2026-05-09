@@ -488,15 +488,10 @@ Provider values in v0.1:
 
 ```text
 anthropic    Direct Claude API calls. Uses api_key_env as x-api-key.
-claude_code  Claude Code CLI bridge. Uses api_key_env as CLAUDE_CODE_OAUTH_TOKEN-style OAuth.
+claude_code  Claude Code CLI bridge. Reads api_key_env, passes it as ANTHROPIC_API_KEY in bare mode.
 ```
 
-`claude_code` is intentionally PatchPlan-only in v0.1. It runs `claude -p` in an isolated temporary working directory with Claude Code tools disabled and session persistence off. Full implementation remains gated to the direct `anthropic` provider until Kimetsu can wrap Claude Code edits behind the PatchPlan diff gate.
-
-When `provider = "claude_code"` and `api_key_env = "ANTHROPIC_API_KEY"`,
-Kimetsu runs Claude Code with `--bare` and passes the key as
-`ANTHROPIC_API_KEY`. OAuth-backed Claude Code tokens use the non-bare path
-because Claude Code bare mode does not read OAuth or keychain credentials.
+`claude_code` is intentionally PatchPlan-only in v0.1. It runs `claude -p --bare` in an isolated temporary working directory with Claude Code tools disabled and session persistence off. The configured secret is mapped into the child process as `ANTHROPIC_API_KEY`, even when the source variable is named `CLAUDE_CODE_OAUTH_TOKEN`. Full implementation remains gated to the direct `anthropic` provider until Kimetsu can wrap Claude Code edits behind the PatchPlan diff gate.
 
 Multi-repo project membership in v0.1 is by convention only: set the same `project_id` in each repo's `project.toml`. Cross-repo project memory sync is deferred.
 
