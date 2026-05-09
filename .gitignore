@@ -1,0 +1,7 @@
+/target/
+/.kimetsu/
+.env
+.env.*
+!.env.example
+*.log
+**/*.rs.bk

@@ -1,0 +1,18 @@
+[package]
+name = "kimetsu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "kimetsu"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kimetsu-agent = { path = "../kimetsu-agent" }
+kimetsu-brain = { path = "../kimetsu-brain" }
+kimetsu-core = { path = "../kimetsu-core" }
+tracing.workspace = true
+tracing-subscriber.workspace = true

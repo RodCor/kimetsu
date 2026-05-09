@@ -1,0 +1,1093 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use kimetsu_brain::context::{self, ContextBundle, ContextCapsule, ContextRequest};
+use kimetsu_brain::ingest;
+use kimetsu_brain::lock::ProjectLock;
+use kimetsu_brain::project;
+use kimetsu_brain::projector;
+use kimetsu_brain::trace::{RunPaths, TraceWriter};
+use kimetsu_core::KimetsuResult;
+use kimetsu_core::config::ProjectConfig;
+use kimetsu_core::event::Event;
+use kimetsu_core::ids::{RunId, new_id};
+use kimetsu_core::paths::ProjectPaths;
+use serde::{Deserialize, Serialize};
+
+use crate::agent_loop::parse_structured_json;
+use crate::anthropic::AnthropicProvider;
+use crate::model::{
+    MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
+    ToolChoice,
+};
+use crate::tools::CommandSpec;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingStage {
+    Intake,
+    RepoScan,
+    ContextRetrieval,
+    Localization,
+    PatchPlan,
+    Implementation,
+    Verification,
+    Review,
+    MemoryProposal,
+    FinalReport,
+}
+
+impl CodingStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intake => "intake",
+            Self::RepoScan => "repo_scan",
+            Self::ContextRetrieval => "context_retrieval",
+            Self::Localization => "localization",
+            Self::PatchPlan => "patch_plan",
+            Self::Implementation => "implementation",
+            Self::Verification => "verification",
+            Self::Review => "review",
+            Self::MemoryProposal => "memory_proposal",
+            Self::FinalReport => "final_report",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodingRunOptions {
+    pub repo: PathBuf,
+    pub task: String,
+    pub dry_run: bool,
+    pub allow_high_risk: bool,
+    pub disable_model: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodingRunResult {
+    pub run_id: RunId,
+    pub dry_run: bool,
+    pub patch_plan_id: String,
+    pub final_report_path: PathBuf,
+    pub trace_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchPlan {
+    pub patch_plan_id: String,
+    pub run_id: String,
+    pub revision_of: Option<String>,
+    pub rationale: String,
+    pub files_to_read: Vec<String>,
+    pub files_to_modify: Vec<String>,
+    pub files_to_create: Vec<String>,
+    pub files_to_delete: Vec<String>,
+    pub verification_commands: Vec<CommandSpec>,
+    pub expected_outcome: String,
+    pub risk_level: RiskLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PatchPlanDraft {
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    files_to_read: Vec<String>,
+    #[serde(default)]
+    files_to_modify: Vec<String>,
+    #[serde(default)]
+    files_to_create: Vec<String>,
+    #[serde(default)]
+    files_to_delete: Vec<String>,
+    #[serde(default)]
+    verification_commands: Vec<CommandSpec>,
+    #[serde(default)]
+    expected_outcome: String,
+    #[serde(default)]
+    risk_level: serde_json::Value,
+}
+
+pub fn run_coding_dry_run(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
+    if !options.dry_run {
+        return Err("full coding implementation is not wired yet; rerun with --dry-run".into());
+    }
+
+    let (paths, config, conn) = project::load_project(&options.repo)?;
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "run coding", Some(run_id))?;
+    let (mut writer, run_paths) = TraceWriter::create(&paths, run_id)?;
+    let mut events = Vec::new();
+
+    emit(
+        &mut writer,
+        &mut events,
+        Event::new(
+            run_id,
+            "run.started",
+            serde_json::json!({
+                "mode": "coding",
+                "task": options.task,
+                "project_id": config.kimetsu.project_id,
+                "repo_root": paths.repo_root.to_string_lossy(),
+                "model": format!("{}/{}", config.model.provider, config.model.model),
+                "platform": std::env::consts::OS,
+                "kimetsu_version": env!("CARGO_PKG_VERSION"),
+                "config_hash": config_hash(&paths.project_toml)?,
+                "dry_run": true,
+            }),
+        ),
+    )?;
+
+    stage_entered(&mut writer, &mut events, run_id, CodingStage::Intake)?;
+    stage_completed(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::Intake,
+        serde_json::json!({
+            "summary": "Task accepted for dry-run patch planning.",
+            "task": options.task,
+            "allow_high_risk": options.allow_high_risk,
+        }),
+    )?;
+
+    stage_entered(&mut writer, &mut events, run_id, CodingStage::RepoScan)?;
+    let ingest_summary = ingest::ingest_repo(&conn, &paths, &config)?;
+    emit(
+        &mut writer,
+        &mut events,
+        Event::new(
+            run_id,
+            "repo.ingested",
+            serde_json::json!({
+                "repo_root": ingest_summary.repo_root.to_string_lossy(),
+                "indexed_files": ingest_summary.indexed_files,
+                "skipped_files": ingest_summary.skipped_files,
+                "manifests": ingest_summary.manifests,
+            }),
+        ),
+    )?;
+    stage_completed(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::RepoScan,
+        serde_json::json!({
+            "summary": "Repo index refreshed.",
+            "indexed_files": ingest_summary.indexed_files,
+            "skipped_files": ingest_summary.skipped_files,
+            "manifests": ingest_summary.manifests,
+        }),
+    )?;
+
+    stage_entered(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::ContextRetrieval,
+    )?;
+    let repo_root = paths
+        .repo_root
+        .canonicalize()?
+        .to_string_lossy()
+        .to_string();
+    let localization_context = context::retrieve_context(
+        &conn,
+        &repo_root,
+        &config.broker.weights,
+        ContextRequest {
+            stage: CodingStage::Localization.as_str().to_string(),
+            query: options.task.clone(),
+            budget_tokens: config.broker.default_budget_tokens,
+        },
+    )?;
+    let patch_context = context::retrieve_context(
+        &conn,
+        &repo_root,
+        &config.broker.weights,
+        ContextRequest {
+            stage: CodingStage::PatchPlan.as_str().to_string(),
+            query: options.task.clone(),
+            budget_tokens: config.broker.default_budget_tokens,
+        },
+    )?;
+    stage_completed(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::ContextRetrieval,
+        serde_json::json!({
+            "summary": "Context capsules retrieved.",
+            "localization_capsules": localization_context.capsules.len(),
+            "patch_plan_capsules": patch_context.capsules.len(),
+        }),
+    )?;
+
+    stage_entered(&mut writer, &mut events, run_id, CodingStage::Localization)?;
+    let files_to_read = likely_files(&localization_context, 5);
+    stage_completed(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::Localization,
+        serde_json::json!({
+            "summary": "Likely files selected from context capsules.",
+            "files_to_read": files_to_read,
+        }),
+    )?;
+
+    stage_entered(&mut writer, &mut events, run_id, CodingStage::PatchPlan)?;
+    let model_patch_plan = if options.disable_model {
+        emit(
+            &mut writer,
+            &mut events,
+            Event::new(
+                run_id,
+                "model.skipped",
+                serde_json::json!({
+                    "stage": CodingStage::PatchPlan.as_str(),
+                    "provider": config.model.provider,
+                    "model": config.model.model,
+                    "reason": "disabled_by_options",
+                    "api_key_env": config.model.api_key_env,
+                }),
+            ),
+        )?;
+        Ok(None)
+    } else {
+        try_model_patch_plan(
+            &mut writer,
+            &mut events,
+            &run_paths,
+            &paths,
+            &config,
+            run_id,
+            &options.task,
+            &files_to_read,
+            &patch_context,
+        )
+    };
+    let patch_plan = match model_patch_plan {
+        Ok(Some(patch_plan)) => patch_plan,
+        Ok(None) => build_dry_run_patch_plan(
+            &paths,
+            run_id,
+            &options.task,
+            &files_to_read,
+            &patch_context,
+        ),
+        Err(err) => {
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "run.failed",
+                    serde_json::json!({
+                        "category": "Model",
+                        "message": err.to_string(),
+                        "failed_stage": CodingStage::PatchPlan.as_str(),
+                    }),
+                ),
+            )?;
+            projector::apply_events(&conn, &events)?;
+            return Err(err);
+        }
+    };
+    if matches!(patch_plan.risk_level, RiskLevel::High) && !options.allow_high_risk {
+        emit(
+            &mut writer,
+            &mut events,
+            Event::new(
+                run_id,
+                "gate.failed",
+                serde_json::json!({
+                    "kind": "high_risk",
+                    "message": "PatchPlan is high risk and --allow-high-risk was not set.",
+                }),
+            ),
+        )?;
+        emit(
+            &mut writer,
+            &mut events,
+            Event::new(
+                run_id,
+                "run.failed",
+                serde_json::json!({
+                    "category": "Gate",
+                    "message": "high-risk PatchPlan blocked",
+                    "failed_stage": CodingStage::PatchPlan.as_str(),
+                }),
+            ),
+        )?;
+        projector::apply_events(&conn, &events)?;
+        return Err("high-risk PatchPlan blocked; rerun with --allow-high-risk".into());
+    }
+
+    let patch_plan_path = run_paths
+        .patch_plans_dir
+        .join(format!("{}.json", patch_plan.patch_plan_id));
+    fs::write(&patch_plan_path, serde_json::to_vec_pretty(&patch_plan)?)?;
+    let patch_plan_artifact = format!("patch_plans/{}.json", patch_plan.patch_plan_id);
+    emit(
+        &mut writer,
+        &mut events,
+        Event::new(
+            run_id,
+            "patch.plan.created",
+            serde_json::json!({
+                "patch_plan_id": patch_plan.patch_plan_id,
+                "artifact": patch_plan_artifact,
+            }),
+        ),
+    )?;
+    stage_completed(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::PatchPlan,
+        serde_json::json!({
+            "summary": "Dry-run PatchPlan generated.",
+            "patch_plan_id": patch_plan.patch_plan_id,
+            "files_to_modify": patch_plan.files_to_modify,
+            "verification_commands": patch_plan.verification_commands,
+            "risk_level": patch_plan.risk_level,
+        }),
+    )?;
+
+    stage_entered(&mut writer, &mut events, run_id, CodingStage::FinalReport)?;
+    let final_report =
+        render_dry_run_report(&options.task, run_id, &patch_plan, &run_paths.trace_jsonl);
+    fs::write(&run_paths.final_report, final_report)?;
+    stage_completed(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::FinalReport,
+        serde_json::json!({
+            "summary": "Dry-run final report written.",
+            "final_report_path": "final_report.md",
+        }),
+    )?;
+    emit(
+        &mut writer,
+        &mut events,
+        Event::new(
+            run_id,
+            "run.finished",
+            serde_json::json!({
+                "status": "success",
+                "final_report_path": "final_report.md",
+                "total_cost_usd": 0.0,
+                "total_tool_calls": 0,
+                "dry_run": true,
+            }),
+        ),
+    )?;
+
+    projector::apply_events(&conn, &events)?;
+
+    Ok(CodingRunResult {
+        run_id,
+        dry_run: true,
+        patch_plan_id: patch_plan.patch_plan_id,
+        final_report_path: run_paths.final_report,
+        trace_path: run_paths.trace_jsonl,
+    })
+}
+
+fn try_model_patch_plan(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_paths: &RunPaths,
+    paths: &ProjectPaths,
+    config: &ProjectConfig,
+    run_id: RunId,
+    task: &str,
+    files_to_read: &[String],
+    patch_context: &ContextBundle,
+) -> KimetsuResult<Option<PatchPlan>> {
+    if cfg!(test) {
+        return Ok(None);
+    }
+
+    let Some(mut provider) = AnthropicProvider::from_config(&paths.repo_root, config)? else {
+        emit(
+            writer,
+            events,
+            Event::new(
+                run_id,
+                "model.skipped",
+                serde_json::json!({
+                    "stage": CodingStage::PatchPlan.as_str(),
+                    "provider": config.model.provider,
+                    "model": config.model.model,
+                    "reason": "missing_api_key",
+                    "api_key_env": config.model.api_key_env,
+                }),
+            ),
+        )?;
+        return Ok(None);
+    };
+
+    let request = build_patch_plan_request(config, task, files_to_read, patch_context);
+    record_model_requested(
+        writer,
+        events,
+        run_paths,
+        run_id,
+        provider.model_name(),
+        &request,
+    )?;
+    let response = provider.complete(request)?;
+    record_model_responded(writer, events, run_paths, run_id, &response)?;
+
+    if !response.tool_calls.is_empty() {
+        return Err("PatchPlan model unexpectedly requested tools".into());
+    }
+
+    let text = response
+        .text
+        .as_deref()
+        .ok_or("PatchPlan model response did not include text")?;
+    let draft: PatchPlanDraft = parse_structured_json(text)?;
+    Ok(Some(patch_plan_from_draft(
+        paths,
+        run_id,
+        task,
+        files_to_read,
+        patch_context,
+        draft,
+    )))
+}
+
+fn build_patch_plan_request(
+    config: &ProjectConfig,
+    task: &str,
+    files_to_read: &[String],
+    patch_context: &ContextBundle,
+) -> ModelRequest {
+    let system = ModelMessage {
+        role: MessageRole::System,
+        content: vec![MessageContent::Text {
+            text: "You are the PatchPlan stage of Kimetsu, a conservative AI coding harness. Return only valid JSON and do not modify files.".to_string(),
+        }],
+    };
+    let user = ModelMessage::user_text(format!(
+        "Task:\n{task}\n\n\
+         Localization-selected files:\n{localized_files}\n\n\
+         Context capsules:\n{capsules}\n\n\
+         Return exactly one JSON object with this shape:\n\
+         {{\n\
+           \"rationale\": \"short reason for the plan\",\n\
+           \"files_to_read\": [\"repo/relative/path\"],\n\
+           \"files_to_modify\": [\"repo/relative/path\"],\n\
+           \"files_to_create\": [],\n\
+           \"files_to_delete\": [],\n\
+           \"verification_commands\": [{{\"program\":\"cargo\",\"args\":[\"test\"],\"cwd_relative\":\".\",\"timeout_secs\":null,\"expected_exit\":0}}],\n\
+           \"expected_outcome\": \"observable result\",\n\
+           \"risk_level\": \"low\"\n\
+         }}\n\n\
+         Rules:\n\
+         - Use only repo-relative paths. No absolute paths.\n\
+         - Prefer low-risk, minimal changes.\n\
+         - Include files_to_modify in files_to_read.\n\
+         - If uncertain, choose files_to_read and leave files_to_modify empty.\n\
+         - risk_level must be one of: low, medium, high.\n\
+         - Return JSON only, without Markdown fences.",
+        localized_files = render_localized_files(files_to_read),
+        capsules = render_context_capsules(patch_context, 12),
+    ));
+
+    ModelRequest {
+        messages: vec![system, user],
+        tools: Vec::new(),
+        tool_choice: ToolChoice::None,
+        max_output_tokens: config.model.max_output_tokens.min(4096),
+        temperature: config.model.temperature,
+        metadata: serde_json::json!({
+            "stage": CodingStage::PatchPlan.as_str(),
+            "purpose": "dry_run_patch_plan",
+        }),
+    }
+}
+
+fn record_model_requested(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_paths: &RunPaths,
+    run_id: RunId,
+    model: &str,
+    request: &ModelRequest,
+) -> KimetsuResult<()> {
+    let mut event = Event::new(
+        run_id,
+        "model.requested",
+        serde_json::json!({
+            "stage": CodingStage::PatchPlan.as_str(),
+            "provider": "anthropic",
+            "model": model,
+            "request_artifact": null,
+            "tool_names": request.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+            "estimated_input_tokens": estimate_request_tokens(request),
+        }),
+    );
+    let artifact = write_json_artifact(
+        run_paths,
+        &format!("{}.model_request.json", event.event_id),
+        request,
+    )?;
+    event.payload["request_artifact"] = serde_json::json!(artifact);
+    emit(writer, events, event)
+}
+
+fn record_model_responded(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_paths: &RunPaths,
+    run_id: RunId,
+    response: &ModelResponse,
+) -> KimetsuResult<()> {
+    let mut event = Event::new(
+        run_id,
+        "model.responded",
+        serde_json::json!({
+            "stage": CodingStage::PatchPlan.as_str(),
+            "response_artifact": null,
+            "stop_reason": response.stop_reason,
+            "usage": response.usage,
+        }),
+    );
+    let artifact = write_json_artifact(
+        run_paths,
+        &format!("{}.model_response.json", event.event_id),
+        response,
+    )?;
+    event.payload["response_artifact"] = serde_json::json!(artifact);
+    emit(writer, events, event)
+}
+
+fn write_json_artifact<T: Serialize>(
+    run_paths: &RunPaths,
+    file_name: &str,
+    value: &T,
+) -> KimetsuResult<String> {
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+        return Err("invalid artifact file name".into());
+    }
+    fs::create_dir_all(&run_paths.artifacts_dir)?;
+    fs::write(
+        run_paths.artifacts_dir.join(file_name),
+        serde_json::to_vec_pretty(value)?,
+    )?;
+    Ok(format!("artifacts/{file_name}"))
+}
+
+fn patch_plan_from_draft(
+    paths: &ProjectPaths,
+    run_id: RunId,
+    task: &str,
+    localized_files_to_read: &[String],
+    patch_context: &ContextBundle,
+    draft: PatchPlanDraft,
+) -> PatchPlan {
+    let fallback =
+        build_dry_run_patch_plan(paths, run_id, task, localized_files_to_read, patch_context);
+    let mut files_to_read = sanitize_paths(draft.files_to_read);
+    for path in localized_files_to_read {
+        if let Some(path) = sanitize_path(path) {
+            push_unique(&mut files_to_read, path);
+        }
+    }
+    if files_to_read.is_empty() {
+        files_to_read = fallback.files_to_read.clone();
+    }
+
+    let mut files_to_modify = sanitize_paths(draft.files_to_modify);
+    if files_to_modify.is_empty() {
+        files_to_modify = fallback.files_to_modify.clone();
+    }
+    let files_to_create = sanitize_paths(draft.files_to_create);
+    let files_to_delete = sanitize_paths(draft.files_to_delete);
+
+    for path in files_to_modify
+        .iter()
+        .chain(files_to_delete.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        push_unique(&mut files_to_read, path);
+    }
+
+    let verification_commands = {
+        let sanitized = sanitize_commands(draft.verification_commands);
+        if sanitized.is_empty() {
+            fallback.verification_commands
+        } else {
+            sanitized
+        }
+    };
+    let inferred_risk = infer_risk_level(&files_to_modify, &files_to_create, &files_to_delete);
+    let risk_level = parse_risk_level(&draft.risk_level)
+        .map(|risk| max_risk_level(risk, inferred_risk))
+        .unwrap_or(inferred_risk);
+
+    PatchPlan {
+        patch_plan_id: new_id().to_string(),
+        run_id: run_id.to_string(),
+        revision_of: None,
+        rationale: if draft.rationale.trim().is_empty() {
+            fallback.rationale
+        } else {
+            draft.rationale.trim().to_string()
+        },
+        files_to_read,
+        files_to_modify,
+        files_to_create,
+        files_to_delete,
+        verification_commands,
+        expected_outcome: if draft.expected_outcome.trim().is_empty() {
+            fallback.expected_outcome
+        } else {
+            draft.expected_outcome.trim().to_string()
+        },
+        risk_level,
+    }
+}
+
+fn emit(writer: &mut TraceWriter, events: &mut Vec<Event>, event: Event) -> KimetsuResult<()> {
+    writer.append(&event, true)?;
+    events.push(event);
+    Ok(())
+}
+
+fn stage_entered(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_id: RunId,
+    stage: CodingStage,
+) -> KimetsuResult<()> {
+    emit(
+        writer,
+        events,
+        Event::new(
+            run_id,
+            "stage.entered",
+            serde_json::json!({ "stage": stage.as_str() }),
+        ),
+    )
+}
+
+fn stage_completed(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_id: RunId,
+    stage: CodingStage,
+    mut payload: serde_json::Value,
+) -> KimetsuResult<()> {
+    payload["stage"] = serde_json::json!(stage.as_str());
+    emit(
+        writer,
+        events,
+        Event::new(run_id, "stage.completed", payload),
+    )
+}
+
+fn likely_files(context: &ContextBundle, max: usize) -> Vec<String> {
+    context
+        .capsules
+        .iter()
+        .filter_map(file_from_capsule)
+        .take(max)
+        .collect()
+}
+
+fn file_from_capsule(capsule: &ContextCapsule) -> Option<String> {
+    capsule
+        .expansion_handle
+        .strip_prefix("file:")
+        .map(str::to_string)
+}
+
+fn render_localized_files(files_to_read: &[String]) -> String {
+    if files_to_read.is_empty() {
+        return "None selected.".to_string();
+    }
+
+    files_to_read
+        .iter()
+        .map(|path| format!("- {path}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_context_capsules(context: &ContextBundle, max_capsules: usize) -> String {
+    if context.capsules.is_empty() {
+        return "None.".to_string();
+    }
+
+    context
+        .capsules
+        .iter()
+        .take(max_capsules)
+        .map(|capsule| {
+            format!(
+                "- id: {id}\n  kind: {kind}\n  score: {score:.3}\n  handle: {handle}\n  summary: {summary}",
+                id = capsule.id,
+                kind = capsule.kind,
+                score = capsule.score,
+                handle = capsule.expansion_handle,
+                summary = truncate_text(&capsule.summary, 700),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_dry_run_patch_plan(
+    paths: &ProjectPaths,
+    run_id: RunId,
+    task: &str,
+    files_to_read: &[String],
+    patch_context: &ContextBundle,
+) -> PatchPlan {
+    let mut files_to_modify = files_to_read
+        .iter()
+        .filter(|path| is_code_source(path))
+        .take(1)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if files_to_modify.is_empty() {
+        files_to_modify = patch_context
+            .capsules
+            .iter()
+            .filter_map(file_from_capsule)
+            .filter(|path| is_code_source(path))
+            .take(1)
+            .collect();
+    }
+
+    let risk_level = infer_risk_level(&files_to_modify, &[], &[]);
+    let mut files_to_read = files_to_read.to_vec();
+    for path in &files_to_modify {
+        if !files_to_read.contains(path) {
+            files_to_read.push(path.clone());
+        }
+    }
+
+    PatchPlan {
+        patch_plan_id: new_id().to_string(),
+        run_id: run_id.to_string(),
+        revision_of: None,
+        rationale: "Dry-run plan generated from retrieved context. Model-backed planning is the next phase.".to_string(),
+        files_to_read,
+        files_to_modify,
+        files_to_create: Vec::new(),
+        files_to_delete: Vec::new(),
+        verification_commands: detect_verification_commands(&paths.repo_root),
+        expected_outcome: format!("Address task: {task}"),
+        risk_level,
+    }
+}
+
+fn sanitize_paths(paths: Vec<String>) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    for path in paths {
+        if let Some(path) = sanitize_path(&path) {
+            push_unique(&mut sanitized, path);
+        }
+    }
+    sanitized
+}
+
+fn sanitize_path(path: &str) -> Option<String> {
+    let mut path = path
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .replace('\\', "/");
+    if let Some(stripped) = path.strip_prefix("file:") {
+        path = stripped.to_string();
+    }
+    while let Some(stripped) = path.strip_prefix("./") {
+        path = stripped.to_string();
+    }
+    if path.is_empty()
+        || path.contains('\0')
+        || path.contains(':')
+        || Path::new(&path).is_absolute()
+    {
+        return None;
+    }
+    if path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn sanitize_commands(commands: Vec<CommandSpec>) -> Vec<CommandSpec> {
+    commands
+        .into_iter()
+        .filter_map(|command| {
+            let program = command.program.trim();
+            if program.is_empty() || program.contains('\0') {
+                return None;
+            }
+            Some(CommandSpec {
+                program: program.to_string(),
+                args: command
+                    .args
+                    .into_iter()
+                    .filter_map(|arg| {
+                        let arg = arg.trim();
+                        if arg.is_empty() || arg.contains('\0') {
+                            None
+                        } else {
+                            Some(arg.to_string())
+                        }
+                    })
+                    .collect(),
+                cwd_relative: command
+                    .cwd_relative
+                    .and_then(|cwd| {
+                        if cwd.trim() == "." {
+                            Some(".".to_string())
+                        } else {
+                            sanitize_path(&cwd)
+                        }
+                    })
+                    .or_else(|| Some(".".to_string())),
+                timeout_secs: command.timeout_secs,
+                expected_exit: command.expected_exit.or(Some(0)),
+            })
+        })
+        .collect()
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn infer_risk_level(
+    files_to_modify: &[String],
+    files_to_create: &[String],
+    files_to_delete: &[String],
+) -> RiskLevel {
+    if !files_to_delete.is_empty()
+        || files_to_modify
+            .iter()
+            .chain(files_to_create.iter())
+            .any(|path| is_high_risk_path(path))
+    {
+        RiskLevel::High
+    } else if files_to_modify.len() + files_to_create.len() > 5 || !files_to_create.is_empty() {
+        RiskLevel::Medium
+    } else {
+        RiskLevel::Low
+    }
+}
+
+fn is_high_risk_path(path: &str) -> bool {
+    path.contains(".github/")
+        || path.ends_with("Cargo.toml")
+        || path.ends_with("Cargo.lock")
+        || path.ends_with("package.json")
+        || path.ends_with("package-lock.json")
+        || path.ends_with("go.mod")
+        || path.ends_with("go.sum")
+        || path.ends_with("pyproject.toml")
+        || path.ends_with("uv.lock")
+}
+
+fn parse_risk_level(value: &serde_json::Value) -> Option<RiskLevel> {
+    let value = value.as_str()?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "low" => Some(RiskLevel::Low),
+        "medium" => Some(RiskLevel::Medium),
+        "high" => Some(RiskLevel::High),
+        _ => None,
+    }
+}
+
+fn max_risk_level(left: RiskLevel, right: RiskLevel) -> RiskLevel {
+    if risk_rank(left) >= risk_rank(right) {
+        left
+    } else {
+        right
+    }
+}
+
+fn risk_rank(level: RiskLevel) -> u8 {
+    match level {
+        RiskLevel::Low => 0,
+        RiskLevel::Medium => 1,
+        RiskLevel::High => 2,
+    }
+}
+
+fn estimate_request_tokens(request: &ModelRequest) -> u32 {
+    let text = serde_json::to_string(request).unwrap_or_default();
+    ((text.split_whitespace().count() as f32) * 1.33).ceil() as u32
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn is_code_source(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next(),
+        Some("rs" | "js" | "ts" | "tsx" | "jsx" | "py" | "go")
+    )
+}
+
+fn detect_verification_commands(repo_root: &Path) -> Vec<CommandSpec> {
+    let mut commands = Vec::new();
+    if repo_root.join("Cargo.toml").exists() {
+        commands.push(command("cargo", ["test"]));
+    }
+    if repo_root.join("package.json").exists() {
+        commands.push(command("npm", ["test"]));
+    }
+    if repo_root.join("pyproject.toml").exists() {
+        commands.push(command("pytest", []));
+    }
+    if repo_root.join("go.mod").exists() {
+        commands.push(command("go", ["test", "./..."]));
+    }
+    commands
+}
+
+fn command<const N: usize>(program: &str, args: [&str; N]) -> CommandSpec {
+    CommandSpec {
+        program: program.to_string(),
+        args: args.into_iter().map(str::to_string).collect(),
+        cwd_relative: Some(".".to_string()),
+        timeout_secs: None,
+        expected_exit: Some(0),
+    }
+}
+
+fn render_dry_run_report(
+    task: &str,
+    run_id: RunId,
+    patch_plan: &PatchPlan,
+    trace_path: &Path,
+) -> String {
+    format!(
+        "# {task}\n\n\
+         ## Summary\n\
+         Dry-run completed through PatchPlan. No files were modified.\n\n\
+         ## Changed files\n\
+         None.\n\n\
+         ## Verification\n\
+         Not run in dry-run mode. Planned commands: {commands}\n\n\
+         ## Memory proposals\n\
+         None.\n\n\
+         ## Known risks\n\
+         Model-backed implementation and verification are not wired yet.\n\n\
+         ## Trace\n\
+         run_id: {run_id}\n\
+         trace path: {trace}\n\
+         patch_plan_id: {patch_plan_id}\n\n\
+         Generated by kimetsu {version}\n",
+        commands = serde_json::to_string(&patch_plan.verification_commands)
+            .unwrap_or_else(|_| "[]".to_string()),
+        trace = trace_path.display(),
+        patch_plan_id = patch_plan.patch_plan_id,
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn config_hash(path: &Path) -> KimetsuResult<String> {
+    Ok(blake3::hash(&fs::read(path)?).to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use kimetsu_brain::trace::read_trace;
+
+    use super::*;
+
+    #[test]
+    fn dry_run_pipeline_writes_trace_patch_plan_and_report() {
+        let root = std::env::temp_dir().join(format!("kimetsu-pipeline-test-{}", new_id()));
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub fn failing_area() -> bool { false }\n",
+        )
+        .expect("source");
+        project::init_project(&root, false).expect("init project");
+
+        let result = run_coding_dry_run(CodingRunOptions {
+            repo: root.clone(),
+            task: "Fix failing_area behavior".to_string(),
+            dry_run: true,
+            allow_high_risk: false,
+            disable_model: true,
+        })
+        .expect("dry run");
+
+        assert!(result.final_report_path.exists());
+        assert!(result.trace_path.exists());
+        let patch_plan_path = root
+            .join(".kimetsu")
+            .join("runs")
+            .join(result.run_id.to_string())
+            .join("patch_plans")
+            .join(format!("{}.json", result.patch_plan_id));
+        assert!(patch_plan_path.exists());
+        let patch_plan: PatchPlan =
+            serde_json::from_slice(&fs::read(patch_plan_path).expect("read patch plan"))
+                .expect("parse patch plan");
+        assert!(
+            patch_plan
+                .files_to_read
+                .iter()
+                .any(|path| path == "src/lib.rs")
+        );
+        assert!(
+            patch_plan
+                .verification_commands
+                .iter()
+                .any(|command| command.program == "cargo")
+        );
+
+        let events = read_trace(&result.trace_path).expect("read trace");
+        assert!(events.iter().any(|event| event.kind == "stage.entered"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "patch.plan.created")
+        );
+        assert!(events.iter().any(|event| event.kind == "run.finished"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
