@@ -755,6 +755,95 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         }
     }
 
+    let memory_proposal_summary: Option<MemoryProposalSummary> =
+        if !options.dry_run && implementation_outcome.is_some() && !options.disable_model {
+            stage_entered(&mut writer, &mut events, run_id, CodingStage::MemoryProposal)?;
+            let existing_memories = load_existing_memories_for_proposal(&conn).unwrap_or_default();
+            let proposed = match try_model_memory_proposals(
+                &mut writer,
+                &mut events,
+                &run_paths,
+                &paths,
+                &config,
+                options.model_key_override.as_deref(),
+                run_id,
+                &options.task,
+                &patch_plan,
+                verification_summary.as_ref(),
+                &existing_memories,
+            ) {
+                Ok(summary) => summary,
+                Err(err) => {
+                    emit(
+                        &mut writer,
+                        &mut events,
+                        Event::new(
+                            run_id,
+                            "memory_proposal.error",
+                            serde_json::json!({
+                                "stage": CodingStage::MemoryProposal.as_str(),
+                                "message": err.to_string(),
+                            }),
+                        ),
+                    )?;
+                    None
+                }
+            };
+
+            if let Some(summary) = proposed.as_ref() {
+                for proposal in &summary.accepted {
+                    emit(
+                        &mut writer,
+                        &mut events,
+                        Event::new(
+                            run_id,
+                            "memory.proposed",
+                            serde_json::json!({
+                                "proposal_id": proposal.proposal_id,
+                                "scope": proposal.scope,
+                                "kind": proposal.kind,
+                                "text": proposal.text,
+                                "rationale": proposal.rationale,
+                                "proposed_confidence": proposal.confidence,
+                                "source_event_ids": [],
+                            }),
+                        ),
+                    )?;
+                }
+            }
+
+            let stage_payload = match proposed.as_ref() {
+                Some(summary) => serde_json::json!({
+                    "summary": format!(
+                        "{} raw, {} accepted, {} filtered_identifier, {} filtered_dedup, {} filtered_invalid.",
+                        summary.raw_count,
+                        summary.accepted.len(),
+                        summary.filtered_identifier,
+                        summary.filtered_dedup,
+                        summary.filtered_invalid,
+                    ),
+                    "raw_count": summary.raw_count,
+                    "accepted": summary.accepted.len() as u32,
+                    "filtered_identifier": summary.filtered_identifier,
+                    "filtered_dedup": summary.filtered_dedup,
+                    "filtered_invalid": summary.filtered_invalid,
+                }),
+                None => serde_json::json!({
+                    "summary": "MemoryProposal skipped (no provider or skipped on disable_model).",
+                }),
+            };
+            stage_completed(
+                &mut writer,
+                &mut events,
+                run_id,
+                CodingStage::MemoryProposal,
+                stage_payload,
+            )?;
+            proposed
+        } else {
+            None
+        };
+
     stage_entered(&mut writer, &mut events, run_id, CodingStage::FinalReport)?;
     let final_report = render_coding_report(
         &options.task,
@@ -763,6 +852,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         &patch_plan,
         implementation_outcome.as_ref(),
         verification_summary.as_ref(),
+        memory_proposal_summary.as_ref(),
         &run_paths.trace_jsonl,
     );
     fs::write(&run_paths.final_report, final_report)?;
@@ -970,6 +1060,260 @@ fn build_patch_plan_request(
             "purpose": "dry_run_patch_plan",
         }),
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MemoryProposalEnvelope {
+    #[serde(default)]
+    proposals: Vec<RawMemoryProposal>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawMemoryProposal {
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AcceptedProposal {
+    pub proposal_id: String,
+    pub scope: String,
+    pub kind: String,
+    pub text: String,
+    pub rationale: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MemoryProposalSummary {
+    pub raw_count: u32,
+    pub accepted: Vec<AcceptedProposal>,
+    pub filtered_identifier: u32,
+    pub filtered_dedup: u32,
+    pub filtered_invalid: u32,
+}
+
+fn try_model_memory_proposals(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_paths: &RunPaths,
+    paths: &ProjectPaths,
+    config: &ProjectConfig,
+    model_key_override: Option<&str>,
+    run_id: RunId,
+    task: &str,
+    patch_plan: &PatchPlan,
+    verification_summary: Option<&serde_json::Value>,
+    existing_memories: &[ExistingMemorySnapshot],
+) -> KimetsuResult<Option<MemoryProposalSummary>> {
+    if cfg!(test) {
+        return Ok(None);
+    }
+
+    let Some(mut provider) = load_text_provider(&paths.repo_root, config, model_key_override)?
+    else {
+        emit(
+            writer,
+            events,
+            Event::new(
+                run_id,
+                "model.skipped",
+                serde_json::json!({
+                    "stage": CodingStage::MemoryProposal.as_str(),
+                    "provider": config.model.provider,
+                    "model": config.model.model,
+                    "reason": "missing_api_key",
+                    "api_key_env": config.model.api_key_env,
+                }),
+            ),
+        )?;
+        return Ok(None);
+    };
+
+    let request = build_memory_proposal_request(
+        config,
+        task,
+        patch_plan,
+        verification_summary,
+        existing_memories,
+    );
+    record_model_requested(
+        writer,
+        events,
+        run_paths,
+        run_id,
+        &provider.provider_name,
+        &provider.model_name,
+        &request,
+    )?;
+    let response = provider.complete(request)?;
+    record_model_responded(
+        writer,
+        events,
+        run_paths,
+        run_id,
+        &provider.provider_name,
+        &response,
+    )?;
+
+    let raw_text = response.text.as_deref().unwrap_or("");
+    let envelope: MemoryProposalEnvelope = match parse_structured_json(raw_text) {
+        Ok(env) => env,
+        Err(_) => MemoryProposalEnvelope::default(),
+    };
+
+    Ok(Some(filter_memory_proposals(
+        envelope.proposals,
+        run_id,
+        patch_plan,
+        existing_memories,
+    )))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingMemorySnapshot {
+    pub scope: String,
+    pub kind: String,
+    pub normalized_text: String,
+    pub text: String,
+}
+
+fn build_memory_proposal_request(
+    config: &ProjectConfig,
+    task: &str,
+    patch_plan: &PatchPlan,
+    verification_summary: Option<&serde_json::Value>,
+    existing_memories: &[ExistingMemorySnapshot],
+) -> ModelRequest {
+    let system = ModelMessage {
+        role: MessageRole::System,
+        content: vec![MessageContent::Text {
+            text: "You are the MemoryProposal stage of Kimetsu. Review this completed run and propose zero or more personal memories that would help on a similar future task. A personal memory must be transferable: it applies beyond this specific bug, file, or function.\n\nAcceptable categories:\n- preference (scope=global_user): a user preference for tools, languages, or style.\n- convention (scope=repo or project): a codebase convention (naming, layout, design rules).\n- failure_pattern (scope=repo): a recurring failure with a known mitigation.\n\nReject (do not propose):\n- Anything that names this specific bug, file path, or function name.\n- Trivially-derivable facts (\"the codebase uses Rust\", \"there is a Cargo.toml\").\n- Memories supported by only one observation in this run unless confidence <= 0.4.\n\nOutput exactly one JSON object on its own line. No prose, no markdown, no backticks:\n\n{\"proposals\":[{\"scope\":\"global_user|project|repo\",\"kind\":\"preference|convention|failure_pattern\",\"text\":\"<single sentence>\",\"rationale\":\"<one line>\",\"confidence\":0.0..1.0}]}\n\nEmit {\"proposals\":[]} if nothing transferable emerged.".to_string(),
+        }],
+    };
+    let memories_block = if existing_memories.is_empty() {
+        "(none)".to_string()
+    } else {
+        existing_memories
+            .iter()
+            .map(|m| format!("- [{}/{}] {}", m.scope, m.kind, m.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let verification_block = verification_summary
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "(no verification ran)".to_string());
+    let user = ModelMessage::user_text(format!(
+        "Task:\n{task}\n\n\
+         PatchPlan rationale: {rationale}\n\
+         Expected outcome: {expected}\n\
+         risk_level: {risk}\n\n\
+         Verification summary:\n{verification}\n\n\
+         Existing accepted memories (do not duplicate):\n{memories}\n\n\
+         Now output the proposals JSON envelope. Remember: do not name the files, functions, or bug from this run; propose only transferable preferences, conventions, or failure patterns.",
+        rationale = patch_plan.rationale,
+        expected = patch_plan.expected_outcome,
+        risk = format!("{:?}", patch_plan.risk_level).to_ascii_lowercase(),
+        verification = truncate_text(&verification_block, 1500),
+        memories = memories_block,
+    ));
+    ModelRequest {
+        messages: vec![system, user],
+        tools: Vec::new(),
+        tool_choice: ToolChoice::None,
+        max_output_tokens: config.model.max_output_tokens.min(2048),
+        temperature: config.model.temperature,
+        metadata: serde_json::json!({
+            "stage": CodingStage::MemoryProposal.as_str(),
+            "purpose": "memory_proposal",
+        }),
+    }
+}
+
+fn filter_memory_proposals(
+    raw_proposals: Vec<RawMemoryProposal>,
+    run_id: RunId,
+    patch_plan: &PatchPlan,
+    existing_memories: &[ExistingMemorySnapshot],
+) -> MemoryProposalSummary {
+    let raw_count = raw_proposals.len() as u32;
+    let mut summary = MemoryProposalSummary {
+        raw_count,
+        ..MemoryProposalSummary::default()
+    };
+    let plan_paths: Vec<String> = patch_plan
+        .files_to_modify
+        .iter()
+        .chain(patch_plan.files_to_create.iter())
+        .chain(patch_plan.files_to_delete.iter())
+        .chain(patch_plan.files_to_read.iter())
+        .map(|p| p.to_lowercase())
+        .collect();
+
+    for raw in raw_proposals {
+        let scope = raw.scope.trim().to_lowercase();
+        let kind = raw.kind.trim().to_lowercase();
+        let text = raw.text.trim().to_string();
+        if text.is_empty() {
+            summary.filtered_invalid = summary.filtered_invalid.saturating_add(1);
+            continue;
+        }
+        if !is_supported_scope(&scope) || !is_supported_proposal_kind(&kind) {
+            summary.filtered_invalid = summary.filtered_invalid.saturating_add(1);
+            continue;
+        }
+
+        let lowered = text.to_lowercase();
+        let mentions_run_path = plan_paths
+            .iter()
+            .any(|path| !path.is_empty() && lowered.contains(path));
+        if mentions_run_path {
+            summary.filtered_identifier = summary.filtered_identifier.saturating_add(1);
+            continue;
+        }
+
+        let normalized = kimetsu_core::memory::normalize_memory_text(&text);
+        let duplicate = existing_memories.iter().any(|m| {
+            m.scope.eq_ignore_ascii_case(&scope)
+                && m.kind.eq_ignore_ascii_case(&kind)
+                && m.normalized_text == normalized
+        });
+        if duplicate {
+            summary.filtered_dedup = summary.filtered_dedup.saturating_add(1);
+            continue;
+        }
+
+        let confidence = raw.confidence.clamp(0.0, 1.0);
+        let confidence = if confidence == 0.0 { 0.5 } else { confidence };
+
+        let proposal = AcceptedProposal {
+            proposal_id: format!("{}_{}", run_id, new_id()),
+            scope,
+            kind,
+            text,
+            rationale: raw.rationale.trim().to_string(),
+            confidence,
+        };
+        summary.accepted.push(proposal);
+    }
+
+    summary
+}
+
+fn is_supported_scope(scope: &str) -> bool {
+    matches!(scope, "global_user" | "project" | "repo")
+}
+
+fn is_supported_proposal_kind(kind: &str) -> bool {
+    matches!(kind, "preference" | "convention" | "failure_pattern")
 }
 
 fn record_model_requested(
@@ -1501,6 +1845,32 @@ fn command<const N: usize>(program: &str, args: [&str; N]) -> CommandSpec {
     }
 }
 
+fn load_existing_memories_for_proposal(
+    conn: &rusqlite::Connection,
+) -> KimetsuResult<Vec<ExistingMemorySnapshot>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT scope, kind, text, normalized_text
+        FROM memories
+        ORDER BY created_at DESC
+        LIMIT 200
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ExistingMemorySnapshot {
+            scope: row.get(0)?,
+            kind: row.get(1)?,
+            text: row.get(2)?,
+            normalized_text: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn render_coding_report(
     task: &str,
     run_id: RunId,
@@ -1508,6 +1878,7 @@ fn render_coding_report(
     patch_plan: &PatchPlan,
     implementation: Option<&AgentLoopOutcome>,
     verification: Option<&serde_json::Value>,
+    memory_proposals: Option<&MemoryProposalSummary>,
     trace_path: &Path,
 ) -> String {
     let mode_summary = if dry_run {
@@ -1533,9 +1904,13 @@ fn render_coding_report(
         "Model-backed implementation and verification are not wired in dry-run."
     } else if verification.is_none() && patch_plan.verification_commands.is_empty() {
         "PatchPlan declared no verification commands; outcome is unverified."
+    } else if memory_proposals.is_none() {
+        "MemoryProposal stage not run (model disabled or run did not reach Implementation)."
     } else {
-        "Review and memory proposal stages are not wired yet."
+        "Review stage is not wired yet."
     };
+
+    let memory_section = render_memory_proposal_section(memory_proposals);
 
     format!(
         "# {task}\n\n\
@@ -1548,7 +1923,7 @@ fn render_coding_report(
          ## Implementation output\n\
          {implementation_summary}\n\n\
          ## Memory proposals\n\
-         None.\n\n\
+         {memory_section}\n\n\
          ## Known risks\n\
          {known_risks}\n\n\
          ## Trace\n\
@@ -1704,6 +2079,44 @@ fn render_retry_context(
     if !other_failures.is_empty() {
         lines.push(format!("Also failing: {}", other_failures.join(", ")));
     }
+    lines.join("\n")
+}
+
+fn render_memory_proposal_section(summary: Option<&MemoryProposalSummary>) -> String {
+    let Some(summary) = summary else {
+        return "None proposed (stage not run).".to_string();
+    };
+    if summary.accepted.is_empty() {
+        return format!(
+            "None accepted ({} raw, {} dropped on identifier match, {} on dedup, {} invalid).",
+            summary.raw_count,
+            summary.filtered_identifier,
+            summary.filtered_dedup,
+            summary.filtered_invalid
+        );
+    }
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} accepted ({} raw, {} dropped on identifier match, {} on dedup, {} invalid).",
+        summary.accepted.len(),
+        summary.raw_count,
+        summary.filtered_identifier,
+        summary.filtered_dedup,
+        summary.filtered_invalid
+    ));
+    for proposal in &summary.accepted {
+        lines.push(format!(
+            "- [{}/{}] (conf {:.2}) {}",
+            proposal.scope, proposal.kind, proposal.confidence, proposal.text
+        ));
+        if !proposal.rationale.is_empty() {
+            lines.push(format!("  rationale: {}", proposal.rationale));
+        }
+    }
+    lines.push(
+        "Use `kimetsu brain memory proposals` to review, then `accept <id>` to promote."
+            .to_string(),
+    );
     lines.join("\n")
 }
 
@@ -2020,6 +2433,145 @@ mod tests {
         assert!(rendered.contains("cargo test"));
         assert!(rendered.contains("assertion"));
         assert!(rendered.contains("cargo clippy"));
+    }
+
+    #[test]
+    fn filter_memory_proposals_drops_run_specific_text() {
+        let plan = PatchPlan {
+            patch_plan_id: "p".into(),
+            run_id: "r".into(),
+            revision_of: None,
+            rationale: "".into(),
+            files_to_read: Vec::new(),
+            files_to_modify: vec!["src/lib.rs".into()],
+            files_to_create: Vec::new(),
+            files_to_delete: Vec::new(),
+            verification_commands: Vec::new(),
+            expected_outcome: "".into(),
+            risk_level: RiskLevel::Low,
+        };
+        let proposals = vec![
+            RawMemoryProposal {
+                scope: "global_user".into(),
+                kind: "preference".into(),
+                text: "Prefer ripgrep over grep for code search.".into(),
+                rationale: "".into(),
+                confidence: 0.8,
+            },
+            RawMemoryProposal {
+                scope: "repo".into(),
+                kind: "convention".into(),
+                text: "src/lib.rs holds the public API.".into(),
+                rationale: "".into(),
+                confidence: 0.9,
+            },
+        ];
+        let summary = filter_memory_proposals(proposals, RunId::new(), &plan, &[]);
+        assert_eq!(summary.raw_count, 2);
+        assert_eq!(summary.accepted.len(), 1);
+        assert_eq!(summary.filtered_identifier, 1);
+        assert_eq!(summary.accepted[0].kind, "preference");
+    }
+
+    #[test]
+    fn filter_memory_proposals_drops_duplicates_by_normalized_text() {
+        let plan = sample_patch_plan(Vec::new());
+        let existing = ExistingMemorySnapshot {
+            scope: "global_user".into(),
+            kind: "preference".into(),
+            normalized_text: kimetsu_core::memory::normalize_memory_text(
+                "Prefer ripgrep over grep.",
+            ),
+            text: "Prefer ripgrep over grep.".into(),
+        };
+        let proposals = vec![RawMemoryProposal {
+            scope: "global_user".into(),
+            kind: "preference".into(),
+            text: "  Prefer  ripgrep  over grep.  ".into(),
+            rationale: "".into(),
+            confidence: 0.7,
+        }];
+        let summary = filter_memory_proposals(proposals, RunId::new(), &plan, &[existing]);
+        assert_eq!(summary.accepted.len(), 0);
+        assert_eq!(summary.filtered_dedup, 1);
+    }
+
+    #[test]
+    fn filter_memory_proposals_drops_invalid_scopes_and_kinds() {
+        let plan = sample_patch_plan(Vec::new());
+        let proposals = vec![
+            RawMemoryProposal {
+                scope: "global_user".into(),
+                kind: "fact".into(),
+                text: "Some fact.".into(),
+                rationale: "".into(),
+                confidence: 0.5,
+            },
+            RawMemoryProposal {
+                scope: "session".into(),
+                kind: "preference".into(),
+                text: "Bad scope.".into(),
+                rationale: "".into(),
+                confidence: 0.5,
+            },
+            RawMemoryProposal {
+                scope: "global_user".into(),
+                kind: "preference".into(),
+                text: "".into(),
+                rationale: "".into(),
+                confidence: 0.5,
+            },
+        ];
+        let summary = filter_memory_proposals(proposals, RunId::new(), &plan, &[]);
+        assert_eq!(summary.accepted.len(), 0);
+        assert_eq!(summary.filtered_invalid, 3);
+    }
+
+    #[test]
+    fn render_memory_proposal_section_renders_accepted_proposals() {
+        let summary = MemoryProposalSummary {
+            raw_count: 2,
+            accepted: vec![AcceptedProposal {
+                proposal_id: "abc".into(),
+                scope: "global_user".into(),
+                kind: "preference".into(),
+                text: "Use rg over grep.".into(),
+                rationale: "Stated in prior runs".into(),
+                confidence: 0.8,
+            }],
+            filtered_identifier: 1,
+            filtered_dedup: 0,
+            filtered_invalid: 0,
+        };
+        let rendered = render_memory_proposal_section(Some(&summary));
+        assert!(rendered.contains("1 accepted"));
+        assert!(rendered.contains("[global_user/preference]"));
+        assert!(rendered.contains("Use rg over grep"));
+        assert!(rendered.contains("rationale: Stated in prior runs"));
+    }
+
+    #[test]
+    fn build_memory_proposal_request_includes_existing_memories() {
+        let config = ProjectConfig::default_for_project("test");
+        let plan = sample_patch_plan(Vec::new());
+        let existing = ExistingMemorySnapshot {
+            scope: "global_user".into(),
+            kind: "preference".into(),
+            normalized_text: "use rg over grep".into(),
+            text: "Use rg over grep".into(),
+        };
+        let request =
+            build_memory_proposal_request(&config, "fix bug", &plan, None, &[existing.clone()]);
+        let user_text = request
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::User))
+            .map(|m| m.text_content())
+            .collect::<String>();
+        assert!(user_text.contains("Use rg over grep"));
+        assert!(user_text.contains("Existing accepted memories"));
+        assert!(request.tools.is_empty());
+        assert!(matches!(request.tool_choice, ToolChoice::None));
     }
 
     fn sample_patch_plan(commands: Vec<CommandSpec>) -> PatchPlan {

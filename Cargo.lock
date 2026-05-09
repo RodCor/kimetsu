@@ -680,6 +680,7 @@ dependencies = [
  "kimetsu-core",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "similar",
