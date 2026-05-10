@@ -213,7 +213,31 @@ impl BenchMode {
     }
 }
 
+/// Print binary path, build mtime, and crate version on stderr at the start
+/// of every bench run. Lesson learned from the MP-1.6 cycle: launching a
+/// model-backed bench with a stale `target/debug/kimetsu` cost ~30 minutes
+/// and ~$8 because the new instrumentation simply was not in the binary.
+/// One line of stdout makes that mistake impossible to miss.
+fn print_bench_provenance() {
+    let exe_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let mtime_iso = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| time::OffsetDateTime::from(t).format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    eprintln!(
+        "kimetsu_bench provenance: version={} binary={} built_at={}",
+        env!("CARGO_PKG_VERSION"),
+        exe_path,
+        mtime_iso,
+    );
+}
+
 pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
+    print_bench_provenance();
     let bench_run_id = new_id().to_string();
     let mut tasks = bench_tasks();
     if let Some(limit) = options.limit {
