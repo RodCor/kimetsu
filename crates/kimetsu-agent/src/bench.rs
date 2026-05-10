@@ -96,6 +96,21 @@ struct BenchTaskResult {
     irrelevant_context_loaded: u32,
     included_handles: Vec<String>,
     dry_run: Option<DryRunBenchMetrics>,
+    /// MP-1.6: only populated for BrainOnAutoWarm. Lists every memory the
+    /// seed phase auto-accepted into the project's brain so the followup
+    /// phase's regression is auditable against the exact text injected.
+    #[serde(default)]
+    auto_accepted_memories: Vec<AutoAcceptedMemory>,
+    /// MP-1.6: only populated for BrainOnAutoWarm. Path to the saved
+    /// seed-phase trace.jsonl (under the bench artifact dir) so triage does
+    /// not require keeping the temp fixture alive.
+    #[serde(default)]
+    seed_trace_artifact: Option<String>,
+    /// MP-1.6: capsules that the broker actually surfaced into the followup
+    /// phase, with kind/handle/score/relevance. Lets the report distinguish
+    /// "memories did the work" from "prior_run did the work".
+    #[serde(default)]
+    injected_capsules: Vec<InjectedCapsuleSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -323,14 +338,22 @@ fn run_task_mode(
     }
     project::ingest_repo(&repo)?;
 
-    // BrainOnAutoWarm: run the followup task once as the seed phase, auto-
-    // accept any high-confidence personal proposals it produced, reset the
-    // source files so the agent has a clean surface, and then run the
-    // followup task again. Only the second run's trace contributes to bench
-    // metrics; the first run is setup.
-    let mut auto_accepted: u32 = 0;
+    // BrainOnAutoWarm: run the *seed_task* (intentionally different from the
+    // followup so the seed phase produces transferable conventions, not a
+    // dress rehearsal of the same fix), auto-accept any high-confidence
+    // personal proposals it produced, reset the source files, then run the
+    // followup task. The seed-phase trace is preserved as an artifact so the
+    // report can audit which memories carried over.
+    let mut auto_accepted: Vec<AutoAcceptedMemory> = Vec::new();
+    let mut seed_trace_artifact: Option<String> = None;
     if mode == BenchMode::BrainOnAutoWarm {
-        let _seed = run_pipeline_phase(&repo, task, mode, model_config)?;
+        let seed_result = run_pipeline_phase(&repo, task, task.seed_task, mode, model_config)?;
+        seed_trace_artifact = Some(copy_seed_trace_artifact(
+            output_dir,
+            task,
+            mode,
+            &seed_result.trace_path,
+        )?);
         auto_accepted = auto_accept_pending_proposals(&repo)?;
         // Reset source files so the followup phase has a fresh surface.
         write_fixture_repo(&repo, task)?;
@@ -342,16 +365,51 @@ fn run_task_mode(
     } else {
         project::retrieve_context(&repo, "patch_plan", task.followup_task, 420)?.capsules
     };
-    let pipeline_result = run_pipeline_phase(&repo, task, mode, model_config)?;
+    let injected_capsules: Vec<InjectedCapsuleSnapshot> = measured_capsules
+        .iter()
+        .map(|c| InjectedCapsuleSnapshot {
+            kind: c.kind.clone(),
+            handle: c.expansion_handle.clone(),
+            score: c.score,
+            relevance: c.relevance,
+        })
+        .collect();
+    let pipeline_result =
+        run_pipeline_phase(&repo, task, task.followup_task, mode, model_config)?;
     let metrics = dry_run_metrics(output_dir, task, mode, &pipeline_result.trace_path)?;
     let mut result = evaluate_capsules(task, mode, measured_capsules, Some(metrics));
+    result.injected_capsules = injected_capsules;
     if mode == BenchMode::BrainOnAutoWarm {
-        // Surface how many proposals the seed phase yielded, so the operator
-        // can tell whether a flat warm-vs-cold delta is the model's fault or
-        // because no proposals survived auto-accept.
-        result.accepted_memories_used = result.accepted_memories_used.max(auto_accepted);
+        // Codex review: surface the actual memory text and IDs the seed phase
+        // injected, not just a count. Without this we cannot diagnose why a
+        // followup that carries auto-accepted memories regresses vs cold.
+        result.accepted_memories_used = result
+            .accepted_memories_used
+            .max(auto_accepted.len() as u32);
+        result.auto_accepted_memories = auto_accepted;
+        result.seed_trace_artifact = seed_trace_artifact;
     }
     Ok(result)
+}
+
+fn copy_seed_trace_artifact(
+    output_dir: &Path,
+    task: &BenchTask,
+    mode: BenchMode,
+    trace_path: &Path,
+) -> KimetsuResult<String> {
+    let artifact_dir = output_dir
+        .join("artifacts")
+        .join(task.id)
+        .join(mode.as_str());
+    fs::create_dir_all(&artifact_dir)?;
+    let dest = artifact_dir.join("seed_trace.jsonl");
+    fs::copy(trace_path, &dest)?;
+    Ok(format!(
+        "artifacts/{}/{}/seed_trace.jsonl",
+        task.id,
+        mode.as_str()
+    ))
 }
 
 /// Run a single pipeline phase. On a hard error the trace was still finalized
@@ -360,12 +418,13 @@ fn run_task_mode(
 fn run_pipeline_phase(
     repo: &Path,
     task: &BenchTask,
+    task_text: &str,
     mode: BenchMode,
     model_config: Option<&ModelBenchConfig>,
 ) -> KimetsuResult<crate::pipeline::CodingRunResult> {
     let pipeline_result = run_coding_dry_run(CodingRunOptions {
         repo: repo.to_path_buf(),
-        task: task.followup_task.to_string(),
+        task: task_text.to_string(),
         dry_run: task.dry_run,
         allow_high_risk: true,
         disable_model: model_config.is_none(),
@@ -406,8 +465,11 @@ fn run_pipeline_phase(
 
 /// Apply the MEMORY-PROPOSALS.md auto-accept heuristics to whatever pending
 /// proposals are sitting in the project's brain.db, accepting those that pass
-/// and ignoring the rest. Returns the number accepted.
-fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<u32> {
+/// and ignoring the rest. Returns the accepted proposals so the bench can
+/// surface their text in the report (per Codex review: measurement integrity
+/// requires knowing exactly which memory the seed phase carried into the
+/// followup, not just a count).
+fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<Vec<AutoAcceptedMemory>> {
     let pending = project::list_proposals(
         repo,
         project::ProposalFilter {
@@ -416,7 +478,7 @@ fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<u32> {
             ..project::ProposalFilter::default()
         },
     )?;
-    let mut accepted: u32 = 0;
+    let mut accepted = Vec::new();
     for proposal in pending {
         if !auto_accept_policy_allows(&proposal) {
             continue;
@@ -426,21 +488,50 @@ fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<u32> {
             &proposal.proposal_id,
             project::AcceptOverrides::default(),
         ) {
-            Ok(_) => accepted = accepted.saturating_add(1),
+            Ok(memory_id) => accepted.push(AutoAcceptedMemory {
+                memory_id,
+                proposal_id: proposal.proposal_id,
+                scope: proposal.scope,
+                kind: proposal.kind,
+                text: proposal.text,
+                confidence: proposal.proposed_confidence,
+            }),
             Err(_) => continue,
         }
     }
     Ok(accepted)
 }
 
-/// Auto-accept policy from MEMORY-PROPOSALS.md, refined after MP-1.5 prompt
-/// engineering. failure_pattern always requires a human review (too easy for
-/// the model to overgeneralize a one-shot failure); preference auto-accepts
-/// only at global_user with high confidence; convention auto-accepts at repo
-/// or project with mid-confidence. Thresholds were lowered from the original
-/// MP-3 values after the first model-backed bench showed Opus consistently
-/// proposing useful conventions at confidence 0.5-0.7 that the strict
-/// thresholds rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoAcceptedMemory {
+    pub memory_id: String,
+    pub proposal_id: String,
+    pub scope: String,
+    pub kind: String,
+    pub text: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectedCapsuleSnapshot {
+    pub kind: String,
+    pub handle: String,
+    pub score: f32,
+    pub relevance: f32,
+}
+
+/// Auto-accept policy. failure_pattern always requires human review;
+/// preference auto-accepts only at global_user with high confidence;
+/// convention auto-accepts at repo or project with mid-confidence.
+///
+/// History:
+/// - MP-3 originals: preference 0.8, convention 0.7.
+/// - MP-1.5 lowered to preference 0.75, convention 0.6 to let real
+///   proposals through.
+/// - MP-1.6 reverts convention to 0.7 after the second bench showed two
+///   real-fix tasks regressing because mid-confidence conventions were
+///   applied where they did not fit. The relevance gate (MP-1.8) is the
+///   structural fix; this revert is the conservative interim.
 pub(crate) fn auto_accept_policy_allows(proposal: &project::ProposalRow) -> bool {
     let kind = proposal.kind.to_lowercase();
     let scope = proposal.scope.to_lowercase();
@@ -450,7 +541,7 @@ pub(crate) fn auto_accept_policy_allows(proposal: &project::ProposalRow) -> bool
     }
     match (kind.as_str(), scope.as_str()) {
         ("preference", "global_user") => conf >= 0.75,
-        ("convention", "repo") | ("convention", "project") => conf >= 0.6,
+        ("convention", "repo") | ("convention", "project") => conf >= 0.7,
         _ => false,
     }
 }
@@ -565,6 +656,9 @@ fn evaluate_capsules(
         irrelevant_context_loaded,
         included_handles,
         dry_run,
+        auto_accepted_memories: Vec::new(),
+        seed_trace_artifact: None,
+        injected_capsules: Vec::new(),
     }
 }
 
@@ -1668,10 +1762,10 @@ mod tests {
         };
         assert!(!auto_accept_policy_allows(&scoped_pref));
 
-        // convention at repo or project scope >= 0.6 accepts (MP-1.5: lowered
-        // from 0.7 after the first model-backed bench showed Opus emitting
-        // useful conventions in the 0.5-0.7 band that the strict threshold
-        // rejected).
+        // convention at repo or project scope >= 0.7 accepts (MP-1.6: reverted
+        // from 0.6 after the second bench showed mid-confidence conventions
+        // regressing real-fix tasks. Relevance gate (MP-1.8) is the
+        // structural fix; this threshold is the conservative interim).
         let repo_conv = project::ProposalRow {
             proposal_id: "p2".into(),
             run_id: "r".into(),
@@ -1679,7 +1773,7 @@ mod tests {
             kind: "convention".into(),
             text: "Use find_* for fallible lookups.".into(),
             rationale: String::new(),
-            proposed_confidence: 0.6,
+            proposed_confidence: 0.7,
             status: "pending".into(),
             decided_reason: None,
         };
@@ -1692,7 +1786,7 @@ mod tests {
         assert!(auto_accept_policy_allows(&project_conv));
 
         let weak_conv = project::ProposalRow {
-            proposed_confidence: 0.59,
+            proposed_confidence: 0.69,
             ..repo_conv.clone()
         };
         assert!(!auto_accept_policy_allows(&weak_conv));

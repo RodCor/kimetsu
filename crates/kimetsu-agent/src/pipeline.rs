@@ -407,6 +407,56 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         }),
     )?;
 
+    // MP-1.6 plan-validation gate (Codex review): reject any file in
+    // files_to_create that already exists on disk before Implementation
+    // starts. The model occasionally proposes "create lib.rs" when nudged by
+    // an auto-accepted convention; without this gate the agent burns turns
+    // before the strict diff gate catches the contradiction.
+    if !options.dry_run {
+        let mut create_collisions: Vec<String> = Vec::new();
+        for path in &patch_plan.files_to_create {
+            let absolute = paths.repo_root.join(path);
+            if absolute.exists() {
+                create_collisions.push(path.clone());
+            }
+        }
+        if !create_collisions.is_empty() {
+            let message = format!(
+                "PatchPlan declares files_to_create that already exist: {}",
+                create_collisions.join(", ")
+            );
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "gate.failed",
+                    serde_json::json!({
+                        "kind": "patch_plan",
+                        "reason": "files_to_create_already_exist",
+                        "paths": create_collisions,
+                        "message": &message,
+                    }),
+                ),
+            )?;
+            emit(
+                &mut writer,
+                &mut events,
+                Event::new(
+                    run_id,
+                    "run.failed",
+                    serde_json::json!({
+                        "category": "Gate",
+                        "message": &message,
+                        "failed_stage": CodingStage::PatchPlan.as_str(),
+                    }),
+                ),
+            )?;
+            projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+            return Err(message.into());
+        }
+    }
+
     let mut implementation_outcome = None;
     let mut verification_summary: Option<serde_json::Value> = None;
     let mut verification_tool_calls: u32 = 0;
