@@ -433,9 +433,14 @@ fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<u32> {
     Ok(accepted)
 }
 
-/// Auto-accept policy from MEMORY-PROPOSALS.md. failure_pattern always
-/// requires a human; preference auto-accepts only at global_user/>=0.8;
-/// convention auto-accepts at repo or project/>=0.7.
+/// Auto-accept policy from MEMORY-PROPOSALS.md, refined after MP-1.5 prompt
+/// engineering. failure_pattern always requires a human review (too easy for
+/// the model to overgeneralize a one-shot failure); preference auto-accepts
+/// only at global_user with high confidence; convention auto-accepts at repo
+/// or project with mid-confidence. Thresholds were lowered from the original
+/// MP-3 values after the first model-backed bench showed Opus consistently
+/// proposing useful conventions at confidence 0.5-0.7 that the strict
+/// thresholds rejected.
 pub(crate) fn auto_accept_policy_allows(proposal: &project::ProposalRow) -> bool {
     let kind = proposal.kind.to_lowercase();
     let scope = proposal.scope.to_lowercase();
@@ -444,8 +449,8 @@ pub(crate) fn auto_accept_policy_allows(proposal: &project::ProposalRow) -> bool
         return false;
     }
     match (kind.as_str(), scope.as_str()) {
-        ("preference", "global_user") => conf >= 0.8,
-        ("convention", "repo") | ("convention", "project") => conf >= 0.7,
+        ("preference", "global_user") => conf >= 0.75,
+        ("convention", "repo") | ("convention", "project") => conf >= 0.6,
         _ => false,
     }
 }
@@ -1663,7 +1668,10 @@ mod tests {
         };
         assert!(!auto_accept_policy_allows(&scoped_pref));
 
-        // convention at repo or project scope >= 0.7 accepts
+        // convention at repo or project scope >= 0.6 accepts (MP-1.5: lowered
+        // from 0.7 after the first model-backed bench showed Opus emitting
+        // useful conventions in the 0.5-0.7 band that the strict threshold
+        // rejected).
         let repo_conv = project::ProposalRow {
             proposal_id: "p2".into(),
             run_id: "r".into(),
@@ -1671,7 +1679,7 @@ mod tests {
             kind: "convention".into(),
             text: "Use find_* for fallible lookups.".into(),
             rationale: String::new(),
-            proposed_confidence: 0.7,
+            proposed_confidence: 0.6,
             status: "pending".into(),
             decided_reason: None,
         };
@@ -1684,7 +1692,7 @@ mod tests {
         assert!(auto_accept_policy_allows(&project_conv));
 
         let weak_conv = project::ProposalRow {
-            proposed_confidence: 0.69,
+            proposed_confidence: 0.59,
             ..repo_conv.clone()
         };
         assert!(!auto_accept_policy_allows(&weak_conv));

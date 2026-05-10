@@ -813,21 +813,37 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             }
 
             let stage_payload = match proposed.as_ref() {
-                Some(summary) => serde_json::json!({
-                    "summary": format!(
-                        "{} raw, {} accepted, {} filtered_identifier, {} filtered_dedup, {} filtered_invalid.",
-                        summary.raw_count,
-                        summary.accepted.len(),
-                        summary.filtered_identifier,
-                        summary.filtered_dedup,
-                        summary.filtered_invalid,
-                    ),
-                    "raw_count": summary.raw_count,
-                    "accepted": summary.accepted.len() as u32,
-                    "filtered_identifier": summary.filtered_identifier,
-                    "filtered_dedup": summary.filtered_dedup,
-                    "filtered_invalid": summary.filtered_invalid,
-                }),
+                Some(summary) => {
+                    let filtered_examples: Vec<serde_json::Value> = summary
+                        .filtered_examples
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "reason": f.reason,
+                                "scope": f.scope,
+                                "kind": f.kind,
+                                "confidence": f.confidence,
+                                "text": f.text,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "summary": format!(
+                            "{} raw, {} accepted, {} filtered_identifier, {} filtered_dedup, {} filtered_invalid.",
+                            summary.raw_count,
+                            summary.accepted.len(),
+                            summary.filtered_identifier,
+                            summary.filtered_dedup,
+                            summary.filtered_invalid,
+                        ),
+                        "raw_count": summary.raw_count,
+                        "accepted": summary.accepted.len() as u32,
+                        "filtered_identifier": summary.filtered_identifier,
+                        "filtered_dedup": summary.filtered_dedup,
+                        "filtered_invalid": summary.filtered_invalid,
+                        "filtered_examples": filtered_examples,
+                    })
+                }
                 None => serde_json::json!({
                     "summary": "MemoryProposal skipped (no provider or skipped on disable_model).",
                 }),
@@ -1099,6 +1115,19 @@ pub(crate) struct MemoryProposalSummary {
     pub filtered_identifier: u32,
     pub filtered_dedup: u32,
     pub filtered_invalid: u32,
+    /// Truncated text + reason for proposals the filter dropped, so we can see
+    /// why an apparently-good run produced no surviving memories without
+    /// re-running the bench.
+    pub filtered_examples: Vec<FilteredProposalExample>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilteredProposalExample {
+    pub reason: &'static str,
+    pub text: String,
+    pub scope: String,
+    pub kind: String,
+    pub confidence: f32,
 }
 
 fn try_model_memory_proposals(
@@ -1196,7 +1225,7 @@ fn build_memory_proposal_request(
     let system = ModelMessage {
         role: MessageRole::System,
         content: vec![MessageContent::Text {
-            text: "You are the MemoryProposal stage of Kimetsu. Review this completed run and propose zero or more personal memories that would help on a similar future task. A personal memory must be transferable: it applies beyond this specific bug, file, or function.\n\nAcceptable categories:\n- preference (scope=global_user): a user preference for tools, languages, or style.\n- convention (scope=repo or project): a codebase convention (naming, layout, design rules).\n- failure_pattern (scope=repo): a recurring failure with a known mitigation.\n\nReject (do not propose):\n- Anything that names this specific bug, file path, or function name.\n- Trivially-derivable facts (\"the codebase uses Rust\", \"there is a Cargo.toml\").\n- Memories supported by only one observation in this run unless confidence <= 0.4.\n\nOutput exactly one JSON object on its own line. No prose, no markdown, no backticks:\n\n{\"proposals\":[{\"scope\":\"global_user|project|repo\",\"kind\":\"preference|convention|failure_pattern\",\"text\":\"<single sentence>\",\"rationale\":\"<one line>\",\"confidence\":0.0..1.0}]}\n\nEmit {\"proposals\":[]} if nothing transferable emerged.".to_string(),
+            text: "You are the MemoryProposal stage of Kimetsu. Review this completed run and propose zero or more *personal memories* that would help on a similar future task.\n\nA personal memory must be transferable: it applies beyond this specific bug, file, or function. Generalize what you learned about how this user/codebase prefers to work.\n\nAcceptable categories:\n- preference (scope=global_user): a user preference for tools, languages, style, or workflow. Examples: tool choice, formatting, error handling style, language editions.\n- convention (scope=repo or project): a codebase rule that recurs across files. Examples: naming patterns, layout, module organization, what kind of helper goes where.\n- failure_pattern (scope=repo): a recurring failure with a known mitigation, distilled from how this run had to handle a verification or implementation failure.\n\nProposing well:\n- Aim to surface 1-3 transferable items per run when patterns are visible. An empty array is fine when truly nothing generalizable emerged.\n- Generalize. If the convention is \"v2 modules re-export v1\", say that as a rule, not as \"add src/v2/mod.rs\".\n- Confidence guidance:\n  * 0.9: clearly demonstrated and explicit in the task or PatchPlan.\n  * 0.8: consistently observed across multiple steps of this run.\n  * 0.7: inferred from one strong observation; reasonable for auto-acceptance.\n  * 0.5 or lower: speculative or single weak observation.\n  * Always include a numeric confidence; do not omit the field.\n\nReject (do not propose):\n- Anything whose only point is naming this specific bug, file path, or function.\n- Trivially-derivable facts (\"the codebase uses Rust\", \"there is a Cargo.toml\").\n- Vacuous catch-alls (\"write good code\", \"prefer clean implementations\").\n\nGood proposals (transferable):\n- {\"scope\":\"global_user\",\"kind\":\"preference\",\"text\":\"Prefer ripgrep over grep for code search.\",\"rationale\":\"task referenced rg explicitly\",\"confidence\":0.85}\n- {\"scope\":\"repo\",\"kind\":\"convention\",\"text\":\"Public API uses fallible find_* helpers; rename get_* to find_* when adding lookups that return Option.\",\"rationale\":\"existing API pattern in the crate\",\"confidence\":0.8}\n- {\"scope\":\"repo\",\"kind\":\"convention\",\"text\":\"When introducing a versioned API module, add a thin re-export from the previous version rather than duplicating logic.\",\"rationale\":\"matches the namespacing pattern used in lib.rs\",\"confidence\":0.8}\n- {\"scope\":\"repo\",\"kind\":\"failure_pattern\",\"text\":\"When cargo test fails with both an area and a perimeter assertion, both helpers usually share a copy-paste bug; check both files.\",\"rationale\":\"two-file bug surfaced as paired test failures\",\"confidence\":0.75}\n\nBad proposals (do not emit):\n- \"Fix src/lib.rs so the area test passes.\" -> run-specific\n- \"Use Rust.\" -> trivially derivable\n- \"Write better code.\" -> vacuous\n\nOutput exactly one JSON object on its own line. No prose, no markdown, no backticks:\n\n{\"proposals\":[{\"scope\":\"global_user|project|repo\",\"kind\":\"preference|convention|failure_pattern\",\"text\":\"<single sentence>\",\"rationale\":\"<one line>\",\"confidence\":0.0..1.0}, ...]}\n\nEmit {\"proposals\":[]} only when nothing transferable emerged.".to_string(),
         }],
     };
     let memories_block = if existing_memories.is_empty() {
@@ -1244,6 +1273,10 @@ fn filter_memory_proposals(
     patch_plan: &PatchPlan,
     existing_memories: &[ExistingMemorySnapshot],
 ) -> MemoryProposalSummary {
+    const SHORT_PROPOSAL_LIMIT_CHARS: usize = 80;
+    const FILTERED_EXAMPLE_TEXT_CAP: usize = 240;
+    const MAX_FILTERED_EXAMPLES: usize = 6;
+
     let raw_count = raw_proposals.len() as u32;
     let mut summary = MemoryProposalSummary {
         raw_count,
@@ -1258,25 +1291,45 @@ fn filter_memory_proposals(
         .map(|p| p.to_lowercase())
         .collect();
 
+    let mut record_filtered =
+        |summary: &mut MemoryProposalSummary, raw: &RawMemoryProposal, reason: &'static str| {
+            if summary.filtered_examples.len() < MAX_FILTERED_EXAMPLES {
+                summary.filtered_examples.push(FilteredProposalExample {
+                    reason,
+                    text: truncate_text(raw.text.trim(), FILTERED_EXAMPLE_TEXT_CAP),
+                    scope: raw.scope.trim().to_lowercase(),
+                    kind: raw.kind.trim().to_lowercase(),
+                    confidence: raw.confidence.clamp(0.0, 1.0),
+                });
+            }
+        };
+
     for raw in raw_proposals {
         let scope = raw.scope.trim().to_lowercase();
         let kind = raw.kind.trim().to_lowercase();
         let text = raw.text.trim().to_string();
         if text.is_empty() {
             summary.filtered_invalid = summary.filtered_invalid.saturating_add(1);
+            record_filtered(&mut summary, &raw, "empty_text");
             continue;
         }
         if !is_supported_scope(&scope) || !is_supported_proposal_kind(&kind) {
             summary.filtered_invalid = summary.filtered_invalid.saturating_add(1);
+            record_filtered(&mut summary, &raw, "invalid_scope_or_kind");
             continue;
         }
 
+        // Loosened identifier filter: only reject when the proposal is short
+        // enough to be plausibly run-specific *and* mentions a plan path. Long
+        // generalised guidance that incidentally references a path stays in;
+        // the auto-accept policy is the next gate.
         let lowered = text.to_lowercase();
         let mentions_run_path = plan_paths
             .iter()
             .any(|path| !path.is_empty() && lowered.contains(path));
-        if mentions_run_path {
+        if mentions_run_path && text.len() < SHORT_PROPOSAL_LIMIT_CHARS {
             summary.filtered_identifier = summary.filtered_identifier.saturating_add(1);
+            record_filtered(&mut summary, &raw, "short_and_path_specific");
             continue;
         }
 
@@ -1288,11 +1341,16 @@ fn filter_memory_proposals(
         });
         if duplicate {
             summary.filtered_dedup = summary.filtered_dedup.saturating_add(1);
+            record_filtered(&mut summary, &raw, "duplicate_of_existing");
             continue;
         }
 
+        // Default confidence raised from 0.5 -> 0.7 when the model omits the
+        // field. Most well-formed proposals from Opus do not emit a numeric
+        // confidence; the prior 0.5 default kept them below the auto-accept
+        // threshold, so they ended up Pending forever.
         let confidence = raw.confidence.clamp(0.0, 1.0);
-        let confidence = if confidence == 0.0 { 0.5 } else { confidence };
+        let confidence = if confidence == 0.0 { 0.7 } else { confidence };
 
         let proposal = AcceptedProposal {
             proposal_id: format!("{}_{}", run_id, new_id()),
@@ -2086,24 +2144,18 @@ fn render_memory_proposal_section(summary: Option<&MemoryProposalSummary>) -> St
     let Some(summary) = summary else {
         return "None proposed (stage not run).".to_string();
     };
-    if summary.accepted.is_empty() {
-        return format!(
-            "None accepted ({} raw, {} dropped on identifier match, {} on dedup, {} invalid).",
-            summary.raw_count,
-            summary.filtered_identifier,
-            summary.filtered_dedup,
-            summary.filtered_invalid
-        );
-    }
-    let mut lines = Vec::new();
-    lines.push(format!(
+    let header = format!(
         "{} accepted ({} raw, {} dropped on identifier match, {} on dedup, {} invalid).",
         summary.accepted.len(),
         summary.raw_count,
         summary.filtered_identifier,
         summary.filtered_dedup,
         summary.filtered_invalid
-    ));
+    );
+    if summary.accepted.is_empty() && summary.filtered_examples.is_empty() {
+        return header;
+    }
+    let mut lines = vec![header];
     for proposal in &summary.accepted {
         lines.push(format!(
             "- [{}/{}] (conf {:.2}) {}",
@@ -2113,10 +2165,21 @@ fn render_memory_proposal_section(summary: Option<&MemoryProposalSummary>) -> St
             lines.push(format!("  rationale: {}", proposal.rationale));
         }
     }
-    lines.push(
-        "Use `kimetsu brain memory proposals` to review, then `accept <id>` to promote."
-            .to_string(),
-    );
+    if !summary.filtered_examples.is_empty() {
+        lines.push("Filtered examples (visible for triage):".to_string());
+        for example in &summary.filtered_examples {
+            lines.push(format!(
+                "- ({}) [{}/{}] (conf {:.2}) {}",
+                example.reason, example.scope, example.kind, example.confidence, example.text
+            ));
+        }
+    }
+    if !summary.accepted.is_empty() {
+        lines.push(
+            "Use `kimetsu brain memory proposals` to review, then `accept <id>` to promote."
+                .to_string(),
+        );
+    }
     lines.join("\n")
 }
 
@@ -2436,6 +2499,39 @@ mod tests {
     }
 
     #[test]
+    fn filter_memory_proposals_keeps_long_guidance_even_with_path_mention() {
+        // MP-1.5: the path filter only fires when the proposal is short enough
+        // (<80 chars) to plausibly be run-specific. Long generalised guidance
+        // that incidentally references a plan path stays in.
+        let plan = PatchPlan {
+            patch_plan_id: "p".into(),
+            run_id: "r".into(),
+            revision_of: None,
+            rationale: "".into(),
+            files_to_read: Vec::new(),
+            files_to_modify: vec!["src/lib.rs".into()],
+            files_to_create: Vec::new(),
+            files_to_delete: Vec::new(),
+            verification_commands: Vec::new(),
+            expected_outcome: "".into(),
+            risk_level: RiskLevel::Low,
+        };
+        let long_generic = RawMemoryProposal {
+            scope: "repo".into(),
+            kind: "convention".into(),
+            text: "When introducing a new versioned API module, add a thin re-export from the previous version (for example through src/lib.rs) rather than duplicating logic across versions.".into(),
+            rationale: String::new(),
+            confidence: 0.0, // model omitted; default should now be 0.7
+        };
+        let summary = filter_memory_proposals(vec![long_generic], RunId::new(), &plan, &[]);
+        assert_eq!(summary.accepted.len(), 1, "long guidance should not be filtered as path-specific");
+        assert!(
+            (summary.accepted[0].confidence - 0.7).abs() < f32::EPSILON,
+            "missing confidence should default to 0.7 after MP-1.5"
+        );
+    }
+
+    #[test]
     fn filter_memory_proposals_drops_run_specific_text() {
         let plan = PatchPlan {
             patch_plan_id: "p".into(),
@@ -2542,6 +2638,7 @@ mod tests {
             filtered_identifier: 1,
             filtered_dedup: 0,
             filtered_invalid: 0,
+            filtered_examples: Vec::new(),
         };
         let rendered = render_memory_proposal_section(Some(&summary));
         assert!(rendered.contains("1 accepted"));
