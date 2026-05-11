@@ -187,15 +187,19 @@ If the user wants `kimetsu brain memory accept --auto` for the bench (or a futur
 
 ## Phasing
 
-| Phase | Scope |
-|---|---|
-| **MP-1** | Wire the MemoryProposal stage. Single-turn no-tool prompt. Parse and persist proposals. No auto-accept. |
-| **MP-2** | Acceptance UI: `--scope`, `--kind`, `--from-run`, `--min-confidence` filters. Rejection reason capture. |
-| **MP-3** | Bench `brain_on_auto_warm` mode + per-bench auto-accept heuristics. This is the falsifiable test that the brain learns from runs. |
-| **MP-4** | `use_count` tracking and `kimetsu brain memory invalidate <id>`. |
-| **MP-5** | Confidence decay and pending-proposal expiry. |
+| Phase | Scope | Status |
+|---|---|---|
+| **MP-1** | Wire the MemoryProposal stage. Single-turn no-tool prompt. Parse and persist proposals. No auto-accept. | shipped (ebfd3dd) |
+| **MP-1.5** | Prompt rewrite + threshold/default tuning to elicit useful proposals. | shipped (4e7696b) |
+| **MP-1.6** | Bench measurement integrity: seed_task seeding, preserved seed traces, accepted-memory logging, injected-capsule logging, plan-create existence guard. | shipped (872129e) |
+| **MP-1.7** | `brain_on_auto_warm_no_memory` ablation mode + `failure_category` in report. Isolates memory's contribution from prior_run's. | shipped (5c1e895) |
+| **MP-2** | Acceptance UI: `--scope`, `--kind`, `--from-run`, `--min-confidence` filters. Rejection reason capture. | shipped (3ff9492) |
+| **MP-3** | Bench `brain_on_auto_warm` mode + per-bench auto-accept heuristics. The first falsifiable test that the brain learns from runs. | shipped (4956257) |
+| **MP-1.8 (deprioritized)** | ~Per-kind memory relevance gate before retrieval injection.~ The MP-1.7 ablation showed lexical relevance does not predict usefulness — memories at `rel=1.00` still hurt. Replaced by MP-4. | dropped |
+| **MP-4** | Memory usefulness tracking. New `context.injected` event; `usefulness_score` column; broker scoring bias; auto-accept shadowing against low-usefulness existing memories; `kimetsu brain memory invalidate`. Details in [MEMORY-USEFULNESS.md](MEMORY-USEFULNESS.md). | next |
+| **MP-5** | Confidence decay and pending-proposal expiry. | future |
 
-MP-1 is ~150 lines of pipeline code + ~50 lines of prompt wiring. MP-2 is CLI ergonomics. MP-3 is the meaty one — the auto-accept loop has to interact with the bench fixture mechanism cleanly without making the cold/warm comparison cheat.
+MP-1 was ~150 lines of pipeline + ~50 of prompt. MP-2 was CLI ergonomics. MP-3 was the auto-warm bench mode. MP-1.5 and MP-1.6 were iteration on the prompt and measurement after observing the bench. MP-1.7 was the un-cooked ablation test that revealed the brain's wins so far come from `prior_run` capsules, not from accepted memories. MP-4 is the structural fix the ablation pointed at: outcome-weighted retrieval.
 
 ## Open questions
 
