@@ -257,6 +257,24 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         )?;
         (localization_context, patch_context, "Context capsules retrieved.")
     };
+    // MP-4a: emit a `context.injected` event per stage so the projector can
+    // correlate accepted memories with terminal outcomes. The projector reads
+    // every context.injected for a run when applying run.finished/failed and
+    // updates memories.usefulness_score / use_count accordingly.
+    emit_context_injected(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::Localization,
+        &localization_context,
+    )?;
+    emit_context_injected(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::PatchPlan,
+        &patch_context,
+    )?;
     stage_completed(
         &mut writer,
         &mut events,
@@ -1649,6 +1667,49 @@ fn stage_entered(
             run_id,
             "stage.entered",
             serde_json::json!({ "stage": stage.as_str() }),
+        ),
+    )
+}
+
+/// MP-4a: emit a `context.injected` event capturing the broker's bundle for
+/// a stage. The projector later joins these against terminal events to
+/// update memory usefulness. The payload separates capsules by kind so
+/// downstream consumers don't have to re-parse handles.
+fn emit_context_injected(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_id: RunId,
+    stage: CodingStage,
+    bundle: &ContextBundle,
+) -> KimetsuResult<()> {
+    let mut memory_ids: Vec<String> = Vec::new();
+    let mut prior_run_ids: Vec<String> = Vec::new();
+    let mut file_paths: Vec<String> = Vec::new();
+    let mut capsule_handles: Vec<String> = Vec::with_capacity(bundle.capsules.len());
+    for capsule in &bundle.capsules {
+        let handle = capsule.expansion_handle.as_str();
+        capsule_handles.push(handle.to_string());
+        if let Some(id) = handle.strip_prefix("memory:") {
+            memory_ids.push(id.to_string());
+        } else if let Some(id) = handle.strip_prefix("run:") {
+            prior_run_ids.push(id.to_string());
+        } else if let Some(path) = handle.strip_prefix("file:") {
+            file_paths.push(path.to_string());
+        }
+    }
+    emit(
+        writer,
+        events,
+        Event::new(
+            run_id,
+            "context.injected",
+            serde_json::json!({
+                "stage": stage.as_str(),
+                "capsule_handles": capsule_handles,
+                "memory_ids": memory_ids,
+                "prior_run_ids": prior_run_ids,
+                "file_paths": file_paths,
+            }),
         ),
     )
 }

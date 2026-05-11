@@ -124,7 +124,89 @@ fn apply_terminal_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
             total_cost
         ],
     )?;
+
+    apply_memory_usefulness_for_run(conn, event)?;
     Ok(())
+}
+
+/// MP-4a outcome attribution: when a run terminates, look up every
+/// `context.injected` event the run emitted, collect the unique memory ids,
+/// and update each memory's `use_count` and `usefulness_score`.
+///
+/// Delta rules (per MEMORY-USEFULNESS.md):
+///   run.finished                 -> +1 (helped) and +1 use
+///   run.failed (cat != "Gate")   -> -1 (hurt)   and +1 use
+///   run.failed (cat == "Gate")   ->  no update (graceful early-exit;
+///                                   the plan-create existence guard
+///                                   doesn't reflect on the memory)
+///   run.aborted                  ->  no update (user-initiated stop)
+fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let delta: i64 = match event.kind.as_str() {
+        "run.finished" => 1,
+        "run.failed" => {
+            let category = event
+                .payload
+                .get("category")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if category == "Gate" {
+                return Ok(());
+            }
+            -1
+        }
+        _ => return Ok(()), // run.aborted, anything else: no update
+    };
+
+    let run_id = event.run_id.to_string();
+    let memory_ids = collect_injected_memory_ids(conn, &run_id)?;
+    if memory_ids.is_empty() {
+        return Ok(());
+    }
+
+    for memory_id in memory_ids {
+        conn.execute(
+            "
+            UPDATE memories
+            SET use_count = use_count + 1,
+                usefulness_score = usefulness_score + ?2,
+                last_used_at = ?3
+            WHERE memory_id = ?1
+            ",
+            params![memory_id, delta as f64, ts_text(event)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// Walk this run's `context.injected` events and return the unique memory
+/// ids that were surfaced into any stage's broker bundle. Per-run counting:
+/// a memory injected into Localization AND PatchPlan in the same run counts
+/// once.
+fn collect_injected_memory_ids(conn: &Connection, run_id: &str) -> KimetsuResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT payload_json
+        FROM events
+        WHERE run_id = ?1 AND kind = 'context.injected'
+        ",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        let payload_json = row?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        if let Some(ids) = payload.get("memory_ids").and_then(|v| v.as_array()) {
+            for id in ids {
+                if let Some(id_str) = id.as_str() {
+                    if !id_str.is_empty() {
+                        seen.insert(id_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(seen.into_iter().collect())
 }
 
 fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> {

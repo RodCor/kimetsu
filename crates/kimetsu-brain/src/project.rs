@@ -46,6 +46,11 @@ pub struct MemoryRow {
     pub text: String,
     pub confidence: f32,
     pub use_count: u32,
+    /// MP-4a: running net outcome score. +1 for each run.finished that
+    /// surfaced this memory; -1 for each run.failed (excluding Gate
+    /// failures). Use_count tracks all updates, useful as a small-sample
+    /// guard before letting the score bias retrieval.
+    pub usefulness_score: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +264,7 @@ pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
     let (_paths, _config, conn) = load_project(start)?;
     let mut stmt = conn.prepare(
         "
-        SELECT memory_id, scope, kind, text, confidence, use_count
+        SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
         FROM memories
         ORDER BY created_at DESC
         LIMIT 100
@@ -274,6 +279,7 @@ pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
             text: row.get(3)?,
             confidence: row.get(4)?,
             use_count: row.get(5)?,
+            usefulness_score: row.get::<_, f64>(6)? as f32,
         })
     })?;
 
@@ -726,6 +732,238 @@ mod tests {
                 .iter()
                 .any(|capsule| capsule.expansion_handle == "file:src/lib.rs"),
             "repo index should survive event-only rebuild: {matches:?}"
+        );
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn run_finished_increments_usefulness_for_injected_memories() {
+        // MP-4a outcome attribution: a memory in the context of a run.finished
+        // gains +1 usefulness and +1 use_count; per-run counting means the
+        // same memory injected into two stages of one run still counts once.
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+        let memory_id = add_memory(
+            &root,
+            MemoryScope::GlobalUser,
+            MemoryKind::Preference,
+            "Prefer ripgrep over grep.",
+        )
+        .expect("add memory");
+
+        {
+            let (paths, _config, conn) = load_project(&root).expect("load");
+            let run_id = RunId::new();
+            let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id).expect("trace");
+            let evs: Vec<Event> = vec![
+                Event::new(
+                    run_id,
+                    "run.started",
+                    serde_json::json!({"project_id": "test", "task": "x"}),
+                ),
+                Event::new(
+                    run_id,
+                    "context.injected",
+                    serde_json::json!({
+                        "stage": "localization",
+                        "capsule_handles": [format!("memory:{memory_id}")],
+                        "memory_ids": [memory_id.clone()],
+                        "prior_run_ids": [],
+                        "file_paths": [],
+                    }),
+                ),
+                Event::new(
+                    run_id,
+                    "context.injected",
+                    serde_json::json!({
+                        "stage": "patch_plan",
+                        "capsule_handles": [format!("memory:{memory_id}")],
+                        "memory_ids": [memory_id.clone()],
+                        "prior_run_ids": [],
+                        "file_paths": [],
+                    }),
+                ),
+                Event::new(
+                    run_id,
+                    "run.finished",
+                    serde_json::json!({"status": "success", "total_cost_usd": 0.1}),
+                ),
+            ];
+            for ev in &evs {
+                writer.append(ev, true).expect("append");
+            }
+            projector::apply_events(&conn, &evs).expect("project");
+        }
+
+        let memories = list_memories(&root).expect("list memories");
+        let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
+        assert_eq!(m.use_count, 1, "per-run counting: 2 stages count once");
+        assert!(
+            (m.usefulness_score - 1.0).abs() < f32::EPSILON,
+            "expected usefulness_score = 1.0, got {}",
+            m.usefulness_score
+        );
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn run_failed_decrements_usefulness_unless_gate() {
+        // run.failed with category != "Gate" decrements; category == "Gate"
+        // is a graceful early-exit (e.g. the plan-create existence guard)
+        // and must not blame memories that happened to be in context.
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+        let memory_id = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "Use find_* for fallible lookups.",
+        )
+        .expect("add memory");
+
+        {
+            let (paths, _config, conn) = load_project(&root).expect("load");
+
+            // First run: gate-failure -> no update at all.
+            let gate_run = RunId::new();
+            let (mut writer, _) = TraceWriter::create(&paths, gate_run).expect("trace");
+            let gate_events: Vec<Event> = vec![
+                Event::new(
+                    gate_run,
+                    "run.started",
+                    serde_json::json!({"project_id": "test", "task": "g"}),
+                ),
+                Event::new(
+                    gate_run,
+                    "context.injected",
+                    serde_json::json!({
+                        "stage": "patch_plan",
+                        "capsule_handles": [format!("memory:{memory_id}")],
+                        "memory_ids": [memory_id.clone()],
+                        "prior_run_ids": [],
+                        "file_paths": [],
+                    }),
+                ),
+                Event::new(
+                    gate_run,
+                    "run.failed",
+                    serde_json::json!({
+                        "category": "Gate",
+                        "failed_stage": "patch_plan",
+                        "message": "files_to_create_already_exist",
+                    }),
+                ),
+            ];
+            for ev in &gate_events {
+                writer.append(ev, true).expect("append");
+            }
+            projector::apply_events(&conn, &gate_events).expect("project gate-fail");
+
+            // Second run: real implementation failure -> -1.
+            let impl_run = RunId::new();
+            let (mut writer2, _) = TraceWriter::create(&paths, impl_run).expect("trace");
+            let impl_events: Vec<Event> = vec![
+                Event::new(
+                    impl_run,
+                    "run.started",
+                    serde_json::json!({"project_id": "test", "task": "i"}),
+                ),
+                Event::new(
+                    impl_run,
+                    "context.injected",
+                    serde_json::json!({
+                        "stage": "patch_plan",
+                        "capsule_handles": [format!("memory:{memory_id}")],
+                        "memory_ids": [memory_id.clone()],
+                        "prior_run_ids": [],
+                        "file_paths": [],
+                    }),
+                ),
+                Event::new(
+                    impl_run,
+                    "run.failed",
+                    serde_json::json!({
+                        "category": "Implementation",
+                        "failed_stage": "implementation",
+                        "message": "test broke",
+                    }),
+                ),
+            ];
+            for ev in &impl_events {
+                writer2.append(ev, true).expect("append");
+            }
+            projector::apply_events(&conn, &impl_events).expect("project impl-fail");
+        }
+
+        let memories = list_memories(&root).expect("list memories");
+        let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
+        assert_eq!(m.use_count, 1, "only the non-Gate failure counts as a use");
+        assert!(
+            (m.usefulness_score - (-1.0)).abs() < f32::EPSILON,
+            "expected usefulness_score = -1.0, got {}",
+            m.usefulness_score
+        );
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn run_aborted_does_not_update_usefulness() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+        let memory_id = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "Module re-exports live in lib.rs.",
+        )
+        .expect("add memory");
+
+        {
+            let (paths, _config, conn) = load_project(&root).expect("load");
+            let run_id = RunId::new();
+            let (mut writer, _) = TraceWriter::create(&paths, run_id).expect("trace");
+            let evs: Vec<Event> = vec![
+                Event::new(
+                    run_id,
+                    "run.started",
+                    serde_json::json!({"project_id": "test", "task": "a"}),
+                ),
+                Event::new(
+                    run_id,
+                    "context.injected",
+                    serde_json::json!({
+                        "stage": "patch_plan",
+                        "capsule_handles": [format!("memory:{memory_id}")],
+                        "memory_ids": [memory_id.clone()],
+                        "prior_run_ids": [],
+                        "file_paths": [],
+                    }),
+                ),
+                Event::new(
+                    run_id,
+                    "run.aborted",
+                    serde_json::json!({"reason": "user_abort"}),
+                ),
+            ];
+            for ev in &evs {
+                writer.append(ev, true).expect("append");
+            }
+            projector::apply_events(&conn, &evs).expect("project");
+        }
+
+        let memories = list_memories(&root).expect("list memories");
+        let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
+        assert_eq!(m.use_count, 0, "aborted runs must not update use_count");
+        assert!(
+            m.usefulness_score.abs() < f32::EPSILON,
+            "expected usefulness_score = 0.0, got {}",
+            m.usefulness_score
         );
 
         fs::remove_dir_all(root).expect("remove temp project");

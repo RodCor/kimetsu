@@ -58,7 +58,8 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             provenance_snapshot_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             last_used_at TEXT,
-            use_count INTEGER NOT NULL DEFAULT 0
+            use_count INTEGER NOT NULL DEFAULT 0,
+            usefulness_score REAL NOT NULL DEFAULT 0.0
         );
 
         CREATE INDEX IF NOT EXISTS idx_memories_scope_kind_norm
@@ -119,6 +120,12 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     // so an upgraded binary opens an older brain.db without forcing a
     // `kimetsu brain rebuild`.
     add_column_if_missing(conn, "memory_proposals", "decided_reason TEXT")?;
+    // MP-4a: usefulness_score tracks the net outcome correlation of each
+    // memory. Incremented when a memory was in the context of a run.finished
+    // event; decremented for run.failed with category != "Gate". Used by the
+    // broker (MP-4b) to bias retrieval and by auto-accept (MP-4c) to shadow
+    // re-acceptance of low-usefulness patterns.
+    add_column_if_missing(conn, "memories", "usefulness_score REAL NOT NULL DEFAULT 0.0")?;
 
     let schema_version: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",

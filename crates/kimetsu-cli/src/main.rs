@@ -409,13 +409,23 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
             }
 
             for memory in memories {
+                let usefulness_ratio = if memory.use_count > 0 {
+                    format!(
+                        " ratio={:+.2}",
+                        memory.usefulness_score / memory.use_count as f32
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{} [{}:{} confidence={:.2} uses={}] {}",
+                    "{} [{}:{} confidence={:.2} uses={} usefulness={:+.1}{}] {}",
                     memory.memory_id,
                     memory.scope,
                     memory.kind,
                     memory.confidence,
                     memory.use_count,
+                    memory.usefulness_score,
+                    usefulness_ratio,
                     memory.text
                 );
             }
