@@ -119,6 +119,12 @@ struct DryRunBenchMetrics {
     trace_artifact: String,
     patch_plan_artifact: String,
     terminal_kind: String,
+    /// MP-1.7 polish: when terminal_kind is run.failed, pull the `category`
+    /// field from the run.failed payload so the report can distinguish a
+    /// graceful early-exit (`Gate`, e.g. the plan-create existence guard)
+    /// from a real crash (`Implementation`, `Verification`, `Provider`).
+    #[serde(default)]
+    failure_category: Option<String>,
     duration_us: u64,
     duration_ms: u64,
     trace_events: u32,
@@ -191,15 +197,22 @@ enum BenchMode {
     /// follow-up pipeline. Memories carried across phases are *only* what the
     /// agent itself proposed -- no hand-curated warm seed.
     BrainOnAutoWarm,
+    /// MP-1.7 ablation: same flow as BrainOnAutoWarm, but after auto-accept
+    /// the bench wipes the `memories` projection so the followup phase
+    /// surfaces only repo_file / repo_manifest / prior_run capsules. Lets
+    /// the report quantify how much of auto_warm's win is memory vs
+    /// prior-run trace persistence.
+    BrainOnAutoWarmNoMemory,
 }
 
 impl BenchMode {
-    fn all() -> [Self; 4] {
+    fn all() -> [Self; 5] {
         [
             Self::BrainOff,
             Self::BrainOnCold,
             Self::BrainOnWarm,
             Self::BrainOnAutoWarm,
+            Self::BrainOnAutoWarmNoMemory,
         ]
     }
 
@@ -209,6 +222,7 @@ impl BenchMode {
             Self::BrainOnCold => "brain_on_cold",
             Self::BrainOnWarm => "brain_on_warm",
             Self::BrainOnAutoWarm => "brain_on_auto_warm",
+            Self::BrainOnAutoWarmNoMemory => "brain_on_auto_warm_no_memory",
         }
     }
 }
@@ -362,15 +376,25 @@ fn run_task_mode(
     }
     project::ingest_repo(&repo)?;
 
-    // BrainOnAutoWarm: run the *seed_task* (intentionally different from the
-    // followup so the seed phase produces transferable conventions, not a
-    // dress rehearsal of the same fix), auto-accept any high-confidence
+    // Two-phase auto-warm modes: run the *seed_task* (intentionally different
+    // from the followup so the seed phase produces transferable conventions,
+    // not a dress rehearsal of the same fix), auto-accept any high-confidence
     // personal proposals it produced, reset the source files, then run the
     // followup task. The seed-phase trace is preserved as an artifact so the
     // report can audit which memories carried over.
+    //
+    // MP-1.7 ablation: `BrainOnAutoWarmNoMemory` does the same flow but
+    // wipes the `memories` projection between seed and followup. The
+    // run.finished events from the seed phase stay in the canonical trace,
+    // so the broker can still surface a `prior_run` capsule -- only memory
+    // capsules disappear. The delta between AutoWarm and AutoWarmNoMemory
+    // isolates the actual contribution of accepted memories.
     let mut auto_accepted: Vec<AutoAcceptedMemory> = Vec::new();
     let mut seed_trace_artifact: Option<String> = None;
-    if mode == BenchMode::BrainOnAutoWarm {
+    if matches!(
+        mode,
+        BenchMode::BrainOnAutoWarm | BenchMode::BrainOnAutoWarmNoMemory
+    ) {
         let seed_result = run_pipeline_phase(&repo, task, task.seed_task, mode, model_config)?;
         seed_trace_artifact = Some(copy_seed_trace_artifact(
             output_dir,
@@ -379,6 +403,9 @@ fn run_task_mode(
             &seed_result.trace_path,
         )?);
         auto_accepted = auto_accept_pending_proposals(&repo)?;
+        if mode == BenchMode::BrainOnAutoWarmNoMemory {
+            wipe_memory_projection(&repo)?;
+        }
         // Reset source files so the followup phase has a fresh surface.
         write_fixture_repo(&repo, task)?;
         project::ingest_repo(&repo)?;
@@ -403,10 +430,14 @@ fn run_task_mode(
     let metrics = dry_run_metrics(output_dir, task, mode, &pipeline_result.trace_path)?;
     let mut result = evaluate_capsules(task, mode, measured_capsules, Some(metrics));
     result.injected_capsules = injected_capsules;
-    if mode == BenchMode::BrainOnAutoWarm {
-        // Codex review: surface the actual memory text and IDs the seed phase
-        // injected, not just a count. Without this we cannot diagnose why a
-        // followup that carries auto-accepted memories regresses vs cold.
+    if matches!(
+        mode,
+        BenchMode::BrainOnAutoWarm | BenchMode::BrainOnAutoWarmNoMemory
+    ) {
+        // Surface the memory text and IDs the seed phase accepted, plus the
+        // seed-phase trace path. For BrainOnAutoWarmNoMemory we still record
+        // what would have been carried over so the report shows what the
+        // ablation is actually withholding.
         result.accepted_memories_used = result
             .accepted_memories_used
             .max(auto_accepted.len() as u32);
@@ -414,6 +445,23 @@ fn run_task_mode(
         result.seed_trace_artifact = seed_trace_artifact;
     }
     Ok(result)
+}
+
+/// MP-1.7: drop every row from the `memories` projection so the broker
+/// surfaces no `memory:` capsules in the followup retrieval. The canonical
+/// trace (run.started / memory.accepted / run.finished events) is preserved;
+/// only the brain.db projection is cleared. This is the cheapest way to
+/// isolate "what did the accepted memories contribute?" from "what did the
+/// prior_run capsule contribute?" without touching the broker code.
+fn wipe_memory_projection(repo: &Path) -> KimetsuResult<()> {
+    let (_paths, _config, conn) = project::load_project(repo)?;
+    conn.execute_batch(
+        "
+        DELETE FROM memories;
+        DELETE FROM memories_fts;
+        ",
+    )?;
+    Ok(())
 }
 
 fn copy_seed_trace_artifact(
@@ -697,17 +745,19 @@ fn dry_run_metrics(
         .first()
         .map(|event| event.run_id.to_string())
         .unwrap_or_default();
-    let terminal_kind = events
-        .iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                "run.finished" | "run.failed" | "run.aborted"
-            )
-        })
+    let terminal_event = events.iter().rev().find(|event| {
+        matches!(
+            event.kind.as_str(),
+            "run.finished" | "run.failed" | "run.aborted"
+        )
+    });
+    let terminal_kind = terminal_event
         .map(|event| event.kind.clone())
         .unwrap_or_else(|| "running".to_string());
+    let failure_category = terminal_event
+        .filter(|event| event.kind == "run.failed")
+        .and_then(|event| event.payload.get("category").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
     let duration_us = match (events.first(), events.last()) {
         (Some(first), Some(last)) => duration_us(first.ts, last.ts),
         _ => 0,
@@ -802,6 +852,7 @@ fn dry_run_metrics(
         trace_artifact,
         patch_plan_artifact,
         terminal_kind,
+        failure_category,
         duration_us,
         duration_ms,
         trace_events: events.len() as u32,
@@ -1080,7 +1131,8 @@ fn pair_mode_against_off<'a>(report: &'a BenchReport, other_mode: &str) -> Vec<P
 fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
     let warm_pairs = pair_mode_against_off(report, "brain_on_warm");
     let auto_pairs = pair_mode_against_off(report, "brain_on_auto_warm");
-    if warm_pairs.is_empty() && auto_pairs.is_empty() {
+    let ablation_pairs = pair_mode_against_off(report, "brain_on_auto_warm_no_memory");
+    if warm_pairs.is_empty() && auto_pairs.is_empty() && ablation_pairs.is_empty() {
         return String::new();
     }
 
@@ -1091,7 +1143,7 @@ fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
     out.push_str("- ≥15 pp success-rate uplift\n");
     out.push_str("- strictly fewer verification retries\n\n");
     out.push_str(
-        "`brain_on_warm` is hand-curated; `brain_on_auto_warm` carries only memories the agent itself proposed and survived auto-accept. The auto-warm row is the un-cooked test of the brain's value.\n\n",
+        "`brain_on_warm` is hand-curated. `brain_on_auto_warm` carries only memories the agent itself proposed and survived auto-accept. `brain_on_auto_warm_no_memory` is the MP-1.7 ablation: same flow as auto_warm but with the `memories` projection wiped between phases, so the followup sees only repo / prior_run capsules. The delta between auto_warm and auto_warm_no_memory isolates the actual contribution of accepted memories.\n\n",
     );
 
     if !warm_pairs.is_empty() {
@@ -1099,6 +1151,12 @@ fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
     }
     if !auto_pairs.is_empty() {
         out.push_str(&render_paired_block("brain_on_auto_warm", &auto_pairs));
+    }
+    if !ablation_pairs.is_empty() {
+        out.push_str(&render_paired_block(
+            "brain_on_auto_warm_no_memory",
+            &ablation_pairs,
+        ));
     }
     out
 }
@@ -1240,6 +1298,12 @@ fn render_report(report: &BenchReport) -> String {
     );
     for result in &report.results {
         let dry_run = result.dry_run.as_ref();
+        let terminal_display = dry_run
+            .map(|metrics| match (&metrics.terminal_kind, &metrics.failure_category) {
+                (k, Some(cat)) if k == "run.failed" => format!("run.failed({cat})"),
+                (k, _) => k.clone(),
+            })
+            .unwrap_or_else(|| "not_run".to_string());
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.2} | {} | {} | {} | {} | {} |\n",
             result.task_id,
@@ -1249,9 +1313,7 @@ fn render_report(report: &BenchReport) -> String {
             result.accepted_memories_used,
             result.context_loads,
             result.irrelevant_context_loaded,
-            dry_run
-                .map(|metrics| metrics.terminal_kind.as_str())
-                .unwrap_or("not_run"),
+            terminal_display,
             dry_run
                 .map(|metrics| metrics.duration_us as f32 / 1_000.0)
                 .unwrap_or(0.0),
