@@ -260,6 +260,24 @@ struct FinishPayload {
     summary: Option<String>,
 }
 
+/// Spawn `command` with piped stdio and enforce a wall-clock timeout.
+///
+/// Bug fix (observed during the MP-4 bench): on Windows the `claude` CLI
+/// spawns Node worker grandchildren that inherit the parent's stdout/stderr
+/// pipes. `TerminateProcess` on `claude` does NOT terminate the grandchildren
+/// — they keep the write-end of the pipe open. A naive
+/// `child.wait_with_output()` after `child.kill()` reads stdout/stderr until
+/// EOF, and EOF never arrives because the grandchild still owns the
+/// write-end. The whole bench parent then deadlocks reading from a pipe with
+/// no writer that will ever close.
+///
+/// The fix: read stdout/stderr on dedicated drainer threads, take ownership
+/// of those handles, and on timeout `child.kill()` + `child.wait()` only.
+/// We deliberately do NOT join the drainer threads when we time out — they
+/// stay parked on the grandchild's open write-end, but that's a thread leak,
+/// not a deadlock of the main bench loop, and the next call to this function
+/// is unaffected. On the happy path the child exits, the drainers finish on
+/// their own, and we join them to recover the captured output.
 fn run_with_timeout(mut command: Command, timeout: Duration) -> KimetsuResult<Output> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -267,18 +285,49 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> KimetsuResult<Ou
         .spawn()?;
     let started = Instant::now();
 
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_handle = stdout.map(|mut s| {
+        thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+    });
+    let stderr_handle = stderr.map(|mut s| {
+        thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+    });
+
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
+        if let Some(status) = child.try_wait()? {
+            let stdout_bytes = stdout_handle
+                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())).unwrap_or_default())
+                .unwrap_or_default();
+            let stderr_bytes = stderr_handle
+                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())).unwrap_or_default())
+                .unwrap_or_default();
+            return Ok(Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            });
         }
 
         if started.elapsed() >= timeout {
             let _ = child.kill();
-            let output = child.wait_with_output()?;
+            let _ = child.wait();
+            // Drainer threads may still be parked on a grandchild's pipe;
+            // we intentionally do not join them. Build the error from
+            // whatever the timeout said, not from the (unreadable) pipes.
             return Err(format!(
-                "timed out after {}s; {}",
-                timeout.as_secs(),
-                output_summary(&output)
+                "timed out after {}s; child killed; grandchild may still hold stdio pipes",
+                timeout.as_secs()
             )
             .into());
         }
