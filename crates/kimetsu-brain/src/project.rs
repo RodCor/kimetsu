@@ -494,6 +494,61 @@ pub fn accept_proposal(
     Ok(memory_id)
 }
 
+/// MP-4d: human override that flags an accepted memory so the broker stops
+/// surfacing it. Emits a `memory.invalidated` event and projects it. The
+/// canonical trace keeps the original `memory.accepted`; invalidation is
+/// purely additive metadata. Idempotent — re-invalidating a memory just
+/// overwrites the timestamp/reason.
+pub fn invalidate_memory(
+    start: &Path,
+    memory_id: &str,
+    reason: Option<&str>,
+) -> KimetsuResult<()> {
+    let (paths, config, conn) = load_project(start)?;
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE memory_id = ?1",
+        params![memory_id],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Err(format!("memory not found: {memory_id}").into());
+    }
+
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "brain memory invalidate", Some(run_id))?;
+    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
+
+    let resolved_reason = reason
+        .and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| "invalidated_by_cli".to_string());
+
+    let started = admin_started_event(&paths, &config, run_id, "memory invalidate")?;
+    writer.append(&started, true)?;
+
+    let invalidated = Event::new(
+        run_id,
+        "memory.invalidated",
+        serde_json::json!({
+            "memory_id": memory_id,
+            "reason": resolved_reason,
+        }),
+    );
+    writer.append(&invalidated, true)?;
+
+    let finished = admin_finished_event(run_id);
+    writer.append(&finished, true)?;
+
+    projector::apply_events(&conn, &[started, invalidated, finished])?;
+    Ok(())
+}
+
 pub fn reject_proposal(
     start: &Path,
     proposal_id: &str,
@@ -1067,6 +1122,110 @@ mod tests {
             .find(|m| m.memory_id == memory_id)
             .expect("promoted memory present");
         assert!((promoted.confidence - 0.55).abs() < f32::EPSILON);
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    /// MP-4d: invalidate_memory emits a `memory.invalidated` event and
+    /// projects it. The memory row keeps everything but gains
+    /// `invalidated_at`/`invalidated_reason`, and the row survives a
+    /// projection rebuild (event is canonical).
+    #[test]
+    fn invalidate_memory_persists_invalidated_metadata_and_survives_rebuild() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+
+        let memory_id = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "Use find_* for fallible lookups.",
+        )
+        .expect("add memory");
+
+        invalidate_memory(&root, &memory_id, Some("hurt 4 runs in a row"))
+            .expect("invalidate memory");
+
+        // Direct DB peek so we can read the new columns even before they are
+        // surfaced via MemoryRow.
+        {
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let (invalidated_at, invalidated_reason): (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT invalidated_at, invalidated_reason FROM memories WHERE memory_id = ?1",
+                    params![memory_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("query invalidated metadata");
+            assert!(invalidated_at.is_some(), "invalidated_at must be set");
+            assert_eq!(invalidated_reason.as_deref(), Some("hurt 4 runs in a row"));
+        }
+
+        // Rebuild from trace and confirm invalidation survives.
+        rebuild_projection(&root).expect("rebuild projection");
+        {
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let invalidated_at: Option<String> = conn
+                .query_row(
+                    "SELECT invalidated_at FROM memories WHERE memory_id = ?1",
+                    params![memory_id],
+                    |row| row.get(0),
+                )
+                .expect("query after rebuild");
+            assert!(
+                invalidated_at.is_some(),
+                "invalidated_at must survive event replay"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    /// MP-4b broker integration: an invalidated memory must not appear in
+    /// the retrieved context bundle, even though the row still exists in
+    /// brain.db for replay/audit.
+    #[test]
+    fn invalidated_memory_is_excluded_from_broker_retrieval() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+
+        let memory_id = add_memory(
+            &root,
+            MemoryScope::GlobalUser,
+            MemoryKind::Preference,
+            "Prefer ripgrep over grep for repo search.",
+        )
+        .expect("add memory");
+
+        // Sanity: broker surfaces it pre-invalidation.
+        let pre = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
+            .expect("pre context");
+        assert!(
+            pre.capsules
+                .iter()
+                .any(|c| c.expansion_handle == format!("memory:{memory_id}")),
+            "memory must appear before invalidation: {:?}",
+            pre.capsules
+        );
+
+        invalidate_memory(&root, &memory_id, Some("no longer accurate"))
+            .expect("invalidate");
+
+        let post = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
+            .expect("post context");
+        assert!(
+            post.capsules
+                .iter()
+                .all(|c| c.expansion_handle != format!("memory:{memory_id}")),
+            "invalidated memory must not be retrieved: {:?}",
+            post.capsules
+        );
+
+        // The row itself still exists in brain.db.
+        let memories = list_memories(&root).expect("list");
+        assert!(memories.iter().any(|m| m.memory_id == memory_id));
 
         fs::remove_dir_all(root).expect("remove temp project");
     }

@@ -59,7 +59,9 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             created_at TEXT NOT NULL,
             last_used_at TEXT,
             use_count INTEGER NOT NULL DEFAULT 0,
-            usefulness_score REAL NOT NULL DEFAULT 0.0
+            usefulness_score REAL NOT NULL DEFAULT 0.0,
+            invalidated_at TEXT,
+            invalidated_reason TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_memories_scope_kind_norm
@@ -126,6 +128,11 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     // broker (MP-4b) to bias retrieval and by auto-accept (MP-4c) to shadow
     // re-acceptance of low-usefulness patterns.
     add_column_if_missing(conn, "memories", "usefulness_score REAL NOT NULL DEFAULT 0.0")?;
+    // MP-4d: invalidated_at is set by `kimetsu brain memory invalidate` so
+    // the human reviewer can permanently retire a memory without rewriting
+    // the trace. The broker excludes invalidated rows from retrieval.
+    add_column_if_missing(conn, "memories", "invalidated_at TEXT")?;
+    add_column_if_missing(conn, "memories", "invalidated_reason TEXT")?;
 
     let schema_version: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",

@@ -42,6 +42,7 @@ fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         "memory.accepted" => apply_memory_accepted(conn, event),
         "memory.proposed" => apply_memory_proposed(conn, event),
         "memory.rejected" => apply_memory_rejected(conn, event),
+        "memory.invalidated" => apply_memory_invalidated(conn, event),
         _ => Ok(()),
     }
 }
@@ -363,6 +364,35 @@ fn apply_memory_rejected(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         WHERE proposal_id = ?1
         ",
         params![proposal_id, ts_text(event)?, reason],
+    )?;
+    Ok(())
+}
+
+/// MP-4d: human-invalidated memories are flagged so the broker excludes
+/// them from retrieval and `kimetsu brain memory list` can render the
+/// reason. The canonical trace still holds the original memory.accepted
+/// event; invalidation is additive metadata, not a delete.
+fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(memory_id) = event
+        .payload
+        .get("memory_id")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(());
+    };
+    let reason = event
+        .payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string());
+    conn.execute(
+        "
+        UPDATE memories
+        SET invalidated_at = ?2,
+            invalidated_reason = ?3
+        WHERE memory_id = ?1
+        ",
+        params![memory_id, ts_text(event)?, reason],
     )?;
     Ok(())
 }

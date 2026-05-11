@@ -134,10 +134,15 @@ pub fn search_repo_files(
 
 fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
+    // MP-4d: exclude invalidated memories from retrieval. The row stays in
+    // brain.db so `memory list` and replay can still see the history; only
+    // the broker filters it out.
     let mut stmt = conn.prepare(
         "
-        SELECT memory_id, scope, kind, text, confidence, created_at
+        SELECT memory_id, scope, kind, text, confidence, created_at,
+               use_count, usefulness_score
         FROM memories
+        WHERE invalidated_at IS NULL
         ORDER BY created_at DESC
         LIMIT 200
         ",
@@ -151,12 +156,15 @@ fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candid
             row.get::<_, String>(3)?,
             row.get::<_, f32>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, f64>(7)?,
         ))
     })?;
 
     let mut candidates = Vec::new();
     for row in rows {
-        let (memory_id, scope, kind, text, confidence, created_at) = row?;
+        let (memory_id, scope, kind, text, confidence, created_at, use_count, usefulness_score) =
+            row?;
         let raw_relevance = lexical_relevance(&query_tokens, &format!("{kind} {text}"));
         if raw_relevance <= 0.0 && !query_tokens.is_empty() {
             continue;
@@ -164,8 +172,16 @@ fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candid
 
         let freshness = freshness(&created_at);
         let scope_weight = scope_weight(&scope);
+        // MP-4b: bias raw_relevance by usefulness so memories that have
+        // consistently helped surface higher and memories that have
+        // consistently hurt surface lower. small_sample_threshold=3 means
+        // a fresh memory gets neutral treatment until it has data; the
+        // multiplier envelope is [0.5, 1.5] so a single memory cannot
+        // dominate the budget in either direction.
+        let multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
+        let biased_relevance = raw_relevance * multiplier;
         candidates.push(Candidate {
-            raw_relevance,
+            raw_relevance: biased_relevance,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "memory".to_string(),
@@ -186,6 +202,22 @@ fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candid
         });
     }
     Ok(candidates)
+}
+
+/// MP-4b multiplier in [0.5, 1.5] derived from a memory's outcome history.
+/// `use_count < 3` is treated as small-sample and yields 1.0 (neutral) so a
+/// brand-new memory has a fair chance to demonstrate value before being
+/// boosted or penalized.
+pub(crate) fn usefulness_multiplier(usefulness_score: f32, use_count: u32) -> f32 {
+    const SMALL_SAMPLE_THRESHOLD: u32 = 3;
+    const MULTIPLIER_MIN: f32 = 0.5;
+    const MULTIPLIER_MAX: f32 = 1.5;
+    if use_count < SMALL_SAMPLE_THRESHOLD {
+        return 1.0;
+    }
+    let ratio = usefulness_score / use_count as f32; // in -1.0..1.0 typically
+    let normalized = ((ratio + 1.0) / 2.0).clamp(0.0, 1.0); // map to 0..1
+    MULTIPLIER_MIN + normalized * (MULTIPLIER_MAX - MULTIPLIER_MIN)
 }
 
 fn repo_file_candidates(
@@ -419,4 +451,53 @@ fn excerpt(text: &str) -> String {
 
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MP-4b: small samples (use_count < 3) are treated as neutral so a
+    /// fresh memory has a fair chance to demonstrate value before being
+    /// boosted or penalized.
+    #[test]
+    fn usefulness_multiplier_is_neutral_for_small_samples() {
+        // Even a perfect score must not boost when there isn't enough data.
+        assert!((usefulness_multiplier(2.0, 2) - 1.0).abs() < f32::EPSILON);
+        // Even a -2/-2 row must not be penalized at use_count=2.
+        assert!((usefulness_multiplier(-2.0, 2) - 1.0).abs() < f32::EPSILON);
+        // use_count = 0 is neutral too.
+        assert!((usefulness_multiplier(0.0, 0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// MP-4b: at use_count >= 3 the multiplier maps ratio in [-1, 1] linearly
+    /// onto [MULTIPLIER_MIN, MULTIPLIER_MAX] = [0.5, 1.5]. A neutral memory
+    /// (ratio = 0) gets a 1.0 multiplier.
+    #[test]
+    fn usefulness_multiplier_maps_ratio_onto_envelope() {
+        // ratio = 1.0 -> 1.5 (max boost)
+        assert!((usefulness_multiplier(5.0, 5) - 1.5).abs() < f32::EPSILON);
+        // ratio = -1.0 -> 0.5 (max penalty)
+        assert!((usefulness_multiplier(-5.0, 5) - 0.5).abs() < f32::EPSILON);
+        // ratio = 0.0 -> 1.0 (neutral)
+        let mid = usefulness_multiplier(0.0, 6);
+        assert!((mid - 1.0).abs() < f32::EPSILON, "got {mid}");
+        // ratio = 0.5 -> 1.25 (mid boost)
+        let high = usefulness_multiplier(2.0, 4);
+        assert!((high - 1.25).abs() < f32::EPSILON, "got {high}");
+        // ratio = -0.5 -> 0.75 (mid penalty)
+        let low = usefulness_multiplier(-2.0, 4);
+        assert!((low - 0.75).abs() < f32::EPSILON, "got {low}");
+    }
+
+    /// MP-4b: the multiplier is bounded so even a runaway score cannot
+    /// dominate the budget; a single memory with usefulness_score >> use_count
+    /// is clamped at the upper envelope.
+    #[test]
+    fn usefulness_multiplier_clamps_to_envelope() {
+        // ratio > 1.0 is clamped to 1.0 -> 1.5
+        assert!((usefulness_multiplier(100.0, 5) - 1.5).abs() < f32::EPSILON);
+        // ratio < -1.0 is clamped to -1.0 -> 0.5
+        assert!((usefulness_multiplier(-100.0, 5) - 0.5).abs() < f32::EPSILON);
+    }
 }

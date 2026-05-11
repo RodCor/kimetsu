@@ -99,6 +99,17 @@ enum MemoryCommand {
     Proposals(ProposalsArgs),
     Accept(AcceptArgs),
     Reject(RejectArgs),
+    Invalidate(InvalidateArgs),
+}
+
+#[derive(Debug, Args)]
+struct InvalidateArgs {
+    memory_id: String,
+    /// Short note persisted alongside invalidated_at; rendered in
+    /// `memory list` so the human reviewer remembers why this memory
+    /// was retired.
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -492,6 +503,19 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
                 println!("rejected proposal: {} (reason: {reason})", args.proposal_id);
             } else {
                 println!("rejected proposal: {}", args.proposal_id);
+            }
+            Ok(())
+        }
+        MemoryCommand::Invalidate(args) => {
+            project::invalidate_memory(
+                &env::current_dir()?,
+                &args.memory_id,
+                args.reason.as_deref(),
+            )?;
+            if let Some(reason) = args.reason.as_deref() {
+                println!("invalidated memory: {} (reason: {reason})", args.memory_id);
+            } else {
+                println!("invalidated memory: {}", args.memory_id);
             }
             Ok(())
         }

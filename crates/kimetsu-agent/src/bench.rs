@@ -550,9 +550,14 @@ fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<Vec<AutoAcceptedM
             ..project::ProposalFilter::default()
         },
     )?;
+    // MP-4c: load the shadow pool once per auto-accept pass. The policy
+    // rejects re-acceptance of any proposal whose normalized_text overlaps
+    // an existing memory with use_count >= 3 and a usefulness ratio below
+    // -0.2.
+    let shadow_pool = build_shadow_pool(repo)?;
     let mut accepted = Vec::new();
     for proposal in pending {
-        if !auto_accept_policy_allows(&proposal) {
+        if !auto_accept_policy_allows(&proposal, &shadow_pool) {
             continue;
         }
         match project::accept_proposal(
@@ -572,6 +577,29 @@ fn auto_accept_pending_proposals(repo: &Path) -> KimetsuResult<Vec<AutoAcceptedM
         }
     }
     Ok(accepted)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProposalShadow {
+    pub scope: String,
+    pub kind: String,
+    pub normalized_text: String,
+    pub use_count: u32,
+    pub usefulness_score: f32,
+}
+
+fn build_shadow_pool(repo: &Path) -> KimetsuResult<Vec<ProposalShadow>> {
+    let memories = project::list_memories(repo)?;
+    Ok(memories
+        .into_iter()
+        .map(|m| ProposalShadow {
+            scope: m.scope,
+            kind: m.kind,
+            normalized_text: kimetsu_core::memory::normalize_memory_text(&m.text),
+            use_count: m.use_count,
+            usefulness_score: m.usefulness_score,
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,25 +624,99 @@ pub struct InjectedCapsuleSnapshot {
 /// preference auto-accepts only at global_user with high confidence;
 /// convention auto-accepts at repo or project with mid-confidence.
 ///
+/// MP-4c adds a shadowing check: a proposal that re-states a low-usefulness
+/// existing memory (high token-Jaccard overlap, same scope+kind,
+/// use_count >= 3, usefulness ratio < -0.2) is rejected even if it would
+/// otherwise pass on confidence. Lets the brain stop re-injecting the same
+/// hurting convention every seed run.
+///
 /// History:
 /// - MP-3 originals: preference 0.8, convention 0.7.
 /// - MP-1.5 lowered to preference 0.75, convention 0.6 to let real
 ///   proposals through.
 /// - MP-1.6 reverts convention to 0.7 after the second bench showed two
 ///   real-fix tasks regressing because mid-confidence conventions were
-///   applied where they did not fit. The relevance gate (MP-1.8) is the
-///   structural fix; this revert is the conservative interim.
-pub(crate) fn auto_accept_policy_allows(proposal: &project::ProposalRow) -> bool {
+///   applied where they did not fit.
+/// - MP-4c adds shadowing against low-usefulness existing memories.
+pub(crate) fn auto_accept_policy_allows(
+    proposal: &project::ProposalRow,
+    shadow_pool: &[ProposalShadow],
+) -> bool {
     let kind = proposal.kind.to_lowercase();
     let scope = proposal.scope.to_lowercase();
     let conf = proposal.proposed_confidence;
     if proposal.text.trim().is_empty() {
         return false;
     }
-    match (kind.as_str(), scope.as_str()) {
+    let passes_confidence = match (kind.as_str(), scope.as_str()) {
         ("preference", "global_user") => conf >= 0.75,
         ("convention", "repo") | ("convention", "project") => conf >= 0.7,
         _ => false,
+    };
+    if !passes_confidence {
+        return false;
+    }
+    if is_shadowed_by_low_usefulness(proposal, shadow_pool) {
+        return false;
+    }
+    true
+}
+
+const SHADOW_JACCARD_THRESHOLD: f32 = 0.5;
+const SHADOW_MIN_USE_COUNT: u32 = 3;
+const SHADOW_MAX_RATIO: f32 = -0.2;
+
+fn is_shadowed_by_low_usefulness(
+    proposal: &project::ProposalRow,
+    shadow_pool: &[ProposalShadow],
+) -> bool {
+    let proposal_normalized = kimetsu_core::memory::normalize_memory_text(&proposal.text);
+    let proposal_tokens = jaccard_tokens(&proposal_normalized);
+    if proposal_tokens.is_empty() {
+        return false;
+    }
+    let proposal_scope = proposal.scope.to_lowercase();
+    let proposal_kind = proposal.kind.to_lowercase();
+    for shadow in shadow_pool {
+        if shadow.use_count < SHADOW_MIN_USE_COUNT {
+            continue;
+        }
+        let ratio = shadow.usefulness_score / shadow.use_count as f32;
+        if ratio >= SHADOW_MAX_RATIO {
+            continue;
+        }
+        if shadow.scope.to_lowercase() != proposal_scope {
+            continue;
+        }
+        if shadow.kind.to_lowercase() != proposal_kind {
+            continue;
+        }
+        let overlap = jaccard_similarity(&proposal_tokens, &shadow.normalized_text);
+        if overlap >= SHADOW_JACCARD_THRESHOLD {
+            return true;
+        }
+    }
+    false
+}
+
+fn jaccard_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn jaccard_similarity(a: &std::collections::BTreeSet<String>, b_text: &str) -> f32 {
+    let b: std::collections::BTreeSet<String> = jaccard_tokens(b_text);
+    if a.is_empty() && b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(&b).count() as f32;
+    let union = a.union(&b).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
     }
 }
 
@@ -1821,6 +1923,8 @@ mod tests {
 
     #[test]
     fn auto_accept_policy_matches_documented_thresholds() {
+        let empty_pool: &[ProposalShadow] = &[];
+
         // preference / global_user accepts at >= 0.8
         let strong_pref = project::ProposalRow {
             proposal_id: "p1".into(),
@@ -1833,20 +1937,20 @@ mod tests {
             status: "pending".into(),
             decided_reason: None,
         };
-        assert!(auto_accept_policy_allows(&strong_pref));
+        assert!(auto_accept_policy_allows(&strong_pref, empty_pool));
 
         let weak_pref = project::ProposalRow {
             proposed_confidence: 0.6,
             ..strong_pref.clone()
         };
-        assert!(!auto_accept_policy_allows(&weak_pref));
+        assert!(!auto_accept_policy_allows(&weak_pref, empty_pool));
 
         // preference at non-global_user scope: never auto-accept
         let scoped_pref = project::ProposalRow {
             scope: "repo".into(),
             ..strong_pref.clone()
         };
-        assert!(!auto_accept_policy_allows(&scoped_pref));
+        assert!(!auto_accept_policy_allows(&scoped_pref, empty_pool));
 
         // convention at repo or project scope >= 0.7 accepts (MP-1.6: reverted
         // from 0.6 after the second bench showed mid-confidence conventions
@@ -1863,19 +1967,19 @@ mod tests {
             status: "pending".into(),
             decided_reason: None,
         };
-        assert!(auto_accept_policy_allows(&repo_conv));
+        assert!(auto_accept_policy_allows(&repo_conv, empty_pool));
 
         let project_conv = project::ProposalRow {
             scope: "project".into(),
             ..repo_conv.clone()
         };
-        assert!(auto_accept_policy_allows(&project_conv));
+        assert!(auto_accept_policy_allows(&project_conv, empty_pool));
 
         let weak_conv = project::ProposalRow {
             proposed_confidence: 0.69,
             ..repo_conv.clone()
         };
-        assert!(!auto_accept_policy_allows(&weak_conv));
+        assert!(!auto_accept_policy_allows(&weak_conv, empty_pool));
 
         // failure_pattern is always rejected for auto-accept
         let failure = project::ProposalRow {
@@ -1889,13 +1993,84 @@ mod tests {
             status: "pending".into(),
             decided_reason: None,
         };
-        assert!(!auto_accept_policy_allows(&failure));
+        assert!(!auto_accept_policy_allows(&failure, empty_pool));
 
         // Empty text is never accepted regardless of category.
         let empty = project::ProposalRow {
             text: "   ".into(),
             ..strong_pref
         };
-        assert!(!auto_accept_policy_allows(&empty));
+        assert!(!auto_accept_policy_allows(&empty, empty_pool));
+    }
+
+    /// MP-4c: a proposal that re-states an existing memory with
+    /// use_count >= 3 and usefulness ratio < -0.2 (same scope+kind, normalized
+    /// token Jaccard >= 0.5) must be rejected even when the confidence would
+    /// otherwise pass. Lets the brain stop re-injecting the same hurting
+    /// convention every seed run.
+    #[test]
+    fn auto_accept_shadowed_by_low_usefulness_memory_is_rejected() {
+        let proposal = project::ProposalRow {
+            proposal_id: "p_shadow".into(),
+            run_id: "r".into(),
+            scope: "repo".into(),
+            kind: "convention".into(),
+            text: "Use find_* for fallible lookups.".into(),
+            rationale: String::new(),
+            proposed_confidence: 0.9,
+            status: "pending".into(),
+            decided_reason: None,
+        };
+
+        // Memory that has hurt 4 of 4 runs (usefulness ratio = -1.0).
+        let bad_shadow = ProposalShadow {
+            scope: "repo".into(),
+            kind: "convention".into(),
+            normalized_text: kimetsu_core::memory::normalize_memory_text(
+                "Use find_ prefix for fallible lookups.",
+            ),
+            use_count: 4,
+            usefulness_score: -4.0,
+        };
+        assert!(!auto_accept_policy_allows(&proposal, &[bad_shadow.clone()]));
+
+        // Small sample (use_count < 3) does NOT shadow even when ratio is bad.
+        let small_sample = ProposalShadow {
+            use_count: 2,
+            usefulness_score: -2.0,
+            ..bad_shadow.clone()
+        };
+        assert!(auto_accept_policy_allows(&proposal, &[small_sample]));
+
+        // Ratio above -0.2 does NOT shadow even with enough samples.
+        let neutral_shadow = ProposalShadow {
+            use_count: 10,
+            usefulness_score: 0.0,
+            ..bad_shadow.clone()
+        };
+        assert!(auto_accept_policy_allows(&proposal, &[neutral_shadow]));
+
+        // Different scope does not shadow.
+        let wrong_scope = ProposalShadow {
+            scope: "global_user".into(),
+            ..bad_shadow.clone()
+        };
+        assert!(auto_accept_policy_allows(&proposal, &[wrong_scope]));
+
+        // Different kind does not shadow.
+        let wrong_kind = ProposalShadow {
+            kind: "preference".into(),
+            ..bad_shadow.clone()
+        };
+        assert!(auto_accept_policy_allows(&proposal, &[wrong_kind]));
+
+        // Low overlap (<0.5 Jaccard) does not shadow.
+        let unrelated = ProposalShadow {
+            normalized_text: kimetsu_core::memory::normalize_memory_text(
+                "Always run cargo fmt before committing.",
+            ),
+            ..bad_shadow
+        };
+        assert!(auto_accept_policy_allows(&proposal, &[unrelated]));
     }
 }
