@@ -195,7 +195,19 @@ def _format_shell_command(program: str, args: Iterable[str]) -> str:
 # --- The adapter -----------------------------------------------------------
 
 class KimetsuAgent(BaseAgent):
-    """Harbor external-agent wrapper around `kimetsu agent --harbor-mode`."""
+    """Harbor external-agent wrapper around `kimetsu agent --harbor-mode`.
+
+    Mode selection (MP-7d):
+    - default: spawn kimetsu with the real model loop (claude_code
+      provider). `CLAUDE_CODE_OAUTH_TOKEN` must be set in the
+      environment when the kimetsu binary starts.
+    - `KIMETSU_HARBOR_STUB=1`: pass `--stub` so the binary runs the
+      protocol-only multi-step stub (no model calls). Used by the smoke
+      test on machines without API credentials.
+
+    `KIMETSU_HARBOR_MODEL` (optional) overrides the model id; default is
+    whatever the binary's --model flag falls back to (`claude-haiku-4-5`).
+    """
 
     @staticmethod
     def name() -> str:
@@ -225,14 +237,17 @@ class KimetsuAgent(BaseAgent):
         to setting attributes otherwise.
         """
         binary = resolve_kimetsu_binary()
-        logger.info("starting kimetsu agent: %s --harbor-mode --task=%r", binary, instruction)
+        argv = [binary, "agent", "--harbor-mode", "--task", instruction]
+        if os.environ.get("KIMETSU_HARBOR_STUB"):
+            argv.append("--stub")
+        model_override = os.environ.get("KIMETSU_HARBOR_MODEL")
+        if model_override:
+            argv.extend(["--model", model_override])
+
+        logger.info("starting kimetsu agent: argv=%r", argv)
 
         proc = await asyncio.create_subprocess_exec(
-            binary,
-            "agent",
-            "--harbor-mode",
-            "--task",
-            instruction,
+            *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

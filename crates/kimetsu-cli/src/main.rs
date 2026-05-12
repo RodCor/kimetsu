@@ -63,6 +63,21 @@ struct AgentArgs {
     /// The instruction/task string the agent should work on.
     #[arg(long)]
     task: String,
+    /// Run the protocol-only multi-step stub instead of the real model
+    /// agent. Useful for smoke tests on machines without API credentials.
+    /// Default is to use the real model loop (claude_code provider).
+    #[arg(long)]
+    stub: bool,
+    /// Hard cap on model ↔ tool ping-pong rounds before agent.done is
+    /// forced. Defaults to DEFAULT_MODEL_TURN_BUDGET. Set lower in CI
+    /// to keep cost bounded.
+    #[arg(long, default_value_t = kimetsu_agent::harbor::DEFAULT_MODEL_TURN_BUDGET)]
+    turn_budget: u32,
+    /// Model id passed to the provider (claude_code only in v0.2).
+    /// Defaults to the value of $KIMETSU_HARBOR_MODEL or
+    /// `claude-haiku-4-5` if unset.
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -390,13 +405,18 @@ fn run() -> KimetsuResult<()> {
     }
 }
 
-/// MP-7c: dispatcher for `kimetsu agent`. Builds a `HarborSession`,
+/// MP-7c/d: dispatcher for `kimetsu agent`. Builds a `HarborSession`,
 /// wraps it in a `HarborShellExecutor` that fronts a real `ToolRuntime`,
-/// and drives the multi-step routed flow. The flow itself is still a
-/// stub (pwd + echo); MP-7d will replace it with the broker + model +
-/// tool loop while leaving this scaffolding intact.
+/// then either:
+///   - drives the protocol-only multi-step stub (`--stub`) for smoke
+///     tests on machines without API credentials, or
+///   - runs the real model agent loop (default) — model issues
+///     shell_command tool calls based on the task; we route them
+///     through HarborShellExecutor and feed results back.
 fn agent(args: AgentArgs) -> KimetsuResult<()> {
-    use kimetsu_agent::harbor::{HarborSession, HarborShellExecutor, run_multi_step_stub};
+    use kimetsu_agent::harbor::{
+        HarborSession, HarborShellExecutor, run_model_agent, run_multi_step_stub,
+    };
     use kimetsu_agent::tools::{ToolRuntime, ToolRuntimeConfig};
     use kimetsu_core::ids::RunId;
     use std::cell::RefCell;
@@ -411,8 +431,7 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
 
     // We need *something* as a repo_root for ToolRuntime's artifact
     // bookkeeping; in harbor mode no host-side path validation matters
-    // because subprocess work routes through Harbor. The system temp
-    // dir keeps the runtime happy without writing into the user's CWD.
+    // because subprocess work routes through Harbor.
     let scratch = std::env::temp_dir().join(format!("kimetsu-harbor-{}", RunId::new()));
     std::fs::create_dir_all(&scratch)?;
 
@@ -432,13 +451,62 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
                 redact_secrets: false,
                 ..ToolRuntimeConfig::default()
             });
-        let _ = run_multi_step_stub(&args.task, Rc::clone(&session), &mut runtime)?;
+
+        if args.stub {
+            let _ = run_multi_step_stub(&args.task, Rc::clone(&session), &mut runtime)?;
+        } else {
+            let mut provider = build_harbor_model_provider(args.model.as_deref(), &scratch)?;
+            let _ = run_model_agent(
+                &args.task,
+                Rc::clone(&session),
+                &mut runtime,
+                &mut *provider,
+                args.turn_budget,
+            )?;
+        }
         Ok(())
     };
 
-    // Best-effort cleanup of the scratch dir; never fail the agent on cleanup.
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// MP-7d: construct a ModelProvider for the harbor agent. Reads
+/// `CLAUDE_CODE_OAUTH_TOKEN` from the environment (set by the Harbor
+/// run command or the Python adapter) and instantiates a
+/// `ClaudeCodeProvider` directly — no kimetsu project required, since
+/// in harbor mode the workspace lives in Harbor's container and the
+/// host has nothing to load. Anthropic provider can land in MP-7e when
+/// the bench shows a need.
+fn build_harbor_model_provider(
+    model_override: Option<&str>,
+    scratch: &std::path::Path,
+) -> KimetsuResult<Box<dyn kimetsu_agent::model::ModelProvider>> {
+    use kimetsu_agent::claude_code::ClaudeCodeProvider;
+    use kimetsu_core::config::ProjectConfig;
+
+    let oauth = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").map_err(|_| {
+        "CLAUDE_CODE_OAUTH_TOKEN is not set; required for `kimetsu agent --harbor-mode` model runs (or pass --stub)"
+    })?;
+    let model_name = model_override
+        .map(str::to_string)
+        .or_else(|| std::env::var("KIMETSU_HARBOR_MODEL").ok())
+        .unwrap_or_else(|| "claude-haiku-4-5".to_string());
+
+    // Synthesize a minimal ProjectConfig so ClaudeCodeProvider's
+    // from_config_with_key plumbing keeps working. Most fields are
+    // unused in harbor mode (we override the api_key directly).
+    let mut config = ProjectConfig::default_for_project("kimetsu-harbor");
+    config.model.provider = "claude_code".to_string();
+    config.model.model = model_name;
+    config.model.api_key_env = "CLAUDE_CODE_OAUTH_TOKEN".to_string();
+    config.model.request_timeout_secs = 180;
+    config.run.max_total_cost_usd = 5.0;
+
+    match ClaudeCodeProvider::from_config_with_key(scratch, &config, Some(&oauth))? {
+        Some(provider) => Ok(Box::new(provider)),
+        None => Err("failed to construct ClaudeCodeProvider (no API key resolved)".into()),
+    }
 }
 
 fn init(args: InitArgs) -> KimetsuResult<()> {

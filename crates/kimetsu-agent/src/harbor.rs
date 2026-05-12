@@ -338,6 +338,210 @@ pub struct MultiStepStubReport {
     pub echo: crate::tools::ShellCommandOutput,
 }
 
+/// MP-7d: maximum turns of model ↔ tool ping-pong before we force the
+/// agent to wrap up. 25 mirrors the loop budget used inside the v0.1
+/// pipeline; we surface it here as a const so MP-8 can tune it from the
+/// Terminal-Bench data.
+pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 25;
+
+/// MP-7d: report returned by `run_model_agent`. Mostly for tests + the
+/// CLI smoke surface; production runs care about the JSON-RPC frames
+/// already emitted to Harbor.
+#[derive(Debug)]
+pub struct ModelAgentReport {
+    pub turns: u32,
+    pub tool_calls: u32,
+    pub stop_reason: crate::model::StopReason,
+    pub final_text: Option<String>,
+    pub usage: crate::model::TokenUsage,
+}
+
+/// MP-7d: the real agent loop. Wires a `ModelProvider` (claude_code,
+/// anthropic, or a `MockProvider` in tests) to a `ToolRuntime` whose
+/// shell backend routes through Harbor. The model issues
+/// `shell_command` calls based on the task; we run them via the runtime
+/// (which proxies via HarborShellExecutor → JSON-RPC → Harbor →
+/// container), feed the result back as a tool result message, and loop
+/// until the model returns plain text or we exhaust the turn budget.
+///
+/// `agent.done` carries the model's final text as the summary so
+/// Terminal-Bench's grader sees a real answer, not a stub string. The
+/// session's frame stream is identical in shape to MP-7c — only the
+/// content changes.
+pub fn run_model_agent<R, W>(
+    task: &str,
+    session: Rc<RefCell<HarborSession<R, W>>>,
+    runtime: &mut crate::tools::ToolRuntime,
+    provider: &mut dyn crate::model::ModelProvider,
+    turn_budget: u32,
+) -> KimetsuResult<ModelAgentReport>
+where
+    R: BufRead + 'static,
+    W: Write + 'static,
+{
+    use crate::model::{ModelMessage, ModelRequest, StopReason, ToolChoice, ToolDefinition};
+
+    let system = MessageMessage::system_prompt_for_harbor();
+    let user = ModelMessage::user_text(task);
+    let mut messages = vec![system, user];
+
+    let tool_defs = vec![ToolDefinition {
+        name: "shell_command".to_string(),
+        description: "Run a single shell command inside the workspace. \
+            Returns exit_code, stdout, stderr. Use this to read files \
+            (cat), list dirs (ls), search (grep / rg), edit (sed, echo \
+            > file), and run build / test commands."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "program": { "type": "string", "description": "Program name, e.g. `bash` or `cat`." },
+                "args":    { "type": "array", "items": { "type": "string" }, "description": "Command arguments." },
+                "cwd_relative": { "type": "string", "description": "Workspace-relative working directory; default is workspace root." },
+                "timeout_secs": { "type": "integer", "description": "Hard timeout in seconds; default 60." }
+            },
+            "required": ["program"],
+        }),
+    }];
+
+    let mut tool_calls_total = 0u32;
+    let mut last_usage = crate::model::TokenUsage::default();
+    let mut final_text: Option<String> = None;
+    let mut stop_reason = StopReason::EndTurn;
+    let mut turn = 0u32;
+
+    while turn < turn_budget {
+        turn += 1;
+
+        let request = ModelRequest {
+            messages: messages.clone(),
+            tools: tool_defs.clone(),
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: 4096,
+            temperature: 0.0,
+            metadata: serde_json::json!({
+                "kimetsu_mode": "harbor",
+                "turn": turn,
+                "task_preview": preview_text(task, 120),
+            }),
+        };
+
+        let response = provider.complete(request)?;
+        last_usage = response.usage;
+        stop_reason = response.stop_reason.clone();
+
+        if !response.tool_calls.is_empty() {
+            messages.push(ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
+
+            for call in response.tool_calls {
+                tool_calls_total += 1;
+                if call.name != "shell_command" {
+                    let err = serde_json::json!({
+                        "error": format!(
+                            "unsupported tool `{}`; only `shell_command` is available in harbor mode",
+                            call.name
+                        ),
+                    });
+                    messages.push(ModelMessage::tool_result(call.id, call.name, err));
+                    continue;
+                }
+                let spec_value = call.input;
+                let result_value = match serde_json::from_value::<crate::tools::CommandSpec>(
+                    spec_value.clone(),
+                ) {
+                    Ok(spec) => match runtime.shell_command(spec) {
+                        Ok(output) => serde_json::to_value(output).unwrap_or_else(|err| {
+                            serde_json::json!({ "error": err.to_string() })
+                        }),
+                        Err(err) => serde_json::json!({
+                            "error": format!("shell_command failed: {err}"),
+                        }),
+                    },
+                    Err(err) => serde_json::json!({
+                        "error": format!("invalid shell_command input: {err}; got {spec_value}"),
+                    }),
+                };
+                messages.push(ModelMessage::tool_result(call.id, "shell_command", result_value));
+            }
+            continue;
+        }
+
+        // No tool calls -> the model is done answering. Capture the text.
+        if let Some(text) = response.text.clone() {
+            final_text = Some(text.clone());
+            messages.push(ModelMessage::assistant_text(text));
+        } else {
+            // Empty response with no tool call: stop, surface the
+            // protocol-level stop reason so MP-8 telemetry can see what
+            // went wrong (refusal? max_tokens? api error?).
+            final_text = None;
+        }
+        break;
+    }
+
+    let summary = final_text.clone().unwrap_or_else(|| {
+        format!(
+            "kimetsu MP-7d agent ran {turn} turn(s) without producing a final answer (stop_reason={stop_reason:?})"
+        )
+    });
+
+    session.borrow_mut().emit_done(AgentDoneParams {
+        summary,
+        context: Some(serde_json::json!({
+            "mode": "model_agent",
+            "turns": turn,
+            "tool_calls": tool_calls_total,
+            "stop_reason": format!("{stop_reason:?}"),
+            "input_tokens": last_usage.input_tokens,
+            "output_tokens": last_usage.output_tokens,
+            "cost_usd": last_usage.cost_usd,
+            "protocol_version": HARBOR_PROTOCOL_VERSION,
+        })),
+    })?;
+
+    Ok(ModelAgentReport {
+        turns: turn,
+        tool_calls: tool_calls_total,
+        stop_reason,
+        final_text,
+        usage: last_usage,
+    })
+}
+
+fn preview_text(text: &str, limit: usize) -> String {
+    let mut clipped: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        clipped.push('…');
+    }
+    clipped
+}
+
+/// MP-7d: namespace helper so the system prompt is one focused location
+/// rather than scattered as `format!` calls throughout the loop. The
+/// prompt is intentionally short and Terminal-Bench-oriented; MP-8 will
+/// fold in the broker context (memories + prior-run capsules) here.
+struct MessageMessage;
+impl MessageMessage {
+    fn system_prompt_for_harbor() -> crate::model::ModelMessage {
+        crate::model::ModelMessage {
+            role: crate::model::MessageRole::System,
+            content: vec![crate::model::MessageContent::Text {
+                text: concat!(
+                    "You are Kimetsu, a coding agent running inside a sandboxed terminal ",
+                    "environment provided by Harbor / Terminal-Bench. Your only tool is ",
+                    "`shell_command` — use it to inspect the workspace (cat, ls, grep), ",
+                    "edit files (sed, echo > file), and run build / test commands. ",
+                    "When the task is complete or you have gathered enough information to ",
+                    "give a final answer, respond with plain text and no tool call. Be ",
+                    "concise; do not narrate every step. Workspace paths are relative to ",
+                    "the task's working directory."
+                ).to_string(),
+            }],
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +749,239 @@ mod tests {
 
         assert!(lines.next().is_none(), "no trailing frames expected");
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// MP-7d: drive `run_model_agent` with a MockProvider that scripts
+    /// three turns:
+    ///   turn 1 - issue a shell_command tool call (`ls` on the workspace)
+    ///   turn 2 - issue a second shell_command tool call (`cat README.md`)
+    ///   turn 3 - return a plain text final answer
+    /// The fake Harbor responds with canned ToolExecResults for each
+    /// routed shell command. Assert:
+    /// - exactly 2 tool.exec frames went to Harbor
+    /// - the model saw both tool results before producing its final text
+    /// - agent.done summary == the model's final text
+    /// - ModelAgentReport carries turns=3, tool_calls=2, EndTurn
+    #[test]
+    fn model_agent_drives_tool_loop_and_emits_done_with_final_text() {
+        use crate::model::{ModelResponse, MockProvider};
+        use crate::tools::{ToolRuntime, ToolRuntimeConfig};
+        use kimetsu_core::ids::RunId;
+        use std::fs;
+
+        // Two scripted ToolExecResult replies (one per shell command).
+        let ls_response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "exit_code": 0,
+                "stdout": "README.md\nsrc/\n",
+                "stderr": "",
+                "timed_out": false,
+            }
+        });
+        let cat_response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "exit_code": 0,
+                "stdout": "# Project\nThis is a test repo.\n",
+                "stderr": "",
+                "timed_out": false,
+            }
+        });
+        let canned = format!("{ls_response}\n{cat_response}\n");
+        let reader = Cursor::new(canned.into_bytes());
+        let writer = Vec::<u8>::new();
+        let session = Rc::new(RefCell::new(HarborSession::new(reader, writer)));
+
+        // Three scripted model responses.
+        let final_answer = "The project is a test repo. README explains it.";
+        let model_responses = vec![
+            ModelResponse::tool_call(
+                "call_1",
+                "shell_command",
+                json!({ "program": "ls", "args": [], "cwd_relative": null, "timeout_secs": 15 }),
+            ),
+            ModelResponse::tool_call(
+                "call_2",
+                "shell_command",
+                json!({
+                    "program": "cat",
+                    "args": ["README.md"],
+                    "cwd_relative": null,
+                    "timeout_secs": 15,
+                }),
+            ),
+            ModelResponse::text(final_answer),
+        ];
+        let mut provider = MockProvider::new(model_responses);
+
+        // ToolRuntime with HarborShellExecutor on a scratch dir.
+        let root = std::env::temp_dir().join(format!("kimetsu-mp7d-test-{}", RunId::new()));
+        fs::create_dir_all(&root).expect("create scratch root");
+
+        let report = {
+            let executor = Box::new(HarborShellExecutor::new(Rc::clone(&session)));
+            let mut runtime = ToolRuntime::new(&root, RunId::new())
+                .expect("runtime")
+                .with_shell_executor(executor)
+                .with_config(ToolRuntimeConfig {
+                    redact_secrets: false,
+                    ..ToolRuntimeConfig::default()
+                });
+            let report = run_model_agent(
+                "summarize the README",
+                Rc::clone(&session),
+                &mut runtime,
+                &mut provider,
+                DEFAULT_MODEL_TURN_BUDGET,
+            )
+            .expect("model agent");
+            drop(runtime);
+            report
+        };
+
+        assert_eq!(report.turns, 3);
+        assert_eq!(report.tool_calls, 2);
+        assert_eq!(report.final_text.as_deref(), Some(final_answer));
+
+        // Drain the writer and inspect the JSON-RPC frame sequence:
+        // tool.exec (id=1, ls) -> tool.exec (id=2, cat README.md) -> agent.done.
+        let session_inner = Rc::try_unwrap(session)
+            .map_err(|_| "rc still has outstanding refs")
+            .unwrap()
+            .into_inner();
+        let written = String::from_utf8(session_inner.writer).expect("utf8");
+        let mut lines = written.lines();
+
+        let req1: Value = serde_json::from_str(lines.next().expect("ls line")).unwrap();
+        assert_eq!(req1["method"], "tool.exec");
+        assert_eq!(req1["id"], 1);
+        assert_eq!(req1["params"]["program"], "ls");
+
+        let req2: Value = serde_json::from_str(lines.next().expect("cat line")).unwrap();
+        assert_eq!(req2["method"], "tool.exec");
+        assert_eq!(req2["id"], 2);
+        assert_eq!(req2["params"]["program"], "cat");
+        assert_eq!(req2["params"]["args"][0], "README.md");
+
+        let done: Value = serde_json::from_str(lines.next().expect("done line")).unwrap();
+        assert_eq!(done["method"], "agent.done");
+        assert_eq!(done["params"]["summary"].as_str().unwrap(), final_answer);
+        assert_eq!(done["params"]["context"]["mode"], "model_agent");
+        assert_eq!(done["params"]["context"]["turns"], 3);
+        assert_eq!(done["params"]["context"]["tool_calls"], 2);
+
+        assert!(lines.next().is_none(), "no trailing frames expected");
+        fs::remove_dir_all(root).ok();
+
+        // Confirm the model saw the right conversation shape: 1 system,
+        // 1 user (task), then alternating assistant-tool-call / tool-result
+        // pairs, then a final assistant-text turn.
+        let observed_msgs = &provider.requests.last().expect("last request").messages;
+        // System + user + 2*(tool_call + tool_result) = 6 messages on turn 3.
+        assert!(
+            observed_msgs.len() >= 6,
+            "expected >= 6 messages by turn 3, got {}: {observed_msgs:?}",
+            observed_msgs.len()
+        );
+        assert!(matches!(
+            observed_msgs[0].role,
+            crate::model::MessageRole::System
+        ));
+        assert!(matches!(
+            observed_msgs[1].role,
+            crate::model::MessageRole::User
+        ));
+    }
+
+    /// MP-7d: turn-budget guard. A model that never returns plain text
+    /// must be cut off after `turn_budget` iterations, with `agent.done`
+    /// still emitted carrying the budget-exhaustion summary so Harbor
+    /// records a clean termination instead of a hang.
+    #[test]
+    fn model_agent_stops_when_turn_budget_exhausted() {
+        use crate::model::{ModelResponse, MockProvider};
+        use crate::tools::{ToolRuntime, ToolRuntimeConfig};
+        use kimetsu_core::ids::RunId;
+        use std::fs;
+
+        // Pre-queue 3 ToolExecResults to match the 3 turn budget.
+        let mut canned = String::new();
+        for id in 1..=3u64 {
+            canned.push_str(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "exit_code": 0,
+                    "stdout": format!("turn {id}"),
+                    "stderr": "",
+                    "timed_out": false,
+                }
+            }).to_string());
+            canned.push('\n');
+        }
+        let reader = Cursor::new(canned.into_bytes());
+        let writer = Vec::<u8>::new();
+        let session = Rc::new(RefCell::new(HarborSession::new(reader, writer)));
+
+        // Three tool-call responses, no final text -> budget exhausted.
+        let model_responses: Vec<ModelResponse> = (1..=3)
+            .map(|i| {
+                ModelResponse::tool_call(
+                    format!("call_{i}"),
+                    "shell_command",
+                    json!({ "program": "echo", "args": [format!("step {i}")] }),
+                )
+            })
+            .collect();
+        let mut provider = MockProvider::new(model_responses);
+
+        let root = std::env::temp_dir().join(format!("kimetsu-mp7d-budget-{}", RunId::new()));
+        fs::create_dir_all(&root).expect("scratch");
+
+        let report = {
+            let executor = Box::new(HarborShellExecutor::new(Rc::clone(&session)));
+            let mut runtime = ToolRuntime::new(&root, RunId::new())
+                .expect("runtime")
+                .with_shell_executor(executor)
+                .with_config(ToolRuntimeConfig {
+                    redact_secrets: false,
+                    ..ToolRuntimeConfig::default()
+                });
+            let report = run_model_agent(
+                "loop forever",
+                Rc::clone(&session),
+                &mut runtime,
+                &mut provider,
+                3,
+            )
+            .expect("budget-capped agent");
+            drop(runtime);
+            report
+        };
+
+        assert_eq!(report.turns, 3, "should stop at budget");
+        assert_eq!(report.tool_calls, 3, "all 3 tool calls fired");
+        assert!(report.final_text.is_none(), "no final text produced");
+
+        let session_inner = Rc::try_unwrap(session)
+            .map_err(|_| "rc held")
+            .unwrap()
+            .into_inner();
+        let written = String::from_utf8(session_inner.writer).expect("utf8");
+        // 3 tool.exec frames + 1 agent.done = 4 frames
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 4, "expected 3 tool.exec + 1 agent.done");
+        let done: Value = serde_json::from_str(lines[3]).unwrap();
+        assert_eq!(done["method"], "agent.done");
+        let summary = done["params"]["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("3 turn") && summary.contains("without producing a final answer"),
+            "budget-exhausted summary: {summary}"
+        );
         fs::remove_dir_all(root).ok();
     }
 

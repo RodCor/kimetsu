@@ -59,6 +59,11 @@ async def main() -> int:
     binary = resolve_kimetsu_binary()
     print(f"[smoke] using kimetsu binary: {binary}")
 
+    # MP-7d: force the stub mode so the smoke test doesn't require API
+    # credentials. The real model agent runs without this env var when
+    # Harbor invokes us (CLAUDE_CODE_OAUTH_TOKEN must be set then).
+    os.environ["KIMETSU_HARBOR_STUB"] = "1"
+
     env = FakeEnvironment()
     context: dict[str, object] = {}
     agent = KimetsuAgent()
