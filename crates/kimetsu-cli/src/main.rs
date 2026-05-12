@@ -390,25 +390,55 @@ fn run() -> KimetsuResult<()> {
     }
 }
 
-/// MP-7a: dispatcher for `kimetsu agent`. For now only `--harbor-mode`
-/// is implemented; without it we error so a typo doesn't silently no-op.
+/// MP-7c: dispatcher for `kimetsu agent`. Builds a `HarborSession`,
+/// wraps it in a `HarborShellExecutor` that fronts a real `ToolRuntime`,
+/// and drives the multi-step routed flow. The flow itself is still a
+/// stub (pwd + echo); MP-7d will replace it with the broker + model +
+/// tool loop while leaving this scaffolding intact.
 fn agent(args: AgentArgs) -> KimetsuResult<()> {
+    use kimetsu_agent::harbor::{HarborSession, HarborShellExecutor, run_multi_step_stub};
+    use kimetsu_agent::tools::{ToolRuntime, ToolRuntimeConfig};
+    use kimetsu_core::ids::RunId;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     if !args.harbor_mode {
         return Err(
             "kimetsu agent currently only supports --harbor-mode; see V0.2-PLAN.md MP-7"
                 .into(),
         );
     }
+
+    // We need *something* as a repo_root for ToolRuntime's artifact
+    // bookkeeping; in harbor mode no host-side path validation matters
+    // because subprocess work routes through Harbor. The system temp
+    // dir keeps the runtime happy without writing into the user's CWD.
+    let scratch = std::env::temp_dir().join(format!("kimetsu-harbor-{}", RunId::new()));
+    std::fs::create_dir_all(&scratch)?;
+
     let stdin = io::stdin();
     let reader = stdin.lock();
     let stdout = io::stdout();
     let writer = stdout.lock();
-    let mut session = kimetsu_agent::harbor::HarborSession::new(reader, writer);
-    // MP-7a ships the protocol scaffolding only; MP-7c plumbs the real
-    // pipeline through HarborSession. For now run the stub agent so the
-    // Python wrapper has something to handshake against.
-    let _ = kimetsu_agent::harbor::run_stub_agent(&args.task, &mut session)?;
-    Ok(())
+    let session = Rc::new(RefCell::new(HarborSession::new(reader, writer)));
+
+    let executor: Box<dyn kimetsu_agent::tools::ShellExecutor> =
+        Box::new(HarborShellExecutor::new(Rc::clone(&session)));
+
+    let result: KimetsuResult<()> = {
+        let mut runtime = ToolRuntime::new(&scratch, RunId::new())?
+            .with_shell_executor(executor)
+            .with_config(ToolRuntimeConfig {
+                redact_secrets: false,
+                ..ToolRuntimeConfig::default()
+            });
+        let _ = run_multi_step_stub(&args.task, Rc::clone(&session), &mut runtime)?;
+        Ok(())
+    };
+
+    // Best-effort cleanup of the scratch dir; never fail the agent on cleanup.
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 fn init(args: InitArgs) -> KimetsuResult<()> {

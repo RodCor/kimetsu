@@ -75,18 +75,27 @@ async def main() -> int:
     print(f"[smoke] tool_calls: {context.get('tool_calls')}")
     print(f"[smoke] environment received {len(env.calls)} command(s)")
 
-    # Validate: exactly one tool.exec for the stub agent's echo, agent.done
-    # populated summary that mentions our task and the protocol version.
+    # MP-7c flow: kimetsu issues two routed shell commands (pwd then
+    # echo) through HarborShellExecutor and emits agent.done with a
+    # context.steps summary. Validate both round-trips landed.
     summary = str(context.get("summary") or "")
     assert "harbor adapter smoke test" in summary, summary
     assert "protocol=0.1" in summary, summary
-    assert len(env.calls) == 1, env.calls
-    assert env.calls[0].startswith("echo"), env.calls
+    assert len(env.calls) == 2, env.calls
+    assert env.calls[0].startswith("pwd"), env.calls
+    assert env.calls[1].startswith("echo"), env.calls
     tool_calls = context.get("tool_calls") or []
-    assert isinstance(tool_calls, list) and len(tool_calls) == 1
-    assert tool_calls[0]["program"] == "echo"
-    assert tool_calls[0]["exit_code"] == 0
+    assert isinstance(tool_calls, list) and len(tool_calls) == 2
+    assert [tc["program"] for tc in tool_calls] == ["pwd", "echo"]
+    assert all(tc["exit_code"] == 0 for tc in tool_calls), tool_calls
     assert context.get("protocol_version") == "0.1"
+
+    # kimetsu_context should carry the per-step context payload we
+    # populated on the Rust side (stub: "multi-step", two steps).
+    kctx = context.get("kimetsu_context") or {}
+    assert kctx.get("stub") == "multi-step", kctx
+    steps = kctx.get("steps") or []
+    assert [s["program"] for s in steps] == ["pwd", "echo"], steps
 
     print("[smoke] OK")
     return 0

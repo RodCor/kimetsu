@@ -28,12 +28,20 @@
 //! flowing through HarborSession) lands in MP-7c, once MP-7b's Python
 //! wrapper has been validated against Harbor.
 
+use std::cell::RefCell;
 use std::io::{BufRead, Write};
+use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use kimetsu_core::KimetsuResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::tools::{
+    CommandSpec, RawShellOutput, ShellExecutor, ToolRuntimeConfig,
+};
 
 /// The version this binary speaks. Bumped when the wire protocol changes
 /// in a non-backward-compatible way so the Python adapter can refuse to
@@ -230,6 +238,106 @@ pub fn run_stub_agent<R: BufRead, W: Write>(
     Ok(probe)
 }
 
+/// MP-7c: `ShellExecutor` impl that proxies every `shell_command` call
+/// through a shared `HarborSession`. The session lives in
+/// `Rc<RefCell<...>>` so the agent function can hand a clone to the
+/// executor (boxed and owned by `ToolRuntime`) while keeping its own
+/// handle for the final `agent.done` emission.
+pub struct HarborShellExecutor<R: BufRead, W: Write> {
+    session: Rc<RefCell<HarborSession<R, W>>>,
+}
+
+impl<R: BufRead, W: Write> HarborShellExecutor<R, W> {
+    pub fn new(session: Rc<RefCell<HarborSession<R, W>>>) -> Self {
+        Self { session }
+    }
+}
+
+impl<R: BufRead + 'static, W: Write + 'static> ShellExecutor for HarborShellExecutor<R, W> {
+    fn execute(
+        &mut self,
+        _repo_root: &Path,
+        spec: &CommandSpec,
+        config: &ToolRuntimeConfig,
+    ) -> KimetsuResult<RawShellOutput> {
+        let started = Instant::now();
+        let timeout_secs = spec
+            .timeout_secs
+            .unwrap_or(config.default_timeout_secs)
+            .min(config.max_timeout_secs);
+        let result = self
+            .session
+            .borrow_mut()
+            .request_tool_exec(ToolExecParams {
+                program: spec.program.clone(),
+                args: spec.args.clone(),
+                cwd: spec.cwd_relative.clone(),
+                timeout_secs,
+            })?;
+        Ok(RawShellOutput {
+            exit_code: result.exit_code,
+            stdout: result.stdout.into_bytes(),
+            stderr: result.stderr.into_bytes(),
+            timed_out: result.timed_out,
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// MP-7c: multi-step stub that exercises the full `ShellExecutor` path.
+/// Runs two shell commands through `HarborShellExecutor` (`pwd` to
+/// surface the workspace root, then `echo` to confirm the task made it
+/// across), then emits `agent.done`. Returns the captured outputs so
+/// tests can assert on per-step behavior.
+///
+/// MP-7d will replace this with a real model loop that issues
+/// `shell_command` calls based on the task description. The protocol
+/// surface and tool routing stay identical.
+pub fn run_multi_step_stub<R: BufRead + 'static, W: Write + 'static>(
+    task: &str,
+    session: Rc<RefCell<HarborSession<R, W>>>,
+    runtime: &mut crate::tools::ToolRuntime,
+) -> KimetsuResult<MultiStepStubReport> {
+    let pwd_out = runtime.shell_command(CommandSpec {
+        program: "pwd".into(),
+        args: vec![],
+        cwd_relative: None,
+        timeout_secs: Some(15),
+        expected_exit: Some(0),
+    })?;
+    let echo_out = runtime.shell_command(CommandSpec {
+        program: "echo".into(),
+        args: vec![format!("kimetsu MP-7c routed task: {task}")],
+        cwd_relative: None,
+        timeout_secs: Some(15),
+        expected_exit: Some(0),
+    })?;
+
+    session.borrow_mut().emit_done(AgentDoneParams {
+        summary: format!(
+            "MP-7c multi-step stub for `{task}` completed; protocol={HARBOR_PROTOCOL_VERSION}"
+        ),
+        context: Some(json!({
+            "stub": "multi-step",
+            "steps": [
+                { "program": "pwd",  "exit_code": pwd_out.exit_code },
+                { "program": "echo", "exit_code": echo_out.exit_code },
+            ],
+        })),
+    })?;
+
+    Ok(MultiStepStubReport {
+        pwd: pwd_out,
+        echo: echo_out,
+    })
+}
+
+#[derive(Debug)]
+pub struct MultiStepStubReport {
+    pub pwd: crate::tools::ShellCommandOutput,
+    pub echo: crate::tools::ShellCommandOutput,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +438,114 @@ mod tests {
         });
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("closed stdin"), "got: {msg}");
+    }
+
+    /// MP-7c: drive the full multi-step routed flow through a
+    /// HarborShellExecutor wired into a real ToolRuntime. The fake
+    /// adapter returns scripted ToolExecResult values per request; we
+    /// assert that:
+    ///   - both shell_command calls came back routed (exit_code visible)
+    ///   - the harness wrote two tool.exec frames in order, followed by
+    ///     agent.done with the routed context summary
+    #[test]
+    fn multi_step_stub_routes_two_shell_commands_through_harbor() {
+        use crate::tools::{ToolRuntime, ToolRuntimeConfig};
+        use kimetsu_core::ids::RunId;
+        use std::fs;
+
+        // The two scripted responses, one per shell_command call.
+        let pwd_response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "exit_code": 0,
+                "stdout": "/workspace",
+                "stderr": "",
+                "timed_out": false,
+            }
+        });
+        let echo_response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "exit_code": 0,
+                "stdout": "kimetsu MP-7c routed task: bench fixture",
+                "stderr": "",
+                "timed_out": false,
+            }
+        });
+        let canned = format!("{pwd_response}\n{echo_response}\n");
+
+        // Reader / writer for HarborSession.
+        let reader = Cursor::new(canned.into_bytes());
+        let writer = Vec::<u8>::new();
+        let session = Rc::new(RefCell::new(HarborSession::new(reader, writer)));
+
+        // ToolRuntime needs a real on-disk root for redaction artifact
+        // bookkeeping (still local — only the subprocess execution
+        // routes through Harbor). Use a temp dir.
+        let root = std::env::temp_dir().join(format!("kimetsu-harbor-test-{}", RunId::new()));
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let report = {
+            let executor = Box::new(HarborShellExecutor::new(Rc::clone(&session)));
+            let mut runtime = ToolRuntime::new(&root, RunId::new())
+                .expect("runtime")
+                .with_shell_executor(executor)
+                .with_config(ToolRuntimeConfig {
+                    redact_secrets: false,
+                    ..ToolRuntimeConfig::default()
+                });
+            let report = run_multi_step_stub("bench fixture", Rc::clone(&session), &mut runtime)
+                .expect("multi-step stub");
+            // Drop runtime here so the Rc<RefCell<...>> only has one
+            // remaining strong reference for the asserts below.
+            drop(runtime);
+            report
+        };
+
+        assert_eq!(report.pwd.exit_code, 0);
+        assert!(report.pwd.stdout_summary.contains("/workspace"));
+        assert_eq!(report.echo.exit_code, 0);
+        assert!(report.echo.stdout_summary.contains("bench fixture"));
+
+        // Pull the writer back out and inspect the frames we sent.
+        let session_inner = Rc::try_unwrap(session)
+            .map_err(|_| "rc still has outstanding refs")
+            .unwrap()
+            .into_inner();
+        let written = String::from_utf8(session_inner.writer).expect("utf8");
+        let mut lines = written.lines();
+
+        let req1: Value = serde_json::from_str(lines.next().expect("pwd line")).unwrap();
+        assert_eq!(req1["method"], "tool.exec");
+        assert_eq!(req1["id"], 1);
+        assert_eq!(req1["params"]["program"], "pwd");
+
+        let req2: Value = serde_json::from_str(lines.next().expect("echo line")).unwrap();
+        assert_eq!(req2["method"], "tool.exec");
+        assert_eq!(req2["id"], 2);
+        assert_eq!(req2["params"]["program"], "echo");
+        assert!(req2["params"]["args"][0]
+            .as_str()
+            .unwrap()
+            .contains("bench fixture"));
+
+        let done: Value = serde_json::from_str(lines.next().expect("done line")).unwrap();
+        assert_eq!(done["method"], "agent.done");
+        assert!(done["params"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("bench fixture"));
+        assert_eq!(done["params"]["context"]["stub"], "multi-step");
+        let steps = done["params"]["context"]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["program"], "pwd");
+        assert_eq!(steps[1]["program"], "echo");
+
+        assert!(lines.next().is_none(), "no trailing frames expected");
+
+        fs::remove_dir_all(root).ok();
     }
 
     /// JSON-RPC error frames must surface as errors with the adapter's

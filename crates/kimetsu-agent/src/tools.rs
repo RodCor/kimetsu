@@ -54,6 +54,90 @@ impl ToolPatchPlan {
     }
 }
 
+/// MP-7c: raw output of a shell command, before redaction / capping /
+/// artifact writing. Returned by `ShellExecutor::execute`.
+#[derive(Debug, Clone, Default)]
+pub struct RawShellOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
+    pub duration_ms: u64,
+}
+
+/// MP-7c: pluggable shell backend. `LocalShellExecutor` (default) runs
+/// the subprocess via `std::process::Command::new` on the host machine.
+/// `HarborShellExecutor` (in `crate::harbor`) proxies the call through
+/// the kimetsu↔Harbor JSON-RPC protocol so commands actually run inside
+/// Harbor's container during Terminal-Bench grading.
+///
+/// The trait is intentionally narrow — only `execute` — so adding a new
+/// backend (Daytona, Vercel Sandbox, etc.) is one impl block.
+pub trait ShellExecutor {
+    fn execute(
+        &mut self,
+        repo_root: &Path,
+        spec: &CommandSpec,
+        config: &ToolRuntimeConfig,
+    ) -> KimetsuResult<RawShellOutput>;
+}
+
+/// Default executor: runs the subprocess locally. Behavior is identical
+/// to what `shell_command_inner` did before MP-7c — `env_clear` plus an
+/// allowlist of host env vars, hard timeout with process-tree kill.
+pub struct LocalShellExecutor;
+
+impl ShellExecutor for LocalShellExecutor {
+    fn execute(
+        &mut self,
+        repo_root: &Path,
+        spec: &CommandSpec,
+        config: &ToolRuntimeConfig,
+    ) -> KimetsuResult<RawShellOutput> {
+        let cwd = resolve_cwd_under(repo_root, spec.cwd_relative.as_deref().unwrap_or("."))?;
+        let timeout_secs = spec
+            .timeout_secs
+            .unwrap_or(config.default_timeout_secs)
+            .min(config.max_timeout_secs);
+        let timeout = Duration::from_secs(timeout_secs);
+        let started = Instant::now();
+
+        let mut command = Command::new(&spec.program);
+        command
+            .args(&spec.args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        for key in default_env_allowlist(&config.env_allowlist_extra) {
+            if let Some(value) = std::env::var_os(&key) {
+                command.env(key, value);
+            }
+        }
+
+        let mut child = command.spawn()?;
+        let timed_out = loop {
+            if child.try_wait()?.is_some() {
+                break false;
+            }
+            if started.elapsed() >= timeout {
+                kill_process_tree(&mut child);
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = child.wait_with_output()?;
+        Ok(RawShellOutput {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            timed_out,
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
 pub struct ToolRuntime {
     repo_root: PathBuf,
     run_id: RunId,
@@ -62,6 +146,10 @@ pub struct ToolRuntime {
     run_paths: Option<RunPaths>,
     active_plan: Option<ToolPatchPlan>,
     config: ToolRuntimeConfig,
+    /// MP-7c: backend that actually runs `shell_command` invocations.
+    /// `LocalShellExecutor` is the default; harbor mode swaps in
+    /// `HarborShellExecutor` to route through the JSON-RPC bridge.
+    shell_executor: Box<dyn ShellExecutor>,
 }
 
 impl ToolRuntime {
@@ -74,6 +162,7 @@ impl ToolRuntime {
             run_paths: None,
             active_plan: None,
             config: ToolRuntimeConfig::default(),
+            shell_executor: Box::new(LocalShellExecutor),
         })
     }
 
@@ -90,6 +179,14 @@ impl ToolRuntime {
 
     pub fn with_stage(mut self, stage: impl Into<String>) -> Self {
         self.stage = stage.into();
+        self
+    }
+
+    /// MP-7c: swap the shell backend. Pass a `HarborShellExecutor` to
+    /// route every `shell_command` call through Harbor's container; pass
+    /// `LocalShellExecutor` (the default) for normal host-side runs.
+    pub fn with_shell_executor(mut self, executor: Box<dyn ShellExecutor>) -> Self {
+        self.shell_executor = executor;
         self
     }
 
@@ -375,45 +472,18 @@ impl ToolRuntime {
 
     fn shell_command_inner(&mut self, input: &CommandSpec) -> KimetsuResult<ShellCommandOutput> {
         validate_command_policy(input)?;
-        let cwd = self.resolve_cwd(input.cwd_relative.as_deref().unwrap_or("."))?;
-        let timeout_secs = input
-            .timeout_secs
-            .unwrap_or(self.config.default_timeout_secs)
-            .min(self.config.max_timeout_secs);
-        let timeout = Duration::from_secs(timeout_secs);
-        let started = Instant::now();
 
-        let mut command = Command::new(&input.program);
-        command
-            .args(&input.args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear();
-        for key in default_env_allowlist(&self.config.env_allowlist_extra) {
-            if let Some(value) = std::env::var_os(&key) {
-                command.env(key, value);
-            }
-        }
+        // MP-7c: subprocess work delegated to the shell executor. The
+        // executor decides whether to run locally or proxy via the
+        // Harbor JSON-RPC bridge; everything around it (redaction,
+        // artifact write-out, capped summaries) is pipeline-side and
+        // identical regardless of where the command ran.
+        let raw = self
+            .shell_executor
+            .execute(&self.repo_root, input, &self.config)?;
 
-        let mut child = command.spawn()?;
-        let timed_out = loop {
-            if child.try_wait()?.is_some() {
-                break false;
-            }
-            if started.elapsed() >= timeout {
-                kill_process_tree(&mut child);
-                break true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let output = child.wait_with_output()?;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut stdout = String::from_utf8_lossy(&raw.stdout).to_string();
+        let mut stderr = String::from_utf8_lossy(&raw.stderr).to_string();
         if self.config.redact_secrets {
             stdout = redact_text(&stdout);
             stderr = redact_text(&stderr);
@@ -425,13 +495,13 @@ impl ToolRuntime {
             self.write_stream_artifacts(stdout.as_bytes(), stderr.as_bytes())?;
 
         Ok(ShellCommandOutput {
-            exit_code,
+            exit_code: raw.exit_code,
             stdout_summary: capped_stdout,
             stderr_summary: capped_stderr,
             stdout_artifact,
             stderr_artifact,
-            duration_ms,
-            timed_out,
+            duration_ms: raw.duration_ms,
+            timed_out: raw.timed_out,
             killed_for_policy: false,
         })
     }
@@ -526,20 +596,6 @@ impl ToolRuntime {
             nearest_existing_parent(parent)?.canonicalize()?
         };
         ensure_inside(&self.repo_root, &canonical_parent)?;
-        Ok(full)
-    }
-
-    fn resolve_cwd(&self, repo_path: &str) -> KimetsuResult<PathBuf> {
-        let path = normalize_repo_path(repo_path)?;
-        let full = if path == "." {
-            self.repo_root.clone()
-        } else {
-            self.resolve_existing(&path)?
-        };
-        if !full.is_dir() {
-            return Err("cwd_outside_repo".into());
-        }
-        ensure_inside(&self.repo_root, &full)?;
         Ok(full)
     }
 
@@ -803,6 +859,26 @@ pub struct ApplyPatchOutput {
 #[derive(Debug)]
 struct DirectOutput {
     stdout: String,
+}
+
+/// MP-7c: free-function variant of `ToolRuntime::resolve_cwd` so the
+/// `LocalShellExecutor` (which doesn't hold a `ToolRuntime` reference)
+/// can resolve a repo-relative cwd against any repo root.
+fn resolve_cwd_under(repo_root: &Path, repo_path: &str) -> KimetsuResult<PathBuf> {
+    let path = normalize_repo_path(repo_path)?;
+    let full = if path == "." {
+        repo_root.to_path_buf()
+    } else {
+        let full = repo_root.join(&path);
+        let canonical = full.canonicalize()?;
+        ensure_inside(repo_root, &canonical)?;
+        canonical
+    };
+    if !full.is_dir() {
+        return Err("cwd_outside_repo".into());
+    }
+    ensure_inside(repo_root, &full)?;
+    Ok(full)
 }
 
 fn normalize_repo_path(path: &str) -> KimetsuResult<String> {
