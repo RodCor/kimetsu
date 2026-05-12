@@ -105,6 +105,12 @@ enum MemoryCommand {
     /// "human curates"; this subcommand is the non-interactive batch mode
     /// (interactive TTY review lands in MP-5b).
     Review(ReviewArgs),
+    /// MP-6: ranked memories by usefulness ratio so the user can see what
+    /// is pulling weight after curation.
+    Top(TopArgs),
+    /// MP-6: bulk-invalidate memories whose outcome attribution says they
+    /// hurt more than they help. Safe-by-default: dry-run unless --apply.
+    Prune(PruneArgs),
 }
 
 #[derive(Debug, Args)]
@@ -165,6 +171,45 @@ struct RejectArgs {
     /// Optional short note; persisted on the memory_proposals row for triage.
     #[arg(long)]
     reason: Option<String>,
+}
+
+/// MP-6: surface the curated memories that are pulling weight. Sorted by
+/// `usefulness_score / use_count` descending, then by use_count
+/// descending as the tie-break.
+#[derive(Debug, Args)]
+struct TopArgs {
+    /// Restrict to a single scope (global_user|project|repo|run).
+    #[arg(long)]
+    scope: Option<String>,
+    /// Hide memories with fewer than this many recorded uses; the small-
+    /// sample guard. Default 3 matches the broker's threshold so the
+    /// listing only shows entries the bias actually applies to.
+    #[arg(long, default_value_t = 3)]
+    min_uses: u32,
+    /// Hard cap on rows returned.
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+}
+
+/// MP-6: prune memories whose outcome attribution data says they cost more
+/// than they help. Defaults match the MP-4c shadowing thresholds so the
+/// prune list is exactly the entries the broker is already discounting.
+#[derive(Debug, Args)]
+struct PruneArgs {
+    /// Restrict to a single scope.
+    #[arg(long)]
+    scope: Option<String>,
+    /// Only consider memories with at least this many uses.
+    #[arg(long, default_value_t = 3)]
+    min_uses: u32,
+    /// Prune memories whose `usefulness_score / use_count` is at or below
+    /// this value. Default -0.2 mirrors MP-4c's SHADOW_MAX_RATIO.
+    #[arg(long, default_value_t = -0.2)]
+    max_ratio: f32,
+    /// Actually invalidate the matches. Without this, the command prints
+    /// what would be pruned and exits 0.
+    #[arg(long)]
+    apply: bool,
 }
 
 /// Batch review of pending memory proposals. Either `--accept-all` or
@@ -566,7 +611,102 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
             Ok(())
         }
         MemoryCommand::Review(args) => review_proposals(args),
+        MemoryCommand::Top(args) => memory_top(args),
+        MemoryCommand::Prune(args) => memory_prune(args),
     }
+}
+
+/// MP-6: pretty-print `list_memories_top`. Surfaces ratio + use_count
+/// alongside the text so the user can quickly judge which entries to
+/// keep and which to invalidate.
+fn memory_top(args: TopArgs) -> KimetsuResult<()> {
+    let cwd = env::current_dir()?;
+    let rows = project::list_memories_top(
+        &cwd,
+        project::TopOptions {
+            scope: args.scope.clone(),
+            min_uses: args.min_uses,
+            limit: args.limit,
+        },
+    )?;
+    if rows.is_empty() {
+        println!("no memories meet the min-uses threshold ({})", args.min_uses);
+        return Ok(());
+    }
+    println!(
+        "top memories (min_uses>={}, limit={}{}):",
+        args.min_uses,
+        args.limit,
+        args.scope
+            .as_deref()
+            .map(|s| format!(", scope={s}"))
+            .unwrap_or_default()
+    );
+    for m in rows {
+        let ratio = m.usefulness_score as f64 / m.use_count.max(1) as f64;
+        println!(
+            "  {} [{}:{} uses={} usefulness={:+.1} ratio={:+.2}] {}",
+            m.memory_id, m.scope, m.kind, m.use_count, m.usefulness_score, ratio, m.text
+        );
+    }
+    Ok(())
+}
+
+/// MP-6: dry-run by default. Without `--apply` it prints the prune list
+/// and exits 0; with `--apply` it invalidates each match via the same
+/// `invalidate_memory` path used by `memory invalidate`.
+fn memory_prune(args: PruneArgs) -> KimetsuResult<()> {
+    let cwd = env::current_dir()?;
+    let summary = project::prune_low_usefulness(
+        &cwd,
+        project::PruneOptions {
+            scope: args.scope.clone(),
+            min_uses: args.min_uses,
+            max_ratio: args.max_ratio,
+            apply: args.apply,
+        },
+    )?;
+
+    if summary.candidates.is_empty() {
+        println!(
+            "no memories match the prune criteria (min_uses>={}, max_ratio<={:+.2}{})",
+            args.min_uses,
+            args.max_ratio,
+            args.scope
+                .as_deref()
+                .map(|s| format!(", scope={s}"))
+                .unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    let action = if args.apply { "pruning" } else { "would prune" };
+    println!(
+        "{action} {} memorie(s) (min_uses>={}, max_ratio<={:+.2}{}):",
+        summary.candidates.len(),
+        args.min_uses,
+        args.max_ratio,
+        args.scope
+            .as_deref()
+            .map(|s| format!(", scope={s}"))
+            .unwrap_or_default()
+    );
+    for c in &summary.candidates {
+        let ratio = c.usefulness_score as f64 / c.use_count.max(1) as f64;
+        println!(
+            "  {} [{}:{} uses={} usefulness={:+.1} ratio={:+.2}] {}",
+            c.memory_id, c.scope, c.kind, c.use_count, c.usefulness_score, ratio, c.text
+        );
+    }
+    if !args.apply {
+        println!("dry-run; pass --apply to invalidate these memories");
+    } else {
+        println!(
+            "summary: invalidated={} failed={}",
+            summary.invalidated, summary.failed
+        );
+    }
+    Ok(())
 }
 
 /// MP-5a/b: review handler. Three modes:

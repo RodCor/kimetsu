@@ -290,6 +290,226 @@ pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
     Ok(memories)
 }
 
+/// MP-6: ranked list of memories sorted by the same usefulness ratio the
+/// broker uses for retrieval scoring (`usefulness_score / use_count`).
+/// Filters out invalidated rows and any memory with `use_count < min_uses`
+/// (the small-sample guard; default 3 matches the broker's
+/// SMALL_SAMPLE_THRESHOLD). Optional scope filter narrows to a single
+/// memory class. Lets the user see which memories are actually doing
+/// work so they can prune the rest with `memory prune`.
+#[derive(Debug, Clone, Default)]
+pub struct TopOptions {
+    pub scope: Option<String>,
+    pub min_uses: u32,
+    pub limit: u32,
+}
+
+pub fn list_memories_top(start: &Path, opts: TopOptions) -> KimetsuResult<Vec<MemoryRow>> {
+    let (_paths, _config, conn) = load_project(start)?;
+    let min_uses = opts.min_uses.max(1) as i64;
+    let limit = if opts.limit == 0 { 20 } else { opts.limit } as i64;
+
+    let (sql, scope_param): (&str, Option<String>) = if let Some(scope) = opts.scope.as_deref() {
+        (
+            "
+            SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
+            FROM memories
+            WHERE invalidated_at IS NULL
+              AND use_count >= ?1
+              AND lower(scope) = lower(?2)
+            ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
+            LIMIT ?3
+            ",
+            Some(scope.to_string()),
+        )
+    } else {
+        (
+            "
+            SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
+            FROM memories
+            WHERE invalidated_at IS NULL
+              AND use_count >= ?1
+            ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
+            LIMIT ?2
+            ",
+            None,
+        )
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = if let Some(scope) = scope_param {
+        stmt.query_map(params![min_uses, scope, limit], map_memory_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![min_uses, limit], map_memory_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    // SQLite's NaN-from-zero protection: a freshly-created memory with
+    // use_count=0 would division-zero, but the WHERE clause guards
+    // min_uses >= 1, so we never see a NaN here. Sort is a defensive
+    // tie-breaker only.
+    rows.sort_by(|a, b| {
+        let ra = a.usefulness_score as f64 / a.use_count.max(1) as f64;
+        let rb = b.usefulness_score as f64 / b.use_count.max(1) as f64;
+        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(rows)
+}
+
+fn map_memory_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
+    Ok(MemoryRow {
+        memory_id: row.get(0)?,
+        scope: row.get(1)?,
+        kind: row.get(2)?,
+        text: row.get(3)?,
+        confidence: row.get(4)?,
+        use_count: row.get(5)?,
+        usefulness_score: row.get::<_, f64>(6)? as f32,
+    })
+}
+
+/// MP-6: bulk prune of memories whose outcome-attribution data says they
+/// are net-negative. Selection rules:
+///   use_count >= min_uses
+///   usefulness_score / use_count <= max_ratio
+///   invalidated_at IS NULL
+///   scope filter optional
+///
+/// `apply = false` is the default at the CLI layer so the user sees
+/// what would be touched before any writes. `apply = true` invalidates
+/// each match via the existing `invalidate_memory` path so every
+/// removal still emits a canonical `memory.invalidated` event.
+#[derive(Debug, Clone)]
+pub struct PruneOptions {
+    pub scope: Option<String>,
+    pub min_uses: u32,
+    pub max_ratio: f32,
+    pub apply: bool,
+}
+
+impl Default for PruneOptions {
+    fn default() -> Self {
+        Self {
+            scope: None,
+            min_uses: 3,
+            max_ratio: -0.2,
+            apply: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PruneCandidate {
+    pub memory_id: String,
+    pub scope: String,
+    pub kind: String,
+    pub use_count: u32,
+    pub usefulness_score: f32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PruneSummary {
+    pub candidates: Vec<PruneCandidate>,
+    pub invalidated: u32,
+    pub failed: u32,
+}
+
+pub fn prune_low_usefulness(start: &Path, opts: PruneOptions) -> KimetsuResult<PruneSummary> {
+    let min_uses = opts.min_uses.max(1) as i64;
+
+    let candidates = {
+        let (_paths, _config, conn) = load_project(start)?;
+        let (sql, scope_param): (&str, Option<String>) = if let Some(scope) = opts.scope.as_deref()
+        {
+            (
+                "
+                SELECT memory_id, scope, kind, text, use_count, usefulness_score
+                FROM memories
+                WHERE invalidated_at IS NULL
+                  AND use_count >= ?1
+                  AND (usefulness_score / CAST(use_count AS REAL)) <= ?2
+                  AND lower(scope) = lower(?3)
+                ORDER BY (usefulness_score / CAST(use_count AS REAL)) ASC
+                ",
+                Some(scope.to_string()),
+            )
+        } else {
+            (
+                "
+                SELECT memory_id, scope, kind, text, use_count, usefulness_score
+                FROM memories
+                WHERE invalidated_at IS NULL
+                  AND use_count >= ?1
+                  AND (usefulness_score / CAST(use_count AS REAL)) <= ?2
+                ORDER BY (usefulness_score / CAST(use_count AS REAL)) ASC
+                ",
+                None,
+            )
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let max_ratio = opts.max_ratio as f64;
+        let mut found: Vec<PruneCandidate> = if let Some(scope) = scope_param {
+            stmt.query_map(params![min_uses, max_ratio, scope], |row| {
+                Ok(PruneCandidate {
+                    memory_id: row.get(0)?,
+                    scope: row.get(1)?,
+                    kind: row.get(2)?,
+                    text: row.get(3)?,
+                    use_count: row.get(4)?,
+                    usefulness_score: row.get::<_, f64>(5)? as f32,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![min_uses, max_ratio], |row| {
+                Ok(PruneCandidate {
+                    memory_id: row.get(0)?,
+                    scope: row.get(1)?,
+                    kind: row.get(2)?,
+                    text: row.get(3)?,
+                    use_count: row.get(4)?,
+                    usefulness_score: row.get::<_, f64>(5)? as f32,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        // Stable tie-break: lowest ratio first, then highest use_count
+        // first (penalize the long-running underperformers).
+        found.sort_by(|a, b| {
+            let ra = a.usefulness_score as f64 / a.use_count.max(1) as f64;
+            let rb = b.usefulness_score as f64 / b.use_count.max(1) as f64;
+            ra.partial_cmp(&rb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.use_count.cmp(&a.use_count))
+        });
+        found
+    };
+
+    let mut summary = PruneSummary {
+        candidates: candidates.clone(),
+        invalidated: 0,
+        failed: 0,
+    };
+    if !opts.apply {
+        return Ok(summary);
+    }
+
+    for candidate in &candidates {
+        let ratio = candidate.usefulness_score / candidate.use_count.max(1) as f32;
+        let reason = format!(
+            "pruned_by_usefulness ratio={:+.2} use_count={}",
+            ratio, candidate.use_count
+        );
+        match invalidate_memory(start, &candidate.memory_id, Some(&reason)) {
+            Ok(()) => summary.invalidated += 1,
+            Err(_) => summary.failed += 1,
+        }
+    }
+    Ok(summary)
+}
+
 pub fn list_proposals(
     start: &Path,
     filter: ProposalFilter,
@@ -1226,6 +1446,221 @@ mod tests {
         // The row itself still exists in brain.db.
         let memories = list_memories(&root).expect("list");
         assert!(memories.iter().any(|m| m.memory_id == memory_id));
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+/// MP-6: `list_memories_top` returns invalidated_at IS NULL memories
+    /// sorted by ratio descending, filtered by `min_uses`. Memories with
+    /// use_count below the threshold are dropped entirely so the listing
+    /// only shows entries the broker bias actually applies to.
+    #[test]
+    fn list_memories_top_sorts_by_usefulness_ratio_and_drops_small_samples() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+
+        let m_great = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "GREAT")
+            .expect("great");
+        let m_meh = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "meh")
+            .expect("meh");
+        let m_bad = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "BAD")
+            .expect("bad");
+        let m_fresh = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "fresh")
+            .expect("fresh");
+
+        // Directly set usefulness data; the event-sourcing path is already
+        // tested by `run_finished_increments_usefulness_for_injected_memories`.
+        {
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            conn.execute(
+                "UPDATE memories SET use_count = 5, usefulness_score = 4.0 WHERE memory_id = ?1",
+                params![m_great],
+            )
+            .expect("set great");
+            conn.execute(
+                "UPDATE memories SET use_count = 5, usefulness_score = 0.0 WHERE memory_id = ?1",
+                params![m_meh],
+            )
+            .expect("set meh");
+            conn.execute(
+                "UPDATE memories SET use_count = 5, usefulness_score = -3.0 WHERE memory_id = ?1",
+                params![m_bad],
+            )
+            .expect("set bad");
+            // m_fresh stays at use_count=0; should be excluded.
+        }
+
+        let top = list_memories_top(
+            &root,
+            TopOptions {
+                scope: None,
+                min_uses: 3,
+                limit: 10,
+            },
+        )
+        .expect("top");
+        assert_eq!(top.len(), 3, "fresh memory below min_uses must be excluded");
+        assert_eq!(top[0].memory_id, m_great);
+        assert_eq!(top[1].memory_id, m_meh);
+        assert_eq!(top[2].memory_id, m_bad);
+
+        // Now invalidate the GREAT memory and confirm it disappears.
+        invalidate_memory(&root, &m_great, Some("test")).expect("invalidate");
+        let top_after = list_memories_top(
+            &root,
+            TopOptions {
+                scope: None,
+                min_uses: 3,
+                limit: 10,
+            },
+        )
+        .expect("top after");
+        assert_eq!(top_after.len(), 2);
+        assert!(top_after.iter().all(|m| m.memory_id != m_great));
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    /// MP-6: `prune_low_usefulness` lists candidates without writing when
+    /// `apply = false`, and invalidates each match via the canonical
+    /// `memory.invalidated` event path when `apply = true`. The prune
+    /// reason includes the ratio + use_count so audit trail explains
+    /// why the memory left.
+    #[test]
+    fn prune_low_usefulness_dry_run_then_apply() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+
+        let m_keep = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "keep me, I help",
+        )
+        .expect("keep");
+        let m_drop_1 = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "drop me, I hurt",
+        )
+        .expect("drop1");
+        let m_drop_2 = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "drop me too",
+        )
+        .expect("drop2");
+        let m_small_sample = add_memory(
+            &root,
+            MemoryScope::Repo,
+            MemoryKind::Convention,
+            "small sample shouldn't be pruned even if score is bad",
+        )
+        .expect("small");
+
+        {
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            // keep: ratio = +0.6 (above threshold)
+            conn.execute(
+                "UPDATE memories SET use_count = 5, usefulness_score = 3.0 WHERE memory_id = ?1",
+                params![m_keep],
+            )
+            .expect("set keep");
+            // drop_1: ratio = -0.6 (well below -0.2)
+            conn.execute(
+                "UPDATE memories SET use_count = 5, usefulness_score = -3.0 WHERE memory_id = ?1",
+                params![m_drop_1],
+            )
+            .expect("set drop1");
+            // drop_2: ratio = -0.4
+            conn.execute(
+                "UPDATE memories SET use_count = 5, usefulness_score = -2.0 WHERE memory_id = ?1",
+                params![m_drop_2],
+            )
+            .expect("set drop2");
+            // small_sample: ratio = -1.0 but only 2 uses, must NOT be pruned
+            conn.execute(
+                "UPDATE memories SET use_count = 2, usefulness_score = -2.0 WHERE memory_id = ?1",
+                params![m_small_sample],
+            )
+            .expect("set small");
+        }
+
+        // Dry-run: lists candidates but does not invalidate.
+        let dry = prune_low_usefulness(
+            &root,
+            PruneOptions {
+                scope: None,
+                min_uses: 3,
+                max_ratio: -0.2,
+                apply: false,
+            },
+        )
+        .expect("dry-run");
+        assert_eq!(dry.candidates.len(), 2);
+        assert_eq!(dry.invalidated, 0);
+        let ids: Vec<&str> = dry.candidates.iter().map(|c| c.memory_id.as_str()).collect();
+        assert!(ids.contains(&m_drop_1.as_str()));
+        assert!(ids.contains(&m_drop_2.as_str()));
+        // Confirm small_sample stayed out of the candidate list.
+        assert!(!ids.contains(&m_small_sample.as_str()));
+
+        // Pre-apply state: all four memories still active.
+        let pre = list_memories(&root).expect("pre");
+        assert_eq!(pre.len(), 4);
+
+        // Apply: both bad memories invalidated, keep + small_sample untouched.
+        let applied = prune_low_usefulness(
+            &root,
+            PruneOptions {
+                scope: None,
+                min_uses: 3,
+                max_ratio: -0.2,
+                apply: true,
+            },
+        )
+        .expect("apply");
+        assert_eq!(applied.candidates.len(), 2);
+        assert_eq!(applied.invalidated, 2);
+        assert_eq!(applied.failed, 0);
+
+        // Post-apply: list_memories_top with min_uses=3 should now only
+        // surface the keep memory (drops are invalidated_at IS NOT NULL,
+        // small_sample is filtered by min_uses).
+        let top = list_memories_top(
+            &root,
+            TopOptions {
+                scope: None,
+                min_uses: 3,
+                limit: 10,
+            },
+        )
+        .expect("top after prune");
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].memory_id, m_keep);
+
+        // Confirm the canonical event trail: each pruned memory has a
+        // non-null invalidated_at and the reason mentions "pruned_by_usefulness".
+        // Scope the connection so it's dropped before fs::remove_dir_all
+        // on Windows, where SQLite holds an exclusive lock on the journal.
+        {
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let reason: String = conn
+                .query_row(
+                    "SELECT invalidated_reason FROM memories WHERE memory_id = ?1",
+                    params![m_drop_1],
+                    |row| row.get(0),
+                )
+                .expect("invalidated reason");
+            assert!(
+                reason.starts_with("pruned_by_usefulness"),
+                "unexpected reason: {reason}"
+            );
+        }
 
         fs::remove_dir_all(root).expect("remove temp project");
     }
