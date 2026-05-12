@@ -48,6 +48,21 @@ enum Command {
         #[command(subcommand)]
         command: LockCommand,
     },
+    /// MP-7a: agent transports. Today only `--harbor-mode` exists, used
+    /// by the Terminal-Bench Python wrapper (see V0.2-PLAN.md MP-7).
+    Agent(AgentArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentArgs {
+    /// Speak the kimetsu↔Harbor JSON-RPC protocol on stdin/stdout
+    /// instead of executing tools locally. Used by Harbor's external-
+    /// agent mode for Terminal-Bench grading.
+    #[arg(long)]
+    harbor_mode: bool,
+    /// The instruction/task string the agent should work on.
+    #[arg(long)]
+    task: String,
 }
 
 #[derive(Debug, Args)]
@@ -371,7 +386,29 @@ fn run() -> KimetsuResult<()> {
         Command::Bench { command } => bench(command),
         Command::Runs { command } => runs(command),
         Command::Lock { command } => lock(command),
+        Command::Agent(args) => agent(args),
     }
+}
+
+/// MP-7a: dispatcher for `kimetsu agent`. For now only `--harbor-mode`
+/// is implemented; without it we error so a typo doesn't silently no-op.
+fn agent(args: AgentArgs) -> KimetsuResult<()> {
+    if !args.harbor_mode {
+        return Err(
+            "kimetsu agent currently only supports --harbor-mode; see V0.2-PLAN.md MP-7"
+                .into(),
+        );
+    }
+    let stdin = io::stdin();
+    let reader = stdin.lock();
+    let stdout = io::stdout();
+    let writer = stdout.lock();
+    let mut session = kimetsu_agent::harbor::HarborSession::new(reader, writer);
+    // MP-7a ships the protocol scaffolding only; MP-7c plumbs the real
+    // pipeline through HarborSession. For now run the stub agent so the
+    // Python wrapper has something to handshake against.
+    let _ = kimetsu_agent::harbor::run_stub_agent(&args.task, &mut session)?;
+    Ok(())
 }
 
 fn init(args: InitArgs) -> KimetsuResult<()> {
