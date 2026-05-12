@@ -1229,4 +1229,124 @@ mod tests {
 
         fs::remove_dir_all(root).expect("remove temp project");
     }
+
+    /// MP-5a: the brain primitives behind `kimetsu brain memory review`.
+    /// Workflow: inject several proposals across two runs, filter by run +
+    /// confidence to pick the keepers, batch-accept those, then
+    /// batch-reject the remainder. The final state must show exactly the
+    /// accepted proposals as memories and exactly the rejected proposals
+    /// carrying a non-empty decided_reason.
+    #[test]
+    fn batch_review_accepts_filtered_subset_and_rejects_remainder() {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        init_project(&root, false).expect("init project");
+
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+
+        // Two proposals from run_a (one strong, one weak) plus two more
+        // from run_b. The "review" flow will accept run_a's strong one,
+        // reject everything else.
+        let proposals: [(&str, RunId, &str, &str, f32, &str); 4] = [
+            ("p_a_strong", run_a, "global_user", "preference", 0.92, "Prefer rg over grep"),
+            ("p_a_weak",   run_a, "repo",        "convention", 0.55, "Always use let-else"),
+            ("p_b1",       run_b, "repo",        "convention", 0.70, "Use Result not panic"),
+            ("p_b2",       run_b, "global_user", "preference", 0.88, "Open links in new tab"),
+        ];
+
+        {
+            let (paths, _config, conn) = load_project(&root).expect("load");
+            for (proposal_id, run_id, scope, kind, conf, text) in &proposals {
+                let (mut writer, _) = TraceWriter::create(&paths, *run_id).expect("trace");
+                let event = Event::new(
+                    *run_id,
+                    "memory.proposed",
+                    serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "scope": scope,
+                        "kind": kind,
+                        "text": text,
+                        "rationale": "fixture",
+                        "proposed_confidence": conf,
+                        "source_event_ids": [],
+                    }),
+                );
+                writer.append(&event, true).expect("append");
+                projector::apply_events(&conn, &[event]).expect("project");
+            }
+        }
+
+        // Step 1: --accept-all --from-run <run_a> --min-confidence 0.8
+        // mirrors the CLI filter + accept loop.
+        let to_accept = list_proposals(
+            &root,
+            ProposalFilter {
+                from_run: Some(run_a.to_string()),
+                min_confidence: Some(0.8),
+                status: Some("pending".into()),
+                limit: 100,
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list strong from run_a");
+        assert_eq!(to_accept.len(), 1, "filter should keep only p_a_strong");
+        assert_eq!(to_accept[0].proposal_id, "p_a_strong");
+        let memory_id = accept_proposal(
+            &root,
+            &to_accept[0].proposal_id,
+            AcceptOverrides::default(),
+        )
+        .expect("accept p_a_strong");
+
+        // Step 2: --reject-all --reason "batch_reject" over the remaining
+        // pending proposals.
+        let to_reject = list_proposals(
+            &root,
+            ProposalFilter {
+                status: Some("pending".into()),
+                limit: 100,
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list remaining pending");
+        assert_eq!(to_reject.len(), 3, "three proposals should remain pending");
+        for p in &to_reject {
+            reject_proposal(&root, &p.proposal_id, Some("batch_reject"))
+                .expect("reject in batch");
+        }
+
+        // Final state: exactly one memory; exactly three rejected proposals;
+        // zero pending. Decision reason persisted on each rejected row.
+        let memories = list_memories(&root).expect("list memories");
+        assert_eq!(memories.len(), 1, "only the accepted proposal becomes a memory");
+        assert_eq!(memories[0].memory_id, memory_id);
+
+        let pending = list_proposals(
+            &root,
+            ProposalFilter {
+                status: Some("pending".into()),
+                limit: 100,
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list pending");
+        assert!(pending.is_empty(), "no proposals left pending after batch review");
+
+        let rejected = list_proposals(
+            &root,
+            ProposalFilter {
+                status: Some("rejected".into()),
+                limit: 100,
+                ..ProposalFilter::default()
+            },
+        )
+        .expect("list rejected");
+        assert_eq!(rejected.len(), 3);
+        for row in &rejected {
+            assert_eq!(row.decided_reason.as_deref(), Some("batch_reject"));
+        }
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
 }

@@ -100,6 +100,10 @@ enum MemoryCommand {
     Accept(AcceptArgs),
     Reject(RejectArgs),
     Invalidate(InvalidateArgs),
+    /// MP-5a: batch review pending memory proposals. The v0.2 default is
+    /// "human curates"; this subcommand is the non-interactive batch mode
+    /// (interactive TTY review lands in MP-5b).
+    Review(ReviewArgs),
 }
 
 #[derive(Debug, Args)]
@@ -160,6 +164,47 @@ struct RejectArgs {
     /// Optional short note; persisted on the memory_proposals row for triage.
     #[arg(long)]
     reason: Option<String>,
+}
+
+/// Batch review of pending memory proposals. Either `--accept-all` or
+/// `--reject-all` is required (they are mutually exclusive). The filter
+/// flags narrow the batch; defaults match `memory proposals` listing.
+///
+/// Examples:
+///   kimetsu brain memory review --accept-all --from-run <run_id>
+///   kimetsu brain memory review --reject-all --reason "too task-specific"
+///   kimetsu brain memory review --accept-all --scope global_user --min-confidence 0.8
+///   kimetsu brain memory review --accept-all --dry-run     # preview only
+#[derive(Debug, Args)]
+struct ReviewArgs {
+    /// Accept every pending proposal matching the filters.
+    #[arg(long, conflicts_with = "reject_all")]
+    accept_all: bool,
+    /// Reject every pending proposal matching the filters.
+    #[arg(long, conflicts_with = "accept_all")]
+    reject_all: bool,
+    /// Reason recorded on each rejected proposal; defaults to
+    /// "batch_reject" when omitted with `--reject-all`.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Restrict to a single scope (global_user|project|repo|run).
+    #[arg(long)]
+    scope: Option<String>,
+    /// Restrict to a single kind (preference|convention|failure_pattern|...).
+    #[arg(long)]
+    kind: Option<String>,
+    /// Restrict to proposals from a specific run.
+    #[arg(long)]
+    from_run: Option<String>,
+    /// Drop proposals whose proposed_confidence is below this value.
+    #[arg(long)]
+    min_confidence: Option<f32>,
+    /// Hard cap on rows reviewed in this batch.
+    #[arg(long, default_value_t = 100)]
+    limit: u32,
+    /// Print what would happen without writing any events.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -519,7 +564,107 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
             }
             Ok(())
         }
+        MemoryCommand::Review(args) => review_proposals(args),
     }
+}
+
+/// MP-5a: batch review handler. Loads the pending proposals matching the
+/// filter, then either accepts or rejects every match. Exits non-zero if
+/// neither `--accept-all` nor `--reject-all` was given so a misconfigured
+/// CI script never silently no-ops.
+fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
+    if !args.accept_all && !args.reject_all {
+        return Err(
+            "memory review requires --accept-all or --reject-all (interactive mode lands in MP-5b)"
+                .into(),
+        );
+    }
+
+    let cwd = env::current_dir()?;
+    let pending = project::list_proposals(
+        &cwd,
+        project::ProposalFilter {
+            scope: args.scope.clone(),
+            kind: args.kind.clone(),
+            from_run: args.from_run.clone(),
+            min_confidence: args.min_confidence,
+            status: Some("pending".to_string()),
+            limit: args.limit,
+        },
+    )?;
+
+    if pending.is_empty() {
+        println!("no pending proposals matched the filters");
+        return Ok(());
+    }
+
+    let action = if args.accept_all { "accept" } else { "reject" };
+    println!(
+        "review: would {action} {} pending proposal(s){}",
+        pending.len(),
+        if args.dry_run { " (dry-run)" } else { "" }
+    );
+    for p in &pending {
+        println!(
+            "  {} [{}:{} confidence={:.2} run={}] {}",
+            p.proposal_id, p.scope, p.kind, p.proposed_confidence, p.run_id, p.text
+        );
+    }
+    if args.dry_run {
+        return Ok(());
+    }
+
+    let mut accepted = 0u32;
+    let mut rejected = 0u32;
+    let mut failed = 0u32;
+    let resolved_reason = args
+        .reason
+        .clone()
+        .unwrap_or_else(|| "batch_reject".to_string());
+
+    for proposal in pending {
+        if args.accept_all {
+            match project::accept_proposal(
+                &cwd,
+                &proposal.proposal_id,
+                project::AcceptOverrides::default(),
+            ) {
+                Ok(memory_id) => {
+                    accepted += 1;
+                    println!("accepted {} -> memory {memory_id}", proposal.proposal_id);
+                }
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "skipped accept on {}: {err}",
+                        proposal.proposal_id
+                    );
+                }
+            }
+        } else {
+            match project::reject_proposal(&cwd, &proposal.proposal_id, Some(&resolved_reason)) {
+                Ok(()) => {
+                    rejected += 1;
+                    println!(
+                        "rejected {} (reason: {resolved_reason})",
+                        proposal.proposal_id
+                    );
+                }
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "skipped reject on {}: {err}",
+                        proposal.proposal_id
+                    );
+                }
+            }
+        }
+    }
+
+    println!(
+        "summary: accepted={accepted} rejected={rejected} failed={failed}"
+    );
+    Ok(())
 }
 
 fn run_command(command: RunCommand) -> KimetsuResult<()> {
