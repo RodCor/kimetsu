@@ -16,3 +16,6 @@ kimetsu-brain = { path = "../kimetsu-brain" }
 kimetsu-core = { path = "../kimetsu-core" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,5 +1,6 @@
 use std::env;
-use std::path::PathBuf;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
@@ -568,16 +569,18 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
     }
 }
 
-/// MP-5a: batch review handler. Loads the pending proposals matching the
-/// filter, then either accepts or rejects every match. Exits non-zero if
-/// neither `--accept-all` nor `--reject-all` was given so a misconfigured
-/// CI script never silently no-ops.
+/// MP-5a/b: review handler. Three modes:
+///
+/// * `--accept-all` / `--reject-all` — non-interactive batch (MP-5a).
+/// * No flags + stdin is a TTY — interactive walkthrough (MP-5b): one
+///   proposal at a time, prompt `[a]ccept [r]eject [s]kip [q]uit`.
+/// * No flags + stdin is NOT a TTY — error, so a misconfigured CI script
+///   never silently hangs on a stdin read.
 fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
-    if !args.accept_all && !args.reject_all {
-        return Err(
-            "memory review requires --accept-all or --reject-all (interactive mode lands in MP-5b)"
-                .into(),
-        );
+    if args.accept_all && args.reject_all {
+        // clap's conflicts_with should already block this, but guard in
+        // case it's bypassed via internal callers.
+        return Err("--accept-all and --reject-all are mutually exclusive".into());
     }
 
     let cwd = env::current_dir()?;
@@ -596,6 +599,17 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
     if pending.is_empty() {
         println!("no pending proposals matched the filters");
         return Ok(());
+    }
+
+    // MP-5b: no batch flag -> interactive walkthrough when stdin is a TTY.
+    if !args.accept_all && !args.reject_all {
+        if !io::stdin().is_terminal() {
+            return Err(
+                "memory review requires --accept-all / --reject-all when stdin is not a TTY"
+                    .into(),
+            );
+        }
+        return interactive_review_loop(&cwd, pending);
     }
 
     let action = if args.accept_all { "accept" } else { "reject" };
@@ -665,6 +679,169 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
         "summary: accepted={accepted} rejected={rejected} failed={failed}"
     );
     Ok(())
+}
+
+/// MP-5b: walk pending proposals one at a time, prompting the user for
+/// each. Decisions persist immediately (idempotent via the existing
+/// brain APIs), so `[q]uit` partway through leaves an accurate state.
+///
+/// Prompt vocabulary kept intentionally small for v0.2:
+///   `a` accept | `r` reject | `s` skip | `q` quit | `?` re-print help
+/// On `r` we ask for an optional reason on a follow-up line; empty input
+/// keeps the default `reviewed_rejected_interactive`. Edits to scope /
+/// kind / text are deferred to MP-5c — for now [s]kip + the existing
+/// `memory accept --scope X` / `memory reject` commands cover that path.
+fn interactive_review_loop(cwd: &Path, pending: Vec<project::ProposalRow>) -> KimetsuResult<()> {
+    let stdin = io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let stdout = io::stdout();
+    let mut stdout_lock = stdout.lock();
+    interactive_review_loop_inner(cwd, pending, &mut stdin_lock, &mut stdout_lock)
+}
+
+/// Pure plumbing for `interactive_review_loop`: takes injected I/O so the
+/// loop can be driven from tests with scripted input. Production wiring
+/// passes stdin/stdout locks; tests pass `Cursor::new(b"a\n...")` and a
+/// `Vec<u8>` writer.
+fn interactive_review_loop_inner<R: BufRead, W: Write>(
+    cwd: &Path,
+    pending: Vec<project::ProposalRow>,
+    reader: &mut R,
+    writer: &mut W,
+) -> KimetsuResult<()> {
+    let total = pending.len();
+    let mut input = String::new();
+    let mut accepted = 0u32;
+    let mut rejected = 0u32;
+    let mut skipped = 0u32;
+    let mut failed = 0u32;
+
+    writeln!(
+        writer,
+        "interactive review: {total} pending proposal(s). [a]ccept [r]eject [s]kip [q]uit [?]help"
+    )?;
+
+    for (idx, proposal) in pending.into_iter().enumerate() {
+        writeln!(writer)?;
+        writeln!(
+            writer,
+            "[{idx_one}/{total}] {pid}  scope={scope}  kind={kind}  confidence={conf:.2}  run={run}",
+            idx_one = idx + 1,
+            pid = proposal.proposal_id,
+            scope = proposal.scope,
+            kind = proposal.kind,
+            conf = proposal.proposed_confidence,
+            run = proposal.run_id,
+        )?;
+        writeln!(writer, "  text: {}", proposal.text)?;
+        if !proposal.rationale.is_empty() {
+            writeln!(writer, "  rationale: {}", proposal.rationale)?;
+        }
+
+        loop {
+            write!(writer, "  > ")?;
+            writer.flush().ok();
+            input.clear();
+            let read = reader.read_line(&mut input)?;
+            if read == 0 {
+                let processed = accepted + rejected + skipped + failed;
+                let unprocessed = (total as u32).saturating_sub(processed);
+                skipped += unprocessed;
+                writeln!(
+                    writer,
+                    "(stdin closed; {unprocessed} proposal(s) skipped)"
+                )?;
+                print_interactive_summary(writer, accepted, rejected, skipped, failed)?;
+                return Ok(());
+            }
+            let choice = input.trim().to_ascii_lowercase();
+            match choice.as_str() {
+                "a" | "accept" => {
+                    match project::accept_proposal(
+                        cwd,
+                        &proposal.proposal_id,
+                        project::AcceptOverrides::default(),
+                    ) {
+                        Ok(memory_id) => {
+                            accepted += 1;
+                            writeln!(writer, "  -> accepted: memory {memory_id}")?;
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            writeln!(writer, "  -> accept failed: {err}")?;
+                        }
+                    }
+                    break;
+                }
+                "r" | "reject" => {
+                    write!(writer, "  reason (enter to use default): ")?;
+                    writer.flush().ok();
+                    let mut reason_buf = String::new();
+                    reader.read_line(&mut reason_buf)?;
+                    let reason = reason_buf.trim();
+                    let resolved = if reason.is_empty() {
+                        "reviewed_rejected_interactive"
+                    } else {
+                        reason
+                    };
+                    match project::reject_proposal(cwd, &proposal.proposal_id, Some(resolved)) {
+                        Ok(()) => {
+                            rejected += 1;
+                            writeln!(writer, "  -> rejected (reason: {resolved})")?;
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            writeln!(writer, "  -> reject failed: {err}")?;
+                        }
+                    }
+                    break;
+                }
+                "s" | "skip" | "" => {
+                    skipped += 1;
+                    writeln!(writer, "  -> skipped (still pending)")?;
+                    break;
+                }
+                "q" | "quit" | "exit" => {
+                    let processed = accepted + rejected + skipped + failed;
+                    let unprocessed = (total as u32).saturating_sub(processed);
+                    skipped += unprocessed;
+                    writeln!(
+                        writer,
+                        "(quit; {} proposal(s) remain pending)",
+                        unprocessed.saturating_sub(1)
+                    )?;
+                    print_interactive_summary(writer, accepted, rejected, skipped, failed)?;
+                    return Ok(());
+                }
+                "?" | "h" | "help" => {
+                    writeln!(
+                        writer,
+                        "  commands: [a]ccept  [r]eject  [s]kip (default)  [q]uit  [?]help"
+                    )?;
+                }
+                other => {
+                    writeln!(writer, "  unrecognized command '{other}'; try ? for help")?;
+                }
+            }
+        }
+    }
+
+    print_interactive_summary(writer, accepted, rejected, skipped, failed)?;
+    Ok(())
+}
+
+fn print_interactive_summary<W: Write>(
+    writer: &mut W,
+    accepted: u32,
+    rejected: u32,
+    skipped: u32,
+    failed: u32,
+) -> io::Result<()> {
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "summary: accepted={accepted} rejected={rejected} skipped={skipped} failed={failed}"
+    )
 }
 
 fn run_command(command: RunCommand) -> KimetsuResult<()> {
@@ -807,4 +984,208 @@ fn lock(command: LockCommand) -> KimetsuResult<()> {
 fn not_implemented(feature: &str) -> KimetsuResult<()> {
     println!("{feature} is planned but not implemented in phase 0");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kimetsu_brain::projector;
+    use kimetsu_core::event::Event;
+    use kimetsu_core::ids::RunId;
+    use std::fs;
+    use std::io::Cursor;
+
+    /// MP-5b: end-to-end driver test for the interactive loop. Inject three
+    /// pending proposals, script `a\nr\nbecause noisy\ns\n` as stdin input,
+    /// confirm: one proposal becomes a memory, one is rejected with the
+    /// typed reason, one stays pending; summary line accounts for all three.
+    #[test]
+    fn interactive_loop_accepts_rejects_and_skips_from_scripted_input() {
+        // ulid-named temp dir to avoid collisions when tests run concurrently.
+        let root = std::env::temp_dir()
+            .join(format!("kimetsu-cli-test-{}", RunId::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        project::init_project(&root, false).expect("init project");
+
+        // Inject 3 pending proposals via the brain's event-sourced path.
+        let proposals: [(&str, &str, &str, f32, &str); 3] = [
+            ("p_accept",  "global_user", "preference", 0.92, "Prefer rg over grep"),
+            ("p_reject",  "repo",        "convention", 0.66, "Always use let-else"),
+            ("p_skip",    "repo",        "convention", 0.71, "Use find_* for fallible lookups"),
+        ];
+        {
+            let (paths, _config, conn) = project::load_project(&root).expect("load");
+            let run_id = RunId::new();
+            let (mut writer, _) = kimetsu_brain::trace::TraceWriter::create(&paths, run_id)
+                .expect("trace");
+            for (proposal_id, scope, kind, conf, text) in &proposals {
+                let event = Event::new(
+                    run_id,
+                    "memory.proposed",
+                    serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "scope": scope,
+                        "kind": kind,
+                        "text": text,
+                        "rationale": "fixture",
+                        "proposed_confidence": conf,
+                        "source_event_ids": [],
+                    }),
+                );
+                writer.append(&event, true).expect("append");
+                projector::apply_events(&conn, &[event]).expect("project");
+            }
+        }
+
+        let pending = project::list_proposals(
+            &root,
+            project::ProposalFilter {
+                status: Some("pending".into()),
+                limit: 100,
+                ..project::ProposalFilter::default()
+            },
+        )
+        .expect("list pending");
+        assert_eq!(pending.len(), 3);
+
+        // Sort so the order matches our scripted input (a, r, s).
+        let mut ordered = pending;
+        ordered.sort_by(|a, b| a.proposal_id.cmp(&b.proposal_id));
+        // Sorted ids: p_accept, p_reject, p_skip. That matches a/r/s.
+
+        // Script: accept first, reject second (with reason "because noisy"),
+        // skip third. The reject branch consumes two lines (command + reason).
+        let scripted = b"a\nr\nbecause noisy\ns\n";
+        let mut reader = Cursor::new(&scripted[..]);
+        let mut writer = Vec::<u8>::new();
+        interactive_review_loop_inner(&root, ordered, &mut reader, &mut writer)
+            .expect("interactive loop");
+
+        let out = String::from_utf8(writer).expect("utf8 output");
+        assert!(out.contains("interactive review: 3 pending proposal(s)"), "{out}");
+        assert!(out.contains("-> accepted: memory"), "{out}");
+        assert!(out.contains("-> rejected (reason: because noisy)"), "{out}");
+        assert!(out.contains("-> skipped (still pending)"), "{out}");
+        assert!(
+            out.contains("summary: accepted=1 rejected=1 skipped=1 failed=0"),
+            "{out}"
+        );
+
+        // Final state: one memory, one rejected proposal carrying our reason,
+        // one still-pending proposal.
+        let memories = project::list_memories(&root).expect("list memories");
+        assert_eq!(memories.len(), 1);
+
+        let pending_after = project::list_proposals(
+            &root,
+            project::ProposalFilter {
+                status: Some("pending".into()),
+                limit: 100,
+                ..project::ProposalFilter::default()
+            },
+        )
+        .expect("list pending after");
+        assert_eq!(pending_after.len(), 1);
+        assert_eq!(pending_after[0].proposal_id, "p_skip");
+
+        let rejected_after = project::list_proposals(
+            &root,
+            project::ProposalFilter {
+                status: Some("rejected".into()),
+                limit: 100,
+                ..project::ProposalFilter::default()
+            },
+        )
+        .expect("list rejected after");
+        assert_eq!(rejected_after.len(), 1);
+        assert_eq!(rejected_after[0].proposal_id, "p_reject");
+        assert_eq!(
+            rejected_after[0].decided_reason.as_deref(),
+            Some("because noisy")
+        );
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    /// MP-5b: `q` mid-loop must persist any prior decisions and not touch
+    /// the remaining pending proposals.
+    #[test]
+    fn interactive_loop_quit_preserves_partial_decisions() {
+        let root = std::env::temp_dir()
+            .join(format!("kimetsu-cli-test-{}", RunId::new()));
+        fs::create_dir_all(&root).expect("create temp project");
+        project::init_project(&root, false).expect("init project");
+
+        let proposals: [(&str, &str, &str, f32, &str); 3] = [
+            ("q_accept", "global_user", "preference", 0.91, "Use ripgrep"),
+            ("q_a",      "repo",        "convention", 0.71, "Memory two"),
+            ("q_b",      "repo",        "convention", 0.71, "Memory three"),
+        ];
+        {
+            let (paths, _config, conn) = project::load_project(&root).expect("load");
+            let run_id = RunId::new();
+            let (mut writer, _) = kimetsu_brain::trace::TraceWriter::create(&paths, run_id)
+                .expect("trace");
+            for (proposal_id, scope, kind, conf, text) in &proposals {
+                let event = Event::new(
+                    run_id,
+                    "memory.proposed",
+                    serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "scope": scope,
+                        "kind": kind,
+                        "text": text,
+                        "rationale": "fixture",
+                        "proposed_confidence": conf,
+                        "source_event_ids": [],
+                    }),
+                );
+                writer.append(&event, true).expect("append");
+                projector::apply_events(&conn, &[event]).expect("project");
+            }
+        }
+
+        let mut pending = project::list_proposals(
+            &root,
+            project::ProposalFilter {
+                status: Some("pending".into()),
+                limit: 100,
+                ..project::ProposalFilter::default()
+            },
+        )
+        .expect("list pending");
+        pending.sort_by(|a, b| a.proposal_id.cmp(&b.proposal_id));
+        // Sorted: q_a, q_accept, q_b. Script: accept-skip-accept-quit?
+        // To keep it simple: a then q. First proposal accepted, then quit
+        // skips the rest. So q_a should be a memory; q_accept + q_b pending.
+
+        let scripted = b"a\nq\n";
+        let mut reader = Cursor::new(&scripted[..]);
+        let mut writer = Vec::<u8>::new();
+        interactive_review_loop_inner(&root, pending, &mut reader, &mut writer)
+            .expect("loop");
+
+        let out = String::from_utf8(writer).expect("utf8");
+        assert!(out.contains("-> accepted: memory"), "{out}");
+        assert!(out.contains("(quit;"), "{out}");
+        assert!(
+            out.contains("summary: accepted=1 rejected=0 skipped=2 failed=0"),
+            "{out}"
+        );
+
+        let memories = project::list_memories(&root).expect("list memories");
+        assert_eq!(memories.len(), 1);
+        let pending_after = project::list_proposals(
+            &root,
+            project::ProposalFilter {
+                status: Some("pending".into()),
+                limit: 100,
+                ..project::ProposalFilter::default()
+            },
+        )
+        .expect("list pending after");
+        assert_eq!(pending_after.len(), 2, "two proposals still pending after quit");
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
 }
