@@ -25,13 +25,35 @@ This is MP-7b in `V0.2-PLAN.md`. The protocol spec lives at the top of
    `target/release/kimetsu[.exe]` and `target/debug/kimetsu[.exe]`
    relative to CWD. Set `KIMETSU_BIN=/abs/path/to/kimetsu` to override.
 2. **Python 3.10+** (uses PEP 604 `str | None` union syntax).
-3. For real Terminal-Bench runs: **Harbor CLI** and **Docker Desktop**:
+3. **Harbor CLI**: the package on PyPI is named `harbor`
+   (not `harbor-framework`):
 
    ```bash
-   pip install harbor-framework      # or whatever Harbor publishes
-   harbor --version                  # verify install
-   docker info                       # verify Docker is up
+   pip install harbor           # installs harbor.exe / hb.exe / hr.exe
+   # or, per Harbor's own docs:
+   uv tool install harbor
+   harbor --version             # 0.6.x at the time of writing
    ```
+
+   On Windows the binaries land in
+   `C:\Users\<you>\AppData\Roaming\Python\Python313\Scripts`; add that
+   directory to `PATH` if pip warns it isn't on PATH.
+4. **An environment to run the task in.** Harbor supports many:
+
+   | `-e` flag | what it is | needs |
+   |-----------|------------|-------|
+   | `docker`   | local Docker | Docker Desktop running on the host |
+   | `daytona`  | cloud sandbox | `DAYTONA_API_KEY` |
+   | `e2b`      | cloud sandbox | `E2B_API_KEY` |
+   | `modal`    | cloud sandbox | `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` |
+   | `runloop`  | cloud sandbox | `RUNLOOP_API_KEY` |
+
+   For v0.2 the official Terminal-Bench leaderboard runs use either
+   `docker` (local) or `daytona` (per the Harbor docs). Pick whichever
+   matches what's set up on your machine.
+5. **API credentials for the model**: `CLAUDE_CODE_OAUTH_TOKEN` for
+   kimetsu's real model loop (default in `kimetsu agent --harbor-mode`).
+   Pass via env or `--env-file path/to/.env` on `harbor run`.
 
 ## Smoke test (no Harbor needed)
 
@@ -59,19 +81,34 @@ can move on to a real Harbor run.
 
 ## Real Terminal-Bench run
 
-Once Harbor + Docker are set up:
+Once Harbor + an environment are set up:
 
 ```bash
-# Sanity: oracle run confirms Harbor itself is wired up correctly.
-harbor run -d terminal-bench/terminal-bench-2 -a oracle -n 4
+# 1. Sanity: oracle run confirms Harbor + environment are wired up.
+harbor run --dataset terminal-bench/terminal-bench-2 -a oracle -n 4
 
-# Kimetsu run via this adapter. The --agent-import-path tells Harbor
-# to load harbor.kimetsu_agent:KimetsuAgent from PYTHONPATH (set
-# PYTHONPATH to the repo root so the import resolves).
+# 2. Kimetsu's three-mode gauntlet (per V0.2-PLAN.md MP-8).
+#
+# a) Bare Claude Code baseline (no kimetsu wrapper).
+harbor run --dataset terminal-bench/terminal-bench-2 \
+  -a claude-code -m claude-haiku-4-5 -n 4
+
+# b) Kimetsu with no brain (broker disabled). MP-7d real model loop;
+#    the model only sees shell_command and works the task without any
+#    broker grounding or memory injection.
 PYTHONPATH="$(pwd)" \
 KIMETSU_BIN="$(pwd)/target/release/kimetsu" \
-  harbor run \
-    -d terminal-bench/terminal-bench-2 \
+KIMETSU_DISABLE_BROKER=1 \
+  harbor run --dataset terminal-bench/terminal-bench-2 \
+    --agent-import-path harbor.kimetsu_agent:KimetsuAgent \
+    -n 4
+
+# c) Kimetsu with brain + curated memories. Same invocation; the
+#    broker uses whatever was curated via `kimetsu brain memory
+#    review` / `memory top` / `memory prune` on the host.
+PYTHONPATH="$(pwd)" \
+KIMETSU_BIN="$(pwd)/target/release/kimetsu" \
+  harbor run --dataset terminal-bench/terminal-bench-2 \
     --agent-import-path harbor.kimetsu_agent:KimetsuAgent \
     -n 4
 ```
@@ -82,10 +119,13 @@ On Windows / PowerShell:
 $env:PYTHONPATH = (Get-Location).Path
 $env:KIMETSU_BIN = "$pwd\target\release\kimetsu.exe"
 harbor run `
-  -d terminal-bench/terminal-bench-2 `
+  --dataset terminal-bench/terminal-bench-2 `
   --agent-import-path harbor.kimetsu_agent:KimetsuAgent `
   -n 4
 ```
+
+Per the v0.2 ship gate (V0.2-PLAN.md MP-8): three runs per mode within
+±5pp over a 1-week window. Stability matters more than peak accuracy.
 
 ## MP-7a is a stub agent; MP-7c will plumb the real pipeline
 
