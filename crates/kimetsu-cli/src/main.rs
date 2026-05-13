@@ -500,7 +500,7 @@ fn build_harbor_model_provider(
     config.model.provider = "claude_code".to_string();
     config.model.model = model_name;
     config.model.api_key_env = "CLAUDE_CODE_OAUTH_TOKEN".to_string();
-    config.model.request_timeout_secs = 180;
+    config.model.request_timeout_secs = 600;
     config.run.max_total_cost_usd = 5.0;
 
     match ClaudeCodeProvider::from_config_with_key(scratch, &config, Some(&oauth))? {

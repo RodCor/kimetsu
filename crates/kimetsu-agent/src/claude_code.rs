@@ -87,8 +87,15 @@ impl ModelProvider for ClaudeCodeProvider {
             .arg("json")
             .arg("--model")
             .arg(&self.model)
+            // MP-7d: bump to 8. v0.1 pipeline drove one Claude-Code turn at
+            // a time and re-issued requests; harbor mode lets the model use
+            // shell_command in its response, which Claude Code internally
+            // reports as `stop_reason: tool_use`. With max-turns=1 that
+            // tripped error_max_turns before we could parse the envelope.
+            // 8 gives Claude Code's inner loop room to produce a final
+            // text answer when our outer envelope flow doesn't fire.
             .arg("--max-turns")
-            .arg("1")
+            .arg("8")
             .arg("--max-budget-usd")
             .arg(format!("{:.4}", self.max_budget_usd))
             .arg("--no-session-persistence")

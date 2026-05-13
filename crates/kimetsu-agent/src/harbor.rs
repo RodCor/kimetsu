@@ -522,19 +522,34 @@ fn preview_text(text: &str, limit: usize) -> String {
 /// fold in the broker context (memories + prior-run capsules) here.
 struct MessageMessage;
 impl MessageMessage {
+    /// MP-7d / MP-8: the kimetsu-side role description for the
+    /// harbor-mode agent. Crucially, this MUST NOT contradict the
+    /// envelope-grammar instructions that `claude_code::render_tool_protocol`
+    /// appends after this system prompt. An earlier draft told the model
+    /// "respond with plain text and no tool call" — which the model
+    /// happily obeyed, completely bypassing the JSON envelope contract.
+    /// Result: 0/3 reward on the first MP-8 gauntlet because no
+    /// shell_command call ever fired.
+    ///
+    /// Rewritten to describe role only, leaving response-format rules
+    /// entirely to render_tool_protocol so there is exactly one
+    /// authoritative source for the grammar.
     fn system_prompt_for_harbor() -> crate::model::ModelMessage {
         crate::model::ModelMessage {
             role: crate::model::MessageRole::System,
             content: vec![crate::model::MessageContent::Text {
                 text: concat!(
-                    "You are Kimetsu, a coding agent running inside a sandboxed terminal ",
-                    "environment provided by Harbor / Terminal-Bench. Your only tool is ",
-                    "`shell_command` — use it to inspect the workspace (cat, ls, grep), ",
-                    "edit files (sed, echo > file), and run build / test commands. ",
-                    "When the task is complete or you have gathered enough information to ",
-                    "give a final answer, respond with plain text and no tool call. Be ",
-                    "concise; do not narrate every step. Workspace paths are relative to ",
-                    "the task's working directory."
+                    "You are Kimetsu, a coding agent driving a sandboxed Linux ",
+                    "shell inside Harbor / Terminal-Bench. The only tool available ",
+                    "to you is `shell_command`. Use it for every action: read ",
+                    "files (cat, head, sed -n), search (grep, rg), list (ls), ",
+                    "create or edit files (cat <<EOF, sed -i, printf > file), ",
+                    "and run build / test commands. Keep each command focused; ",
+                    "do not chain unrelated steps. Workspace paths are relative ",
+                    "to the task's starting directory. Be concise — no narration ",
+                    "between calls. Follow the JSON envelope grammar below ",
+                    "exactly; that is the only way to invoke a tool or signal ",
+                    "completion."
                 ).to_string(),
             }],
         }

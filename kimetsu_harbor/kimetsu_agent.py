@@ -263,9 +263,28 @@ class KimetsuAgent(BaseAgent):
             while True:
                 line = await proc.stdout.readline()
                 if not line:
-                    # Subprocess closed stdout without sending agent.done
+                    # Subprocess closed stdout without sending agent.done.
+                    # Drain stderr so the error message points at the real
+                    # cause instead of just "exited early".
+                    stderr_bytes = b""
+                    if proc.stderr is not None:
+                        try:
+                            stderr_bytes = await asyncio.wait_for(
+                                proc.stderr.read(), timeout=2.0
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    exit_code = proc.returncode
+                    if exit_code is None:
+                        # Process may still be exiting; wait briefly so
+                        # we can include the real exit code in the error.
+                        try:
+                            exit_code = await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            exit_code = -1
                     raise RuntimeError(
-                        "kimetsu agent exited before emitting agent.done"
+                        "kimetsu agent exited before emitting agent.done: "
+                        f"exit={exit_code}; stderr={stderr_bytes.decode(errors='replace')[:2000]}"
                     )
                 try:
                     msg = json.loads(line.decode("utf-8"))

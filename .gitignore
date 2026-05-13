@@ -7,3 +7,11 @@
 **/*.rs.bk
 
 .git-commit-msg.tmp
+
+# Harbor / Terminal-Bench artifacts (per-run, large, regenerable)
+/jobs/
+/.bench-pid
+/.bench-stdout.log
+/.bench-stderr.log
+**/__pycache__/
+*.pyc
