@@ -709,6 +709,7 @@ dependencies = [
  "kimetsu-agent",
  "kimetsu-brain",
  "kimetsu-core",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

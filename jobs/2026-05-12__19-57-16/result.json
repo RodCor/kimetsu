@@ -1,0 +1,89 @@
+{
+    "id": "d32fdba4-093e-40e0-88f2-5a7e65cf9374",
+    "started_at": "2026-05-12T19:57:20.124078",
+    "updated_at": "2026-05-12T23:21:26.827839Z",
+    "finished_at": null,
+    "n_total_trials": 89,
+    "stats": {
+        "n_completed_trials": 53,
+        "n_errored_trials": 53,
+        "n_running_trials": 0,
+        "n_pending_trials": 36,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "oracle__terminal-bench/terminal-bench-2": {
+                "n_trials": 0,
+                "n_errors": 53,
+                "metrics": [
+                    {
+                        "mean": 0.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {},
+                "exception_stats": {
+                    "RuntimeError": [
+                        "make-mips-interpreter__irSAebC",
+                        "circuit-fibsqrt__SXsHWhy",
+                        "build-pov-ray__r84HGs4",
+                        "overfull-hbox__SKeT5Vv",
+                        "video-processing__ara3XjZ",
+                        "distribution-search__pGTiNTc",
+                        "break-filter-js-from-html__cTEjDh2",
+                        "protein-assembly__WLTKvXi",
+                        "path-tracing__3Ag8ayQ",
+                        "compile-compcert__2m2NjrW",
+                        "dna-assembly__aKBbLM7",
+                        "caffe-cifar-10__iYKknFf",
+                        "install-windows-3-11__4UUCZ8c",
+                        "log-summary-date-ranges__uHbFGeq",
+                        "vulnerable-secret__2HtsUaw",
+                        "openssl-selfsigned-cert__jX6n5LJ",
+                        "crack-7z-hash__cRjzY5U",
+                        "feal-linear-cryptanalysis__NjDDNam",
+                        "polyglot-rust-c__F3aY5rB",
+                        "cancel-async-tasks__hKNsffY",
+                        "dna-insert__RkAHuz8",
+                        "rstan-to-pystan__MYohxRm",
+                        "git-leak-recovery__DXEccV2",
+                        "db-wal-recovery__ZGZ2QKc",
+                        "headless-terminal__WCUFnMA",
+                        "extract-elf__FwUU5eQ",
+                        "constraints-scheduling__bNEXcuo",
+                        "winning-avg-corewars__2RBkTfv",
+                        "custom-memory-heap-crash__9GafAw4",
+                        "build-cython-ext__jR28xiL",
+                        "mteb-leaderboard__P6uozQi",
+                        "fix-git__SGRCJBF",
+                        "regex-chess__sJnBgE6",
+                        "prove-plus-comm__wnaBxAX",
+                        "pytorch-model-recovery__L6NMj5r",
+                        "mailman__uW3HTWk",
+                        "write-compressor__UzPEwfP",
+                        "chess-best-move__ZPxW7eB",
+                        "extract-moves-from-video__dm4A9Nh",
+                        "gcode-to-text__mm8o8Jh",
+                        "multi-source-data-merger__THUnQEf",
+                        "merge-diff-arc-agi-task__tJZTv7p",
+                        "kv-store-grpc__k68htsg",
+                        "git-multibranch__KweafMV",
+                        "qemu-alpine-ssh__JgkXRLz",
+                        "regex-log__zpKfugQ",
+                        "nginx-request-logging__QzsxTD9",
+                        "tune-mjcf__2gXy7KN",
+                        "build-pmars__7tLuJcH",
+                        "sqlite-with-gcov__uBNSpyN",
+                        "sanitize-git-repo__oZ349nz",
+                        "reshard-c4-data__Rgm9D6h",
+                        "train-fasttext__qPXwQUe"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

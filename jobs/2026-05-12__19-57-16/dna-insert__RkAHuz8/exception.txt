@@ -1,0 +1,122 @@
+Traceback (most recent call last):
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\trial\trial.py", line 951, in run
+    await self._setup_environment()
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\trial\trial.py", line 313, in _setup_environment
+    await self._start_environment_with_retry()
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\tenacity\asyncio\__init__.py", line 193, in async_wrapped
+    return await copy(fn, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\tenacity\asyncio\__init__.py", line 112, in __call__
+    do = await self.iter(retry_state=retry_state)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\tenacity\asyncio\__init__.py", line 157, in iter
+    result = await action(retry_state)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\tenacity\_utils.py", line 111, in inner
+    return call(*args, **kwargs)
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\tenacity\__init__.py", line 393, in <lambda>
+    self._add_action_func(lambda rs: rs.outcome.result())
+                                     ~~~~~~~~~~~~~~~~~^^
+  File "C:\Python313\Lib\concurrent\futures\_base.py", line 449, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "C:\Python313\Lib\concurrent\futures\_base.py", line 401, in __get_result
+    raise self._exception
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\tenacity\asyncio\__init__.py", line 116, in __call__
+    result = await fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\trial\trial.py", line 325, in _start_environment_with_retry
+    await asyncio.wait_for(
+    ...<4 lines>...
+    )
+  File "C:\Python313\Lib\asyncio\tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\environments\docker\docker.py", line 495, in start
+    await self._run_docker_compose_command(["up", "--detach", "--wait"])
+  File "C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\environments\docker\docker.py", line 382, in _run_docker_compose_command
+    raise RuntimeError(
+    ...<5 lines>...
+    )
+RuntimeError: Docker compose command failed for environment terminal-bench/dna-insert. Command: docker compose --project-name dna-insert__rkahuz8 --project-directory C:\Users\rodri\.cache\harbor\tasks\packages\terminal-bench\dna-insert\6e134a226ff852d8bf20f15480c7c1d74e3911d5b458f5cca07aabd23e380f0d\environment -f C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\environments\docker\docker-compose-base.yaml -f C:\Users\rodri\AppData\Roaming\Python\Python313\site-packages\harbor\environments\docker\docker-compose-prebuilt.yaml up --detach --wait. Return code: 1. Stdout:  main Pulling 
+ 4b3ffd8ccb52 Pulling fs layer 
+ 9040135e24f8 Pulling fs layer 
+ f4f5c7323e80 Pulling fs layer 
+ 9040135e24f8 Downloading [==================================================>]      93B/93B
+ 9040135e24f8 Verifying Checksum 
+ 9040135e24f8 Download complete 
+ 4b3ffd8ccb52 Downloading [>                                                  ]  300.2kB/29.72MB
+ f4f5c7323e80 Downloading [=============>                                     ]     372B/1.389kB
+ f4f5c7323e80 Downloading [==================================================>]  1.389kB/1.389kB
+ f4f5c7323e80 Verifying Checksum 
+ f4f5c7323e80 Download complete 
+ 4b3ffd8ccb52 Downloading [==>                                                ]  1.229MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===>                                               ]  2.161MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=====>                                             ]  3.085MB/29.72MB
+ 4b3ffd8ccb52 Downloading [======>                                            ]  4.018MB/29.72MB
+ 4b3ffd8ccb52 Downloading [========>                                          ]  5.264MB/29.72MB
+ 4b3ffd8ccb52 Downloading [==========>                                        ]  6.188MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===========>                                       ]  7.122MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=============>                                     ]  8.056MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===============>                                   ]   8.99MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=================>                                 ]  10.22MB/29.72MB
+ 4b3ffd8ccb52 Downloading [==================>                                ]  11.14MB/29.72MB
+ 4b3ffd8ccb52 Downloading [====================>                              ]  12.08MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=====================>                             ]  13.01MB/29.72MB
+ 4b3ffd8ccb52 Downloading [======================>                            ]  13.64MB/29.72MB
+ 4b3ffd8ccb52 Downloading [========================>                          ]  14.57MB/29.72MB
+ 4b3ffd8ccb52 Downloading [==========================>                        ]   15.5MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===========================>                       ]  16.44MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=============================>                     ]  17.37MB/29.72MB
+ 4b3ffd8ccb52 Downloading [==============================>                    ]   18.3MB/29.72MB
+ 4b3ffd8ccb52 Downloading [================================>                  ]  19.23MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=================================>                 ]  20.15MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===================================>               ]  21.08MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=====================================>             ]  22.02MB/29.72MB
+ 4b3ffd8ccb52 Downloading [======================================>            ]  22.95MB/29.72MB
+ 4b3ffd8ccb52 Downloading [========================================>          ]  23.86MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=========================================>         ]  24.79MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===========================================>       ]  25.72MB/29.72MB
+ 4b3ffd8ccb52 Downloading [============================================>      ]  26.66MB/29.72MB
+ 4b3ffd8ccb52 Downloading [==============================================>    ]  27.58MB/29.72MB
+ 4b3ffd8ccb52 Downloading [===============================================>   ]  28.52MB/29.72MB
+ 4b3ffd8ccb52 Downloading [=================================================> ]  29.45MB/29.72MB
+ 4b3ffd8ccb52 Verifying Checksum 
+ 4b3ffd8ccb52 Download complete 
+ 4b3ffd8ccb52 Extracting [>                                                  ]  327.7kB/29.72MB
+ 4b3ffd8ccb52 Extracting [===>                                               ]  1.966MB/29.72MB
+ 4b3ffd8ccb52 Extracting [======>                                            ]  3.604MB/29.72MB
+ 4b3ffd8ccb52 Extracting [========>                                          ]  5.243MB/29.72MB
+ 4b3ffd8ccb52 Extracting [===========>                                       ]  6.554MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=============>                                     ]  7.864MB/29.72MB
+ 4b3ffd8ccb52 Extracting [==============>                                    ]  8.847MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=================>                                 ]  10.16MB/29.72MB
+ 4b3ffd8ccb52 Extracting [===================>                               ]   11.8MB/29.72MB
+ 4b3ffd8ccb52 Extracting [======================>                            ]  13.43MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=========================>                         ]  15.07MB/29.72MB
+ 4b3ffd8ccb52 Extracting [============================>                      ]  16.71MB/29.72MB
+ 4b3ffd8ccb52 Extracting [===============================>                   ]  18.68MB/29.72MB
+ 4b3ffd8ccb52 Extracting [==================================>                ]  20.32MB/29.72MB
+ 4b3ffd8ccb52 Extracting [====================================>              ]  21.63MB/29.72MB
+ 4b3ffd8ccb52 Extracting [======================================>            ]  22.94MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=========================================>         ]  24.58MB/29.72MB
+ 4b3ffd8ccb52 Extracting [==========================================>        ]  25.56MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=============================================>     ]  26.87MB/29.72MB
+ 4b3ffd8ccb52 Extracting [==============================================>    ]  27.85MB/29.72MB
+ 4b3ffd8ccb52 Extracting [===============================================>   ]  28.51MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=================================================> ]  29.16MB/29.72MB
+ 4b3ffd8ccb52 Extracting [=================================================> ]  29.49MB/29.72MB
+ 4b3ffd8ccb52 Extracting [==================================================>]  29.72MB/29.72MB
+ 4b3ffd8ccb52 Pull complete 
+ 9040135e24f8 Extracting [==================================================>]      93B/93B
+ 9040135e24f8 Extracting [==================================================>]      93B/93B
+ 9040135e24f8 Pull complete 
+ f4f5c7323e80 Extracting [==================================================>]  1.389kB/1.389kB
+ f4f5c7323e80 Extracting [==================================================>]  1.389kB/1.389kB
+ f4f5c7323e80 Pull complete 
+ main Pulled 
+ Network dna-insert__rkahuz8_default  Creating
+ Network dna-insert__rkahuz8_default  Created
+ Container dna-insert__rkahuz8-main-1  Creating
+Error response from daemon: invalid volume specification: 'E:/Kimetsu/jobs/2026-05-12__19-57-16/dna-insert__RkAHuz8/verifier:/logs/verifier:rw'
+. Stderr: None. 
