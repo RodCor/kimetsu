@@ -135,10 +135,15 @@ def _normalize_exec_result(raw: Any) -> ExecResult:
     if isinstance(raw, ExecResult):
         return raw
 
-    # Dict / mapping shape
+    # Dict / mapping shape — also handle Harbor's `return_code` key.
     if isinstance(raw, Mapping):
+        exit_code = raw.get("return_code")
+        if exit_code is None:
+            exit_code = raw.get("exit_code")
+        if exit_code is None:
+            exit_code = raw.get("returncode", 0)
         return ExecResult(
-            exit_code=int(raw.get("exit_code", raw.get("returncode", 0)) or 0),
+            exit_code=int(exit_code or 0),
             stdout=str(raw.get("stdout", "") or ""),
             stderr=str(raw.get("stderr", "") or ""),
             timed_out=bool(raw.get("timed_out", False)),
@@ -158,8 +163,12 @@ def _normalize_exec_result(raw: Any) -> ExecResult:
                 stderr=str(b) if b is not None else "",
             )
 
-    # Object with attrs
-    exit_code = getattr(raw, "exit_code", None)
+    # Object with attrs. Harbor's BaseModel ExecResult uses
+    # `return_code` (not `exit_code`); we keep the other names as
+    # fallbacks so a different harness adapter still works.
+    exit_code = getattr(raw, "return_code", None)
+    if exit_code is None:
+        exit_code = getattr(raw, "exit_code", None)
     if exit_code is None:
         exit_code = getattr(raw, "returncode", None)
     if exit_code is not None:

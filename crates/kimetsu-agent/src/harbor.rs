@@ -381,8 +381,53 @@ where
 {
     use crate::model::{ModelMessage, ModelRequest, StopReason, ToolChoice, ToolDefinition};
 
+    // MP-9 (path B): Claude Code 2.x in `-p` mode injects its own
+    // agentic harness over our --system-prompt and tells the model it
+    // has Monitor / PushNotification / RemoteTrigger tools. The MP-8
+    // gauntlet caught the model trusting CC's harness over our system
+    // prompt and never invoking shell_command.
+    //
+    // The fix is to make the envelope contract authoritative in the
+    // USER message (which the model reads last, right before
+    // responding). The system prompt is still descriptive; the user
+    // message carries the actual task PLUS an explicit override note
+    // that:
+    //   1. tells the model to ignore any other tool catalog CC may have
+    //      mentioned;
+    //   2. repeats the envelope grammar verbatim;
+    //   3. asks for a tool_call envelope as the first response.
+    // This is the v0.1 envelope pattern adapted to compete with CC's
+    // harness override.
     let system = MessageMessage::system_prompt_for_harbor();
-    let user = ModelMessage::user_text(task);
+    let user = ModelMessage::user_text(format!(
+        "Task (from Harbor / Terminal-Bench):\n\
+         {task}\n\n\
+         === Important runtime override ===\n\
+         You are running inside the Kimetsu wrapper. Any tool catalog the\n\
+         Claude Code runtime advertises (Monitor, PushNotification,\n\
+         RemoteTrigger, Bash, Edit, etc.) is NOT real in this environment.\n\
+         The only way to take an action is to emit a JSON envelope that\n\
+         Kimetsu will parse out of your response text and execute on your\n\
+         behalf. There is exactly one usable tool: `shell_command`.\n\
+         \n\
+         Response format (one JSON object per reply, no prose, no\n\
+         markdown, no backticks):\n\
+         \n\
+         To run a command:\n\
+         {{\"thought\": \"<short rationale>\",\n\
+          \"tool_call\": {{\"name\": \"shell_command\",\n\
+                          \"input\": {{\"program\": \"<bin>\",\n\
+                                     \"args\": [\"<arg1>\", \"<arg2>\"],\n\
+                                     \"cwd_relative\": \"<dir or null>\",\n\
+                                     \"timeout_secs\": 60}}}}}}\n\
+         \n\
+         To finish and report the final answer:\n\
+         {{\"thought\": \"<short rationale>\",\n\
+          \"finish\": {{\"summary\": \"<one-line outcome the verifier should see>\"}}}}\n\
+         \n\
+         Workspace paths are relative to the task's starting directory.\n\
+         Begin with one tool_call envelope. Do not narrate."
+    ));
     let mut messages = vec![system, user];
 
     let tool_defs = vec![ToolDefinition {
@@ -522,34 +567,23 @@ fn preview_text(text: &str, limit: usize) -> String {
 /// fold in the broker context (memories + prior-run capsules) here.
 struct MessageMessage;
 impl MessageMessage {
-    /// MP-7d / MP-8: the kimetsu-side role description for the
-    /// harbor-mode agent. Crucially, this MUST NOT contradict the
-    /// envelope-grammar instructions that `claude_code::render_tool_protocol`
-    /// appends after this system prompt. An earlier draft told the model
-    /// "respond with plain text and no tool call" — which the model
-    /// happily obeyed, completely bypassing the JSON envelope contract.
-    /// Result: 0/3 reward on the first MP-8 gauntlet because no
-    /// shell_command call ever fired.
-    ///
-    /// Rewritten to describe role only, leaving response-format rules
-    /// entirely to render_tool_protocol so there is exactly one
-    /// authoritative source for the grammar.
+    /// MP-9 (path B): minimal role description for the harbor-mode
+    /// agent. All format rules — envelope grammar, tool catalog, the
+    /// override notice that Claude Code's internal harness tools
+    /// (Monitor / PushNotification / RemoteTrigger / Bash / Edit) are
+    /// NOT real here — live in the user message in `run_model_agent`,
+    /// not here. The system prompt is whatever Claude Code's `-p`
+    /// runtime allows; the user message is what the model reads last
+    /// before responding, and that's where the authority needs to be.
     fn system_prompt_for_harbor() -> crate::model::ModelMessage {
         crate::model::ModelMessage {
             role: crate::model::MessageRole::System,
             content: vec![crate::model::MessageContent::Text {
                 text: concat!(
                     "You are Kimetsu, a coding agent driving a sandboxed Linux ",
-                    "shell inside Harbor / Terminal-Bench. The only tool available ",
-                    "to you is `shell_command`. Use it for every action: read ",
-                    "files (cat, head, sed -n), search (grep, rg), list (ls), ",
-                    "create or edit files (cat <<EOF, sed -i, printf > file), ",
-                    "and run build / test commands. Keep each command focused; ",
-                    "do not chain unrelated steps. Workspace paths are relative ",
-                    "to the task's starting directory. Be concise — no narration ",
-                    "between calls. Follow the JSON envelope grammar below ",
-                    "exactly; that is the only way to invoke a tool or signal ",
-                    "completion."
+                    "shell inside Harbor / Terminal-Bench. Follow the response ",
+                    "format described in the user message exactly. Be concise; ",
+                    "no narration between actions."
                 ).to_string(),
             }],
         }
