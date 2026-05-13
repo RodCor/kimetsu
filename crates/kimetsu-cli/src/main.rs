@@ -75,8 +75,10 @@ struct AgentArgs {
     turn_budget: u32,
     /// Model id passed to the provider (claude_code only in v0.2).
     /// Defaults to the value of $KIMETSU_HARBOR_MODEL or
-    /// `claude-sonnet-4-5` if unset. Use `claude-opus-4-7` for the
-    /// strongest tier (matches the v0.1 fixture bench) or
+    /// `claude-opus-4-7` if unset — matches the v0.1 fixture bench's
+    /// model so the v0.2 Terminal-Bench numbers are directly
+    /// comparable to the existing MP-4 verdict. Use
+    /// `claude-sonnet-4-5` for the mid-budget tier or
     /// `claude-haiku-4-5` for cheap iteration / smoke testing.
     #[arg(long)]
     model: Option<String>,
@@ -493,7 +495,7 @@ fn build_harbor_model_provider(
     let model_name = model_override
         .map(str::to_string)
         .or_else(|| std::env::var("KIMETSU_HARBOR_MODEL").ok())
-        .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
+        .unwrap_or_else(|| "claude-opus-4-7".to_string());
 
     // Synthesize a minimal ProjectConfig so ClaudeCodeProvider's
     // from_config_with_key plumbing keeps working. Most fields are
