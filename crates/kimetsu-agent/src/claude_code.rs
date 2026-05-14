@@ -87,15 +87,16 @@ impl ModelProvider for ClaudeCodeProvider {
             .arg("json")
             .arg("--model")
             .arg(&self.model)
-            // MP-7d: bump to 8. v0.1 pipeline drove one Claude-Code turn at
-            // a time and re-issued requests; harbor mode lets the model use
-            // shell_command in its response, which Claude Code internally
-            // reports as `stop_reason: tool_use`. With max-turns=1 that
-            // tripped error_max_turns before we could parse the envelope.
-            // 8 gives Claude Code's inner loop room to produce a final
-            // text answer when our outer envelope flow doesn't fire.
+            // MP-7d / MP-13c: bump to 16. 8 was already a workaround for
+            // Claude Code's inner-loop interpretation of our envelope
+            // tool_use. Some MP-12 trials (compile-compcert,
+            // circuit-fibsqrt) showed CC's inner loop running close to
+            // 8 turns before our envelope grammar finally fired; the
+            // result was claude_code provider stalls. 16 doubles the
+            // headroom for those cases without exploding cost — the
+            // outer kimetsu loop is still the real budget gate.
             .arg("--max-turns")
-            .arg("8")
+            .arg("16")
             .arg("--max-budget-usd")
             .arg(format!("{:.4}", self.max_budget_usd))
             .arg("--no-session-persistence")

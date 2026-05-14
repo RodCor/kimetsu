@@ -481,7 +481,10 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
                 Rc::clone(&session),
                 &mut runtime,
                 &mut *provider,
-                args.turn_budget,
+                kimetsu_agent::harbor::HarborAgentOpts {
+                    turn_budget: args.turn_budget,
+                    ..kimetsu_agent::harbor::HarborAgentOpts::default()
+                },
                 brain_context.as_deref(),
             )?;
         }

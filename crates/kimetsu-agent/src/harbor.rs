@@ -342,7 +342,11 @@ pub struct MultiStepStubReport {
 /// agent to wrap up. 25 mirrors the loop budget used inside the v0.1
 /// pipeline; we surface it here as a const so MP-8 can tune it from the
 /// Terminal-Bench data.
-pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 25;
+// MP-13b: bumped 25 -> 40. MP-12 trial logs showed compile-compcert,
+// caffe-cifar-10, install-windows-3-11 hitting the budget cap before
+// finishing. 40 turns gives ~60% more headroom while still bounding
+// runaway cost.
+pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 40;
 
 /// MP-7d: report returned by `run_model_agent`. Mostly for tests + the
 /// CLI smoke surface; production runs care about the JSON-RPC frames
@@ -368,18 +372,53 @@ pub struct ModelAgentReport {
 /// Terminal-Bench's grader sees a real answer, not a stub string. The
 /// session's frame stream is identical in shape to MP-7c — only the
 /// content changes.
+/// MP-13: opts for tuning the harbor agent loop. Defaults match
+/// production CLI usage. Tests use `HarborAgentOpts::for_tests()` to
+/// disable the auto-orient pre-shell + the persistence gate so
+/// scripted MockProvider responses aren't perturbed.
+#[derive(Debug, Clone, Copy)]
+pub struct HarborAgentOpts {
+    pub turn_budget: u32,
+    pub auto_orient: bool,
+    pub min_actions_before_finish: u32,
+}
+
+impl Default for HarborAgentOpts {
+    fn default() -> Self {
+        Self {
+            turn_budget: DEFAULT_MODEL_TURN_BUDGET,
+            auto_orient: true,
+            min_actions_before_finish: 3,
+        }
+    }
+}
+
+impl HarborAgentOpts {
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self {
+            turn_budget: DEFAULT_MODEL_TURN_BUDGET,
+            auto_orient: false,
+            min_actions_before_finish: 0,
+        }
+    }
+}
+
 pub fn run_model_agent<R, W>(
     task: &str,
     session: Rc<RefCell<HarborSession<R, W>>>,
     runtime: &mut crate::tools::ToolRuntime,
     provider: &mut dyn crate::model::ModelProvider,
-    turn_budget: u32,
+    opts: HarborAgentOpts,
     brain_context: Option<&str>,
 ) -> KimetsuResult<ModelAgentReport>
 where
     R: BufRead + 'static,
     W: Write + 'static,
 {
+    let turn_budget = opts.turn_budget;
+    let auto_orient = opts.auto_orient;
+    let min_actions_before_finish = opts.min_actions_before_finish;
     use crate::model::{ModelMessage, ModelRequest, StopReason, ToolChoice};
 
     // MP-9 (path B): Claude Code 2.x in `-p` mode injects its own
@@ -400,6 +439,31 @@ where
     // This is the v0.1 envelope pattern adapted to compete with CC's
     // harness override.
     let system = MessageMessage::system_prompt_for_harbor();
+
+    // MP-13a (auto-orient): bare Claude Code's agentic harness orients
+    // the model implicitly — directory listing, README peek, build
+    // system sniff — before the first model turn. The kimetsu wrapper
+    // doesn't do that, so the model spends its first 3-5 turns on
+    // `pwd && ls && cat README*` orientation. On a 25-40 turn budget
+    // that's a ~15-20% tax on every task.
+    //
+    // Fix: run one composite shell command up front and inject the
+    // result into the user message as "Initial workspace state". The
+    // model arrives at the task description already knowing pwd,
+    // top-level layout, and the likely task-instructions file. Saves
+    // 1-3 turns per task and gives the model better grounding for its
+    // first tool call.
+    let orient_block = if auto_orient {
+        match collect_workspace_orientation(runtime) {
+            Some(text) if !text.trim().is_empty() => format!(
+                "=== Initial workspace state (Kimetsu auto-orientation) ===\n\
+                 {text}\n\n",
+            ),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
 
     // MP-11 (brain mode): if a kimetsu project supplied broker context
     // for this task — curated memories, prior-run capsules — render it
@@ -428,7 +492,8 @@ where
     // (b) collapses multi-step idioms (read-then-modify) into single
     // turns.
     let user = ModelMessage::user_text(format!(
-        "{prior_block}\
+        "{orient_block}\
+         {prior_block}\
          Task (from Harbor / Terminal-Bench):\n\
          {task}\n\n\
          === Important runtime override ===\n\
@@ -474,6 +539,8 @@ where
     let mut final_text: Option<String> = None;
     let mut stop_reason = StopReason::EndTurn;
     let mut turn = 0u32;
+    // MP-13d: flag so the persistence gate fires at most once per task.
+    let mut persistence_nudge_sent = false;
 
     while turn < turn_budget {
         turn += 1;
@@ -507,7 +574,35 @@ where
             continue;
         }
 
-        // No tool calls -> the model is done answering. Capture the text.
+        // No tool calls -> the model is trying to finish.
+        //
+        // MP-13d (persistence gate): on real Terminal-Bench tasks we
+        // observed the model emitting `finish` after 0-1 tool calls on
+        // hard tasks like make-mips-interpreter — basically giving up
+        // before even trying. Per the v0.2 plan's "kimetsu wraps the
+        // model with a persistent harness" promise, we reject premature
+        // finishes ONCE and push the model to actually try something.
+        // Second time around we let the finish through so we don't loop
+        // forever on a model that's genuinely stuck.
+        if tool_calls_total < min_actions_before_finish && !persistence_nudge_sent {
+            persistence_nudge_sent = true;
+            let nudge = format!(
+                "You have only taken {tool_calls_total} action(s) on this task. \
+                 Terminal-Bench rarely accepts answers without inspection — \
+                 at minimum read the relevant files, run the verifier or \
+                 reproduce the task setup before declaring done. Please \
+                 keep working: emit another tool_call envelope. If you \
+                 genuinely believe the task requires no shell action, \
+                 explain briefly in `thought` and then emit finish on \
+                 your next turn."
+            );
+            if let Some(text) = response.text.clone() {
+                messages.push(ModelMessage::assistant_text(text));
+            }
+            messages.push(ModelMessage::user_text(nudge));
+            continue;
+        }
+
         if let Some(text) = response.text.clone() {
             final_text = Some(text.clone());
             messages.push(ModelMessage::assistant_text(text));
@@ -1008,6 +1103,62 @@ fn harbor_shell_command(runtime: &mut crate::tools::ToolRuntime, input: &Value) 
 
 // --- small helpers ---------------------------------------------------------
 
+/// MP-13a: orient the model with one upfront shell command. Returns
+/// a multi-block string (pwd / top-level ls / nearby task-instruction
+/// files / build system sniff). Best-effort — on failure we return
+/// None and the user message just omits the section, which is no
+/// worse than the pre-MP-13 behavior.
+///
+/// We deliberately do this in a SINGLE composite shell call so it
+/// costs one round-trip through the HarborSession instead of four.
+fn collect_workspace_orientation(runtime: &mut crate::tools::ToolRuntime) -> Option<String> {
+    let script = concat!(
+        "echo '## pwd';",
+        " pwd;",
+        " echo '## top-level (ls -la)';",
+        " ls -la 2>/dev/null | head -40;",
+        " if [ -d /app ] && [ \"$(pwd)\" != /app ]; then",
+        "   echo '## /app (ls -la)';",
+        "   ls -la /app 2>/dev/null | head -40;",
+        " fi;",
+        " echo '## task-instruction files (head -80 of first match)';",
+        " for f in TASK.md task.md INSTRUCTIONS.md INSTRUCTIONS.txt README.md README.txt README PROBLEM.md problem.md PROMPT.md prompt.md;",
+        " do",
+        "   if [ -r \"$f\" ]; then echo \"--- $f ---\"; head -80 \"$f\"; break; fi;",
+        "   if [ -r \"/app/$f\" ]; then echo \"--- /app/$f ---\"; head -80 \"/app/$f\"; break; fi;",
+        " done;",
+        " echo '## build-system sniff';",
+        " ls -1 Makefile makefile CMakeLists.txt setup.py pyproject.toml package.json Cargo.toml go.mod build.gradle pom.xml /app/Makefile /app/CMakeLists.txt /app/setup.py /app/pyproject.toml /app/package.json /app/Cargo.toml 2>/dev/null | head -10;",
+        " echo '## done'",
+    );
+
+    let spec = crate::tools::CommandSpec {
+        program: "bash".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        cwd_relative: None,
+        timeout_secs: Some(30),
+        expected_exit: None,
+    };
+    match runtime.shell_command(spec) {
+        Ok(out) if out.exit_code == 0 || !out.stdout_summary.trim().is_empty() => {
+            // Cap at ~3500 bytes so a runaway ls -la doesn't dominate
+            // the user-message budget. Most task-instruction files
+            // fit in 2-3 KB; ~3500 bytes still leaves headroom for
+            // the task description and the tool-format block.
+            const CAP_BYTES: usize = 3500;
+            let raw = out.stdout_summary;
+            if raw.len() <= CAP_BYTES {
+                Some(raw)
+            } else {
+                let mut clipped = raw[..CAP_BYTES].to_string();
+                clipped.push_str("\n…[orientation truncated]\n");
+                Some(clipped)
+            }
+        }
+        _ => None,
+    }
+}
+
 /// POSIX-style single-quote escape: `it's fine` -> `'it'\''s fine'`.
 fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -1384,7 +1535,7 @@ mod tests {
                 Rc::clone(&session),
                 &mut runtime,
                 &mut provider,
-                DEFAULT_MODEL_TURN_BUDGET,
+                HarborAgentOpts::for_tests(),
                 None,
             )
             .expect("model agent");
@@ -1505,7 +1656,10 @@ mod tests {
                 Rc::clone(&session),
                 &mut runtime,
                 &mut provider,
-                3,
+                HarborAgentOpts {
+                    turn_budget: 3,
+                    ..HarborAgentOpts::for_tests()
+                },
                 None,
             )
             .expect("budget-capped agent");
