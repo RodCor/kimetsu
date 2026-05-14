@@ -380,7 +380,7 @@ where
     R: BufRead + 'static,
     W: Write + 'static,
 {
-    use crate::model::{ModelMessage, ModelRequest, StopReason, ToolChoice, ToolDefinition};
+    use crate::model::{ModelMessage, ModelRequest, StopReason, ToolChoice};
 
     // MP-9 (path B): Claude Code 2.x in `-p` mode injects its own
     // agentic harness over our --system-prompt and tells the model it
@@ -417,6 +417,16 @@ where
         _ => String::new(),
     };
 
+    // MP-12: full v0.1-comparable tool surface (7 tools instead of just
+    // shell_command). Each composed-tool implementation in harbor_tools.rs
+    // dispatches one or more shell calls through the same
+    // HarborShellExecutor that shell_command uses, then assembles a
+    // structured result the model can rely on (read_file gets line
+    // numbers + truncation; list_files gets a sized listing; etc.).
+    // The model sees these as first-class JSON tools, which (a) cuts
+    // the "I need to remember the exact bash invocation" overhead and
+    // (b) collapses multi-step idioms (read-then-modify) into single
+    // turns.
     let user = ModelMessage::user_text(format!(
         "{prior_block}\
          Task (from Harbor / Terminal-Bench):\n\
@@ -424,49 +434,40 @@ where
          === Important runtime override ===\n\
          You are running inside the Kimetsu wrapper. Any tool catalog the\n\
          Claude Code runtime advertises (Monitor, PushNotification,\n\
-         RemoteTrigger, Bash, Edit, etc.) is NOT real in this environment.\n\
-         The only way to take an action is to emit a JSON envelope that\n\
-         Kimetsu will parse out of your response text and execute on your\n\
-         behalf. There is exactly one usable tool: `shell_command`.\n\
+         RemoteTrigger, Bash, Edit, etc.) is NOT real here.\n\
+         The only way to take action is to emit a JSON envelope that\n\
+         Kimetsu will parse out of your response text and execute. The\n\
+         tool set below is what's available; ignore everything else.\n\
+         \n\
+         === Tools (pick the most specific one; fall back to shell_command) ===\n\
+         - read_file:    {{path, max_lines?}} -> {{content, lines, truncated}}\n\
+         - list_files:   {{path?, max_depth?, max_entries?}} -> {{entries}}\n\
+         - search_files: {{pattern, path?, max_matches?, glob?}} -> {{matches}}\n\
+         - write_file:   {{path, content}} -> {{path, bytes_written}}\n\
+         - git_status:   {{cwd?}} -> {{porcelain}}\n\
+         - git_diff:     {{paths?, cwd?}} -> {{diff}}\n\
+         - shell_command:{{program, args, cwd_relative?, timeout_secs?}} -> {{exit_code, stdout, stderr}}\n\
          \n\
          Response format (one JSON object per reply, no prose, no\n\
          markdown, no backticks):\n\
          \n\
-         To run a command:\n\
+         To call a tool:\n\
          {{\"thought\": \"<short rationale>\",\n\
-          \"tool_call\": {{\"name\": \"shell_command\",\n\
-                          \"input\": {{\"program\": \"<bin>\",\n\
-                                     \"args\": [\"<arg1>\", \"<arg2>\"],\n\
-                                     \"cwd_relative\": \"<dir or null>\",\n\
-                                     \"timeout_secs\": 60}}}}}}\n\
+          \"tool_call\": {{\"name\": \"<tool>\", \"input\": <object matching the schema>}}}}\n\
          \n\
          To finish and report the final answer:\n\
          {{\"thought\": \"<short rationale>\",\n\
           \"finish\": {{\"summary\": \"<one-line outcome the verifier should see>\"}}}}\n\
          \n\
          Workspace paths are relative to the task's starting directory.\n\
-         Begin with one tool_call envelope. Do not narrate."
+         Use read_file / list_files / search_files for inspection;\n\
+         write_file for new content; shell_command for everything else\n\
+         (builds, tests, package installs, invoking the verifier). Begin\n\
+         with one tool_call envelope. Do not narrate."
     ));
     let mut messages = vec![system, user];
 
-    let tool_defs = vec![ToolDefinition {
-        name: "shell_command".to_string(),
-        description: "Run a single shell command inside the workspace. \
-            Returns exit_code, stdout, stderr. Use this to read files \
-            (cat), list dirs (ls), search (grep / rg), edit (sed, echo \
-            > file), and run build / test commands."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "program": { "type": "string", "description": "Program name, e.g. `bash` or `cat`." },
-                "args":    { "type": "array", "items": { "type": "string" }, "description": "Command arguments." },
-                "cwd_relative": { "type": "string", "description": "Workspace-relative working directory; default is workspace root." },
-                "timeout_secs": { "type": "integer", "description": "Hard timeout in seconds; default 60." }
-            },
-            "required": ["program"],
-        }),
-    }];
+    let tool_defs = harbor_tool_definitions();
 
     let mut tool_calls_total = 0u32;
     let mut last_usage = crate::model::TokenUsage::default();
@@ -499,33 +500,9 @@ where
 
             for call in response.tool_calls {
                 tool_calls_total += 1;
-                if call.name != "shell_command" {
-                    let err = serde_json::json!({
-                        "error": format!(
-                            "unsupported tool `{}`; only `shell_command` is available in harbor mode",
-                            call.name
-                        ),
-                    });
-                    messages.push(ModelMessage::tool_result(call.id, call.name, err));
-                    continue;
-                }
-                let spec_value = call.input;
-                let result_value = match serde_json::from_value::<crate::tools::CommandSpec>(
-                    spec_value.clone(),
-                ) {
-                    Ok(spec) => match runtime.shell_command(spec) {
-                        Ok(output) => serde_json::to_value(output).unwrap_or_else(|err| {
-                            serde_json::json!({ "error": err.to_string() })
-                        }),
-                        Err(err) => serde_json::json!({
-                            "error": format!("shell_command failed: {err}"),
-                        }),
-                    },
-                    Err(err) => serde_json::json!({
-                        "error": format!("invalid shell_command input: {err}; got {spec_value}"),
-                    }),
-                };
-                messages.push(ModelMessage::tool_result(call.id, "shell_command", result_value));
+                let name = call.name.clone();
+                let result_value = harbor_dispatch_tool(runtime, &name, call.input.clone());
+                messages.push(ModelMessage::tool_result(call.id, name, result_value));
             }
             continue;
         }
@@ -607,6 +584,509 @@ impl MessageMessage {
             }],
         }
     }
+}
+
+// =====================================================================
+// MP-12: composed-tool surface for harbor mode.
+//
+// The bare Claude-Code agent in MP-10b had 18.75 pp accuracy advantage
+// over the kimetsu wrapper. The MP-11-RESULTS.md verdict traced it to
+// a tool-surface gap: bare CC exposes Bash + Edit + Read + Glob + Grep
+// + Write etc.; kimetsu exposed only `shell_command`. Common operations
+// (read file -> edit -> verify) required 3-4 shell turns instead of one
+// structured tool call.
+//
+// MP-12 closes the gap WITHOUT regressing the harbor protocol — each
+// new tool is a thin Rust shim that composes 1-2 shell calls through
+// the existing HarborShellExecutor and returns a structured JSON
+// result. The model sees seven first-class tools; under the hood every
+// tool eventually dispatches a `tool.exec` JSON-RPC frame to Harbor's
+// container.
+// =====================================================================
+
+use crate::model::ToolDefinition;
+
+const READ_FILE_DEFAULT_MAX_LINES: u32 = 800;
+const LIST_FILES_DEFAULT_MAX_DEPTH: u32 = 3;
+const LIST_FILES_DEFAULT_MAX_ENTRIES: u32 = 200;
+const SEARCH_FILES_DEFAULT_MAX_MATCHES: u32 = 100;
+const TOOL_DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// MP-12: the seven tools the harbor model sees. Order matters for
+/// the model's first scan; put the most-used ones first (`read_file`,
+/// `list_files`, `search_files`) so the catalog is read top-down.
+pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a UTF-8 text file from the workspace. Returns content \
+                with line numbers, total line count, and a `truncated` flag if the \
+                file exceeded `max_lines`."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_lines": { "type": "integer", "description": "Cap on lines returned; default 800." }
+                },
+                "required": ["path"],
+            }),
+        },
+        ToolDefinition {
+            name: "list_files".to_string(),
+            description: "List files under `path` up to `max_depth` directories deep. \
+                Returns up to `max_entries` paths sorted alphabetically."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative root; default '.'." },
+                    "max_depth": { "type": "integer", "description": "Default 3." },
+                    "max_entries": { "type": "integer", "description": "Default 200." }
+                },
+            }),
+        },
+        ToolDefinition {
+            name: "search_files".to_string(),
+            description: "Grep for `pattern` (regex) under `path`. Returns up to \
+                `max_matches` hits as {file, line, text}."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "path": { "type": "string", "description": "Default '.'." },
+                    "max_matches": { "type": "integer", "description": "Default 100." },
+                    "glob": { "type": "string", "description": "Optional filename glob, e.g. '*.py'." }
+                },
+                "required": ["pattern"],
+            }),
+        },
+        ToolDefinition {
+            name: "write_file".to_string(),
+            description: "Create or overwrite a file at `path` with `content`. \
+                Returns `bytes_written`. Use this for new files or full rewrites; \
+                use shell_command + sed for in-place edits."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"],
+            }),
+        },
+        ToolDefinition {
+            name: "git_status".to_string(),
+            description: "Run `git status --porcelain` in `cwd`. Returns the raw \
+                porcelain output."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Default workspace root." }
+                },
+            }),
+        },
+        ToolDefinition {
+            name: "git_diff".to_string(),
+            description: "Run `git diff` (working tree vs HEAD) for the given paths. \
+                If `paths` is omitted, diffs everything."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "cwd": { "type": "string" }
+                },
+            }),
+        },
+        ToolDefinition {
+            name: "shell_command".to_string(),
+            description: "Escape hatch for anything the named tools don't cover: \
+                builds, tests, package installs, running the verifier. \
+                Returns exit_code, stdout, stderr."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "program": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } },
+                    "cwd_relative": { "type": "string" },
+                    "timeout_secs": { "type": "integer" }
+                },
+                "required": ["program"],
+            }),
+        },
+    ]
+}
+
+/// MP-12: route a model-emitted tool call to its composed-shell impl.
+/// Returns a structured JSON value the agent loop hands back as a
+/// tool_result message. Unknown tool names get an `error` object so
+/// the model can self-correct without aborting the run.
+pub fn harbor_dispatch_tool(
+    runtime: &mut crate::tools::ToolRuntime,
+    name: &str,
+    input: Value,
+) -> Value {
+    match name {
+        "read_file" => harbor_read_file(runtime, &input),
+        "list_files" => harbor_list_files(runtime, &input),
+        "search_files" => harbor_search_files(runtime, &input),
+        "write_file" => harbor_write_file(runtime, &input),
+        "git_status" => harbor_git_status(runtime, &input),
+        "git_diff" => harbor_git_diff(runtime, &input),
+        "shell_command" => harbor_shell_command(runtime, &input),
+        other => json!({
+            "error": format!(
+                "unsupported tool `{other}`; pick one of \
+                 read_file / list_files / search_files / write_file / \
+                 git_status / git_diff / shell_command"
+            ),
+        }),
+    }
+}
+
+fn input_str<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input.get(key).and_then(Value::as_str)
+}
+fn input_u32(input: &Value, key: &str, default: u32) -> u32 {
+    input
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|n| n as u32)
+        .unwrap_or(default)
+}
+
+fn run_shell(
+    runtime: &mut crate::tools::ToolRuntime,
+    program: &str,
+    args: Vec<String>,
+    cwd_relative: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<crate::tools::ShellCommandOutput, String> {
+    let spec = CommandSpec {
+        program: program.to_string(),
+        args,
+        cwd_relative,
+        timeout_secs: Some(timeout_secs.unwrap_or(TOOL_DEFAULT_TIMEOUT_SECS)),
+        expected_exit: None,
+    };
+    runtime.shell_command(spec).map_err(|e| e.to_string())
+}
+
+fn harbor_read_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(path) = input_str(input, "path") else {
+        return json!({ "error": "read_file requires `path`" });
+    };
+    let max_lines = input_u32(input, "max_lines", READ_FILE_DEFAULT_MAX_LINES);
+    // `wc -l` first so we know how truncated we are; then sed -n to cap.
+    // Both run in one shell so the model only sees one tool turn.
+    let cmd = format!(
+        "set -e; total=$(wc -l < {0} 2>/dev/null || echo 0); sed -n '1,{1}p' {0}; echo \"::LINES_TOTAL::$total\"",
+        shell_quote(path),
+        max_lines
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), cmd],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("read_file shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("read_file: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+            "path": path,
+        });
+    }
+    // Split off the trailing ::LINES_TOTAL::N marker.
+    let raw = out.stdout_summary;
+    let (content, total_line_count) = split_total_marker(&raw);
+    let returned_lines = content.lines().count() as u32;
+    let truncated = total_line_count.map(|t| t > returned_lines).unwrap_or(false);
+    json!({
+        "path": path,
+        "content": content,
+        "lines_returned": returned_lines,
+        "lines_total": total_line_count,
+        "truncated": truncated,
+        "duration_ms": out.duration_ms,
+    })
+}
+
+fn harbor_list_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let path = input_str(input, "path").unwrap_or(".");
+    let max_depth = input_u32(input, "max_depth", LIST_FILES_DEFAULT_MAX_DEPTH);
+    let max_entries = input_u32(input, "max_entries", LIST_FILES_DEFAULT_MAX_ENTRIES);
+    let args = vec![
+        path.to_string(),
+        "-maxdepth".into(),
+        max_depth.to_string(),
+        "-mindepth".into(),
+        "1".into(),
+        "-type".into(),
+        "f".into(),
+    ];
+    let out = match run_shell(runtime, "find", args, None, Some(TOOL_DEFAULT_TIMEOUT_SECS)) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("list_files shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("list_files: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+            "path": path,
+        });
+    }
+    let mut entries: Vec<&str> = out
+        .stdout_summary
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    entries.sort();
+    let total = entries.len() as u32;
+    let truncated = total > max_entries;
+    entries.truncate(max_entries as usize);
+    json!({
+        "path": path,
+        "max_depth": max_depth,
+        "entries": entries,
+        "entries_returned": entries.len() as u32,
+        "entries_total": total,
+        "truncated": truncated,
+    })
+}
+
+fn harbor_search_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(pattern) = input_str(input, "pattern") else {
+        return json!({ "error": "search_files requires `pattern`" });
+    };
+    let path = input_str(input, "path").unwrap_or(".");
+    let max_matches = input_u32(input, "max_matches", SEARCH_FILES_DEFAULT_MAX_MATCHES);
+    let glob = input_str(input, "glob");
+
+    // Use grep -rnE; --include for globs; head -n for cap. -I skips binary.
+    let mut cmd = String::from("grep -rnEI ");
+    if let Some(g) = glob {
+        cmd.push_str(&format!("--include={} ", shell_quote(g)));
+    }
+    cmd.push_str(&shell_quote(pattern));
+    cmd.push(' ');
+    cmd.push_str(&shell_quote(path));
+    cmd.push_str(&format!(" 2>/dev/null | head -n {max_matches} || true"));
+
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), cmd],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("search_files shell failed: {e}") }),
+    };
+    let matches: Vec<Value> = out
+        .stdout_summary
+        .lines()
+        .filter_map(parse_grep_line)
+        .collect();
+    json!({
+        "pattern": pattern,
+        "path": path,
+        "matches": matches,
+        "matches_returned": matches.len() as u32,
+        "truncated": matches.len() as u32 >= max_matches,
+    })
+}
+
+fn harbor_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(path) = input_str(input, "path") else {
+        return json!({ "error": "write_file requires `path`" });
+    };
+    let Some(content) = input_str(input, "content") else {
+        return json!({ "error": "write_file requires `content`" });
+    };
+    // Heredoc with a fixed sentinel; base64 the content so any content
+    // is safe (no need to escape backticks, $, etc.).
+    let encoded = base64_encode(content.as_bytes());
+    let cmd = format!(
+        "set -e; mkdir -p \"$(dirname -- {0})\"; echo {1} | base64 -d > {0}; wc -c < {0}",
+        shell_quote(path),
+        shell_quote(&encoded)
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), cmd],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("write_file shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("write_file: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+            "path": path,
+        });
+    }
+    let bytes_written: u64 = out.stdout_summary.trim().parse().unwrap_or(0);
+    json!({
+        "path": path,
+        "bytes_written": bytes_written,
+        "duration_ms": out.duration_ms,
+    })
+}
+
+fn harbor_git_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let cwd = input_str(input, "cwd").map(str::to_string);
+    let out = match run_shell(
+        runtime,
+        "git",
+        vec!["status".into(), "--porcelain".into()],
+        cwd,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("git_status shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("git_status: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+        });
+    }
+    json!({
+        "porcelain": out.stdout_summary,
+        "clean": out.stdout_summary.trim().is_empty(),
+    })
+}
+
+fn harbor_git_diff(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let cwd = input_str(input, "cwd").map(str::to_string);
+    let mut args = vec!["diff".to_string()];
+    if let Some(arr) = input.get("paths").and_then(Value::as_array) {
+        args.push("--".to_string());
+        for p in arr {
+            if let Some(s) = p.as_str() {
+                args.push(s.to_string());
+            }
+        }
+    }
+    let out = match run_shell(runtime, "git", args, cwd, Some(TOOL_DEFAULT_TIMEOUT_SECS)) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("git_diff shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("git_diff: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+        });
+    }
+    json!({
+        "diff": out.stdout_summary,
+        "empty": out.stdout_summary.trim().is_empty(),
+    })
+}
+
+fn harbor_shell_command(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let spec_value = input.clone();
+    match serde_json::from_value::<CommandSpec>(spec_value.clone()) {
+        Ok(spec) => match runtime.shell_command(spec) {
+            Ok(output) => serde_json::to_value(output)
+                .unwrap_or_else(|err| json!({ "error": err.to_string() })),
+            Err(err) => json!({ "error": format!("shell_command failed: {err}") }),
+        },
+        Err(err) => json!({
+            "error": format!("invalid shell_command input: {err}; got {spec_value}"),
+        }),
+    }
+}
+
+// --- small helpers ---------------------------------------------------------
+
+/// POSIX-style single-quote escape: `it's fine` -> `'it'\''s fine'`.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn truncate(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..cap])
+    }
+}
+
+fn split_total_marker(raw: &str) -> (String, Option<u32>) {
+    // Find the last line that is exactly "::LINES_TOTAL::N".
+    let marker = "::LINES_TOTAL::";
+    if let Some(idx) = raw.rfind(marker) {
+        let (before, rest) = raw.split_at(idx);
+        let n: Option<u32> = rest
+            .trim_start_matches(marker)
+            .trim()
+            .parse()
+            .ok();
+        return (before.trim_end_matches('\n').to_string(), n);
+    }
+    (raw.to_string(), None)
+}
+
+fn parse_grep_line(line: &str) -> Option<Value> {
+    // grep -n format: "<file>:<line>:<text>"
+    let mut parts = line.splitn(3, ':');
+    let file = parts.next()?.to_string();
+    let line_no: u32 = parts.next()?.parse().ok()?;
+    let text = parts.next()?.to_string();
+    Some(json!({ "file": file, "line": line_no, "text": text }))
+}
+
+/// Tiny base64 encoder (RFC 4648) — we don't need a crate just for one
+/// helper. Used to ship file content through a shell heredoc safely.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.push(ALPHA[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHA[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHA[(n & 0x3F) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = u32::from(rem[0]) << 16;
+            out.push(ALPHA[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3F) as usize] as char);
+            out.push_str("==");
+        }
+        2 => {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(ALPHA[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3F) as usize] as char);
+            out.push(ALPHA[((n >> 6) & 0x3F) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
 }
 
 
