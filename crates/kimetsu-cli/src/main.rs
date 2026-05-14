@@ -82,6 +82,15 @@ struct AgentArgs {
     /// `claude-haiku-4-5` for cheap iteration / smoke testing.
     #[arg(long)]
     model: Option<String>,
+    /// MP-11: path to a kimetsu project whose broker (curated memories,
+    /// prior-run capsules, repo capsules) should be injected into the
+    /// model's user message before the task. Without this flag the
+    /// agent runs in "no-brain" mode — the v0.2 kimetsu-no-brain
+    /// baseline. With it, the agent runs in "brain" mode — the
+    /// kimetsu-brain leg of the v0.2 falsifiable claim. Also honors
+    /// $KIMETSU_HARBOR_PROJECT if the flag is omitted.
+    #[arg(long)]
+    project: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -460,12 +469,20 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
             let _ = run_multi_step_stub(&args.task, Rc::clone(&session), &mut runtime)?;
         } else {
             let mut provider = build_harbor_model_provider(args.model.as_deref(), &scratch)?;
+
+            // MP-11: resolve --project / $KIMETSU_HARBOR_PROJECT into a
+            // brain context block (curated memories + prior-run capsules)
+            // to inject into the user message. Empty / missing project =
+            // no-brain mode.
+            let brain_context = resolve_brain_context(args.project.as_deref(), &args.task)?;
+
             let _ = run_model_agent(
                 &args.task,
                 Rc::clone(&session),
                 &mut runtime,
                 &mut *provider,
                 args.turn_budget,
+                brain_context.as_deref(),
             )?;
         }
         Ok(())
@@ -511,6 +528,79 @@ fn build_harbor_model_provider(
         Some(provider) => Ok(Box::new(provider)),
         None => Err("failed to construct ClaudeCodeProvider (no API key resolved)".into()),
     }
+}
+
+/// MP-11: resolve the optional --project (or $KIMETSU_HARBOR_PROJECT)
+/// path into a rendered brain-context string that `run_model_agent`
+/// prepends to the user message. The path must point at a kimetsu
+/// project root (i.e. contain a `.kimetsu/` directory with brain.db).
+///
+/// Behaviour:
+/// - flag/env unset OR resolved path missing -> Ok(None) (no-brain mode)
+/// - resolved path present but broker returns no capsules within budget
+///   -> Ok(Some("(no broker capsules retrieved)")) for telemetry; the
+///   run_model_agent caller treats trimmed-empty as no-brain anyway
+/// - retrieval errors out -> surface the error rather than silently
+///   degrading to no-brain (we don't want a broken brain pool to
+///   masquerade as "no-brain" in the v0.2 comparison)
+fn resolve_brain_context(
+    cli_path: Option<&Path>,
+    task: &str,
+) -> KimetsuResult<Option<String>> {
+    let resolved = cli_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("KIMETSU_HARBOR_PROJECT").ok().map(PathBuf::from));
+    let Some(project_dir) = resolved else {
+        return Ok(None);
+    };
+    if !project_dir.is_dir() {
+        eprintln!(
+            "kimetsu agent: --project {} is not a directory; running no-brain",
+            project_dir.display()
+        );
+        return Ok(None);
+    }
+
+    // Use "harbor" as the broker stage label so context.rs scoring
+    // can route it however the v0.1 weights specify (currently
+    // unknown stages fall back to defaults). 2000 tokens of budget
+    // — enough for 5-10 capsules without dominating the user
+    // message.
+    let bundle = match project::retrieve_context(&project_dir, "harbor", task, 2000) {
+        Ok(b) => b,
+        Err(err) => {
+            return Err(format!(
+                "failed to retrieve broker context from {}: {err}",
+                project_dir.display()
+            )
+            .into());
+        }
+    };
+
+    if bundle.capsules.is_empty() {
+        return Ok(Some(
+            "(no broker capsules retrieved — project has no memories or no relevance hit)".to_string(),
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Retrieved {} capsule(s) within a {}-token budget ({} tokens used):\n",
+        bundle.capsules.len(),
+        bundle.budget_tokens,
+        bundle.used_tokens,
+    ));
+    for (i, c) in bundle.capsules.iter().enumerate() {
+        out.push_str(&format!(
+            "[{idx}] {kind} (score {score:.2}, scope_weight {sw:.2})\n  {summary}\n",
+            idx = i + 1,
+            kind = c.kind,
+            score = c.score,
+            sw = c.scope_weight,
+            summary = c.summary,
+        ));
+    }
+    Ok(Some(out))
 }
 
 fn init(args: InitArgs) -> KimetsuResult<()> {

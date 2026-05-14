@@ -374,6 +374,7 @@ pub fn run_model_agent<R, W>(
     runtime: &mut crate::tools::ToolRuntime,
     provider: &mut dyn crate::model::ModelProvider,
     turn_budget: u32,
+    brain_context: Option<&str>,
 ) -> KimetsuResult<ModelAgentReport>
 where
     R: BufRead + 'static,
@@ -399,8 +400,26 @@ where
     // This is the v0.1 envelope pattern adapted to compete with CC's
     // harness override.
     let system = MessageMessage::system_prompt_for_harbor();
+
+    // MP-11 (brain mode): if a kimetsu project supplied broker context
+    // for this task — curated memories, prior-run capsules — render it
+    // as a "Prior context" section the model sees BEFORE the task.
+    // This is the kimetsu-brain leg of the v0.2 falsifiable claim. In
+    // no-brain mode `brain_context` is None and the rendered section is
+    // omitted entirely (no "empty memories" stub that would dilute the
+    // model's attention).
+    let prior_block = match brain_context {
+        Some(text) if !text.trim().is_empty() => format!(
+            "=== Prior context (from Kimetsu's broker — curated memories \
+             and prior-run capsules retrieved for this task) ===\n\
+             {text}\n\n",
+        ),
+        _ => String::new(),
+    };
+
     let user = ModelMessage::user_text(format!(
-        "Task (from Harbor / Terminal-Bench):\n\
+        "{prior_block}\
+         Task (from Harbor / Terminal-Bench):\n\
          {task}\n\n\
          === Important runtime override ===\n\
          You are running inside the Kimetsu wrapper. Any tool catalog the\n\
@@ -886,6 +905,7 @@ mod tests {
                 &mut runtime,
                 &mut provider,
                 DEFAULT_MODEL_TURN_BUDGET,
+                None,
             )
             .expect("model agent");
             drop(runtime);
@@ -1006,6 +1026,7 @@ mod tests {
                 &mut runtime,
                 &mut provider,
                 3,
+                None,
             )
             .expect("budget-capped agent");
             drop(runtime);
