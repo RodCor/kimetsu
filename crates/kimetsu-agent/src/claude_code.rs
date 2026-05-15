@@ -71,69 +71,120 @@ impl ModelProvider for ClaudeCodeProvider {
         let config_dir = work_dir.path().join("config");
         fs::create_dir_all(&config_dir)?;
 
-        let mut command = Command::new("claude");
-        command
-            .current_dir(work_dir.path())
-            .env("CLAUDE_CONFIG_DIR", &config_dir)
-            .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
-            // Route the configured token through the OAuth env var; the local
-            // `claude` CLI accepts OAuth for non-`--bare` invocations.
-            .env("CLAUDE_CODE_OAUTH_TOKEN", &self.api_key)
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("ANTHROPIC_AUTH_TOKEN")
-            .arg("-p")
-            .arg(&prompt)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--model")
-            .arg(&self.model)
-            // MP-7d / MP-13c: bump to 16. 8 was already a workaround for
-            // Claude Code's inner-loop interpretation of our envelope
-            // tool_use. Some MP-12 trials (compile-compcert,
-            // circuit-fibsqrt) showed CC's inner loop running close to
-            // 8 turns before our envelope grammar finally fired; the
-            // result was claude_code provider stalls. 16 doubles the
-            // headroom for those cases without exploding cost — the
-            // outer kimetsu loop is still the real budget gate.
-            .arg("--max-turns")
-            .arg("16")
-            .arg("--max-budget-usd")
-            .arg(format!("{:.4}", self.max_budget_usd))
-            .arg("--no-session-persistence")
-            .arg("--tools")
-            .arg("")
-            .arg("--permission-mode")
-            .arg("bypassPermissions")
-            .arg("--system-prompt")
-            .arg(&system_prompt);
+        // MP-13f: retry loop for transient Anthropic 5xx errors. The
+        // MP-13 brain gauntlet caught a real 14-of-16-trials wipeout
+        // when Anthropic returned 529 Overloaded across a ~70-minute
+        // window; the kimetsu binary aborted on the first transient
+        // failure and the adapter saw the process exit before
+        // agent.done. We now retry up to 3 times with 5s/15s
+        // exponential backoff. Outer kimetsu loop is still the budget
+        // ceiling.
+        const MAX_ATTEMPTS: u32 = 3;
+        const BASE_BACKOFF_SECS: u64 = 5;
 
-        let output = run_with_timeout(command, self.timeout).map_err(|err| {
-            redact_token(
-                &format!("claude_code provider failed: {err}"),
-                &self.api_key,
-            )
-        })?;
-        if !output.status.success() {
-            return Err(redact_token(
-                &format!(
-                    "claude_code provider failed (exit {}): {}",
-                    output
-                        .status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "signal".to_string()),
-                    output_summary(&output)
-                ),
-                &self.api_key,
-            )
-            .into());
+        let build_command = || {
+            let mut command = Command::new("claude");
+            command
+                .current_dir(work_dir.path())
+                .env("CLAUDE_CONFIG_DIR", &config_dir)
+                .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
+                // Route the configured token through the OAuth env var; the local
+                // `claude` CLI accepts OAuth for non-`--bare` invocations.
+                .env("CLAUDE_CODE_OAUTH_TOKEN", &self.api_key)
+                .env_remove("ANTHROPIC_API_KEY")
+                .env_remove("ANTHROPIC_AUTH_TOKEN")
+                .arg("-p")
+                .arg(&prompt)
+                .arg("--output-format")
+                .arg("json")
+                .arg("--model")
+                .arg(&self.model)
+                // MP-7d / MP-13c: bump to 16. 8 was already a workaround for
+                // Claude Code's inner-loop interpretation of our envelope
+                // tool_use. Some MP-12 trials (compile-compcert,
+                // circuit-fibsqrt) showed CC's inner loop running close to
+                // 8 turns before our envelope grammar finally fired; the
+                // result was claude_code provider stalls. 16 doubles the
+                // headroom for those cases without exploding cost — the
+                // outer kimetsu loop is still the real budget gate.
+                .arg("--max-turns")
+                .arg("16")
+                .arg("--max-budget-usd")
+                .arg(format!("{:.4}", self.max_budget_usd))
+                .arg("--no-session-persistence")
+                .arg("--tools")
+                .arg("")
+                .arg("--permission-mode")
+                .arg("bypassPermissions")
+                .arg("--system-prompt")
+                .arg(&system_prompt);
+            command
+        };
+
+        let mut last_error: Option<String> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let output = run_with_timeout(build_command(), self.timeout).map_err(|err| {
+                redact_token(
+                    &format!("claude_code provider failed: {err}"),
+                    &self.api_key,
+                )
+            })?;
+
+            // Two retry conditions:
+            //  (a) Claude Code exits non-zero AND stdout JSON has
+            //      api_error_status >= 500
+            //  (b) stdout text contains "Overloaded" as a fallback
+            //      sentinel for cases where the JSON parse fails
+            let stdout_text = String::from_utf8_lossy(&output.stdout);
+            let transient = if !output.status.success() {
+                let cc: Option<ClaudeCodeJson> = serde_json::from_str(&stdout_text).ok();
+                let status_5xx = cc
+                    .as_ref()
+                    .and_then(|c| c.api_error_status)
+                    .map(|s| s >= 500)
+                    .unwrap_or(false);
+                let overloaded_text = stdout_text.contains("Overloaded")
+                    || stdout_text.contains("\"api_error_status\":5");
+                status_5xx || overloaded_text
+            } else {
+                false
+            };
+
+            if !output.status.success() {
+                let err_msg = redact_token(
+                    &format!(
+                        "claude_code provider failed (exit {}, attempt {attempt}/{MAX_ATTEMPTS}): {}",
+                        output
+                            .status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "signal".to_string()),
+                        output_summary(&output)
+                    ),
+                    &self.api_key,
+                );
+                if transient && attempt < MAX_ATTEMPTS {
+                    let backoff = BASE_BACKOFF_SECS * (1u64 << (attempt - 1));
+                    eprintln!(
+                        "claude_code transient error on attempt {attempt}/{MAX_ATTEMPTS}; retrying in {backoff}s"
+                    );
+                    thread::sleep(Duration::from_secs(backoff));
+                    last_error = Some(err_msg);
+                    continue;
+                }
+                return Err(err_msg.into());
+            }
+
+            let mut response = parse_claude_code_output(&output.stdout)?;
+            if tool_loop {
+                apply_tool_envelope(&mut response);
+            }
+            return Ok(response);
         }
 
-        let mut response = parse_claude_code_output(&output.stdout)?;
-        if tool_loop {
-            apply_tool_envelope(&mut response);
-        }
-        Ok(response)
+        Err(last_error
+            .unwrap_or_else(|| "claude_code provider exhausted retries".to_string())
+            .into())
     }
 }
 
@@ -414,6 +465,11 @@ fn truncate(value: &str, max_chars: usize) -> String {
 struct ClaudeCodeJson {
     subtype: Option<String>,
     is_error: Option<bool>,
+    /// MP-13f: when CC's underlying Anthropic call returns a 5xx
+    /// transient (typically 529 Overloaded during peak load), CC
+    /// surfaces it here. We retry on >=500 with exponential backoff.
+    #[serde(default)]
+    api_error_status: Option<u32>,
     result: Option<String>,
     stop_reason: Option<String>,
     total_cost_usd: Option<f32>,
