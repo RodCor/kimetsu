@@ -146,6 +146,23 @@ impl ModelProvider for ClaudeCodeProvider {
                 // kimetsu loop already enforces budget via cost tracking
                 // and turn count; the inner cap was redundant.
                 .arg("--no-session-persistence")
+                // MP-17h: keep `--tools ""` to disable Claude Code's
+                // built-in tool surface (Bash, Edit, Read, Write, Glob,
+                // Grep, TodoWrite, Task, ...). Without this, claude runs
+                // its own inner agentic loop using those tools, which:
+                //   (a) conflicts with our envelope grammar — model
+                //       gets two tool surfaces and chooses wrong;
+                //   (b) buffers entire interaction with `--output-format
+                //       json` → our heartbeat sees 0 bytes for the full
+                //       1500s idle window and kills the subprocess;
+                //   (c) routes filesystem ops to the wrong place
+                //       (claude's cwd, not the Harbor container).
+                // MP-17g dropped this flag thinking it was redundant
+                // with our envelope override; it isn't. The flag does
+                // NOT affect our argv ARG_MAX situation (stdin-pipe
+                // already handles that).
+                .arg("--tools")
+                .arg("")
                 .arg("--permission-mode")
                 .arg("bypassPermissions")
                 .arg("--system-prompt")
