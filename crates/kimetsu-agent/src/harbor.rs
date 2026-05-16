@@ -557,14 +557,113 @@ where
          {{\"thought\": \"<short rationale>\",\n\
           \"finish\": {{\"summary\": \"<one-line outcome the verifier should see>\"}}}}\n\
          \n\
+         === Tool selection heuristics (read this before responding) ===\n\
+         \n\
+         LONG-RUNNING COMMANDS (>60s expected):\n\
+         Use shell_background, NOT shell_command. The wrapper kills any\n\
+         single foreground call that runs longer than ~1500s wall-clock,\n\
+         so big builds / training / large test suites MUST be backgrounded.\n\
+         Examples that need shell_background:\n\
+           - `make`, `make -j`, `cargo build --release`, `cmake --build`\n\
+           - `pip install` of heavy packages, `npm install` in big trees\n\
+           - Training scripts (python train.py, caffe train ...)\n\
+           - Long test suites, ray tracers, simulators\n\
+           - Anything where you'd watch a progress bar\n\
+         Pattern:\n\
+           1) shell_background {{program, args}}        -> {{handle, pid}}\n\
+           2) shell_status     {{handle}}                -> {{running, runtime_sec, exit_code?}}\n\
+           3) shell_output     {{handle, tail_bytes:4096}} -> {{stdout_tail, stderr_tail}}\n\
+              Loop 2+3 as needed. Insert `think` calls between polls to\n\
+              plan next steps instead of polling tighter than ~10s.\n\
+           4) shell_stop {{handle}} only if you decide to give up early.\n\
+         \n\
+         FILE EDITS — pick the cheapest tool that fits:\n\
+           - edit_file: changing a few lines in an existing file. ~50x\n\
+             cheaper than write_file for small edits. Hash-checked.\n\
+           - apply_patch: coordinated changes across multiple files.\n\
+             Accepts BOTH standard unified diff AND Codex starred-patch\n\
+             format (*** Begin Patch / *** Update File: / *** Add File:).\n\
+           - write_file: ONLY for new files or full rewrites. Using it\n\
+             to change a few lines wastes tokens and risks corrupting\n\
+             unrelated content.\n\
+         \n\
+         FILE READS — slice big files, don't dump them:\n\
+           - read_file {{offset, limit}}: read lines N..M of a big file.\n\
+             A 2000-line source dump costs ~10k tokens of input;\n\
+             lines 400-450 costs ~50 tokens. Pick the slice.\n\
+           - multi_read: 2+ files at once in one tool call. Cheaper than\n\
+             N separate read_file calls because the shell round-trip is\n\
+             paid once.\n\
+           - glob: find files by NAME pattern ('**/*.py'). Use this\n\
+             instead of search_files when you don't need content search.\n\
+           - search_files: grep file CONTENT. Slower than glob; only use\n\
+             when you need to find code by what it contains.\n\
+         \n\
+         PLANNING & DELIBERATION:\n\
+           - plan: when the task has >=3 distinct steps, call plan FIRST\n\
+             with the breakdown. Update statuses as you progress. The\n\
+             plan survives across turns in your conversation history.\n\
+           - think: pure reasoning slot — no I/O. Use when you need to\n\
+             work through a problem before acting. Cheaper than a probe\n\
+             tool call.\n\
+         \n\
+         PARALLEL CALLS (when independent):\n\
+         Batch reads / status checks / unrelated edits via the parallel\n\
+         tool_calls form. Saves one full model turn per extra call.\n\
+         Don't batch dependent calls (e.g. read after edit) — those need\n\
+         to be serialized.\n\
+         \n\
+         === Worked example: long-running compile task ===\n\
+         Task summary: \"Build CompCert from source, expose ccomp binary.\"\n\
+         Turn 1 (orient + read instructions in one shot):\n\
+           {{\"thought\":\"sniff layout and INSTALL doc\",\n\
+            \"tool_calls\":[\n\
+              {{\"name\":\"list_files\",\"input\":{{\"path\":\".\",\"max_depth\":1}}}},\n\
+              {{\"name\":\"read_file\",\"input\":{{\"path\":\"INSTALL.md\",\"limit\":80}}}}\n\
+            ]}}\n\
+         Turn 2 (configure + record plan):\n\
+           {{\"thought\":\"configure first, then background make\",\n\
+            \"tool_calls\":[\n\
+              {{\"name\":\"shell_command\",\"input\":{{\"program\":\"./configure\",\"args\":[\"x86_64-linux\"]}}}},\n\
+              {{\"name\":\"plan\",\"input\":{{\"todos\":[\n\
+                {{\"content\":\"configure\",\"status\":\"completed\"}},\n\
+                {{\"content\":\"build (background)\",\"status\":\"in_progress\"}},\n\
+                {{\"content\":\"verify ccomp binary\",\"status\":\"pending\"}}\n\
+              ]}}}}\n\
+            ]}}\n\
+         Turn 3 (kick off background build):\n\
+           {{\"thought\":\"make -j; expect ~15 min\",\n\
+            \"tool_call\":{{\"name\":\"shell_background\",\"input\":{{\"program\":\"make\",\"args\":[\"-j4\"]}}}}}}\n\
+         Turn 4 (poll while waiting):\n\
+           {{\"thought\":\"check progress\",\n\
+            \"tool_call\":{{\"name\":\"shell_status\",\"input\":{{\"handle\":\"bg-<received>\"}}}}}}\n\
+         Turn 5 (still running, check tail):\n\
+           {{\"thought\":\"see latest output\",\n\
+            \"tool_call\":{{\"name\":\"shell_output\",\"input\":{{\"handle\":\"bg-<received>\",\"tail_bytes\":4096}}}}}}\n\
+         Turn N (build done, verify):\n\
+           {{\"thought\":\"build complete, smoke-test ccomp\",\n\
+            \"tool_call\":{{\"name\":\"shell_command\",\"input\":{{\"program\":\"/tmp/CompCert/ccomp\",\"args\":[\"-v\"]}}}}}}\n\
+         Turn N+1 (finish):\n\
+           {{\"thought\":\"ccomp prints version; done\",\n\
+            \"finish\":{{\"summary\":\"CompCert built; ccomp at /tmp/CompCert/ccomp\"}}}}\n\
+         \n\
+         === Common pitfalls (don't do these) ===\n\
+           - Running `make` via shell_command for a multi-minute build\n\
+             (it will time out — use shell_background).\n\
+           - Using write_file to change 3 lines (use edit_file).\n\
+           - Reading a 2000-line file when you only need ~50 lines\n\
+             (use offset+limit).\n\
+           - Polling shell_status every 1s without a `think` between\n\
+             polls (wasteful; the model burns turns on no-op probes).\n\
+           - Emitting plain text without a JSON envelope when you have\n\
+             more work to do (Kimetsu will nudge you to keep going).\n\
+           - Calling finish before producing the artifact the verifier\n\
+             expects (the verifier reads files / runs scripts; an empty\n\
+             summary alone won't pass).\n\
+         \n\
          Workspace paths are relative to the task's starting directory.\n\
-         Use read_file / list_files / search_files for inspection;\n\
-         edit_file for targeted in-place edits (cheaper than write_file\n\
-         for small changes); apply_patch for multi-file unified-diff\n\
-         changes; write_file only for new files or full rewrites;\n\
-         shell_command for everything else (builds, tests, package\n\
-         installs, invoking the verifier). Begin with one tool_call\n\
-         envelope. Do not narrate."
+         Begin with one tool_call (or one parallel tool_calls batch).\n\
+         Do not narrate. Do not output plain prose. Always wrap in JSON."
     ));
     let mut messages = vec![system, user];
 

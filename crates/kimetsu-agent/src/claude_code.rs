@@ -279,6 +279,24 @@ fn render_tool_protocol(tools: &[ToolDefinition]) -> String {
          - Wait for all tool results before requesting more.\n\
          - Do not invent tool results. Do not output tool_result blocks yourself.\n\
          \n\
+         Tool selection heuristics (MP-17a):\n\
+         - Any command expected to take >60s (make / build / training /\n\
+           ray-trace / large test suite) MUST use shell_background, not\n\
+           shell_command. The wrapper kills foreground calls at ~1500s.\n\
+           Poll with shell_status / shell_output between turns.\n\
+         - Edits to existing files: edit_file (cheap, hash-checked) or\n\
+           apply_patch (multi-file diff). NEVER use write_file to change\n\
+           a few lines — it costs ~50x more tokens and risks corruption.\n\
+         - Big-file reads: read_file with offset+limit, not full dumps.\n\
+           multi_read when you need 2+ files at once.\n\
+         - glob for path patterns, search_files for content grep. Pick\n\
+           the cheaper one for the question you're asking.\n\
+         - Use plan for >=3-step tasks; update statuses as you progress.\n\
+         - Use think for reasoning slots; don't burn real tool calls on\n\
+           pure deliberation.\n\
+         - Batch independent calls via parallel tool_calls form to save\n\
+           model round-trips.\n\
+         \n\
          Available tools:\n{catalog}"
     )
 }
