@@ -259,10 +259,12 @@ fn render_tool_protocol(tools: &[ToolDefinition]) -> String {
         "Tool-call protocol (Kimetsu executes tools on your behalf):\n\
          - When you need a tool, output exactly one JSON object and nothing else:\n\
            {{\"thought\": \"<short rationale>\", \"tool_call\": {{\"name\": \"<tool>\", \"input\": <object>}}}}\n\
+         - To batch independent tools in one turn (no inter-call dependencies), use the parallel form:\n\
+           {{\"thought\": \"<short rationale>\", \"tool_calls\": [{{\"name\": \"<tool>\", \"input\": <object>}}, ...]}}\n\
          - When you are done, output exactly one JSON object and nothing else:\n\
            {{\"thought\": \"<short rationale>\", \"finish\": {{\"summary\": \"<one-line outcome>\"}}}}\n\
          - No prose, no markdown, no backticks. One JSON object per response.\n\
-         - You may call exactly one tool per response. Wait for the tool result before requesting another.\n\
+         - Wait for all tool results before requesting more.\n\
          - Do not invent tool results. Do not output tool_result blocks yourself.\n\
          \n\
          Available tools:\n{catalog}"
@@ -281,13 +283,29 @@ fn apply_tool_envelope(response: &mut ModelResponse) {
         Err(_) => return,
     };
 
-    if let Some(call) = envelope.tool_call {
-        let id = format!("call_{}", new_id());
-        response.tool_calls = vec![ToolCall {
-            id,
-            name: call.name,
-            input: call.input,
-        }];
+    // MP-14c: prefer the parallel-call form when both are present.
+    // Either form turns into the same Vec<ToolCall> the agent loop
+    // already iterates over.
+    let parallel_calls: Vec<ToolCallPayload> = envelope.tool_calls.unwrap_or_default();
+    let single_call: Option<ToolCallPayload> = envelope.tool_call;
+
+    if !parallel_calls.is_empty() || single_call.is_some() {
+        let mut calls: Vec<ToolCall> = parallel_calls
+            .into_iter()
+            .map(|c| ToolCall {
+                id: format!("call_{}", new_id()),
+                name: c.name,
+                input: c.input,
+            })
+            .collect();
+        if let Some(c) = single_call {
+            calls.push(ToolCall {
+                id: format!("call_{}", new_id()),
+                name: c.name,
+                input: c.input,
+            });
+        }
+        response.tool_calls = calls;
         response.text = envelope.thought;
         response.stop_reason = StopReason::ToolUse;
     } else if envelope.finish.is_some() {
@@ -302,6 +320,12 @@ struct ToolEnvelope {
     thought: Option<String>,
     #[serde(default)]
     tool_call: Option<ToolCallPayload>,
+    /// MP-14c: parallel-call form. When the model emits multiple
+    /// independent tool calls in one turn, it can pack them here
+    /// instead of taking one turn per call. The agent loop executes
+    /// them in order and feeds back all results at once.
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallPayload>>,
     #[serde(default)]
     finish: Option<FinishPayload>,
 }

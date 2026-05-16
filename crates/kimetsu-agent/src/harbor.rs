@@ -508,7 +508,9 @@ where
          - read_file:    {{path, max_lines?}} -> {{content, lines, truncated}}\n\
          - list_files:   {{path?, max_depth?, max_entries?}} -> {{entries}}\n\
          - search_files: {{pattern, path?, max_matches?, glob?}} -> {{matches}}\n\
-         - write_file:   {{path, content}} -> {{path, bytes_written}}\n\
+         - edit_file:    {{path, old_string, new_string, replace_all?}} or {{path, edits:[...]}} -> {{bytes_delta}}\n\
+         - write_file:   {{path, content}} -> {{path, bytes_written}}  (use ONLY for new files / full rewrites)\n\
+         - apply_patch:  {{diff, cwd?, strip?}} -> {{files_patched, hunks_failed}}  (unified diff across files)\n\
          - git_status:   {{cwd?}} -> {{porcelain}}\n\
          - git_diff:     {{paths?, cwd?}} -> {{diff}}\n\
          - shell_command:{{program, args, cwd_relative?, timeout_secs?}} -> {{exit_code, stdout, stderr}}\n\
@@ -516,9 +518,20 @@ where
          Response format (one JSON object per reply, no prose, no\n\
          markdown, no backticks):\n\
          \n\
-         To call a tool:\n\
+         To call a single tool:\n\
          {{\"thought\": \"<short rationale>\",\n\
           \"tool_call\": {{\"name\": \"<tool>\", \"input\": <object matching the schema>}}}}\n\
+         \n\
+         To batch several independent tools in one turn (saves model\n\
+         round-trips when calls don't depend on each other's output):\n\
+         {{\"thought\": \"<short rationale>\",\n\
+          \"tool_calls\": [\n\
+            {{\"name\": \"<tool>\", \"input\": <object>}},\n\
+            {{\"name\": \"<tool>\", \"input\": <object>}}\n\
+          ]}}\n\
+         Each call is dispatched and its result returned before the next\n\
+         model turn. Only batch when the inputs are independent — if call\n\
+         B needs to see B's output first, use the single form.\n\
          \n\
          To finish and report the final answer:\n\
          {{\"thought\": \"<short rationale>\",\n\
@@ -526,9 +539,12 @@ where
          \n\
          Workspace paths are relative to the task's starting directory.\n\
          Use read_file / list_files / search_files for inspection;\n\
-         write_file for new content; shell_command for everything else\n\
-         (builds, tests, package installs, invoking the verifier). Begin\n\
-         with one tool_call envelope. Do not narrate."
+         edit_file for targeted in-place edits (cheaper than write_file\n\
+         for small changes); apply_patch for multi-file unified-diff\n\
+         changes; write_file only for new files or full rewrites;\n\
+         shell_command for everything else (builds, tests, package\n\
+         installs, invoking the verifier). Begin with one tool_call\n\
+         envelope. Do not narrate."
     ));
     let mut messages = vec![system, user];
 
@@ -760,8 +776,9 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "write_file".to_string(),
             description: "Create or overwrite a file at `path` with `content`. \
-                Returns `bytes_written`. Use this for new files or full rewrites; \
-                use shell_command + sed for in-place edits."
+                Returns `bytes_written`. Use this for NEW files or FULL rewrites; \
+                for changing a few lines in an existing file use edit_file instead \
+                (cheaper, less likely to corrupt unrelated parts)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -770,6 +787,57 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
                     "content": { "type": "string" }
                 },
                 "required": ["path", "content"],
+            }),
+        },
+        ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "In-place replace `old_string` -> `new_string` in `path`. \
+                `old_string` must occur exactly once unless `replace_all: true`. \
+                Use this whenever you want to change a few lines in an existing \
+                file — much cheaper than write_file's full rewrite. For multiple \
+                edits in one call, pass `edits: [{old_string, new_string, replace_all?}, ...]` \
+                instead of the single old_string/new_string pair."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string", "description": "Single-edit form: exact bytes to replace." },
+                    "new_string": { "type": "string", "description": "Single-edit form: replacement bytes." },
+                    "replace_all": { "type": "boolean", "description": "If old_string occurs more than once, replace every match. Default false." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Multi-edit form: array of {old_string, new_string, replace_all?}. Applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" }
+                            },
+                            "required": ["old_string", "new_string"],
+                        }
+                    }
+                },
+                "required": ["path"],
+            }),
+        },
+        ToolDefinition {
+            name: "apply_patch".to_string(),
+            description: "Apply a unified diff to one or more files. Use this when \
+                making related changes across multiple files in one operation. \
+                `strip` defaults to 0 (workspace-relative paths); set to 1 if your \
+                diff has `a/` / `b/` prefixes. Returns the list of files patched \
+                and any hunk failures."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "diff": { "type": "string", "description": "Unified-diff text (--- a/old\\n+++ b/new\\n@@ ...)" },
+                    "cwd": { "type": "string", "description": "Workspace-relative directory to apply the patch in; default workspace root." },
+                    "strip": { "type": "integer", "description": "patch -p<N> prefix-strip. Default 0." }
+                },
+                "required": ["diff"],
             }),
         },
         ToolDefinition {
@@ -831,6 +899,8 @@ pub fn harbor_dispatch_tool(
         "list_files" => harbor_list_files(runtime, &input),
         "search_files" => harbor_search_files(runtime, &input),
         "write_file" => harbor_write_file(runtime, &input),
+        "edit_file" => harbor_edit_file(runtime, &input),
+        "apply_patch" => harbor_apply_patch(runtime, &input),
         "git_status" => harbor_git_status(runtime, &input),
         "git_diff" => harbor_git_diff(runtime, &input),
         "shell_command" => harbor_shell_command(runtime, &input),
@@ -838,7 +908,7 @@ pub fn harbor_dispatch_tool(
             "error": format!(
                 "unsupported tool `{other}`; pick one of \
                  read_file / list_files / search_files / write_file / \
-                 git_status / git_diff / shell_command"
+                 edit_file / apply_patch / git_status / git_diff / shell_command"
             ),
         }),
     }
@@ -1035,6 +1105,265 @@ fn harbor_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
         "path": path,
         "bytes_written": bytes_written,
         "duration_ms": out.duration_ms,
+    })
+}
+
+/// MP-14a: in-place replace `old_string` → `new_string` in `path`.
+///
+/// CC's Edit semantics: `old_string` must occur exactly once in the
+/// file unless `replace_all = true`. The file is read, transformed
+/// in Rust (avoiding shell quoting issues for arbitrary content),
+/// and written back via the same base64 heredoc path as write_file
+/// (so binaries / weird quotes stay safe).
+///
+/// Cheaper than write_file when the model only wants to change a
+/// few lines: the model sends two short strings instead of the whole
+/// file content, and the wire-format saves output tokens
+/// proportional to file size.
+fn harbor_edit_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(path) = input_str(input, "path") else {
+        return json!({ "error": "edit_file requires `path`" });
+    };
+    // Single-edit shape: {path, old_string, new_string, replace_all?}.
+    // Multi-edit shape: {path, edits: [{old_string, new_string, replace_all?}, ...]}.
+    let edits: Vec<EditOp> = if let Some(arr) = input.get("edits").and_then(Value::as_array) {
+        let mut ops = Vec::with_capacity(arr.len());
+        for (idx, e) in arr.iter().enumerate() {
+            let Some(old) = e.get("old_string").and_then(Value::as_str) else {
+                return json!({ "error": format!("edit_file: edits[{idx}].old_string required") });
+            };
+            let Some(new) = e.get("new_string").and_then(Value::as_str) else {
+                return json!({ "error": format!("edit_file: edits[{idx}].new_string required") });
+            };
+            let replace_all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            ops.push(EditOp {
+                old: old.to_string(),
+                new: new.to_string(),
+                replace_all,
+            });
+        }
+        ops
+    } else {
+        let Some(old) = input_str(input, "old_string") else {
+            return json!({ "error": "edit_file requires `old_string` or `edits` array" });
+        };
+        let Some(new) = input_str(input, "new_string") else {
+            return json!({ "error": "edit_file requires `new_string` or `edits` array" });
+        };
+        let replace_all = input
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        vec![EditOp {
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all,
+        }]
+    };
+
+    // Read the file via `cat | base64` so we can round-trip arbitrary
+    // content (binary-safe). The base64 wrapper means the model's
+    // edit strings are exact-bytes against the file content the user
+    // sees from `cat`.
+    let read_cmd = format!(
+        "set -e; if [ ! -f {0} ]; then echo '__KIMETSU_MISSING__'; exit 0; fi; base64 -w 0 {0}",
+        shell_quote(path)
+    );
+    let read_out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), read_cmd],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("edit_file read shell failed: {e}") }),
+    };
+    if read_out.exit_code != 0 {
+        return json!({
+            "error": format!("edit_file: read failed exit {}; stderr: {}", read_out.exit_code, truncate(&read_out.stderr_summary, 400)),
+            "path": path,
+        });
+    }
+    let stdout = read_out.stdout_summary.trim();
+    if stdout == "__KIMETSU_MISSING__" {
+        return json!({
+            "error": format!("edit_file: file not found at `{path}`. To create a new file, use write_file."),
+            "path": path,
+        });
+    }
+    let original_bytes = match base64_decode(stdout) {
+        Ok(b) => b,
+        Err(e) => return json!({ "error": format!("edit_file: base64 decode failed: {e}") }),
+    };
+    // We assume UTF-8 for edits; binary files should be left alone.
+    let original = match std::str::from_utf8(&original_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            return json!({
+                "error": format!("edit_file: `{path}` is not valid UTF-8; can't safely apply string replacements. Use write_file for full rewrites."),
+                "path": path,
+            });
+        }
+    };
+
+    let mut content = original.clone();
+    let mut applied = Vec::with_capacity(edits.len());
+    for (idx, op) in edits.iter().enumerate() {
+        if op.old.is_empty() {
+            return json!({
+                "error": format!("edit_file: edits[{idx}].old_string is empty"),
+            });
+        }
+        if op.old == op.new {
+            return json!({
+                "error": format!("edit_file: edits[{idx}] old_string == new_string (no-op)"),
+            });
+        }
+        let count = content.matches(&op.old).count();
+        if count == 0 {
+            return json!({
+                "error": format!(
+                    "edit_file: edits[{idx}].old_string not found in `{path}`. Read the file first to confirm the exact text (including whitespace / line endings)."
+                ),
+                "path": path,
+            });
+        }
+        if count > 1 && !op.replace_all {
+            return json!({
+                "error": format!(
+                    "edit_file: edits[{idx}].old_string occurs {count} times in `{path}`. Add `replace_all: true` to replace every occurrence, or include surrounding context to make the match unique."
+                ),
+                "path": path,
+                "occurrences": count,
+            });
+        }
+        if op.replace_all {
+            content = content.replace(&op.old, &op.new);
+        } else {
+            // Replace exactly once.
+            content = content.replacen(&op.old, &op.new, 1);
+        }
+        applied.push(json!({
+            "edit_index": idx,
+            "occurrences_replaced": if op.replace_all { count } else { 1 },
+        }));
+    }
+
+    // Write the new content back through the same base64 heredoc as
+    // write_file. This keeps binary-safety + permission inheritance
+    // identical to a fresh write_file.
+    let encoded = base64_encode(content.as_bytes());
+    let write_cmd = format!(
+        "set -e; mkdir -p \"$(dirname -- {0})\"; echo {1} | base64 -d > {0}; wc -c < {0}",
+        shell_quote(path),
+        shell_quote(&encoded)
+    );
+    let write_out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), write_cmd],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("edit_file write shell failed: {e}") }),
+    };
+    if write_out.exit_code != 0 {
+        return json!({
+            "error": format!("edit_file: write failed exit {}; stderr: {}", write_out.exit_code, truncate(&write_out.stderr_summary, 400)),
+            "path": path,
+        });
+    }
+    let bytes_written: u64 = write_out.stdout_summary.trim().parse().unwrap_or(0);
+    json!({
+        "path": path,
+        "edits_applied": applied,
+        "bytes_before": original.len() as u64,
+        "bytes_after": bytes_written,
+        "bytes_delta": bytes_written as i64 - original.len() as i64,
+    })
+}
+
+struct EditOp {
+    old: String,
+    new: String,
+    replace_all: bool,
+}
+
+/// MP-14b: apply a unified diff to one or more files via container
+/// `patch -p<strip>`. Codex's signature operation — lets the model
+/// accumulate multi-file edits in one envelope instead of one
+/// edit_file call per file.
+///
+/// Implementation:
+///   1. base64-encode the diff (so quoting is safe).
+///   2. pipe `echo $b64 | base64 -d | patch -p<strip> --batch -d <cwd>`.
+///   3. parse stdout for "patching file X" lines to report which
+///      files actually changed.
+///
+/// `strip` defaults to 0 (paths in the diff are workspace-relative).
+/// Use 1 if your diff has a `a/` / `b/` prefix.
+fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(diff) = input_str(input, "diff") else {
+        return json!({ "error": "apply_patch requires `diff` (unified-diff text)" });
+    };
+    let cwd = input_str(input, "cwd").map(str::to_string);
+    let strip = input_u32(input, "strip", 0);
+
+    let encoded = base64_encode(diff.as_bytes());
+    let cmd = format!(
+        "echo {} | base64 -d | patch -p{} --batch 2>&1",
+        shell_quote(&encoded),
+        strip
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), cmd],
+        cwd.clone(),
+        Some(TOOL_DEFAULT_TIMEOUT_SECS * 2), // patches can touch many files
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("apply_patch shell failed: {e}") }),
+    };
+
+    let mut patched_files: Vec<String> = Vec::new();
+    let mut hunks_failed = 0u32;
+    let mut rejects: Vec<String> = Vec::new();
+    for line in out.stdout_summary.lines() {
+        // GNU patch output: "patching file X" / "patching file X (Y hunk(s) succeeded ...)" / "X.rej created"
+        if let Some(rest) = line.strip_prefix("patching file ") {
+            // Strip optional trailing " (...)" info.
+            let file = rest.split_once(' ').map(|(f, _)| f).unwrap_or(rest);
+            patched_files.push(file.trim().to_string());
+        } else if line.contains("FAILED") {
+            hunks_failed += 1;
+        } else if let Some(rest) = line.strip_prefix("Hunk") {
+            if rest.contains("FAILED") {
+                hunks_failed += 1;
+            }
+        } else if line.contains(".rej") {
+            rejects.push(line.to_string());
+        }
+    }
+
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("apply_patch: patch exited {}; output: {}", out.exit_code, truncate(&out.stdout_summary, 800)),
+            "files_attempted": patched_files,
+            "hunks_failed": hunks_failed,
+            "rejects": rejects,
+            "exit_code": out.exit_code,
+        });
+    }
+
+    json!({
+        "ok": true,
+        "files_patched": patched_files,
+        "hunks_failed": hunks_failed,
+        "rejects": rejects,
+        "output_excerpt": truncate(&out.stdout_summary, 800),
     })
 }
 
@@ -1238,6 +1567,38 @@ fn base64_encode(input: &[u8]) -> String {
         _ => {}
     }
     out
+}
+
+/// MP-14a counterpart to base64_encode: decode standard RFC 4648
+/// base64 (with optional `=` padding, whitespace skipped). Used by
+/// edit_file to round-trip file content read back from the container.
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '=' {
+            break;
+        }
+        let v: u32 = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return Err(format!("invalid base64 character: {ch:?}")),
+        };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buf.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(buf)
 }
 
 
