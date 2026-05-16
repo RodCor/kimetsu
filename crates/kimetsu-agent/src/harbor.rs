@@ -522,6 +522,14 @@ where
          - git_status:   {{cwd?}} -> {{porcelain}}\n\
          - git_diff:     {{paths?, cwd?}} -> {{diff}}\n\
          - shell_command:{{program, args, cwd_relative?, timeout_secs?}} -> {{exit_code, stdout, stderr}}\n\
+         - shell_background:{{program, args, cwd_relative?}} -> {{handle, pid}}\n\
+                         (fire-and-forget for long builds / training; non-blocking)\n\
+         - shell_status: {{handle}} -> {{running, runtime_sec, exit_code?, bytes_stdout, bytes_stderr}}\n\
+         - shell_output: {{handle, tail_bytes?}} -> {{stdout_tail, stderr_tail}}\n\
+                         (poll latest output without blocking the background process)\n\
+         - shell_stop:   {{handle, signal?}} -> {{stopped, exit_code}}\n\
+         - view_image:   {{path, include_base64?, max_bytes?}} -> {{format, width, height, size_bytes, sha256, base64?}}\n\
+                         (read image metadata + optional bytes for workspace images)\n\
          - plan:         {{todos:[{{content,status,activeForm?}}]}} -> {{todos}}\n\
                          (maintain a checklist across turns on multi-step tasks)\n\
          - think:        {{thought}} -> {{ack:true}}\n\
@@ -841,18 +849,27 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "apply_patch".to_string(),
-            description: "Apply a unified diff to one or more files. Use this when \
-                making related changes across multiple files in one operation. \
-                `strip` defaults to 0 (workspace-relative paths); set to 1 if your \
-                diff has `a/` / `b/` prefixes. Returns the list of files patched \
-                and any hunk failures."
+            description: "Apply a diff to one or more files. Accepts EITHER \
+                standard unified-diff format (`--- a/old\\n+++ b/new\\n@@ ...`) \
+                OR Codex starred-patch format (MP-16b):\n  \
+                  *** Begin Patch\n  \
+                  *** Update File: path/to/file\n  \
+                  @@ optional context\n  \
+                  -old line\n  \
+                  +new line\n  \
+                  *** End Patch\n\
+                Also supports `*** Add File: path` (followed by `+`-prefixed \
+                lines for new content) and `*** Delete File: path` for \
+                removals. `strip` defaults to 0 (workspace-relative paths); \
+                set to 1 if your diff has `a/` / `b/` prefixes. Returns the \
+                list of files patched and any hunk failures."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "diff": { "type": "string", "description": "Unified-diff text (--- a/old\\n+++ b/new\\n@@ ...)" },
+                    "diff": { "type": "string", "description": "Unified diff OR Codex starred-patch text." },
                     "cwd": { "type": "string", "description": "Workspace-relative directory to apply the patch in; default workspace root." },
-                    "strip": { "type": "integer", "description": "patch -p<N> prefix-strip. Default 0." }
+                    "strip": { "type": "integer", "description": "patch -p<N> prefix-strip. Default 0 (ignored for Codex starred-patch)." }
                 },
                 "required": ["diff"],
             }),
@@ -1024,6 +1041,102 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["thought"],
             }),
         },
+        // ---------- MP-16a: background shell quartet ----------
+        // For long-running tasks (builds, training, multi-step compilers)
+        // where a single foreground shell_command would blow the
+        // claude_code provider wall-clock (MP-15a default 1500s). Pattern:
+        // fire shell_background -> get handle -> poll shell_status /
+        // shell_output every model turn -> shell_stop if needed. State
+        // lives in /tmp/kimetsu-bg-<handle>.{meta,out,err,exitcode} so the
+        // composed-shell model has continuity across tool calls.
+        ToolDefinition {
+            name: "shell_background".to_string(),
+            description: "Spawn a long-running command in the background and \
+                return a handle. The process runs detached; stdout/stderr \
+                land in /tmp/kimetsu-bg-<handle>.{out,err}. Use this for \
+                anything you'd otherwise want to leave running while you \
+                think (compiles, training, large test suites). Poll with \
+                shell_status / shell_output; reap with shell_stop or by \
+                letting it exit naturally."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "program": { "type": "string" },
+                    "args":    { "type": "array", "items": { "type": "string" } },
+                    "cwd_relative": { "type": "string", "description": "Optional workspace-relative cwd." }
+                },
+                "required": ["program"],
+            }),
+        },
+        ToolDefinition {
+            name: "shell_status".to_string(),
+            description: "Check whether a background process from \
+                shell_background is still running. Returns \
+                {running, runtime_sec, exit_code?, bytes_stdout, bytes_stderr}. \
+                Non-blocking — call it freely."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string" }
+                },
+                "required": ["handle"],
+            }),
+        },
+        ToolDefinition {
+            name: "shell_output".to_string(),
+            description: "Fetch the latest stdout/stderr from a background \
+                process. `tail_bytes` (default 8192) caps the size returned \
+                so a chatty build doesn't blow the response budget. The \
+                process keeps running; this is read-only."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle":     { "type": "string" },
+                    "tail_bytes": { "type": "integer", "description": "Default 8192." }
+                },
+                "required": ["handle"],
+            }),
+        },
+        ToolDefinition {
+            name: "shell_stop".to_string(),
+            description: "Send a signal to a background process. Default \
+                SIGTERM (15); pass `signal: 9` for SIGKILL. Returns \
+                {stopped, exit_code, runtime_sec}. After stop, log files \
+                remain until the task ends."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string" },
+                    "signal": { "type": "integer", "description": "POSIX signal number; default 15 (SIGTERM)." }
+                },
+                "required": ["handle"],
+            }),
+        },
+        // ---------- MP-16c: view_image ----------
+        ToolDefinition {
+            name: "view_image".to_string(),
+            description: "Read an image file from the workspace and return \
+                metadata plus optional base64 content. Useful when a task \
+                ships PNG/JPEG/PDF/etc. as part of the workspace and you \
+                need to verify size / hash / dimensions, or pipe the bytes \
+                to a script. By default returns metadata only; set \
+                `include_base64: true` to also return the bytes (capped at \
+                `max_bytes`, default 256KB)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path":           { "type": "string" },
+                    "include_base64": { "type": "boolean", "description": "Default false (metadata only)." },
+                    "max_bytes":      { "type": "integer", "description": "Cap when include_base64=true; default 262144." }
+                },
+                "required": ["path"],
+            }),
+        },
     ]
 }
 
@@ -1053,12 +1166,20 @@ pub fn harbor_dispatch_tool(
         "delete_file" => harbor_delete_file(runtime, &input),
         "plan" => harbor_plan(&input),
         "think" => harbor_think(&input),
+        // MP-16 additions
+        "shell_background" => harbor_shell_background(runtime, &input),
+        "shell_status"     => harbor_shell_status(runtime, &input),
+        "shell_output"     => harbor_shell_output(runtime, &input),
+        "shell_stop"       => harbor_shell_stop(runtime, &input),
+        "view_image"       => harbor_view_image(runtime, &input),
         other => json!({
             "error": format!(
                 "unsupported tool `{other}`; pick one of \
                  read_file / list_files / search_files / write_file / \
                  edit_file / apply_patch / git_status / git_diff / shell_command / \
-                 glob / multi_read / move_file / delete_file / plan / think"
+                 glob / multi_read / move_file / delete_file / plan / think / \
+                 shell_background / shell_status / shell_output / shell_stop / \
+                 view_image"
             ),
         }),
     }
@@ -1473,11 +1594,32 @@ struct EditOp {
 /// `strip` defaults to 0 (paths in the diff are workspace-relative).
 /// Use 1 if your diff has a `a/` / `b/` prefix.
 fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
-    let Some(diff) = input_str(input, "diff") else {
-        return json!({ "error": "apply_patch requires `diff` (unified-diff text)" });
+    let Some(diff_raw) = input_str(input, "diff") else {
+        return json!({ "error": "apply_patch requires `diff` (unified-diff or Codex starred-patch text)" });
     };
     let cwd = input_str(input, "cwd").map(str::to_string);
-    let strip = input_u32(input, "strip", 0);
+    let mut strip = input_u32(input, "strip", 0);
+
+    // MP-16b: detect Codex's starred-patch format and translate to
+    // standard unified diff. The Codex format opens with `*** Begin
+    // Patch`; the translator produces `--- a/X` / `+++ b/X` headers so
+    // GNU patch accepts it, which forces strip=1 regardless of the
+    // caller's `strip` arg.
+    let (diff, format_used) = if diff_raw.contains("*** Begin Patch") {
+        match translate_codex_patch(diff_raw) {
+            Ok(translated) => {
+                strip = 1;
+                (translated, "codex_starred")
+            }
+            Err(err) => {
+                return json!({
+                    "error": format!("apply_patch: Codex starred-patch translation failed: {err}"),
+                });
+            }
+        }
+    } else {
+        (diff_raw.to_string(), "unified")
+    };
 
     let encoded = base64_encode(diff.as_bytes());
     let cmd = format!(
@@ -1519,6 +1661,7 @@ fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
     if out.exit_code != 0 {
         return json!({
             "error": format!("apply_patch: patch exited {}; output: {}", out.exit_code, truncate(&out.stdout_summary, 800)),
+            "format": format_used,
             "files_attempted": patched_files,
             "hunks_failed": hunks_failed,
             "rejects": rejects,
@@ -1528,6 +1671,7 @@ fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
 
     json!({
         "ok": true,
+        "format": format_used,
         "files_patched": patched_files,
         "hunks_failed": hunks_failed,
         "rejects": rejects,
@@ -1890,6 +2034,628 @@ fn check_workspace_path(label: &str, p: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MP-16b: translate Codex starred-patch -> standard unified diff.
+//
+// Codex grammar:
+//   *** Begin Patch
+//   *** Update File: <path>
+//   @@ optional anchor
+//   -old
+//   +new
+//   *** Add File: <path>
+//   +line
+//   +line
+//   *** Delete File: <path>
+//   *** End Patch
+//
+// We translate each per-file section into:
+//   --- a/<path>
+//   +++ b/<path>
+//   <hunk>
+// then GNU patch consumes it with -p1 (a/ / b/ prefixes stripped).
+//
+// This is intentionally permissive — Codex's emitted diffs vary in
+// whether they include `@@` markers, blank lines, etc. We synthesize a
+// generic `@@ -0,0 +1,N @@` for Add File and `@@ -1,N +0,0 @@` for
+// Delete File so GNU patch is happy.
+fn translate_codex_patch(raw: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut current: Option<CodexSection> = None;
+    let mut saw_begin = false;
+    let mut saw_end = false;
+
+    fn flush(section: CodexSection, out: &mut String) -> Result<(), String> {
+        match section {
+            CodexSection::Update { path, body } => {
+                out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+                // If body doesn't include any @@ line, GNU patch in --batch
+                // mode still accepts it as a flat hunk if we prepend one.
+                // We compute crude counts so the hunk header isn't a lie.
+                let has_hunk = body.lines().any(|l| l.starts_with("@@"));
+                if !has_hunk {
+                    let (minus, plus) = body.lines().fold((0u32, 0u32), |(m, p), l| {
+                        if l.starts_with('-') && !l.starts_with("---") {
+                            (m + 1, p)
+                        } else if l.starts_with('+') && !l.starts_with("+++") {
+                            (m, p + 1)
+                        } else if !l.is_empty() {
+                            (m + 1, p + 1) // context line counted both sides
+                        } else {
+                            (m, p)
+                        }
+                    });
+                    out.push_str(&format!("@@ -1,{minus} +1,{plus} @@\n"));
+                }
+                out.push_str(&body);
+                if !body.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            CodexSection::Add { path, body } => {
+                let plus = body.lines().count() as u32;
+                out.push_str(&format!("--- /dev/null\n+++ b/{path}\n"));
+                out.push_str(&format!("@@ -0,0 +1,{plus} @@\n"));
+                // Body lines should already be prefixed with `+`. If not,
+                // add the prefix so GNU patch reads them as additions.
+                for line in body.lines() {
+                    if line.starts_with('+') {
+                        out.push_str(line);
+                    } else {
+                        out.push('+');
+                        out.push_str(line);
+                    }
+                    out.push('\n');
+                }
+            }
+            CodexSection::Delete { path } => {
+                // Best-effort delete header. We don't know the original
+                // line count; GNU patch with --batch accepts this form
+                // and removes the file outright when `--remove-empty-files`
+                // could be set, but to stay safe we emit a single-line
+                // negative hunk.
+                out.push_str(&format!("--- a/{path}\n+++ /dev/null\n"));
+                out.push_str("@@ -1,1 +0,0 @@\n-\n");
+            }
+        }
+        Ok(())
+    }
+
+    for line in raw.lines() {
+        if line.starts_with("*** Begin Patch") {
+            saw_begin = true;
+            continue;
+        }
+        if line.starts_with("*** End Patch") {
+            saw_end = true;
+            if let Some(sec) = current.take() {
+                flush(sec, &mut out)?;
+            }
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("*** Update File: ") {
+            if let Some(sec) = current.take() {
+                flush(sec, &mut out)?;
+            }
+            current = Some(CodexSection::Update {
+                path: rest.trim().to_string(),
+                body: String::new(),
+            });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("*** Add File: ") {
+            if let Some(sec) = current.take() {
+                flush(sec, &mut out)?;
+            }
+            current = Some(CodexSection::Add {
+                path: rest.trim().to_string(),
+                body: String::new(),
+            });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("*** Delete File: ") {
+            if let Some(sec) = current.take() {
+                flush(sec, &mut out)?;
+            }
+            current = Some(CodexSection::Delete {
+                path: rest.trim().to_string(),
+            });
+            continue;
+        }
+        if let Some(sec) = current.as_mut() {
+            match sec {
+                CodexSection::Update { body, .. } | CodexSection::Add { body, .. } => {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                CodexSection::Delete { .. } => { /* drop trailing lines for Delete */ }
+            }
+        }
+    }
+
+    if !saw_begin {
+        return Err("missing `*** Begin Patch` header".to_string());
+    }
+    if !saw_end {
+        // Permissive: if `*** End Patch` was forgotten, flush whatever
+        // section was open. Don't outright fail.
+        if let Some(sec) = current.take() {
+            flush(sec, &mut out)?;
+        }
+    }
+    if out.is_empty() {
+        return Err("no per-file sections found".to_string());
+    }
+    Ok(out)
+}
+
+enum CodexSection {
+    Update { path: String, body: String },
+    Add    { path: String, body: String },
+    Delete { path: String },
+}
+
+// ---------------------------------------------------------------------------
+// MP-16a: background shell quartet.
+//
+// State lives in /tmp inside the Harbor container, since each tool.exec
+// is a fresh shell call from our Rust process. Per-handle layout:
+//
+//   /tmp/kimetsu-bg-<handle>.meta      JSON {handle, pid, started_at_sec,
+//                                            program, cwd}
+//   /tmp/kimetsu-bg-<handle>.out       stdout drain
+//   /tmp/kimetsu-bg-<handle>.err       stderr drain
+//   /tmp/kimetsu-bg-<handle>.exitcode  written when the process exits
+//
+// Handles look like `bg-<epoch_ns>-<rand4>` and are opaque to the model.
+// `setsid` detaches the spawn from the parent's process group so killing
+// our own subprocess doesn't reap the background tree.
+
+const BG_HANDLE_PREFIX: &str = "bg-";
+
+fn validate_bg_handle(handle: &str) -> Result<(), String> {
+    if !handle.starts_with(BG_HANDLE_PREFIX) {
+        return Err(format!("invalid handle: expected `{BG_HANDLE_PREFIX}*`, got {handle:?}"));
+    }
+    if handle.len() > 128
+        || handle
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    {
+        return Err(format!("invalid handle characters: {handle:?}"));
+    }
+    Ok(())
+}
+
+fn harbor_shell_background(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(program) = input_str(input, "program") else {
+        return json!({ "error": "shell_background requires `program`" });
+    };
+    let args: Vec<String> = input
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd_relative = input_str(input, "cwd_relative").map(str::to_string);
+
+    // Build the shell-side command: write meta + spawn + record exit code.
+    // We use bash because we need $! / wait / setsid. The composed script
+    // returns the handle on stdout for the model to capture.
+    let mut argv = String::from(shell_quote(program));
+    for a in &args {
+        argv.push(' ');
+        argv.push_str(&shell_quote(a));
+    }
+    let script = format!(
+        r#"
+set -e
+HANDLE="{prefix}$(date +%s%N)-$(printf '%04x' $((RANDOM * RANDOM % 65536)))"
+BASE="/tmp/kimetsu-bg-$HANDLE"
+META="$BASE.meta"
+OUT="$BASE.out"
+ERR="$BASE.err"
+EXIT="$BASE.exitcode"
+: > "$OUT"
+: > "$ERR"
+rm -f "$EXIT"
+( setsid bash -c '{argv}; echo $? > '"$EXIT" \
+    > "$OUT" 2> "$ERR" < /dev/null ) &
+PID=$!
+disown
+printf '{{"handle":"%s","pid":%s,"started_at_sec":%s,"program":%s,"cwd":%s}}\n' \
+    "$HANDLE" "$PID" "$(date +%s)" {prog_json} {cwd_json} > "$META"
+echo "$HANDLE $PID"
+"#,
+        prefix = BG_HANDLE_PREFIX,
+        argv = argv.replace('\'', "'\\''"),
+        prog_json = shell_quote(&format!("\"{program}\"")),
+        cwd_json = shell_quote(&format!(
+            "\"{}\"",
+            cwd_relative.as_deref().unwrap_or(".")
+        )),
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), script],
+        cwd_relative.clone(),
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("shell_background shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("shell_background launch failed: exit {}; stderr {}", out.exit_code, truncate(&out.stderr_summary, 400))
+        });
+    }
+    // Parse "HANDLE PID\n"
+    let first_line = out.stdout_summary.lines().next().unwrap_or("").trim();
+    let mut parts = first_line.splitn(2, ' ');
+    let handle = parts.next().unwrap_or("").to_string();
+    let pid: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if handle.is_empty() || pid == 0 {
+        return json!({
+            "error": format!("shell_background: could not parse launcher output: {first_line:?}")
+        });
+    }
+    json!({
+        "handle": handle,
+        "pid": pid,
+        "program": program,
+        "started": true,
+        "stdout_path": format!("/tmp/kimetsu-bg-{handle}.out"),
+        "stderr_path": format!("/tmp/kimetsu-bg-{handle}.err"),
+    })
+}
+
+fn harbor_shell_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(handle) = input_str(input, "handle") else {
+        return json!({ "error": "shell_status requires `handle`" });
+    };
+    if let Err(e) = validate_bg_handle(handle) {
+        return json!({ "error": e });
+    }
+    let script = format!(
+        r#"
+BASE=/tmp/kimetsu-bg-{handle}
+META="$BASE.meta"
+OUT="$BASE.out"
+ERR="$BASE.err"
+EXIT="$BASE.exitcode"
+if [[ ! -f "$META" ]]; then
+    echo "no_such_handle"
+    exit 0
+fi
+PID=$(grep -oE '"pid":[0-9]+' "$META" | head -1 | cut -d: -f2)
+STARTED=$(grep -oE '"started_at_sec":[0-9]+' "$META" | head -1 | cut -d: -f2)
+NOW=$(date +%s)
+RUNTIME=$((NOW - STARTED))
+BYTES_OUT=$(wc -c < "$OUT" 2>/dev/null || echo 0)
+BYTES_ERR=$(wc -c < "$ERR" 2>/dev/null || echo 0)
+if kill -0 "$PID" 2>/dev/null; then
+    echo "running pid=$PID runtime=$RUNTIME out=$BYTES_OUT err=$BYTES_ERR"
+elif [[ -f "$EXIT" ]]; then
+    EC=$(cat "$EXIT")
+    echo "exited pid=$PID runtime=$RUNTIME exit=$EC out=$BYTES_OUT err=$BYTES_ERR"
+else
+    echo "gone pid=$PID runtime=$RUNTIME out=$BYTES_OUT err=$BYTES_ERR"
+fi
+"#,
+        handle = handle
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), script],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("shell_status shell failed: {e}") }),
+    };
+    let line = out.stdout_summary.lines().next().unwrap_or("").trim().to_string();
+    if line == "no_such_handle" {
+        return json!({ "error": format!("no such handle: {handle}") });
+    }
+    parse_bg_status_line(&line, handle)
+}
+
+fn parse_bg_status_line(line: &str, handle: &str) -> Value {
+    let mut state = "unknown";
+    let mut fields = std::collections::HashMap::new();
+    for (i, tok) in line.split_whitespace().enumerate() {
+        if i == 0 {
+            state = tok;
+            continue;
+        }
+        if let Some((k, v)) = tok.split_once('=') {
+            fields.insert(k.to_string(), v.to_string());
+        }
+    }
+    let pid: u32 = fields
+        .get("pid")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let runtime: u64 = fields
+        .get("runtime")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let bytes_out: u64 = fields
+        .get("out")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let bytes_err: u64 = fields
+        .get("err")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let exit_code: Option<i32> = fields.get("exit").and_then(|s| s.parse().ok());
+    let running = state == "running";
+    json!({
+        "handle": handle,
+        "running": running,
+        "state": state,
+        "pid": pid,
+        "runtime_sec": runtime,
+        "exit_code": exit_code,
+        "bytes_stdout": bytes_out,
+        "bytes_stderr": bytes_err,
+    })
+}
+
+fn harbor_shell_output(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(handle) = input_str(input, "handle") else {
+        return json!({ "error": "shell_output requires `handle`" });
+    };
+    if let Err(e) = validate_bg_handle(handle) {
+        return json!({ "error": e });
+    }
+    let tail_bytes = input_u32(input, "tail_bytes", 8192).max(1);
+    let script = format!(
+        r#"
+BASE=/tmp/kimetsu-bg-{handle}
+OUT="$BASE.out"
+ERR="$BASE.err"
+if [[ ! -f "$BASE.meta" ]]; then
+    echo "no_such_handle"
+    exit 0
+fi
+echo "::STDOUT::"
+tail -c {n} "$OUT" 2>/dev/null || true
+echo "::STDERR::"
+tail -c {n} "$ERR" 2>/dev/null || true
+echo "::END::"
+"#,
+        handle = handle,
+        n = tail_bytes
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), script],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("shell_output shell failed: {e}") }),
+    };
+    let raw = out.stdout_summary;
+    if raw.contains("no_such_handle") {
+        return json!({ "error": format!("no such handle: {handle}") });
+    }
+    let stdout_tail = extract_between(&raw, "::STDOUT::", "::STDERR::");
+    let stderr_tail = extract_between(&raw, "::STDERR::", "::END::");
+    json!({
+        "handle": handle,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "tail_bytes": tail_bytes,
+    })
+}
+
+fn extract_between(raw: &str, start: &str, end: &str) -> String {
+    if let Some(s) = raw.find(start) {
+        let after = &raw[s + start.len()..];
+        if let Some(e) = after.find(end) {
+            return after[..e].trim_matches('\n').to_string();
+        }
+        return after.trim_matches('\n').to_string();
+    }
+    String::new()
+}
+
+fn harbor_shell_stop(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(handle) = input_str(input, "handle") else {
+        return json!({ "error": "shell_stop requires `handle`" });
+    };
+    if let Err(e) = validate_bg_handle(handle) {
+        return json!({ "error": e });
+    }
+    let signal = input_u32(input, "signal", 15).clamp(1, 31);
+    let script = format!(
+        r#"
+BASE=/tmp/kimetsu-bg-{handle}
+META="$BASE.meta"
+EXIT="$BASE.exitcode"
+if [[ ! -f "$META" ]]; then
+    echo "no_such_handle"
+    exit 0
+fi
+PID=$(grep -oE '"pid":[0-9]+' "$META" | head -1 | cut -d: -f2)
+STARTED=$(grep -oE '"started_at_sec":[0-9]+' "$META" | head -1 | cut -d: -f2)
+NOW=$(date +%s)
+RUNTIME=$((NOW - STARTED))
+if kill -0 "$PID" 2>/dev/null; then
+    # Target the whole process group (setsid'd at spawn time).
+    PGID=$(ps -o pgid= -p "$PID" 2>/dev/null | tr -d ' ' || true)
+    if [[ -n "$PGID" ]]; then
+        kill -{signal} -"$PGID" 2>/dev/null || kill -{signal} "$PID" 2>/dev/null || true
+    else
+        kill -{signal} "$PID" 2>/dev/null || true
+    fi
+    # Wait briefly for it to die.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "still_running pid=$PID runtime=$RUNTIME signal={signal}"
+    elif [[ -f "$EXIT" ]]; then
+        echo "stopped pid=$PID runtime=$RUNTIME exit=$(cat "$EXIT")"
+    else
+        echo "stopped pid=$PID runtime=$RUNTIME exit=-{signal}"
+    fi
+elif [[ -f "$EXIT" ]]; then
+    echo "already_exited pid=$PID runtime=$RUNTIME exit=$(cat "$EXIT")"
+else
+    echo "gone pid=$PID runtime=$RUNTIME"
+fi
+"#,
+        handle = handle,
+        signal = signal
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), script],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("shell_stop shell failed: {e}") }),
+    };
+    let line = out.stdout_summary.lines().next().unwrap_or("").trim();
+    if line == "no_such_handle" {
+        return json!({ "error": format!("no such handle: {handle}") });
+    }
+    let status = parse_bg_status_line(line, handle);
+    let stopped = matches!(
+        status.get("state").and_then(Value::as_str),
+        Some("stopped") | Some("already_exited") | Some("gone")
+    );
+    let mut obj = status.as_object().cloned().unwrap_or_default();
+    obj.insert("stopped".to_string(), json!(stopped));
+    obj.insert("signal".to_string(), json!(signal));
+    Value::Object(obj)
+}
+
+// ---------------------------------------------------------------------------
+// MP-16c: view_image — metadata + optional base64 for workspace images.
+//
+// Cheap version: shell out to `file`, `wc -c`, `sha256sum`, plus a sniff
+// for image dimensions when ImageMagick's `identify` is present. We
+// deliberately don't pipe the image to Claude's vision API here —
+// surfacing image bytes to the model via the claude `-p` text channel
+// would require provider-level work outside MP-16 scope. The metadata
+// + optional base64 still help: the model can verify expected files,
+// compare hashes, or hand the base64 to a Python script it writes.
+
+const VIEW_IMAGE_DEFAULT_MAX_BYTES: u32 = 256 * 1024;
+
+fn harbor_view_image(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(path) = input_str(input, "path") else {
+        return json!({ "error": "view_image requires `path`" });
+    };
+    let include_b64 = input
+        .get("include_base64")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_bytes = input_u32(input, "max_bytes", VIEW_IMAGE_DEFAULT_MAX_BYTES).max(64);
+
+    let want_b64 = if include_b64 { "1" } else { "0" };
+    let script = format!(
+        r#"
+set -u
+P={path_q}
+if [[ ! -f "$P" ]]; then
+    echo "::ERR::not a regular file"
+    exit 0
+fi
+SIZE=$(wc -c < "$P" 2>/dev/null || echo 0)
+SHA=$(sha256sum "$P" 2>/dev/null | awk '{{print $1}}')
+TYPE=$(file -b --mime-type "$P" 2>/dev/null || echo "application/octet-stream")
+WH=$(identify -format '%w %h' "$P" 2>/dev/null | head -1 || echo "")
+echo "::SIZE::$SIZE"
+echo "::SHA::$SHA"
+echo "::TYPE::$TYPE"
+echo "::WH::$WH"
+if [[ "{want_b64}" == "1" && "$SIZE" -le "{max_bytes}" ]]; then
+    echo "::B64::"
+    base64 -w0 "$P" 2>/dev/null
+    echo
+    echo "::B64END::"
+fi
+"#,
+        path_q = shell_quote(path),
+        want_b64 = want_b64,
+        max_bytes = max_bytes,
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), script],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("view_image shell failed: {e}") }),
+    };
+    let raw = &out.stdout_summary;
+    if let Some(err) = raw.strip_prefix("::ERR::") {
+        return json!({
+            "error": format!("view_image: {}", err.lines().next().unwrap_or("").trim()),
+            "path": path,
+        });
+    }
+    let size = extract_marker(raw, "::SIZE::")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let sha = extract_marker(raw, "::SHA::").unwrap_or_default();
+    let mime = extract_marker(raw, "::TYPE::").unwrap_or_default();
+    let wh = extract_marker(raw, "::WH::").unwrap_or_default();
+    let (width, height) = parse_wh(&wh);
+    let base64 = if include_b64 {
+        Some(extract_between(raw, "::B64::", "::B64END::").replace('\n', ""))
+    } else {
+        None
+    };
+    let format = mime
+        .strip_prefix("image/")
+        .map(str::to_string)
+        .unwrap_or(mime.clone());
+    json!({
+        "path": path,
+        "format": format,
+        "mime": mime,
+        "size_bytes": size,
+        "sha256": sha,
+        "width": width,
+        "height": height,
+        "base64": base64,
+        "base64_truncated": include_b64 && size > max_bytes as u64,
+    })
+}
+
+fn extract_marker(raw: &str, marker: &str) -> Option<String> {
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+fn parse_wh(s: &str) -> (Option<u32>, Option<u32>) {
+    let mut parts = s.split_whitespace();
+    let w = parts.next().and_then(|p| p.parse().ok());
+    let h = parts.next().and_then(|p| p.parse().ok());
+    (w, h)
 }
 
 // --- small helpers ---------------------------------------------------------
@@ -2597,5 +3363,137 @@ mod tests {
         assert!(check_workspace_path("p", "ok/path/../bad").is_err());
         assert!(check_workspace_path("p", "ok/path").is_ok());
         assert!(check_workspace_path("p", "deep/nested/file.rs").is_ok());
+    }
+
+    // ----- MP-16 unit tests (pure-Rust paths) -----
+
+    #[test]
+    fn codex_patch_translator_handles_update_file() {
+        let codex = "\
+*** Begin Patch
+*** Update File: src/lib.rs
+@@
+-old line
++new line
+*** End Patch
+";
+        let unified = translate_codex_patch(codex).expect("translate");
+        assert!(unified.contains("--- a/src/lib.rs"));
+        assert!(unified.contains("+++ b/src/lib.rs"));
+        assert!(unified.contains("-old line"));
+        assert!(unified.contains("+new line"));
+    }
+
+    #[test]
+    fn codex_patch_translator_handles_add_file() {
+        let codex = "\
+*** Begin Patch
+*** Add File: notes/new.md
++# Heading
++body line
+*** End Patch
+";
+        let unified = translate_codex_patch(codex).expect("translate");
+        assert!(unified.contains("--- /dev/null"));
+        assert!(unified.contains("+++ b/notes/new.md"));
+        // Hunk header reflects 2 added lines.
+        assert!(unified.contains("@@ -0,0 +1,2 @@"));
+        assert!(unified.contains("+# Heading"));
+    }
+
+    #[test]
+    fn codex_patch_translator_handles_delete_file() {
+        let codex = "\
+*** Begin Patch
+*** Delete File: legacy/old.rs
+*** End Patch
+";
+        let unified = translate_codex_patch(codex).expect("translate");
+        assert!(unified.contains("--- a/legacy/old.rs"));
+        assert!(unified.contains("+++ /dev/null"));
+    }
+
+    #[test]
+    fn codex_patch_translator_synthesizes_hunk_when_missing() {
+        // Update File with no `@@` marker still gets a synthesized header.
+        let codex = "\
+*** Begin Patch
+*** Update File: src/x.rs
+-removed
++added
+*** End Patch
+";
+        let unified = translate_codex_patch(codex).expect("translate");
+        assert!(unified.contains("@@ -1,"));
+    }
+
+    #[test]
+    fn codex_patch_translator_rejects_unmarked_input() {
+        let plain = "diff --git a/x b/x\n--- a/x\n+++ b/x\n";
+        let err = translate_codex_patch(plain).unwrap_err();
+        assert!(err.contains("Begin Patch"));
+    }
+
+    #[test]
+    fn validate_bg_handle_accepts_well_formed() {
+        assert!(validate_bg_handle("bg-1234567890-abcd").is_ok());
+        assert!(validate_bg_handle("bg-abc_def-0001").is_ok());
+    }
+
+    #[test]
+    fn validate_bg_handle_rejects_garbage() {
+        assert!(validate_bg_handle("").is_err());
+        assert!(validate_bg_handle("noprefix").is_err());
+        assert!(validate_bg_handle("bg-with;semicolon").is_err());
+        assert!(validate_bg_handle("bg-`backtick`").is_err());
+        // Pathological-length handle is refused.
+        let oversized = format!("bg-{}", "a".repeat(200));
+        assert!(validate_bg_handle(&oversized).is_err());
+    }
+
+    #[test]
+    fn parse_bg_status_line_running_state() {
+        let v = parse_bg_status_line(
+            "running pid=12345 runtime=42 out=1024 err=128",
+            "bg-1-abcd",
+        );
+        assert_eq!(v["state"], "running");
+        assert_eq!(v["running"], true);
+        assert_eq!(v["pid"], 12345);
+        assert_eq!(v["runtime_sec"], 42);
+        assert_eq!(v["bytes_stdout"], 1024);
+        assert_eq!(v["bytes_stderr"], 128);
+        assert!(v["exit_code"].is_null());
+    }
+
+    #[test]
+    fn parse_bg_status_line_exited_state() {
+        let v = parse_bg_status_line(
+            "exited pid=999 runtime=120 exit=0 out=2048 err=0",
+            "bg-2-beef",
+        );
+        assert_eq!(v["state"], "exited");
+        assert_eq!(v["running"], false);
+        assert_eq!(v["exit_code"], 0);
+    }
+
+    #[test]
+    fn extract_between_pulls_section() {
+        let raw = "::A::\nhello\nworld\n::B::\ntrailing\n";
+        assert_eq!(extract_between(raw, "::A::", "::B::"), "hello\nworld");
+    }
+
+    #[test]
+    fn extract_marker_finds_first_match() {
+        let raw = "::SIZE::1234\n::SHA::abc\n";
+        assert_eq!(extract_marker(raw, "::SIZE::"), Some("1234".to_string()));
+        assert_eq!(extract_marker(raw, "::MISSING::"), None);
+    }
+
+    #[test]
+    fn parse_wh_handles_well_formed_and_garbage() {
+        assert_eq!(parse_wh("640 480"), (Some(640), Some(480)));
+        assert_eq!(parse_wh(""), (None, None));
+        assert_eq!(parse_wh("abc def"), (None, None));
     }
 }
