@@ -8,7 +8,7 @@ use kimetsu_core::ids::RunId;
 use kimetsu_core::memory::{MemoryKind, MemoryScope, normalize_memory_text};
 use kimetsu_core::paths::{ProjectPaths, default_project_id};
 use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use ulid::Ulid;
 
 use crate::context::{self, ContextBundle, ContextRequest};
@@ -206,6 +206,27 @@ pub fn add_memory(
     let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let memory_id = Ulid::new().to_string();
     let normalized = normalize_memory_text(text);
+
+    // MP-17 #14: dedup. If an ACTIVE memory with the same scope + kind +
+    // normalized text already exists, return its ID without writing a
+    // duplicate. The scope/kind tuple keeps task-specific duplicates
+    // separate from global ones; the normalized form makes minor
+    // whitespace / punctuation differences collapse to the same row.
+    let existing: Option<String> = conn
+        .query_row(
+            "
+            SELECT memory_id FROM memories
+            WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
+              AND invalidated_at IS NULL
+            LIMIT 1
+            ",
+            rusqlite::params![scope.to_string(), kind.to_string(), normalized],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing_id) = existing {
+        return Ok(existing_id);
+    }
 
     let started = Event::new(
         run_id,

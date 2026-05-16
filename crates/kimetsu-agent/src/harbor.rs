@@ -381,6 +381,10 @@ pub struct HarborAgentOpts {
     pub turn_budget: u32,
     pub auto_orient: bool,
     pub min_actions_before_finish: u32,
+    /// MP-17c: fire a one-time self-verify reminder right before the
+    /// model's first finish attempt. Disabled in tests so scripted
+    /// MockProvider responses aren't perturbed.
+    pub self_verify_nudge_enabled: bool,
 }
 
 impl Default for HarborAgentOpts {
@@ -389,6 +393,7 @@ impl Default for HarborAgentOpts {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
             auto_orient: true,
             min_actions_before_finish: 3,
+            self_verify_nudge_enabled: true,
         }
     }
 }
@@ -400,6 +405,7 @@ impl HarborAgentOpts {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
             auto_orient: false,
             min_actions_before_finish: 0,
+            self_verify_nudge_enabled: false,
         }
     }
 }
@@ -676,6 +682,8 @@ where
     let mut turn = 0u32;
     // MP-13d: flag so the persistence gate fires at most once per task.
     let mut persistence_nudge_sent = false;
+    // MP-17c: flag so the self-verify nudge fires at most once per task.
+    let mut self_verify_nudge_sent = false;
 
     while turn < turn_budget {
         turn += 1;
@@ -735,6 +743,32 @@ where
                 messages.push(ModelMessage::assistant_text(text));
             }
             messages.push(ModelMessage::user_text(nudge));
+            continue;
+        }
+
+        // MP-17c: one-time pre-finish self-verify nudge. Fires AT MOST ONCE
+        // per task, after the persistence gate has passed. On the
+        // make-mips-interpreter / install-windows-3-11 / video-processing
+        // class of failures the model produced output that didn't match
+        // the verifier; a single "before I accept finish, briefly check
+        // your output exists and matches the spec" reminder costs ~one
+        // extra model turn but catches the "I forgot to verify" cases
+        // cheaply. The model is free to confirm "verified, done" and
+        // re-emit finish on the next turn — we accept it then unconditionally.
+        if !self_verify_nudge_sent && opts.self_verify_nudge_enabled {
+            self_verify_nudge_sent = true;
+            let nudge = "Before I accept the finish: briefly verify your \
+                output is what the verifier will check. Concretely: list \
+                the files you produced (list_files / shell_command ls), \
+                cat at least one to confirm content, and run any \
+                verification command the task spec mentions (test runner, \
+                a known executable, the named binary). If everything \
+                checks out, emit `finish` on your next turn and we're \
+                done. If you spot a gap, fix it first.";
+            if let Some(text) = response.text.clone() {
+                messages.push(ModelMessage::assistant_text(text));
+            }
+            messages.push(ModelMessage::user_text(nudge.to_string()));
             continue;
         }
 
@@ -1737,6 +1771,18 @@ fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
         Err(e) => return json!({ "error": format!("apply_patch shell failed: {e}") }),
     };
 
+    // MP-17 #10: if GNU `patch` is not installed in this container, fall
+    // back to a Rust-side unified-diff applier that re-routes each hunk
+    // through harbor_edit_file (base64 round-trip read+edit+write through
+    // the composed-shell layer). Detection: exit 127 ("command not found"
+    // by convention) or stderr explicitly says so.
+    let patch_not_found = out.exit_code == 127
+        || out.stderr_summary.contains("command not found")
+        || out.stdout_summary.contains("command not found");
+    if patch_not_found {
+        return harbor_apply_patch_rust_fallback(runtime, &diff, cwd.as_deref(), format_used);
+    }
+
     let mut patched_files: Vec<String> = Vec::new();
     let mut hunks_failed = 0u32;
     let mut rejects: Vec<String> = Vec::new();
@@ -1775,6 +1821,243 @@ fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
         "hunks_failed": hunks_failed,
         "rejects": rejects,
         "output_excerpt": truncate(&out.stdout_summary, 800),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// MP-17 #10: pure-Rust unified-diff applier (fallback when patch(1) absent).
+//
+// Strategy: parse the diff into per-file sections + per-hunk old/new pairs,
+// then re-route each hunk through harbor_edit_file. edit_file already does
+// the base64 round-trip read+modify+write through HarborShellExecutor, so
+// we get composed-shell safety for free and don't depend on patch(1) being
+// installed in the container.
+//
+// Limitations vs GNU patch:
+//   - No fuzz matching: the reconstructed OLD must occur in the file
+//     exactly once (edit_file's hash-check semantics).
+//   - No --reverse / --merge mode.
+//   - No automatic .rej generation; the response carries `files_failed`
+//     entries so the model can self-correct.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct DiffFile {
+    path: String,
+    /// is_new: true if header was `--- /dev/null` (creation)
+    is_new: bool,
+    /// is_delete: true if header was `+++ /dev/null` (deletion)
+    is_delete: bool,
+    hunks: Vec<DiffHunk>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    /// Reconstructed OLD text (context + removal lines).
+    old: String,
+    /// Reconstructed NEW text (context + addition lines).
+    new: String,
+}
+
+fn parse_unified_diff(diff: &str) -> Result<Vec<DiffFile>, String> {
+    let mut files: Vec<DiffFile> = Vec::new();
+    let mut iter = diff.lines().peekable();
+    while let Some(line) = iter.next() {
+        if !line.starts_with("--- ") {
+            continue;
+        }
+        let minus_header = line;
+        let plus_header = iter.next().unwrap_or("");
+        if !plus_header.starts_with("+++ ") {
+            return Err(format!(
+                "expected `+++ ` after `--- `, got: {}",
+                truncate(plus_header, 80)
+            ));
+        }
+        let is_new = minus_header.trim_start_matches("--- ").trim() == "/dev/null";
+        let is_delete = plus_header.trim_start_matches("+++ ").trim() == "/dev/null";
+        let path = if is_delete {
+            extract_diff_path(minus_header.trim_start_matches("--- "))
+        } else {
+            extract_diff_path(plus_header.trim_start_matches("+++ "))
+        };
+        let mut hunks = Vec::new();
+        // Walk lines until the next `--- ` (next file) or EOF, collecting hunks.
+        while let Some(next) = iter.peek() {
+            if next.starts_with("--- ") {
+                break;
+            }
+            let line = iter.next().unwrap();
+            if line.starts_with("@@") {
+                // Start a new hunk; collect body until next `@@` or `--- `.
+                let mut old_lines = String::new();
+                let mut new_lines = String::new();
+                while let Some(peek) = iter.peek() {
+                    if peek.starts_with("@@") || peek.starts_with("--- ") {
+                        break;
+                    }
+                    let body = iter.next().unwrap();
+                    if let Some(rest) = body.strip_prefix('-') {
+                        if body.starts_with("---") {
+                            break;
+                        }
+                        old_lines.push_str(rest);
+                        old_lines.push('\n');
+                    } else if let Some(rest) = body.strip_prefix('+') {
+                        if body.starts_with("+++") {
+                            break;
+                        }
+                        new_lines.push_str(rest);
+                        new_lines.push('\n');
+                    } else if let Some(rest) = body.strip_prefix(' ') {
+                        old_lines.push_str(rest);
+                        old_lines.push('\n');
+                        new_lines.push_str(rest);
+                        new_lines.push('\n');
+                    } else if body.is_empty() {
+                        old_lines.push('\n');
+                        new_lines.push('\n');
+                    } else if body.starts_with('\\') {
+                        // "\ No newline at end of file" — skip the marker.
+                    } else {
+                        // Unknown line type; treat as context to be safe.
+                        old_lines.push_str(body);
+                        old_lines.push('\n');
+                        new_lines.push_str(body);
+                        new_lines.push('\n');
+                    }
+                }
+                hunks.push(DiffHunk {
+                    old: old_lines,
+                    new: new_lines,
+                });
+            }
+        }
+        files.push(DiffFile {
+            path,
+            is_new,
+            is_delete,
+            hunks,
+        });
+    }
+    if files.is_empty() {
+        return Err("no per-file sections found (no `--- ` headers)".to_string());
+    }
+    Ok(files)
+}
+
+fn extract_diff_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Strip GNU patch's a/ or b/ prefix when present.
+    if let Some(rest) = trimmed.strip_prefix("a/") {
+        return rest.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("b/") {
+        return rest.to_string();
+    }
+    trimmed.to_string()
+}
+
+fn harbor_apply_patch_rust_fallback(
+    runtime: &mut crate::tools::ToolRuntime,
+    diff: &str,
+    cwd: Option<&str>,
+    format_used: &'static str,
+) -> Value {
+    let files = match parse_unified_diff(diff) {
+        Ok(f) => f,
+        Err(e) => {
+            return json!({
+                "error": format!("apply_patch (rust fallback): diff parse failed: {e}"),
+                "format": format_used,
+            });
+        }
+    };
+
+    let mut files_patched: Vec<String> = Vec::new();
+    let mut files_failed: Vec<Value> = Vec::new();
+    let mut hunks_failed = 0u32;
+
+    for f in files {
+        let full_path = match cwd {
+            Some(c) if !c.is_empty() => format!("{}/{}", c.trim_end_matches('/'), f.path),
+            _ => f.path.clone(),
+        };
+
+        if f.is_new {
+            // Reconstruct the new-file content from the hunks' `new` text.
+            let content: String = f.hunks.iter().map(|h| h.new.clone()).collect();
+            let write_input = json!({ "path": full_path, "content": content });
+            let res = harbor_write_file(runtime, &write_input);
+            if res.get("error").is_some() {
+                files_failed.push(json!({
+                    "path": full_path,
+                    "kind": "add_file",
+                    "error": res["error"].clone(),
+                }));
+            } else {
+                files_patched.push(full_path);
+            }
+            continue;
+        }
+        if f.is_delete {
+            let del_input = json!({ "path": full_path, "recursive": false });
+            let res = harbor_delete_file(runtime, &del_input);
+            if res.get("error").is_some() {
+                files_failed.push(json!({
+                    "path": full_path,
+                    "kind": "delete_file",
+                    "error": res["error"].clone(),
+                }));
+            } else {
+                files_patched.push(full_path);
+            }
+            continue;
+        }
+        // Modify case: run each hunk through edit_file in order.
+        let mut file_ok = true;
+        for (i, hunk) in f.hunks.iter().enumerate() {
+            // Skip trailing newline difference quirks: edit_file uses exact match.
+            let edit_input = json!({
+                "path": full_path,
+                "old_string": hunk.old.trim_end_matches('\n'),
+                "new_string": hunk.new.trim_end_matches('\n'),
+            });
+            let res = harbor_edit_file(runtime, &edit_input);
+            if res.get("error").is_some() {
+                files_failed.push(json!({
+                    "path": full_path,
+                    "hunk": i,
+                    "error": res["error"].clone(),
+                }));
+                hunks_failed += 1;
+                file_ok = false;
+                // Don't bail on the file — subsequent hunks may still apply.
+            }
+        }
+        if file_ok {
+            files_patched.push(full_path);
+        }
+    }
+
+    if files_patched.is_empty() && !files_failed.is_empty() {
+        return json!({
+            "error": "apply_patch (rust fallback): no files patched cleanly",
+            "format": format_used,
+            "fallback": "rust",
+            "files_patched": files_patched,
+            "files_failed": files_failed,
+            "hunks_failed": hunks_failed,
+        });
+    }
+
+    json!({
+        "ok": files_failed.is_empty(),
+        "format": format_used,
+        "fallback": "rust",
+        "files_patched": files_patched,
+        "files_failed": files_failed,
+        "hunks_failed": hunks_failed,
     })
 }
 
@@ -3594,5 +3877,104 @@ mod tests {
         assert_eq!(parse_wh("640 480"), (Some(640), Some(480)));
         assert_eq!(parse_wh(""), (None, None));
         assert_eq!(parse_wh("abc def"), (None, None));
+    }
+
+    // ----- MP-17 #10: unified-diff parser tests -----
+
+    #[test]
+    fn parse_unified_diff_single_file_single_hunk() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+ fn main() {
+-    let x = 1;
++    let x = 2;
+ }
+";
+        let files = parse_unified_diff(diff).expect("parse");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/lib.rs");
+        assert!(!files[0].is_new);
+        assert!(!files[0].is_delete);
+        assert_eq!(files[0].hunks.len(), 1);
+        let h = &files[0].hunks[0];
+        assert!(h.old.contains("let x = 1;"));
+        assert!(h.new.contains("let x = 2;"));
+        assert!(h.old.contains("fn main()"));
+        assert!(h.new.contains("fn main()"));
+    }
+
+    #[test]
+    fn parse_unified_diff_detects_new_file() {
+        let diff = "\
+--- /dev/null
++++ b/notes/new.md
+@@ -0,0 +1,2 @@
++# heading
++body
+";
+        let files = parse_unified_diff(diff).expect("parse");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "notes/new.md");
+        assert!(files[0].is_new);
+        assert!(!files[0].is_delete);
+        assert_eq!(files[0].hunks.len(), 1);
+        assert!(files[0].hunks[0].new.contains("# heading"));
+    }
+
+    #[test]
+    fn parse_unified_diff_detects_delete_file() {
+        let diff = "\
+--- a/old.rs
++++ /dev/null
+@@ -1,1 +0,0 @@
+-line
+";
+        let files = parse_unified_diff(diff).expect("parse");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "old.rs");
+        assert!(!files[0].is_new);
+        assert!(files[0].is_delete);
+    }
+
+    #[test]
+    fn parse_unified_diff_multi_file() {
+        let diff = "\
+--- a/x.rs
++++ b/x.rs
+@@ -1,1 +1,1 @@
+-a
++b
+--- a/y.rs
++++ b/y.rs
+@@ -1,1 +1,1 @@
+-c
++d
+";
+        let files = parse_unified_diff(diff).expect("parse");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "x.rs");
+        assert_eq!(files[1].path, "y.rs");
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_missing_plus_header() {
+        let diff = "--- a/x\nbogus\n";
+        assert!(parse_unified_diff(diff).is_err());
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_empty() {
+        assert!(parse_unified_diff("").is_err());
+        assert!(parse_unified_diff("no headers here").is_err());
+    }
+
+    #[test]
+    fn extract_diff_path_strips_ab_prefix() {
+        assert_eq!(extract_diff_path("a/src/lib.rs"), "src/lib.rs");
+        assert_eq!(extract_diff_path("b/notes/new.md"), "notes/new.md");
+        assert_eq!(extract_diff_path("plain/path.rs"), "plain/path.rs");
+        assert_eq!(extract_diff_path("  a/x.rs  "), "x.rs");
     }
 }

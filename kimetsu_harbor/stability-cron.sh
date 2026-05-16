@@ -76,6 +76,15 @@ export KIMETSU_BIN="$REPO/target/release/kimetsu"
 export KIMETSU_HARBOR_MODEL="claude-opus-4-7"
 log "binary: $KIMETSU_BIN ($(stat -c %s "$KIMETSU_BIN") bytes)"
 
+# MP-17d: k=2 multi-attempt toggle. Default k=1 keeps cost predictable;
+# bump via STABILITY_K=2 (or higher) in the cron environment when you
+# want variance-insurance via best-of-k. n is the concurrency, l is the
+# task slice — both also env-overridable.
+STABILITY_K="${STABILITY_K:-1}"
+STABILITY_N="${STABILITY_N:-2}"
+STABILITY_L="${STABILITY_L:-16}"
+log "harbor flags: -n $STABILITY_N -k $STABILITY_K -l $STABILITY_L"
+
 run_leg() {
     local leg="$1"
     local job="stability-$DAY-$leg"
@@ -94,7 +103,7 @@ run_leg() {
     harbor run \
         -d terminal-bench/terminal-bench-2 \
         --agent-import-path kimetsu_harbor.kimetsu_agent:KimetsuAgent \
-        -n 2 -k 1 -l 16 \
+        -n "$STABILITY_N" -k "$STABILITY_K" -l "$STABILITY_L" \
         --job-name "$job" \
         -o "$JOBS_DIR" \
         -y >>"$LOG" 2>&1 || log "WARN: $leg harbor returned non-zero"

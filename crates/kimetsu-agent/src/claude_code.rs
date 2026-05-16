@@ -373,7 +373,17 @@ struct FinishPayload {
     summary: Option<String>,
 }
 
-/// Spawn `command` with piped stdio and enforce a wall-clock timeout.
+/// Spawn `command` with piped stdio and enforce a smart timeout.
+///
+/// Two-axis timeout (MP-17f):
+///   - `timeout` is the IDLE deadline. If the subprocess produces no
+///     bytes on stdout or stderr for this long, it's killed. An actively
+///     producing process (compile, training, ray tracer streaming progress)
+///     keeps resetting this timer and survives.
+///   - A hard ceiling of `3 * timeout` is also enforced so a runaway chatty
+///     subprocess can't loop indefinitely. Pick `timeout` such that
+///     `3 * timeout` is still acceptable wall-clock for the hardest task
+///     you expect (default 1500s -> hard cap 4500s = 75min).
 ///
 /// Bug fix (observed during the MP-4 bench): on Windows the `claude` CLI
 /// spawns Node worker grandchildren that inherit the parent's stdout/stderr
@@ -384,38 +394,68 @@ struct FinishPayload {
 /// write-end. The whole bench parent then deadlocks reading from a pipe with
 /// no writer that will ever close.
 ///
-/// The fix: read stdout/stderr on dedicated drainer threads, take ownership
-/// of those handles, and on timeout `child.kill()` + `child.wait()` only.
-/// We deliberately do NOT join the drainer threads when we time out — they
-/// stay parked on the grandchild's open write-end, but that's a thread leak,
-/// not a deadlock of the main bench loop, and the next call to this function
-/// is unaffected. On the happy path the child exits, the drainers finish on
-/// their own, and we join them to recover the captured output.
+/// The fix: read stdout/stderr on dedicated drainer threads that increment
+/// a shared atomic byte-counter as they read. The main loop polls the
+/// counter to detect activity. On timeout we `child.kill()` + `child.wait()`
+/// only and leak the drainers (they stay parked on a grandchild's pipe,
+/// but that's a thread leak, not a deadlock).
 fn run_with_timeout(mut command: Command, timeout: Duration) -> KimetsuResult<Output> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let started = Instant::now();
+    let hard_ceiling = timeout.saturating_mul(3);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_handle = stdout.map(|mut s| {
+    let stdout_bytes_seen = Arc::new(AtomicU64::new(0));
+    let stderr_bytes_seen = Arc::new(AtomicU64::new(0));
+
+    let stdout_counter = stdout_bytes_seen.clone();
+    let stdout_handle = stdout.map(move |mut s| {
         thread::spawn(move || -> std::io::Result<Vec<u8>> {
             use std::io::Read;
             let mut buf = Vec::new();
-            s.read_to_end(&mut buf)?;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        stdout_counter.fetch_add(n as u64, AtomicOrdering::Relaxed);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             Ok(buf)
         })
     });
-    let stderr_handle = stderr.map(|mut s| {
+    let stderr_counter = stderr_bytes_seen.clone();
+    let stderr_handle = stderr.map(move |mut s| {
         thread::spawn(move || -> std::io::Result<Vec<u8>> {
             use std::io::Read;
             let mut buf = Vec::new();
-            s.read_to_end(&mut buf)?;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        stderr_counter.fetch_add(n as u64, AtomicOrdering::Relaxed);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             Ok(buf)
         })
     });
+
+    let mut last_activity = Instant::now();
+    let mut last_byte_total: u64 = 0;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -432,17 +472,37 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> KimetsuResult<Ou
             });
         }
 
-        if started.elapsed() >= timeout {
+        // Update last_activity if any bytes flowed since the last tick.
+        let cur_total = stdout_bytes_seen.load(AtomicOrdering::Relaxed)
+            + stderr_bytes_seen.load(AtomicOrdering::Relaxed);
+        if cur_total > last_byte_total {
+            last_activity = Instant::now();
+            last_byte_total = cur_total;
+        }
+
+        let idle = last_activity.elapsed();
+        let wall = started.elapsed();
+        let idle_timeout = idle >= timeout;
+        let hard_timeout = wall >= hard_ceiling;
+
+        if idle_timeout || hard_timeout {
             let _ = child.kill();
             let _ = child.wait();
-            // Drainer threads may still be parked on a grandchild's pipe;
-            // we intentionally do not join them. Build the error from
-            // whatever the timeout said, not from the (unreadable) pipes.
-            return Err(format!(
-                "timed out after {}s; child killed; grandchild may still hold stdio pipes",
-                timeout.as_secs()
-            )
-            .into());
+            let reason = if hard_timeout {
+                format!(
+                    "hard timeout: ran {}s (3x idle cap of {}s); child killed",
+                    wall.as_secs(),
+                    timeout.as_secs()
+                )
+            } else {
+                format!(
+                    "idle timeout: no stdio activity for {}s (after {}s total, {} bytes streamed); child killed",
+                    idle.as_secs(),
+                    wall.as_secs(),
+                    last_byte_total
+                )
+            };
+            return Err(reason.into());
         }
 
         thread::sleep(Duration::from_millis(100));

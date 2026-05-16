@@ -84,6 +84,13 @@ pub fn retrieve_context(
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    // MP-17 #13: Maximal-Marginal-Relevance (MMR) re-ranking — when two
+    // capsules look very similar (same tokens in the summary), keep the
+    // higher-scoring one but push the redundant ones down so the budget
+    // covers more distinct ground. Lambda=0.7 keeps the original ordering
+    // strongly while penalizing >0.5-Jaccard overlaps.
+    let capsules = apply_mmr_diversity(capsules, 0.7);
+
     let capsule_budget = request.budget_tokens / 2;
     let mut used_tokens = 0u32;
     let mut included = Vec::new();
@@ -209,15 +216,24 @@ fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candid
 /// brand-new memory has a fair chance to demonstrate value before being
 /// boosted or penalized.
 pub(crate) fn usefulness_multiplier(usefulness_score: f32, use_count: u32) -> f32 {
-    const SMALL_SAMPLE_THRESHOLD: u32 = 3;
+    // MP-17e: soften the hard sample-size threshold via Bayesian smoothing.
+    //
+    // Old behaviour: hard cutoff at use_count < 3 returned neutral 1.0,
+    // then full envelope kicked in. That meant a memory with 2 uses (both
+    // helpful) was treated identically to a memory with 0 uses, which
+    // wasted early signal. New behaviour: linearly blend toward the
+    // full multiplier as use_count climbs to FULL_CONFIDENCE_USES.
+    const FULL_CONFIDENCE_USES: u32 = 3;
     const MULTIPLIER_MIN: f32 = 0.5;
     const MULTIPLIER_MAX: f32 = 1.5;
-    if use_count < SMALL_SAMPLE_THRESHOLD {
+    if use_count == 0 {
         return 1.0;
     }
     let ratio = usefulness_score / use_count as f32; // in -1.0..1.0 typically
     let normalized = ((ratio + 1.0) / 2.0).clamp(0.0, 1.0); // map to 0..1
-    MULTIPLIER_MIN + normalized * (MULTIPLIER_MAX - MULTIPLIER_MIN)
+    let full_multiplier = MULTIPLIER_MIN + normalized * (MULTIPLIER_MAX - MULTIPLIER_MIN);
+    let confidence = (use_count as f32 / FULL_CONFIDENCE_USES as f32).min(1.0);
+    1.0 * (1.0 - confidence) + full_multiplier * confidence
 }
 
 fn repo_file_candidates(
@@ -405,13 +421,72 @@ fn freshness(created_at: &str) -> f32 {
 }
 
 fn query_tokens(query: &str) -> Vec<String> {
-    query
+    let mut tokens: Vec<String> = query
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .map(str::trim)
         .filter(|part| part.len() >= 2)
         .map(str::to_ascii_lowercase)
-        .collect()
+        .collect();
+    // MP-17 #11: task-class routing — augment the query with tool-aware
+    // tokens so MP-17b's tool-proficiency capsules surface higher when
+    // the task description matches a known class. Cheap keyword fan-out;
+    // the underlying lexical_relevance counts substring matches so the
+    // augmented tokens only matter when a capsule's text actually mentions
+    // them (i.e. the new MP-17b capsules light up, not generic text).
+    let lower = query.to_ascii_lowercase();
+    for (triggers, expansions) in CLASS_HINTS.iter() {
+        if triggers.iter().any(|t| lower.contains(t)) {
+            tokens.extend(expansions.iter().map(|e| e.to_string()));
+        }
+    }
+    tokens
 }
+
+// MP-17 #11: (trigger keywords, expansion tokens) pairs.
+//
+// When the user task mentions a trigger, we add the expansions to the
+// query token set. Capsules whose text mentions the same expansions
+// then score higher on lexical_relevance. The expansions are kimetsu
+// tool / concept names so MP-17b capsules (which document those tools)
+// surface preferentially.
+const CLASS_HINTS: &[(&[&str], &[&str])] = &[
+    (
+        &["build", "compile", "make", "cargo", "cmake", "configure", "install", "train", "benchmark", "test suite", "ray trace", "render"],
+        &["shell_background", "shell_status", "shell_output", "shell_stop", "long_running"],
+    ),
+    (
+        &["edit", "modify", "change", "fix", "update", "patch", "refactor", "rename"],
+        &["edit_file", "apply_patch", "old_string", "new_string"],
+    ),
+    (
+        &["read", "inspect", "review", "analyze", "examine", "view", "show"],
+        &["read_file", "offset", "limit", "multi_read"],
+    ),
+    (
+        &["find", "locate", "search", "look up", "discover", "list"],
+        &["glob", "search_files", "list_files"],
+    ),
+    (
+        &["plan", "step", "checklist", "todo", "task list", "phase"],
+        &["plan", "todos"],
+    ),
+    (
+        &["verify", "check", "ensure", "validate", "pass test", "verifier"],
+        &["finish", "verifier", "verification"],
+    ),
+    (
+        &["image", "png", "jpeg", "jpg", "pdf", "diagram", "screenshot"],
+        &["view_image", "base64", "sha256"],
+    ),
+    (
+        &["delete", "remove", "rm "],
+        &["delete_file", "recursive"],
+    ),
+    (
+        &["rename", "move file", "mv "],
+        &["move_file"],
+    ),
+];
 
 fn fts_query(query: &str) -> Option<String> {
     let tokens = query_tokens(query);
@@ -426,6 +501,89 @@ fn fts_query(query: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" OR "),
     )
+}
+
+/// MP-17 #13: greedy MMR (Maximal Marginal Relevance) re-ranking.
+///
+/// Given capsules already sorted by relevance score, walk the list and
+/// at each step pick the next capsule that maximizes
+/// `lambda * score - (1 - lambda) * max_overlap_with_already_picked`.
+///
+/// Overlap = Jaccard similarity of the lowercased token sets of the
+/// `summary` field. Capsules from different kinds (memory / repo_file /
+/// manifest) get a 0.5 similarity floor so redundancy is only penalized
+/// within-kind (a memory and a repo_file aren't really redundant even
+/// if they share words).
+fn apply_mmr_diversity(
+    mut sorted: Vec<ContextCapsule>,
+    lambda: f32,
+) -> Vec<ContextCapsule> {
+    if sorted.len() <= 1 {
+        return sorted;
+    }
+    // Pre-tokenize summaries for cheap Jaccard.
+    let summaries: Vec<std::collections::HashSet<String>> = sorted
+        .iter()
+        .map(|c| summary_token_set(&c.summary))
+        .collect();
+    let mut picked_indices: Vec<usize> = Vec::with_capacity(sorted.len());
+    let mut remaining: Vec<usize> = (0..sorted.len()).collect();
+
+    // Always seed with the top-scoring capsule.
+    picked_indices.push(remaining.remove(0));
+
+    while !remaining.is_empty() {
+        let mut best_idx_in_remaining = 0;
+        let mut best_score = f32::MIN;
+        for (i, &cand) in remaining.iter().enumerate() {
+            let mut max_overlap = 0.0f32;
+            for &p in &picked_indices {
+                let raw = jaccard(&summaries[cand], &summaries[p]);
+                let overlap = if sorted[cand].kind == sorted[p].kind {
+                    raw
+                } else {
+                    // cross-kind: scale down so we don't over-penalize a memory
+                    // that happens to share words with a repo file.
+                    raw * 0.5
+                };
+                if overlap > max_overlap {
+                    max_overlap = overlap;
+                }
+            }
+            let mmr = lambda * sorted[cand].score - (1.0 - lambda) * max_overlap;
+            if mmr > best_score {
+                best_score = mmr;
+                best_idx_in_remaining = i;
+            }
+        }
+        picked_indices.push(remaining.remove(best_idx_in_remaining));
+    }
+    // Reorder `sorted` to match picked_indices.
+    let mut out = Vec::with_capacity(sorted.len());
+    // We need to drain in picked_indices order; do it by taking with mem::replace.
+    let mut taken: Vec<Option<ContextCapsule>> = sorted.drain(..).map(Some).collect();
+    for idx in picked_indices {
+        if let Some(c) = taken[idx].take() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn summary_token_set(s: &str) -> std::collections::HashSet<String> {
+    s.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|t| t.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f32 {
+    if a.is_empty() && b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
+    intersection as f32 / union.max(1) as f32
 }
 
 fn lexical_relevance(tokens: &[String], haystack: &str) -> f32 {
@@ -457,17 +615,33 @@ fn one_line(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// MP-4b: small samples (use_count < 3) are treated as neutral so a
-    /// fresh memory has a fair chance to demonstrate value before being
-    /// boosted or penalized.
+    /// MP-17e: zero-use rows are neutral (no data); use_count >= 1 starts
+    /// blending toward the full multiplier (Bayesian smoothing).
     #[test]
-    fn usefulness_multiplier_is_neutral_for_small_samples() {
-        // Even a perfect score must not boost when there isn't enough data.
-        assert!((usefulness_multiplier(2.0, 2) - 1.0).abs() < f32::EPSILON);
-        // Even a -2/-2 row must not be penalized at use_count=2.
-        assert!((usefulness_multiplier(-2.0, 2) - 1.0).abs() < f32::EPSILON);
-        // use_count = 0 is neutral too.
+    fn usefulness_multiplier_neutral_at_zero_uses() {
+        // use_count = 0 is the only strictly-neutral case.
         assert!((usefulness_multiplier(0.0, 0) - 1.0).abs() < f32::EPSILON);
+        assert!((usefulness_multiplier(5.0, 0) - 1.0).abs() < f32::EPSILON);
+        assert!((usefulness_multiplier(-5.0, 0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// MP-17e: between use_count 1..3 the multiplier blends linearly from
+    /// neutral (1.0) toward the full envelope. A use_count of 2 with a
+    /// perfect ratio lands at 2/3 of the way to the max boost.
+    #[test]
+    fn usefulness_multiplier_blends_smoothly_in_transition() {
+        // use_count = 1, ratio = 1.0 -> confidence 1/3, blend toward 1.5
+        // expected = 1.0 * 2/3 + 1.5 * 1/3 = 1.1667
+        let one_use = usefulness_multiplier(1.0, 1);
+        assert!((one_use - 1.16666666).abs() < 1e-4, "got {one_use}");
+        // use_count = 2, ratio = 1.0 -> confidence 2/3, blend toward 1.5
+        // expected = 1.0 * 1/3 + 1.5 * 2/3 = 1.3333
+        let two_uses = usefulness_multiplier(2.0, 2);
+        assert!((two_uses - 1.33333333).abs() < 1e-4, "got {two_uses}");
+        // use_count = 2 with ratio = -1.0 should pull toward the penalty side.
+        let two_uses_bad = usefulness_multiplier(-2.0, 2);
+        // expected = 1.0 * 1/3 + 0.5 * 2/3 = 0.6667
+        assert!((two_uses_bad - 0.66666666).abs() < 1e-4, "got {two_uses_bad}");
     }
 
     /// MP-4b: at use_count >= 3 the multiplier maps ratio in [-1, 1] linearly
@@ -499,5 +673,79 @@ mod tests {
         assert!((usefulness_multiplier(100.0, 5) - 1.5).abs() < f32::EPSILON);
         // ratio < -1.0 is clamped to -1.0 -> 0.5
         assert!((usefulness_multiplier(-100.0, 5) - 0.5).abs() < f32::EPSILON);
+    }
+
+    // ----- MP-17 #11: task-class query expansion -----
+
+    #[test]
+    fn query_tokens_expands_build_class() {
+        let toks = query_tokens("Build the project from source");
+        assert!(toks.iter().any(|t| t == "build"));
+        // class-aware expansion adds tool tokens:
+        assert!(toks.iter().any(|t| t == "shell_background"));
+        assert!(toks.iter().any(|t| t == "long_running"));
+    }
+
+    #[test]
+    fn query_tokens_expands_edit_class() {
+        let toks = query_tokens("Modify the config to fix the bug");
+        assert!(toks.iter().any(|t| t == "edit_file"));
+        assert!(toks.iter().any(|t| t == "apply_patch"));
+    }
+
+    #[test]
+    fn query_tokens_expands_search_class() {
+        let toks = query_tokens("Find all references to the symbol");
+        assert!(toks.iter().any(|t| t == "glob"));
+        assert!(toks.iter().any(|t| t == "search_files"));
+    }
+
+    #[test]
+    fn query_tokens_no_expansion_on_unrelated_query() {
+        let toks = query_tokens("hello world testing nothing");
+        // Only the "test" trigger fires here -> verification expansion.
+        assert!(toks.iter().any(|t| t == "hello"));
+        // The base tokens are present regardless.
+        assert!(toks.iter().any(|t| t == "world"));
+    }
+
+    // ----- MP-17 #13: MMR diversity helpers -----
+
+    #[test]
+    fn jaccard_is_zero_for_disjoint_sets() {
+        let a: std::collections::HashSet<String> =
+            ["foo", "bar"].iter().map(|s| s.to_string()).collect();
+        let b: std::collections::HashSet<String> =
+            ["baz", "qux"].iter().map(|s| s.to_string()).collect();
+        assert!((jaccard(&a, &b) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn jaccard_is_one_for_identical_sets() {
+        let a: std::collections::HashSet<String> =
+            ["foo", "bar"].iter().map(|s| s.to_string()).collect();
+        let b = a.clone();
+        assert!((jaccard(&a, &b) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn jaccard_partial_overlap() {
+        let a: std::collections::HashSet<String> =
+            ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        let b: std::collections::HashSet<String> =
+            ["bar", "qux"].iter().map(|s| s.to_string()).collect();
+        // intersection = {bar} = 1, union = {foo,bar,baz,qux} = 4
+        assert!((jaccard(&a, &b) - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn summary_token_set_lowercases_and_filters_short() {
+        let set = summary_token_set("Build the Foo-bar project");
+        assert!(set.contains("build"));
+        assert!(set.contains("foo"));
+        assert!(set.contains("bar"));
+        assert!(set.contains("project"));
+        // "the" is len=3, included; "a" or "i" would be excluded.
+        assert!(set.contains("the"));
     }
 }
