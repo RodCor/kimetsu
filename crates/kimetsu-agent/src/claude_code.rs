@@ -21,7 +21,15 @@ pub struct ClaudeCodeProvider {
     api_key: String,
     model: String,
     timeout: Duration,
-    max_budget_usd: f32,
+    // MP-15b: `--max-budget-usd` removed from the claude CLI invocation.
+    // Claude Code's internal budget message ("Budget is $0/$5") was being
+    // misread by the model on `make-mips-interpreter` — it interpreted the
+    // "spent/total" notation as "remaining/total" and prematurely bailed
+    // after 7 tool calls / 1m35s. The outer kimetsu loop (turn budget +
+    // run-level max_total_cost_usd) is the real budget gate; passing
+    // --max-budget-usd to claude was redundant and harmful. The field is
+    // gone; if a future iteration needs an inner-loop cap, route it through
+    // a separate (less ambiguous) mechanism.
 }
 
 impl ClaudeCodeProvider {
@@ -50,7 +58,6 @@ impl ClaudeCodeProvider {
             api_key: secret,
             model: config.model.model.clone(),
             timeout: Duration::from_secs(config.model.request_timeout_secs),
-            max_budget_usd: config.run.max_total_cost_usd,
         }))
     }
 
@@ -109,8 +116,13 @@ impl ModelProvider for ClaudeCodeProvider {
                 // outer kimetsu loop is still the real budget gate.
                 .arg("--max-turns")
                 .arg("16")
-                .arg("--max-budget-usd")
-                .arg(format!("{:.4}", self.max_budget_usd))
+                // MP-15b: `--max-budget-usd` removed. Claude Code surfaces it
+                // as "Budget is $X/$Y", which the model misreads as
+                // remaining/total instead of spent/total — it bailed
+                // prematurely on `make-mips-interpreter` after 1m35s
+                // ("I have no budget to spend on this task"). The outer
+                // kimetsu loop already enforces budget via cost tracking
+                // and turn count; the inner cap was redundant.
                 .arg("--no-session-persistence")
                 .arg("--tools")
                 .arg("")

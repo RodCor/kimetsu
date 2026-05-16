@@ -524,7 +524,17 @@ fn build_harbor_model_provider(
     config.model.provider = "claude_code".to_string();
     config.model.model = model_name;
     config.model.api_key_env = "CLAUDE_CODE_OAUTH_TOKEN".to_string();
-    config.model.request_timeout_secs = 600;
+    // MP-15a: provider wall-clock per-call timeout.
+    //   default bumped 600 -> 1500 (25 min). 600 was killing
+    //   `circuit-fibsqrt`-class tasks where the model was still
+    //   actively iterating; bare CC won that task, so it's a
+    //   recoverable gate-2 loss. Env override
+    //   `KIMETSU_HARBOR_PROVIDER_TIMEOUT_SECS` lets the cron /
+    //   stability harness retune without rebuilding.
+    config.model.request_timeout_secs = std::env::var("KIMETSU_HARBOR_PROVIDER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1500);
     config.run.max_total_cost_usd = 5.0;
 
     match ClaudeCodeProvider::from_config_with_key(scratch, &config, Some(&oauth))? {
