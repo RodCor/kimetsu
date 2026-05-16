@@ -7,6 +7,13 @@
 **/*.rs.bk
 
 .git-commit-msg.tmp
+.commit-msg.tmp
+
+# Ad-hoc orchestration / probe scripts used while running gauntlets in WSL.
+/.mp*.sh
+/.wsl-*.sh
+/.harbor-*.sh
+/.token-*.sh
 
 # Harbor / Terminal-Bench artifacts (per-run, large, regenerable)
 /jobs/
