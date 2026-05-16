@@ -505,15 +505,27 @@ where
          tool set below is what's available; ignore everything else.\n\
          \n\
          === Tools (pick the most specific one; fall back to shell_command) ===\n\
-         - read_file:    {{path, max_lines?}} -> {{content, lines, truncated}}\n\
+         - read_file:    {{path, offset?, limit?, max_lines?}} -> {{content, lines_total, truncated}}\n\
+                         (use offset+limit to read a SLICE of a big file — much cheaper than full read)\n\
+         - multi_read:   {{paths:[...]}} or {{files:[{{path, offset?, limit?}}]}} -> {{files:[...]}}\n\
+                         (batch N file reads in one call; cheaper than N read_file calls)\n\
          - list_files:   {{path?, max_depth?, max_entries?}} -> {{entries}}\n\
+         - glob:         {{pattern, path?, max_entries?}} -> {{matches}}\n\
+                         (find by path pattern: '**/*.rs', 'src/**/test_*.py')\n\
          - search_files: {{pattern, path?, max_matches?, glob?}} -> {{matches}}\n\
+                         (grep file CONTENT; use `glob` instead when you only need names)\n\
          - edit_file:    {{path, old_string, new_string, replace_all?}} or {{path, edits:[...]}} -> {{bytes_delta}}\n\
          - write_file:   {{path, content}} -> {{path, bytes_written}}  (use ONLY for new files / full rewrites)\n\
          - apply_patch:  {{diff, cwd?, strip?}} -> {{files_patched, hunks_failed}}  (unified diff across files)\n\
+         - move_file:    {{from, to}} -> {{moved}}\n\
+         - delete_file:  {{path, recursive?}} -> {{deleted}}\n\
          - git_status:   {{cwd?}} -> {{porcelain}}\n\
          - git_diff:     {{paths?, cwd?}} -> {{diff}}\n\
          - shell_command:{{program, args, cwd_relative?, timeout_secs?}} -> {{exit_code, stdout, stderr}}\n\
+         - plan:         {{todos:[{{content,status,activeForm?}}]}} -> {{todos}}\n\
+                         (maintain a checklist across turns on multi-step tasks)\n\
+         - think:        {{thought}} -> {{ack:true}}\n\
+                         (pure deliberation slot; no I/O, no state change)\n\
          \n\
          Response format (one JSON object per reply, no prose, no\n\
          markdown, no backticks):\n\
@@ -730,15 +742,20 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a UTF-8 text file from the workspace. Returns content \
-                with line numbers, total line count, and a `truncated` flag if the \
-                file exceeded `max_lines`."
+            description: "Read a UTF-8 text file from the workspace. Returns content, \
+                total line count, and a `truncated` flag if the slice was capped. \
+                MP-14e: use `offset` (1-based start line) and `limit` (max lines to \
+                return) to read a SLICE of a large file — far cheaper in input \
+                tokens than fetching the whole thing. `max_lines` (legacy) caps the \
+                slice from line 1; prefer `offset`+`limit` for big files."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "max_lines": { "type": "integer", "description": "Cap on lines returned; default 800." }
+                    "offset": { "type": "integer", "description": "1-based start line. Default 1." },
+                    "limit": { "type": "integer", "description": "Max lines to return from `offset`. Default 800." },
+                    "max_lines": { "type": "integer", "description": "Legacy: cap on lines from line 1. Use offset+limit instead." }
                 },
                 "required": ["path"],
             }),
@@ -882,6 +899,131 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["program"],
             }),
         },
+        // ---------- MP-14e additions ----------
+        ToolDefinition {
+            name: "glob".to_string(),
+            description: "Find files whose path matches a glob pattern (cheap \
+                pattern-based discovery; complements search_files which greps \
+                content). Supports `**` for recursive descent. Example: \
+                `{pattern: \"**/*.rs\"}`. Returns matching paths sorted by \
+                modification time (most recent first) so the model sees what \
+                changed most recently first."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob like '**/*.py' or 'src/**/test_*.go'." },
+                    "path": { "type": "string", "description": "Workspace-relative root; default '.'." },
+                    "max_entries": { "type": "integer", "description": "Default 200." }
+                },
+                "required": ["pattern"],
+            }),
+        },
+        ToolDefinition {
+            name: "multi_read".to_string(),
+            description: "Read several files in a single tool call. Cheaper than \
+                N separate read_file calls because the shell round-trip cost is \
+                paid once. Each entry can carry its own offset/limit slice. \
+                Returns `files: [{path, content, lines_total, truncated, error?}]`."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "Simple form: array of workspace-relative paths. Each read uses full default slice.",
+                        "items": { "type": "string" }
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Rich form: array of {path, offset?, limit?} for per-file slicing.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "offset": { "type": "integer" },
+                                "limit": { "type": "integer" }
+                            },
+                            "required": ["path"],
+                        }
+                    },
+                    "limit": { "type": "integer", "description": "Default per-file slice cap when using `paths`. Default 400." }
+                },
+            }),
+        },
+        ToolDefinition {
+            name: "move_file".to_string(),
+            description: "Rename or move a file or directory inside the workspace. \
+                Refuses absolute paths, `..` traversal, and empty operands."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Workspace-relative source path." },
+                    "to":   { "type": "string", "description": "Workspace-relative destination path." }
+                },
+                "required": ["from", "to"],
+            }),
+        },
+        ToolDefinition {
+            name: "delete_file".to_string(),
+            description: "Delete a file or directory under the workspace. Set \
+                `recursive: true` for directories. Refuses absolute paths, \
+                `..` traversal, and the workspace root itself."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "recursive": { "type": "boolean", "description": "Required for non-empty directories. Default false." }
+                },
+                "required": ["path"],
+            }),
+        },
+        ToolDefinition {
+            name: "plan".to_string(),
+            description: "Record or update a structured plan / todo list for this \
+                task. The plan is echoed back in the tool result and remains in \
+                the conversation history, giving you a visible checklist across \
+                turns. Use it on multi-step tasks: enumerate the steps up front, \
+                then update statuses as you go. Status must be one of: pending, \
+                in_progress, completed."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string", "description": "Imperative step description." },
+                                "status":  { "type": "string", "enum": ["pending", "in_progress", "completed"] },
+                                "activeForm": { "type": "string", "description": "Optional present-continuous form for display." }
+                            },
+                            "required": ["content", "status"],
+                        }
+                    }
+                },
+                "required": ["todos"],
+            }),
+        },
+        ToolDefinition {
+            name: "think".to_string(),
+            description: "Pure deliberation slot: pass a `thought` string, get an \
+                acknowledgement back. No shell, no I/O, no state change. Use \
+                this when you need to reason about what to do next without \
+                burning a tool call on an action. Cheap; the thought is \
+                preserved in the conversation history."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thought": { "type": "string", "description": "Free-form reasoning, plan, or observation." }
+                },
+                "required": ["thought"],
+            }),
+        },
     ]
 }
 
@@ -904,11 +1046,19 @@ pub fn harbor_dispatch_tool(
         "git_status" => harbor_git_status(runtime, &input),
         "git_diff" => harbor_git_diff(runtime, &input),
         "shell_command" => harbor_shell_command(runtime, &input),
+        // MP-14e additions
+        "glob" => harbor_glob(runtime, &input),
+        "multi_read" => harbor_multi_read(runtime, &input),
+        "move_file" => harbor_move_file(runtime, &input),
+        "delete_file" => harbor_delete_file(runtime, &input),
+        "plan" => harbor_plan(&input),
+        "think" => harbor_think(&input),
         other => json!({
             "error": format!(
                 "unsupported tool `{other}`; pick one of \
                  read_file / list_files / search_files / write_file / \
-                 edit_file / apply_patch / git_status / git_diff / shell_command"
+                 edit_file / apply_patch / git_status / git_diff / shell_command / \
+                 glob / multi_read / move_file / delete_file / plan / think"
             ),
         }),
     }
@@ -946,13 +1096,26 @@ fn harbor_read_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> V
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "read_file requires `path`" });
     };
-    let max_lines = input_u32(input, "max_lines", READ_FILE_DEFAULT_MAX_LINES);
-    // `wc -l` first so we know how truncated we are; then sed -n to cap.
+    // MP-14e: offset/limit semantics, with backwards-compat to max_lines.
+    // - explicit `offset`/`limit` wins
+    // - else fall back to max_lines from line 1
+    // - both defaults: 1..=800
+    let has_slice = input.get("offset").is_some() || input.get("limit").is_some();
+    let offset = input_u32(input, "offset", 1).max(1);
+    let limit = if has_slice {
+        input_u32(input, "limit", READ_FILE_DEFAULT_MAX_LINES)
+    } else {
+        input_u32(input, "max_lines", READ_FILE_DEFAULT_MAX_LINES)
+    };
+    let end_line = offset.saturating_add(limit).saturating_sub(1);
+
+    // `wc -l` first so we know how truncated we are; then sed -n to slice.
     // Both run in one shell so the model only sees one tool turn.
     let cmd = format!(
-        "set -e; total=$(wc -l < {0} 2>/dev/null || echo 0); sed -n '1,{1}p' {0}; echo \"::LINES_TOTAL::$total\"",
+        "set -e; total=$(wc -l < {0} 2>/dev/null || echo 0); sed -n '{1},{2}p' {0}; echo \"::LINES_TOTAL::$total\"",
         shell_quote(path),
-        max_lines
+        offset,
+        end_line,
     );
     let out = match run_shell(
         runtime,
@@ -974,10 +1137,15 @@ fn harbor_read_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> V
     let raw = out.stdout_summary;
     let (content, total_line_count) = split_total_marker(&raw);
     let returned_lines = content.lines().count() as u32;
-    let truncated = total_line_count.map(|t| t > returned_lines).unwrap_or(false);
+    // truncated: there are more lines beyond what we returned.
+    let truncated = total_line_count
+        .map(|t| t > offset.saturating_add(returned_lines).saturating_sub(1))
+        .unwrap_or(false);
     json!({
         "path": path,
         "content": content,
+        "offset": offset,
+        "limit": limit,
         "lines_returned": returned_lines,
         "lines_total": total_line_count,
         "truncated": truncated,
@@ -1428,6 +1596,300 @@ fn harbor_shell_command(runtime: &mut crate::tools::ToolRuntime, input: &Value) 
             "error": format!("invalid shell_command input: {err}; got {spec_value}"),
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// MP-14e: pattern file-find, batch read, typed move/delete, plan, think.
+// All six exist to cut per-turn cost or per-turn waste vs composing the same
+// thing out of raw shell_command calls.
+// ---------------------------------------------------------------------------
+
+const GLOB_DEFAULT_MAX_ENTRIES: u32 = 200;
+const MULTI_READ_DEFAULT_LIMIT: u32 = 400;
+const MULTI_READ_MAX_FILES: usize = 25;
+
+/// MP-14e: glob — pattern-based file discovery (complement to search_files's
+/// content grep). Maps the glob to `find -path`. `**` is rewritten to `*`
+/// because POSIX find doesn't grok `**` natively; we still recurse because
+/// `find` recurses by default unless `-maxdepth` says otherwise.
+fn harbor_glob(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(pattern) = input_str(input, "pattern") else {
+        return json!({ "error": "glob requires `pattern`" });
+    };
+    let path = input_str(input, "path").unwrap_or(".");
+    let max_entries = input_u32(input, "max_entries", GLOB_DEFAULT_MAX_ENTRIES);
+    // POSIX find treats `**` as `*/*` rather than recursive-everything. We
+    // recurse by default; collapse `**` to `*` for matching purposes.
+    let find_pattern = pattern.replace("**", "*");
+    // Use `find ... -path '*<pat>'` so a relative pattern like '*.rs' still
+    // matches files in nested directories.
+    let path_pattern = if find_pattern.starts_with('/') || find_pattern.starts_with("./") {
+        find_pattern.clone()
+    } else {
+        format!("*/{find_pattern}")
+    };
+    // -printf '%T@ %p\n' gives mtime-prefixed paths for sort -nr.
+    let cmd = format!(
+        "find {0} -type f \\( -path {1} -o -path {2} \\) -printf '%T@ %p\\n' 2>/dev/null \
+         | sort -nr | head -n {3} | cut -d' ' -f2-",
+        shell_quote(path),
+        shell_quote(&path_pattern),
+        shell_quote(&find_pattern),
+        max_entries
+    );
+    let out = match run_shell(
+        runtime,
+        "bash",
+        vec!["-c".into(), cmd],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("glob shell failed: {e}") }),
+    };
+    let matches: Vec<&str> = out
+        .stdout_summary
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    let returned = matches.len() as u32;
+    json!({
+        "pattern": pattern,
+        "path": path,
+        "matches": matches,
+        "matches_returned": returned,
+        "truncated": returned >= max_entries,
+    })
+}
+
+/// MP-14e: multi_read — batch N file reads in one tool call. Accepts either
+/// `paths: ["a", "b"]` (each with the default slice) or `files: [{path,
+/// offset?, limit?}]` (per-file slice). Caps at MULTI_READ_MAX_FILES to keep
+/// any single result envelope bounded.
+fn harbor_multi_read(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    #[derive(Debug)]
+    struct Req {
+        path: String,
+        offset: u32,
+        limit: u32,
+    }
+
+    let default_limit = input_u32(input, "limit", MULTI_READ_DEFAULT_LIMIT);
+    let mut reqs: Vec<Req> = Vec::new();
+
+    if let Some(arr) = input.get("paths").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(p) = v.as_str() {
+                reqs.push(Req {
+                    path: p.to_string(),
+                    offset: 1,
+                    limit: default_limit,
+                });
+            }
+        }
+    }
+    if let Some(arr) = input.get("files").and_then(Value::as_array) {
+        for v in arr {
+            let Some(path) = v.get("path").and_then(Value::as_str) else { continue };
+            let offset = v
+                .get("offset")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32)
+                .unwrap_or(1)
+                .max(1);
+            let limit = v
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32)
+                .unwrap_or(default_limit);
+            reqs.push(Req {
+                path: path.to_string(),
+                offset,
+                limit,
+            });
+        }
+    }
+    if reqs.is_empty() {
+        return json!({ "error": "multi_read requires `paths` or `files`" });
+    }
+    if reqs.len() > MULTI_READ_MAX_FILES {
+        return json!({
+            "error": format!(
+                "multi_read accepts at most {MULTI_READ_MAX_FILES} files per call (got {})",
+                reqs.len()
+            )
+        });
+    }
+    let mut files: Vec<Value> = Vec::with_capacity(reqs.len());
+    for r in &reqs {
+        let inner = json!({
+            "path": r.path,
+            "offset": r.offset,
+            "limit": r.limit,
+        });
+        let result = harbor_read_file(runtime, &inner);
+        files.push(result);
+    }
+    json!({
+        "files": files,
+        "files_returned": files.len() as u32,
+    })
+}
+
+/// MP-14e: move_file — typed rename inside the workspace. Refuses absolute
+/// paths and `..` traversal so a typo can't escape the sandbox.
+fn harbor_move_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(from) = input_str(input, "from") else {
+        return json!({ "error": "move_file requires `from`" });
+    };
+    let Some(to) = input_str(input, "to") else {
+        return json!({ "error": "move_file requires `to`" });
+    };
+    if let Err(err) = check_workspace_path("from", from) {
+        return json!({ "error": err });
+    }
+    if let Err(err) = check_workspace_path("to", to) {
+        return json!({ "error": err });
+    }
+    let out = match run_shell(
+        runtime,
+        "mv",
+        vec![from.to_string(), to.to_string()],
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("move_file shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("move_file: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+            "from": from,
+            "to": to,
+        });
+    }
+    json!({ "moved": true, "from": from, "to": to })
+}
+
+/// MP-14e: delete_file — typed remove inside the workspace. `recursive: true`
+/// is required for non-empty directories. Refuses workspace root, absolute
+/// paths, and `..` traversal.
+fn harbor_delete_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+    let Some(path) = input_str(input, "path") else {
+        return json!({ "error": "delete_file requires `path`" });
+    };
+    if path == "." || path == "./" {
+        return json!({ "error": "delete_file: refusing to delete the workspace root" });
+    }
+    if let Err(err) = check_workspace_path("path", path) {
+        return json!({ "error": err });
+    }
+    let recursive = input
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut args: Vec<String> = Vec::with_capacity(2);
+    if recursive {
+        args.push("-rf".to_string());
+    } else {
+        args.push("-f".to_string());
+    }
+    args.push(path.to_string());
+    let out = match run_shell(
+        runtime,
+        "rm",
+        args,
+        None,
+        Some(TOOL_DEFAULT_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(e) => return json!({ "error": format!("delete_file shell failed: {e}") }),
+    };
+    if out.exit_code != 0 {
+        return json!({
+            "error": format!("delete_file: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+            "path": path,
+        });
+    }
+    json!({ "deleted": true, "path": path, "recursive": recursive })
+}
+
+/// MP-14e: plan — record a todo list. We don't persist it server-side; the
+/// tool simply validates + echoes it. The fact that the result sits in the
+/// conversation history is enough for the model to "see" the plan on every
+/// subsequent turn. Status must be pending|in_progress|completed.
+fn harbor_plan(input: &Value) -> Value {
+    let Some(todos) = input.get("todos").and_then(Value::as_array) else {
+        return json!({ "error": "plan requires `todos: [{content,status,activeForm?}]`" });
+    };
+    let mut normalized: Vec<Value> = Vec::with_capacity(todos.len());
+    let mut counts = (0u32, 0u32, 0u32); // (pending, in_progress, completed)
+    for (i, item) in todos.iter().enumerate() {
+        let Some(content) = item.get("content").and_then(Value::as_str) else {
+            return json!({ "error": format!("plan: todo[{i}] missing `content`") });
+        };
+        let Some(status) = item.get("status").and_then(Value::as_str) else {
+            return json!({ "error": format!("plan: todo[{i}] missing `status`") });
+        };
+        match status {
+            "pending" => counts.0 += 1,
+            "in_progress" => counts.1 += 1,
+            "completed" => counts.2 += 1,
+            other => {
+                return json!({
+                    "error": format!(
+                        "plan: todo[{i}] status={other:?}; must be pending|in_progress|completed"
+                    )
+                });
+            }
+        }
+        let active_form = item
+            .get("activeForm")
+            .and_then(Value::as_str)
+            .unwrap_or(content);
+        normalized.push(json!({
+            "content": content,
+            "status": status,
+            "activeForm": active_form,
+        }));
+    }
+    json!({
+        "todos": normalized,
+        "pending": counts.0,
+        "in_progress": counts.1,
+        "completed": counts.2,
+        "total": normalized.len() as u32,
+    })
+}
+
+/// MP-14e: think — pure ack. No shell, no I/O. The thought lives in the
+/// conversation history; that's the entire point.
+fn harbor_think(input: &Value) -> Value {
+    let Some(thought) = input_str(input, "thought") else {
+        return json!({ "error": "think requires `thought`" });
+    };
+    json!({
+        "ack": true,
+        "thought_len": thought.len() as u32,
+    })
+}
+
+/// Workspace-path safety: workspace-relative, no absolute prefix, no `..`
+/// segment. Used by move_file / delete_file to keep a typo from reaching
+/// outside the task sandbox.
+fn check_workspace_path(label: &str, p: &str) -> Result<(), String> {
+    if p.is_empty() {
+        return Err(format!("`{label}` must not be empty"));
+    }
+    if p.starts_with('/') {
+        return Err(format!("`{label}` must be workspace-relative, not absolute"));
+    }
+    for seg in p.split('/') {
+        if seg == ".." {
+            return Err(format!("`{label}` may not contain `..` segments"));
+        }
+    }
+    Ok(())
 }
 
 // --- small helpers ---------------------------------------------------------
@@ -2072,5 +2534,68 @@ mod tests {
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("method not found in adapter"), "got: {msg}");
         assert!(msg.contains("-32601"), "got: {msg}");
+    }
+
+    // ----- MP-14e unit tests (pure-Rust paths, no shell needed) -----
+
+    #[test]
+    fn plan_tool_validates_and_normalizes_todos() {
+        let input = json!({
+            "todos": [
+                {"content": "scan", "status": "completed", "activeForm": "Scanning"},
+                {"content": "fix",  "status": "in_progress"},
+                {"content": "ship", "status": "pending"},
+            ]
+        });
+        let result = harbor_plan(&input);
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["pending"], 1);
+        assert_eq!(result["in_progress"], 1);
+        assert_eq!(result["completed"], 1);
+        // activeForm defaults to content when omitted.
+        assert_eq!(result["todos"][1]["activeForm"], "fix");
+        assert_eq!(result["todos"][0]["activeForm"], "Scanning");
+    }
+
+    #[test]
+    fn plan_tool_rejects_invalid_status() {
+        let input = json!({
+            "todos": [
+                {"content": "x", "status": "blocked"},
+            ]
+        });
+        let result = harbor_plan(&input);
+        let err = result["error"].as_str().unwrap_or("");
+        assert!(err.contains("must be pending|in_progress|completed"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_tool_rejects_missing_fields() {
+        assert!(harbor_plan(&json!({})).get("error").is_some());
+        assert!(harbor_plan(&json!({"todos": [{"status": "pending"}]}))
+            .get("error")
+            .is_some());
+        assert!(harbor_plan(&json!({"todos": [{"content": "x"}]}))
+            .get("error")
+            .is_some());
+    }
+
+    #[test]
+    fn think_tool_acknowledges_and_reports_length() {
+        let thought = "consider whether to rebuild";
+        let result = harbor_think(&json!({"thought": thought}));
+        assert_eq!(result["ack"], true);
+        assert_eq!(result["thought_len"], thought.len() as u64);
+        assert!(harbor_think(&json!({})).get("error").is_some());
+    }
+
+    #[test]
+    fn check_workspace_path_rejects_escape_attempts() {
+        assert!(check_workspace_path("p", "").is_err());
+        assert!(check_workspace_path("p", "/etc/passwd").is_err());
+        assert!(check_workspace_path("p", "../sibling").is_err());
+        assert!(check_workspace_path("p", "ok/path/../bad").is_err());
+        assert!(check_workspace_path("p", "ok/path").is_ok());
+        assert!(check_workspace_path("p", "deep/nested/file.rs").is_ok());
     }
 }
