@@ -89,6 +89,26 @@ impl ModelProvider for ClaudeCodeProvider {
         const MAX_ATTEMPTS: u32 = 3;
         const BASE_BACKOFF_SECS: u64 = 5;
 
+        // MP-17g: pipe the prompt via stdin instead of as a positional argv.
+        //
+        // Background: after MP-17a's expanded user message (heuristics +
+        // worked example + pitfalls) + brain context + accumulated multi-
+        // turn message history, the rendered prompt routinely crosses
+        // 50-100KB by turn 10. Passing it as a single argv slot to the
+        // claude CLI triggered `exec()` -> E2BIG ("Argument list too long",
+        // os error 7) on the longer tasks (make-mips-interpreter,
+        // path-tracing, etc.) — observed during the MP-17 validation
+        // gauntlet attempt at 19:16Z. Linux's ARG_MAX is typically 128KB
+        // shared between argv + envp; once argv approaches that ceiling
+        // any further messages cause exec to fail outright.
+        //
+        // The fix: drop the positional prompt argument and write the
+        // prompt to the child's stdin, which has no comparable size limit
+        // for `claude -p` mode. We also drop --tools "" because the
+        // system-prompt + user-message envelope grammar already overrides
+        // tool advertising; the empty --tools arg was a belt-and-braces
+        // measure that combined with our long prompt could push us past
+        // the limit on some shells.
         let build_command = || {
             let mut command = Command::new("claude");
             command
@@ -101,7 +121,9 @@ impl ModelProvider for ClaudeCodeProvider {
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("ANTHROPIC_AUTH_TOKEN")
                 .arg("-p")
-                .arg(&prompt)
+                // MP-17g: no positional prompt; we feed it via stdin.
+                .arg("--input-format")
+                .arg("text")
                 .arg("--output-format")
                 .arg("json")
                 .arg("--model")
@@ -124,8 +146,6 @@ impl ModelProvider for ClaudeCodeProvider {
                 // kimetsu loop already enforces budget via cost tracking
                 // and turn count; the inner cap was redundant.
                 .arg("--no-session-persistence")
-                .arg("--tools")
-                .arg("")
                 .arg("--permission-mode")
                 .arg("bypassPermissions")
                 .arg("--system-prompt")
@@ -135,7 +155,7 @@ impl ModelProvider for ClaudeCodeProvider {
 
         let mut last_error: Option<String> = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            let output = run_with_timeout(build_command(), self.timeout).map_err(|err| {
+            let output = run_with_timeout_stdin(build_command(), &prompt, self.timeout).map_err(|err| {
                 redact_token(
                     &format!("claude_code provider failed: {err}"),
                     &self.api_key,
@@ -399,16 +419,37 @@ struct FinishPayload {
 /// counter to detect activity. On timeout we `child.kill()` + `child.wait()`
 /// only and leak the drainers (they stay parked on a grandchild's pipe,
 /// but that's a thread leak, not a deadlock).
-fn run_with_timeout(mut command: Command, timeout: Duration) -> KimetsuResult<Output> {
+fn run_with_timeout_stdin(
+    mut command: Command,
+    stdin_payload: &str,
+    timeout: Duration,
+) -> KimetsuResult<Output> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+    // MP-17g: pipe the prompt via stdin to avoid argv ARG_MAX limits.
     let mut child = command
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let started = Instant::now();
     let hard_ceiling = timeout.saturating_mul(3);
+
+    // Write the prompt to the child's stdin and close the pipe so the
+    // claude CLI sees EOF and stops waiting for more input. We do this
+    // BEFORE installing the drainer threads so we can surface a clear
+    // "stdin write failed" error if the spawn was somehow bad.
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Err(err) = stdin.write_all(stdin_payload.as_bytes()) {
+            // The child has died or refused stdin; kill and bail.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("stdin write failed: {err}").into());
+        }
+        // Dropping `stdin` here closes the pipe (EOF).
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
