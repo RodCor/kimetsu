@@ -107,7 +107,7 @@ struct AgentArgs {
     /// Hard cap on model ↔ tool ping-pong rounds before agent.done is
     /// forced. Defaults to DEFAULT_MODEL_TURN_BUDGET. Set lower in CI
     /// to keep cost bounded.
-    #[arg(long, default_value_t = kimetsu_agent::harbor::DEFAULT_MODEL_TURN_BUDGET)]
+    #[arg(long, default_value_t = kimetsu_harbor_rs::DEFAULT_MODEL_TURN_BUDGET)]
     turn_budget: u32,
     /// Model id passed to the provider (claude_code only in v0.2).
     /// Defaults to the value of $KIMETSU_HARBOR_MODEL or
@@ -464,11 +464,14 @@ fn run() -> KimetsuResult<()> {
 ///     shell_command tool calls based on the task; we route them
 ///     through HarborShellExecutor and feed results back.
 fn agent(args: AgentArgs) -> KimetsuResult<()> {
-    use kimetsu_agent::harbor::{
-        HarborSession, HarborShellExecutor, run_model_agent, run_multi_step_stub,
-    };
+    // v0.3.2: harbor transport types live in kimetsu-harbor-rs now.
+    // The transport-agnostic agent loop (run_model_agent) still lives
+    // in kimetsu-agent and is re-exported via kimetsu-harbor-rs.
     use kimetsu_agent::tools::{ToolRuntime, ToolRuntimeConfig};
     use kimetsu_core::ids::RunId;
+    use kimetsu_harbor_rs::{
+        AgentDoneParams, HarborSession, HarborShellExecutor, run_model_agent, run_multi_step_stub,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -520,18 +523,16 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
                 &args.task,
                 &mut runtime,
                 &mut *provider,
-                kimetsu_agent::harbor::HarborAgentOpts {
+                kimetsu_harbor_rs::HarborAgentOpts {
                     turn_budget: args.turn_budget,
-                    ..kimetsu_agent::harbor::HarborAgentOpts::default()
+                    ..kimetsu_harbor_rs::HarborAgentOpts::default()
                 },
                 brain_context.as_deref(),
             )?;
-            session
-                .borrow_mut()
-                .emit_done(kimetsu_agent::harbor::AgentDoneParams {
-                    summary: report.summary,
-                    context: Some(report.context),
-                })?;
+            session.borrow_mut().emit_done(AgentDoneParams {
+                summary: report.summary,
+                context: Some(report.context),
+            })?;
         }
         Ok(())
     };

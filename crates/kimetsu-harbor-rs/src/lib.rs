@@ -1,50 +1,53 @@
 //! Terminal-Bench / Harbor transport adapter for kimetsu.
 //!
-//! v0.3 architectural intent: keep the Harbor / Terminal-Bench specific
-//! JSON-RPC transport out of `kimetsu-agent` so other transports
-//! (the new `kimetsu-chat` REPL, future HTTP / MCP servers, embedded
-//! library use) don't pay the cost of dragging in benchmark-only code.
+//! v0.3.2 — physical migration complete. The wire protocol +
+//! HarborSession + HarborShellExecutor + stub runners that lived in
+//! `kimetsu-agent/src/harbor.rs` through v0.3.1 are now physically
+//! housed here. The agent core (`kimetsu-agent`) compiles + tests pass
+//! without any reference to JSON-RPC machinery — exactly the
+//! dependency property `kimetsu-chat` needed.
 //!
-//! For v0.3.0 this crate is intentionally a thin re-export shell over
-//! `kimetsu_agent::harbor`. The HarborSession + JSON-RPC types still
-//! live in `kimetsu-agent/src/harbor.rs` because they're entangled
-//! with the agent loop's call sites and a Big Bang move would risk
-//! breaking the production benchmark binary that's currently shipping.
+//! Public modules:
+//!   - [`protocol`] — wire-protocol type definitions (HarborRequest,
+//!     ToolExecParams/Result, AgentDoneParams, JsonRpc*).
+//!   - [`session`] — `HarborSession<R, W>` (the line-oriented RPC
+//!     reader/writer) + `HarborShellExecutor` (the `ShellExecutor`
+//!     impl that routes shell calls through the session).
+//!   - [`stubs`] — `run_stub_agent` and `run_multi_step_stub` for the
+//!     `kimetsu agent --harbor-mode --stub` smoke path used by the
+//!     python adapter.
 //!
-//! Phase-2 work (slated for v0.3.1+): physically migrate the JSON-RPC
-//! layer here, leaving `kimetsu-agent` with the protocol-agnostic
-//! tool runtime, prompts, verify loop, and provider plumbing.
-//!
-//! Public API:
-//!   - re-export of the harbor entry point used by `kimetsu-cli`
-//!     (`agent --harbor-mode`)
-//!   - re-export of the model-agent loop + opts struct (for any external
-//!     consumer that wants to drive a harbor session programmatically)
-//!
-//! Why a separate crate now (even as a re-export) instead of waiting?
-//!   - Lets us version harbor independently of the agent core.
-//!   - Lets `kimetsu-chat` depend ONLY on `kimetsu-agent`, never on
-//!     harbor — verifying the dependency direction we want before
-//!     the physical migration lands.
-//!   - Makes the architectural intent legible from the workspace
-//!     layout alone.
+//! Re-exports at the crate root surface the common types so callers
+//! (kimetsu-cli, the python adapter via `kimetsu agent --harbor-mode`)
+//! don't need to walk the module tree. Agent-core surface they also
+//! need (run_model_agent, HarborAgentOpts, AgentDoneParams was already
+//! here, etc.) is re-exported from `kimetsu_agent::harbor` for now;
+//! Phase-3 (a future cleanup) will pull those agent-core re-exports
+//! out of the harbor module entirely.
 
-// Core transport types — currently still defined in kimetsu-agent::harbor.
-// Phase-2 will physically move these here.
-pub use kimetsu_agent::harbor::{
-    AgentDoneParams, HARBOR_PROTOCOL_VERSION, HarborAgentOpts, HarborRequest, HarborSession,
-    HarborShellExecutor, JsonRpcError, JsonRpcResponse, ModelAgentReport, ToolExecParams,
-    ToolExecResult, run_model_agent, run_stub_agent,
+pub mod protocol;
+pub mod session;
+pub mod stubs;
+
+// Wire-protocol surface.
+pub use protocol::{
+    AgentDoneParams, HARBOR_PROTOCOL_VERSION, HarborRequest, JsonRpcError, JsonRpcResponse,
+    ToolExecParams, ToolExecResult,
 };
 
-// Tool definitions + dispatcher live with the agent runtime, but harbor
-// callers need them to drive the agent loop. Re-exporting them here keeps
-// kimetsu-cli's harbor-mode entry point dependency-clean.
-pub use kimetsu_agent::harbor::{harbor_dispatch_tool, harbor_tool_definitions};
+// Session + executor surface.
+pub use session::{HarborSession, HarborShellExecutor};
 
-// Defaults the harbor runner cares about.
+// Stub runners (for --stub mode).
+pub use stubs::{MultiStepStubReport, run_multi_step_stub, run_stub_agent};
+
+// Agent-core surface harbor callers still need. These live in
+// kimetsu-agent because they're transport-agnostic; we re-export
+// them here for convenience so kimetsu-cli has a single import path
+// for everything harbor mode requires.
 pub use kimetsu_agent::harbor::{
-    DEFAULT_MODEL_TURN_BUDGET, MAX_VERIFY_ITERATIONS, STALL_WINDOW_TURNS,
+    DEFAULT_MODEL_TURN_BUDGET, HarborAgentOpts, MAX_VERIFY_ITERATIONS, ModelAgentReport,
+    STALL_WINDOW_TURNS, harbor_dispatch_tool, harbor_tool_definitions, run_model_agent,
 };
 
 /// Crate-level metadata so harbor-specific telemetry can distinguish
