@@ -124,8 +124,19 @@ impl ModelProvider for ClaudeCodeProvider {
                 // MP-17g: no positional prompt; we feed it via stdin.
                 .arg("--input-format")
                 .arg("text")
+                // MP-17k: switch from `json` (buffered single blob) to
+                // `stream-json` (newline-delimited events). With `json`,
+                // claude held the entire response in memory until done
+                // and our MP-17f idle-byte heartbeat saw 0 bytes for the
+                // whole 1500s on hard tasks (circuit-fibsqrt was the
+                // canonical hang). stream-json emits a `system` init
+                // event immediately, then `assistant` events as the model
+                // streams tokens, then a final `result` event with the
+                // usage/cost summary. Our heartbeat sees continuous
+                // activity; we extract the `result` event for the same
+                // shape parse_claude_code_output used to consume.
                 .arg("--output-format")
-                .arg("json")
+                .arg("stream-json")
                 .arg("--model")
                 .arg(&self.model)
                 // MP-7d / MP-13c: bump to 16. 8 was already a workaround for
@@ -186,7 +197,10 @@ impl ModelProvider for ClaudeCodeProvider {
             //      sentinel for cases where the JSON parse fails
             let stdout_text = String::from_utf8_lossy(&output.stdout);
             let transient = if !output.status.success() {
-                let cc: Option<ClaudeCodeJson> = serde_json::from_str(&stdout_text).ok();
+                // MP-17k: stdout is now stream-json (one JSON event per
+                // line). Extract the final `result` event and check its
+                // api_error_status.
+                let cc: Option<ClaudeCodeJson> = extract_result_event(&stdout_text).ok();
                 let status_5xx = cc
                     .as_ref()
                     .and_then(|c| c.api_error_status)
@@ -569,9 +583,9 @@ fn run_with_timeout_stdin(
 
 fn parse_claude_code_output(stdout: &[u8]) -> KimetsuResult<ModelResponse> {
     let text = String::from_utf8_lossy(stdout);
-    let response: ClaudeCodeJson = serde_json::from_str(&text).map_err(|err| {
+    let response = extract_result_event(&text).map_err(|err| {
         format!(
-            "failed to parse claude_code JSON output: {err}; output: {}",
+            "failed to parse claude_code stream-json output: {err}; output: {}",
             truncate(&text, 700)
         )
     })?;
@@ -608,6 +622,56 @@ fn parse_claude_code_output(stdout: &[u8]) -> KimetsuResult<ModelResponse> {
             cost_usd: response.total_cost_usd.unwrap_or_default(),
         },
     })
+}
+
+/// MP-17k: extract the final `result` event from claude's stream-json
+/// output. With `--output-format stream-json` the CLI emits one JSON
+/// object per line; the last event with `type: "result"` carries the
+/// usage/cost summary in the same shape the old single-blob `json`
+/// format used. Falls back to single-blob parse for backward compat /
+/// for callers that still set `--output-format json`.
+fn extract_result_event(text: &str) -> Result<ClaudeCodeJson, String> {
+    // Walk lines; remember the last successfully-parsed `result` event.
+    let mut last_result: Option<ClaudeCodeJson> = None;
+    let mut parse_errors = 0u32;
+    let mut seen_events = 0u32;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        seen_events += 1;
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        let event_type = value.get("type").and_then(|t| t.as_str());
+        if event_type == Some("result") {
+            match serde_json::from_value::<ClaudeCodeJson>(value) {
+                Ok(parsed) => last_result = Some(parsed),
+                Err(_) => parse_errors += 1,
+            }
+        }
+    }
+    if let Some(r) = last_result {
+        return Ok(r);
+    }
+    // Backward compat: if no `result` event was found, try parsing the
+    // whole text as a single-blob ClaudeCodeJson (old `--output-format
+    // json` shape).
+    if let Ok(blob) = serde_json::from_str::<ClaudeCodeJson>(text) {
+        return Ok(blob);
+    }
+    if seen_events == 0 {
+        Err("no JSON events on stdout (claude produced no output)".to_string())
+    } else {
+        Err(format!(
+            "no `result` event in {seen_events} stream-json events (parse_errors={parse_errors})"
+        ))
+    }
 }
 
 fn output_summary(output: &Output) -> String {
@@ -801,5 +865,76 @@ mod tests {
         assert!(prompt.contains("previous tool_call"));
         assert!(prompt.contains("call_42"));
         assert!(prompt.contains("tool_result"));
+    }
+
+    // ----- MP-17k: stream-json parser tests -----
+
+    #[test]
+    fn stream_json_parser_returns_last_result_event() {
+        let stream = r#"{"type":"system","subtype":"init","cwd":"/app"}
+{"type":"assistant","message":{"role":"assistant","content":[]}}
+{"type":"result","subtype":"success","is_error":false,"result":"hello","stop_reason":"end_turn","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5}}
+"#;
+        let parsed = extract_result_event(stream).expect("parse");
+        assert_eq!(parsed.result.as_deref(), Some("hello"));
+        assert_eq!(parsed.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(parsed.total_cost_usd, Some(0.001));
+    }
+
+    #[test]
+    fn stream_json_parser_skips_non_result_events() {
+        let stream = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"thinking..."}]}}
+{"type":"user","message":{"role":"user","content":"tool result"}}
+{"type":"result","subtype":"success","is_error":false,"result":"final","stop_reason":"end_turn"}
+"#;
+        let parsed = extract_result_event(stream).expect("parse");
+        assert_eq!(parsed.result.as_deref(), Some("final"));
+    }
+
+    #[test]
+    fn stream_json_parser_picks_LAST_result_when_multiple() {
+        // Defensive: if claude emits multiple result events (e.g. due to
+        // a bug or retry), we take the last one as the canonical wrap-up.
+        let stream = r#"{"type":"result","is_error":true,"result":"transient error","stop_reason":"end_turn"}
+{"type":"result","is_error":false,"result":"final answer","stop_reason":"end_turn"}
+"#;
+        let parsed = extract_result_event(stream).expect("parse");
+        assert_eq!(parsed.result.as_deref(), Some("final answer"));
+        assert_eq!(parsed.is_error, Some(false));
+    }
+
+    #[test]
+    fn stream_json_parser_tolerates_malformed_lines() {
+        let stream = r#"{"type":"system"}
+this is not json
+{"type":"result","is_error":false,"result":"survived","stop_reason":"end_turn"}
+"#;
+        let parsed = extract_result_event(stream).expect("parse");
+        assert_eq!(parsed.result.as_deref(), Some("survived"));
+    }
+
+    #[test]
+    fn stream_json_parser_falls_back_to_single_blob() {
+        // Backward compat: if the caller still uses --output-format json,
+        // we should still parse the single-blob payload.
+        let blob = r#"{"subtype":"success","is_error":false,"result":"single-blob","stop_reason":"end_turn","total_cost_usd":0.002}"#;
+        let parsed = extract_result_event(blob).expect("parse");
+        assert_eq!(parsed.result.as_deref(), Some("single-blob"));
+    }
+
+    #[test]
+    fn stream_json_parser_errors_when_no_result_event() {
+        let stream = r#"{"type":"system"}
+{"type":"assistant","message":{}}
+"#;
+        let err = extract_result_event(stream).unwrap_err();
+        assert!(err.contains("no `result` event") || err.contains("no JSON events"));
+    }
+
+    #[test]
+    fn stream_json_parser_errors_on_empty_output() {
+        let err = extract_result_event("").unwrap_err();
+        assert!(err.contains("no JSON events"));
     }
 }
