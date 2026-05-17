@@ -90,6 +90,16 @@ impl<P: ModelProvider> AgentLoop<P> {
                 .output_tokens
                 .saturating_add(response.usage.output_tokens);
             usage.cost_usd += response.usage.cost_usd;
+            // v0.3.4a: accumulate Anthropic prompt-cache counters too.
+            // The pipeline path uses the same TokenUsage struct as harbor;
+            // surfacing cache_creation / cache_read here keeps pipeline
+            // bench rows comparable across providers.
+            usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .saturating_add(response.usage.cache_creation_input_tokens);
+            usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .saturating_add(response.usage.cache_read_input_tokens);
             self.write_model_responded(&response)?;
 
             if usage.cost_usd > self.config.max_cost_usd {
@@ -242,6 +252,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                     cost_usd: 0.01,
+                    ..TokenUsage::default()
                 },
             },
             ModelResponse::text(r#"{"status":"ok"}"#),

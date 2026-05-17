@@ -267,6 +267,13 @@ enum AnthropicContent {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    /// v0.3.4a: Anthropic returns 0 (not absent) when no cache write
+    /// happened on this call, but we accept absence too via Option +
+    /// `unwrap_or_default` for forward-compat with older API responses.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 impl From<AnthropicUsage> for TokenUsage {
@@ -275,6 +282,10 @@ impl From<AnthropicUsage> for TokenUsage {
             input_tokens: value.input_tokens,
             output_tokens: value.output_tokens,
             cost_usd: 0.0,
+            // v0.3.4a: surface cache stats so callers get the same
+            // visibility as the claude_code provider.
+            cache_creation_input_tokens: value.cache_creation_input_tokens.unwrap_or_default(),
+            cache_read_input_tokens: value.cache_read_input_tokens.unwrap_or_default(),
         }
     }
 }

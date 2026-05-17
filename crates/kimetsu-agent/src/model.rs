@@ -172,6 +172,21 @@ pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cost_usd: f32,
+    /// v0.3.4a: Anthropic prompt-caching write counter. Tokens whose
+    /// ephemeral cache entry was created during this request. High
+    /// cache_creation alongside low cache_read means we're paying full
+    /// freight on every call — see the per-call TempCommandDir + missing
+    /// `--continue` story documented in V0.3-PLAN.md. Defaulted to 0 for
+    /// providers that don't surface it (so existing tests keep passing).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// v0.3.4a: Anthropic prompt-caching read counter. Tokens charged at
+    /// the discounted "cache hit" rate because they matched an ephemeral
+    /// cache entry from a recent prior request. This is the number we
+    /// want to grow over a chat session; if it stays at 0 across turns
+    /// the prompt cache is not landing.
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 pub trait ModelProvider {

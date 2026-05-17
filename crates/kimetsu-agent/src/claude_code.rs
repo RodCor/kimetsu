@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,28 @@ pub struct ClaudeCodeProvider {
     // --max-budget-usd to claude was redundant and harmful. The field is
     // gone; if a future iteration needs an inner-loop cap, route it through
     // a separate (less ambiguous) mechanism.
+    //
+    // v0.3.4b: stable tempdir per provider (was: fresh per call).
+    //
+    // Before this change, every `complete()` invocation created a brand-
+    // new `TempCommandDir` under `$TEMP/kimetsu-claude-code-<run_id>/`
+    // and pointed claude's `--current-dir` + `CLAUDE_CONFIG_DIR` at it.
+    // Per-call tempdir means:
+    //   * claude treats each call as a fresh "project" — its prompt-cache
+    //     keys (which include cwd-derived state) miss, so we pay
+    //     `cache_creation` freight on the system prompt every turn.
+    //   * the directory churn shows up as a perf cliff on Windows where
+    //     mkdir + rmdir aren't free even for empty dirs.
+    //
+    // Lifting it to a provider-scoped field means a single chat session
+    // (or harbor session, or pipeline run) sees one stable cwd across
+    // every `complete()` call. The `Arc` wrapper keeps the `Clone` derive
+    // sound — cloning ClaudeCodeProvider now shares the tempdir instead
+    // of double-dropping it.
+    //
+    // Drop on `TempCommandDir` deletes the dir when the last Arc drops,
+    // so we don't leak across sessions.
+    work_dir: Arc<TempCommandDir>,
 }
 
 impl ClaudeCodeProvider {
@@ -54,10 +77,17 @@ impl ClaudeCodeProvider {
             return Ok(None);
         };
 
+        // v0.3.4b: provision the stable tempdir + config subdir once at
+        // construction. Both live for the provider's lifetime.
+        let work_dir = TempCommandDir::create()?;
+        let config_dir = work_dir.path().join("config");
+        fs::create_dir_all(&config_dir)?;
+
         Ok(Some(Self {
             api_key: secret,
             model: config.model.model.clone(),
             timeout: Duration::from_secs(config.model.request_timeout_secs),
+            work_dir: Arc::new(work_dir),
         }))
     }
 
@@ -74,8 +104,15 @@ impl ModelProvider for ClaudeCodeProvider {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&render_tool_protocol(&request.tools));
         }
-        let work_dir = TempCommandDir::create()?;
+        // v0.3.4b: reuse the provider's stable tempdir. Created once in
+        // from_config_with_key; survives until the provider is dropped.
+        // Stable cwd keeps Anthropic's prompt-cache keys aligned across
+        // calls so cache_read_input_tokens has a chance of growing.
+        let work_dir: &TempCommandDir = &self.work_dir;
         let config_dir = work_dir.path().join("config");
+        // Defensive: re-create config dir if something cleared it
+        // between calls (e.g. user blew away $TEMP). Cheap no-op if it
+        // already exists.
         fs::create_dir_all(&config_dir)?;
 
         // MP-13f: retry loop for transient Anthropic 5xx errors. The
@@ -628,6 +665,11 @@ fn parse_claude_code_output(stdout: &[u8]) -> KimetsuResult<ModelResponse> {
             input_tokens: usage.input_tokens.unwrap_or_default(),
             output_tokens: usage.output_tokens.unwrap_or_default(),
             cost_usd: response.total_cost_usd.unwrap_or_default(),
+            // v0.3.4a: pass cache stats through. Anthropic returns 0
+            // (not absent) when no cache was used, so unwrap_or_default
+            // matches the wire-level convention.
+            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or_default(),
+            cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or_default(),
         },
     })
 }
@@ -724,6 +766,15 @@ struct ClaudeCodeJson {
 struct ClaudeCodeUsage {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    /// v0.3.4a: Anthropic prompt-cache write counter. The `result` event
+    /// from claude's stream-json surfaces this when the API returns
+    /// cache_creation_input_tokens; we forward it into `TokenUsage` so
+    /// the chat REPL (and any future telemetry) can show cache hit/miss
+    /// behavior per turn. Same for cache_read below.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug)]

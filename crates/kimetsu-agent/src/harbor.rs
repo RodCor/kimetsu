@@ -400,7 +400,12 @@ pub fn run_model_agent(
     let tool_defs = harbor_tool_definitions();
 
     let mut tool_calls_total = 0u32;
-    let mut last_usage = crate::model::TokenUsage::default();
+    // v0.3.4a: was `last_usage` (overwrite per turn). For multi-turn
+    // agent loops that meant the chat cost meter only saw the FINAL
+    // model turn's cost — under-billing the budget. Cumulative now,
+    // so cost.record_turn(report.usage.cost_usd) is accurate AND the
+    // cache stats reflect the full session, not just the wrap-up turn.
+    let mut total_usage = crate::model::TokenUsage::default();
     let mut final_text: Option<String> = None;
     let mut stop_reason = StopReason::EndTurn;
     let mut turn = 0u32;
@@ -450,7 +455,21 @@ pub fn run_model_agent(
         };
 
         let response = provider.complete(request)?;
-        last_usage = response.usage;
+        // v0.3.4a: accumulate instead of overwrite. Saturating-add so a
+        // pathological provider that returns u32::MAX can't wrap into 0.
+        total_usage.input_tokens = total_usage
+            .input_tokens
+            .saturating_add(response.usage.input_tokens);
+        total_usage.output_tokens = total_usage
+            .output_tokens
+            .saturating_add(response.usage.output_tokens);
+        total_usage.cost_usd += response.usage.cost_usd;
+        total_usage.cache_creation_input_tokens = total_usage
+            .cache_creation_input_tokens
+            .saturating_add(response.usage.cache_creation_input_tokens);
+        total_usage.cache_read_input_tokens = total_usage
+            .cache_read_input_tokens
+            .saturating_add(response.usage.cache_read_input_tokens);
         stop_reason = response.stop_reason.clone();
 
         if !response.tool_calls.is_empty() {
@@ -584,9 +603,16 @@ pub fn run_model_agent(
         "turns": turn,
         "tool_calls": tool_calls_total,
         "stop_reason": format!("{stop_reason:?}"),
-        "input_tokens": last_usage.input_tokens,
-        "output_tokens": last_usage.output_tokens,
-        "cost_usd": last_usage.cost_usd,
+        "input_tokens": total_usage.input_tokens,
+        "output_tokens": total_usage.output_tokens,
+        "cost_usd": total_usage.cost_usd,
+        // v0.3.4a: surface Anthropic prompt-cache stats so callers
+        // (chat REPL, future telemetry) can see whether the cache is
+        // landing. cache_read growing turn-over-turn is the success
+        // signal; cache_creation dominating cache_read across turns
+        // means we're paying full input freight every time.
+        "cache_creation_input_tokens": total_usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": total_usage.cache_read_input_tokens,
         "protocol_version": HARBOR_PROTOCOL_VERSION,
         // MP-18: surface the model's self-reflections so the brain
         // curation pipeline can propose them as memory rows.
@@ -599,7 +625,7 @@ pub fn run_model_agent(
         tool_calls: tool_calls_total,
         stop_reason,
         final_text,
-        usage: last_usage,
+        usage: total_usage,
         summary,
         context,
     })

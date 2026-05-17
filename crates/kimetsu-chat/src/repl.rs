@@ -469,6 +469,23 @@ pub fn run_repl<R: BufRead, W: Write>(
                     report.turns,
                     report.tool_calls,
                 )?;
+                // v0.3.4a: print Anthropic prompt-cache stats so the
+                // user can see whether the prompt cache is landing
+                // across turns. cache_read should grow over the session
+                // once persistent-subprocess (v0.3.4e) lands; today
+                // most calls show cache_creation > 0, cache_read == 0.
+                let cc = report.usage.cache_creation_input_tokens;
+                let cr = report.usage.cache_read_input_tokens;
+                if cc > 0 || cr > 0 {
+                    writeln!(
+                        writer,
+                        "[cache] input={} output={} cache_write={} cache_read={}",
+                        report.usage.input_tokens,
+                        report.usage.output_tokens,
+                        cc,
+                        cr,
+                    )?;
+                }
                 if !still_within {
                     writeln!(
                         writer,
