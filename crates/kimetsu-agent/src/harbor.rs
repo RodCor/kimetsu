@@ -348,6 +348,15 @@ pub struct MultiStepStubReport {
 /// deliberation gets cut off at the stall window.
 pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 80;
 
+/// MP-18: how many times we ask the model to "verify before finish"
+/// before giving up and accepting the finish unconditionally. Set low
+/// because each iteration adds at minimum one model turn (the verify
+/// response) and at maximum several more turns (workspace inspection +
+/// fix-ups). Two iterations means: model tries to finish → verify nudge
+/// → model checks / fixes → tries to finish again → verify nudge →
+/// model finishes → accepted. So up to 3 finish-attempts per task.
+pub const MAX_VERIFY_ITERATIONS: u32 = 2;
+
 /// MP-17m.2: outer-loop heartbeat. If the model hasn't produced ANY
 /// useful tool call (touches workspace state — shell, file, git) in
 /// this many consecutive turns, treat it as stalled and wrap up.
@@ -686,8 +695,18 @@ where
     let mut turn = 0u32;
     // MP-13d: flag so the persistence gate fires at most once per task.
     let mut persistence_nudge_sent = false;
-    // MP-17c: flag so the self-verify nudge fires at most once per task.
-    let mut self_verify_nudge_sent = false;
+    // MP-17c → MP-18: replaced one-shot self-verify with iterative goal verify.
+    // verify_iterations counts how many times the model tried to finish and
+    // got pushed back to verify. After MAX_VERIFY_ITERATIONS attempts we
+    // accept the finish unconditionally so we never deadlock.
+    let mut verify_iterations: u32 = 0;
+    // MP-18: capture the latest plan tool call so the verify nudge can recap
+    // it back to the model. last-write-wins; the model can re-call plan to
+    // refine and we always show the most-recent version.
+    let mut task_plan: Option<Value> = None;
+    // MP-18: accumulate record_deviation calls across the run. Surfaced in
+    // agent.done's context for downstream brain-curation flows.
+    let mut recorded_deviations: Vec<Value> = Vec::new();
     // MP-17m.2: outer-loop stall heartbeat. Counts consecutive turns
     // since the model last fired a USEFUL tool call. Reset on workspace-
     // touching tool calls (shell/file/git). Pure think/plan turns or
@@ -743,6 +762,21 @@ where
             for call in response.tool_calls {
                 tool_calls_total += 1;
                 let name = call.name.clone();
+                // MP-18: capture goal artifacts before dispatching.
+                //
+                // `plan` — last-write-wins record of the model's current plan.
+                //   Used by the verify nudge to remind the model what it
+                //   committed to.
+                //
+                // `record_deviation` — accumulate into recorded_deviations.
+                //   Will be surfaced in agent.done so the brain pipeline can
+                //   propose the `lesson_for_next_time` as a failure_pattern
+                //   memory.
+                if name == "plan" {
+                    task_plan = Some(call.input.clone());
+                } else if name == "record_deviation" {
+                    recorded_deviations.push(call.input.clone());
+                }
                 let result_value = harbor_dispatch_tool(runtime, &name, call.input.clone());
                 messages.push(ModelMessage::tool_result(call.id, name, result_value));
             }
@@ -778,39 +812,37 @@ where
             continue;
         }
 
-        // MP-17c: one-time pre-finish self-verify nudge. Fires AT MOST ONCE
-        // per task, after the persistence gate has passed. On the
-        // make-mips-interpreter / install-windows-3-11 / video-processing
-        // class of failures the model produced output that didn't match
-        // the verifier; a single "before I accept finish, briefly check
-        // your output exists and matches the spec" reminder costs ~one
-        // extra model turn but catches the "I forgot to verify" cases
-        // cheaply. The model is free to confirm "verified, done" and
-        // re-emit finish on the next turn — we accept it then unconditionally.
-        // MP-17j: only fire the self-verify nudge when the task description
-        // mentions verifier-class keywords. The MP-17 brain-only gauntlet at
-        // 21:32Z showed 3 prior wins (overfull-hbox / compile-compcert /
-        // log-summary-date-ranges) regressed to zeros — the always-on nudge
-        // burned a turn re-checking output on tasks where the model would
-        // have finished cleanly. Now we gate on whether the task itself
-        // signals a verification step is part of the spec.
-        if !self_verify_nudge_sent
-            && opts.self_verify_nudge_enabled
-            && task_signals_verification(task)
-        {
-            self_verify_nudge_sent = true;
-            let nudge = "Before I accept the finish: briefly verify your \
-                output is what the verifier will check. Concretely: list \
-                the files you produced (list_files / shell_command ls), \
-                cat at least one to confirm content, and run any \
-                verification command the task spec mentions (test runner, \
-                a known executable, the named binary). If everything \
-                checks out, emit `finish` on your next turn and we're \
-                done. If you spot a gap, fix it first.";
+        // MP-18: brain-powered iterative goal verify.
+        //
+        // Replaces the MP-17c one-shot nudge. When the model tries to finish
+        // we recap the original task instruction + the most recent plan and
+        // ask two structured questions: WHAT is missing and WHERE did the
+        // execution deviate? The model self-inspects the workspace (list_files
+        // / cat / shell_command) and either confirms "all good" → we accept
+        // on the next finish, or identifies a deviation → optionally calls
+        // record_deviation (strict mode: required; lenient default: optional)
+        // → fixes → finishes again.
+        //
+        // Capped at MAX_VERIFY_ITERATIONS = 2 so a stuck model never deadlocks.
+        // The persistence gate above already covered the "didn't even try"
+        // case; this loop covers the "tried but didn't actually solve it"
+        // class (overfull-hbox / video-processing / install-windows-3-11
+        // pattern in MP-17m).
+        if verify_iterations < MAX_VERIFY_ITERATIONS && opts.self_verify_nudge_enabled {
+            let strict = std::env::var("KIMETSU_HARBOR_VERIFY_STRICT")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false);
+            verify_iterations += 1;
+            let nudge = render_verify_nudge(
+                task,
+                task_plan.as_ref(),
+                verify_iterations,
+                strict,
+            );
             if let Some(text) = response.text.clone() {
                 messages.push(ModelMessage::assistant_text(text));
             }
-            messages.push(ModelMessage::user_text(nudge.to_string()));
+            messages.push(ModelMessage::user_text(nudge));
             continue;
         }
 
@@ -843,6 +875,10 @@ where
             "output_tokens": last_usage.output_tokens,
             "cost_usd": last_usage.cost_usd,
             "protocol_version": HARBOR_PROTOCOL_VERSION,
+            // MP-18: surface the model's self-reflections so the brain
+            // curation pipeline can propose them as memory rows.
+            "verify_iterations": verify_iterations,
+            "recorded_deviations": recorded_deviations,
         })),
     })?;
 
@@ -861,6 +897,77 @@ fn preview_text(text: &str, limit: usize) -> String {
         clipped.push('…');
     }
     clipped
+}
+
+/// MP-18: construct the iterative goal-verify nudge. Recaps the task
+/// instruction + (if available) the most-recent plan the model committed
+/// to, asks the two structured questions, and either *suggests* or
+/// *requires* a `record_deviation` call depending on `strict`.
+///
+/// Iteration N=1 is gentle ("first verify pass"); N=2 is firmer ("you've
+/// been asked once; now really check"). After MAX_VERIFY_ITERATIONS the
+/// caller stops looping entirely.
+fn render_verify_nudge(
+    task: &str,
+    plan: Option<&Value>,
+    iteration: u32,
+    strict: bool,
+) -> String {
+    let task_recap = preview_text(task, 800);
+    let plan_recap = match plan {
+        Some(p) => {
+            // The `plan` tool input is {todos:[{content,status,activeForm?}]}.
+            // We render as a numbered list with statuses so the model can
+            // re-read its own commitments.
+            let mut out = String::from("Your most recent plan:\n");
+            if let Some(todos) = p.get("todos").and_then(Value::as_array) {
+                for (i, t) in todos.iter().enumerate() {
+                    let content = t.get("content").and_then(Value::as_str).unwrap_or("?");
+                    let status = t.get("status").and_then(Value::as_str).unwrap_or("?");
+                    out.push_str(&format!("  {}. [{}] {}\n", i + 1, status, content));
+                }
+            } else {
+                out.push_str("  (plan recorded but todos field unreadable)\n");
+            }
+            out
+        }
+        None => String::from("(no plan was recorded for this task)\n"),
+    };
+    let deviation_clause = if strict {
+        "If anything is missing or wrong, you MUST call `record_deviation` \
+         describing what is missing, where in your plan you deviated, and a \
+         one-sentence generalizable lesson. THEN fix the issue and try \
+         finish again."
+    } else {
+        "If anything is missing or wrong, fix it. If the gap is something \
+         that would help future tasks (a reusable lesson), optionally call \
+         `record_deviation` so it can become a brain memory. Then try \
+         finish again."
+    };
+    let urgency = if iteration == 1 {
+        "Before I accept finish:"
+    } else {
+        "Second verify pass — your previous finish attempt was rejected. \
+         Take this seriously:"
+    };
+    format!(
+        "{urgency}\n\
+         \n\
+         === Goal recap (task instruction) ===\n\
+         {task_recap}\n\
+         \n\
+         === {plan_recap}\n\
+         === Inspect, then answer two questions ===\n\
+         1. WHAT IS MISSING — inspect your workspace (list_files, cat, \
+            shell_command). For each artifact the task asked for, confirm \
+            it exists and matches the spec.\n\
+         2. WHERE YOU DEVIATED — if anything is missing, identify which \
+            step of your plan (or which decision) was the divergence point.\n\
+         \n\
+         {deviation_clause}\n\
+         \n\
+         If everything checks out, emit `finish` on your next turn and we're done."
+    )
 }
 
 /// MP-7d: namespace helper so the system prompt is one focused location
@@ -1216,6 +1323,38 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["thought"],
             }),
         },
+        // ---------- MP-18: brain-powered goal verify ----------
+        ToolDefinition {
+            name: "record_deviation".to_string(),
+            description: "Capture a self-reflection on a gap between your output \
+                and the task goal. Call this when, during the verify loop, you \
+                discover something missing or wrong with your output. The \
+                `lesson_for_next_time` field becomes a candidate memory for \
+                future tasks (reviewed via `kimetsu brain memory review`). \
+                Lenient by default — only call when there's a generalizable \
+                lesson worth surfacing. With `KIMETSU_HARBOR_VERIFY_STRICT=1` \
+                set, the wrapper will require this call before accepting any \
+                fix-up cycle."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "missing": {
+                        "type": "string",
+                        "description": "Concrete description of what the goal asks for that your output doesn't satisfy."
+                    },
+                    "where_deviated": {
+                        "type": "string",
+                        "description": "Which step of your plan (or which decision) was the divergence point."
+                    },
+                    "lesson_for_next_time": {
+                        "type": "string",
+                        "description": "Generalizable one-sentence lesson. Will be proposed as a `failure_pattern` memory if non-trivial."
+                    }
+                },
+                "required": ["missing", "where_deviated", "lesson_for_next_time"],
+            }),
+        },
         // ---------- MP-16a: background shell quartet ----------
         // For long-running tasks (builds, training, multi-step compilers)
         // where a single foreground shell_command would blow the
@@ -1347,6 +1486,8 @@ pub fn harbor_dispatch_tool(
         "shell_output"     => harbor_shell_output(runtime, &input),
         "shell_stop"       => harbor_shell_stop(runtime, &input),
         "view_image"       => harbor_view_image(runtime, &input),
+        // MP-18: brain-powered goal verify
+        "record_deviation" => harbor_record_deviation(&input),
         other => json!({
             "error": format!(
                 "unsupported tool `{other}`; pick one of \
@@ -1354,7 +1495,7 @@ pub fn harbor_dispatch_tool(
                  edit_file / apply_patch / git_status / git_diff / shell_command / \
                  glob / multi_read / move_file / delete_file / plan / think / \
                  shell_background / shell_status / shell_output / shell_stop / \
-                 view_image"
+                 view_image / record_deviation"
             ),
         }),
     }
@@ -2442,22 +2583,52 @@ fn harbor_think(input: &Value) -> Value {
     })
 }
 
-/// MP-17j (tuned in MP-17m.1): cheap keyword check on the task description
-/// to decide whether the self-verify nudge is worth firing.
+/// MP-18: brain-powered goal verify — capture the model's self-reflection
+/// on a gap between its output and the task goal. The handler validates +
+/// echoes the input back. The agent loop sweeps `record_deviation` calls
+/// out of the tool-call stream and accumulates them in agent state;
+/// they're surfaced in `agent.done` at task end and become candidate
+/// memory proposals (kind=failure_pattern) via the existing brain
+/// curation flow.
+fn harbor_record_deviation(input: &Value) -> Value {
+    let Some(missing) = input_str(input, "missing") else {
+        return json!({ "error": "record_deviation requires `missing`" });
+    };
+    let Some(where_deviated) = input_str(input, "where_deviated") else {
+        return json!({ "error": "record_deviation requires `where_deviated`" });
+    };
+    let Some(lesson) = input_str(input, "lesson_for_next_time") else {
+        return json!({ "error": "record_deviation requires `lesson_for_next_time`" });
+    };
+    if missing.trim().is_empty() || where_deviated.trim().is_empty() || lesson.trim().is_empty() {
+        return json!({ "error": "record_deviation: all three fields must be non-empty" });
+    }
+    json!({
+        "recorded": true,
+        "missing": missing,
+        "where_deviated": where_deviated,
+        "lesson_for_next_time": lesson,
+    })
+}
+
+/// MP-17j (tuned in MP-17m.1, superseded by MP-18): cheap keyword check
+/// on the task description.
+///
+/// MP-18 replaced the conditional self-verify nudge with always-on
+/// iterative goal verify, so this helper is no longer called from the
+/// agent loop. Kept under `#[allow(dead_code)]` because the test suite
+/// still exercises it as a documented helper, and we may want to
+/// re-enable it as an optimization later (e.g. "skip the verify loop
+/// on tasks where keywords say the task is verification-implicit").
 ///
 /// MP-17m.1: the initial trigger list was too eager. Words like "ensure
 /// that", "check that", "i will check" appear in generic task instructions
-/// where verification IS the task, not an extra step. Firing the nudge
-/// there cost a turn or two of extra model thinking, which on tasks with
-/// tight Harbor budgets (overfull-hbox has a 750s per-task cap) pushed the
-/// trial past the budget. We saw `overfull-hbox` regress from a MP-14d
-/// brain win to a MP-17 timeout because of this.
-///
-/// New triggers are scoped to: explicit verifier identifiers (`pytest`,
-/// `cargo test`, `make test`), explicit deliverable specifications
-/// ("should output", "should print", "should return"), and pass/fail
-/// language tied to a clear test step ("must pass", "should pass"). We
-/// drop the generic "ensure"/"check that"/"i will check" patterns.
+/// where verification IS the task, not an extra step. New triggers are
+/// scoped to: explicit verifier identifiers (`pytest`, `cargo test`,
+/// `make test`), explicit deliverable specifications ("should output",
+/// "should print", "should return"), and pass/fail language tied to a
+/// clear test step ("must pass", "should pass").
+#[allow(dead_code)]
 fn task_signals_verification(task: &str) -> bool {
     let lower = task.to_ascii_lowercase();
     const HINTS: &[&str] = &[
@@ -4105,6 +4276,88 @@ mod tests {
         assert_eq!(extract_diff_path("b/notes/new.md"), "notes/new.md");
         assert_eq!(extract_diff_path("plain/path.rs"), "plain/path.rs");
         assert_eq!(extract_diff_path("  a/x.rs  "), "x.rs");
+    }
+
+    // ----- MP-18: record_deviation + render_verify_nudge tests -----
+
+    #[test]
+    fn record_deviation_accepts_complete_input() {
+        let input = json!({
+            "missing": "output.toml file was empty",
+            "where_deviated": "step 3: forgot to write the analysis result",
+            "lesson_for_next_time": "On tasks producing a file at a specific path, verify the file exists AND is non-empty before finish",
+        });
+        let result = harbor_record_deviation(&input);
+        assert_eq!(result["recorded"], true);
+        assert_eq!(result["missing"], "output.toml file was empty");
+        assert!(result["lesson_for_next_time"].as_str().unwrap().contains("non-empty"));
+    }
+
+    #[test]
+    fn record_deviation_rejects_missing_fields() {
+        assert!(harbor_record_deviation(&json!({})).get("error").is_some());
+        assert!(harbor_record_deviation(&json!({"missing": "x"})).get("error").is_some());
+        assert!(harbor_record_deviation(&json!({"missing": "x", "where_deviated": "y"})).get("error").is_some());
+    }
+
+    #[test]
+    fn record_deviation_rejects_empty_strings() {
+        let r = harbor_record_deviation(&json!({
+            "missing": "",
+            "where_deviated": "  ",
+            "lesson_for_next_time": "",
+        }));
+        assert!(r["error"].as_str().unwrap().contains("non-empty"));
+    }
+
+    #[test]
+    fn render_verify_nudge_includes_task_recap() {
+        let nudge = render_verify_nudge(
+            "Build CompCert from source and expose ccomp binary at /tmp/ccomp",
+            None,
+            1,
+            false,
+        );
+        assert!(nudge.contains("Build CompCert"));
+        assert!(nudge.contains("Goal recap"));
+        assert!(nudge.contains("Inspect"));
+        // First iteration uses gentle framing.
+        assert!(nudge.contains("Before I accept finish"));
+        // Lenient mode says "optionally call record_deviation".
+        assert!(nudge.contains("optionally"));
+    }
+
+    #[test]
+    fn render_verify_nudge_renders_plan_recap_when_present() {
+        let plan = json!({
+            "todos": [
+                {"content": "configure", "status": "completed"},
+                {"content": "build", "status": "completed"},
+                {"content": "verify ccomp -v", "status": "in_progress"},
+            ]
+        });
+        let nudge = render_verify_nudge("(task)", Some(&plan), 1, false);
+        assert!(nudge.contains("1. [completed] configure"));
+        assert!(nudge.contains("2. [completed] build"));
+        assert!(nudge.contains("3. [in_progress] verify ccomp -v"));
+    }
+
+    #[test]
+    fn render_verify_nudge_strict_mode_requires_record_deviation() {
+        let strict = render_verify_nudge("(task)", None, 1, true);
+        assert!(strict.contains("MUST call `record_deviation`"));
+        let lenient = render_verify_nudge("(task)", None, 1, false);
+        assert!(!lenient.contains("MUST call"));
+        assert!(lenient.contains("optionally"));
+    }
+
+    #[test]
+    fn render_verify_nudge_second_iteration_is_firmer() {
+        let first = render_verify_nudge("(task)", None, 1, false);
+        let second = render_verify_nudge("(task)", None, 2, false);
+        assert!(first.contains("Before I accept finish"));
+        assert!(second.contains("Second verify pass"));
+        assert!(second.contains("Take this seriously"));
     }
 
     /// MP-17m.2: the stall heartbeat classifier — workspace-touching
