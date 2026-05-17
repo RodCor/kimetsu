@@ -4,7 +4,7 @@
 //! one or more of them through the existing Kimetsu coding pipeline. The full
 //! integration (cloning the upstream repo at the recorded commit, applying the
 //! `test_patch`, scoring against the gold patch) is documented in
-//! `SWEBENCH.md` and tracked as v0.2 work; v0.1 ships only the task reader and
+//! `docs/SWEBENCH.md` and tracked as v0.2 work; v0.1 ships only the task reader and
 //! a CLI entry point that lets callers smoke-test individual instances against
 //! a repo they have already prepared on disk.
 //!
@@ -13,7 +13,7 @@
 //! - parse SWE-bench Lite / SWE-bench Pro instance JSONL into a typed shape
 //!   without taking on a YAML or git-clone dependency
 //! - drive `pipeline::run_coding` against a caller-supplied `repo` path
-//! - emit a result payload that matches the schema documented in `SWEBENCH.md`
+//! - emit a result payload that matches the schema documented in `docs/SWEBENCH.md`
 //!
 //! Out of scope for this file (and v0.1):
 //!
@@ -128,7 +128,7 @@ pub fn read_tasks(path: &Path) -> KimetsuResult<Vec<SweBenchTask>> {
 ///
 /// v0.1 does not clone the repo nor apply `test_patch`; callers are expected
 /// to do that themselves and point `options.repo` at the resulting workspace.
-/// See `SWEBENCH.md` for the full integration plan.
+/// See `docs/SWEBENCH.md` for the full integration plan.
 pub fn run_swe_bench(options: SweBenchOptions) -> KimetsuResult<Vec<SweBenchInstanceResult>> {
     let mut tasks = read_tasks(&options.tasks)?;
     if let Some(instance_id) = options.instance_id.as_ref() {

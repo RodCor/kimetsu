@@ -134,7 +134,7 @@ fn apply_terminal_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 /// `context.injected` event the run emitted, collect the unique memory ids,
 /// and update each memory's `use_count` and `usefulness_score`.
 ///
-/// Delta rules (per MEMORY-USEFULNESS.md):
+/// Delta rules (per docs/MEMORY-USEFULNESS.md):
 ///   run.finished                 -> +1 (helped) and +1 use
 ///   run.failed (cat != "Gate")   -> -1 (hurt)   and +1 use
 ///   run.failed (cat == "Gate")   ->  no update (graceful early-exit;

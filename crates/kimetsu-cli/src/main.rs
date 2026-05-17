@@ -49,7 +49,7 @@ enum Command {
         command: LockCommand,
     },
     /// MP-7a: agent transports. Today only `--harbor-mode` exists, used
-    /// by the Terminal-Bench Python wrapper (see V0.2-PLAN.md MP-7).
+    /// by the Terminal-Bench Python wrapper (see docs/V0.2-PLAN.md MP-7).
     Agent(AgentArgs),
     /// v0.3: interactive REPL chat — kimetsu as a user-facing coding
     /// assistant. Reuses the full agent runtime (tools, prompts, brain,
@@ -350,7 +350,7 @@ struct SweArgs {
     #[arg(long)]
     tasks: PathBuf,
     /// Caller-prepared repo path. Kimetsu does NOT clone or apply test_patch
-    /// in v0.1 — see SWEBENCH.md for the full integration plan.
+    /// in v0.1 — see docs/SWEBENCH.md for the full integration plan.
     #[arg(long)]
     repo: PathBuf,
     /// Run a single instance by id (default: every task).
@@ -477,7 +477,7 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
 
     if !args.harbor_mode {
         return Err(
-            "kimetsu agent currently only supports --harbor-mode; see V0.2-PLAN.md MP-7"
+            "kimetsu agent currently only supports --harbor-mode; see docs/V0.2-PLAN.md MP-7"
                 .into(),
         );
     }
