@@ -1,0 +1,24 @@
+[package]
+name = "kimetsu-harbor-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Terminal-Bench / Harbor transport adapter for kimetsu.
+#
+# Today this crate is a thin re-export layer over `kimetsu-agent::harbor`
+# so we can split callers (kimetsu-cli, the python adapter) from the
+# implementation without a Big Bang refactor. Phase-2 (v0.3.1+) will
+# physically migrate the HarborSession + JSON-RPC machinery here while
+# leaving the protocol-agnostic agent runtime in kimetsu-agent.
+#
+# Library name uses `_rs` suffix to avoid collision with the python
+# adapter directory `kimetsu_harbor/` at the workspace root.
+
+[dependencies]
+kimetsu-agent = { path = "../kimetsu-agent" }
+kimetsu-brain = { path = "../kimetsu-brain" }
+kimetsu-core = { path = "../kimetsu-core" }
+serde.workspace = true
+serde_json.workspace = true

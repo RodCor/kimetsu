@@ -51,6 +51,42 @@ enum Command {
     /// MP-7a: agent transports. Today only `--harbor-mode` exists, used
     /// by the Terminal-Bench Python wrapper (see V0.2-PLAN.md MP-7).
     Agent(AgentArgs),
+    /// v0.3: interactive REPL chat — kimetsu as a user-facing coding
+    /// assistant. Reuses the full agent runtime (tools, prompts, brain,
+    /// MP-18 verify) with a stdin/stdout transport instead of harbor's
+    /// JSON-RPC. No dependency on Terminal-Bench.
+    Chat(ChatArgs),
+}
+
+#[derive(Debug, Args)]
+struct ChatArgs {
+    /// Workspace root the agent operates inside. All shell / file tools
+    /// resolve paths relative to this directory. Default: current dir.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Path to a kimetsu project (contains `.kimetsu/`). When set, brain
+    /// context retrieves on every model turn and MP-18 deviation
+    /// proposals can land in the pool's review queue. Same shape as
+    /// `agent --project` from harbor mode.
+    #[arg(long)]
+    project: Option<PathBuf>,
+    /// Model id (defaults to `claude-opus-4-7`; honors
+    /// `$KIMETSU_HARBOR_MODEL` for parity with harbor mode).
+    #[arg(long)]
+    model: Option<String>,
+    /// USD budget for this chat session. The cost meter prints running
+    /// total via `/cost` and refuses further model calls when crossed.
+    #[arg(long, default_value_t = 10.0)]
+    max_cost_usd: f32,
+    /// Initial goal statement. Can also be set inline via `/goal <text>`.
+    /// When non-empty, MP-18's iterative verify uses this as the
+    /// target on every finish attempt.
+    #[arg(long)]
+    goal: Option<String>,
+    /// Start in strict-verify mode (MP-18 record_deviation required on
+    /// every fix-up cycle). Toggleable inline via `/strict on|off`.
+    #[arg(long, default_value_t = false)]
+    strict: bool,
 }
 
 #[derive(Debug, Args)]
@@ -415,6 +451,7 @@ fn run() -> KimetsuResult<()> {
         Command::Runs { command } => runs(command),
         Command::Lock { command } => lock(command),
         Command::Agent(args) => agent(args),
+        Command::Chat(args) => chat(args),
     }
 }
 
@@ -493,6 +530,34 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
 
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// v0.3: `kimetsu chat` subcommand. Reuses the kimetsu-agent runtime
+/// via the kimetsu-chat crate. NO dependency on kimetsu-harbor-rs — by
+/// design, chat is its own product surface, completely independent of
+/// Terminal-Bench / Harbor.
+fn chat(args: ChatArgs) -> KimetsuResult<()> {
+    use kimetsu_chat::{ChatConfig, run_repl};
+    use std::io::{stdin, stdout};
+
+    let mut config = ChatConfig::new(args.workspace);
+    config.brain_project = args.project;
+    if let Some(m) = args.model {
+        config.model = m;
+    } else if let Ok(m) = std::env::var("KIMETSU_HARBOR_MODEL") {
+        if !m.is_empty() {
+            config.model = m;
+        }
+    }
+    config.max_cost_usd = args.max_cost_usd;
+    config.goal = args.goal;
+    config.strict_verify = args.strict;
+
+    let stdin = stdin();
+    let stdout = stdout();
+    let reader = stdin.lock();
+    let writer = stdout.lock();
+    run_repl(reader, writer, config).map_err(|e| format!("kimetsu chat: {e}").into())
 }
 
 /// MP-7d: construct a ModelProvider for the harbor agent. Reads

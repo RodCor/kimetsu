@@ -1,0 +1,24 @@
+[package]
+name = "kimetsu-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Interactive REPL transport for kimetsu.
+#
+# Wraps the protocol-agnostic agent core (`kimetsu-agent`) in a
+# stdin/stdout loop with slash commands, local-filesystem tool runtime,
+# a running cost meter, and per-session goal tracking for MP-18's
+# brain-powered iterative verify.
+#
+# Crucially: does NOT depend on kimetsu-harbor-rs. The chat client is
+# completely independent of Terminal-Bench / Harbor — a real product
+# surface, not a benchmark harness.
+
+[dependencies]
+kimetsu-agent = { path = "../kimetsu-agent" }
+kimetsu-brain = { path = "../kimetsu-brain" }
+kimetsu-core = { path = "../kimetsu-core" }
+serde.workspace = true
+serde_json.workspace = true

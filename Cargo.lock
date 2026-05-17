@@ -702,13 +702,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kimetsu-chat"
+version = "0.1.0"
+dependencies = [
+ "kimetsu-agent",
+ "kimetsu-brain",
+ "kimetsu-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kimetsu-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
  "kimetsu-agent",
  "kimetsu-brain",
+ "kimetsu-chat",
  "kimetsu-core",
+ "kimetsu-harbor-rs",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -723,6 +736,17 @@ dependencies = [
  "time",
  "toml",
  "ulid",
+]
+
+[[package]]
+name = "kimetsu-harbor-rs"
+version = "0.1.0"
+dependencies = [
+ "kimetsu-agent",
+ "kimetsu-brain",
+ "kimetsu-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

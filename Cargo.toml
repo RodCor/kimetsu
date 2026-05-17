@@ -2,8 +2,10 @@
 members = [
     "crates/kimetsu-agent",
     "crates/kimetsu-brain",
+    "crates/kimetsu-chat",
     "crates/kimetsu-cli",
     "crates/kimetsu-core",
+    "crates/kimetsu-harbor-rs",
 ]
 resolver = "3"
 

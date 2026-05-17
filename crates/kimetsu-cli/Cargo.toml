@@ -13,7 +13,12 @@ path = "src/main.rs"
 clap.workspace = true
 kimetsu-agent = { path = "../kimetsu-agent" }
 kimetsu-brain = { path = "../kimetsu-brain" }
+kimetsu-chat = { path = "../kimetsu-chat" }
 kimetsu-core = { path = "../kimetsu-core" }
+# kimetsu-harbor-rs holds the harbor/Terminal-Bench transport. CLI uses
+# it via the `agent --harbor-mode` path. Today it's a re-export shell
+# over kimetsu-agent::harbor; v0.3.1 migrates physically.
+kimetsu-harbor-rs = { path = "../kimetsu-harbor-rs" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
