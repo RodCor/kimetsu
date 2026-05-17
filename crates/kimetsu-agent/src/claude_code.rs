@@ -137,6 +137,14 @@ impl ModelProvider for ClaudeCodeProvider {
                 // shape parse_claude_code_output used to consume.
                 .arg("--output-format")
                 .arg("stream-json")
+                // MP-17k addendum: claude CLI REQUIRES --verbose when
+                // pairing -p / --print with --output-format=stream-json.
+                // Without it the CLI errors out at startup with
+                // "When using --print, --output-format=stream-json
+                // requires --verbose". Doesn't affect our parser —
+                // extract_result_event walks the events regardless of
+                // how many or what type.
+                .arg("--verbose")
                 .arg("--model")
                 .arg(&self.model)
                 // MP-7d / MP-13c: bump to 16. 8 was already a workaround for
