@@ -150,7 +150,7 @@ pub fn run_repl<R: BufRead, W: Write>(
     }
 
     // Per-session state.
-    let run_id = RunId::new();
+    let _run_id = RunId::new();
     let mut cost = CostMeter::new(config.max_cost_usd);
     let mut goal = config.goal.clone();
     let mut strict_verify = config.strict_verify;
@@ -159,6 +159,20 @@ pub fn run_repl<R: BufRead, W: Write>(
     // /help / /quit / /cost don't fail if CLAUDE_CODE_OAUTH_TOKEN is
     // unset. Same env handshake harbor mode uses.
     let mut provider: Option<Box<dyn kimetsu_agent::model::ModelProvider>> = None;
+
+    // v0.3.3: multi-turn conversation state. Each TurnRecord captures
+    // the user's message and the model's final response. On each new
+    // turn we render the accumulated transcript into the brain-context
+    // block so the model sees its own past responses; the agent loop
+    // itself is still stateless per call. Cheap, no agent-loop
+    // refactor required.
+    let mut transcript: Vec<TurnRecord> = Vec::new();
+
+    // v0.3.3: accumulated MP-18 record_deviation calls across all
+    // turns this session. On `/quit` we walk this list and write each
+    // `lesson_for_next_time` to the brain as a failure_pattern memory
+    // — closes the MP-18 feedback loop.
+    let mut session_deviations: Vec<DeviationRecord> = Vec::new();
 
     loop {
         write!(writer, "\nyou> ")?;
@@ -182,6 +196,50 @@ pub fn run_repl<R: BufRead, W: Write>(
                     SlashCommand::print_help(&mut writer)?;
                 }
                 SlashCommand::Quit => {
+                    // v0.3.3: auto-propose any accumulated record_deviation
+                    // lessons to the brain pool as failure_pattern memories.
+                    // The user can prune later via `kimetsu brain memory
+                    // prune`; for now we trust the model's self-reflection
+                    // enough to land them as accepted memories.
+                    if let Some(ref project_dir) = config.brain_project {
+                        if !session_deviations.is_empty() {
+                            writeln!(
+                                writer,
+                                "\n[brain] adding {} deviation lesson(s) to {}",
+                                session_deviations.len(),
+                                project_dir.display(),
+                            )?;
+                            for d in &session_deviations {
+                                match brain_project::add_memory(
+                                    project_dir,
+                                    kimetsu_core::memory::MemoryScope::GlobalUser,
+                                    kimetsu_core::memory::MemoryKind::FailurePattern,
+                                    &d.lesson_for_next_time,
+                                ) {
+                                    Ok(id) => writeln!(
+                                        writer,
+                                        "  + {} ({})",
+                                        preview(&d.lesson_for_next_time, 70),
+                                        id,
+                                    )?,
+                                    Err(e) => writeln!(
+                                        writer,
+                                        "  ! failed to add: {e} (lesson: {})",
+                                        preview(&d.lesson_for_next_time, 70),
+                                    )?,
+                                }
+                            }
+                        }
+                    } else if !session_deviations.is_empty() {
+                        writeln!(
+                            writer,
+                            "\n[brain] {} deviation lesson(s) captured but not persisted (no --project set):",
+                            session_deviations.len()
+                        )?;
+                        for d in &session_deviations {
+                            writeln!(writer, "  - {}", preview(&d.lesson_for_next_time, 80))?;
+                        }
+                    }
                     writeln!(writer, "bye.")?;
                     return Ok(());
                 }
@@ -210,16 +268,47 @@ pub fn run_repl<R: BufRead, W: Write>(
                     writeln!(writer, "strict verify: {on}")?;
                 }
                 SlashCommand::Memory(arg) => {
-                    if config.brain_project.is_none() {
+                    // v0.3.3: minimal in-REPL memory ops. For `list` we
+                    // call brain_project::list_memories; everything else
+                    // points the user at the full CLI so we don't
+                    // duplicate the kimetsu-brain command surface here.
+                    if let Some(ref project_dir) = config.brain_project {
+                        match arg.split_whitespace().next().unwrap_or("") {
+                            "list" => match brain_project::list_memories(project_dir) {
+                                Ok(rows) => {
+                                    writeln!(writer, "{} active memories:", rows.len())?;
+                                    for r in rows.iter().take(20) {
+                                        writeln!(
+                                            writer,
+                                            "  {} [{}:{}]  uses={} usefulness={:+.2}  {}",
+                                            r.memory_id,
+                                            r.scope,
+                                            r.kind,
+                                            r.use_count,
+                                            r.usefulness_score,
+                                            preview(&r.text, 80)
+                                        )?;
+                                    }
+                                    if rows.len() > 20 {
+                                        writeln!(writer, "  ... ({} more; use `kimetsu brain memory list` for full)", rows.len() - 20)?;
+                                    }
+                                }
+                                Err(e) => writeln!(writer, "[error] {e}")?,
+                            },
+                            "" => writeln!(
+                                writer,
+                                "usage: /memory list  (use `kimetsu brain memory ...` for add/review/prune)"
+                            )?,
+                            other => writeln!(
+                                writer,
+                                "/memory {other}: not handled in REPL. Use `kimetsu brain memory {other} ...` from your shell."
+                            )?,
+                        }
+                    } else {
                         writeln!(
                             writer,
-                            "memory commands require a --project pointing at a kimetsu project"
+                            "memory commands require --project pointing at a kimetsu project"
                         )?;
-                    } else {
-                        // v0.3.0-alpha: surface a TODO so the user knows
-                        // we hear them but the full wire-up lands in the
-                        // v0.3.0 commit alongside the agent round-trip.
-                        writeln!(writer, "(memory {arg}: scheduled for v0.3.0; brain CLI still works: `kimetsu brain memory ...`)")?;
                     }
                 }
             }
@@ -267,14 +356,24 @@ pub fn run_repl<R: BufRead, W: Write>(
             }
         };
 
-        // If user's message starts with a goal hint, push it into the
-        // task. Otherwise wrap the line as the task. The model gets the
-        // current session goal + strict mode via env vars the agent
-        // loop reads.
+        // v0.3.3: build the task + brain-context for this turn.
+        //
+        // task:      the user's new message (with goal preamble if set)
+        // context:   accumulated transcript of prior turns + retrieved
+        //            brain capsules (if --project is set). The agent
+        //            loop renders this as a "Prior knowledge" block
+        //            before the user message — giving the model
+        //            conversational memory + memory-pool retrieval in
+        //            one channel.
         let task = match goal.as_ref() {
             Some(g) if !g.is_empty() => format!("Goal: {g}\nMessage: {line}"),
             _ => line.to_string(),
         };
+        let brain_context = build_chat_brain_context(
+            config.brain_project.as_deref(),
+            &transcript,
+            &task,
+        );
 
         // Strict verify mode is wired through the env var the agent
         // loop already reads (MP-18). Setting it for this turn only.
@@ -296,7 +395,7 @@ pub fn run_repl<R: BufRead, W: Write>(
             &mut runtime,
             provider.as_mut().expect("provider built above").as_mut(),
             opts,
-            None, // brain context: TODO v0.3.2, plumb retrieve_context here
+            brain_context.as_deref(),
         );
 
         // Restore env so we don't leak state. SAFETY: single-threaded
@@ -313,10 +412,53 @@ pub fn run_repl<R: BufRead, W: Write>(
                 let turn_cost = report.usage.cost_usd;
                 let still_within = cost.record_turn(turn_cost);
                 writeln!(writer, "\nassistant>")?;
-                if let Some(text) = &report.final_text {
-                    writeln!(writer, "{}", text)?;
-                } else {
-                    writeln!(writer, "{}", report.summary)?;
+                let assistant_text = report
+                    .final_text
+                    .clone()
+                    .unwrap_or_else(|| report.summary.clone());
+                writeln!(writer, "{}", assistant_text)?;
+
+                // v0.3.3: append this turn to the conversation transcript
+                // so subsequent turns see prior context. Truncate the
+                // user/assistant text to keep the brain_context block
+                // bounded across long sessions.
+                transcript.push(TurnRecord {
+                    user: line.to_string(),
+                    assistant: assistant_text.clone(),
+                });
+
+                // v0.3.3: pluck recorded_deviations out of the report
+                // context and accumulate for the session. On /quit we
+                // write each lesson_for_next_time as a memory.
+                if let Some(devs) = report
+                    .context
+                    .get("recorded_deviations")
+                    .and_then(|v| v.as_array())
+                {
+                    for d in devs {
+                        let missing = d
+                            .get("missing")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let where_deviated = d
+                            .get("where_deviated")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let lesson = d
+                            .get("lesson_for_next_time")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !lesson.is_empty() {
+                            session_deviations.push(DeviationRecord {
+                                missing,
+                                where_deviated,
+                                lesson_for_next_time: lesson,
+                            });
+                        }
+                    }
                 }
                 writeln!(
                     writer,
@@ -333,31 +475,135 @@ pub fn run_repl<R: BufRead, W: Write>(
                         "[budget] crossed budget; next message will be refused."
                     )?;
                 }
-                // Surface any record_deviation calls so the user can act
-                // on them (v0.3.2 will auto-propose them to the brain).
-                if let Some(devs) = report
+                // v0.3.3: deviations are now accumulated into
+                // session_deviations above; we tell the user only how
+                // many fired so the output stays concise.
+                let dev_count = report
                     .context
                     .get("recorded_deviations")
                     .and_then(|v| v.as_array())
-                {
-                    if !devs.is_empty() {
-                        writeln!(writer, "\n[deviations recorded this turn: {}]", devs.len())?;
-                        for (i, d) in devs.iter().enumerate() {
-                            let lesson = d
-                                .get("lesson_for_next_time")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("(no lesson)");
-                            writeln!(writer, "  {}. {}", i + 1, lesson)?;
-                        }
-                    }
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if dev_count > 0 {
+                    writeln!(
+                        writer,
+                        "[deviations] {dev_count} recorded this turn (will be added to brain on /quit)"
+                    )?;
                 }
             }
             Err(e) => {
                 writeln!(writer, "[error] {e}")?;
             }
         }
+    }
+}
 
-        let _ = run_id; // keep run_id captured for future brain ingestion
+/// v0.3.3: one user/assistant exchange in the chat transcript. Used to
+/// render the conversational history into the brain-context block on
+/// the next turn so the model sees its own previous responses.
+#[derive(Debug, Clone)]
+struct TurnRecord {
+    user: String,
+    assistant: String,
+}
+
+/// v0.3.3: a single MP-18 record_deviation call captured from a turn.
+/// Accumulated for the session; on /quit we walk these and write each
+/// `lesson_for_next_time` to the brain pool as a failure_pattern
+/// memory — closes the MP-18 feedback loop in chat mode.
+#[derive(Debug, Clone)]
+struct DeviationRecord {
+    #[allow(dead_code)]
+    missing: String,
+    #[allow(dead_code)]
+    where_deviated: String,
+    lesson_for_next_time: String,
+}
+
+/// v0.3.3: build the brain-context string for one chat turn.
+///
+/// Two concatenated blocks (either may be empty):
+///   1. Retrieved brain capsules (if --project is set) — surfaced from
+///      `kimetsu_brain::project::retrieve_context` with the current
+///      task as the query, 2000-token budget, stage="chat".
+///   2. Conversation transcript so far (if any prior turns) — last
+///      ~10 turns of user/assistant exchanges, each capped so a long
+///      session doesn't blow the prompt budget.
+///
+/// The agent loop renders this whole string as a "Prior knowledge"
+/// block before the new user message. The model gets memory-pool
+/// retrieval AND conversational continuity through a single channel.
+fn build_chat_brain_context(
+    project_dir: Option<&std::path::Path>,
+    transcript: &[TurnRecord],
+    task: &str,
+) -> Option<String> {
+    const TURN_CAP_BYTES: usize = 1200;
+    const TRANSCRIPT_TAIL: usize = 10;
+
+    let mut out = String::new();
+
+    // Block 1: retrieved capsules.
+    if let Some(dir) = project_dir {
+        if dir.is_dir() {
+            match brain_project::retrieve_context(dir, "chat", task, 2000) {
+                Ok(bundle) if !bundle.capsules.is_empty() => {
+                    out.push_str(&format!(
+                        "Retrieved {} brain capsule(s) for this turn ({}/{} tokens used):\n",
+                        bundle.capsules.len(),
+                        bundle.used_tokens,
+                        bundle.budget_tokens,
+                    ));
+                    for (i, c) in bundle.capsules.iter().enumerate() {
+                        out.push_str(&format!(
+                            "  [{}] {} (score {:.2}, scope_weight {:.2})\n      {}\n",
+                            i + 1,
+                            c.kind,
+                            c.score,
+                            c.scope_weight,
+                            preview(&c.summary, 240),
+                        ));
+                    }
+                }
+                Ok(_) => {
+                    // Brain is configured but had nothing relevant.
+                    // We deliberately stay silent in the prompt — no
+                    // need to tell the model the brain was empty.
+                }
+                Err(_) => {
+                    // Silent failure: brain retrieval is best-effort.
+                    // If the DB is missing or corrupt the user will
+                    // see it on the brain CLI; don't pollute the prompt.
+                }
+            }
+        }
+    }
+
+    // Block 2: conversation transcript (last N turns, each capped).
+    if !transcript.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let start = transcript.len().saturating_sub(TRANSCRIPT_TAIL);
+        let recent = &transcript[start..];
+        out.push_str(&format!(
+            "Conversation so far (last {} turn(s) of this session):\n",
+            recent.len()
+        ));
+        for (i, t) in recent.iter().enumerate() {
+            out.push_str(&format!(
+                "  turn {}\n  > user: {}\n  < assistant: {}\n",
+                start + i + 1,
+                preview(&t.user, TURN_CAP_BYTES / 2),
+                preview(&t.assistant, TURN_CAP_BYTES / 2),
+            ));
+        }
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -505,5 +751,76 @@ mod tests {
         run_repl(Cursor::new(input), &mut output, config).expect("repl");
         let out_str = String::from_utf8(output).unwrap();
         assert!(out_str.contains("cost so far: $0.0000"));
+    }
+
+    // ----- v0.3.3: multi-turn transcript + brain retrieval helpers -----
+
+    #[test]
+    fn build_chat_brain_context_returns_none_when_no_state() {
+        // No project, no transcript -> nothing to surface.
+        let out = build_chat_brain_context(None, &[], "do something");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn build_chat_brain_context_renders_transcript_alone() {
+        // Transcript present, no project -> transcript block only.
+        let transcript = vec![
+            TurnRecord {
+                user: "list files in src/".to_string(),
+                assistant: "Found 12 files. Here they are: ...".to_string(),
+            },
+            TurnRecord {
+                user: "read the largest one".to_string(),
+                assistant: "It's main.rs (4321 lines). Want me to summarize?".to_string(),
+            },
+        ];
+        let out = build_chat_brain_context(None, &transcript, "yes please")
+            .expect("transcript should produce context");
+        assert!(out.contains("Conversation so far"));
+        assert!(out.contains("last 2 turn(s)"));
+        assert!(out.contains("list files in src/"));
+        assert!(out.contains("It's main.rs (4321 lines)"));
+        // Each turn should be tagged with its 1-based index.
+        assert!(out.contains("turn 1"));
+        assert!(out.contains("turn 2"));
+    }
+
+    #[test]
+    fn build_chat_brain_context_truncates_long_turns() {
+        let huge_user = "a".repeat(5_000);
+        let huge_asst = "b".repeat(5_000);
+        let transcript = vec![TurnRecord {
+            user: huge_user,
+            assistant: huge_asst,
+        }];
+        let out =
+            build_chat_brain_context(None, &transcript, "next").expect("context");
+        // 1200/2 = 600-char cap per side; should be << 5000 chars.
+        // Plus the cap appends "…" only when actually truncated, and
+        // preview uses char count not bytes. Verify clipping happened.
+        assert!(out.contains("aaa"));
+        assert!(out.contains("bbb"));
+        assert!(out.contains("…"), "expected the … truncation marker");
+    }
+
+    #[test]
+    fn build_chat_brain_context_keeps_only_tail_when_history_is_long() {
+        // 25 turns -> only the last 10 should appear in the rendered
+        // block to keep the prompt budget bounded.
+        let transcript: Vec<TurnRecord> = (1..=25)
+            .map(|i| TurnRecord {
+                user: format!("user message {i}"),
+                assistant: format!("assistant reply {i}"),
+            })
+            .collect();
+        let out = build_chat_brain_context(None, &transcript, "next")
+            .expect("context");
+        // Last 10 means turns 16..=25 are present, 1..=15 are gone.
+        assert!(out.contains("user message 25"));
+        assert!(out.contains("user message 16"));
+        assert!(!out.contains("user message 15"));
+        assert!(!out.contains("user message 1\n"));
+        assert!(out.contains("last 10 turn(s)"));
     }
 }
