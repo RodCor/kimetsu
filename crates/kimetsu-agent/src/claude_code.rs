@@ -1,8 +1,12 @@
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::Arc;
-use std::thread;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use kimetsu_core::KimetsuResult;
@@ -17,7 +21,7 @@ use crate::model::{
     ToolCall, ToolDefinition,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClaudeCodeProvider {
     api_key: String,
     model: String,
@@ -53,6 +57,101 @@ pub struct ClaudeCodeProvider {
     // Drop on `TempCommandDir` deletes the dir when the last Arc drops,
     // so we don't leak across sessions.
     work_dir: Arc<TempCommandDir>,
+    // v0.3.4e: persistent subprocess via stream-json input.
+    //
+    // When `persistent_enabled` is true (set from
+    // `KIMETSU_CLAUDE_PERSISTENT=1`), `complete()` keeps a single
+    // long-lived `claude -p --input-format stream-json --output-format
+    // stream-json` subprocess alive across calls. Each call writes a
+    // newline-delimited `user` event to the subprocess's stdin and
+    // reads events from stdout until a `result` event arrives. The
+    // subprocess survives until either:
+    //   (a) the provider is dropped, or
+    //   (b) the system-prompt fingerprint changes (different tool
+    //       catalog, model swap, etc.), or
+    //   (c) the subprocess dies (broken pipe, killed externally).
+    //
+    // Cases (b) + (c) cause a clean respawn on the next call; the
+    // failed call surfaces an Err and `agent_loop` retries upstream
+    // (or falls back to a fresh one-shot if KIMETSU_CLAUDE_PERSISTENT
+    // is still set — same model semantics, just paying the spawn tax
+    // again).
+    //
+    // Default off because we haven't yet live-validated that the
+    // claude CLI keeps reading stdin past the first `result` event.
+    // The CLI's `--input-format stream-json` flag says "realtime
+    // streaming input" + the `--replay-user-messages` flag only makes
+    // sense in a multi-event context, so we believe it works — but
+    // until a live run confirms `cache_read_input_tokens` actually
+    // grows turn-over-turn (visible in v0.3.4a's [cache] line), we
+    // leave the persistent path opt-in.
+    session: Option<PersistentClaudeSession>,
+    persistent_enabled: bool,
+}
+
+/// v0.3.4e: long-lived claude subprocess used by the persistent path.
+///
+/// One subprocess per ClaudeCodeProvider. Lifecycle:
+///   1. spawn_persistent_session() launches `claude -p
+///      --input-format stream-json --output-format stream-json
+///      --verbose --system-prompt <prompt>` and starts a drainer
+///      thread that parses stdout lines into JSON events.
+///   2. complete()'s persistent path writes one
+///      `{"type":"user","message":{"role":"user","content":"..."}}`
+///      event per call and blocks (with idle timeout) on the drainer
+///      channel until a `{"type":"result",...}` event arrives.
+///   3. Drop kills the child + lets the drainer thread leak (it
+///      parks on a closed pipe and exits naturally).
+///
+/// `session_fingerprint` is a hash of the (system_prompt, model)
+/// pair the session was spawned with. If a subsequent complete()
+/// call would need a different system prompt, the session is
+/// dropped and respawned. This keeps the persistent path safe
+/// against pipeline callers that vary the system prompt per stage.
+struct PersistentClaudeSession {
+    child: Child,
+    stdin: ChildStdin,
+    /// Drainer thread sends one event per line of stdout, or an
+    /// error string if a line failed to parse as JSON. Disconnected =
+    /// child died (EOF on stdout).
+    stdout_rx: Receiver<Result<serde_json::Value, String>>,
+    /// Kept so we can join on drop. The drainer either exits on EOF
+    /// or is leaked if the channel receiver is dropped first.
+    _drainer: JoinHandle<()>,
+    session_fingerprint: u64,
+}
+
+impl std::fmt::Debug for PersistentClaudeSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentClaudeSession")
+            .field("session_fingerprint", &self.session_fingerprint)
+            .field("child_pid", &self.child.id())
+            .finish()
+    }
+}
+
+impl Drop for PersistentClaudeSession {
+    fn drop(&mut self) {
+        // Closing stdin would let claude exit cleanly, but the field is
+        // not Option<> so we can't move it out. Killing the child is the
+        // most reliable cross-platform shutdown.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // _drainer thread will see EOF on stdout and exit naturally.
+        // We don't join — at worst it lingers a few ms.
+    }
+}
+
+/// v0.3.4e: hash the (system_prompt, model) pair so we know to
+/// respawn the persistent session whenever either changes. Cheap
+/// DefaultHasher (FxHash-ish quality) is plenty here — we only
+/// compare equality.
+fn fingerprint(system_prompt: &str, model: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    system_prompt.hash(&mut h);
+    "::".hash(&mut h);
+    model.hash(&mut h);
+    h.finish()
 }
 
 impl ClaudeCodeProvider {
@@ -83,16 +182,240 @@ impl ClaudeCodeProvider {
         let config_dir = work_dir.path().join("config");
         fs::create_dir_all(&config_dir)?;
 
+        // v0.3.4e: opt-in persistent subprocess mode. Off by default
+        // until we live-validate that cache_read_input_tokens grows
+        // turn-over-turn. Truthy values: "1", "true", "yes" (case-
+        // insensitive). Any other value or unset = off.
+        let persistent_enabled = std::env::var("KIMETSU_CLAUDE_PERSISTENT")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false);
+
         Ok(Some(Self {
             api_key: secret,
             model: config.model.model.clone(),
             timeout: Duration::from_secs(config.model.request_timeout_secs),
             work_dir: Arc::new(work_dir),
+            session: None,
+            persistent_enabled,
         }))
     }
 
     pub fn model_name(&self) -> &str {
         &self.model
+    }
+
+    /// v0.3.4e: complete one turn through the persistent subprocess.
+    ///
+    /// Spawns the subprocess on first call (or after a fingerprint
+    /// mismatch / dropped session). Writes one stream-json `user`
+    /// event to stdin, reads events from stdout until the matching
+    /// `result` event arrives, returns it parsed as ModelResponse.
+    ///
+    /// Idle timeout: the same `self.timeout` the one-shot path uses
+    /// for `run_with_timeout_stdin`. If no bytes arrive on stdout for
+    /// `self.timeout` consecutive seconds, we kill the session and
+    /// surface an error so the caller can fall back to one-shot.
+    fn complete_persistent(
+        &mut self,
+        system_prompt: &str,
+        user_text: &str,
+    ) -> KimetsuResult<ModelResponse> {
+        let fp = fingerprint(system_prompt, &self.model);
+        let need_spawn = self
+            .session
+            .as_ref()
+            .map(|s| s.session_fingerprint != fp)
+            .unwrap_or(true);
+        if need_spawn {
+            // Drop the old session first so its child is reaped before
+            // we open a new one — keeps process counts bounded.
+            self.session = None;
+            self.session = Some(self.spawn_persistent_session(system_prompt, fp)?);
+        }
+
+        let session = self
+            .session
+            .as_mut()
+            .expect("session was just spawned or reused");
+
+        // Stream-json `user` event. Claude expects newline-delimited
+        // JSON; one object per line. The `message` shape mirrors the
+        // Anthropic Messages API user-message format.
+        let user_event = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": user_text,
+            }
+        });
+        let mut line = serde_json::to_string(&user_event)
+            .map_err(|e| format!("serialize user event: {e}"))?;
+        line.push('\n');
+
+        if let Err(err) = session.stdin.write_all(line.as_bytes()) {
+            // Broken pipe = subprocess died. Surface the error so
+            // complete() can fall back; the session is dropped after
+            // we return.
+            return Err(format!("persistent stdin write failed: {err}").into());
+        }
+        // flush so claude sees the message immediately
+        let _ = session.stdin.flush();
+
+        // Drain events until we see a `result` event with the matching
+        // shape. The drainer thread already parsed each line as JSON
+        // so we just walk the channel.
+        let started = Instant::now();
+        let hard_ceiling = self.timeout.saturating_mul(3);
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= hard_ceiling {
+                return Err(format!(
+                    "persistent session hard timeout after {}s",
+                    elapsed.as_secs()
+                )
+                .into());
+            }
+            let remaining = self
+                .timeout
+                .checked_sub(Duration::from_millis(0))
+                .unwrap_or(self.timeout);
+            match session.stdout_rx.recv_timeout(remaining) {
+                Ok(Ok(event)) => {
+                    let event_type = event.get("type").and_then(|t| t.as_str());
+                    if event_type == Some("result") {
+                        // Hand the value to the same parser the one-
+                        // shot path uses — single source of truth for
+                        // ClaudeCodeJson → ModelResponse conversion.
+                        let parsed: ClaudeCodeJson =
+                            serde_json::from_value(event).map_err(|e| {
+                                format!("failed to parse `result` event in persistent path: {e}")
+                            })?;
+                        return claude_code_json_to_response(parsed);
+                    }
+                    // Non-result events (system init, assistant deltas,
+                    // user replay, etc.) are noise to the parser; the
+                    // drainer already kept the heartbeat alive.
+                }
+                Ok(Err(parse_err)) => {
+                    // Malformed line — log and keep reading. claude
+                    // occasionally emits debug noise pre-init.
+                    eprintln!("[persistent] skipping malformed stdout line: {parse_err}");
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "persistent session idle timeout after {}s",
+                        self.timeout.as_secs()
+                    )
+                    .into());
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Drainer ended -> child died or stdout closed.
+                    return Err("persistent session disconnected (child died?)".into());
+                }
+            }
+        }
+    }
+
+    /// v0.3.4e: launch the persistent claude subprocess.
+    ///
+    /// Mirrors the one-shot path's flag set with two changes:
+    ///   * `--input-format stream-json` (so claude reads multiple
+    ///     user events from stdin)
+    ///   * we don't redirect stderr (the drainer would block on it;
+    ///     instead we let claude inherit our stderr so users see
+    ///     diagnostics without us having to buffer them)
+    fn spawn_persistent_session(
+        &self,
+        system_prompt: &str,
+        session_fp: u64,
+    ) -> KimetsuResult<PersistentClaudeSession> {
+        let work_dir: &TempCommandDir = &self.work_dir;
+        let config_dir = work_dir.path().join("config");
+        fs::create_dir_all(&config_dir)?;
+
+        let mut command = Command::new("claude");
+        command
+            .current_dir(work_dir.path())
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", &self.api_key)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .arg("-p")
+            // v0.3.4e: stream-json INPUT so we can write multiple
+            // user events to stdin across the subprocess lifetime.
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            .arg("--model")
+            .arg(&self.model)
+            .arg("--max-turns")
+            .arg("16")
+            .arg("--no-session-persistence")
+            .arg("--tools")
+            .arg("")
+            .arg("--permission-mode")
+            .arg("bypassPermissions")
+            .arg("--system-prompt")
+            .arg(system_prompt)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Let stderr inherit — we don't want to buffer it on a
+            // potentially-long-lived subprocess, and we want
+            // diagnostics visible during dev.
+            .stderr(Stdio::inherit());
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("failed to spawn persistent claude: {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("persistent claude: stdin pipe missing")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("persistent claude: stdout pipe missing")?;
+
+        let (tx, rx) = mpsc::channel::<Result<serde_json::Value, String>>();
+        let drainer = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line_res in reader.lines() {
+                match line_res {
+                    Ok(line) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let msg = match serde_json::from_str::<serde_json::Value>(trimmed) {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(format!("{e}: {}", truncate(trimmed, 200))),
+                        };
+                        if tx.send(msg).is_err() {
+                            // Receiver dropped — provider is shutting down.
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Channel closes on drop; receiver sees Disconnected.
+        });
+
+        Ok(PersistentClaudeSession {
+            child,
+            stdin,
+            stdout_rx: rx,
+            _drainer: drainer,
+            session_fingerprint: session_fp,
+        })
     }
 }
 
@@ -104,6 +427,41 @@ impl ModelProvider for ClaudeCodeProvider {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&render_tool_protocol(&request.tools));
         }
+
+        // v0.3.4e: try the persistent path first when opted in.
+        //
+        // On success the subprocess stays alive for the next call,
+        // giving Anthropic's prompt cache a chance to land (cache_read
+        // grows turn-over-turn instead of cache_creation paying full
+        // freight every call).
+        //
+        // On failure we drop the session and fall through to the one-
+        // shot path below. That gives the call a chance to succeed
+        // even if the persistent transport hit a transient issue
+        // (broken pipe, malformed event, etc.) and means a single bad
+        // turn doesn't tank the whole session — next call will respawn
+        // a fresh persistent subprocess.
+        if self.persistent_enabled {
+            match self.complete_persistent(&system_prompt, &prompt) {
+                Ok(response) => {
+                    let mut response = response;
+                    if tool_loop {
+                        apply_tool_envelope(&mut response);
+                    }
+                    return Ok(response);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "claude_code persistent path failed, falling back to one-shot: {}",
+                        redact_token(&err.to_string(), &self.api_key),
+                    );
+                    // Make sure any half-dead session is dropped so the
+                    // next call respawns cleanly.
+                    self.session = None;
+                }
+            }
+        }
+
         // v0.3.4b: reuse the provider's stable tempdir. Created once in
         // from_config_with_key; survives until the provider is dropped.
         // Stable cwd keeps Anthropic's prompt-cache keys aligned across
@@ -634,7 +992,14 @@ fn parse_claude_code_output(stdout: &[u8]) -> KimetsuResult<ModelResponse> {
             truncate(&text, 700)
         )
     })?;
+    claude_code_json_to_response(response)
+}
 
+/// v0.3.4e: shared `ClaudeCodeJson` → `ModelResponse` conversion. The
+/// one-shot path runs this after `extract_result_event` walks all
+/// stream-json lines; the persistent path runs it directly on the
+/// `result` event handed to it by the drainer thread.
+fn claude_code_json_to_response(response: ClaudeCodeJson) -> KimetsuResult<ModelResponse> {
     if response.is_error.unwrap_or(false) || matches!(response.subtype.as_deref(), Some("error")) {
         return Err(format!(
             "claude_code returned an error result: {}",
@@ -995,5 +1360,80 @@ this is not json
     fn stream_json_parser_errors_on_empty_output() {
         let err = extract_result_event("").unwrap_err();
         assert!(err.contains("no JSON events"));
+    }
+
+    // ----- v0.3.4e: persistent session helpers -----
+
+    #[test]
+    fn fingerprint_distinguishes_system_prompt_and_model() {
+        let a = fingerprint("system A", "claude-opus-4-7");
+        let b = fingerprint("system B", "claude-opus-4-7");
+        let c = fingerprint("system A", "claude-sonnet-4-6");
+        assert_ne!(a, b, "different system prompt -> different fingerprint");
+        assert_ne!(a, c, "different model -> different fingerprint");
+        assert_eq!(
+            a,
+            fingerprint("system A", "claude-opus-4-7"),
+            "same inputs -> same fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_collision_resistant_for_close_strings() {
+        // Defensive: the separator "::" makes ("ab", "c") distinct from
+        // ("a", "bc"). Without it both hash the concatenated "abc".
+        let with_separator_1 = fingerprint("ab", "c");
+        let with_separator_2 = fingerprint("a", "bc");
+        assert_ne!(
+            with_separator_1, with_separator_2,
+            "the '::' separator must prevent string-concat collisions"
+        );
+    }
+
+    #[test]
+    fn cache_stats_round_trip_through_parser() {
+        // v0.3.4a regression test: cache_creation_input_tokens and
+        // cache_read_input_tokens land on the ModelResponse.usage when
+        // the result event carries them.
+        let response = parse_claude_code_output(
+            br#"{
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "{\"finish\":{\"summary\":\"done\"}}",
+                "stop_reason": "end_turn",
+                "total_cost_usd": 0.05,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 7000,
+                    "cache_read_input_tokens": 16500
+                }
+            }"#,
+        )
+        .expect("parse stream-json result event");
+        assert_eq!(response.usage.input_tokens, 100);
+        assert_eq!(response.usage.output_tokens, 20);
+        assert_eq!(response.usage.cache_creation_input_tokens, 7000);
+        assert_eq!(response.usage.cache_read_input_tokens, 16500);
+    }
+
+    #[test]
+    fn cache_stats_default_to_zero_when_absent() {
+        // Forward compat with older claude CLI versions that don't yet
+        // surface cache_creation/cache_read.
+        let response = parse_claude_code_output(
+            br#"{
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "ok",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 50, "output_tokens": 10}
+            }"#,
+        )
+        .expect("parse result event without cache fields");
+        assert_eq!(response.usage.cache_creation_input_tokens, 0);
+        assert_eq!(response.usage.cache_read_input_tokens, 0);
     }
 }
