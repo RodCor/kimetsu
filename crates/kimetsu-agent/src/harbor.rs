@@ -395,9 +395,11 @@ fn is_useful_tool(name: &str) -> bool {
     USEFUL_TOOL_NAMES.iter().any(|t| *t == name)
 }
 
-/// MP-7d: report returned by `run_model_agent`. Mostly for tests + the
-/// CLI smoke surface; production runs care about the JSON-RPC frames
-/// already emitted to Harbor.
+/// MP-7d: report returned by `run_model_agent`. v0.3.1 Phase-2: also
+/// carries the AgentDoneParams payload (summary + context) the caller
+/// would have emitted; transport-specific code (harbor or chat) decides
+/// what to do with it. This decouples the agent loop from any specific
+/// I/O surface.
 #[derive(Debug)]
 pub struct ModelAgentReport {
     pub turns: u32,
@@ -405,6 +407,13 @@ pub struct ModelAgentReport {
     pub stop_reason: crate::model::StopReason,
     pub final_text: Option<String>,
     pub usage: crate::model::TokenUsage,
+    /// v0.3.1: summary string the harbor done frame would have used —
+    /// either the model's final plain-text response or a budget-
+    /// exhaustion sentinel built from the loop stop reason.
+    pub summary: String,
+    /// v0.3.1: structured context the harbor done frame's `context`
+    /// field would have carried (turns, cost, deviations, etc.).
+    pub context: serde_json::Value,
 }
 
 /// MP-7d: the real agent loop. Wires a `ModelProvider` (claude_code,
@@ -457,18 +466,17 @@ impl HarborAgentOpts {
     }
 }
 
-pub fn run_model_agent<R, W>(
+/// v0.3.1 Phase-2: agent loop is now transport-agnostic. Doesn't take a
+/// session anymore — callers (harbor mode, chat mode, future transports)
+/// inspect the returned `ModelAgentReport.summary` and `.context` and
+/// emit them in whatever protocol they speak.
+pub fn run_model_agent(
     task: &str,
-    session: Rc<RefCell<HarborSession<R, W>>>,
     runtime: &mut crate::tools::ToolRuntime,
     provider: &mut dyn crate::model::ModelProvider,
     opts: HarborAgentOpts,
     brain_context: Option<&str>,
-) -> KimetsuResult<ModelAgentReport>
-where
-    R: BufRead + 'static,
-    W: Write + 'static,
-{
+) -> KimetsuResult<ModelAgentReport> {
     let turn_budget = opts.turn_budget;
     let auto_orient = opts.auto_orient;
     let min_actions_before_finish = opts.min_actions_before_finish;
@@ -864,23 +872,24 @@ where
         )
     });
 
-    session.borrow_mut().emit_done(AgentDoneParams {
-        summary,
-        context: Some(serde_json::json!({
-            "mode": "model_agent",
-            "turns": turn,
-            "tool_calls": tool_calls_total,
-            "stop_reason": format!("{stop_reason:?}"),
-            "input_tokens": last_usage.input_tokens,
-            "output_tokens": last_usage.output_tokens,
-            "cost_usd": last_usage.cost_usd,
-            "protocol_version": HARBOR_PROTOCOL_VERSION,
-            // MP-18: surface the model's self-reflections so the brain
-            // curation pipeline can propose them as memory rows.
-            "verify_iterations": verify_iterations,
-            "recorded_deviations": recorded_deviations,
-        })),
-    })?;
+    // v0.3.1 Phase-2: agent loop no longer emits the done frame itself.
+    // Callers receive the summary + context via the returned report and
+    // emit (over JSON-RPC, REPL stdout, etc.) in whatever protocol the
+    // transport speaks.
+    let context = serde_json::json!({
+        "mode": "model_agent",
+        "turns": turn,
+        "tool_calls": tool_calls_total,
+        "stop_reason": format!("{stop_reason:?}"),
+        "input_tokens": last_usage.input_tokens,
+        "output_tokens": last_usage.output_tokens,
+        "cost_usd": last_usage.cost_usd,
+        "protocol_version": HARBOR_PROTOCOL_VERSION,
+        // MP-18: surface the model's self-reflections so the brain
+        // curation pipeline can propose them as memory rows.
+        "verify_iterations": verify_iterations,
+        "recorded_deviations": recorded_deviations,
+    });
 
     Ok(ModelAgentReport {
         turns: turn,
@@ -888,6 +897,8 @@ where
         stop_reason,
         final_text,
         usage: last_usage,
+        summary,
+        context,
     })
 }
 
@@ -3756,7 +3767,6 @@ mod tests {
                 });
             let report = run_model_agent(
                 "summarize the README",
-                Rc::clone(&session),
                 &mut runtime,
                 &mut provider,
                 HarborAgentOpts::for_tests(),
@@ -3764,6 +3774,16 @@ mod tests {
             )
             .expect("model agent");
             drop(runtime);
+            // v0.3.1: the agent loop no longer emits agent.done itself;
+            // the test wrapper does so we keep the JSON-RPC frame
+            // assertions later in this test functioning.
+            session
+                .borrow_mut()
+                .emit_done(AgentDoneParams {
+                    summary: report.summary.clone(),
+                    context: Some(report.context.clone()),
+                })
+                .expect("emit_done from test wrapper");
             report
         };
 
@@ -3877,7 +3897,6 @@ mod tests {
                 });
             let report = run_model_agent(
                 "loop forever",
-                Rc::clone(&session),
                 &mut runtime,
                 &mut provider,
                 HarborAgentOpts {
@@ -3888,6 +3907,15 @@ mod tests {
             )
             .expect("budget-capped agent");
             drop(runtime);
+            // v0.3.1: test wrapper emits the agent.done frame the loop
+            // used to emit, so JSON-RPC frame assertions below still pass.
+            session
+                .borrow_mut()
+                .emit_done(AgentDoneParams {
+                    summary: report.summary.clone(),
+                    context: Some(report.context.clone()),
+                })
+                .expect("emit_done from test wrapper");
             report
         };
 

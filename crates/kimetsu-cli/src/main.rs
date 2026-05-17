@@ -513,9 +513,11 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
             // no-brain mode.
             let brain_context = resolve_brain_context(args.project.as_deref(), &args.task)?;
 
-            let _ = run_model_agent(
+            // v0.3.1 Phase-2: agent loop is transport-agnostic. CLI
+            // calls run_model_agent + emits the agent.done frame here
+            // (instead of the loop emitting it internally).
+            let report = run_model_agent(
                 &args.task,
-                Rc::clone(&session),
                 &mut runtime,
                 &mut *provider,
                 kimetsu_agent::harbor::HarborAgentOpts {
@@ -524,6 +526,12 @@ fn agent(args: AgentArgs) -> KimetsuResult<()> {
                 },
                 brain_context.as_deref(),
             )?;
+            session
+                .borrow_mut()
+                .emit_done(kimetsu_agent::harbor::AgentDoneParams {
+                    summary: report.summary,
+                    context: Some(report.context),
+                })?;
         }
         Ok(())
     };
