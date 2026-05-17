@@ -338,15 +338,53 @@ pub struct MultiStepStubReport {
     pub echo: crate::tools::ShellCommandOutput,
 }
 
-/// MP-7d: maximum turns of model ↔ tool ping-pong before we force the
-/// agent to wrap up. 25 mirrors the loop budget used inside the v0.1
-/// pipeline; we surface it here as a const so MP-8 can tune it from the
-/// Terminal-Bench data.
-// MP-13b: bumped 25 -> 40. MP-12 trial logs showed compile-compcert,
-// caffe-cifar-10, install-windows-3-11 hitting the budget cap before
-// finishing. 40 turns gives ~60% more headroom while still bounding
-// runaway cost.
-pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 40;
+/// MP-7d / MP-13b / MP-17m.2: hard ceiling on model ↔ tool ping-pong.
+///
+/// The number's bumped 25 → 40 → 80 across phases as we saw real tasks
+/// run out before finishing. MP-17m.2 makes this a SAFETY NET rather
+/// than the primary stop condition; the real cutoff is now activity-
+/// based via `STALL_WINDOW_TURNS` below. A model making steady useful
+/// tool calls can run all 80 turns; a model spinning in pure
+/// deliberation gets cut off at the stall window.
+pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 80;
+
+/// MP-17m.2: outer-loop heartbeat. If the model hasn't produced ANY
+/// useful tool call (touches workspace state — shell, file, git) in
+/// this many consecutive turns, treat it as stalled and wrap up.
+/// Pure-deliberation tools (think, plan) don't count as activity
+/// because a sequence of them is exactly the loop pattern we want to
+/// catch. The persistence + self-verify gates already cover the
+/// "no tool calls at all" case before finish; this catches the
+/// "lots of think/plan, no real work" case during the run.
+pub const STALL_WINDOW_TURNS: u32 = 10;
+
+/// MP-17m.2: tool names that count as "useful" — they touch workspace
+/// state or read it back. Anything not in this set (think, plan,
+/// view_image-as-passive-metadata, future no-op tools) is silently
+/// counted as deliberation and doesn't reset the stall counter.
+const USEFUL_TOOL_NAMES: &[&str] = &[
+    "shell_command",
+    "shell_background",
+    "shell_status",
+    "shell_output",
+    "shell_stop",
+    "read_file",
+    "multi_read",
+    "list_files",
+    "glob",
+    "search_files",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "move_file",
+    "delete_file",
+    "git_status",
+    "git_diff",
+];
+
+fn is_useful_tool(name: &str) -> bool {
+    USEFUL_TOOL_NAMES.iter().any(|t| *t == name)
+}
 
 /// MP-7d: report returned by `run_model_agent`. Mostly for tests + the
 /// CLI smoke surface; production runs care about the JSON-RPC frames
@@ -650,9 +688,23 @@ where
     let mut persistence_nudge_sent = false;
     // MP-17c: flag so the self-verify nudge fires at most once per task.
     let mut self_verify_nudge_sent = false;
+    // MP-17m.2: outer-loop stall heartbeat. Counts consecutive turns
+    // since the model last fired a USEFUL tool call. Reset on workspace-
+    // touching tool calls (shell/file/git). Pure think/plan turns or
+    // turns with no tool calls increment it. When it crosses
+    // STALL_WINDOW_TURNS we break out — we don't kill the trial outright;
+    // we exit the loop with whatever stop_reason the model emitted and
+    // let `agent.done` carry the summary.
+    let mut turns_since_useful = 0u32;
 
     while turn < turn_budget {
         turn += 1;
+
+        // MP-17m.2: cheap stall check before another expensive model call.
+        if turns_since_useful >= STALL_WINDOW_TURNS {
+            stop_reason = StopReason::Error;
+            break;
+        }
 
         let request = ModelRequest {
             messages: messages.clone(),
@@ -673,6 +725,20 @@ where
 
         if !response.tool_calls.is_empty() {
             messages.push(ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
+
+            // MP-17m.2: did this turn include at least one workspace-touching
+            // tool call? If yes, reset the stall counter; if not (think/plan
+            // only), increment so a long string of deliberation-only turns
+            // gets caught.
+            let any_useful = response
+                .tool_calls
+                .iter()
+                .any(|c| is_useful_tool(&c.name));
+            if any_useful {
+                turns_since_useful = 0;
+            } else {
+                turns_since_useful = turns_since_useful.saturating_add(1);
+            }
 
             for call in response.tool_calls {
                 tool_calls_total += 1;
@@ -2376,36 +2442,42 @@ fn harbor_think(input: &Value) -> Value {
     })
 }
 
-/// MP-17j: cheap keyword check on the task description to decide whether
-/// the self-verify nudge is worth firing. Tasks that explicitly mention a
-/// verifier / test step benefit from a "did you actually run it?" nudge;
-/// pure transformation tasks (LaTeX text substitution, data summarization)
-/// don't, and the nudge there just costs a turn.
+/// MP-17j (tuned in MP-17m.1): cheap keyword check on the task description
+/// to decide whether the self-verify nudge is worth firing.
+///
+/// MP-17m.1: the initial trigger list was too eager. Words like "ensure
+/// that", "check that", "i will check" appear in generic task instructions
+/// where verification IS the task, not an extra step. Firing the nudge
+/// there cost a turn or two of extra model thinking, which on tasks with
+/// tight Harbor budgets (overfull-hbox has a 750s per-task cap) pushed the
+/// trial past the budget. We saw `overfull-hbox` regress from a MP-14d
+/// brain win to a MP-17 timeout because of this.
+///
+/// New triggers are scoped to: explicit verifier identifiers (`pytest`,
+/// `cargo test`, `make test`), explicit deliverable specifications
+/// ("should output", "should print", "should return"), and pass/fail
+/// language tied to a clear test step ("must pass", "should pass"). We
+/// drop the generic "ensure"/"check that"/"i will check" patterns.
 fn task_signals_verification(task: &str) -> bool {
     let lower = task.to_ascii_lowercase();
     const HINTS: &[&str] = &[
-        "verify",
+        // explicit verifier identifier
         "verifier",
-        "check that",
-        "ensure that",
-        "ensure the",
-        "make sure",
-        "test that",
-        "run the test",
-        "should pass",
-        "must pass",
-        "should produce",
-        "should print",
-        "should output",
-        "should return",
-        "i will check",
-        "we will check",
-        "the verifier",
-        "the test",
-        "test suite",
         "pytest",
         "cargo test",
         "make test",
+        "test suite",
+        "run the test",
+        // explicit deliverable specification with a concrete word
+        "should output",
+        "should print",
+        "should return",
+        "should produce",
+        // pass/fail tied to a test
+        "must pass",
+        "should pass",
+        // very specific verifier mention
+        "the verifier",
     ];
     HINTS.iter().any(|h| lower.contains(h))
 }
@@ -3981,24 +4053,41 @@ mod tests {
     }
 
     #[test]
-    fn task_signals_verification_matches_verifier_keywords() {
-        // Tasks with explicit verifier language should trigger the nudge.
-        assert!(task_signals_verification("verify the output matches"));
+    fn task_signals_verification_matches_specific_triggers() {
+        // Concrete verifier identifiers / deliverables should fire.
         assert!(task_signals_verification(
-            "Ensure that pytest passes when you run it"
+            "Ensure pytest passes when you run it"
         ));
-        assert!(task_signals_verification(
-            "I will check that the binary runs"
-        ));
-        assert!(task_signals_verification("The verifier will run /app/test.sh"));
         assert!(task_signals_verification(
             "Your script should output 42 when run"
+        ));
+        assert!(task_signals_verification(
+            "The verifier will run /app/test.sh"
+        ));
+        assert!(task_signals_verification(
+            "make test must pass before declaring done"
+        ));
+        assert!(task_signals_verification(
+            "cargo test should pass under release mode"
         ));
     }
 
     #[test]
-    fn task_signals_verification_skips_pure_transformation() {
-        // Pure transformation / generation tasks shouldn't trigger.
+    fn task_signals_verification_skips_generic_language() {
+        // MP-17m.1: generic "ensure that"/"check that"/"i will check"
+        // appear in tons of task instructions where verification IS the
+        // task — firing the nudge there costs a turn or two with no
+        // upside. These should NOT trigger.
+        assert!(!task_signals_verification(
+            "Ensure that the LaTeX document compiles successfully"
+        ));
+        assert!(!task_signals_verification(
+            "I will check that you booted doom correctly"
+        ));
+        assert!(!task_signals_verification(
+            "check that the first frame is correctly created"
+        ));
+        // Pure transformation / generation tasks still don't trigger.
         assert!(!task_signals_verification(
             "Replace words in input.tex with their synonyms in synonyms.txt"
         ));
@@ -4016,5 +4105,47 @@ mod tests {
         assert_eq!(extract_diff_path("b/notes/new.md"), "notes/new.md");
         assert_eq!(extract_diff_path("plain/path.rs"), "plain/path.rs");
         assert_eq!(extract_diff_path("  a/x.rs  "), "x.rs");
+    }
+
+    /// MP-17m.2: the stall heartbeat classifier — workspace-touching
+    /// tools count as activity; pure deliberation tools don't.
+    #[test]
+    fn is_useful_tool_recognises_workspace_actions() {
+        // Workspace-touching tools (reset stall counter).
+        for tool in [
+            "shell_command",
+            "shell_background",
+            "shell_status",
+            "shell_output",
+            "shell_stop",
+            "read_file",
+            "multi_read",
+            "list_files",
+            "glob",
+            "search_files",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "move_file",
+            "delete_file",
+            "git_status",
+            "git_diff",
+        ] {
+            assert!(is_useful_tool(tool), "{tool} should be useful");
+        }
+    }
+
+    #[test]
+    fn is_useful_tool_excludes_deliberation_tools() {
+        // Pure-deliberation tools shouldn't reset the stall counter.
+        assert!(!is_useful_tool("think"));
+        assert!(!is_useful_tool("plan"));
+        // view_image is borderline (it's a metadata read) — current policy
+        // is to NOT count it; we can revisit if the gauntlet shows it
+        // helping.
+        assert!(!is_useful_tool("view_image"));
+        // Unknown / typo tool names also don't count.
+        assert!(!is_useful_tool("unknown_tool"));
+        assert!(!is_useful_tool(""));
     }
 }

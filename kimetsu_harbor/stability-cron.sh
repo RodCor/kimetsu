@@ -83,7 +83,14 @@ log "binary: $KIMETSU_BIN ($(stat -c %s "$KIMETSU_BIN") bytes)"
 STABILITY_K="${STABILITY_K:-1}"
 STABILITY_N="${STABILITY_N:-2}"
 STABILITY_L="${STABILITY_L:-16}"
-log "harbor flags: -n $STABILITY_N -k $STABILITY_K -l $STABILITY_L"
+# MP-17m.3: scale Harbor's per-trial wall-clock budgets. Default 1.0
+# keeps the task-defined limits; bump to 2.0 (or higher) to give hard
+# tasks more time. Cost roughly scales with this since longer trials
+# mean more model turns. Use STABILITY_TIMEOUT_MULT=2.0 to test
+# whether make-mips-interpreter / path-tracing / dna-assembly flip
+# from Harbor timeouts to actual completions.
+STABILITY_TIMEOUT_MULT="${STABILITY_TIMEOUT_MULT:-1.0}"
+log "harbor flags: -n $STABILITY_N -k $STABILITY_K -l $STABILITY_L --timeout-multiplier $STABILITY_TIMEOUT_MULT"
 
 run_leg() {
     local leg="$1"
@@ -104,6 +111,7 @@ run_leg() {
         -d terminal-bench/terminal-bench-2 \
         --agent-import-path kimetsu_harbor.kimetsu_agent:KimetsuAgent \
         -n "$STABILITY_N" -k "$STABILITY_K" -l "$STABILITY_L" \
+        --timeout-multiplier "$STABILITY_TIMEOUT_MULT" \
         --job-name "$job" \
         -o "$JOBS_DIR" \
         -y >>"$LOG" 2>&1 || log "WARN: $leg harbor returned non-zero"
