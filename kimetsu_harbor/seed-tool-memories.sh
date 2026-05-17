@@ -41,38 +41,27 @@ cd "$PROJECT"
 echo "[$(date -u +%H:%M:%SZ)] seeding pool at $PROJECT (binary: $BIN)"
 echo
 
-# --- step 1: invalidate the shell-era memories that contradict v0.2 tools ---
+# --- step 1: (MP-17j) DO NOT invalidate pre-MP-12 shell-workflow
+# capsules. ---
+#
+# Original MP-17b retired 3 memories ("redirect to /tmp/build.log",
+# "sed -i for in-place edits", "ls + find -maxdepth orientation")
+# on the theory that they contradicted the new typed tool surface.
+# The MP-17 brain-only validation at 21:32:43Z proved this wrong:
+# brain dropped from MP-14d's 7/16 to 5/16, and the 3 newly-lost
+# tasks (overfull-hbox, compile-compcert, log-summary-date-ranges)
+# were exactly the shell-workflow patterns those capsules covered.
+#
+# Those memories complement (don't contradict) the typed-tool
+# capsules below: typed-tool capsules answer "WHEN to pick which
+# tool"; shell-workflow capsules answer "HOW to actually do the
+# work in the right shape".
+#
+# If you ran an OLDER seed-tool-memories.sh that DID invalidate
+# those rows, run kimetsu_harbor/restore-shell-memories.sh to add
+# fresh copies back into the active pool.
+echo "(MP-17j: no invalidations — pre-MP-12 capsules are complementary, not contradictory)"
 
-# Patterns are unique substrings inside the memory text. We grep the
-# `memory list` output for them, pull the ID from the matching line,
-# and invalidate it. Each pattern -> one --reason so the audit trail
-# survives in `memory list`.
-
-declare -a RETIRE
-RETIRE[0]="redirect output to /tmp/build.log|outdated: use shell_background and shell_status/output to poll instead"
-RETIRE[1]="For in-place file edits use sed -i|outdated: use edit_file (hash-checked, cheaper than full rewrite)"
-RETIRE[2]="For unfamiliar build tasks, run this orientation chain first|outdated: use list_files + multi_read for orientation"
-
-# We can't use grep -B / -A because each memory list entry is on a
-# single line (ID and text together). Single grep -F is enough.
-
-LIST=$("$BIN" brain memory list 2>&1)
-
-for pair in "${RETIRE[@]}"; do
-    pattern="${pair%%|*}"
-    reason="${pair##*|}"
-    while IFS= read -r line; do
-        if echo "$line" | grep -qF "$pattern"; then
-            id=$(echo "$line" | awk '{print $1}')
-            if [[ "$id" =~ ^[A-Z0-9]{20,}$ ]]; then
-                echo "  invalidate $id  ($pattern)"
-                "$BIN" brain memory invalidate "$id" --reason "$reason" 2>&1 | sed 's/^/    /' | head -2
-            fi
-        fi
-    done <<< "$LIST"
-done
-
-echo
 
 # --- step 2: add tool-proficiency capsules ---
 

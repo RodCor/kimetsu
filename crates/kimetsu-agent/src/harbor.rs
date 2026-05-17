@@ -619,40 +619,6 @@ where
          Don't batch dependent calls (e.g. read after edit) — those need\n\
          to be serialized.\n\
          \n\
-         === Worked example: long-running compile task ===\n\
-         Task summary: \"Build CompCert from source, expose ccomp binary.\"\n\
-         Turn 1 (orient + read instructions in one shot):\n\
-           {{\"thought\":\"sniff layout and INSTALL doc\",\n\
-            \"tool_calls\":[\n\
-              {{\"name\":\"list_files\",\"input\":{{\"path\":\".\",\"max_depth\":1}}}},\n\
-              {{\"name\":\"read_file\",\"input\":{{\"path\":\"INSTALL.md\",\"limit\":80}}}}\n\
-            ]}}\n\
-         Turn 2 (configure + record plan):\n\
-           {{\"thought\":\"configure first, then background make\",\n\
-            \"tool_calls\":[\n\
-              {{\"name\":\"shell_command\",\"input\":{{\"program\":\"./configure\",\"args\":[\"x86_64-linux\"]}}}},\n\
-              {{\"name\":\"plan\",\"input\":{{\"todos\":[\n\
-                {{\"content\":\"configure\",\"status\":\"completed\"}},\n\
-                {{\"content\":\"build (background)\",\"status\":\"in_progress\"}},\n\
-                {{\"content\":\"verify ccomp binary\",\"status\":\"pending\"}}\n\
-              ]}}}}\n\
-            ]}}\n\
-         Turn 3 (kick off background build):\n\
-           {{\"thought\":\"make -j; expect ~15 min\",\n\
-            \"tool_call\":{{\"name\":\"shell_background\",\"input\":{{\"program\":\"make\",\"args\":[\"-j4\"]}}}}}}\n\
-         Turn 4 (poll while waiting):\n\
-           {{\"thought\":\"check progress\",\n\
-            \"tool_call\":{{\"name\":\"shell_status\",\"input\":{{\"handle\":\"bg-<received>\"}}}}}}\n\
-         Turn 5 (still running, check tail):\n\
-           {{\"thought\":\"see latest output\",\n\
-            \"tool_call\":{{\"name\":\"shell_output\",\"input\":{{\"handle\":\"bg-<received>\",\"tail_bytes\":4096}}}}}}\n\
-         Turn N (build done, verify):\n\
-           {{\"thought\":\"build complete, smoke-test ccomp\",\n\
-            \"tool_call\":{{\"name\":\"shell_command\",\"input\":{{\"program\":\"/tmp/CompCert/ccomp\",\"args\":[\"-v\"]}}}}}}\n\
-         Turn N+1 (finish):\n\
-           {{\"thought\":\"ccomp prints version; done\",\n\
-            \"finish\":{{\"summary\":\"CompCert built; ccomp at /tmp/CompCert/ccomp\"}}}}\n\
-         \n\
          === Common pitfalls (don't do these) ===\n\
            - Running `make` via shell_command for a multi-minute build\n\
              (it will time out — use shell_background).\n\
@@ -755,7 +721,17 @@ where
         // extra model turn but catches the "I forgot to verify" cases
         // cheaply. The model is free to confirm "verified, done" and
         // re-emit finish on the next turn — we accept it then unconditionally.
-        if !self_verify_nudge_sent && opts.self_verify_nudge_enabled {
+        // MP-17j: only fire the self-verify nudge when the task description
+        // mentions verifier-class keywords. The MP-17 brain-only gauntlet at
+        // 21:32Z showed 3 prior wins (overfull-hbox / compile-compcert /
+        // log-summary-date-ranges) regressed to zeros — the always-on nudge
+        // burned a turn re-checking output on tasks where the model would
+        // have finished cleanly. Now we gate on whether the task itself
+        // signals a verification step is part of the spec.
+        if !self_verify_nudge_sent
+            && opts.self_verify_nudge_enabled
+            && task_signals_verification(task)
+        {
             self_verify_nudge_sent = true;
             let nudge = "Before I accept the finish: briefly verify your \
                 output is what the verifier will check. Concretely: list \
@@ -2400,6 +2376,40 @@ fn harbor_think(input: &Value) -> Value {
     })
 }
 
+/// MP-17j: cheap keyword check on the task description to decide whether
+/// the self-verify nudge is worth firing. Tasks that explicitly mention a
+/// verifier / test step benefit from a "did you actually run it?" nudge;
+/// pure transformation tasks (LaTeX text substitution, data summarization)
+/// don't, and the nudge there just costs a turn.
+fn task_signals_verification(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    const HINTS: &[&str] = &[
+        "verify",
+        "verifier",
+        "check that",
+        "ensure that",
+        "ensure the",
+        "make sure",
+        "test that",
+        "run the test",
+        "should pass",
+        "must pass",
+        "should produce",
+        "should print",
+        "should output",
+        "should return",
+        "i will check",
+        "we will check",
+        "the verifier",
+        "the test",
+        "test suite",
+        "pytest",
+        "cargo test",
+        "make test",
+    ];
+    HINTS.iter().any(|h| lower.contains(h))
+}
+
 /// Workspace-path safety: workspace-relative, no absolute prefix, no `..`
 /// segment. Used by move_file / delete_file to keep a typo from reaching
 /// outside the task sandbox.
@@ -3968,6 +3978,36 @@ mod tests {
     fn parse_unified_diff_rejects_empty() {
         assert!(parse_unified_diff("").is_err());
         assert!(parse_unified_diff("no headers here").is_err());
+    }
+
+    #[test]
+    fn task_signals_verification_matches_verifier_keywords() {
+        // Tasks with explicit verifier language should trigger the nudge.
+        assert!(task_signals_verification("verify the output matches"));
+        assert!(task_signals_verification(
+            "Ensure that pytest passes when you run it"
+        ));
+        assert!(task_signals_verification(
+            "I will check that the binary runs"
+        ));
+        assert!(task_signals_verification("The verifier will run /app/test.sh"));
+        assert!(task_signals_verification(
+            "Your script should output 42 when run"
+        ));
+    }
+
+    #[test]
+    fn task_signals_verification_skips_pure_transformation() {
+        // Pure transformation / generation tasks shouldn't trigger.
+        assert!(!task_signals_verification(
+            "Replace words in input.tex with their synonyms in synonyms.txt"
+        ));
+        assert!(!task_signals_verification(
+            "Summarize the log file at /app/access.log into a TOML report"
+        ));
+        assert!(!task_signals_verification(
+            "Generate a self-signed TLS certificate at /tmp/cert.pem"
+        ));
     }
 
     #[test]
