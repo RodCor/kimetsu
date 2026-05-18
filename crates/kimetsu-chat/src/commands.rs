@@ -42,7 +42,10 @@ impl SlashCommand {
             "cost" => Some(Self::Cost),
             "goal" => Some(Self::Goal(rest.to_string())),
             "strict" => {
-                let on = matches!(rest.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes");
+                let on = matches!(
+                    rest.to_ascii_lowercase().as_str(),
+                    "on" | "true" | "1" | "yes"
+                );
                 Some(Self::Strict(on))
             }
             "memory" | "m" | "brain" => Some(Self::Memory(rest.to_string())),
@@ -58,9 +61,18 @@ impl SlashCommand {
         writeln!(out, "  /help                show this list")?;
         writeln!(out, "  /quit                end the session")?;
         writeln!(out, "  /cost                running cost + budget")?;
-        writeln!(out, "  /goal [<text>]       set the session goal (empty = recall)")?;
-        writeln!(out, "  /strict on|off       toggle MP-18 strict verify mode")?;
-        writeln!(out, "  /memory <args>       brain memory operations (see kimetsu brain memory)")?;
+        writeln!(
+            out,
+            "  /goal [<text>]       set the session goal (empty = recall)"
+        )?;
+        writeln!(
+            out,
+            "  /strict on|off       toggle MP-18 strict verify mode"
+        )?;
+        writeln!(
+            out,
+            "  /memory <args>       brain memory operations (see kimetsu brain memory)"
+        )?;
         Ok(())
     }
 }
@@ -87,19 +99,42 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/goal refactor errors to thiserror"),
-            Some(SlashCommand::Goal("refactor errors to thiserror".to_string()))
+            Some(SlashCommand::Goal(
+                "refactor errors to thiserror".to_string()
+            ))
         );
     }
 
     #[test]
     fn parses_strict_truthy_and_falsy() {
-        assert_eq!(SlashCommand::parse("/strict on"), Some(SlashCommand::Strict(true)));
-        assert_eq!(SlashCommand::parse("/strict ON"), Some(SlashCommand::Strict(true)));
-        assert_eq!(SlashCommand::parse("/strict true"), Some(SlashCommand::Strict(true)));
-        assert_eq!(SlashCommand::parse("/strict 1"), Some(SlashCommand::Strict(true)));
-        assert_eq!(SlashCommand::parse("/strict yes"), Some(SlashCommand::Strict(true)));
-        assert_eq!(SlashCommand::parse("/strict off"), Some(SlashCommand::Strict(false)));
-        assert_eq!(SlashCommand::parse("/strict"), Some(SlashCommand::Strict(false)));
+        assert_eq!(
+            SlashCommand::parse("/strict on"),
+            Some(SlashCommand::Strict(true))
+        );
+        assert_eq!(
+            SlashCommand::parse("/strict ON"),
+            Some(SlashCommand::Strict(true))
+        );
+        assert_eq!(
+            SlashCommand::parse("/strict true"),
+            Some(SlashCommand::Strict(true))
+        );
+        assert_eq!(
+            SlashCommand::parse("/strict 1"),
+            Some(SlashCommand::Strict(true))
+        );
+        assert_eq!(
+            SlashCommand::parse("/strict yes"),
+            Some(SlashCommand::Strict(true))
+        );
+        assert_eq!(
+            SlashCommand::parse("/strict off"),
+            Some(SlashCommand::Strict(false))
+        );
+        assert_eq!(
+            SlashCommand::parse("/strict"),
+            Some(SlashCommand::Strict(false))
+        );
     }
 
     #[test]

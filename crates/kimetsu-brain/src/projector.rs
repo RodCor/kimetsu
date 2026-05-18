@@ -199,10 +199,10 @@ fn collect_injected_memory_ids(conn: &Connection, run_id: &str) -> KimetsuResult
         let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
         if let Some(ids) = payload.get("memory_ids").and_then(|v| v.as_array()) {
             for id in ids {
-                if let Some(id_str) = id.as_str() {
-                    if !id_str.is_empty() {
-                        seen.insert(id_str.to_string());
-                    }
+                if let Some(id_str) = id.as_str()
+                    && !id_str.is_empty()
+                {
+                    seen.insert(id_str.to_string());
                 }
             }
         }
@@ -273,8 +273,12 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     )?;
 
     conn.execute(
-        "INSERT INTO memories_fts (text, kind, scope) VALUES (?1, ?2, ?3)",
-        params![text, kind, scope],
+        "DELETE FROM memories_fts WHERE memory_id = ?1",
+        params![memory_id],
+    )?;
+    conn.execute(
+        "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
+        params![memory_id, text, kind, scope],
     )?;
     Ok(())
 }

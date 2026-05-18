@@ -1,49 +1,20 @@
-//! MP-7d onwards: the protocol-agnostic agent runtime.
+//! Protocol-agnostic Kimetsu agent harness.
 //!
-//! Historically this file housed the entire harbor transport (JSON-RPC
-//! session, executor, stubs) plus the agent loop. v0.3.2 physically
-//! split the two: the wire types moved to `kimetsu-harbor-rs` (see its
-//! `protocol`, `session`, and `stubs` modules); this module keeps the
-//! transport-agnostic core (tool registry, dispatcher, `run_model_agent`,
-//! prompts, MP-18 verify) that BOTH harbor mode and chat mode depend on.
-//!
-//! The module name stays `harbor` for compatibility with downstream
-//! callers (kimetsu-cli still imports lots from here); a future cleanup
-//! may rename it to `agent` since "harbor" no longer captures the
-//! content.
-//!
-//! What's gone from this file (now in kimetsu-harbor-rs):
-//!   - HARBOR_PROTOCOL_VERSION, HarborRequest, ToolExecParams,
-//!     ToolExecResult, AgentDoneParams, JsonRpcResponse, JsonRpcError
-//!   - HarborSession<R, W>, HarborShellExecutor<R, W>
-//!   - run_stub_agent, run_multi_step_stub, MultiStepStubReport
-//!   - Their tests (JSON-RPC round-trip, multi-step stub).
-
+//! This module owns the shared agent loop, model prompt contract, tool
+//! registry, dispatcher, and MP-18 verify behavior used by product surfaces
+//! such as `kimetsu chat` and by benchmark adapters. Terminal-Bench / Harbor
+//! transport code lives in `kimetsu-harbor-rs`; this module does not own
+//! JSON-RPC wire types, benchmark sessions, or benchmark stubs.
 use kimetsu_core::KimetsuResult;
 use serde_json::{Value, json};
 
-use crate::tools::CommandSpec;
+use crate::tools::{CommandSpec, ListFilesInput, MultiReadLinesInput, ReadFileLinesInput};
 
-/// Wire-protocol version. The canonical home is `kimetsu_harbor_rs::HARBOR_PROTOCOL_VERSION`;
-/// duplicated here as `const` (not a re-export) because kimetsu-agent
-/// can't depend on kimetsu-harbor-rs (one-way edge). The two strings
-/// must match; a future test in kimetsu-harbor-rs will assert this if
-/// you change either.
-const HARBOR_PROTOCOL_VERSION: &str = "0.1";
+const KIMETSU_HARNESS_VERSION: &str = "0.1";
 
-// Wire types (ToolExecParams, ToolExecResult, AgentDoneParams,
-// HarborRequest, JsonRpcResponse, JsonRpcError) physically live in
-// `kimetsu_harbor_rs::protocol` as of v0.3.2.
-
-// HarborSession + run_stub_agent moved to kimetsu_harbor_rs::session +
-// kimetsu_harbor_rs::stubs as of v0.3.2.
-
-// HarborShellExecutor, run_multi_step_stub, MultiStepStubReport moved
-// to kimetsu_harbor_rs::session + kimetsu_harbor_rs::stubs as of v0.3.2.
-
-/// MP-7d / MP-13b / MP-17m.2: hard ceiling on model ↔ tool ping-pong.
+/// MP-7d / MP-13b / MP-17m.2: hard ceiling on model <-> tool ping-pong.
 ///
-/// The number's bumped 25 → 40 → 80 across phases as we saw real tasks
+/// The number's bumped 25 -> 40 -> 80 across phases as we saw real tasks
 /// run out before finishing. MP-17m.2 makes this a SAFETY NET rather
 /// than the primary stop condition; the real cutoff is now activity-
 /// based via `STALL_WINDOW_TURNS` below. A model making steady useful
@@ -55,13 +26,13 @@ pub const DEFAULT_MODEL_TURN_BUDGET: u32 = 80;
 /// before giving up and accepting the finish unconditionally. Set low
 /// because each iteration adds at minimum one model turn (the verify
 /// response) and at maximum several more turns (workspace inspection +
-/// fix-ups). Two iterations means: model tries to finish → verify nudge
-/// → model checks / fixes → tries to finish again → verify nudge →
-/// model finishes → accepted. So up to 3 finish-attempts per task.
+/// fix-ups). Two iterations means: model tries to finish -> verify nudge
+/// -> model checks / fixes -> tries to finish again -> verify nudge ->
+/// model finishes -> accepted. So up to 3 finish-attempts per task.
 pub const MAX_VERIFY_ITERATIONS: u32 = 2;
 
 /// MP-17m.2: outer-loop heartbeat. If the model hasn't produced ANY
-/// useful tool call (touches workspace state — shell, file, git) in
+/// useful tool call (touches workspace state - shell, file, git) in
 /// this many consecutive turns, treat it as stalled and wrap up.
 /// Pure-deliberation tools (think, plan) don't count as activity
 /// because a sequence of them is exactly the loop pattern we want to
@@ -70,7 +41,7 @@ pub const MAX_VERIFY_ITERATIONS: u32 = 2;
 /// "lots of think/plan, no real work" case during the run.
 pub const STALL_WINDOW_TURNS: u32 = 10;
 
-/// MP-17m.2: tool names that count as "useful" — they touch workspace
+/// MP-17m.2: tool names that count as "useful" - they touch workspace
 /// state or read it back. Anything not in this set (think, plan,
 /// view_image-as-passive-metadata, future no-op tools) is silently
 /// counted as deliberation and doesn't reset the stall counter.
@@ -95,14 +66,12 @@ const USEFUL_TOOL_NAMES: &[&str] = &[
 ];
 
 fn is_useful_tool(name: &str) -> bool {
-    USEFUL_TOOL_NAMES.iter().any(|t| *t == name)
+    USEFUL_TOOL_NAMES.contains(&name)
 }
 
 /// MP-7d: report returned by `run_model_agent`. v0.3.1 Phase-2: also
-/// carries the AgentDoneParams payload (summary + context) the caller
-/// would have emitted; transport-specific code (harbor or chat) decides
-/// what to do with it. This decouples the agent loop from any specific
-/// I/O surface.
+/// carries the summary + context a caller may emit through its own
+/// transport. This decouples the agent loop from any specific I/O surface.
 #[derive(Debug)]
 pub struct ModelAgentReport {
     pub turns: u32,
@@ -110,79 +79,98 @@ pub struct ModelAgentReport {
     pub stop_reason: crate::model::StopReason,
     pub final_text: Option<String>,
     pub usage: crate::model::TokenUsage,
-    /// v0.3.1: summary string the harbor done frame would have used —
-    /// either the model's final plain-text response or a budget-
-    /// exhaustion sentinel built from the loop stop reason.
+    /// Summary string for the caller's transport response: either the
+    /// model's final plain-text response or a budget-exhaustion sentinel
+    /// built from the loop stop reason.
     pub summary: String,
-    /// v0.3.1: structured context the harbor done frame's `context`
-    /// field would have carried (turns, cost, deviations, etc.).
+    /// Structured context for the caller's transport response (turns, cost,
+    /// deviations, etc.).
     pub context: serde_json::Value,
 }
 
 /// MP-7d: the real agent loop. Wires a `ModelProvider` (claude_code,
-/// anthropic, or a `MockProvider` in tests) to a `ToolRuntime` whose
-/// shell backend routes through Harbor. The model issues
-/// `shell_command` calls based on the task; we run them via the runtime
-/// (which proxies via HarborShellExecutor → JSON-RPC → Harbor →
-/// container), feed the result back as a tool result message, and loop
-/// until the model returns plain text or we exhaust the turn budget.
+/// anthropic, or a `MockProvider` in tests) to a `ToolRuntime`. The model
+/// issues tool calls based on the task; we run them via the runtime, feed
+/// the result back as a tool result message, and loop until the model
+/// returns plain text or we exhaust the turn budget.
 ///
-/// `agent.done` carries the model's final text as the summary so
-/// Terminal-Bench's grader sees a real answer, not a stub string. The
-/// session's frame stream is identical in shape to MP-7c — only the
-/// content changes.
-/// MP-13: opts for tuning the harbor agent loop. Defaults match
-/// production CLI usage. Tests use `HarborAgentOpts::for_tests()` to
-/// disable the auto-orient pre-shell + the persistence gate so
-/// scripted MockProvider responses aren't perturbed.
+/// MP-13: opts for tuning the Kimetsu agent loop. Defaults are neutral for
+/// product usage; benchmark adapters should pass their own mode/source.
+/// Tests use `KimetsuAgentOpts::for_tests()` to disable the auto-orient
+/// pre-shell + persistence gate so scripted MockProvider responses aren't
+/// perturbed.
 #[derive(Debug, Clone, Copy)]
-pub struct HarborAgentOpts {
+pub struct KimetsuAgentOpts {
     pub turn_budget: u32,
     pub auto_orient: bool,
     pub min_actions_before_finish: u32,
+    /// Transport label used in prompt text and telemetry. Harbor mode
+    /// keeps the Terminal-Bench wording; chat uses a product-facing label.
+    pub mode: &'static str,
+    pub task_source: &'static str,
+    /// Strict verify policy. None keeps the legacy env-controlled behavior
+    /// for Harbor runs; product surfaces pass an explicit value.
+    pub strict_verify: Option<bool>,
     /// MP-17c: fire a one-time self-verify reminder right before the
     /// model's first finish attempt. Disabled in tests so scripted
     /// MockProvider responses aren't perturbed.
     pub self_verify_nudge_enabled: bool,
 }
 
-impl Default for HarborAgentOpts {
+impl Default for KimetsuAgentOpts {
     fn default() -> Self {
         Self {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
             auto_orient: true,
             min_actions_before_finish: 3,
+            mode: "kimetsu",
+            task_source: "user",
+            strict_verify: Some(false),
             self_verify_nudge_enabled: true,
         }
     }
 }
 
-impl HarborAgentOpts {
+impl KimetsuAgentOpts {
+    pub fn for_harbor() -> Self {
+        Self {
+            mode: "harbor",
+            task_source: "Harbor / Terminal-Bench",
+            strict_verify: None,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub fn for_tests() -> Self {
         Self {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
             auto_orient: false,
             min_actions_before_finish: 0,
+            mode: "test",
+            task_source: "test",
+            strict_verify: Some(false),
             self_verify_nudge_enabled: false,
         }
     }
 }
 
 /// v0.3.1 Phase-2: agent loop is now transport-agnostic. Doesn't take a
-/// session anymore — callers (harbor mode, chat mode, future transports)
+/// session anymore - callers (benchmark adapters, chat mode, future transports)
 /// inspect the returned `ModelAgentReport.summary` and `.context` and
 /// emit them in whatever protocol they speak.
 pub fn run_model_agent(
     task: &str,
     runtime: &mut crate::tools::ToolRuntime,
     provider: &mut dyn crate::model::ModelProvider,
-    opts: HarborAgentOpts,
+    opts: KimetsuAgentOpts,
     brain_context: Option<&str>,
 ) -> KimetsuResult<ModelAgentReport> {
     let turn_budget = opts.turn_budget;
     let auto_orient = opts.auto_orient;
     let min_actions_before_finish = opts.min_actions_before_finish;
+    let mode = opts.mode;
+    let task_source = opts.task_source;
     use crate::model::{ModelMessage, ModelRequest, StopReason, ToolChoice};
 
     // MP-9 (path B): Claude Code 2.x in `-p` mode injects its own
@@ -202,11 +190,11 @@ pub fn run_model_agent(
     //   3. asks for a tool_call envelope as the first response.
     // This is the v0.1 envelope pattern adapted to compete with CC's
     // harness override.
-    let system = MessageMessage::system_prompt_for_harbor();
+    let system = MessageMessage::system_prompt_for_mode(mode);
 
     // MP-13a (auto-orient): bare Claude Code's agentic harness orients
-    // the model implicitly — directory listing, README peek, build
-    // system sniff — before the first model turn. The kimetsu wrapper
+    // the model implicitly - directory listing, README peek, build
+    // system sniff - before the first model turn. The kimetsu wrapper
     // doesn't do that, so the model spends its first 3-5 turns on
     // `pwd && ls && cat README*` orientation. On a 25-40 turn budget
     // that's a ~15-20% tax on every task.
@@ -230,7 +218,7 @@ pub fn run_model_agent(
     };
 
     // MP-11 (brain mode): if a kimetsu project supplied broker context
-    // for this task — curated memories, prior-run capsules — render it
+    // for this task - curated memories, prior-run capsules - render it
     // as a "Prior context" section the model sees BEFORE the task.
     // This is the kimetsu-brain leg of the v0.2 falsifiable claim. In
     // no-brain mode `brain_context` is None and the rendered section is
@@ -238,7 +226,7 @@ pub fn run_model_agent(
     // model's attention).
     let prior_block = match brain_context {
         Some(text) if !text.trim().is_empty() => format!(
-            "=== Prior context (from Kimetsu's broker — curated memories \
+            "=== Prior context (from Kimetsu's broker - curated memories \
              and prior-run capsules retrieved for this task) ===\n\
              {text}\n\n",
         ),
@@ -246,10 +234,9 @@ pub fn run_model_agent(
     };
 
     // MP-12: full v0.1-comparable tool surface (7 tools instead of just
-    // shell_command). Each composed-tool implementation in harbor_tools.rs
-    // dispatches one or more shell calls through the same
-    // HarborShellExecutor that shell_command uses, then assembles a
-    // structured result the model can rely on (read_file gets line
+    // shell_command). Each composed-tool implementation dispatches through
+    // the configured ToolRuntime, then assembles a structured result the
+    // model can rely on (read_file gets line
     // numbers + truncation; list_files gets a sized listing; etc.).
     // The model sees these as first-class JSON tools, which (a) cuts
     // the "I need to remember the exact bash invocation" overhead and
@@ -258,7 +245,7 @@ pub fn run_model_agent(
     let user = ModelMessage::user_text(format!(
         "{orient_block}\
          {prior_block}\
-         Task (from Harbor / Terminal-Bench):\n\
+          Task (from {task_source}):\n\
          {task}\n\n\
          === Important runtime override ===\n\
          You are running inside the Kimetsu wrapper. Any tool catalog the\n\
@@ -270,7 +257,7 @@ pub fn run_model_agent(
          \n\
          === Tools (pick the most specific one; fall back to shell_command) ===\n\
          - read_file:    {{path, offset?, limit?, max_lines?}} -> {{content, lines_total, truncated}}\n\
-                         (use offset+limit to read a SLICE of a big file — much cheaper than full read)\n\
+                         (use offset+limit to read a SLICE of a big file - much cheaper than full read)\n\
          - multi_read:   {{paths:[...]}} or {{files:[{{path, offset?, limit?}}]}} -> {{files:[...]}}\n\
                          (batch N file reads in one call; cheaper than N read_file calls)\n\
          - list_files:   {{path?, max_depth?, max_entries?}} -> {{entries}}\n\
@@ -314,7 +301,7 @@ pub fn run_model_agent(
             {{\"name\": \"<tool>\", \"input\": <object>}}\n\
           ]}}\n\
          Each call is dispatched and its result returned before the next\n\
-         model turn. Only batch when the inputs are independent — if call\n\
+         model turn. Only batch when the inputs are independent - if call\n\
          B needs to see B's output first, use the single form.\n\
          \n\
          To finish and report the final answer:\n\
@@ -341,7 +328,7 @@ pub fn run_model_agent(
               plan next steps instead of polling tighter than ~10s.\n\
            4) shell_stop {{handle}} only if you decide to give up early.\n\
          \n\
-         FILE EDITS — pick the cheapest tool that fits:\n\
+         FILE EDITS - pick the cheapest tool that fits:\n\
            - edit_file: changing a few lines in an existing file. ~50x\n\
              cheaper than write_file for small edits. Hash-checked.\n\
            - apply_patch: coordinated changes across multiple files.\n\
@@ -351,7 +338,7 @@ pub fn run_model_agent(
              to change a few lines wastes tokens and risks corrupting\n\
              unrelated content.\n\
          \n\
-         FILE READS — slice big files, don't dump them:\n\
+         FILE READS - slice big files, don't dump them:\n\
            - read_file {{offset, limit}}: read lines N..M of a big file.\n\
              A 2000-line source dump costs ~10k tokens of input;\n\
              lines 400-450 costs ~50 tokens. Pick the slice.\n\
@@ -367,19 +354,19 @@ pub fn run_model_agent(
            - plan: when the task has >=3 distinct steps, call plan FIRST\n\
              with the breakdown. Update statuses as you progress. The\n\
              plan survives across turns in your conversation history.\n\
-           - think: pure reasoning slot — no I/O. Use when you need to\n\
+           - think: pure reasoning slot - no I/O. Use when you need to\n\
              work through a problem before acting. Cheaper than a probe\n\
              tool call.\n\
          \n\
          PARALLEL CALLS (when independent):\n\
          Batch reads / status checks / unrelated edits via the parallel\n\
          tool_calls form. Saves one full model turn per extra call.\n\
-         Don't batch dependent calls (e.g. read after edit) — those need\n\
+         Don't batch dependent calls (e.g. read after edit) - those need\n\
          to be serialized.\n\
          \n\
          === Common pitfalls (don't do these) ===\n\
            - Running `make` via shell_command for a multi-minute build\n\
-             (it will time out — use shell_background).\n\
+             (it will time out - use shell_background).\n\
            - Using write_file to change 3 lines (use edit_file).\n\
            - Reading a 2000-line file when you only need ~50 lines\n\
              (use offset+limit).\n\
@@ -397,12 +384,12 @@ pub fn run_model_agent(
     ));
     let mut messages = vec![system, user];
 
-    let tool_defs = harbor_tool_definitions();
+    let tool_defs = kimetsu_tool_definitions();
 
     let mut tool_calls_total = 0u32;
     // v0.3.4a: was `last_usage` (overwrite per turn). For multi-turn
     // agent loops that meant the chat cost meter only saw the FINAL
-    // model turn's cost — under-billing the budget. Cumulative now,
+    // model turn's cost - under-billing the budget. Cumulative now,
     // so cost.record_turn(report.usage.cost_usd) is accurate AND the
     // cache stats reflect the full session, not just the wrap-up turn.
     let mut total_usage = crate::model::TokenUsage::default();
@@ -411,7 +398,7 @@ pub fn run_model_agent(
     let mut turn = 0u32;
     // MP-13d: flag so the persistence gate fires at most once per task.
     let mut persistence_nudge_sent = false;
-    // MP-17c → MP-18: replaced one-shot self-verify with iterative goal verify.
+    // MP-17c -> MP-18: replaced one-shot self-verify with iterative goal verify.
     // verify_iterations counts how many times the model tried to finish and
     // got pushed back to verify. After MAX_VERIFY_ITERATIONS attempts we
     // accept the finish unconditionally so we never deadlock.
@@ -427,7 +414,7 @@ pub fn run_model_agent(
     // since the model last fired a USEFUL tool call. Reset on workspace-
     // touching tool calls (shell/file/git). Pure think/plan turns or
     // turns with no tool calls increment it. When it crosses
-    // STALL_WINDOW_TURNS we break out — we don't kill the trial outright;
+    // STALL_WINDOW_TURNS we break out - we don't kill the trial outright;
     // we exit the loop with whatever stop_reason the model emitted and
     // let `agent.done` carry the summary.
     let mut turns_since_useful = 0u32;
@@ -448,7 +435,7 @@ pub fn run_model_agent(
             max_output_tokens: 4096,
             temperature: 0.0,
             metadata: serde_json::json!({
-                "kimetsu_mode": "harbor",
+                "kimetsu_mode": mode,
                 "turn": turn,
                 "task_preview": preview_text(task, 120),
             }),
@@ -473,16 +460,15 @@ pub fn run_model_agent(
         stop_reason = response.stop_reason.clone();
 
         if !response.tool_calls.is_empty() {
-            messages.push(ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
+            messages.push(ModelMessage::assistant_tool_calls(
+                response.tool_calls.clone(),
+            ));
 
             // MP-17m.2: did this turn include at least one workspace-touching
             // tool call? If yes, reset the stall counter; if not (think/plan
             // only), increment so a long string of deliberation-only turns
             // gets caught.
-            let any_useful = response
-                .tool_calls
-                .iter()
-                .any(|c| is_useful_tool(&c.name));
+            let any_useful = response.tool_calls.iter().any(|c| is_useful_tool(&c.name));
             if any_useful {
                 turns_since_useful = 0;
             } else {
@@ -494,11 +480,11 @@ pub fn run_model_agent(
                 let name = call.name.clone();
                 // MP-18: capture goal artifacts before dispatching.
                 //
-                // `plan` — last-write-wins record of the model's current plan.
+                // `plan` - last-write-wins record of the model's current plan.
                 //   Used by the verify nudge to remind the model what it
                 //   committed to.
                 //
-                // `record_deviation` — accumulate into recorded_deviations.
+                // `record_deviation` - accumulate into recorded_deviations.
                 //   Will be surfaced in agent.done so the brain pipeline can
                 //   propose the `lesson_for_next_time` as a failure_pattern
                 //   memory.
@@ -507,7 +493,7 @@ pub fn run_model_agent(
                 } else if name == "record_deviation" {
                     recorded_deviations.push(call.input.clone());
                 }
-                let result_value = harbor_dispatch_tool(runtime, &name, call.input.clone());
+                let result_value = kimetsu_dispatch_tool(runtime, &name, call.input.clone());
                 messages.push(ModelMessage::tool_result(call.id, name, result_value));
             }
             continue;
@@ -517,7 +503,7 @@ pub fn run_model_agent(
         //
         // MP-13d (persistence gate): on real Terminal-Bench tasks we
         // observed the model emitting `finish` after 0-1 tool calls on
-        // hard tasks like make-mips-interpreter — basically giving up
+        // hard tasks like make-mips-interpreter - basically giving up
         // before even trying. Per the v0.2 plan's "kimetsu wraps the
         // model with a persistent harness" promise, we reject premature
         // finishes ONCE and push the model to actually try something.
@@ -525,10 +511,14 @@ pub fn run_model_agent(
         // forever on a model that's genuinely stuck.
         if tool_calls_total < min_actions_before_finish && !persistence_nudge_sent {
             persistence_nudge_sent = true;
+            let persistence_guidance = if mode == "harbor" {
+                "Terminal-Bench rarely accepts answers without inspection"
+            } else {
+                "Kimetsu should not declare coding tasks done without inspection"
+            };
             let nudge = format!(
                 "You have only taken {tool_calls_total} action(s) on this task. \
-                 Terminal-Bench rarely accepts answers without inspection — \
-                 at minimum read the relevant files, run the verifier or \
+                 {persistence_guidance} - at minimum read the relevant files, run the verifier or \
                  reproduce the task setup before declaring done. Please \
                  keep working: emit another tool_call envelope. If you \
                  genuinely believe the task requires no shell action, \
@@ -548,10 +538,10 @@ pub fn run_model_agent(
         // we recap the original task instruction + the most recent plan and
         // ask two structured questions: WHAT is missing and WHERE did the
         // execution deviate? The model self-inspects the workspace (list_files
-        // / cat / shell_command) and either confirms "all good" → we accept
-        // on the next finish, or identifies a deviation → optionally calls
+        // / cat / shell_command) and either confirms "all good" -> we accept
+        // on the next finish, or identifies a deviation -> optionally calls
         // record_deviation (strict mode: required; lenient default: optional)
-        // → fixes → finishes again.
+        // -> fixes -> finishes again.
         //
         // Capped at MAX_VERIFY_ITERATIONS = 2 so a stuck model never deadlocks.
         // The persistence gate above already covered the "didn't even try"
@@ -559,16 +549,13 @@ pub fn run_model_agent(
         // class (overfull-hbox / video-processing / install-windows-3-11
         // pattern in MP-17m).
         if verify_iterations < MAX_VERIFY_ITERATIONS && opts.self_verify_nudge_enabled {
-            let strict = std::env::var("KIMETSU_HARBOR_VERIFY_STRICT")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false);
+            let strict = opts.strict_verify.unwrap_or_else(|| {
+                std::env::var("KIMETSU_HARBOR_VERIFY_STRICT")
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+                    .unwrap_or(false)
+            });
             verify_iterations += 1;
-            let nudge = render_verify_nudge(
-                task,
-                task_plan.as_ref(),
-                verify_iterations,
-                strict,
-            );
+            let nudge = render_verify_nudge(task, task_plan.as_ref(), verify_iterations, strict);
             if let Some(text) = response.text.clone() {
                 messages.push(ModelMessage::assistant_text(text));
             }
@@ -613,7 +600,7 @@ pub fn run_model_agent(
         // means we're paying full input freight every time.
         "cache_creation_input_tokens": total_usage.cache_creation_input_tokens,
         "cache_read_input_tokens": total_usage.cache_read_input_tokens,
-        "protocol_version": HARBOR_PROTOCOL_VERSION,
+        "harness_version": KIMETSU_HARNESS_VERSION,
         // MP-18: surface the model's self-reflections so the brain
         // curation pipeline can propose them as memory rows.
         "verify_iterations": verify_iterations,
@@ -634,7 +621,7 @@ pub fn run_model_agent(
 fn preview_text(text: &str, limit: usize) -> String {
     let mut clipped: String = text.chars().take(limit).collect();
     if text.chars().count() > limit {
-        clipped.push('…');
+        clipped.push_str("...");
     }
     clipped
 }
@@ -647,12 +634,7 @@ fn preview_text(text: &str, limit: usize) -> String {
 /// Iteration N=1 is gentle ("first verify pass"); N=2 is firmer ("you've
 /// been asked once; now really check"). After MAX_VERIFY_ITERATIONS the
 /// caller stops looping entirely.
-fn render_verify_nudge(
-    task: &str,
-    plan: Option<&Value>,
-    iteration: u32,
-    strict: bool,
-) -> String {
+fn render_verify_nudge(task: &str, plan: Option<&Value>, iteration: u32, strict: bool) -> String {
     let task_recap = preview_text(task, 800);
     let plan_recap = match plan {
         Some(p) => {
@@ -687,7 +669,7 @@ fn render_verify_nudge(
     let urgency = if iteration == 1 {
         "Before I accept finish:"
     } else {
-        "Second verify pass — your previous finish attempt was rejected. \
+        "Second verify pass - your previous finish attempt was rejected. \
          Take this seriously:"
     };
     format!(
@@ -698,10 +680,10 @@ fn render_verify_nudge(
          \n\
          === {plan_recap}\n\
          === Inspect, then answer two questions ===\n\
-         1. WHAT IS MISSING — inspect your workspace (list_files, cat, \
+         1. WHAT IS MISSING - inspect your workspace (list_files, cat, \
             shell_command). For each artifact the task asked for, confirm \
             it exists and matches the spec.\n\
-         2. WHERE YOU DEVIATED — if anything is missing, identify which \
+         2. WHERE YOU DEVIATED - if anything is missing, identify which \
             step of your plan (or which decision) was the divergence point.\n\
          \n\
          {deviation_clause}\n\
@@ -712,35 +694,40 @@ fn render_verify_nudge(
 
 /// MP-7d: namespace helper so the system prompt is one focused location
 /// rather than scattered as `format!` calls throughout the loop. The
-/// prompt is intentionally short and Terminal-Bench-oriented; MP-8 will
-/// fold in the broker context (memories + prior-run capsules) here.
+/// prompt is intentionally short; transport-specific wording is selected
+/// by mode.
 struct MessageMessage;
 impl MessageMessage {
-    /// MP-9 (path B): minimal role description for the harbor-mode
-    /// agent. All format rules — envelope grammar, tool catalog, the
+    /// MP-9 (path B): minimal role description for the agent. All format
+    /// rules - envelope grammar, tool catalog, the
     /// override notice that Claude Code's internal harness tools
     /// (Monitor / PushNotification / RemoteTrigger / Bash / Edit) are
-    /// NOT real here — live in the user message in `run_model_agent`,
+    /// NOT real here - live in the user message in `run_model_agent`,
     /// not here. The system prompt is whatever Claude Code's `-p`
     /// runtime allows; the user message is what the model reads last
     /// before responding, and that's where the authority needs to be.
-    fn system_prompt_for_harbor() -> crate::model::ModelMessage {
+    fn system_prompt_for_mode(mode: &str) -> crate::model::ModelMessage {
+        let surface = match mode {
+            "harbor" => "a sandboxed Linux shell inside Harbor / Terminal-Bench",
+            "chat" => "tools against the user's workspace",
+            "test" => "a test tool runtime",
+            _ => "the Kimetsu tool runtime",
+        };
         crate::model::ModelMessage {
             role: crate::model::MessageRole::System,
             content: vec![crate::model::MessageContent::Text {
-                text: concat!(
-                    "You are Kimetsu, a coding agent driving a sandboxed Linux ",
-                    "shell inside Harbor / Terminal-Bench. Follow the response ",
-                    "format described in the user message exactly. Be concise; ",
-                    "no narration between actions."
-                ).to_string(),
+                text: format!(
+                    "You are Kimetsu, a coding agent driving {surface}. \
+                     Follow the response format described in the user message \
+                     exactly. Be concise; no narration between actions."
+                ),
             }],
         }
     }
 }
 
 // =====================================================================
-// MP-12: composed-tool surface for harbor mode.
+// MP-12: composed-tool surface for the Kimetsu harness.
 //
 // The bare Claude-Code agent in MP-10b had 18.75 pp accuracy advantage
 // over the kimetsu wrapper. The docs/MP-11-RESULTS.md verdict traced it to
@@ -749,12 +736,9 @@ impl MessageMessage {
 // (read file -> edit -> verify) required 3-4 shell turns instead of one
 // structured tool call.
 //
-// MP-12 closes the gap WITHOUT regressing the harbor protocol — each
-// new tool is a thin Rust shim that composes 1-2 shell calls through
-// the existing HarborShellExecutor and returns a structured JSON
-// result. The model sees seven first-class tools; under the hood every
-// tool eventually dispatches a `tool.exec` JSON-RPC frame to Harbor's
-// container.
+// MP-12 closes the gap with first-class file/search/edit tools. Benchmark
+// adapters can still route shell commands through their own ShellExecutor,
+// while product surfaces use the local runtime directly.
 // =====================================================================
 
 use crate::model::ToolDefinition;
@@ -765,17 +749,17 @@ const LIST_FILES_DEFAULT_MAX_ENTRIES: u32 = 200;
 const SEARCH_FILES_DEFAULT_MAX_MATCHES: u32 = 100;
 const TOOL_DEFAULT_TIMEOUT_SECS: u64 = 60;
 
-/// MP-12: the seven tools the harbor model sees. Order matters for
-/// the model's first scan; put the most-used ones first (`read_file`,
+/// MP-12: the tool surface the Kimetsu model sees. Order matters for the
+/// model's first scan; put the most-used ones first (`read_file`,
 /// `list_files`, `search_files`) so the catalog is read top-down.
-pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
+pub fn kimetsu_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),
             description: "Read a UTF-8 text file from the workspace. Returns content, \
                 total line count, and a `truncated` flag if the slice was capped. \
                 MP-14e: use `offset` (1-based start line) and `limit` (max lines to \
-                return) to read a SLICE of a large file — far cheaper in input \
+                return) to read a SLICE of a large file - far cheaper in input \
                 tokens than fetching the whole thing. `max_lines` (legacy) caps the \
                 slice from line 1; prefer `offset`+`limit` for big files."
                 .to_string(),
@@ -841,7 +825,7 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
             description: "In-place replace `old_string` -> `new_string` in `path`. \
                 `old_string` must occur exactly once unless `replace_all: true`. \
                 Use this whenever you want to change a few lines in an existing \
-                file — much cheaper than write_file's full rewrite. For multiple \
+                file - much cheaper than write_file's full rewrite. For multiple \
                 edits in one call, pass `edits: [{old_string, new_string, replace_all?}, ...]` \
                 instead of the single old_string/new_string pair."
                 .to_string(),
@@ -961,8 +945,8 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "multi_read".to_string(),
             description: "Read several files in a single tool call. Cheaper than \
-                N separate read_file calls because the shell round-trip cost is \
-                paid once. Each entry can carry its own offset/limit slice. \
+                N separate read_file calls because the runtime handles the \
+                batch natively. Each entry can carry its own offset/limit slice. \
                 Returns `files: [{path, content, lines_total, truncated, error?}]`."
                 .to_string(),
             input_schema: json!({
@@ -1071,10 +1055,9 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
                 discover something missing or wrong with your output. The \
                 `lesson_for_next_time` field becomes a candidate memory for \
                 future tasks (reviewed via `kimetsu brain memory review`). \
-                Lenient by default — only call when there's a generalizable \
-                lesson worth surfacing. With `KIMETSU_HARBOR_VERIFY_STRICT=1` \
-                set, the wrapper will require this call before accepting any \
-                fix-up cycle."
+                Lenient by default - only call when there's a generalizable \
+                lesson worth surfacing. When strict verify is enabled, the \
+                wrapper will require this call before accepting any fix-up cycle."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1128,7 +1111,7 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
             description: "Check whether a background process from \
                 shell_background is still running. Returns \
                 {running, runtime_sec, exit_code?, bytes_stdout, bytes_stderr}. \
-                Non-blocking — call it freely."
+                Non-blocking - call it freely."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1198,36 +1181,36 @@ pub fn harbor_tool_definitions() -> Vec<ToolDefinition> {
 /// Returns a structured JSON value the agent loop hands back as a
 /// tool_result message. Unknown tool names get an `error` object so
 /// the model can self-correct without aborting the run.
-pub fn harbor_dispatch_tool(
+pub fn kimetsu_dispatch_tool(
     runtime: &mut crate::tools::ToolRuntime,
     name: &str,
     input: Value,
 ) -> Value {
     match name {
-        "read_file" => harbor_read_file(runtime, &input),
-        "list_files" => harbor_list_files(runtime, &input),
-        "search_files" => harbor_search_files(runtime, &input),
-        "write_file" => harbor_write_file(runtime, &input),
-        "edit_file" => harbor_edit_file(runtime, &input),
-        "apply_patch" => harbor_apply_patch(runtime, &input),
-        "git_status" => harbor_git_status(runtime, &input),
-        "git_diff" => harbor_git_diff(runtime, &input),
-        "shell_command" => harbor_shell_command(runtime, &input),
+        "read_file" => kimetsu_read_file(runtime, &input),
+        "list_files" => kimetsu_list_files(runtime, &input),
+        "search_files" => kimetsu_search_files(runtime, &input),
+        "write_file" => kimetsu_write_file(runtime, &input),
+        "edit_file" => kimetsu_edit_file(runtime, &input),
+        "apply_patch" => kimetsu_apply_patch(runtime, &input),
+        "git_status" => kimetsu_git_status(runtime, &input),
+        "git_diff" => kimetsu_git_diff(runtime, &input),
+        "shell_command" => kimetsu_shell_command(runtime, &input),
         // MP-14e additions
-        "glob" => harbor_glob(runtime, &input),
-        "multi_read" => harbor_multi_read(runtime, &input),
-        "move_file" => harbor_move_file(runtime, &input),
-        "delete_file" => harbor_delete_file(runtime, &input),
-        "plan" => harbor_plan(&input),
-        "think" => harbor_think(&input),
+        "glob" => kimetsu_glob(runtime, &input),
+        "multi_read" => kimetsu_multi_read(runtime, &input),
+        "move_file" => kimetsu_move_file(runtime, &input),
+        "delete_file" => kimetsu_delete_file(runtime, &input),
+        "plan" => kimetsu_plan(&input),
+        "think" => kimetsu_think(&input),
         // MP-16 additions
-        "shell_background" => harbor_shell_background(runtime, &input),
-        "shell_status"     => harbor_shell_status(runtime, &input),
-        "shell_output"     => harbor_shell_output(runtime, &input),
-        "shell_stop"       => harbor_shell_stop(runtime, &input),
-        "view_image"       => harbor_view_image(runtime, &input),
+        "shell_background" => kimetsu_shell_background(runtime, &input),
+        "shell_status" => kimetsu_shell_status(runtime, &input),
+        "shell_output" => kimetsu_shell_output(runtime, &input),
+        "shell_stop" => kimetsu_shell_stop(runtime, &input),
+        "view_image" => kimetsu_view_image(runtime, &input),
         // MP-18: brain-powered goal verify
-        "record_deviation" => harbor_record_deviation(&input),
+        "record_deviation" => kimetsu_record_deviation(&input),
         other => json!({
             "error": format!(
                 "unsupported tool `{other}`; pick one of \
@@ -1269,7 +1252,7 @@ fn run_shell(
     runtime.shell_command(spec).map_err(|e| e.to_string())
 }
 
-fn harbor_read_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_read_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "read_file requires `path`" });
     };
@@ -1284,79 +1267,40 @@ fn harbor_read_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> V
     } else {
         input_u32(input, "max_lines", READ_FILE_DEFAULT_MAX_LINES)
     };
-    let end_line = offset.saturating_add(limit).saturating_sub(1);
 
-    // `wc -l` first so we know how truncated we are; then sed -n to slice.
-    // Both run in one shell so the model only sees one tool turn.
-    let cmd = format!(
-        "set -e; total=$(wc -l < {0} 2>/dev/null || echo 0); sed -n '{1},{2}p' {0}; echo \"::LINES_TOTAL::$total\"",
-        shell_quote(path),
+    match runtime.read_file_lines(ReadFileLinesInput {
+        path: path.to_string(),
         offset,
-        end_line,
-    );
-    let out = match run_shell(
-        runtime,
-        "bash",
-        vec!["-c".into(), cmd],
-        None,
-        Some(TOOL_DEFAULT_TIMEOUT_SECS),
-    ) {
-        Ok(o) => o,
-        Err(e) => return json!({ "error": format!("read_file shell failed: {e}") }),
-    };
-    if out.exit_code != 0 {
-        return json!({
-            "error": format!("read_file: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
+        limit,
+    }) {
+        Ok(output) => serde_json::to_value(output).unwrap_or_else(
+            |err| json!({ "error": format!("read_file serialization failed: {err}") }),
+        ),
+        Err(err) => json!({
+            "error": err.to_string(),
             "path": path,
-        });
+        }),
     }
-    // Split off the trailing ::LINES_TOTAL::N marker.
-    let raw = out.stdout_summary;
-    let (content, total_line_count) = split_total_marker(&raw);
-    let returned_lines = content.lines().count() as u32;
-    // truncated: there are more lines beyond what we returned.
-    let truncated = total_line_count
-        .map(|t| t > offset.saturating_add(returned_lines).saturating_sub(1))
-        .unwrap_or(false);
-    json!({
-        "path": path,
-        "content": content,
-        "offset": offset,
-        "limit": limit,
-        "lines_returned": returned_lines,
-        "lines_total": total_line_count,
-        "truncated": truncated,
-        "duration_ms": out.duration_ms,
-    })
 }
 
-fn harbor_list_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_list_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let path = input_str(input, "path").unwrap_or(".");
     let max_depth = input_u32(input, "max_depth", LIST_FILES_DEFAULT_MAX_DEPTH);
     let max_entries = input_u32(input, "max_entries", LIST_FILES_DEFAULT_MAX_ENTRIES);
-    let args = vec![
-        path.to_string(),
-        "-maxdepth".into(),
-        max_depth.to_string(),
-        "-mindepth".into(),
-        "1".into(),
-        "-type".into(),
-        "f".into(),
-    ];
-    let out = match run_shell(runtime, "find", args, None, Some(TOOL_DEFAULT_TIMEOUT_SECS)) {
-        Ok(o) => o,
-        Err(e) => return json!({ "error": format!("list_files shell failed: {e}") }),
+
+    let listed = match runtime.list_files(ListFilesInput {
+        dir: Some(path.to_string()),
+        depth: Some(max_depth),
+        glob: None,
+    }) {
+        Ok(listed) => listed,
+        Err(err) => return json!({ "error": err.to_string(), "path": path }),
     };
-    if out.exit_code != 0 {
-        return json!({
-            "error": format!("list_files: exit {}; stderr: {}", out.exit_code, truncate(&out.stderr_summary, 400)),
-            "path": path,
-        });
-    }
-    let mut entries: Vec<&str> = out
-        .stdout_summary
-        .lines()
-        .filter(|l| !l.is_empty())
+    let mut entries: Vec<String> = listed
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == "file")
+        .map(|entry| entry.path)
         .collect();
     entries.sort();
     let total = entries.len() as u32;
@@ -1372,7 +1316,7 @@ fn harbor_list_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
     })
 }
 
-fn harbor_search_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_search_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(pattern) = input_str(input, "pattern") else {
         return json!({ "error": "search_files requires `pattern`" });
     };
@@ -1414,7 +1358,7 @@ fn harbor_search_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) -
     })
 }
 
-fn harbor_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "write_file requires `path`" });
     };
@@ -1453,7 +1397,7 @@ fn harbor_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
     })
 }
 
-/// MP-14a: in-place replace `old_string` → `new_string` in `path`.
+/// MP-14a: in-place replace `old_string` -> `new_string` in `path`.
 ///
 /// CC's Edit semantics: `old_string` must occur exactly once in the
 /// file unless `replace_all = true`. The file is read, transformed
@@ -1465,7 +1409,7 @@ fn harbor_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
 /// few lines: the model sends two short strings instead of the whole
 /// file content, and the wire-format saves output tokens
 /// proportional to file size.
-fn harbor_edit_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_edit_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "edit_file requires `path`" });
     };
@@ -1480,7 +1424,10 @@ fn harbor_edit_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> V
             let Some(new) = e.get("new_string").and_then(Value::as_str) else {
                 return json!({ "error": format!("edit_file: edits[{idx}].new_string required") });
             };
-            let replace_all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            let replace_all = e
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             ops.push(EditOp {
                 old: old.to_string(),
                 new: new.to_string(),
@@ -1637,7 +1584,7 @@ struct EditOp {
 }
 
 /// MP-14b: apply a unified diff to one or more files via container
-/// `patch -p<strip>`. Codex's signature operation — lets the model
+/// `patch -p<strip>`. Codex's signature operation - lets the model
 /// accumulate multi-file edits in one envelope instead of one
 /// edit_file call per file.
 ///
@@ -1649,7 +1596,7 @@ struct EditOp {
 ///
 /// `strip` defaults to 0 (paths in the diff are workspace-relative).
 /// Use 1 if your diff has a `a/` / `b/` prefix.
-fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(diff_raw) = input_str(input, "diff") else {
         return json!({ "error": "apply_patch requires `diff` (unified-diff or Codex starred-patch text)" });
     };
@@ -1696,14 +1643,14 @@ fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
 
     // MP-17 #10: if GNU `patch` is not installed in this container, fall
     // back to a Rust-side unified-diff applier that re-routes each hunk
-    // through harbor_edit_file (base64 round-trip read+edit+write through
+    // through kimetsu_edit_file (base64 round-trip read+edit+write through
     // the composed-shell layer). Detection: exit 127 ("command not found"
     // by convention) or stderr explicitly says so.
     let patch_not_found = out.exit_code == 127
         || out.stderr_summary.contains("command not found")
         || out.stdout_summary.contains("command not found");
     if patch_not_found {
-        return harbor_apply_patch_rust_fallback(runtime, &diff, cwd.as_deref(), format_used);
+        return kimetsu_apply_patch_rust_fallback(runtime, &diff, cwd.as_deref(), format_used);
     }
 
     let mut patched_files: Vec<String> = Vec::new();
@@ -1751,10 +1698,9 @@ fn harbor_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
 // MP-17 #10: pure-Rust unified-diff applier (fallback when patch(1) absent).
 //
 // Strategy: parse the diff into per-file sections + per-hunk old/new pairs,
-// then re-route each hunk through harbor_edit_file. edit_file already does
-// the base64 round-trip read+modify+write through HarborShellExecutor, so
-// we get composed-shell safety for free and don't depend on patch(1) being
-// installed in the container.
+// then re-route each hunk through kimetsu_edit_file. edit_file keeps the
+// mutation behind the same workspace/path checks as the rest of the runtime,
+// so we don't depend on patch(1) being installed.
 //
 // Limitations vs GNU patch:
 //   - No fuzz matching: the reconstructed OLD must occur in the file
@@ -1841,7 +1787,7 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<DiffFile>, String> {
                         old_lines.push('\n');
                         new_lines.push('\n');
                     } else if body.starts_with('\\') {
-                        // "\ No newline at end of file" — skip the marker.
+                        // "\ No newline at end of file" - skip the marker.
                     } else {
                         // Unknown line type; treat as context to be safe.
                         old_lines.push_str(body);
@@ -1881,7 +1827,7 @@ fn extract_diff_path(raw: &str) -> String {
     trimmed.to_string()
 }
 
-fn harbor_apply_patch_rust_fallback(
+fn kimetsu_apply_patch_rust_fallback(
     runtime: &mut crate::tools::ToolRuntime,
     diff: &str,
     cwd: Option<&str>,
@@ -1911,7 +1857,7 @@ fn harbor_apply_patch_rust_fallback(
             // Reconstruct the new-file content from the hunks' `new` text.
             let content: String = f.hunks.iter().map(|h| h.new.clone()).collect();
             let write_input = json!({ "path": full_path, "content": content });
-            let res = harbor_write_file(runtime, &write_input);
+            let res = kimetsu_write_file(runtime, &write_input);
             if res.get("error").is_some() {
                 files_failed.push(json!({
                     "path": full_path,
@@ -1925,7 +1871,7 @@ fn harbor_apply_patch_rust_fallback(
         }
         if f.is_delete {
             let del_input = json!({ "path": full_path, "recursive": false });
-            let res = harbor_delete_file(runtime, &del_input);
+            let res = kimetsu_delete_file(runtime, &del_input);
             if res.get("error").is_some() {
                 files_failed.push(json!({
                     "path": full_path,
@@ -1946,7 +1892,7 @@ fn harbor_apply_patch_rust_fallback(
                 "old_string": hunk.old.trim_end_matches('\n'),
                 "new_string": hunk.new.trim_end_matches('\n'),
             });
-            let res = harbor_edit_file(runtime, &edit_input);
+            let res = kimetsu_edit_file(runtime, &edit_input);
             if res.get("error").is_some() {
                 files_failed.push(json!({
                     "path": full_path,
@@ -1955,7 +1901,7 @@ fn harbor_apply_patch_rust_fallback(
                 }));
                 hunks_failed += 1;
                 file_ok = false;
-                // Don't bail on the file — subsequent hunks may still apply.
+                // Don't bail on the file - subsequent hunks may still apply.
             }
         }
         if file_ok {
@@ -1984,7 +1930,7 @@ fn harbor_apply_patch_rust_fallback(
     })
 }
 
-fn harbor_git_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_git_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let cwd = input_str(input, "cwd").map(str::to_string);
     let out = match run_shell(
         runtime,
@@ -2007,7 +1953,7 @@ fn harbor_git_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
     })
 }
 
-fn harbor_git_diff(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_git_diff(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let cwd = input_str(input, "cwd").map(str::to_string);
     let mut args = vec!["diff".to_string()];
     if let Some(arr) = input.get("paths").and_then(Value::as_array) {
@@ -2033,7 +1979,7 @@ fn harbor_git_diff(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Va
     })
 }
 
-fn harbor_shell_command(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_shell_command(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let spec_value = input.clone();
     match serde_json::from_value::<CommandSpec>(spec_value.clone()) {
         Ok(spec) => match runtime.shell_command(spec) {
@@ -2057,11 +2003,11 @@ const GLOB_DEFAULT_MAX_ENTRIES: u32 = 200;
 const MULTI_READ_DEFAULT_LIMIT: u32 = 400;
 const MULTI_READ_MAX_FILES: usize = 25;
 
-/// MP-14e: glob — pattern-based file discovery (complement to search_files's
+/// MP-14e: glob - pattern-based file discovery (complement to search_files's
 /// content grep). Maps the glob to `find -path`. `**` is rewritten to `*`
 /// because POSIX find doesn't grok `**` natively; we still recurse because
 /// `find` recurses by default unless `-maxdepth` says otherwise.
-fn harbor_glob(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_glob(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(pattern) = input_str(input, "pattern") else {
         return json!({ "error": "glob requires `pattern`" });
     };
@@ -2111,11 +2057,11 @@ fn harbor_glob(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value 
     })
 }
 
-/// MP-14e: multi_read — batch N file reads in one tool call. Accepts either
+/// MP-14e: multi_read - batch N file reads in one tool call. Accepts either
 /// `paths: ["a", "b"]` (each with the default slice) or `files: [{path,
 /// offset?, limit?}]` (per-file slice). Caps at MULTI_READ_MAX_FILES to keep
 /// any single result envelope bounded.
-fn harbor_multi_read(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_multi_read(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     #[derive(Debug)]
     struct Req {
         path: String,
@@ -2139,7 +2085,9 @@ fn harbor_multi_read(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
     }
     if let Some(arr) = input.get("files").and_then(Value::as_array) {
         for v in arr {
-            let Some(path) = v.get("path").and_then(Value::as_str) else { continue };
+            let Some(path) = v.get("path").and_then(Value::as_str) else {
+                continue;
+            };
             let offset = v
                 .get("offset")
                 .and_then(Value::as_u64)
@@ -2169,25 +2117,27 @@ fn harbor_multi_read(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
             )
         });
     }
-    let mut files: Vec<Value> = Vec::with_capacity(reqs.len());
-    for r in &reqs {
-        let inner = json!({
-            "path": r.path,
-            "offset": r.offset,
-            "limit": r.limit,
-        });
-        let result = harbor_read_file(runtime, &inner);
-        files.push(result);
+
+    let files = reqs
+        .into_iter()
+        .map(|req| ReadFileLinesInput {
+            path: req.path,
+            offset: req.offset,
+            limit: req.limit,
+        })
+        .collect();
+
+    match runtime.multi_read_lines(MultiReadLinesInput { files }) {
+        Ok(output) => serde_json::to_value(output).unwrap_or_else(
+            |err| json!({ "error": format!("multi_read serialization failed: {err}") }),
+        ),
+        Err(err) => json!({ "error": err.to_string() }),
     }
-    json!({
-        "files": files,
-        "files_returned": files.len() as u32,
-    })
 }
 
-/// MP-14e: move_file — typed rename inside the workspace. Refuses absolute
+/// MP-14e: move_file - typed rename inside the workspace. Refuses absolute
 /// paths and `..` traversal so a typo can't escape the sandbox.
-fn harbor_move_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_move_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(from) = input_str(input, "from") else {
         return json!({ "error": "move_file requires `from`" });
     };
@@ -2220,10 +2170,10 @@ fn harbor_move_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> V
     json!({ "moved": true, "from": from, "to": to })
 }
 
-/// MP-14e: delete_file — typed remove inside the workspace. `recursive: true`
+/// MP-14e: delete_file - typed remove inside the workspace. `recursive: true`
 /// is required for non-empty directories. Refuses workspace root, absolute
 /// paths, and `..` traversal.
-fn harbor_delete_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_delete_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "delete_file requires `path`" });
     };
@@ -2244,13 +2194,7 @@ fn harbor_delete_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
         args.push("-f".to_string());
     }
     args.push(path.to_string());
-    let out = match run_shell(
-        runtime,
-        "rm",
-        args,
-        None,
-        Some(TOOL_DEFAULT_TIMEOUT_SECS),
-    ) {
+    let out = match run_shell(runtime, "rm", args, None, Some(TOOL_DEFAULT_TIMEOUT_SECS)) {
         Ok(o) => o,
         Err(e) => return json!({ "error": format!("delete_file shell failed: {e}") }),
     };
@@ -2263,11 +2207,11 @@ fn harbor_delete_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
     json!({ "deleted": true, "path": path, "recursive": recursive })
 }
 
-/// MP-14e: plan — record a todo list. We don't persist it server-side; the
+/// MP-14e: plan - record a todo list. We don't persist it server-side; the
 /// tool simply validates + echoes it. The fact that the result sits in the
 /// conversation history is enough for the model to "see" the plan on every
 /// subsequent turn. Status must be pending|in_progress|completed.
-fn harbor_plan(input: &Value) -> Value {
+fn kimetsu_plan(input: &Value) -> Value {
     let Some(todos) = input.get("todos").and_then(Value::as_array) else {
         return json!({ "error": "plan requires `todos: [{content,status,activeForm?}]`" });
     };
@@ -2311,9 +2255,9 @@ fn harbor_plan(input: &Value) -> Value {
     })
 }
 
-/// MP-14e: think — pure ack. No shell, no I/O. The thought lives in the
+/// MP-14e: think - pure ack. No shell, no I/O. The thought lives in the
 /// conversation history; that's the entire point.
-fn harbor_think(input: &Value) -> Value {
+fn kimetsu_think(input: &Value) -> Value {
     let Some(thought) = input_str(input, "thought") else {
         return json!({ "error": "think requires `thought`" });
     };
@@ -2323,14 +2267,14 @@ fn harbor_think(input: &Value) -> Value {
     })
 }
 
-/// MP-18: brain-powered goal verify — capture the model's self-reflection
+/// MP-18: brain-powered goal verify - capture the model's self-reflection
 /// on a gap between its output and the task goal. The handler validates +
 /// echoes the input back. The agent loop sweeps `record_deviation` calls
 /// out of the tool-call stream and accumulates them in agent state;
 /// they're surfaced in `agent.done` at task end and become candidate
 /// memory proposals (kind=failure_pattern) via the existing brain
 /// curation flow.
-fn harbor_record_deviation(input: &Value) -> Value {
+fn kimetsu_record_deviation(input: &Value) -> Value {
     let Some(missing) = input_str(input, "missing") else {
         return json!({ "error": "record_deviation requires `missing`" });
     };
@@ -2401,7 +2345,9 @@ fn check_workspace_path(label: &str, p: &str) -> Result<(), String> {
         return Err(format!("`{label}` must not be empty"));
     }
     if p.starts_with('/') {
-        return Err(format!("`{label}` must be workspace-relative, not absolute"));
+        return Err(format!(
+            "`{label}` must be workspace-relative, not absolute"
+        ));
     }
     for seg in p.split('/') {
         if seg == ".." {
@@ -2432,7 +2378,7 @@ fn check_workspace_path(label: &str, p: &str) -> Result<(), String> {
 //   <hunk>
 // then GNU patch consumes it with -p1 (a/ / b/ prefixes stripped).
 //
-// This is intentionally permissive — Codex's emitted diffs vary in
+// This is intentionally permissive - Codex's emitted diffs vary in
 // whether they include `@@` markers, blank lines, etc. We synthesize a
 // generic `@@ -0,0 +1,N @@` for Add File and `@@ -1,N +0,0 @@` for
 // Delete File so GNU patch is happy.
@@ -2568,15 +2514,15 @@ fn translate_codex_patch(raw: &str) -> Result<String, String> {
 
 enum CodexSection {
     Update { path: String, body: String },
-    Add    { path: String, body: String },
+    Add { path: String, body: String },
     Delete { path: String },
 }
 
 // ---------------------------------------------------------------------------
 // MP-16a: background shell quartet.
 //
-// State lives in /tmp inside the Harbor container, since each tool.exec
-// is a fresh shell call from our Rust process. Per-handle layout:
+// State lives in /tmp for the active shell backend, since each tool call is
+// a fresh shell invocation from our Rust process. Per-handle layout:
 //
 //   /tmp/kimetsu-bg-<handle>.meta      JSON {handle, pid, started_at_sec,
 //                                            program, cwd}
@@ -2592,7 +2538,9 @@ const BG_HANDLE_PREFIX: &str = "bg-";
 
 fn validate_bg_handle(handle: &str) -> Result<(), String> {
     if !handle.starts_with(BG_HANDLE_PREFIX) {
-        return Err(format!("invalid handle: expected `{BG_HANDLE_PREFIX}*`, got {handle:?}"));
+        return Err(format!(
+            "invalid handle: expected `{BG_HANDLE_PREFIX}*`, got {handle:?}"
+        ));
     }
     if handle.len() > 128
         || handle
@@ -2604,7 +2552,7 @@ fn validate_bg_handle(handle: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn harbor_shell_background(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_shell_background(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(program) = input_str(input, "program") else {
         return json!({ "error": "shell_background requires `program`" });
     };
@@ -2622,7 +2570,7 @@ fn harbor_shell_background(runtime: &mut crate::tools::ToolRuntime, input: &Valu
     // Build the shell-side command: write meta + spawn + record exit code.
     // We use bash because we need $! / wait / setsid. The composed script
     // returns the handle on stdout for the model to capture.
-    let mut argv = String::from(shell_quote(program));
+    let mut argv = shell_quote(program);
     for a in &args {
         argv.push(' ');
         argv.push_str(&shell_quote(a));
@@ -2650,10 +2598,7 @@ echo "$HANDLE $PID"
         prefix = BG_HANDLE_PREFIX,
         argv = argv.replace('\'', "'\\''"),
         prog_json = shell_quote(&format!("\"{program}\"")),
-        cwd_json = shell_quote(&format!(
-            "\"{}\"",
-            cwd_relative.as_deref().unwrap_or(".")
-        )),
+        cwd_json = shell_quote(&format!("\"{}\"", cwd_relative.as_deref().unwrap_or("."))),
     );
     let out = match run_shell(
         runtime,
@@ -2690,7 +2635,7 @@ echo "$HANDLE $PID"
     })
 }
 
-fn harbor_shell_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_shell_status(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(handle) = input_str(input, "handle") else {
         return json!({ "error": "shell_status requires `handle`" });
     };
@@ -2735,7 +2680,13 @@ fi
         Ok(o) => o,
         Err(e) => return json!({ "error": format!("shell_status shell failed: {e}") }),
     };
-    let line = out.stdout_summary.lines().next().unwrap_or("").trim().to_string();
+    let line = out
+        .stdout_summary
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if line == "no_such_handle" {
         return json!({ "error": format!("no such handle: {handle}") });
     }
@@ -2754,22 +2705,13 @@ fn parse_bg_status_line(line: &str, handle: &str) -> Value {
             fields.insert(k.to_string(), v.to_string());
         }
     }
-    let pid: u32 = fields
-        .get("pid")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let pid: u32 = fields.get("pid").and_then(|s| s.parse().ok()).unwrap_or(0);
     let runtime: u64 = fields
         .get("runtime")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let bytes_out: u64 = fields
-        .get("out")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let bytes_err: u64 = fields
-        .get("err")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let bytes_out: u64 = fields.get("out").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let bytes_err: u64 = fields.get("err").and_then(|s| s.parse().ok()).unwrap_or(0);
     let exit_code: Option<i32> = fields.get("exit").and_then(|s| s.parse().ok());
     let running = state == "running";
     json!({
@@ -2784,7 +2726,7 @@ fn parse_bg_status_line(line: &str, handle: &str) -> Value {
     })
 }
 
-fn harbor_shell_output(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_shell_output(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(handle) = input_str(input, "handle") else {
         return json!({ "error": "shell_output requires `handle`" });
     };
@@ -2845,7 +2787,7 @@ fn extract_between(raw: &str, start: &str, end: &str) -> String {
     String::new()
 }
 
-fn harbor_shell_stop(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_shell_stop(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(handle) = input_str(input, "handle") else {
         return json!({ "error": "shell_stop requires `handle`" });
     };
@@ -2921,11 +2863,11 @@ fi
 }
 
 // ---------------------------------------------------------------------------
-// MP-16c: view_image — metadata + optional base64 for workspace images.
+// MP-16c: view_image - metadata + optional base64 for workspace images.
 //
 // Cheap version: shell out to `file`, `wc -c`, `sha256sum`, plus a sniff
 // for image dimensions when ImageMagick's `identify` is present. We
-// deliberately don't pipe the image to Claude's vision API here —
+// deliberately don't pipe the image to Claude's vision API here -
 // surfacing image bytes to the model via the claude `-p` text channel
 // would require provider-level work outside MP-16 scope. The metadata
 // + optional base64 still help: the model can verify expected files,
@@ -2933,7 +2875,7 @@ fi
 
 const VIEW_IMAGE_DEFAULT_MAX_BYTES: u32 = 256 * 1024;
 
-fn harbor_view_image(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
+fn kimetsu_view_image(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value {
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "view_image requires `path`" });
     };
@@ -3037,12 +2979,12 @@ fn parse_wh(s: &str) -> (Option<u32>, Option<u32>) {
 
 /// MP-13a: orient the model with one upfront shell command. Returns
 /// a multi-block string (pwd / top-level ls / nearby task-instruction
-/// files / build system sniff). Best-effort — on failure we return
+/// files / build system sniff). Best-effort - on failure we return
 /// None and the user message just omits the section, which is no
 /// worse than the pre-MP-13 behavior.
 ///
 /// We deliberately do this in a SINGLE composite shell call so it
-/// costs one round-trip through the HarborSession instead of four.
+/// costs one shell/tool round-trip instead of four.
 fn collect_workspace_orientation(runtime: &mut crate::tools::ToolRuntime) -> Option<String> {
     let script = concat!(
         "echo '## pwd';",
@@ -3083,7 +3025,7 @@ fn collect_workspace_orientation(runtime: &mut crate::tools::ToolRuntime) -> Opt
                 Some(raw)
             } else {
                 let mut clipped = raw[..CAP_BYTES].to_string();
-                clipped.push_str("\n…[orientation truncated]\n");
+                clipped.push_str("\n...[orientation truncated]\n");
                 Some(clipped)
             }
         }
@@ -3110,23 +3052,8 @@ fn truncate(s: &str, cap: usize) -> String {
     if s.len() <= cap {
         s.to_string()
     } else {
-        format!("{}…", &s[..cap])
+        format!("{}...", &s[..cap])
     }
-}
-
-fn split_total_marker(raw: &str) -> (String, Option<u32>) {
-    // Find the last line that is exactly "::LINES_TOTAL::N".
-    let marker = "::LINES_TOTAL::";
-    if let Some(idx) = raw.rfind(marker) {
-        let (before, rest) = raw.split_at(idx);
-        let n: Option<u32> = rest
-            .trim_start_matches(marker)
-            .trim()
-            .parse()
-            .ok();
-        return (before.trim_end_matches('\n').to_string(), n);
-    }
-    (raw.to_string(), None)
 }
 
 fn parse_grep_line(line: &str) -> Option<Value> {
@@ -3138,12 +3065,11 @@ fn parse_grep_line(line: &str) -> Option<Value> {
     Some(json!({ "file": file, "line": line_no, "text": text }))
 }
 
-/// Tiny base64 encoder (RFC 4648) — we don't need a crate just for one
+/// Tiny base64 encoder (RFC 4648) - we don't need a crate just for one
 /// helper. Used to ship file content through a shell heredoc safely.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in &mut chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
@@ -3204,12 +3130,9 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-
 
     // ----- MP-14e unit tests (pure-Rust paths, no shell needed) -----
 
@@ -3222,7 +3145,7 @@ mod tests {
                 {"content": "ship", "status": "pending"},
             ]
         });
-        let result = harbor_plan(&input);
+        let result = kimetsu_plan(&input);
         assert_eq!(result["total"], 3);
         assert_eq!(result["pending"], 1);
         assert_eq!(result["in_progress"], 1);
@@ -3239,29 +3162,36 @@ mod tests {
                 {"content": "x", "status": "blocked"},
             ]
         });
-        let result = harbor_plan(&input);
+        let result = kimetsu_plan(&input);
         let err = result["error"].as_str().unwrap_or("");
-        assert!(err.contains("must be pending|in_progress|completed"), "got: {err}");
+        assert!(
+            err.contains("must be pending|in_progress|completed"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn plan_tool_rejects_missing_fields() {
-        assert!(harbor_plan(&json!({})).get("error").is_some());
-        assert!(harbor_plan(&json!({"todos": [{"status": "pending"}]}))
-            .get("error")
-            .is_some());
-        assert!(harbor_plan(&json!({"todos": [{"content": "x"}]}))
-            .get("error")
-            .is_some());
+        assert!(kimetsu_plan(&json!({})).get("error").is_some());
+        assert!(
+            kimetsu_plan(&json!({"todos": [{"status": "pending"}]}))
+                .get("error")
+                .is_some()
+        );
+        assert!(
+            kimetsu_plan(&json!({"todos": [{"content": "x"}]}))
+                .get("error")
+                .is_some()
+        );
     }
 
     #[test]
     fn think_tool_acknowledges_and_reports_length() {
         let thought = "consider whether to rebuild";
-        let result = harbor_think(&json!({"thought": thought}));
+        let result = kimetsu_think(&json!({"thought": thought}));
         assert_eq!(result["ack"], true);
         assert_eq!(result["thought_len"], thought.len() as u64);
-        assert!(harbor_think(&json!({})).get("error").is_some());
+        assert!(kimetsu_think(&json!({})).get("error").is_some());
     }
 
     #[test]
@@ -3362,10 +3292,7 @@ mod tests {
 
     #[test]
     fn parse_bg_status_line_running_state() {
-        let v = parse_bg_status_line(
-            "running pid=12345 runtime=42 out=1024 err=128",
-            "bg-1-abcd",
-        );
+        let v = parse_bg_status_line("running pid=12345 runtime=42 out=1024 err=128", "bg-1-abcd");
         assert_eq!(v["state"], "running");
         assert_eq!(v["running"], true);
         assert_eq!(v["pid"], 12345);
@@ -3521,7 +3448,7 @@ mod tests {
     fn task_signals_verification_skips_generic_language() {
         // MP-17m.1: generic "ensure that"/"check that"/"i will check"
         // appear in tons of task instructions where verification IS the
-        // task — firing the nudge there costs a turn or two with no
+        // task - firing the nudge there costs a turn or two with no
         // upside. These should NOT trigger.
         assert!(!task_signals_verification(
             "Ensure that the LaTeX document compiles successfully"
@@ -3561,22 +3488,35 @@ mod tests {
             "where_deviated": "step 3: forgot to write the analysis result",
             "lesson_for_next_time": "On tasks producing a file at a specific path, verify the file exists AND is non-empty before finish",
         });
-        let result = harbor_record_deviation(&input);
+        let result = kimetsu_record_deviation(&input);
         assert_eq!(result["recorded"], true);
         assert_eq!(result["missing"], "output.toml file was empty");
-        assert!(result["lesson_for_next_time"].as_str().unwrap().contains("non-empty"));
+        assert!(
+            result["lesson_for_next_time"]
+                .as_str()
+                .unwrap()
+                .contains("non-empty")
+        );
     }
 
     #[test]
     fn record_deviation_rejects_missing_fields() {
-        assert!(harbor_record_deviation(&json!({})).get("error").is_some());
-        assert!(harbor_record_deviation(&json!({"missing": "x"})).get("error").is_some());
-        assert!(harbor_record_deviation(&json!({"missing": "x", "where_deviated": "y"})).get("error").is_some());
+        assert!(kimetsu_record_deviation(&json!({})).get("error").is_some());
+        assert!(
+            kimetsu_record_deviation(&json!({"missing": "x"}))
+                .get("error")
+                .is_some()
+        );
+        assert!(
+            kimetsu_record_deviation(&json!({"missing": "x", "where_deviated": "y"}))
+                .get("error")
+                .is_some()
+        );
     }
 
     #[test]
     fn record_deviation_rejects_empty_strings() {
-        let r = harbor_record_deviation(&json!({
+        let r = kimetsu_record_deviation(&json!({
             "missing": "",
             "where_deviated": "  ",
             "lesson_for_next_time": "",
@@ -3634,7 +3574,7 @@ mod tests {
         assert!(second.contains("Take this seriously"));
     }
 
-    /// MP-17m.2: the stall heartbeat classifier — workspace-touching
+    /// MP-17m.2: the stall heartbeat classifier - workspace-touching
     /// tools count as activity; pure deliberation tools don't.
     #[test]
     fn is_useful_tool_recognises_workspace_actions() {
@@ -3667,7 +3607,7 @@ mod tests {
         // Pure-deliberation tools shouldn't reset the stall counter.
         assert!(!is_useful_tool("think"));
         assert!(!is_useful_tool("plan"));
-        // view_image is borderline (it's a metadata read) — current policy
+        // view_image is borderline (it's a metadata read) - current policy
         // is to NOT count it; we can revisit if the gauntlet shows it
         // helping.
         assert!(!is_useful_tool("view_image"));

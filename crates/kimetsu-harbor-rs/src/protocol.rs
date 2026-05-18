@@ -1,9 +1,8 @@
-//! Kimetsu ↔ Harbor JSON-RPC protocol definitions.
+//! Kimetsu â†” Harbor JSON-RPC protocol definitions.
 //!
-//! v0.3.2 — moved here from `kimetsu-agent::harbor`. The wire types
+//! v0.3.2 â€” moved here from `kimetsu-agent::harness`. The wire types
 //! never belonged in the agent core; they only matter to the harbor
-//! transport. Re-exports in `kimetsu-harbor-rs::lib` keep callers
-//! (kimetsu-cli, the python adapter) on stable import paths.
+//! transport and the dedicated benchmark binary.
 //!
 //! The line-oriented dialect:
 //!
@@ -18,8 +17,8 @@ use serde_json::Value;
 
 /// The wire-protocol version this crate speaks. Bumped when a non-
 /// backward-compatible change to the message shape lands so the Python
-/// adapter can refuse a mismatched kimetsu binary instead of silently
-/// misbehaving.
+/// adapter can refuse a mismatched `kimetsu-harbor-agent` binary instead
+/// of silently misbehaving.
 pub const HARBOR_PROTOCOL_VERSION: &str = "0.1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +28,7 @@ pub struct ToolExecParams {
     pub args: Vec<String>,
     /// Workspace-relative directory the command should run in. The
     /// adapter forwards this to `environment.exec(cwd=...)`. `None`
-    /// means "wherever Harbor's environment defaults to" — typically
+    /// means "wherever Harbor's environment defaults to" â€” typically
     /// the task root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,

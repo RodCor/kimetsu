@@ -129,6 +129,52 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
     Ok((paths, config, conn))
 }
 
+pub struct BrainSession {
+    paths: ProjectPaths,
+    config: ProjectConfig,
+    conn: Connection,
+    repo_root: String,
+}
+
+impl BrainSession {
+    pub fn open(start: &Path) -> KimetsuResult<Self> {
+        let (paths, config, conn) = load_project(start)?;
+        let repo_root = paths
+            .repo_root
+            .canonicalize()?
+            .to_string_lossy()
+            .to_string();
+        Ok(Self {
+            paths,
+            config,
+            conn,
+            repo_root,
+        })
+    }
+
+    pub fn retrieve_context(
+        &self,
+        stage: &str,
+        query: &str,
+        budget_tokens: u32,
+    ) -> KimetsuResult<ContextBundle> {
+        context::retrieve_context(
+            &self.conn,
+            &self.repo_root,
+            &self.config.broker.weights,
+            ContextRequest {
+                stage: stage.to_string(),
+                query: query.to_string(),
+                budget_tokens,
+            },
+        )
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.paths.repo_root
+    }
+}
+
 pub fn load_config(paths: &ProjectPaths) -> KimetsuResult<ProjectConfig> {
     let content = fs::read_to_string(&paths.project_toml).map_err(|err| {
         format!(
@@ -531,10 +577,7 @@ pub fn prune_low_usefulness(start: &Path, opts: PruneOptions) -> KimetsuResult<P
     Ok(summary)
 }
 
-pub fn list_proposals(
-    start: &Path,
-    filter: ProposalFilter,
-) -> KimetsuResult<Vec<ProposalRow>> {
+pub fn list_proposals(start: &Path, filter: ProposalFilter) -> KimetsuResult<Vec<ProposalRow>> {
     let (_paths, _config, conn) = load_project(start)?;
     let mut sql = String::from(
         "
@@ -561,11 +604,11 @@ pub fn list_proposals(
         clauses.push("proposed_confidence >= ?".to_string());
         params.push(Box::new(min_conf as f64));
     }
-    if let Some(status) = filter.status.as_deref() {
-        if !status.eq_ignore_ascii_case("any") {
-            clauses.push("status = ?".to_string());
-            params.push(Box::new(status.to_string()));
-        }
+    if let Some(status) = filter.status.as_deref()
+        && !status.eq_ignore_ascii_case("any")
+    {
+        clauses.push("status = ?".to_string());
+        params.push(Box::new(status.to_string()));
     }
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
@@ -647,22 +690,7 @@ pub fn retrieve_context(
     query: &str,
     budget_tokens: u32,
 ) -> KimetsuResult<ContextBundle> {
-    let (paths, config, conn) = load_project(start)?;
-    let repo_root = paths
-        .repo_root
-        .canonicalize()?
-        .to_string_lossy()
-        .to_string();
-    context::retrieve_context(
-        &conn,
-        &repo_root,
-        &config.broker.weights,
-        ContextRequest {
-            stage: stage.to_string(),
-            query: query.to_string(),
-            budget_tokens,
-        },
-    )
+    BrainSession::open(start)?.retrieve_context(stage, query, budget_tokens)
 }
 
 pub fn accept_proposal(
@@ -740,11 +768,7 @@ pub fn accept_proposal(
 /// canonical trace keeps the original `memory.accepted`; invalidation is
 /// purely additive metadata. Idempotent — re-invalidating a memory just
 /// overwrites the timestamp/reason.
-pub fn invalidate_memory(
-    start: &Path,
-    memory_id: &str,
-    reason: Option<&str>,
-) -> KimetsuResult<()> {
+pub fn invalidate_memory(start: &Path, memory_id: &str, reason: Option<&str>) -> KimetsuResult<()> {
     let (paths, config, conn) = load_project(start)?;
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM memories WHERE memory_id = ?1",
@@ -790,11 +814,7 @@ pub fn invalidate_memory(
     Ok(())
 }
 
-pub fn reject_proposal(
-    start: &Path,
-    proposal_id: &str,
-    reason: Option<&str>,
-) -> KimetsuResult<()> {
+pub fn reject_proposal(start: &Path, proposal_id: &str, reason: Option<&str>) -> KimetsuResult<()> {
     let (paths, config, conn) = load_project(start)?;
     let _proposal = load_pending_proposal(&conn, proposal_id)?;
     let run_id = RunId::new();
@@ -1273,9 +1293,27 @@ mod tests {
 
         // Inject three proposals straight via memory.proposed events.
         let proposals = [
-            ("p1", "global_user", "preference", 0.9_f32, "Prefer rg over grep"),
-            ("p2", "repo", "convention", 0.8, "Use find_* for fallible lookups"),
-            ("p3", "repo", "convention", 0.4, "Use let-else where possible"),
+            (
+                "p1",
+                "global_user",
+                "preference",
+                0.9_f32,
+                "Prefer rg over grep",
+            ),
+            (
+                "p2",
+                "repo",
+                "convention",
+                0.8,
+                "Use find_* for fallible lookups",
+            ),
+            (
+                "p3",
+                "repo",
+                "convention",
+                0.4,
+                "Use let-else where possible",
+            ),
         ];
         {
             let (paths, _config, conn) = load_project(&root).expect("load");
@@ -1329,8 +1367,7 @@ mod tests {
         }
 
         // Reject one with a reason and confirm it persists on the projected row.
-        reject_proposal(&root, "p3", Some("not specific to the user"))
-            .expect("reject with reason");
+        reject_proposal(&root, "p3", Some("not specific to the user")).expect("reject with reason");
         let rejected = list_proposals(
             &root,
             ProposalFilter {
@@ -1451,8 +1488,7 @@ mod tests {
             pre.capsules
         );
 
-        invalidate_memory(&root, &memory_id, Some("no longer accurate"))
-            .expect("invalidate");
+        invalidate_memory(&root, &memory_id, Some("no longer accurate")).expect("invalidate");
 
         let post = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
             .expect("post context");
@@ -1471,7 +1507,7 @@ mod tests {
         fs::remove_dir_all(root).expect("remove temp project");
     }
 
-/// MP-6: `list_memories_top` returns invalidated_at IS NULL memories
+    /// MP-6: `list_memories_top` returns invalidated_at IS NULL memories
     /// sorted by ratio descending, filtered by `min_uses`. Memories with
     /// use_count below the threshold are dropped entirely so the listing
     /// only shows entries the broker bias actually applies to.
@@ -1481,14 +1517,14 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
 
-        let m_great = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "GREAT")
-            .expect("great");
-        let m_meh = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "meh")
-            .expect("meh");
-        let m_bad = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "BAD")
-            .expect("bad");
-        let m_fresh = add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "fresh")
-            .expect("fresh");
+        let m_great =
+            add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "GREAT").expect("great");
+        let m_meh =
+            add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "meh").expect("meh");
+        let m_bad =
+            add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "BAD").expect("bad");
+        let _m_fresh =
+            add_memory(&root, MemoryScope::Repo, MemoryKind::Convention, "fresh").expect("fresh");
 
         // Directly set usefulness data; the event-sourcing path is already
         // tested by `run_finished_increments_usefulness_for_injected_memories`.
@@ -1624,7 +1660,11 @@ mod tests {
         .expect("dry-run");
         assert_eq!(dry.candidates.len(), 2);
         assert_eq!(dry.invalidated, 0);
-        let ids: Vec<&str> = dry.candidates.iter().map(|c| c.memory_id.as_str()).collect();
+        let ids: Vec<&str> = dry
+            .candidates
+            .iter()
+            .map(|c| c.memory_id.as_str())
+            .collect();
         assert!(ids.contains(&m_drop_1.as_str()));
         assert!(ids.contains(&m_drop_2.as_str()));
         // Confirm small_sample stayed out of the candidate list.
@@ -1705,10 +1745,38 @@ mod tests {
         // from run_b. The "review" flow will accept run_a's strong one,
         // reject everything else.
         let proposals: [(&str, RunId, &str, &str, f32, &str); 4] = [
-            ("p_a_strong", run_a, "global_user", "preference", 0.92, "Prefer rg over grep"),
-            ("p_a_weak",   run_a, "repo",        "convention", 0.55, "Always use let-else"),
-            ("p_b1",       run_b, "repo",        "convention", 0.70, "Use Result not panic"),
-            ("p_b2",       run_b, "global_user", "preference", 0.88, "Open links in new tab"),
+            (
+                "p_a_strong",
+                run_a,
+                "global_user",
+                "preference",
+                0.92,
+                "Prefer rg over grep",
+            ),
+            (
+                "p_a_weak",
+                run_a,
+                "repo",
+                "convention",
+                0.55,
+                "Always use let-else",
+            ),
+            (
+                "p_b1",
+                run_b,
+                "repo",
+                "convention",
+                0.70,
+                "Use Result not panic",
+            ),
+            (
+                "p_b2",
+                run_b,
+                "global_user",
+                "preference",
+                0.88,
+                "Open links in new tab",
+            ),
         ];
 
         {
@@ -1748,12 +1816,9 @@ mod tests {
         .expect("list strong from run_a");
         assert_eq!(to_accept.len(), 1, "filter should keep only p_a_strong");
         assert_eq!(to_accept[0].proposal_id, "p_a_strong");
-        let memory_id = accept_proposal(
-            &root,
-            &to_accept[0].proposal_id,
-            AcceptOverrides::default(),
-        )
-        .expect("accept p_a_strong");
+        let memory_id =
+            accept_proposal(&root, &to_accept[0].proposal_id, AcceptOverrides::default())
+                .expect("accept p_a_strong");
 
         // Step 2: --reject-all --reason "batch_reject" over the remaining
         // pending proposals.
@@ -1768,14 +1833,17 @@ mod tests {
         .expect("list remaining pending");
         assert_eq!(to_reject.len(), 3, "three proposals should remain pending");
         for p in &to_reject {
-            reject_proposal(&root, &p.proposal_id, Some("batch_reject"))
-                .expect("reject in batch");
+            reject_proposal(&root, &p.proposal_id, Some("batch_reject")).expect("reject in batch");
         }
 
         // Final state: exactly one memory; exactly three rejected proposals;
         // zero pending. Decision reason persisted on each rejected row.
         let memories = list_memories(&root).expect("list memories");
-        assert_eq!(memories.len(), 1, "only the accepted proposal becomes a memory");
+        assert_eq!(
+            memories.len(),
+            1,
+            "only the accepted proposal becomes a memory"
+        );
         assert_eq!(memories[0].memory_id, memory_id);
 
         let pending = list_proposals(
@@ -1787,7 +1855,10 @@ mod tests {
             },
         )
         .expect("list pending");
-        assert!(pending.is_empty(), "no proposals left pending after batch review");
+        assert!(
+            pending.is_empty(),
+            "no proposals left pending after batch review"
+        );
 
         let rejected = list_proposals(
             &root,

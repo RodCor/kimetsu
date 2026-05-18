@@ -4,24 +4,23 @@
 //! assistant responses to stdout. Slash commands are handled inline
 //! before any model round-trip.
 //!
-//! v0.3.1 — agent round-trip live:
+//! v0.3.1 - agent round-trip live:
 //!   - public surface (`ChatConfig`, `run_repl`) is defined here
-//!   - per-message agent invocations call `kimetsu_agent::harbor::run_model_agent`
+//!   - per-message agent invocations call `kimetsu_agent::harness::run_model_agent`
 //!     directly. The agent loop became transport-agnostic in Phase-2 of
 //!     the v0.3 split (no HarborSession dependency), so chat reuses
 //!     the same 20-tool surface + MP-18 verify the gauntlet validated.
 //!   - tool runtime uses host-side `LocalShellExecutor` (the default for
-//!     `ToolRuntime::new`) — commands execute against the user's actual
+//!     `ToolRuntime::new`) - commands execute against the user's actual
 //!     filesystem under `config.workspace_root`.
 //!   - slash commands handled by [`crate::commands`]
 //!   - cost meter wires through [`crate::cost::CostMeter`]
-//!   - claude_code provider construction reuses the same `CLAUDE_CODE_OAUTH_TOKEN`
-//!     environment variable kimetsu's harbor mode uses; budget tracked
-//!     against `config.max_cost_usd`.
+//!   - claude_code provider construction uses `CLAUDE_CODE_OAUTH_TOKEN`;
+//!     budget tracked against `config.max_cost_usd`.
 //!
 //! What's deferred to v0.3.2:
 //!   - session resume / persistent transcripts
-//!   - approve-each-write mode (currently always-bypass like harbor)
+//!   - approve-each-write mode
 //!   - streaming partial responses (today: blocking per-turn)
 //!   - per-tool cost breakdown (rolled-up cost works)
 //!   - rendering tool-call results inline with diff syntax
@@ -30,10 +29,11 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use kimetsu_agent::claude_code::ClaudeCodeProvider;
-use kimetsu_agent::harbor::{HarborAgentOpts, run_model_agent};
+use kimetsu_agent::harness::{KimetsuAgentOpts, run_model_agent};
 use kimetsu_agent::tools::{ToolRuntime, ToolRuntimeConfig};
 use kimetsu_brain::project as brain_project;
 use kimetsu_core::config::ProjectConfig;
+use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::ids::RunId;
 
 use crate::commands::SlashCommand;
@@ -47,8 +47,7 @@ pub struct ChatConfig {
     pub workspace_root: PathBuf,
     /// Optional kimetsu project directory (contains `.kimetsu/`). When set,
     /// brain context is loaded for retrieval and any record_deviation calls
-    /// surface as memory proposals at session end. Same shape as harbor
-    /// mode's `KIMETSU_HARBOR_PROJECT`.
+    /// surface as memory proposals at session end.
     pub brain_project: Option<PathBuf>,
     /// Model identifier (defaults to "claude-opus-4-7").
     pub model: String,
@@ -95,7 +94,7 @@ impl std::fmt::Display for ChatError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NoOauthToken => write!(
                 f,
-                "CLAUDE_CODE_OAUTH_TOKEN is not set. Run `claude auth` or export the token."
+                "CLAUDE_CODE_OAUTH_TOKEN is not set. Put it in the workspace .env or export it."
             ),
             Self::BrainProject(e) => write!(f, "brain project: {e}"),
             Self::Provider(e) => write!(f, "model provider: {e}"),
@@ -114,7 +113,7 @@ impl From<std::io::Error> for ChatError {
 ///
 /// v0.3.0-alpha: this is a scaffold. The body wires the slash-command
 /// handler + cost meter + greeting + quit handling so callers can verify
-/// the dependency direction (chat → kimetsu-agent only, no harbor). The
+/// the dependency direction (chat -> kimetsu-agent only, no benchmark adapter). The
 /// model round-trip itself is plumbed in [`run_repl_with_agent`] which
 /// lands in the v0.3.0 commit that wires the provider.
 pub fn run_repl<R: BufRead, W: Write>(
@@ -131,23 +130,34 @@ pub fn run_repl<R: BufRead, W: Write>(
     if let Some(p) = config.brain_project.as_ref() {
         writeln!(writer, "brain project: {}", p.display())?;
     } else {
-        writeln!(writer, "brain project: <none>  (no memory retrieval / curation)")?;
+        writeln!(
+            writer,
+            "brain project: <none>  (no memory retrieval / curation)"
+        )?;
     }
     writeln!(writer, "model: {}", config.model)?;
-    writeln!(writer, "budget: ${:.2}  strict_verify: {}", config.max_cost_usd, config.strict_verify)?;
+    writeln!(
+        writer,
+        "budget: ${:.2}  strict_verify: {}",
+        config.max_cost_usd, config.strict_verify
+    )?;
     if let Some(g) = config.goal.as_ref() {
         writeln!(writer, "goal: {g}")?;
     }
-    writeln!(
-        writer,
-        "type `/help` for slash commands. `/quit` to exit."
-    )?;
+    writeln!(writer, "type `/help` for slash commands. `/quit` to exit.")?;
 
     // Validate brain project up-front so we don't surprise the user
     // mid-session with a stale path error.
     if let Some(ref p) = config.brain_project {
         validate_brain_project(p)?;
     }
+    let brain_session = match config.brain_project.as_ref() {
+        Some(path) => Some(
+            brain_project::BrainSession::open(path)
+                .map_err(|err| ChatError::BrainProject(format!("{err}")))?,
+        ),
+        None => None,
+    };
 
     // Per-session state.
     let _run_id = RunId::new();
@@ -157,7 +167,7 @@ pub fn run_repl<R: BufRead, W: Write>(
 
     // v0.3.1: provider is constructed lazily on first user message so
     // /help / /quit / /cost don't fail if CLAUDE_CODE_OAUTH_TOKEN is
-    // unset. Same env handshake harbor mode uses.
+    // unset. Same env handshake the benchmark adapter uses.
     let mut provider: Option<Box<dyn kimetsu_agent::model::ModelProvider>> = None;
 
     // v0.3.3: multi-turn conversation state. Each TurnRecord captures
@@ -171,7 +181,7 @@ pub fn run_repl<R: BufRead, W: Write>(
     // v0.3.3: accumulated MP-18 record_deviation calls across all
     // turns this session. On `/quit` we walk this list and write each
     // `lesson_for_next_time` to the brain as a failure_pattern memory
-    // — closes the MP-18 feedback loop.
+    // - closes the MP-18 feedback loop.
     let mut session_deviations: Vec<DeviationRecord> = Vec::new();
 
     loop {
@@ -290,7 +300,11 @@ pub fn run_repl<R: BufRead, W: Write>(
                                         )?;
                                     }
                                     if rows.len() > 20 {
-                                        writeln!(writer, "  ... ({} more; use `kimetsu brain memory list` for full)", rows.len() - 20)?;
+                                        writeln!(
+                                            writer,
+                                            "  ... ({} more; use `kimetsu brain memory list` for full)",
+                                            rows.len() - 20
+                                        )?;
                                     }
                                 }
                                 Err(e) => writeln!(writer, "[error] {e}")?,
@@ -321,7 +335,7 @@ pub fn run_repl<R: BufRead, W: Write>(
         if cost.over_budget() {
             writeln!(
                 writer,
-                "[budget] $${:.4} of $${:.2} spent — refusing further model calls. Raise --max-cost-usd or /quit.",
+                "[budget] $${:.4} of $${:.2} spent - refusing further model calls. Raise --max-cost-usd or /quit.",
                 cost.spent(),
                 cost.budget()
             )?;
@@ -348,6 +362,7 @@ pub fn run_repl<R: BufRead, W: Write>(
         let mut runtime = match ToolRuntime::new(&workspace, RunId::new()) {
             Ok(r) => r.with_config(ToolRuntimeConfig {
                 redact_secrets: false,
+                trace_fsync: false,
                 ..ToolRuntimeConfig::default()
             }),
             Err(e) => {
@@ -362,34 +377,22 @@ pub fn run_repl<R: BufRead, W: Write>(
         // context:   accumulated transcript of prior turns + retrieved
         //            brain capsules (if --project is set). The agent
         //            loop renders this as a "Prior knowledge" block
-        //            before the user message — giving the model
+        //            before the user message - giving the model
         //            conversational memory + memory-pool retrieval in
         //            one channel.
         let task = match goal.as_ref() {
             Some(g) if !g.is_empty() => format!("Goal: {g}\nMessage: {line}"),
             _ => line.to_string(),
         };
-        let brain_context = build_chat_brain_context(
-            config.brain_project.as_deref(),
-            &transcript,
-            &task,
-        );
+        let brain_context = build_chat_brain_context(brain_session.as_ref(), &transcript, &task);
 
-        // Strict verify mode is wired through the env var the agent
-        // loop already reads (MP-18). Setting it for this turn only.
-        // SAFETY (Rust 2024): set_var/remove_var are flagged unsafe
-        // because env mutation isn't thread-safe. We're single-threaded
-        // here (REPL loop, no spawned threads racing on env), so this
-        // is sound.
-        let prev_strict = std::env::var("KIMETSU_HARBOR_VERIFY_STRICT").ok();
-        unsafe {
-            std::env::set_var(
-                "KIMETSU_HARBOR_VERIFY_STRICT",
-                if strict_verify { "1" } else { "0" },
-            );
-        }
-
-        let opts = HarborAgentOpts::default();
+        let opts = KimetsuAgentOpts {
+            mode: "chat",
+            task_source: "user",
+            auto_orient: transcript.is_empty(),
+            strict_verify: Some(strict_verify),
+            ..KimetsuAgentOpts::default()
+        };
         let result = run_model_agent(
             &task,
             &mut runtime,
@@ -397,15 +400,6 @@ pub fn run_repl<R: BufRead, W: Write>(
             opts,
             brain_context.as_deref(),
         );
-
-        // Restore env so we don't leak state. SAFETY: single-threaded
-        // REPL — see note above.
-        unsafe {
-            match prev_strict {
-                Some(v) => std::env::set_var("KIMETSU_HARBOR_VERIFY_STRICT", v),
-                None => std::env::remove_var("KIMETSU_HARBOR_VERIFY_STRICT"),
-            }
-        }
 
         match result {
             Ok(report) => {
@@ -480,10 +474,7 @@ pub fn run_repl<R: BufRead, W: Write>(
                     writeln!(
                         writer,
                         "[cache] input={} output={} cache_write={} cache_read={}",
-                        report.usage.input_tokens,
-                        report.usage.output_tokens,
-                        cc,
-                        cr,
+                        report.usage.input_tokens, report.usage.output_tokens, cc, cr,
                     )?;
                 }
                 if !still_within {
@@ -527,7 +518,7 @@ struct TurnRecord {
 /// v0.3.3: a single MP-18 record_deviation call captured from a turn.
 /// Accumulated for the session; on /quit we walk these and write each
 /// `lesson_for_next_time` to the brain pool as a failure_pattern
-/// memory — closes the MP-18 feedback loop in chat mode.
+/// memory - closes the MP-18 feedback loop in chat mode.
 #[derive(Debug, Clone)]
 struct DeviationRecord {
     #[allow(dead_code)]
@@ -540,10 +531,10 @@ struct DeviationRecord {
 /// v0.3.3: build the brain-context string for one chat turn.
 ///
 /// Two concatenated blocks (either may be empty):
-///   1. Retrieved brain capsules (if --project is set) — surfaced from
+///   1. Retrieved brain capsules (if --project is set) - surfaced from
 ///      `kimetsu_brain::project::retrieve_context` with the current
 ///      task as the query, 2000-token budget, stage="chat".
-///   2. Conversation transcript so far (if any prior turns) — last
+///   2. Conversation transcript so far (if any prior turns) - last
 ///      ~10 turns of user/assistant exchanges, each capped so a long
 ///      session doesn't blow the prompt budget.
 ///
@@ -551,7 +542,7 @@ struct DeviationRecord {
 /// block before the new user message. The model gets memory-pool
 /// retrieval AND conversational continuity through a single channel.
 fn build_chat_brain_context(
-    project_dir: Option<&std::path::Path>,
+    brain_session: Option<&brain_project::BrainSession>,
     transcript: &[TurnRecord],
     task: &str,
 ) -> Option<String> {
@@ -561,37 +552,35 @@ fn build_chat_brain_context(
     let mut out = String::new();
 
     // Block 1: retrieved capsules.
-    if let Some(dir) = project_dir {
-        if dir.is_dir() {
-            match brain_project::retrieve_context(dir, "chat", task, 2000) {
-                Ok(bundle) if !bundle.capsules.is_empty() => {
+    if let Some(session) = brain_session {
+        match session.retrieve_context("chat", task, 2000) {
+            Ok(bundle) if !bundle.capsules.is_empty() => {
+                out.push_str(&format!(
+                    "Retrieved {} brain capsule(s) for this turn ({}/{} tokens used):\n",
+                    bundle.capsules.len(),
+                    bundle.used_tokens,
+                    bundle.budget_tokens,
+                ));
+                for (i, c) in bundle.capsules.iter().enumerate() {
                     out.push_str(&format!(
-                        "Retrieved {} brain capsule(s) for this turn ({}/{} tokens used):\n",
-                        bundle.capsules.len(),
-                        bundle.used_tokens,
-                        bundle.budget_tokens,
+                        "  [{}] {} (score {:.2}, scope_weight {:.2})\n      {}\n",
+                        i + 1,
+                        c.kind,
+                        c.score,
+                        c.scope_weight,
+                        preview(&c.summary, 240),
                     ));
-                    for (i, c) in bundle.capsules.iter().enumerate() {
-                        out.push_str(&format!(
-                            "  [{}] {} (score {:.2}, scope_weight {:.2})\n      {}\n",
-                            i + 1,
-                            c.kind,
-                            c.score,
-                            c.scope_weight,
-                            preview(&c.summary, 240),
-                        ));
-                    }
                 }
-                Ok(_) => {
-                    // Brain is configured but had nothing relevant.
-                    // We deliberately stay silent in the prompt — no
-                    // need to tell the model the brain was empty.
-                }
-                Err(_) => {
-                    // Silent failure: brain retrieval is best-effort.
-                    // If the DB is missing or corrupt the user will
-                    // see it on the brain CLI; don't pollute the prompt.
-                }
+            }
+            Ok(_) => {
+                // Brain is configured but had nothing relevant.
+                // We deliberately stay silent in the prompt - no
+                // need to tell the model the brain was empty.
+            }
+            Err(_) => {
+                // Silent failure: brain retrieval is best-effort.
+                // If the DB is missing or corrupt the user will
+                // see it on the brain CLI; don't pollute the prompt.
             }
         }
     }
@@ -617,33 +606,36 @@ fn build_chat_brain_context(
         }
     }
 
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Build the model provider for chat. Today: claude_code via
-/// CLAUDE_CODE_OAUTH_TOKEN, same handshake harbor mode uses. Future:
-/// switch on `config.model` prefix (anthropic API key vs CC OAuth).
+/// CLAUDE_CODE_OAUTH_TOKEN from the environment or workspace .env.
+/// Future: switch on `config.model` prefix
+/// (anthropic API key vs CC OAuth).
 fn build_chat_provider(
     config: &ChatConfig,
     workspace: &std::path::Path,
 ) -> ChatResult<Box<dyn kimetsu_agent::model::ModelProvider>> {
-    let oauth = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-        .map_err(|_| ChatError::NoOauthToken)?;
     let mut project_cfg = ProjectConfig::default_for_project("kimetsu-chat");
     project_cfg.model.provider = "claude_code".to_string();
     project_cfg.model.model = config.model.clone();
     project_cfg.model.api_key_env = "CLAUDE_CODE_OAUTH_TOKEN".to_string();
-    project_cfg.model.request_timeout_secs = std::env::var("KIMETSU_HARBOR_PROVIDER_TIMEOUT_SECS")
+    project_cfg.model.request_timeout_secs = std::env::var("KIMETSU_PROVIDER_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(1500);
     project_cfg.run.max_total_cost_usd = config.max_cost_usd;
 
-    match ClaudeCodeProvider::from_config_with_key(workspace, &project_cfg, Some(&oauth)) {
+    let oauth =
+        resolve_env_value(workspace, "CLAUDE_CODE_OAUTH_TOKEN").ok_or(ChatError::NoOauthToken)?;
+
+    match ClaudeCodeProvider::from_config_with_key_and_persistent_default(
+        workspace,
+        &project_cfg,
+        Some(&oauth),
+        true,
+    ) {
         Ok(Some(p)) => Ok(Box::new(p)),
         Ok(None) => Err(ChatError::Provider(
             "ClaudeCodeProvider returned None (no API key resolved)".into(),
@@ -661,7 +653,7 @@ fn preview(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let head: String = s.chars().take(max).collect();
-        format!("{head}…")
+        format!("{head}...")
     }
 }
 
@@ -676,8 +668,7 @@ fn validate_brain_project(p: &std::path::Path) -> ChatResult<()> {
     // Light touch: open a connection to verify the brain DB is readable.
     // Heavier validation happens inside add_memory / retrieve_context if
     // the user runs slash commands that hit the brain.
-    let _ = brain_project::list_memories(p)
-        .map_err(|e| ChatError::BrainProject(format!("{e}")))?;
+    let _ = brain_project::list_memories(p).map_err(|e| ChatError::BrainProject(format!("{e}")))?;
     Ok(())
 }
 
@@ -699,7 +690,7 @@ mod tests {
     #[test]
     fn non_slash_input_attempts_agent_round_trip() {
         // v0.3.1: non-slash messages now drive the agent. Without
-        // CLAUDE_CODE_OAUTH_TOKEN the provider build fails — non-fatal,
+        // CLAUDE_CODE_OAUTH_TOKEN the provider build fails - non-fatal,
         // we print the error and continue. Test that the REPL didn't
         // crash, did print the failure message, and still accepted
         // /quit afterward.
@@ -811,14 +802,13 @@ mod tests {
             user: huge_user,
             assistant: huge_asst,
         }];
-        let out =
-            build_chat_brain_context(None, &transcript, "next").expect("context");
+        let out = build_chat_brain_context(None, &transcript, "next").expect("context");
         // 1200/2 = 600-char cap per side; should be << 5000 chars.
-        // Plus the cap appends "…" only when actually truncated, and
+        // Plus the cap appends "..." only when actually truncated, and
         // preview uses char count not bytes. Verify clipping happened.
         assert!(out.contains("aaa"));
         assert!(out.contains("bbb"));
-        assert!(out.contains("…"), "expected the … truncation marker");
+        assert!(out.contains("..."), "expected the ... truncation marker");
     }
 
     #[test]
@@ -831,8 +821,7 @@ mod tests {
                 assistant: format!("assistant reply {i}"),
             })
             .collect();
-        let out = build_chat_brain_context(None, &transcript, "next")
-            .expect("context");
+        let out = build_chat_brain_context(None, &transcript, "next").expect("context");
         // Last 10 means turns 16..=25 are present, 1..=15 are gone.
         assert!(out.contains("user message 25"));
         assert!(out.contains("user message 16"));

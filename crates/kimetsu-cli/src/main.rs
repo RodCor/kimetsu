@@ -48,13 +48,10 @@ enum Command {
         #[command(subcommand)]
         command: LockCommand,
     },
-    /// MP-7a: agent transports. Today only `--harbor-mode` exists, used
-    /// by the Terminal-Bench Python wrapper (see docs/V0.2-PLAN.md MP-7).
-    Agent(AgentArgs),
-    /// v0.3: interactive REPL chat — kimetsu as a user-facing coding
+    /// v0.3: interactive REPL chat - kimetsu as a user-facing coding
     /// assistant. Reuses the full agent runtime (tools, prompts, brain,
-    /// MP-18 verify) with a stdin/stdout transport instead of harbor's
-    /// JSON-RPC. No dependency on Terminal-Bench.
+    /// MP-18 verify) with a stdin/stdout transport. No dependency on
+    /// Terminal-Bench.
     Chat(ChatArgs),
 }
 
@@ -66,12 +63,10 @@ struct ChatArgs {
     workspace: PathBuf,
     /// Path to a kimetsu project (contains `.kimetsu/`). When set, brain
     /// context retrieves on every model turn and MP-18 deviation
-    /// proposals can land in the pool's review queue. Same shape as
-    /// `agent --project` from harbor mode.
+    /// proposals can land in the pool's review queue.
     #[arg(long)]
     project: Option<PathBuf>,
-    /// Model id (defaults to `claude-opus-4-7`; honors
-    /// `$KIMETSU_HARBOR_MODEL` for parity with harbor mode).
+    /// Model id (defaults to `claude-opus-4-7`; honors `$KIMETSU_MODEL`).
     #[arg(long)]
     model: Option<String>,
     /// USD budget for this chat session. The cost meter prints running
@@ -87,46 +82,6 @@ struct ChatArgs {
     /// every fix-up cycle). Toggleable inline via `/strict on|off`.
     #[arg(long, default_value_t = false)]
     strict: bool,
-}
-
-#[derive(Debug, Args)]
-struct AgentArgs {
-    /// Speak the kimetsu↔Harbor JSON-RPC protocol on stdin/stdout
-    /// instead of executing tools locally. Used by Harbor's external-
-    /// agent mode for Terminal-Bench grading.
-    #[arg(long)]
-    harbor_mode: bool,
-    /// The instruction/task string the agent should work on.
-    #[arg(long)]
-    task: String,
-    /// Run the protocol-only multi-step stub instead of the real model
-    /// agent. Useful for smoke tests on machines without API credentials.
-    /// Default is to use the real model loop (claude_code provider).
-    #[arg(long)]
-    stub: bool,
-    /// Hard cap on model ↔ tool ping-pong rounds before agent.done is
-    /// forced. Defaults to DEFAULT_MODEL_TURN_BUDGET. Set lower in CI
-    /// to keep cost bounded.
-    #[arg(long, default_value_t = kimetsu_harbor_rs::DEFAULT_MODEL_TURN_BUDGET)]
-    turn_budget: u32,
-    /// Model id passed to the provider (claude_code only in v0.2).
-    /// Defaults to the value of $KIMETSU_HARBOR_MODEL or
-    /// `claude-opus-4-7` if unset — matches the v0.1 fixture bench's
-    /// model so the v0.2 Terminal-Bench numbers are directly
-    /// comparable to the existing MP-4 verdict. Use
-    /// `claude-sonnet-4-5` for the mid-budget tier or
-    /// `claude-haiku-4-5` for cheap iteration / smoke testing.
-    #[arg(long)]
-    model: Option<String>,
-    /// MP-11: path to a kimetsu project whose broker (curated memories,
-    /// prior-run capsules, repo capsules) should be injected into the
-    /// model's user message before the task. Without this flag the
-    /// agent runs in "no-brain" mode — the v0.2 kimetsu-no-brain
-    /// baseline. With it, the agent runs in "brain" mode — the
-    /// kimetsu-brain leg of the v0.2 falsifiable claim. Also honors
-    /// $KIMETSU_HARBOR_PROJECT if the flag is omitted.
-    #[arg(long)]
-    project: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -350,7 +305,7 @@ struct SweArgs {
     #[arg(long)]
     tasks: PathBuf,
     /// Caller-prepared repo path. Kimetsu does NOT clone or apply test_patch
-    /// in v0.1 — see docs/SWEBENCH.md for the full integration plan.
+    /// in v0.1 â€” see docs/SWEBENCH.md for the full integration plan.
     #[arg(long)]
     repo: PathBuf,
     /// Run a single instance by id (default: every task).
@@ -379,7 +334,7 @@ struct BenchRunArgs {
     limit: Option<usize>,
     /// Soft cost cap; bench stops scheduling new tasks once cumulative model
     /// cost exceeds this. Defaults high because Claude Code OAuth is on a
-    /// subscription — cost is reported as a metric, not a hard constraint.
+    /// subscription â€” cost is reported as a metric, not a hard constraint.
     /// Pass a smaller value if you want the bench to stop early on metered
     /// providers.
     #[arg(long, default_value_t = 250.0)]
@@ -450,99 +405,12 @@ fn run() -> KimetsuResult<()> {
         Command::Bench { command } => bench(command),
         Command::Runs { command } => runs(command),
         Command::Lock { command } => lock(command),
-        Command::Agent(args) => agent(args),
         Command::Chat(args) => chat(args),
     }
 }
 
-/// MP-7c/d: dispatcher for `kimetsu agent`. Builds a `HarborSession`,
-/// wraps it in a `HarborShellExecutor` that fronts a real `ToolRuntime`,
-/// then either:
-///   - drives the protocol-only multi-step stub (`--stub`) for smoke
-///     tests on machines without API credentials, or
-///   - runs the real model agent loop (default) — model issues
-///     shell_command tool calls based on the task; we route them
-///     through HarborShellExecutor and feed results back.
-fn agent(args: AgentArgs) -> KimetsuResult<()> {
-    // v0.3.2: harbor transport types live in kimetsu-harbor-rs now.
-    // The transport-agnostic agent loop (run_model_agent) still lives
-    // in kimetsu-agent and is re-exported via kimetsu-harbor-rs.
-    use kimetsu_agent::tools::{ToolRuntime, ToolRuntimeConfig};
-    use kimetsu_core::ids::RunId;
-    use kimetsu_harbor_rs::{
-        AgentDoneParams, HarborSession, HarborShellExecutor, run_model_agent, run_multi_step_stub,
-    };
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    if !args.harbor_mode {
-        return Err(
-            "kimetsu agent currently only supports --harbor-mode; see docs/V0.2-PLAN.md MP-7"
-                .into(),
-        );
-    }
-
-    // We need *something* as a repo_root for ToolRuntime's artifact
-    // bookkeeping; in harbor mode no host-side path validation matters
-    // because subprocess work routes through Harbor.
-    let scratch = std::env::temp_dir().join(format!("kimetsu-harbor-{}", RunId::new()));
-    std::fs::create_dir_all(&scratch)?;
-
-    let stdin = io::stdin();
-    let reader = stdin.lock();
-    let stdout = io::stdout();
-    let writer = stdout.lock();
-    let session = Rc::new(RefCell::new(HarborSession::new(reader, writer)));
-
-    let executor: Box<dyn kimetsu_agent::tools::ShellExecutor> =
-        Box::new(HarborShellExecutor::new(Rc::clone(&session)));
-
-    let result: KimetsuResult<()> = {
-        let mut runtime = ToolRuntime::new(&scratch, RunId::new())?
-            .with_shell_executor(executor)
-            .with_config(ToolRuntimeConfig {
-                redact_secrets: false,
-                ..ToolRuntimeConfig::default()
-            });
-
-        if args.stub {
-            let _ = run_multi_step_stub(&args.task, Rc::clone(&session), &mut runtime)?;
-        } else {
-            let mut provider = build_harbor_model_provider(args.model.as_deref(), &scratch)?;
-
-            // MP-11: resolve --project / $KIMETSU_HARBOR_PROJECT into a
-            // brain context block (curated memories + prior-run capsules)
-            // to inject into the user message. Empty / missing project =
-            // no-brain mode.
-            let brain_context = resolve_brain_context(args.project.as_deref(), &args.task)?;
-
-            // v0.3.1 Phase-2: agent loop is transport-agnostic. CLI
-            // calls run_model_agent + emits the agent.done frame here
-            // (instead of the loop emitting it internally).
-            let report = run_model_agent(
-                &args.task,
-                &mut runtime,
-                &mut *provider,
-                kimetsu_harbor_rs::HarborAgentOpts {
-                    turn_budget: args.turn_budget,
-                    ..kimetsu_harbor_rs::HarborAgentOpts::default()
-                },
-                brain_context.as_deref(),
-            )?;
-            session.borrow_mut().emit_done(AgentDoneParams {
-                summary: report.summary,
-                context: Some(report.context),
-            })?;
-        }
-        Ok(())
-    };
-
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
-}
-
 /// v0.3: `kimetsu chat` subcommand. Reuses the kimetsu-agent runtime
-/// via the kimetsu-chat crate. NO dependency on kimetsu-harbor-rs — by
+/// via the kimetsu-chat crate. NO dependency on kimetsu-harbor-rs â€” by
 /// design, chat is its own product surface, completely independent of
 /// Terminal-Bench / Harbor.
 fn chat(args: ChatArgs) -> KimetsuResult<()> {
@@ -553,10 +421,10 @@ fn chat(args: ChatArgs) -> KimetsuResult<()> {
     config.brain_project = args.project;
     if let Some(m) = args.model {
         config.model = m;
-    } else if let Ok(m) = std::env::var("KIMETSU_HARBOR_MODEL") {
-        if !m.is_empty() {
-            config.model = m;
-        }
+    } else if let Ok(m) = std::env::var("KIMETSU_MODEL")
+        && !m.is_empty()
+    {
+        config.model = m;
     }
     config.max_cost_usd = args.max_cost_usd;
     config.goal = args.goal;
@@ -567,127 +435,6 @@ fn chat(args: ChatArgs) -> KimetsuResult<()> {
     let reader = stdin.lock();
     let writer = stdout.lock();
     run_repl(reader, writer, config).map_err(|e| format!("kimetsu chat: {e}").into())
-}
-
-/// MP-7d: construct a ModelProvider for the harbor agent. Reads
-/// `CLAUDE_CODE_OAUTH_TOKEN` from the environment (set by the Harbor
-/// run command or the Python adapter) and instantiates a
-/// `ClaudeCodeProvider` directly — no kimetsu project required, since
-/// in harbor mode the workspace lives in Harbor's container and the
-/// host has nothing to load. Anthropic provider can land in MP-7e when
-/// the bench shows a need.
-fn build_harbor_model_provider(
-    model_override: Option<&str>,
-    scratch: &std::path::Path,
-) -> KimetsuResult<Box<dyn kimetsu_agent::model::ModelProvider>> {
-    use kimetsu_agent::claude_code::ClaudeCodeProvider;
-    use kimetsu_core::config::ProjectConfig;
-
-    let oauth = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").map_err(|_| {
-        "CLAUDE_CODE_OAUTH_TOKEN is not set; required for `kimetsu agent --harbor-mode` model runs (or pass --stub)"
-    })?;
-    let model_name = model_override
-        .map(str::to_string)
-        .or_else(|| std::env::var("KIMETSU_HARBOR_MODEL").ok())
-        .unwrap_or_else(|| "claude-opus-4-7".to_string());
-
-    // Synthesize a minimal ProjectConfig so ClaudeCodeProvider's
-    // from_config_with_key plumbing keeps working. Most fields are
-    // unused in harbor mode (we override the api_key directly).
-    let mut config = ProjectConfig::default_for_project("kimetsu-harbor");
-    config.model.provider = "claude_code".to_string();
-    config.model.model = model_name;
-    config.model.api_key_env = "CLAUDE_CODE_OAUTH_TOKEN".to_string();
-    // MP-15a: provider wall-clock per-call timeout.
-    //   default bumped 600 -> 1500 (25 min). 600 was killing
-    //   `circuit-fibsqrt`-class tasks where the model was still
-    //   actively iterating; bare CC won that task, so it's a
-    //   recoverable gate-2 loss. Env override
-    //   `KIMETSU_HARBOR_PROVIDER_TIMEOUT_SECS` lets the cron /
-    //   stability harness retune without rebuilding.
-    config.model.request_timeout_secs = std::env::var("KIMETSU_HARBOR_PROVIDER_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1500);
-    config.run.max_total_cost_usd = 5.0;
-
-    match ClaudeCodeProvider::from_config_with_key(scratch, &config, Some(&oauth))? {
-        Some(provider) => Ok(Box::new(provider)),
-        None => Err("failed to construct ClaudeCodeProvider (no API key resolved)".into()),
-    }
-}
-
-/// MP-11: resolve the optional --project (or $KIMETSU_HARBOR_PROJECT)
-/// path into a rendered brain-context string that `run_model_agent`
-/// prepends to the user message. The path must point at a kimetsu
-/// project root (i.e. contain a `.kimetsu/` directory with brain.db).
-///
-/// Behaviour:
-/// - flag/env unset OR resolved path missing -> Ok(None) (no-brain mode)
-/// - resolved path present but broker returns no capsules within budget
-///   -> Ok(Some("(no broker capsules retrieved)")) for telemetry; the
-///   run_model_agent caller treats trimmed-empty as no-brain anyway
-/// - retrieval errors out -> surface the error rather than silently
-///   degrading to no-brain (we don't want a broken brain pool to
-///   masquerade as "no-brain" in the v0.2 comparison)
-fn resolve_brain_context(
-    cli_path: Option<&Path>,
-    task: &str,
-) -> KimetsuResult<Option<String>> {
-    let resolved = cli_path
-        .map(|p| p.to_path_buf())
-        .or_else(|| std::env::var("KIMETSU_HARBOR_PROJECT").ok().map(PathBuf::from));
-    let Some(project_dir) = resolved else {
-        return Ok(None);
-    };
-    if !project_dir.is_dir() {
-        eprintln!(
-            "kimetsu agent: --project {} is not a directory; running no-brain",
-            project_dir.display()
-        );
-        return Ok(None);
-    }
-
-    // Use "harbor" as the broker stage label so context.rs scoring
-    // can route it however the v0.1 weights specify (currently
-    // unknown stages fall back to defaults). 2000 tokens of budget
-    // — enough for 5-10 capsules without dominating the user
-    // message.
-    let bundle = match project::retrieve_context(&project_dir, "harbor", task, 2000) {
-        Ok(b) => b,
-        Err(err) => {
-            return Err(format!(
-                "failed to retrieve broker context from {}: {err}",
-                project_dir.display()
-            )
-            .into());
-        }
-    };
-
-    if bundle.capsules.is_empty() {
-        return Ok(Some(
-            "(no broker capsules retrieved — project has no memories or no relevance hit)".to_string(),
-        ));
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Retrieved {} capsule(s) within a {}-token budget ({} tokens used):\n",
-        bundle.capsules.len(),
-        bundle.budget_tokens,
-        bundle.used_tokens,
-    ));
-    for (i, c) in bundle.capsules.iter().enumerate() {
-        out.push_str(&format!(
-            "[{idx}] {kind} (score {score:.2}, scope_weight {sw:.2})\n  {summary}\n",
-            idx = i + 1,
-            kind = c.kind,
-            score = c.score,
-            sw = c.scope_weight,
-            summary = c.summary,
-        ));
-    }
-    Ok(Some(out))
 }
 
 fn init(args: InitArgs) -> KimetsuResult<()> {
@@ -880,10 +627,10 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
                 if !proposal.rationale.is_empty() {
                     println!("  rationale: {}", proposal.rationale);
                 }
-                if let Some(reason) = proposal.decided_reason.as_deref() {
-                    if !reason.is_empty() {
-                        println!("  decided_reason: {reason}");
-                    }
+                if let Some(reason) = proposal.decided_reason.as_deref()
+                    && !reason.is_empty()
+                {
+                    println!("  decided_reason: {reason}");
                 }
             }
             Ok(())
@@ -946,7 +693,10 @@ fn memory_top(args: TopArgs) -> KimetsuResult<()> {
         },
     )?;
     if rows.is_empty() {
-        println!("no memories meet the min-uses threshold ({})", args.min_uses);
+        println!(
+            "no memories meet the min-uses threshold ({})",
+            args.min_uses
+        );
         return Ok(());
     }
     println!(
@@ -1027,10 +777,10 @@ fn memory_prune(args: PruneArgs) -> KimetsuResult<()> {
 
 /// MP-5a/b: review handler. Three modes:
 ///
-/// * `--accept-all` / `--reject-all` — non-interactive batch (MP-5a).
-/// * No flags + stdin is a TTY — interactive walkthrough (MP-5b): one
+/// * `--accept-all` / `--reject-all` â€” non-interactive batch (MP-5a).
+/// * No flags + stdin is a TTY â€” interactive walkthrough (MP-5b): one
 ///   proposal at a time, prompt `[a]ccept [r]eject [s]kip [q]uit`.
-/// * No flags + stdin is NOT a TTY — error, so a misconfigured CI script
+/// * No flags + stdin is NOT a TTY â€” error, so a misconfigured CI script
 ///   never silently hangs on a stdin read.
 fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
     if args.accept_all && args.reject_all {
@@ -1061,8 +811,7 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
     if !args.accept_all && !args.reject_all {
         if !io::stdin().is_terminal() {
             return Err(
-                "memory review requires --accept-all / --reject-all when stdin is not a TTY"
-                    .into(),
+                "memory review requires --accept-all / --reject-all when stdin is not a TTY".into(),
             );
         }
         return interactive_review_loop(&cwd, pending);
@@ -1105,10 +854,7 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
                 }
                 Err(err) => {
                     failed += 1;
-                    eprintln!(
-                        "skipped accept on {}: {err}",
-                        proposal.proposal_id
-                    );
+                    eprintln!("skipped accept on {}: {err}", proposal.proposal_id);
                 }
             }
         } else {
@@ -1122,18 +868,13 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
                 }
                 Err(err) => {
                     failed += 1;
-                    eprintln!(
-                        "skipped reject on {}: {err}",
-                        proposal.proposal_id
-                    );
+                    eprintln!("skipped reject on {}: {err}", proposal.proposal_id);
                 }
             }
         }
     }
 
-    println!(
-        "summary: accepted={accepted} rejected={rejected} failed={failed}"
-    );
+    println!("summary: accepted={accepted} rejected={rejected} failed={failed}");
     Ok(())
 }
 
@@ -1145,7 +886,7 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
 ///   `a` accept | `r` reject | `s` skip | `q` quit | `?` re-print help
 /// On `r` we ask for an optional reason on a follow-up line; empty input
 /// keeps the default `reviewed_rejected_interactive`. Edits to scope /
-/// kind / text are deferred to MP-5c — for now [s]kip + the existing
+/// kind / text are deferred to MP-5c â€” for now [s]kip + the existing
 /// `memory accept --scope X` / `memory reject` commands cover that path.
 fn interactive_review_loop(cwd: &Path, pending: Vec<project::ProposalRow>) -> KimetsuResult<()> {
     let stdin = io::stdin();
@@ -1203,10 +944,7 @@ fn interactive_review_loop_inner<R: BufRead, W: Write>(
                 let processed = accepted + rejected + skipped + failed;
                 let unprocessed = (total as u32).saturating_sub(processed);
                 skipped += unprocessed;
-                writeln!(
-                    writer,
-                    "(stdin closed; {unprocessed} proposal(s) skipped)"
-                )?;
+                writeln!(writer, "(stdin closed; {unprocessed} proposal(s) skipped)")?;
                 print_interactive_summary(writer, accepted, rejected, skipped, failed)?;
                 return Ok(());
             }
@@ -1345,7 +1083,7 @@ fn bench(command: BenchCommand) -> KimetsuResult<()> {
                     instance.trace_path.display(),
                 );
             }
-            return Ok(());
+            Ok(())
         }
         BenchCommand::Run(args) => {
             let result = run_benchmark(BenchOptions {
@@ -1458,22 +1196,39 @@ mod tests {
     #[test]
     fn interactive_loop_accepts_rejects_and_skips_from_scripted_input() {
         // ulid-named temp dir to avoid collisions when tests run concurrently.
-        let root = std::env::temp_dir()
-            .join(format!("kimetsu-cli-test-{}", RunId::new()));
+        let root = std::env::temp_dir().join(format!("kimetsu-cli-test-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project");
         project::init_project(&root, false).expect("init project");
 
         // Inject 3 pending proposals via the brain's event-sourced path.
         let proposals: [(&str, &str, &str, f32, &str); 3] = [
-            ("p_accept",  "global_user", "preference", 0.92, "Prefer rg over grep"),
-            ("p_reject",  "repo",        "convention", 0.66, "Always use let-else"),
-            ("p_skip",    "repo",        "convention", 0.71, "Use find_* for fallible lookups"),
+            (
+                "p_accept",
+                "global_user",
+                "preference",
+                0.92,
+                "Prefer rg over grep",
+            ),
+            (
+                "p_reject",
+                "repo",
+                "convention",
+                0.66,
+                "Always use let-else",
+            ),
+            (
+                "p_skip",
+                "repo",
+                "convention",
+                0.71,
+                "Use find_* for fallible lookups",
+            ),
         ];
         {
             let (paths, _config, conn) = project::load_project(&root).expect("load");
             let run_id = RunId::new();
-            let (mut writer, _) = kimetsu_brain::trace::TraceWriter::create(&paths, run_id)
-                .expect("trace");
+            let (mut writer, _) =
+                kimetsu_brain::trace::TraceWriter::create(&paths, run_id).expect("trace");
             for (proposal_id, scope, kind, conf, text) in &proposals {
                 let event = Event::new(
                     run_id,
@@ -1518,7 +1273,10 @@ mod tests {
             .expect("interactive loop");
 
         let out = String::from_utf8(writer).expect("utf8 output");
-        assert!(out.contains("interactive review: 3 pending proposal(s)"), "{out}");
+        assert!(
+            out.contains("interactive review: 3 pending proposal(s)"),
+            "{out}"
+        );
         assert!(out.contains("-> accepted: memory"), "{out}");
         assert!(out.contains("-> rejected (reason: because noisy)"), "{out}");
         assert!(out.contains("-> skipped (still pending)"), "{out}");
@@ -1567,21 +1325,20 @@ mod tests {
     /// the remaining pending proposals.
     #[test]
     fn interactive_loop_quit_preserves_partial_decisions() {
-        let root = std::env::temp_dir()
-            .join(format!("kimetsu-cli-test-{}", RunId::new()));
+        let root = std::env::temp_dir().join(format!("kimetsu-cli-test-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project");
         project::init_project(&root, false).expect("init project");
 
         let proposals: [(&str, &str, &str, f32, &str); 3] = [
             ("q_accept", "global_user", "preference", 0.91, "Use ripgrep"),
-            ("q_a",      "repo",        "convention", 0.71, "Memory two"),
-            ("q_b",      "repo",        "convention", 0.71, "Memory three"),
+            ("q_a", "repo", "convention", 0.71, "Memory two"),
+            ("q_b", "repo", "convention", 0.71, "Memory three"),
         ];
         {
             let (paths, _config, conn) = project::load_project(&root).expect("load");
             let run_id = RunId::new();
-            let (mut writer, _) = kimetsu_brain::trace::TraceWriter::create(&paths, run_id)
-                .expect("trace");
+            let (mut writer, _) =
+                kimetsu_brain::trace::TraceWriter::create(&paths, run_id).expect("trace");
             for (proposal_id, scope, kind, conf, text) in &proposals {
                 let event = Event::new(
                     run_id,
@@ -1618,8 +1375,7 @@ mod tests {
         let scripted = b"a\nq\n";
         let mut reader = Cursor::new(&scripted[..]);
         let mut writer = Vec::<u8>::new();
-        interactive_review_loop_inner(&root, pending, &mut reader, &mut writer)
-            .expect("loop");
+        interactive_review_loop_inner(&root, pending, &mut reader, &mut writer).expect("loop");
 
         let out = String::from_utf8(writer).expect("utf8");
         assert!(out.contains("-> accepted: memory"), "{out}");
@@ -1640,7 +1396,11 @@ mod tests {
             },
         )
         .expect("list pending after");
-        assert_eq!(pending_after.len(), 2, "two proposals still pending after quit");
+        assert_eq!(
+            pending_after.len(),
+            2,
+            "two proposals still pending after quit"
+        );
 
         fs::remove_dir_all(root).expect("remove temp project");
     }

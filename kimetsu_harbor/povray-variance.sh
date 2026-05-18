@@ -44,12 +44,12 @@ fi
 
 cd "$REPO"
 echo "[$(date -u +%H:%M:%SZ)] building..."
-cargo build -p kimetsu-cli --release >/dev/null 2>&1 || {
+cargo build -p kimetsu-harbor-rs --release >/dev/null 2>&1 || {
     echo "build failed; aborting" >&2
     exit 3
 }
 
-export KIMETSU_BIN="$REPO/target/release/kimetsu"
+export KIMETSU_HARBOR_BIN="$REPO/target/release/kimetsu-harbor-agent"
 export KIMETSU_HARBOR_MODEL="claude-opus-4-7"
 export KIMETSU_HARBOR_PROJECT="$BRAIN_PROJECT"
 

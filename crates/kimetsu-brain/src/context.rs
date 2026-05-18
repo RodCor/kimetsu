@@ -141,21 +141,36 @@ pub fn search_repo_files(
 
 fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
+    if let Some(fts_query) = fts_query(query) {
+        let candidates = memory_fts_candidates(conn, &query_tokens, &fts_query, 80)?;
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+
+    latest_memory_candidates(conn, &query_tokens, 200)
+}
+
+fn latest_memory_candidates(
+    conn: &Connection,
+    query_tokens: &[String],
+    limit: u32,
+) -> KimetsuResult<Vec<Candidate>> {
     // MP-4d: exclude invalidated memories from retrieval. The row stays in
     // brain.db so `memory list` and replay can still see the history; only
     // the broker filters it out.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT memory_id, scope, kind, text, confidence, created_at,
                use_count, usefulness_score
         FROM memories
         WHERE invalidated_at IS NULL
         ORDER BY created_at DESC
-        LIMIT 200
+        LIMIT ?1
         ",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![limit], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -172,43 +187,133 @@ fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candid
     for row in rows {
         let (memory_id, scope, kind, text, confidence, created_at, use_count, usefulness_score) =
             row?;
-        let raw_relevance = lexical_relevance(&query_tokens, &format!("{kind} {text}"));
-        if raw_relevance <= 0.0 && !query_tokens.is_empty() {
-            continue;
+        if let Some(candidate) = memory_row_to_candidate(
+            query_tokens,
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            None,
+        ) {
+            candidates.push(candidate);
         }
-
-        let freshness = freshness(&created_at);
-        let scope_weight = scope_weight(&scope);
-        // MP-4b: bias raw_relevance by usefulness so memories that have
-        // consistently helped surface higher and memories that have
-        // consistently hurt surface lower. small_sample_threshold=3 means
-        // a fresh memory gets neutral treatment until it has data; the
-        // multiplier envelope is [0.5, 1.5] so a single memory cannot
-        // dominate the budget in either direction.
-        let multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
-        let biased_relevance = raw_relevance * multiplier;
-        candidates.push(Candidate {
-            raw_relevance: biased_relevance,
-            capsule: ContextCapsule {
-                id: new_id().to_string(),
-                kind: "memory".to_string(),
-                summary: format!("{scope}:{kind} - {text}"),
-                token_estimate: estimate_tokens(&text) + 8,
-                expansion_handle: format!("memory:{memory_id}"),
-                provenance: vec![ProvenanceRef {
-                    source: "Memory".to_string(),
-                    id: memory_id,
-                    excerpt: Some(excerpt(&text)),
-                }],
-                confidence,
-                freshness,
-                relevance: 0.0,
-                scope_weight,
-                score: 0.0,
-            },
-        });
     }
     Ok(candidates)
+}
+
+fn memory_fts_candidates(
+    conn: &Connection,
+    query_tokens: &[String],
+    fts_query: &str,
+    limit: u32,
+) -> KimetsuResult<Vec<Candidate>> {
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT m.memory_id, m.scope, m.kind, m.text, m.confidence, m.created_at,
+               m.use_count, m.usefulness_score, bm25(memories_fts) AS rank
+        FROM memories_fts
+        JOIN memories m
+          ON m.memory_id = memories_fts.memory_id
+        WHERE m.invalidated_at IS NULL
+          AND memories_fts MATCH ?1
+        ORDER BY rank
+        LIMIT ?2
+        ",
+    )?;
+
+    let rows = stmt.query_map(params![fts_query, limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f32>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, f64>(7)?,
+            row.get::<_, f64>(8)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            rank,
+        ) = row?;
+        let fts_relevance = (-rank as f32).max(0.0);
+        if let Some(candidate) = memory_row_to_candidate(
+            query_tokens,
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            Some(fts_relevance),
+        ) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_row_to_candidate(
+    query_tokens: &[String],
+    memory_id: String,
+    scope: String,
+    kind: String,
+    text: String,
+    confidence: f32,
+    created_at: String,
+    use_count: i64,
+    usefulness_score: f64,
+    raw_relevance_override: Option<f32>,
+) -> Option<Candidate> {
+    let lexical = lexical_relevance(query_tokens, &format!("{kind} {text}"));
+    let raw_relevance = raw_relevance_override.unwrap_or(lexical).max(lexical);
+    if raw_relevance <= 0.0 && !query_tokens.is_empty() {
+        return None;
+    }
+
+    let freshness = freshness(&created_at);
+    let scope_weight = scope_weight(&scope);
+    let multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
+    let biased_relevance = raw_relevance * multiplier;
+    Some(Candidate {
+        raw_relevance: biased_relevance,
+        capsule: ContextCapsule {
+            id: new_id().to_string(),
+            kind: "memory".to_string(),
+            summary: format!("{scope}:{kind} - {text}"),
+            token_estimate: estimate_tokens(&text) + 8,
+            expansion_handle: format!("memory:{memory_id}"),
+            provenance: vec![ProvenanceRef {
+                source: "Memory".to_string(),
+                id: memory_id,
+                excerpt: Some(excerpt(&text)),
+            }],
+            confidence,
+            freshness,
+            relevance: 0.0,
+            scope_weight,
+            score: 0.0,
+        },
+    })
 }
 
 /// MP-4b multiplier in [0.5, 1.5] derived from a memory's outcome history.
@@ -246,7 +351,7 @@ fn repo_file_candidates(
         return Ok(Vec::new());
     };
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT path, snippet, language_guess, bm25(repo_files_fts) AS rank
         FROM repo_files_fts
@@ -300,8 +405,15 @@ fn manifest_candidates(
     repo_root: &str,
     query: &str,
 ) -> KimetsuResult<Vec<Candidate>> {
+    if let Some(fts_query) = fts_query(query) {
+        let candidates = manifest_fts_candidates(conn, repo_root, &fts_query, 30)?;
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+
     let query_tokens = query_tokens(query);
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT manifest_path, manifest_kind, parsed_summary_json
         FROM repo_manifests
@@ -326,6 +438,62 @@ fn manifest_candidates(
         if raw_relevance <= 0.0 && !query_tokens.is_empty() {
             continue;
         }
+        let summary = format!("{path} manifest ({kind})");
+        let token_estimate = estimate_tokens(&summary) + 8;
+        candidates.push(Candidate {
+            raw_relevance,
+            capsule: ContextCapsule {
+                id: new_id().to_string(),
+                kind: "repo_manifest".to_string(),
+                summary,
+                token_estimate,
+                expansion_handle: format!("file:{path}"),
+                provenance: vec![ProvenanceRef {
+                    source: "Manifest".to_string(),
+                    id: path,
+                    excerpt: Some(excerpt(&summary_json)),
+                }],
+                confidence: 0.95,
+                freshness: 1.0,
+                relevance: 0.0,
+                scope_weight: 0.9,
+                score: 0.0,
+            },
+        });
+    }
+    Ok(candidates)
+}
+
+fn manifest_fts_candidates(
+    conn: &Connection,
+    repo_root: &str,
+    fts_query: &str,
+    limit: u32,
+) -> KimetsuResult<Vec<Candidate>> {
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT manifest_path, manifest_kind, parsed_summary_json,
+               bm25(repo_manifests_fts) AS rank
+        FROM repo_manifests_fts
+        WHERE repo_root = ?1 AND repo_manifests_fts MATCH ?2
+        ORDER BY rank
+        LIMIT ?3
+        ",
+    )?;
+
+    let rows = stmt.query_map(params![repo_root, fts_query, limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, f64>(3)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (path, kind, summary_json, rank) = row?;
+        let raw_relevance = (-rank as f32).max(0.0);
         let summary = format!("{path} manifest ({kind})");
         let token_estimate = estimate_tokens(&summary) + 8;
         candidates.push(Candidate {
@@ -451,15 +619,38 @@ fn query_tokens(query: &str) -> Vec<String> {
 // surface preferentially.
 const CLASS_HINTS: &[(&[&str], &[&str])] = &[
     (
-        &["build", "compile", "make", "cargo", "cmake", "configure", "install", "train", "benchmark", "test suite", "ray trace", "render"],
-        &["shell_background", "shell_status", "shell_output", "shell_stop", "long_running"],
+        &[
+            "build",
+            "compile",
+            "make",
+            "cargo",
+            "cmake",
+            "configure",
+            "install",
+            "train",
+            "benchmark",
+            "test suite",
+            "ray trace",
+            "render",
+        ],
+        &[
+            "shell_background",
+            "shell_status",
+            "shell_output",
+            "shell_stop",
+            "long_running",
+        ],
     ),
     (
-        &["edit", "modify", "change", "fix", "update", "patch", "refactor", "rename"],
+        &[
+            "edit", "modify", "change", "fix", "update", "patch", "refactor", "rename",
+        ],
         &["edit_file", "apply_patch", "old_string", "new_string"],
     ),
     (
-        &["read", "inspect", "review", "analyze", "examine", "view", "show"],
+        &[
+            "read", "inspect", "review", "analyze", "examine", "view", "show",
+        ],
         &["read_file", "offset", "limit", "multi_read"],
     ),
     (
@@ -471,21 +662,30 @@ const CLASS_HINTS: &[(&[&str], &[&str])] = &[
         &["plan", "todos"],
     ),
     (
-        &["verify", "check", "ensure", "validate", "pass test", "verifier"],
+        &[
+            "verify",
+            "check",
+            "ensure",
+            "validate",
+            "pass test",
+            "verifier",
+        ],
         &["finish", "verifier", "verification"],
     ),
     (
-        &["image", "png", "jpeg", "jpg", "pdf", "diagram", "screenshot"],
+        &[
+            "image",
+            "png",
+            "jpeg",
+            "jpg",
+            "pdf",
+            "diagram",
+            "screenshot",
+        ],
         &["view_image", "base64", "sha256"],
     ),
-    (
-        &["delete", "remove", "rm "],
-        &["delete_file", "recursive"],
-    ),
-    (
-        &["rename", "move file", "mv "],
-        &["move_file"],
-    ),
+    (&["delete", "remove", "rm "], &["delete_file", "recursive"]),
+    (&["rename", "move file", "mv "], &["move_file"]),
 ];
 
 fn fts_query(query: &str) -> Option<String> {
@@ -514,10 +714,7 @@ fn fts_query(query: &str) -> Option<String> {
 /// manifest) get a 0.5 similarity floor so redundancy is only penalized
 /// within-kind (a memory and a repo_file aren't really redundant even
 /// if they share words).
-fn apply_mmr_diversity(
-    mut sorted: Vec<ContextCapsule>,
-    lambda: f32,
-) -> Vec<ContextCapsule> {
+fn apply_mmr_diversity(mut sorted: Vec<ContextCapsule>, lambda: f32) -> Vec<ContextCapsule> {
     if sorted.len() <= 1 {
         return sorted;
     }
@@ -633,15 +830,18 @@ mod tests {
         // use_count = 1, ratio = 1.0 -> confidence 1/3, blend toward 1.5
         // expected = 1.0 * 2/3 + 1.5 * 1/3 = 1.1667
         let one_use = usefulness_multiplier(1.0, 1);
-        assert!((one_use - 1.16666666).abs() < 1e-4, "got {one_use}");
+        assert!((one_use - 1.166_666_6).abs() < 1e-4, "got {one_use}");
         // use_count = 2, ratio = 1.0 -> confidence 2/3, blend toward 1.5
         // expected = 1.0 * 1/3 + 1.5 * 2/3 = 1.3333
         let two_uses = usefulness_multiplier(2.0, 2);
-        assert!((two_uses - 1.33333333).abs() < 1e-4, "got {two_uses}");
+        assert!((two_uses - 1.333_333_4).abs() < 1e-4, "got {two_uses}");
         // use_count = 2 with ratio = -1.0 should pull toward the penalty side.
         let two_uses_bad = usefulness_multiplier(-2.0, 2);
         // expected = 1.0 * 1/3 + 0.5 * 2/3 = 0.6667
-        assert!((two_uses_bad - 0.66666666).abs() < 1e-4, "got {two_uses_bad}");
+        assert!(
+            (two_uses_bad - 0.666_666_7).abs() < 1e-4,
+            "got {two_uses_bad}"
+        );
     }
 
     /// MP-4b: at use_count >= 3 the multiplier maps ratio in [-1, 1] linearly
@@ -730,8 +930,10 @@ mod tests {
 
     #[test]
     fn jaccard_partial_overlap() {
-        let a: std::collections::HashSet<String> =
-            ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        let a: std::collections::HashSet<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let b: std::collections::HashSet<String> =
             ["bar", "qux"].iter().map(|s| s.to_string()).collect();
         // intersection = {bar} = 1, union = {foo,bar,baz,qux} = 4

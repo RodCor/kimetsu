@@ -17,8 +17,8 @@ use serde::Deserialize;
 
 use crate::agent_loop::extract_json_object;
 use crate::model::{
-    MessageContent, MessageRole, ModelProvider, ModelRequest, ModelResponse, StopReason, TokenUsage,
-    ToolCall, ToolDefinition,
+    MessageContent, MessageRole, ModelProvider, ModelRequest, ModelResponse, StopReason,
+    TokenUsage, ToolCall, ToolDefinition,
 };
 
 #[derive(Debug)]
@@ -154,6 +154,17 @@ fn fingerprint(system_prompt: &str, model: &str) -> u64 {
     h.finish()
 }
 
+fn claude_persistent_enabled(default: bool) -> bool {
+    match std::env::var("KIMETSU_CLAUDE_PERSISTENT") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
 impl ClaudeCodeProvider {
     pub fn from_config(repo_root: &Path, config: &ProjectConfig) -> KimetsuResult<Option<Self>> {
         Self::from_config_with_key(repo_root, config, None)
@@ -163,6 +174,15 @@ impl ClaudeCodeProvider {
         repo_root: &Path,
         config: &ProjectConfig,
         key_override: Option<&str>,
+    ) -> KimetsuResult<Option<Self>> {
+        Self::from_config_with_key_and_persistent_default(repo_root, config, key_override, false)
+    }
+
+    pub fn from_config_with_key_and_persistent_default(
+        repo_root: &Path,
+        config: &ProjectConfig,
+        key_override: Option<&str>,
+        persistent_default: bool,
     ) -> KimetsuResult<Option<Self>> {
         if config.model.provider != "claude_code" {
             return Err(format!("unsupported model provider: {}", config.model.provider).into());
@@ -182,17 +202,7 @@ impl ClaudeCodeProvider {
         let config_dir = work_dir.path().join("config");
         fs::create_dir_all(&config_dir)?;
 
-        // v0.3.4e: opt-in persistent subprocess mode. Off by default
-        // until we live-validate that cache_read_input_tokens grows
-        // turn-over-turn. Truthy values: "1", "true", "yes" (case-
-        // insensitive). Any other value or unset = off.
-        let persistent_enabled = std::env::var("KIMETSU_CLAUDE_PERSISTENT")
-            .ok()
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                v == "1" || v == "true" || v == "yes"
-            })
-            .unwrap_or(false);
+        let persistent_enabled = claude_persistent_enabled(persistent_default);
 
         Ok(Some(Self {
             api_key: secret,
@@ -252,8 +262,8 @@ impl ClaudeCodeProvider {
                 "content": user_text,
             }
         });
-        let mut line = serde_json::to_string(&user_event)
-            .map_err(|e| format!("serialize user event: {e}"))?;
+        let mut line =
+            serde_json::to_string(&user_event).map_err(|e| format!("serialize user event: {e}"))?;
         line.push('\n');
 
         if let Err(err) = session.stdin.write_all(line.as_bytes()) {
@@ -586,12 +596,13 @@ impl ModelProvider for ClaudeCodeProvider {
 
         let mut last_error: Option<String> = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            let output = run_with_timeout_stdin(build_command(), &prompt, self.timeout).map_err(|err| {
-                redact_token(
-                    &format!("claude_code provider failed: {err}"),
-                    &self.api_key,
-                )
-            })?;
+            let output =
+                run_with_timeout_stdin(build_command(), &prompt, self.timeout).map_err(|err| {
+                    redact_token(
+                        &format!("claude_code provider failed: {err}"),
+                        &self.api_key,
+                    )
+                })?;
 
             // Two retry conditions:
             //  (a) Claude Code exits non-zero AND stdout JSON has
@@ -935,10 +946,18 @@ fn run_with_timeout_stdin(
     loop {
         if let Some(status) = child.try_wait()? {
             let stdout_bytes = stdout_handle
-                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())).unwrap_or_default())
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Ok(Vec::new()))
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default();
             let stderr_bytes = stderr_handle
-                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())).unwrap_or_default())
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Ok(Vec::new()))
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default();
             return Ok(Output {
                 status,
@@ -1317,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_json_parser_picks_LAST_result_when_multiple() {
+    fn stream_json_parser_picks_last_result_when_multiple() {
         // Defensive: if claude emits multiple result events (e.g. due to
         // a bug or retry), we take the last one as the canonical wrap-up.
         let stream = r#"{"type":"result","is_error":true,"result":"transient error","stop_reason":"end_turn"}

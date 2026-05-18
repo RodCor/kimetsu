@@ -66,7 +66,6 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
 
         CREATE INDEX IF NOT EXISTS idx_memories_scope_kind_norm
             ON memories (scope, kind, normalized_text);
-
         CREATE TABLE IF NOT EXISTS memory_proposals (
             proposal_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -112,8 +111,11 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS repo_files_fts
             USING fts5(repo_root, path, snippet, language_guess);
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS repo_manifests_fts
+            USING fts5(repo_root UNINDEXED, manifest_path, manifest_kind, parsed_summary_json);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-            USING fts5(text, kind, scope);
+            USING fts5(memory_id UNINDEXED, text, kind, scope);
         ",
     )?;
 
@@ -127,12 +129,24 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     // event; decremented for run.failed with category != "Gate". Used by the
     // broker (MP-4b) to bias retrieval and by auto-accept (MP-4c) to shadow
     // re-acceptance of low-usefulness patterns.
-    add_column_if_missing(conn, "memories", "usefulness_score REAL NOT NULL DEFAULT 0.0")?;
+    add_column_if_missing(
+        conn,
+        "memories",
+        "usefulness_score REAL NOT NULL DEFAULT 0.0",
+    )?;
     // MP-4d: invalidated_at is set by `kimetsu brain memory invalidate` so
     // the human reviewer can permanently retire a memory without rewriting
     // the trace. The broker excludes invalidated rows from retrieval.
     add_column_if_missing(conn, "memories", "invalidated_at TEXT")?;
     add_column_if_missing(conn, "memories", "invalidated_reason TEXT")?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_memories_active_created
+            ON memories (invalidated_at, created_at);
+        ",
+    )?;
+    ensure_memories_fts_shape(conn)?;
+    ensure_repo_manifests_fts_shape(conn)?;
 
     let schema_version: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
@@ -171,4 +185,50 @@ fn add_column_if_missing(conn: &Connection, table: &str, column_def: &str) -> Ki
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column_def};"))?;
     }
     Ok(())
+}
+
+fn ensure_memories_fts_shape(conn: &Connection) -> KimetsuResult<()> {
+    if table_has_column(conn, "memories_fts", "memory_id")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS memories_fts;
+        CREATE VIRTUAL TABLE memories_fts
+            USING fts5(memory_id UNINDEXED, text, kind, scope);
+        INSERT INTO memories_fts (memory_id, text, kind, scope)
+            SELECT memory_id, text, kind, scope FROM memories;
+        ",
+    )?;
+    Ok(())
+}
+
+fn ensure_repo_manifests_fts_shape(conn: &Connection) -> KimetsuResult<()> {
+    if table_has_column(conn, "repo_manifests_fts", "parsed_summary_json")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS repo_manifests_fts;
+        CREATE VIRTUAL TABLE repo_manifests_fts
+            USING fts5(repo_root UNINDEXED, manifest_path, manifest_kind, parsed_summary_json);
+        INSERT INTO repo_manifests_fts (
+            repo_root, manifest_path, manifest_kind, parsed_summary_json
+        )
+            SELECT repo_root, manifest_path, manifest_kind, parsed_summary_json
+            FROM repo_manifests;
+        ",
+    )?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> KimetsuResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

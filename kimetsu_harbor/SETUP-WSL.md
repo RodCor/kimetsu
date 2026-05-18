@@ -95,24 +95,24 @@ systemd: running
 docker active: active
 ```
 
-### Build the kimetsu Linux binary
+### Build the Harbor adapter Linux binary
 
 ```powershell
 wsl -d Ubuntu-24.04 -u root --cd /mnt/e/Kimetsu -- bash -c '
   source $HOME/.cargo/env
-  cargo build -p kimetsu-cli --release
+  cargo build -p kimetsu-harbor-rs --release
 '
 ```
 
-Produces `target/release/kimetsu` (Linux ELF). The Windows
-`target/release/kimetsu.exe` and the Linux `target/release/kimetsu` can
-coexist in the same `target/release` dir.
+Produces `target/release/kimetsu-harbor-agent` (Linux ELF). The regular
+`target/release/kimetsu[.exe]` product CLI can coexist in the same
+`target/release` dir.
 
 ### Smoke the adapter against the Linux binary
 
 ```powershell
 wsl -d Ubuntu-24.04 -u root --cd /mnt/e/Kimetsu -- bash -c '
-  KIMETSU_BIN=/mnt/e/Kimetsu/target/release/kimetsu \
+  KIMETSU_HARBOR_BIN=/mnt/e/Kimetsu/target/release/kimetsu-harbor-agent \
   KIMETSU_HARBOR_STUB=1 \
     python3 kimetsu_harbor/smoke_test.py
 '
@@ -146,7 +146,7 @@ $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
 wsl -d Ubuntu-24.04 -u root --cd /mnt/e/Kimetsu -- bash -c "
   export CLAUDE_CODE_OAUTH_TOKEN='$plain'
   export PYTHONPATH=/mnt/e/Kimetsu
-  export KIMETSU_BIN=/mnt/e/Kimetsu/target/release/kimetsu
+  export KIMETSU_HARBOR_BIN=/mnt/e/Kimetsu/target/release/kimetsu-harbor-agent
 
   cd /root/harbor-jobs
 
@@ -154,11 +154,13 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/e/Kimetsu -- bash -c "
   harbor run -d terminal-bench/terminal-bench-2 -a claude-code -m claude-haiku-4-5 -n 4 --yes --job-name bare
 
   # b) kimetsu, no brain
-  KIMETSU_DISABLE_BROKER=1 harbor run -d terminal-bench/terminal-bench-2 \
+  unset KIMETSU_HARBOR_PROJECT
+  harbor run -d terminal-bench/terminal-bench-2 \
     --agent-import-path kimetsu_harbor.kimetsu_agent:KimetsuAgent \
     -n 4 --yes --job-name kimetsu-no-brain
 
   # c) kimetsu with brain + curated memories
+  export KIMETSU_HARBOR_PROJECT=/home/kimetsu/kimetsu-bench-project
   harbor run -d terminal-bench/terminal-bench-2 \
     --agent-import-path kimetsu_harbor.kimetsu_agent:KimetsuAgent \
     -n 4 --yes --job-name kimetsu-brain
@@ -172,10 +174,10 @@ variance within Â±5pp on accuracy across the 3 runs.
 
 The kimetsu repo lives on the Windows `E:` drive. Inside WSL it's
 mounted at `/mnt/e/Kimetsu`. All `cargo build` / `harbor run` commands
-operate on the WSL mount path. The Linux `target/release/kimetsu`
-binary is what the adapter spawns; the Windows `kimetsu.exe` is for
-local CLI use (`kimetsu brain memory review` etc.) and stays usable
-from PowerShell unchanged.
+operate on the WSL mount path. The Linux `target/release/kimetsu-harbor-agent`
+binary is what the adapter spawns; the Windows `kimetsu.exe` is for local
+CLI use (`kimetsu chat`, `kimetsu brain memory review`, etc.) and stays
+usable from PowerShell unchanged.
 
 ## Daemon longevity
 

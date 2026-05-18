@@ -1,10 +1,10 @@
-//! Line-oriented JSON-RPC session for the Kimetsu ↔ Harbor protocol.
+//! Line-oriented JSON-RPC session for the Kimetsu â†” Harbor protocol.
 //!
-//! v0.3.2 — physically moved from `kimetsu-agent::harbor`. The
+//! v0.3.2 â€” physically moved from `kimetsu-agent::harness`. The
 //! session was always harbor-specific; living in kimetsu-agent forced
 //! kimetsu-chat (and any other future transport) to compile JSON-RPC
 //! plumbing it never uses. The agent loop is now transport-agnostic
-//! (Phase-2 v0.3.1) — only this crate owns the wire types.
+//! (Phase-2 v0.3.1) â€” only this crate owns the wire types.
 
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
@@ -17,9 +17,7 @@ use kimetsu_agent::tools::{CommandSpec, RawShellOutput, ShellExecutor, ToolRunti
 use kimetsu_core::KimetsuResult;
 use serde_json::{Value, json};
 
-use crate::protocol::{
-    AgentDoneParams, JsonRpcResponse, ToolExecParams, ToolExecResult,
-};
+use crate::protocol::{AgentDoneParams, JsonRpcResponse, ToolExecParams, ToolExecResult};
 
 /// Line-oriented JSON-RPC session. Reads one JSON object per line from
 /// `reader`, writes one per line to `writer`. The `id` counter is

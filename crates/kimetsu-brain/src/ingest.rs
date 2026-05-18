@@ -102,6 +102,10 @@ pub fn ingest_repo(
         "DELETE FROM repo_manifests WHERE repo_root = ?1",
         params![repo_root_text],
     )?;
+    tx.execute(
+        "DELETE FROM repo_manifests_fts WHERE repo_root = ?1",
+        params![repo_root_text],
+    )?;
 
     let mut manifests = 0usize;
     for file in &indexed {
@@ -147,6 +151,20 @@ pub fn ingest_repo(
                     manifest.parsed_summary_json,
                     manifest.hash,
                     manifest.mtime
+                ],
+            )?;
+            tx.execute(
+                "
+                INSERT INTO repo_manifests_fts (
+                    repo_root, manifest_path, manifest_kind, parsed_summary_json
+                )
+                VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![
+                    repo_root_text,
+                    manifest.path,
+                    manifest.kind,
+                    manifest.parsed_summary_json
                 ],
             )?;
         }

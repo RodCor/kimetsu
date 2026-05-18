@@ -721,7 +721,6 @@ dependencies = [
  "kimetsu-brain",
  "kimetsu-chat",
  "kimetsu-core",
- "kimetsu-harbor-rs",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -742,6 +741,7 @@ dependencies = [
 name = "kimetsu-harbor-rs"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "kimetsu-agent",
  "kimetsu-brain",
  "kimetsu-core",
