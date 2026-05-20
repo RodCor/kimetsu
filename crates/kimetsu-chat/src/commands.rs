@@ -18,6 +18,11 @@ pub enum SlashCommand {
     Quit,
     /// `/cost` — print running cost vs budget.
     Cost,
+    /// `/clear` - clear the visible screen in rich terminals and drop
+    /// the in-session conversation transcript.
+    Clear,
+    /// `/logo` - re-render the Kimetsu session banner.
+    Logo,
     /// `/goal [<text>]` — set or recall the current session goal.
     /// Empty text = recall.
     Goal(String),
@@ -28,10 +33,14 @@ pub enum SlashCommand {
     /// In v0.3.0-alpha this just prints a TODO; v0.3.0 wires it to
     /// `kimetsu_brain::project::add_memory` / proposals.
     Memory(String),
+    /// `/skills <subcommand>` - inspect and load Agent Skills / Codex /
+    /// Claude Code compatible skill folders.
+    Skills(String),
 }
 
 impl SlashCommand {
     pub fn parse(line: &str) -> Option<Self> {
+        let line = line.trim().trim_start_matches('\u{feff}').trim();
         let stripped = line.strip_prefix('/')?;
         let mut iter = stripped.splitn(2, char::is_whitespace);
         let cmd = iter.next().unwrap_or("").trim();
@@ -40,6 +49,8 @@ impl SlashCommand {
             "help" | "h" | "?" => Some(Self::Help),
             "quit" | "q" | "exit" => Some(Self::Quit),
             "cost" => Some(Self::Cost),
+            "clear" | "cls" => Some(Self::Clear),
+            "logo" => Some(Self::Logo),
             "goal" => Some(Self::Goal(rest.to_string())),
             "strict" => {
                 let on = matches!(
@@ -49,6 +60,7 @@ impl SlashCommand {
                 Some(Self::Strict(on))
             }
             "memory" | "m" | "brain" => Some(Self::Memory(rest.to_string())),
+            "skills" | "skill" => Some(Self::Skills(rest.to_string())),
             // Unknown slash commands fall through to the agent — the
             // model can interpret them or surface a "I don't know what
             // /foo means" response. Better than swallowing user intent.
@@ -60,6 +72,11 @@ impl SlashCommand {
         writeln!(out, "slash commands:")?;
         writeln!(out, "  /help                show this list")?;
         writeln!(out, "  /quit                end the session")?;
+        writeln!(
+            out,
+            "  /clear               clear transcript and redraw terminal"
+        )?;
+        writeln!(out, "  /logo                show the Kimetsu dragon banner")?;
         writeln!(out, "  /cost                running cost + budget")?;
         writeln!(
             out,
@@ -73,6 +90,7 @@ impl SlashCommand {
             out,
             "  /memory <args>       brain memory operations (see kimetsu brain memory)"
         )?;
+        writeln!(out, "  /skills <args>       list/load Agent Skills folders")?;
         Ok(())
     }
 }
@@ -89,6 +107,9 @@ mod tests {
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
         assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Quit));
         assert_eq!(SlashCommand::parse("/cost"), Some(SlashCommand::Cost));
+        assert_eq!(SlashCommand::parse("/clear"), Some(SlashCommand::Clear));
+        assert_eq!(SlashCommand::parse("/cls"), Some(SlashCommand::Clear));
+        assert_eq!(SlashCommand::parse("/logo"), Some(SlashCommand::Logo));
     }
 
     #[test]
@@ -147,13 +168,25 @@ mod tests {
             SlashCommand::parse("/memory add some text"),
             Some(SlashCommand::Memory("add some text".to_string()))
         );
+        assert_eq!(
+            SlashCommand::parse("/skills list"),
+            Some(SlashCommand::Skills("list".to_string()))
+        );
+        assert_eq!(
+            SlashCommand::parse("/skill use frontend"),
+            Some(SlashCommand::Skills("use frontend".to_string()))
+        );
     }
 
     #[test]
     fn non_slash_input_is_not_a_command() {
         assert_eq!(SlashCommand::parse("hello world"), None);
         assert_eq!(SlashCommand::parse(""), None);
-        assert_eq!(SlashCommand::parse(" /quit"), None); // leading space disqualifies
+        assert_eq!(SlashCommand::parse(" /quit"), Some(SlashCommand::Quit));
+        assert_eq!(
+            SlashCommand::parse("\u{feff}/help"),
+            Some(SlashCommand::Help)
+        );
     }
 
     #[test]

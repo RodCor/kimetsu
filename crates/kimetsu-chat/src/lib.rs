@@ -23,10 +23,14 @@
 pub mod commands;
 pub mod cost;
 pub mod repl;
+pub mod skills;
+pub mod ui;
 
 pub use commands::SlashCommand;
 pub use cost::CostMeter;
 pub use repl::{ChatConfig, ChatError, ChatResult, run_repl};
+pub use skills::{SkillConfig, SkillRegistry};
+pub use ui::{ChatUi, ChatUiMode, rich_ui_enabled_from_env};
 
 /// Version of the chat transport. Bumped on protocol-affecting
 /// changes (e.g. when we add session resume / persistent transcripts).

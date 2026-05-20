@@ -82,6 +82,29 @@ struct ChatArgs {
     /// every fix-up cycle). Toggleable inline via `/strict on|off`.
     #[arg(long, default_value_t = false)]
     strict: bool,
+    /// Disable ANSI color and terminal polish. Useful for older terminals,
+    /// logs, or deterministic screenshots.
+    #[arg(long)]
+    plain: bool,
+    /// Hide the Kimetsu dragon banner at startup.
+    #[arg(long)]
+    no_logo: bool,
+    /// Load an Agent Skills / Codex / Claude Code compatible skill
+    /// folder by name or path.
+    /// Repeatable. Names are resolved from .codex/skills, .claude/skills,
+    /// .kimetsu/skills, and any --skill-dir roots.
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    /// Additional directory to scan recursively for skill folders.
+    /// Repeatable.
+    #[arg(long = "skill-dir")]
+    skill_dirs: Vec<PathBuf>,
+    /// Do not scan workspace .codex/.claude/.kimetsu skill roots.
+    #[arg(long)]
+    no_workspace_skills: bool,
+    /// Print discovered skills and exit without starting the REPL.
+    #[arg(long)]
+    list_skills: bool,
 }
 
 #[derive(Debug, Args)]
@@ -414,7 +437,7 @@ fn run() -> KimetsuResult<()> {
 /// design, chat is its own product surface, completely independent of
 /// Terminal-Bench / Harbor.
 fn chat(args: ChatArgs) -> KimetsuResult<()> {
-    use kimetsu_chat::{ChatConfig, run_repl};
+    use kimetsu_chat::{ChatConfig, ChatUi, SkillRegistry, rich_ui_enabled_from_env, run_repl};
     use std::io::{stdin, stdout};
 
     let mut config = ChatConfig::new(args.workspace);
@@ -429,9 +452,39 @@ fn chat(args: ChatArgs) -> KimetsuResult<()> {
     config.max_cost_usd = args.max_cost_usd;
     config.goal = args.goal;
     config.strict_verify = args.strict;
+    config.skills.selected = args.skills;
+    config.skills.roots = args.skill_dirs;
+    config.skills.include_workspace_roots = !args.no_workspace_skills;
 
     let stdin = stdin();
     let stdout = stdout();
+    config.ui = if !args.plain && stdout.is_terminal() && rich_ui_enabled_from_env() {
+        ChatUi::rich()
+    } else {
+        ChatUi::plain()
+    }
+    .with_logo(!args.no_logo);
+    if args.list_skills {
+        let workspace = config.workspace_root.canonicalize()?;
+        let registry = SkillRegistry::discover(&workspace, &config.skills)
+            .map_err(|err| format!("kimetsu chat --list-skills: {err}"))?;
+        if registry.skills().is_empty() {
+            println!("no skills found");
+        } else {
+            for skill in registry.skills() {
+                println!(
+                    "{} [{}]\n  {}\n  root: {}\n  entrypoint: {}\n  resources: {}",
+                    skill.name,
+                    skill.source.as_str(),
+                    skill.description,
+                    skill.root.display(),
+                    skill.path.display(),
+                    skill.resource_summary()
+                );
+            }
+        }
+        return Ok(());
+    }
     let reader = stdin.lock();
     let writer = stdout.lock();
     run_repl(reader, writer, config).map_err(|e| format!("kimetsu chat: {e}").into())

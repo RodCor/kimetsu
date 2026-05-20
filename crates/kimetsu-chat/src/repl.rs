@@ -38,6 +38,10 @@ use kimetsu_core::ids::RunId;
 
 use crate::commands::SlashCommand;
 use crate::cost::CostMeter;
+use crate::skills::{
+    LoadedSkill, SkillConfig, SkillRegistry, loaded_skill_names, render_loaded_skills,
+};
+use crate::ui::{CacheStats, ChatBanner, ChatUi, TurnStats};
 
 /// Configuration for one chat session.
 #[derive(Debug, Clone)]
@@ -62,6 +66,11 @@ pub struct ChatConfig {
     /// (model MUST call `record_deviation` on every fix-up cycle). Default
     /// false; user toggles via `/strict` slash command.
     pub strict_verify: bool,
+    /// Terminal renderer. CLI enables the rich renderer only when stdout is
+    /// a terminal; tests and redirected output stay plain by default.
+    pub ui: ChatUi,
+    /// Agent Skills / Codex / Claude Code compatible skill loading.
+    pub skills: SkillConfig,
 }
 
 impl ChatConfig {
@@ -73,6 +82,8 @@ impl ChatConfig {
             max_cost_usd: 10.0,
             goal: None,
             strict_verify: false,
+            ui: ChatUi::plain(),
+            skills: SkillConfig::default(),
         }
     }
 }
@@ -84,6 +95,7 @@ pub enum ChatError {
     Io(std::io::Error),
     NoOauthToken,
     BrainProject(String),
+    Skill(String),
     Provider(String),
     Quit,
 }
@@ -97,6 +109,7 @@ impl std::fmt::Display for ChatError {
                 "CLAUDE_CODE_OAUTH_TOKEN is not set. Put it in the workspace .env or export it."
             ),
             Self::BrainProject(e) => write!(f, "brain project: {e}"),
+            Self::Skill(e) => write!(f, "skills: {e}"),
             Self::Provider(e) => write!(f, "model provider: {e}"),
             Self::Quit => write!(f, "session ended by user"),
         }
@@ -125,26 +138,27 @@ pub fn run_repl<R: BufRead, W: Write>(
         .workspace_root
         .canonicalize()
         .map_err(ChatError::Io)?;
-    writeln!(writer, "kimetsu chat v{}", env!("CARGO_PKG_VERSION"))?;
-    writeln!(writer, "workspace: {}", workspace.display())?;
-    if let Some(p) = config.brain_project.as_ref() {
-        writeln!(writer, "brain project: {}", p.display())?;
-    } else {
-        writeln!(
-            writer,
-            "brain project: <none>  (no memory retrieval / curation)"
-        )?;
-    }
-    writeln!(writer, "model: {}", config.model)?;
-    writeln!(
-        writer,
-        "budget: ${:.2}  strict_verify: {}",
-        config.max_cost_usd, config.strict_verify
+    let skill_registry = SkillRegistry::discover(&workspace, &config.skills)
+        .map_err(|err| ChatError::Skill(err.to_string()))?;
+    let mut loaded_skills = skill_registry
+        .load_selected(&config.skills.selected, &config.skills)
+        .map_err(|err| ChatError::Skill(err.to_string()))?;
+    let ui = config.ui;
+    write_session_banner(
+        &mut writer,
+        ui,
+        ChatBanner {
+            version: env!("CARGO_PKG_VERSION"),
+            workspace: &workspace,
+            brain_project: config.brain_project.as_deref(),
+            model: &config.model,
+            budget: config.max_cost_usd,
+            strict_verify: config.strict_verify,
+            goal: config.goal.as_deref(),
+            skills_loaded: loaded_skills.len(),
+            skills_available: skill_registry.skills().len(),
+        },
     )?;
-    if let Some(g) = config.goal.as_ref() {
-        writeln!(writer, "goal: {g}")?;
-    }
-    writeln!(writer, "type `/help` for slash commands. `/quit` to exit.")?;
 
     // Validate brain project up-front so we don't surprise the user
     // mid-session with a stale path error.
@@ -185,7 +199,7 @@ pub fn run_repl<R: BufRead, W: Write>(
     let mut session_deviations: Vec<DeviationRecord> = Vec::new();
 
     loop {
-        write!(writer, "\nyou> ")?;
+        ui.write_prompt(&mut writer)?;
         writer.flush()?;
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
@@ -204,6 +218,47 @@ pub fn run_repl<R: BufRead, W: Write>(
             match cmd {
                 SlashCommand::Help => {
                     SlashCommand::print_help(&mut writer)?;
+                }
+                SlashCommand::Clear => {
+                    transcript.clear();
+                    ui.clear_screen(&mut writer)?;
+                    write_session_banner(
+                        &mut writer,
+                        ui,
+                        ChatBanner {
+                            version: env!("CARGO_PKG_VERSION"),
+                            workspace: &workspace,
+                            brain_project: config.brain_project.as_deref(),
+                            model: &config.model,
+                            budget: config.max_cost_usd,
+                            strict_verify,
+                            goal: goal.as_deref(),
+                            skills_loaded: loaded_skills.len(),
+                            skills_available: skill_registry.skills().len(),
+                        },
+                    )?;
+                    ui.write_note(
+                        &mut writer,
+                        "[clear]",
+                        "conversation context cleared; goal and cost meter kept.",
+                    )?;
+                }
+                SlashCommand::Logo => {
+                    write_session_banner(
+                        &mut writer,
+                        ui,
+                        ChatBanner {
+                            version: env!("CARGO_PKG_VERSION"),
+                            workspace: &workspace,
+                            brain_project: config.brain_project.as_deref(),
+                            model: &config.model,
+                            budget: config.max_cost_usd,
+                            strict_verify,
+                            goal: goal.as_deref(),
+                            skills_loaded: loaded_skills.len(),
+                            skills_available: skill_registry.skills().len(),
+                        },
+                    )?;
                 }
                 SlashCommand::Quit => {
                     // v0.3.3: auto-propose any accumulated record_deviation
@@ -307,7 +362,7 @@ pub fn run_repl<R: BufRead, W: Write>(
                                         )?;
                                     }
                                 }
-                                Err(e) => writeln!(writer, "[error] {e}")?,
+                                Err(e) => ui.write_error(&mut writer, &e.to_string())?,
                             },
                             "" => writeln!(
                                 writer,
@@ -325,6 +380,16 @@ pub fn run_repl<R: BufRead, W: Write>(
                         )?;
                     }
                 }
+                SlashCommand::Skills(arg) => {
+                    handle_skills_command(
+                        &arg,
+                        &skill_registry,
+                        &config.skills,
+                        &mut loaded_skills,
+                        ui,
+                        &mut writer,
+                    )?;
+                }
             }
             continue;
         }
@@ -333,12 +398,7 @@ pub fn run_repl<R: BufRead, W: Write>(
 
         // Budget gate before spending any tokens.
         if cost.over_budget() {
-            writeln!(
-                writer,
-                "[budget] $${:.4} of $${:.2} spent - refusing further model calls. Raise --max-cost-usd or /quit.",
-                cost.spent(),
-                cost.budget()
-            )?;
+            ui.write_budget_stop(&mut writer, cost.spent(), cost.budget())?;
             continue;
         }
 
@@ -349,7 +409,7 @@ pub fn run_repl<R: BufRead, W: Write>(
             match build_chat_provider(&config, &workspace) {
                 Ok(p) => provider = Some(p),
                 Err(e) => {
-                    writeln!(writer, "[error] {e}")?;
+                    ui.write_error(&mut writer, &e.to_string())?;
                     continue;
                 }
             }
@@ -366,7 +426,7 @@ pub fn run_repl<R: BufRead, W: Write>(
                 ..ToolRuntimeConfig::default()
             }),
             Err(e) => {
-                writeln!(writer, "[error] tool runtime: {e}")?;
+                ui.write_error(&mut writer, &format!("tool runtime: {e}"))?;
                 continue;
             }
         };
@@ -384,7 +444,8 @@ pub fn run_repl<R: BufRead, W: Write>(
             Some(g) if !g.is_empty() => format!("Goal: {g}\nMessage: {line}"),
             _ => line.to_string(),
         };
-        let brain_context = build_chat_brain_context(brain_session.as_ref(), &transcript, &task);
+        let brain_context =
+            build_chat_brain_context(brain_session.as_ref(), &transcript, &loaded_skills, &task);
 
         let opts = KimetsuAgentOpts {
             mode: "chat",
@@ -393,6 +454,8 @@ pub fn run_repl<R: BufRead, W: Write>(
             strict_verify: Some(strict_verify),
             ..KimetsuAgentOpts::default()
         };
+        ui.write_thinking(&mut writer)?;
+        writer.flush()?;
         let result = run_model_agent(
             &task,
             &mut runtime,
@@ -405,12 +468,11 @@ pub fn run_repl<R: BufRead, W: Write>(
             Ok(report) => {
                 let turn_cost = report.usage.cost_usd;
                 let still_within = cost.record_turn(turn_cost);
-                writeln!(writer, "\nassistant>")?;
                 let assistant_text = report
                     .final_text
                     .clone()
                     .unwrap_or_else(|| report.summary.clone());
-                writeln!(writer, "{}", assistant_text)?;
+                ui.write_assistant(&mut writer, &assistant_text)?;
 
                 // v0.3.3: append this turn to the conversation transcript
                 // so subsequent turns see prior context. Truncate the
@@ -454,14 +516,15 @@ pub fn run_repl<R: BufRead, W: Write>(
                         }
                     }
                 }
-                writeln!(
-                    writer,
-                    "\n[turn] cost=$${:.4}  total=$${:.4}/$${:.2}  turns={}  tool_calls={}",
-                    turn_cost,
-                    cost.spent(),
-                    cost.budget(),
-                    report.turns,
-                    report.tool_calls,
+                ui.write_turn_stats(
+                    &mut writer,
+                    TurnStats {
+                        turn_cost,
+                        total_cost: cost.spent(),
+                        budget: cost.budget(),
+                        turns: report.turns,
+                        tool_calls: report.tool_calls,
+                    },
                 )?;
                 // v0.3.4a: print Anthropic prompt-cache stats so the
                 // user can see whether the prompt cache is landing
@@ -471,16 +534,21 @@ pub fn run_repl<R: BufRead, W: Write>(
                 let cc = report.usage.cache_creation_input_tokens;
                 let cr = report.usage.cache_read_input_tokens;
                 if cc > 0 || cr > 0 {
-                    writeln!(
-                        writer,
-                        "[cache] input={} output={} cache_write={} cache_read={}",
-                        report.usage.input_tokens, report.usage.output_tokens, cc, cr,
+                    ui.write_cache_stats(
+                        &mut writer,
+                        CacheStats {
+                            input_tokens: report.usage.input_tokens,
+                            output_tokens: report.usage.output_tokens,
+                            cache_write: cc,
+                            cache_read: cr,
+                        },
                     )?;
                 }
                 if !still_within {
-                    writeln!(
-                        writer,
-                        "[budget] crossed budget; next message will be refused."
+                    ui.write_note(
+                        &mut writer,
+                        "[budget]",
+                        "crossed budget; next message will be refused.",
                     )?;
                 }
                 // v0.3.3: deviations are now accumulated into
@@ -493,17 +561,116 @@ pub fn run_repl<R: BufRead, W: Write>(
                     .map(|a| a.len())
                     .unwrap_or(0);
                 if dev_count > 0 {
-                    writeln!(
-                        writer,
-                        "[deviations] {dev_count} recorded this turn (will be added to brain on /quit)"
+                    ui.write_note(
+                        &mut writer,
+                        "[deviations]",
+                        &format!(
+                            "{dev_count} recorded this turn (will be added to brain on /quit)"
+                        ),
                     )?;
                 }
             }
             Err(e) => {
-                writeln!(writer, "[error] {e}")?;
+                ui.write_error(&mut writer, &e.to_string())?;
             }
         }
     }
+}
+
+fn write_session_banner<W: Write>(
+    writer: &mut W,
+    ui: ChatUi,
+    banner: ChatBanner<'_>,
+) -> ChatResult<()> {
+    ui.write_banner(writer, banner)?;
+    Ok(())
+}
+
+fn handle_skills_command<W: Write>(
+    arg: &str,
+    registry: &SkillRegistry,
+    config: &SkillConfig,
+    loaded: &mut Vec<LoadedSkill>,
+    ui: ChatUi,
+    writer: &mut W,
+) -> ChatResult<()> {
+    let mut parts = arg.split_whitespace();
+    let command = parts.next().unwrap_or("list");
+    match command {
+        "" | "list" | "ls" => {
+            if registry.skills().is_empty() {
+                writeln!(
+                    writer,
+                    "no skills found. Add skill folders under .codex/skills, .claude/skills, .kimetsu/skills, or pass --skill-dir."
+                )?;
+                return Ok(());
+            }
+            writeln!(writer, "{} available skill(s):", registry.skills().len())?;
+            for skill in registry.skills().iter().take(40) {
+                writeln!(
+                    writer,
+                    "  {} [{}; {}] - {}",
+                    skill.name,
+                    skill.source.as_str(),
+                    skill.resource_summary(),
+                    preview(&skill.description, 100)
+                )?;
+            }
+            if registry.skills().len() > 40 {
+                writeln!(
+                    writer,
+                    "  ... ({} more; narrow with /skills use <name>)",
+                    registry.skills().len() - 40
+                )?;
+            }
+        }
+        "loaded" => {
+            if loaded.is_empty() {
+                writeln!(writer, "no skills loaded for this session")?;
+            } else {
+                writeln!(
+                    writer,
+                    "loaded skills: {}",
+                    loaded_skill_names(loaded).join(", ")
+                )?;
+            }
+        }
+        "use" | "load" => {
+            let selection = parts.collect::<Vec<_>>().join(" ");
+            if selection.trim().is_empty() {
+                writeln!(writer, "usage: /skills use <name-or-path>")?;
+                return Ok(());
+            }
+            match registry.load_into(&selection, loaded, config) {
+                Ok(true) => ui.write_note(
+                    writer,
+                    "[skills]",
+                    &format!(
+                        "loaded `{}`",
+                        loaded
+                            .last()
+                            .map(|s| s.manifest.name.as_str())
+                            .unwrap_or(selection.as_str())
+                    ),
+                )?,
+                Ok(false) => {
+                    ui.write_note(writer, "[skills]", &format!("`{selection}` already loaded"))?
+                }
+                Err(err) => ui.write_error(writer, &err)?,
+            }
+        }
+        "clear" | "reset" => {
+            loaded.clear();
+            ui.write_note(writer, "[skills]", "cleared loaded skills")?;
+        }
+        other => {
+            writeln!(
+                writer,
+                "unknown /skills command `{other}`. Use: /skills list | /skills use <name-or-path> | /skills loaded | /skills clear"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// v0.3.3: one user/assistant exchange in the chat transcript. Used to
@@ -544,6 +711,7 @@ struct DeviationRecord {
 fn build_chat_brain_context(
     brain_session: Option<&brain_project::BrainSession>,
     transcript: &[TurnRecord],
+    loaded_skills: &[LoadedSkill],
     task: &str,
 ) -> Option<String> {
     const TURN_CAP_BYTES: usize = 1200;
@@ -551,10 +719,18 @@ fn build_chat_brain_context(
 
     let mut out = String::new();
 
+    // Block 0: explicit skills loaded by the user.
+    if let Some(skill_context) = render_loaded_skills(loaded_skills) {
+        out.push_str(&skill_context);
+    }
+
     // Block 1: retrieved capsules.
     if let Some(session) = brain_session {
         match session.retrieve_context("chat", task, 2000) {
             Ok(bundle) if !bundle.capsules.is_empty() => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
                 out.push_str(&format!(
                     "Retrieved {} brain capsule(s) for this turn ({}/{} tokens used):\n",
                     bundle.capsules.len(),
@@ -675,7 +851,9 @@ fn validate_brain_project(p: &std::path::Path) -> ChatResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn quit_command_ends_session_cleanly() {
@@ -723,6 +901,33 @@ mod tests {
         assert!(out_str.contains("/quit"));
         assert!(out_str.contains("/cost"));
         assert!(out_str.contains("/goal"));
+        assert!(out_str.contains("/clear"));
+        assert!(out_str.contains("/logo"));
+    }
+
+    #[test]
+    fn slash_clear_redraws_banner_and_keeps_session_alive() {
+        let input = b"/clear\n/quit\n";
+        let mut output = Vec::new();
+        let config = ChatConfig::new(std::env::current_dir().unwrap());
+        run_repl(Cursor::new(input), &mut output, config).expect("repl");
+        let out_str = String::from_utf8(output).unwrap();
+        assert!(out_str.contains("[clear] conversation context cleared"));
+        assert!(out_str.matches("kimetsu chat v").count() >= 2);
+        assert!(out_str.contains("bye."));
+    }
+
+    #[test]
+    fn rich_ui_renders_dragon_banner() {
+        let input = b"/quit\n";
+        let mut output = Vec::new();
+        let mut config = ChatConfig::new(std::env::current_dir().unwrap());
+        config.ui = crate::ui::ChatUi::rich();
+        run_repl(Cursor::new(input), &mut output, config).expect("repl");
+        let out_str = String::from_utf8(output).unwrap();
+        assert!(out_str.contains("\u{1b}["));
+        assert!(out_str.contains("( o.o )"));
+        assert!(out_str.contains("powers"));
     }
 
     #[test]
@@ -761,12 +966,34 @@ mod tests {
         assert!(out_str.contains("cost so far: $0.0000"));
     }
 
+    #[test]
+    fn slash_skills_lists_and_loads_workspace_skill() {
+        let root = temp_root("chat_skills");
+        let skill_dir = root.join(".codex/skills/refactor");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: refactor\ndescription: Refactor safely.\n---\nAlways run focused tests.",
+        )
+        .expect("write skill");
+
+        let input = b"/skills list\n/skills use refactor\n/skills loaded\n/quit\n";
+        let mut output = Vec::new();
+        let config = ChatConfig::new(root.clone());
+        run_repl(Cursor::new(input), &mut output, config).expect("repl");
+        let out_str = String::from_utf8(output).unwrap();
+        assert!(out_str.contains("refactor [codex; no resources]"));
+        assert!(out_str.contains("[skills] loaded `refactor`"));
+        assert!(out_str.contains("loaded skills: refactor"));
+        fs::remove_dir_all(root).ok();
+    }
+
     // ----- v0.3.3: multi-turn transcript + brain retrieval helpers -----
 
     #[test]
     fn build_chat_brain_context_returns_none_when_no_state() {
         // No project, no transcript -> nothing to surface.
-        let out = build_chat_brain_context(None, &[], "do something");
+        let out = build_chat_brain_context(None, &[], &[], "do something");
         assert!(out.is_none());
     }
 
@@ -783,7 +1010,7 @@ mod tests {
                 assistant: "It's main.rs (4321 lines). Want me to summarize?".to_string(),
             },
         ];
-        let out = build_chat_brain_context(None, &transcript, "yes please")
+        let out = build_chat_brain_context(None, &transcript, &[], "yes please")
             .expect("transcript should produce context");
         assert!(out.contains("Conversation so far"));
         assert!(out.contains("last 2 turn(s)"));
@@ -802,7 +1029,7 @@ mod tests {
             user: huge_user,
             assistant: huge_asst,
         }];
-        let out = build_chat_brain_context(None, &transcript, "next").expect("context");
+        let out = build_chat_brain_context(None, &transcript, &[], "next").expect("context");
         // 1200/2 = 600-char cap per side; should be << 5000 chars.
         // Plus the cap appends "..." only when actually truncated, and
         // preview uses char count not bytes. Verify clipping happened.
@@ -821,12 +1048,22 @@ mod tests {
                 assistant: format!("assistant reply {i}"),
             })
             .collect();
-        let out = build_chat_brain_context(None, &transcript, "next").expect("context");
+        let out = build_chat_brain_context(None, &transcript, &[], "next").expect("context");
         // Last 10 means turns 16..=25 are present, 1..=15 are gone.
         assert!(out.contains("user message 25"));
         assert!(out.contains("user message 16"));
         assert!(!out.contains("user message 15"));
         assert!(!out.contains("user message 1\n"));
         assert!(out.contains("last 10 turn(s)"));
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("kimetsu_{label}_{nanos}"));
+        fs::create_dir_all(&root).expect("root");
+        root
     }
 }
