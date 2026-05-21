@@ -16,8 +16,10 @@ license = "UNLICENSED"
 authors = ["Kimetsu contributors"]
 
 [workspace.dependencies]
+base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
 ignore = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

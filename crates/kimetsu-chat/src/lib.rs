@@ -20,16 +20,23 @@
 //! REPL loop is a minimal echo placeholder. Implementation lands in
 //! subsequent commits as the v0.3 sprint progresses.
 
+pub mod bridge;
 pub mod commands;
 pub mod cost;
+pub mod mcp_server;
 pub mod repl;
 pub mod skills;
 pub mod ui;
 
+pub use bridge::{
+    BridgeTarget, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
+    plugin_install,
+};
 pub use commands::SlashCommand;
 pub use cost::CostMeter;
+pub use mcp_server::{McpServeConfig, serve_mcp};
 pub use repl::{ChatConfig, ChatError, ChatResult, run_repl};
-pub use skills::{SkillConfig, SkillRegistry};
+pub use skills::{SkillConfig, SkillRegistry, skill_origin_label};
 pub use ui::{ChatUi, ChatUiMode, rich_ui_enabled_from_env};
 
 /// Version of the chat transport. Bumped on protocol-affecting

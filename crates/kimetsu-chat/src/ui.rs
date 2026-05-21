@@ -91,39 +91,49 @@ impl ChatUi {
             "powers",
             "read, edit, patch, shell, verify inside workspace",
         )?;
-        self.write_kv(out, "controls", "/help  /skills  /clear  /cost  /quit")?;
+        self.write_kv(out, "controls", "/ for commands  /skills  /cost  /quit")?;
         Ok(())
     }
 
     pub fn write_prompt<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        writeln!(out)?;
+        self.write_prompt_inline(out)
+    }
+
+    pub fn write_prompt_inline<W: Write>(&self, out: &mut W) -> io::Result<()> {
         if self.is_rich() {
             write!(
                 out,
-                "\n{} {} ",
+                "{} {} ",
                 self.paint(BOLD_CYAN, "you"),
                 self.paint(DIM, ">")
             )
         } else {
-            write!(out, "\nyou> ")
+            write!(out, "you> ")
         }
     }
 
     pub fn write_thinking<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        self.write_thinking_message(
+            out,
+            "thinking; workspace tools may edit files and run commands...",
+        )
+    }
+
+    pub fn write_thinking_text<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        self.write_thinking_message(out, "thinking...")
+    }
+
+    fn write_thinking_message<W: Write>(&self, out: &mut W, message: &str) -> io::Result<()> {
         if self.is_rich() {
             writeln!(
                 out,
                 "\n{} {}",
                 self.paint(BOLD_RED, "kimetsu"),
-                self.paint(
-                    DIM,
-                    "thinking; workspace tools may edit files and run commands..."
-                )
+                self.paint(DIM, message)
             )
         } else {
-            writeln!(
-                out,
-                "\n[kimetsu] thinking; workspace tools may edit files and run commands..."
-            )
+            writeln!(out, "\n[kimetsu] {message}")
         }
     }
 

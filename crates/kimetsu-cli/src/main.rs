@@ -48,6 +48,18 @@ enum Command {
         #[command(subcommand)]
         command: LockCommand,
     },
+    Bridge {
+        #[command(subcommand)]
+        command: BridgeCommand,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// v0.3: interactive REPL chat - kimetsu as a user-facing coding
     /// assistant. Reuses the full agent runtime (tools, prompts, brain,
     /// MP-18 verify) with a stdin/stdout transport. No dependency on
@@ -102,9 +114,104 @@ struct ChatArgs {
     /// Do not scan workspace .codex/.claude/.kimetsu skill roots.
     #[arg(long)]
     no_workspace_skills: bool,
+    /// Do not scan logged-in user tool homes such as ~/.codex, ~/.claude,
+    /// ~/.agents, ~/.kimetsu, or their plugin marketplace caches.
+    #[arg(long)]
+    no_user_skills: bool,
     /// Print discovered skills and exit without starting the REPL.
     #[arg(long)]
     list_skills: bool,
+    /// Search discovered skills and exit without starting the REPL.
+    #[arg(long)]
+    search_skills: Option<String>,
+    /// Print detected skill roots and provider marketplace caches, then exit.
+    #[arg(long)]
+    list_skill_sources: bool,
+    /// Import a discovered skill bundle into workspace .kimetsu/skills.
+    /// Repeatable. Use --install-skill-force to replace an existing import.
+    #[arg(long = "install-skill")]
+    install_skills: Vec<String>,
+    /// Replace an existing .kimetsu/skills/<name> during --install-skill.
+    #[arg(long)]
+    install_skill_force: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum BridgeCommand {
+    Scan(BridgeWorkspaceArgs),
+    Status(BridgeWorkspaceArgs),
+    Import(BridgeImportArgs),
+    Export(BridgeExportArgs),
+    Sync(BridgeSyncArgs),
+    Doctor(BridgeWorkspaceArgs),
+}
+
+#[derive(Debug, Args)]
+struct BridgeWorkspaceArgs {
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    no_user_skills: bool,
+}
+
+#[derive(Debug, Args)]
+struct BridgeImportArgs {
+    selection: String,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    no_user_skills: bool,
+}
+
+#[derive(Debug, Args)]
+struct BridgeExportArgs {
+    selection: String,
+    target: String,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    no_user_skills: bool,
+}
+
+#[derive(Debug, Args)]
+struct BridgeSyncArgs {
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    no_user_skills: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    Serve(McpServeArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpServeArgs {
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    no_user_skills: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    Install(PluginInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct PluginInstallArgs {
+    target: String,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -428,6 +535,9 @@ fn run() -> KimetsuResult<()> {
         Command::Bench { command } => bench(command),
         Command::Runs { command } => runs(command),
         Command::Lock { command } => lock(command),
+        Command::Bridge { command } => bridge(command),
+        Command::Mcp { command } => mcp(command),
+        Command::Plugin { command } => plugin(command),
         Command::Chat(args) => chat(args),
     }
 }
@@ -436,8 +546,131 @@ fn run() -> KimetsuResult<()> {
 /// via the kimetsu-chat crate. NO dependency on kimetsu-harbor-rs â€” by
 /// design, chat is its own product surface, completely independent of
 /// Terminal-Bench / Harbor.
+fn bridge(command: BridgeCommand) -> KimetsuResult<()> {
+    use kimetsu_chat::{
+        BridgeTarget, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
+    };
+
+    match command {
+        BridgeCommand::Scan(args) | BridgeCommand::Status(args) | BridgeCommand::Doctor(args) => {
+            let workspace = args.workspace.canonicalize()?;
+            let config = bridge_skill_config(args.no_user_skills);
+            let scan = bridge_scan(&workspace, &config)
+                .map_err(|err| format!("kimetsu bridge scan: {err}"))?;
+            println!("workspace: {}", workspace.display());
+            println!("extensions: {}", scan.extensions.len());
+            for extension in &scan.extensions {
+                println!(
+                    "  {} [{}] {}",
+                    extension.manifest.name,
+                    extension.manifest.source,
+                    extension.root.display()
+                );
+            }
+            println!("skills: {}", scan.skills.len());
+            for skill in &scan.skills {
+                println!(
+                    "  {}  kimetsu_ext={} kimetsu={} claude={} codex={}  origin={}",
+                    skill.name,
+                    skill.kimetsu_extension,
+                    skill.kimetsu_skill,
+                    skill.claude_skill,
+                    skill.codex_skill,
+                    skill.origin
+                );
+            }
+            if scan.skills.is_empty() {
+                println!(
+                    "no skills found; add provider skills or run `kimetsu plugin install <target>`"
+                );
+            }
+        }
+        BridgeCommand::Import(args) => {
+            let workspace = args.workspace.canonicalize()?;
+            let config = bridge_skill_config(args.no_user_skills);
+            let imported = bridge_import_skill(&workspace, &config, &args.selection, args.force)
+                .map_err(|err| format!("kimetsu bridge import: {err}"))?;
+            println!(
+                "imported {} into {}",
+                imported.manifest.name,
+                imported.root.display()
+            );
+        }
+        BridgeCommand::Export(args) => {
+            let workspace = args.workspace.canonicalize()?;
+            let config = bridge_skill_config(args.no_user_skills);
+            let target = BridgeTarget::parse(&args.target)
+                .map_err(|err| format!("kimetsu bridge export: {err}"))?;
+            let exported =
+                bridge_export_skill(&workspace, &config, &args.selection, target, args.force)
+                    .map_err(|err| format!("kimetsu bridge export: {err}"))?;
+            println!(
+                "exported {} to {} at {}",
+                args.selection,
+                target.as_str(),
+                exported.display()
+            );
+        }
+        BridgeCommand::Sync(args) => {
+            let workspace = args.workspace.canonicalize()?;
+            let config = bridge_skill_config(args.no_user_skills);
+            let imported = bridge_sync(&workspace, &config, args.force)
+                .map_err(|err| format!("kimetsu bridge sync: {err}"))?;
+            println!("imported {imported} skill bundle(s) into .kimetsu/extensions");
+        }
+    }
+    Ok(())
+}
+
+fn mcp(command: McpCommand) -> KimetsuResult<()> {
+    use kimetsu_chat::{McpServeConfig, serve_mcp};
+
+    match command {
+        McpCommand::Serve(args) => {
+            let mut config = McpServeConfig::new(args.workspace);
+            config.skills.include_user_roots = !args.no_user_skills;
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            serve_mcp(stdin.lock(), stdout.lock(), config)
+                .map_err(|err| format!("kimetsu mcp serve: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn plugin(command: PluginCommand) -> KimetsuResult<()> {
+    use kimetsu_chat::{BridgeTarget, plugin_install};
+
+    match command {
+        PluginCommand::Install(args) => {
+            let workspace = args.workspace.canonicalize()?;
+            let target = BridgeTarget::parse(&args.target)
+                .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            let report = plugin_install(&workspace, target, args.force)
+                .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            println!(
+                "installed Kimetsu plugin surface for {}",
+                report.target.as_str()
+            );
+            for file in report.files {
+                println!("  {}", file.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bridge_skill_config(no_user_skills: bool) -> kimetsu_chat::SkillConfig {
+    kimetsu_chat::SkillConfig {
+        include_user_roots: !no_user_skills,
+        ..kimetsu_chat::SkillConfig::default()
+    }
+}
+
 fn chat(args: ChatArgs) -> KimetsuResult<()> {
-    use kimetsu_chat::{ChatConfig, ChatUi, SkillRegistry, rich_ui_enabled_from_env, run_repl};
+    use kimetsu_chat::{
+        ChatConfig, ChatUi, SkillRegistry, rich_ui_enabled_from_env, run_repl, skill_origin_label,
+    };
     use std::io::{stdin, stdout};
 
     let mut config = ChatConfig::new(args.workspace);
@@ -455,15 +688,99 @@ fn chat(args: ChatArgs) -> KimetsuResult<()> {
     config.skills.selected = args.skills;
     config.skills.roots = args.skill_dirs;
     config.skills.include_workspace_roots = !args.no_workspace_skills;
+    config.skills.include_user_roots = !args.no_user_skills;
 
     let stdin = stdin();
     let stdout = stdout();
+    config.raw_terminal_input = stdin.is_terminal() && stdout.is_terminal();
+    config.persist_sessions = true;
     config.ui = if !args.plain && stdout.is_terminal() && rich_ui_enabled_from_env() {
         ChatUi::rich()
     } else {
         ChatUi::plain()
     }
     .with_logo(!args.no_logo);
+    if args.list_skill_sources {
+        let workspace = config.workspace_root.canonicalize()?;
+        let registry = SkillRegistry::discover(&workspace, &config.skills)
+            .map_err(|err| format!("kimetsu chat --list-skill-sources: {err}"))?;
+        if registry.roots().is_empty() {
+            println!("no skill sources configured");
+        } else {
+            for root in registry.roots() {
+                let status = if root.exists { "found" } else { "missing" };
+                let login = match root.kind.as_str() {
+                    "workspace" | "extra" => "local",
+                    _ if root.logged_in => "login detected",
+                    _ => "login unknown",
+                };
+                let marketplace = root
+                    .marketplace
+                    .as_ref()
+                    .map(|marketplace| format!(" marketplace={marketplace}"))
+                    .unwrap_or_default();
+                println!(
+                    "{} [{}; {}; {}{}]\n  {}",
+                    root.source.as_str(),
+                    root.kind.as_str(),
+                    status,
+                    login,
+                    marketplace,
+                    root.path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+    if !args.install_skills.is_empty() {
+        let workspace = config.workspace_root.canonicalize()?;
+        let mut registry = SkillRegistry::discover(&workspace, &config.skills)
+            .map_err(|err| format!("kimetsu chat --install-skill: {err}"))?;
+        for selection in &args.install_skills {
+            let installed = registry
+                .install_as_kimetsu(selection, args.install_skill_force)
+                .map_err(|err| format!("kimetsu chat --install-skill {selection}: {err}"))?;
+            println!(
+                "installed {} as Kimetsu skill\n  {}",
+                installed.name,
+                installed.root.display()
+            );
+            registry
+                .refresh(&config.skills)
+                .map_err(|err| format!("kimetsu chat --install-skill refresh: {err}"))?;
+        }
+        if !args.list_skills {
+            return Ok(());
+        }
+    }
+    if let Some(query) = &args.search_skills {
+        let workspace = config.workspace_root.canonicalize()?;
+        let registry = SkillRegistry::discover(&workspace, &config.skills)
+            .map_err(|err| format!("kimetsu chat --search-skills: {err}"))?;
+        let matches = registry.matching_skills(query);
+        if matches.is_empty() {
+            println!("no skills matched `{query}`");
+        } else {
+            for skill in matches {
+                let state = if registry.is_installed(skill) {
+                    "installed"
+                } else {
+                    "available"
+                };
+                println!(
+                    "{} [{}; {}]\n  {}\n  root: {}\n  entrypoint: {}\n  resources: {}",
+                    skill.name,
+                    state,
+                    skill_origin_label(skill),
+                    skill.description,
+                    skill.root.display(),
+                    skill.path.display(),
+                    skill.resource_summary()
+                );
+            }
+        }
+        return Ok(());
+    }
     if args.list_skills {
         let workspace = config.workspace_root.canonicalize()?;
         let registry = SkillRegistry::discover(&workspace, &config.skills)
@@ -475,7 +792,7 @@ fn chat(args: ChatArgs) -> KimetsuResult<()> {
                 println!(
                     "{} [{}]\n  {}\n  root: {}\n  entrypoint: {}\n  resources: {}",
                     skill.name,
-                    skill.source.as_str(),
+                    skill_origin_label(skill),
                     skill.description,
                     skill.root.display(),
                     skill.path.display(),

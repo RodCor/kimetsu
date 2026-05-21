@@ -20,5 +20,8 @@ authors.workspace = true
 kimetsu-agent = { path = "../kimetsu-agent" }
 kimetsu-brain = { path = "../kimetsu-brain" }
 kimetsu-core = { path = "../kimetsu-core" }
+base64.workspace = true
+crossterm.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

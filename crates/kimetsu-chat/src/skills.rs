@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
 
 pub const DEFAULT_MAX_SKILL_BYTES: usize = 24 * 1024;
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 96 * 1024;
@@ -12,6 +15,7 @@ const MAX_RENDERED_SKILL_RESOURCES: usize = 40;
 pub struct SkillConfig {
     pub enabled: bool,
     pub include_workspace_roots: bool,
+    pub include_user_roots: bool,
     pub roots: Vec<PathBuf>,
     pub selected: Vec<String>,
     pub max_skill_bytes: usize,
@@ -23,6 +27,7 @@ impl Default for SkillConfig {
         Self {
             enabled: true,
             include_workspace_roots: true,
+            include_user_roots: false,
             roots: Vec::new(),
             selected: Vec::new(),
             max_skill_bytes: DEFAULT_MAX_SKILL_BYTES,
@@ -35,6 +40,7 @@ impl Default for SkillConfig {
 pub enum SkillSource {
     Codex,
     ClaudeCode,
+    Agents,
     Kimetsu,
     Unknown,
 }
@@ -44,10 +50,40 @@ impl SkillSource {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
+            Self::Agents => "agents",
             Self::Kimetsu => "kimetsu",
             Self::Unknown => "unknown",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillRootKind {
+    Workspace,
+    User,
+    Marketplace,
+    Extra,
+}
+
+impl SkillRootKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::User => "user",
+            Self::Marketplace => "marketplace",
+            Self::Extra => "extra",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillRoot {
+    pub source: SkillSource,
+    pub kind: SkillRootKind,
+    pub path: PathBuf,
+    pub marketplace: Option<String>,
+    pub logged_in: bool,
+    pub exists: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +91,7 @@ pub struct SkillManifest {
     pub name: String,
     pub description: String,
     pub source: SkillSource,
+    pub marketplace: Option<String>,
     pub root: PathBuf,
     pub path: PathBuf,
     pub resources: Vec<SkillResource>,
@@ -104,6 +141,7 @@ pub struct LoadedSkill {
 #[derive(Debug, Clone)]
 pub struct SkillRegistry {
     workspace: PathBuf,
+    roots: Vec<SkillRoot>,
     skills: Vec<SkillManifest>,
 }
 
@@ -112,20 +150,16 @@ impl SkillRegistry {
         if !config.enabled {
             return Ok(Self {
                 workspace: normalize_path(workspace),
+                roots: Vec::new(),
                 skills: Vec::new(),
             });
         }
 
-        let mut roots = Vec::new();
-        if config.include_workspace_roots {
-            roots.extend(default_workspace_roots(workspace));
-        }
-        roots.extend(config.roots.iter().cloned());
-
+        let roots = discover_skill_roots(workspace, config);
         let mut seen = HashSet::new();
         let mut skills = Vec::new();
-        for root in roots {
-            discover_root(&root, &mut seen, &mut skills)?;
+        for root in &roots {
+            discover_root(root, &mut seen, &mut skills)?;
             if skills.len() >= MAX_DISCOVERED_SKILLS {
                 break;
             }
@@ -139,12 +173,39 @@ impl SkillRegistry {
 
         Ok(Self {
             workspace: normalize_path(workspace),
+            roots,
             skills,
         })
     }
 
+    pub fn refresh(&mut self, config: &SkillConfig) -> Result<(), String> {
+        let next = Self::discover(&self.workspace, config)?;
+        self.roots = next.roots;
+        self.skills = next.skills;
+        Ok(())
+    }
+
+    pub fn roots(&self) -> &[SkillRoot] {
+        &self.roots
+    }
+
     pub fn skills(&self) -> &[SkillManifest] {
         &self.skills
+    }
+
+    pub fn matching_skills(&self, query: &str) -> Vec<&SkillManifest> {
+        self.skills
+            .iter()
+            .filter(|skill| skill_matches_query(skill, query))
+            .collect()
+    }
+
+    pub fn is_installed(&self, skill: &SkillManifest) -> bool {
+        skill.source == SkillSource::Kimetsu
+            || self.skills.iter().any(|candidate| {
+                candidate.source == SkillSource::Kimetsu
+                    && candidate.name.eq_ignore_ascii_case(&skill.name)
+            })
     }
 
     pub fn load_selected(
@@ -217,6 +278,10 @@ impl SkillRegistry {
             })
             .collect();
 
+        if let Some(skill) = preferred_skill_match(selection, &matches) {
+            return Ok(skill.clone());
+        }
+
         match matches.as_slice() {
             [skill] => Ok((*skill).clone()),
             [] => Err(format!("skill `{selection}` not found; use `/skills list`")),
@@ -230,6 +295,15 @@ impl SkillRegistry {
                     .join(", ")
             )),
         }
+    }
+
+    pub fn install_as_kimetsu(
+        &self,
+        selection: &str,
+        force: bool,
+    ) -> Result<SkillManifest, String> {
+        let skill = self.resolve_or_manifest(selection)?;
+        install_skill_as_kimetsu(&self.workspace, &skill, force)
     }
 }
 
@@ -245,9 +319,10 @@ pub fn render_loaded_skills(skills: &[LoadedSkill]) -> Option<String> {
     );
     for skill in skills {
         out.push_str(&format!(
-            "## Skill: {} [{}]\nroot: {}\nentrypoint: {}\ndescription: {}\n",
+            "## Skill: {} [{}]\norigin: {}\nroot: {}\nentrypoint: {}\ndescription: {}\n",
             skill.manifest.name,
             skill.manifest.source.as_str(),
+            skill_origin_label(&skill.manifest),
             skill.manifest.root.display(),
             skill.manifest.path.display(),
             skill.manifest.description
@@ -297,11 +372,478 @@ pub fn default_workspace_roots(workspace: &Path) -> Vec<PathBuf> {
     ]
 }
 
+pub fn discover_skill_roots(workspace: &Path, config: &SkillConfig) -> Vec<SkillRoot> {
+    if !config.enabled {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    if config.include_workspace_roots {
+        for (source, path) in [
+            (
+                SkillSource::Kimetsu,
+                workspace.join(".kimetsu").join("skills"),
+            ),
+            (SkillSource::Codex, workspace.join(".codex").join("skills")),
+            (
+                SkillSource::ClaudeCode,
+                workspace.join(".claude").join("skills"),
+            ),
+        ] {
+            push_skill_root(
+                &mut roots,
+                SkillRoot {
+                    exists: path.exists(),
+                    source,
+                    kind: SkillRootKind::Workspace,
+                    path,
+                    marketplace: None,
+                    logged_in: true,
+                },
+            );
+        }
+    }
+    if config.include_user_roots {
+        roots.extend(default_user_skill_roots());
+    }
+    for root in &config.roots {
+        push_skill_root(
+            &mut roots,
+            SkillRoot {
+                exists: root.exists(),
+                source: source_from_path(root),
+                kind: SkillRootKind::Extra,
+                path: root.clone(),
+                marketplace: None,
+                logged_in: true,
+            },
+        );
+    }
+    roots
+}
+
 pub fn loaded_skill_names(skills: &[LoadedSkill]) -> Vec<String> {
     skills
         .iter()
         .map(|skill| skill.manifest.name.clone())
         .collect()
+}
+
+pub fn skill_origin_label(skill: &SkillManifest) -> String {
+    match &skill.marketplace {
+        Some(marketplace) if !marketplace.is_empty() => {
+            format!("{} marketplace {}", skill.source.as_str(), marketplace)
+        }
+        _ => skill.source.as_str().to_string(),
+    }
+}
+
+fn default_user_skill_roots() -> Vec<SkillRoot> {
+    let mut roots = Vec::new();
+    let Some(home) = home_dir() else {
+        return roots;
+    };
+
+    let providers = [
+        (
+            SkillSource::Kimetsu,
+            "KIMETSU_HOME",
+            ".kimetsu",
+            &["KIMETSU_MODEL"][..],
+        ),
+        (
+            SkillSource::Codex,
+            "CODEX_HOME",
+            ".codex",
+            &["OPENAI_API_KEY", "CODEX_HOME"][..],
+        ),
+        (
+            SkillSource::ClaudeCode,
+            "CLAUDE_HOME",
+            ".claude",
+            &[
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_HOME",
+            ][..],
+        ),
+        (
+            SkillSource::Agents,
+            "AGENTS_HOME",
+            ".agents",
+            &["AGENTS_HOME"][..],
+        ),
+    ];
+
+    for (source, env_key, default_dir, login_envs) in providers {
+        let mut homes = Vec::new();
+        if let Some(path) = env_path(env_key) {
+            homes.push(path);
+        }
+        homes.push(home.join(default_dir));
+
+        for provider_home in dedupe_paths(homes) {
+            let logged_in = provider_logged_in(&provider_home, login_envs);
+            let skills_root = provider_home.join("skills");
+            push_skill_root(
+                &mut roots,
+                SkillRoot {
+                    exists: skills_root.exists(),
+                    source: source.clone(),
+                    kind: SkillRootKind::User,
+                    path: skills_root,
+                    marketplace: None,
+                    logged_in,
+                },
+            );
+            collect_marketplace_skill_roots(&mut roots, source.clone(), &provider_home, logged_in);
+        }
+    }
+
+    roots
+}
+
+fn collect_marketplace_skill_roots(
+    roots: &mut Vec<SkillRoot>,
+    source: SkillSource,
+    provider_home: &Path,
+    logged_in: bool,
+) {
+    for cache_root in [
+        provider_home.join("plugins").join("cache"),
+        provider_home.join("marketplaces").join("cache"),
+    ] {
+        if !cache_root.is_dir() {
+            continue;
+        }
+        collect_marketplace_skill_roots_rec(
+            roots,
+            source.clone(),
+            &cache_root,
+            &cache_root,
+            0,
+            logged_in,
+        );
+    }
+}
+
+fn collect_marketplace_skill_roots_rec(
+    roots: &mut Vec<SkillRoot>,
+    source: SkillSource,
+    cache_root: &Path,
+    dir: &Path,
+    depth: u8,
+    logged_in: bool,
+) {
+    if depth > 6 || roots.len() >= MAX_DISCOVERED_SKILLS {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let is_skills_dir = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("skills"))
+            .unwrap_or(false);
+        if is_skills_dir {
+            push_skill_root(
+                roots,
+                SkillRoot {
+                    exists: true,
+                    source: source.clone(),
+                    kind: SkillRootKind::Marketplace,
+                    marketplace: marketplace_label(cache_root, &path),
+                    path,
+                    logged_in,
+                },
+            );
+        } else if !should_skip_resource_dir(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        ) {
+            collect_marketplace_skill_roots_rec(
+                roots,
+                source.clone(),
+                cache_root,
+                &path,
+                depth + 1,
+                logged_in,
+            );
+        }
+    }
+}
+
+fn marketplace_label(cache_root: &Path, skills_dir: &Path) -> Option<String> {
+    let rel = skills_dir.strip_prefix(cache_root).ok()?;
+    let parts = rel
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .filter(|part| !part.eq_ignore_ascii_case("skills"))
+        .take(2)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn push_skill_root(roots: &mut Vec<SkillRoot>, root: SkillRoot) {
+    let normalized = normalize_path(&root.path);
+    if roots
+        .iter()
+        .any(|existing| normalize_path(&existing.path) == normalized)
+    {
+        return;
+    }
+    roots.push(SkillRoot {
+        path: normalized,
+        ..root
+    });
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let normalized = normalize_path(&path);
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn provider_logged_in(provider_home: &Path, env_keys: &[&str]) -> bool {
+    env_keys
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        || provider_home.join("auth.json").is_file()
+        || provider_home.join("credentials.json").is_file()
+        || provider_home.join("config.json").is_file()
+        || provider_home.join("config.toml").is_file()
+        || provider_home.join("settings.json").is_file()
+        || provider_home.exists()
+}
+
+fn preferred_skill_match<'a>(
+    selection: &str,
+    matches: &[&'a SkillManifest],
+) -> Option<&'a SkillManifest> {
+    let exact = matches
+        .iter()
+        .copied()
+        .filter(|skill| exact_skill_match(skill, selection))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [skill] => return Some(*skill),
+        [] => {}
+        _ => {
+            let kimetsu = exact
+                .iter()
+                .copied()
+                .filter(|skill| skill.source == SkillSource::Kimetsu)
+                .collect::<Vec<_>>();
+            if let [skill] = kimetsu.as_slice() {
+                return Some(*skill);
+            }
+        }
+    }
+
+    let kimetsu = matches
+        .iter()
+        .copied()
+        .filter(|skill| skill.source == SkillSource::Kimetsu)
+        .collect::<Vec<_>>();
+    if let [skill] = kimetsu.as_slice() {
+        Some(*skill)
+    } else {
+        None
+    }
+}
+
+fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    skill.name.to_ascii_lowercase().contains(&query)
+        || skill.description.to_ascii_lowercase().contains(&query)
+        || skill_origin_label(skill)
+            .to_ascii_lowercase()
+            .contains(&query)
+        || skill
+            .root
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains(&query)
+        || skill
+            .resources
+            .iter()
+            .any(|resource| resource.relative_path.to_ascii_lowercase().contains(&query))
+}
+
+fn exact_skill_match(skill: &SkillManifest, selection: &str) -> bool {
+    skill.name.eq_ignore_ascii_case(selection)
+        || skill
+            .path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(|dir| dir.eq_ignore_ascii_case(selection))
+            .unwrap_or(false)
+}
+
+fn install_skill_as_kimetsu(
+    workspace: &Path,
+    skill: &SkillManifest,
+    force: bool,
+) -> Result<SkillManifest, String> {
+    let target_root = normalize_path(&workspace.join(".kimetsu").join("skills"));
+    let slug = slugify_skill_name(&skill.name);
+    let destination = target_root.join(slug);
+
+    if skill.source == SkillSource::Kimetsu && same_path(&skill.root, &destination) {
+        return Ok(skill.clone());
+    }
+
+    fs::create_dir_all(&target_root)
+        .map_err(|err| format!("failed to create {}: {err}", target_root.display()))?;
+    if destination.exists() {
+        if !force {
+            return Err(format!(
+                "{} already exists; pass --force or `/skills install --force {}`",
+                destination.display(),
+                skill.name
+            ));
+        }
+        remove_dir_inside(&destination, &target_root)?;
+    }
+
+    copy_skill_tree(&skill.root, &destination)?;
+    write_install_origin(skill, &destination)?;
+    manifest_from_path_with_origin(&destination, Some(SkillSource::Kimetsu), None)
+}
+
+fn remove_dir_inside(path: &Path, allowed_parent: &Path) -> Result<(), String> {
+    let parent = allowed_parent
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve {}: {err}", allowed_parent.display()))?;
+    let target = path
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve {}: {err}", path.display()))?;
+    if !target.starts_with(&parent) || target == parent {
+        return Err(format!(
+            "refusing to remove {} outside {}",
+            target.display(),
+            parent.display()
+        ));
+    }
+    fs::remove_dir_all(&target)
+        .map_err(|err| format!("failed to remove {}: {err}", target.display()))
+}
+
+fn copy_skill_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    if !source.is_dir() {
+        return Err(format!("{} is not a skill directory", source.display()));
+    }
+    fs::create_dir_all(destination)
+        .map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
+    for entry in
+        fs::read_dir(source).map_err(|err| format!("failed to scan {}: {err}", source.display()))?
+    {
+        let entry = entry.map_err(|err| format!("failed to read skill entry: {err}"))?;
+        let source_path = entry.path();
+        let name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if source_path.is_dir() {
+            if should_skip_resource_dir(name) {
+                continue;
+            }
+            copy_skill_tree(&source_path, &destination.join(name))?;
+        } else if source_path.is_file() {
+            fs::copy(&source_path, destination.join(name)).map_err(|err| {
+                format!(
+                    "failed to copy {} into {}: {err}",
+                    source_path.display(),
+                    destination.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SkillInstallOrigin {
+    imported_at_unix: u64,
+    name: String,
+    source: String,
+    marketplace: Option<String>,
+    original_root: String,
+    original_entrypoint: String,
+}
+
+fn write_install_origin(skill: &SkillManifest, destination: &Path) -> Result<(), String> {
+    let imported_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let origin = SkillInstallOrigin {
+        imported_at_unix,
+        name: skill.name.clone(),
+        source: skill.source.as_str().to_string(),
+        marketplace: skill.marketplace.clone(),
+        original_root: skill.root.display().to_string(),
+        original_entrypoint: skill.path.display().to_string(),
+    };
+    let json = serde_json::to_string_pretty(&origin)
+        .map_err(|err| format!("failed to serialize skill origin: {err}"))?;
+    fs::write(destination.join(".kimetsu-skill-origin.json"), json)
+        .map_err(|err| format!("failed to write skill origin: {err}"))
+}
+
+fn slugify_skill_name(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if (ch == '-' || ch == '_' || ch.is_whitespace()) && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "skill".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn push_loaded_skill(
@@ -350,33 +892,42 @@ fn load_manifest(skill: &SkillManifest, max_skill_bytes: usize) -> Result<Loaded
 }
 
 fn discover_root(
-    root: &Path,
+    root: &SkillRoot,
     seen: &mut HashSet<PathBuf>,
     skills: &mut Vec<SkillManifest>,
 ) -> Result<(), String> {
-    if !root.exists() {
+    if !root.exists {
         return Ok(());
     }
-    let path = normalize_path(root);
+    let path = normalize_path(&root.path);
     if path.is_file() {
-        let manifest = manifest_from_path(&path)?;
+        let manifest = manifest_from_path_with_origin(
+            &path,
+            Some(root.source.clone()),
+            root.marketplace.clone(),
+        )?;
         if seen.insert(normalize_path(&manifest.path)) {
             skills.push(manifest);
         }
         return Ok(());
     }
     if path.join("SKILL.md").is_file() {
-        let manifest = manifest_from_path(&path)?;
+        let manifest = manifest_from_path_with_origin(
+            &path,
+            Some(root.source.clone()),
+            root.marketplace.clone(),
+        )?;
         if seen.insert(normalize_path(&manifest.path)) {
             skills.push(manifest);
         }
         return Ok(());
     }
-    discover_dir(&path, seen, skills, 0)
+    discover_dir(&path, root, seen, skills, 0)
 }
 
 fn discover_dir(
     dir: &Path,
+    root: &SkillRoot,
     seen: &mut HashSet<PathBuf>,
     skills: &mut Vec<SkillManifest>,
     depth: u8,
@@ -392,15 +943,23 @@ fn discover_dir(
         let path = entry.path();
         if path.is_dir() {
             if path.join("SKILL.md").is_file() {
-                let manifest = manifest_from_path(&path)?;
+                let manifest = manifest_from_path_with_origin(
+                    &path,
+                    Some(root.source.clone()),
+                    root.marketplace.clone(),
+                )?;
                 if seen.insert(normalize_path(&manifest.path)) {
                     skills.push(manifest);
                 }
             } else {
-                discover_dir(&path, seen, skills, depth + 1)?;
+                discover_dir(&path, root, seen, skills, depth + 1)?;
             }
         } else if is_markdown_skill_file(&path) {
-            let manifest = manifest_from_path(&path)?;
+            let manifest = manifest_from_path_with_origin(
+                &path,
+                Some(root.source.clone()),
+                root.marketplace.clone(),
+            )?;
             if seen.insert(normalize_path(&manifest.path)) {
                 skills.push(manifest);
             }
@@ -413,6 +972,14 @@ fn discover_dir(
 }
 
 fn manifest_from_path(path: &Path) -> Result<SkillManifest, String> {
+    manifest_from_path_with_origin(path, None, None)
+}
+
+fn manifest_from_path_with_origin(
+    path: &Path,
+    source: Option<SkillSource>,
+    marketplace: Option<String>,
+) -> Result<SkillManifest, String> {
     let path = if path.is_dir() {
         path.join("SKILL.md")
     } else {
@@ -438,7 +1005,8 @@ fn manifest_from_path(path: &Path) -> Result<SkillManifest, String> {
     Ok(SkillManifest {
         name,
         description,
-        source: source_from_path(&path),
+        source: source.unwrap_or_else(|| source_from_path(&path)),
+        marketplace,
         root: normalize_path(path.parent().unwrap_or_else(|| Path::new("."))),
         path: normalize_path(&path),
         resources: discover_skill_resources(path.parent().unwrap_or_else(|| Path::new(".")))
@@ -472,7 +1040,9 @@ fn collect_skill_resources(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if name.eq_ignore_ascii_case("SKILL.md") {
+        if name.eq_ignore_ascii_case("SKILL.md")
+            || name.eq_ignore_ascii_case(".kimetsu-skill-origin.json")
+        {
             continue;
         }
         if path.is_dir() {
@@ -702,6 +1272,8 @@ fn source_from_path(path: &Path) -> SkillSource {
         SkillSource::Codex
     } else if lowered.contains(".claude") {
         SkillSource::ClaudeCode
+    } else if lowered.contains(".agents") {
+        SkillSource::Agents
     } else if lowered.contains(".kimetsu") {
         SkillSource::Kimetsu
     } else {
@@ -830,6 +1402,37 @@ mod tests {
         assert!(context.contains("entrypoint:"));
         assert!(context.contains("[script] scripts/check.ps1"));
         assert!(context.contains("Always run focused tests."));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn installs_external_skill_as_kimetsu_bundle() {
+        let root = temp_root("skill_install");
+        let dir = root.join(".codex/skills/reviewer");
+        fs::create_dir_all(dir.join("references")).expect("dir");
+        fs::write(dir.join("references/checklist.md"), "# Checklist").expect("write ref");
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: reviewer\ndescription: Review diffs.\n---\nLead with findings.",
+        )
+        .expect("write skill");
+
+        let config = SkillConfig::default();
+        let mut registry = SkillRegistry::discover(&root, &config).expect("discover");
+        let installed = registry
+            .install_as_kimetsu("reviewer", false)
+            .expect("install");
+        assert_eq!(installed.source, SkillSource::Kimetsu);
+        assert!(installed.root.ends_with(".kimetsu/skills/reviewer"));
+        assert!(installed.root.join("SKILL.md").is_file());
+        assert!(installed.root.join("references/checklist.md").is_file());
+        assert!(installed.root.join(".kimetsu-skill-origin.json").is_file());
+
+        registry.refresh(&config).expect("refresh");
+        let resolved = registry
+            .resolve_or_manifest("reviewer")
+            .expect("resolve installed preference");
+        assert_eq!(resolved.source, SkillSource::Kimetsu);
         fs::remove_dir_all(root).ok();
     }
 

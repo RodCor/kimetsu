@@ -69,6 +69,82 @@ fn is_useful_tool(name: &str) -> bool {
     USEFUL_TOOL_NAMES.contains(&name)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolLoadout {
+    /// Start with read-only inspection plus `load_tools`; the model can
+    /// request edit/shell/background/image tools only after it has a reason.
+    Dynamic,
+    /// Inspection only. Used for repo questions where editing/running is not
+    /// part of the user's request.
+    ReadOnly,
+    /// Full benchmark/code-task surface. Harbor keeps this default.
+    Full,
+}
+
+impl ToolLoadout {
+    fn initial_tool_names(self) -> Vec<&'static str> {
+        match self {
+            Self::Dynamic => vec![
+                "load_tools",
+                "read_file",
+                "list_files",
+                "glob",
+                "search_files",
+                "git_status",
+                "git_diff",
+                "plan",
+                "think",
+            ],
+            Self::ReadOnly => vec![
+                "read_file",
+                "list_files",
+                "glob",
+                "search_files",
+                "git_status",
+                "git_diff",
+                "think",
+            ],
+            Self::Full => FULL_TOOL_NAMES.to_vec(),
+        }
+    }
+
+    const fn allows_dynamic_loading(self) -> bool {
+        matches!(self, Self::Dynamic)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dynamic => "dynamic",
+            Self::ReadOnly => "read_only",
+            Self::Full => "full",
+        }
+    }
+}
+
+const FULL_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "list_files",
+    "search_files",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "git_status",
+    "git_diff",
+    "shell_command",
+    "glob",
+    "multi_read",
+    "move_file",
+    "delete_file",
+    "plan",
+    "think",
+    "record_deviation",
+    "shell_background",
+    "shell_status",
+    "shell_output",
+    "shell_stop",
+    "view_image",
+];
+
 /// MP-7d: report returned by `run_model_agent`. v0.3.1 Phase-2: also
 /// carries the summary + context a caller may emit through its own
 /// transport. This decouples the agent loop from any specific I/O surface.
@@ -104,6 +180,7 @@ pub struct KimetsuAgentOpts {
     pub turn_budget: u32,
     pub auto_orient: bool,
     pub min_actions_before_finish: u32,
+    pub tool_loadout: ToolLoadout,
     /// Transport label used in prompt text and telemetry. Harbor mode
     /// keeps the Terminal-Bench wording; chat uses a product-facing label.
     pub mode: &'static str,
@@ -123,6 +200,7 @@ impl Default for KimetsuAgentOpts {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
             auto_orient: true,
             min_actions_before_finish: 3,
+            tool_loadout: ToolLoadout::Full,
             mode: "kimetsu",
             task_source: "user",
             strict_verify: Some(false),
@@ -147,6 +225,7 @@ impl KimetsuAgentOpts {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
             auto_orient: false,
             min_actions_before_finish: 0,
+            tool_loadout: ToolLoadout::Full,
             mode: "test",
             task_source: "test",
             strict_verify: Some(false),
@@ -233,158 +312,23 @@ pub fn run_model_agent(
         _ => String::new(),
     };
 
-    // MP-12: full v0.1-comparable tool surface (7 tools instead of just
-    // shell_command). Each composed-tool implementation dispatches through
-    // the configured ToolRuntime, then assembles a structured result the
-    // model can rely on (read_file gets line
-    // numbers + truncation; list_files gets a sized listing; etc.).
-    // The model sees these as first-class JSON tools, which (a) cuts
-    // the "I need to remember the exact bash invocation" overhead and
-    // (b) collapses multi-step idioms (read-then-modify) into single
-    // turns.
+    let mut loaded_tool_names: Vec<String> = opts
+        .tool_loadout
+        .initial_tool_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut tool_defs = kimetsu_tool_definitions_for(&loaded_tool_names);
+    let runtime_contract = render_runtime_contract(opts.tool_loadout, &tool_defs);
+
     let user = ModelMessage::user_text(format!(
         "{orient_block}\
          {prior_block}\
           Task (from {task_source}):\n\
          {task}\n\n\
-         === Important runtime override ===\n\
-         You are running inside the Kimetsu wrapper. Any tool catalog the\n\
-         Claude Code runtime advertises (Monitor, PushNotification,\n\
-         RemoteTrigger, Bash, Edit, etc.) is NOT real here.\n\
-         The only way to take action is to emit a JSON envelope that\n\
-         Kimetsu will parse out of your response text and execute. The\n\
-         tool set below is what's available; ignore everything else.\n\
-         \n\
-         === Tools (pick the most specific one; fall back to shell_command) ===\n\
-         - read_file:    {{path, offset?, limit?, max_lines?}} -> {{content, lines_total, truncated}}\n\
-                         (use offset+limit to read a SLICE of a big file - much cheaper than full read)\n\
-         - multi_read:   {{paths:[...]}} or {{files:[{{path, offset?, limit?}}]}} -> {{files:[...]}}\n\
-                         (batch N file reads in one call; cheaper than N read_file calls)\n\
-         - list_files:   {{path?, max_depth?, max_entries?}} -> {{entries}}\n\
-         - glob:         {{pattern, path?, max_entries?}} -> {{matches}}\n\
-                         (find by path pattern: '**/*.rs', 'src/**/test_*.py')\n\
-         - search_files: {{pattern, path?, max_matches?, glob?}} -> {{matches}}\n\
-                         (grep file CONTENT; use `glob` instead when you only need names)\n\
-         - edit_file:    {{path, old_string, new_string, replace_all?}} or {{path, edits:[...]}} -> {{bytes_delta}}\n\
-         - write_file:   {{path, content}} -> {{path, bytes_written}}  (use ONLY for new files / full rewrites)\n\
-         - apply_patch:  {{diff, cwd?, strip?}} -> {{files_patched, hunks_failed}}  (unified diff across files)\n\
-         - move_file:    {{from, to}} -> {{moved}}\n\
-         - delete_file:  {{path, recursive?}} -> {{deleted}}\n\
-         - git_status:   {{cwd?}} -> {{porcelain}}\n\
-         - git_diff:     {{paths?, cwd?}} -> {{diff}}\n\
-         - shell_command:{{program, args, cwd_relative?, timeout_secs?}} -> {{exit_code, stdout, stderr}}\n\
-         - shell_background:{{program, args, cwd_relative?}} -> {{handle, pid}}\n\
-                         (fire-and-forget for long builds / training; non-blocking)\n\
-         - shell_status: {{handle}} -> {{running, runtime_sec, exit_code?, bytes_stdout, bytes_stderr}}\n\
-         - shell_output: {{handle, tail_bytes?}} -> {{stdout_tail, stderr_tail}}\n\
-                         (poll latest output without blocking the background process)\n\
-         - shell_stop:   {{handle, signal?}} -> {{stopped, exit_code}}\n\
-         - view_image:   {{path, include_base64?, max_bytes?}} -> {{format, width, height, size_bytes, sha256, base64?}}\n\
-                         (read image metadata + optional bytes for workspace images)\n\
-         - plan:         {{todos:[{{content,status,activeForm?}}]}} -> {{todos}}\n\
-                         (maintain a checklist across turns on multi-step tasks)\n\
-         - think:        {{thought}} -> {{ack:true}}\n\
-                         (pure deliberation slot; no I/O, no state change)\n\
-         \n\
-         Response format (one JSON object per reply, no prose, no\n\
-         markdown, no backticks):\n\
-         \n\
-         To call a single tool:\n\
-         {{\"thought\": \"<short rationale>\",\n\
-          \"tool_call\": {{\"name\": \"<tool>\", \"input\": <object matching the schema>}}}}\n\
-         \n\
-         To batch several independent tools in one turn (saves model\n\
-         round-trips when calls don't depend on each other's output):\n\
-         {{\"thought\": \"<short rationale>\",\n\
-          \"tool_calls\": [\n\
-            {{\"name\": \"<tool>\", \"input\": <object>}},\n\
-            {{\"name\": \"<tool>\", \"input\": <object>}}\n\
-          ]}}\n\
-         Each call is dispatched and its result returned before the next\n\
-         model turn. Only batch when the inputs are independent - if call\n\
-         B needs to see B's output first, use the single form.\n\
-         \n\
-         To finish and report the final answer:\n\
-         {{\"thought\": \"<short rationale>\",\n\
-          \"finish\": {{\"summary\": \"<one-line outcome the verifier should see>\"}}}}\n\
-         \n\
-         === Tool selection heuristics (read this before responding) ===\n\
-         \n\
-         LONG-RUNNING COMMANDS (>60s expected):\n\
-         Use shell_background, NOT shell_command. The wrapper kills any\n\
-         single foreground call that runs longer than ~1500s wall-clock,\n\
-         so big builds / training / large test suites MUST be backgrounded.\n\
-         Examples that need shell_background:\n\
-           - `make`, `make -j`, `cargo build --release`, `cmake --build`\n\
-           - `pip install` of heavy packages, `npm install` in big trees\n\
-           - Training scripts (python train.py, caffe train ...)\n\
-           - Long test suites, ray tracers, simulators\n\
-           - Anything where you'd watch a progress bar\n\
-         Pattern:\n\
-           1) shell_background {{program, args}}        -> {{handle, pid}}\n\
-           2) shell_status     {{handle}}                -> {{running, runtime_sec, exit_code?}}\n\
-           3) shell_output     {{handle, tail_bytes:4096}} -> {{stdout_tail, stderr_tail}}\n\
-              Loop 2+3 as needed. Insert `think` calls between polls to\n\
-              plan next steps instead of polling tighter than ~10s.\n\
-           4) shell_stop {{handle}} only if you decide to give up early.\n\
-         \n\
-         FILE EDITS - pick the cheapest tool that fits:\n\
-           - edit_file: changing a few lines in an existing file. ~50x\n\
-             cheaper than write_file for small edits. Hash-checked.\n\
-           - apply_patch: coordinated changes across multiple files.\n\
-             Accepts BOTH standard unified diff AND Codex starred-patch\n\
-             format (*** Begin Patch / *** Update File: / *** Add File:).\n\
-           - write_file: ONLY for new files or full rewrites. Using it\n\
-             to change a few lines wastes tokens and risks corrupting\n\
-             unrelated content.\n\
-         \n\
-         FILE READS - slice big files, don't dump them:\n\
-           - read_file {{offset, limit}}: read lines N..M of a big file.\n\
-             A 2000-line source dump costs ~10k tokens of input;\n\
-             lines 400-450 costs ~50 tokens. Pick the slice.\n\
-           - multi_read: 2+ files at once in one tool call. Cheaper than\n\
-             N separate read_file calls because the shell round-trip is\n\
-             paid once.\n\
-           - glob: find files by NAME pattern ('**/*.py'). Use this\n\
-             instead of search_files when you don't need content search.\n\
-           - search_files: grep file CONTENT. Slower than glob; only use\n\
-             when you need to find code by what it contains.\n\
-         \n\
-         PLANNING & DELIBERATION:\n\
-           - plan: when the task has >=3 distinct steps, call plan FIRST\n\
-             with the breakdown. Update statuses as you progress. The\n\
-             plan survives across turns in your conversation history.\n\
-           - think: pure reasoning slot - no I/O. Use when you need to\n\
-             work through a problem before acting. Cheaper than a probe\n\
-             tool call.\n\
-         \n\
-         PARALLEL CALLS (when independent):\n\
-         Batch reads / status checks / unrelated edits via the parallel\n\
-         tool_calls form. Saves one full model turn per extra call.\n\
-         Don't batch dependent calls (e.g. read after edit) - those need\n\
-         to be serialized.\n\
-         \n\
-         === Common pitfalls (don't do these) ===\n\
-           - Running `make` via shell_command for a multi-minute build\n\
-             (it will time out - use shell_background).\n\
-           - Using write_file to change 3 lines (use edit_file).\n\
-           - Reading a 2000-line file when you only need ~50 lines\n\
-             (use offset+limit).\n\
-           - Polling shell_status every 1s without a `think` between\n\
-             polls (wasteful; the model burns turns on no-op probes).\n\
-           - Emitting plain text without a JSON envelope when you have\n\
-             more work to do (Kimetsu will nudge you to keep going).\n\
-           - Calling finish before producing the artifact the verifier\n\
-             expects (the verifier reads files / runs scripts; an empty\n\
-             summary alone won't pass).\n\
-         \n\
-         Workspace paths are relative to the task's starting directory.\n\
-         Begin with one tool_call (or one parallel tool_calls batch).\n\
-         Do not narrate. Do not output plain prose. Always wrap in JSON."
+         {runtime_contract}"
     ));
     let mut messages = vec![system, user];
-
-    let tool_defs = kimetsu_tool_definitions();
 
     let mut tool_calls_total = 0u32;
     // v0.3.4a: was `last_usage` (overwrite per turn). For multi-turn
@@ -478,6 +422,30 @@ pub fn run_model_agent(
             for call in response.tool_calls {
                 tool_calls_total += 1;
                 let name = call.name.clone();
+                if name == "load_tools" {
+                    let result_value = kimetsu_load_tools(
+                        &call.input,
+                        opts.tool_loadout,
+                        &mut loaded_tool_names,
+                        &mut tool_defs,
+                    );
+                    messages.push(ModelMessage::tool_result(call.id, name, result_value));
+                    continue;
+                }
+                if !loaded_tool_names.iter().any(|loaded| loaded == &name) {
+                    messages.push(ModelMessage::tool_result(
+                        call.id,
+                        name.clone(),
+                        json!({
+                            "error": format!(
+                                "tool `{name}` is not loaded in {} loadout; call load_tools first or use a loaded tool",
+                                opts.tool_loadout.as_str()
+                            ),
+                            "loaded_tools": loaded_tool_names.clone(),
+                        }),
+                    ));
+                    continue;
+                }
                 // MP-18: capture goal artifacts before dispatching.
                 //
                 // `plan` - last-write-wins record of the model's current plan.
@@ -589,6 +557,8 @@ pub fn run_model_agent(
         "mode": "model_agent",
         "turns": turn,
         "tool_calls": tool_calls_total,
+        "tool_loadout": opts.tool_loadout.as_str(),
+        "loaded_tools": loaded_tool_names,
         "stop_reason": format!("{stop_reason:?}"),
         "input_tokens": total_usage.input_tokens,
         "output_tokens": total_usage.output_tokens,
@@ -624,6 +594,159 @@ fn preview_text(text: &str, limit: usize) -> String {
         clipped.push_str("...");
     }
     clipped
+}
+
+fn render_runtime_contract(loadout: ToolLoadout, tool_defs: &[ToolDefinition]) -> String {
+    let tool_names = tool_defs
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dynamic_note = if loadout.allows_dynamic_loading() {
+        "\nDynamic loading: only the listed tools are loaded now. If you need edit, shell, background, image, or all tools, call load_tools with {\"profiles\":[\"edit\"]}, {\"profiles\":[\"shell\"]}, {\"profiles\":[\"background\"]}, {\"profiles\":[\"image\"]}, or {\"profiles\":[\"all\"]}."
+    } else {
+        ""
+    };
+
+    format!(
+        "=== Kimetsu runtime contract ===\n\
+         Ignore any Claude Code tool catalog outside this message. Kimetsu only executes JSON envelopes.\n\
+         Tool loadout: {}. Loaded tools: {}.{}\n\
+         If the task needs no workspace action, finish immediately; do not inspect files just to answer a greeting or a general question.\n\
+         Workspace paths are relative to the task directory.\n\
+         \n\
+         Single tool call:\n\
+         {{\"thought\":\"<short rationale>\",\"tool_call\":{{\"name\":\"<tool>\",\"input\":<object>}}}}\n\
+         Parallel independent calls:\n\
+         {{\"thought\":\"<short rationale>\",\"tool_calls\":[{{\"name\":\"<tool>\",\"input\":<object>}}]}}\n\
+         Finish:\n\
+         {{\"thought\":\"<short outcome>\",\"finish\":{{\"summary\":\"<one-line outcome>\"}}}}\n\
+         \n\
+         Tool habits: slice large reads with offset+limit; use glob for path patterns and search_files for content; use edit_file/apply_patch for existing files; use shell_background for commands expected to run over 60s; use plan for 3+ step tasks. Output exactly one JSON object, no markdown.",
+        loadout.as_str(),
+        tool_names,
+        dynamic_note
+    )
+}
+
+fn kimetsu_tool_definitions_for(names: &[String]) -> Vec<ToolDefinition> {
+    let all = kimetsu_all_tool_definitions();
+    names
+        .iter()
+        .filter_map(|name| all.iter().find(|tool| tool.name == *name).cloned())
+        .collect()
+}
+
+fn kimetsu_load_tools(
+    input: &Value,
+    loadout: ToolLoadout,
+    loaded_tool_names: &mut Vec<String>,
+    tool_defs: &mut Vec<ToolDefinition>,
+) -> Value {
+    if !loadout.allows_dynamic_loading() {
+        return json!({
+            "ok": false,
+            "error": "load_tools is only available in dynamic tool loadout"
+        });
+    }
+
+    let mut requested = Vec::new();
+    if let Some(profile) = input.get("profile").and_then(Value::as_str) {
+        requested.extend(tool_names_for_profile(profile));
+    }
+    if let Some(profiles) = input.get("profiles").and_then(Value::as_array) {
+        for profile in profiles.iter().filter_map(Value::as_str) {
+            requested.extend(tool_names_for_profile(profile));
+        }
+    }
+    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+        requested.extend(tools.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+
+    if requested.is_empty() {
+        return json!({
+            "ok": false,
+            "error": "load_tools requires `profile`, `profiles`, or `tools`"
+        });
+    }
+
+    let valid = kimetsu_all_tool_definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    let mut added = Vec::new();
+    let mut unknown = Vec::new();
+    for name in requested {
+        if !valid.iter().any(|valid_name| valid_name == &name) {
+            unknown.push(name);
+            continue;
+        }
+        if !loaded_tool_names.iter().any(|loaded| loaded == &name) {
+            loaded_tool_names.push(name.clone());
+            added.push(name);
+        }
+    }
+
+    order_loaded_tools(loaded_tool_names);
+    *tool_defs = kimetsu_tool_definitions_for(loaded_tool_names);
+
+    json!({
+        "ok": unknown.is_empty(),
+        "added": added,
+        "unknown": unknown,
+        "loaded_tools": loaded_tool_names,
+    })
+}
+
+fn tool_names_for_profile(profile: &str) -> Vec<String> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "read" | "readonly" | "read_only" | "inspect" => vec![
+            "read_file",
+            "list_files",
+            "glob",
+            "search_files",
+            "git_status",
+            "git_diff",
+            "multi_read",
+        ],
+        "edit" | "write" | "filesystem" => vec![
+            "multi_read",
+            "edit_file",
+            "apply_patch",
+            "write_file",
+            "move_file",
+            "delete_file",
+        ],
+        "shell" | "run" | "verify" | "test" => vec!["shell_command"],
+        "background" | "long_running" => vec![
+            "shell_command",
+            "shell_background",
+            "shell_status",
+            "shell_output",
+            "shell_stop",
+        ],
+        "image" | "vision" => vec!["view_image"],
+        "memory" | "verify_loop" => vec!["record_deviation"],
+        "all" | "full" => FULL_TOOL_NAMES.to_vec(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn order_loaded_tools(names: &mut Vec<String>) {
+    let order = kimetsu_all_tool_definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    names.sort_by_key(|name| {
+        order
+            .iter()
+            .position(|known| known == name)
+            .unwrap_or(usize::MAX)
+    });
+    names.dedup();
 }
 
 /// MP-18: construct the iterative goal-verify nudge. Recaps the task
@@ -753,7 +876,31 @@ const TOOL_DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// model's first scan; put the most-used ones first (`read_file`,
 /// `list_files`, `search_files`) so the catalog is read top-down.
 pub fn kimetsu_tool_definitions() -> Vec<ToolDefinition> {
+    let names = FULL_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    kimetsu_tool_definitions_for(&names)
+}
+
+fn kimetsu_all_tool_definitions() -> Vec<ToolDefinition> {
     vec![
+        ToolDefinition {
+            name: "load_tools".to_string(),
+            description: "Dynamically load additional Kimetsu tool profiles only when needed. \
+                Use this in dynamic loadout before editing files, running shell commands, \
+                managing long-running commands, or reading images. Profiles: read, edit, \
+                shell, background, image, all. You can also pass explicit `tools`."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "profile": { "type": "string", "description": "One profile: read, edit, shell, background, image, all." },
+                    "profiles": { "type": "array", "items": { "type": "string" } },
+                    "tools": { "type": "array", "items": { "type": "string" } }
+                },
+            }),
+        },
         ToolDefinition {
             name: "read_file".to_string(),
             description: "Read a UTF-8 text file from the workspace. Returns content, \
@@ -3133,6 +3280,11 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{MockProvider, ModelResponse};
+    use crate::tools::ToolRuntime;
+    use kimetsu_core::ids::RunId;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ----- MP-14e unit tests (pure-Rust paths, no shell needed) -----
 
@@ -3192,6 +3344,80 @@ mod tests {
         assert_eq!(result["ack"], true);
         assert_eq!(result["thought_len"], thought.len() as u64);
         assert!(kimetsu_think(&json!({})).get("error").is_some());
+    }
+
+    #[test]
+    fn dynamic_loadout_starts_small_and_loads_profiles_on_request() {
+        let root = temp_root("dynamic_tools");
+        let mut runtime = ToolRuntime::new(&root, RunId::new()).expect("runtime");
+        let mut provider = MockProvider::new([
+            ModelResponse::tool_call(
+                "call_1",
+                "load_tools",
+                json!({"profiles": ["edit", "shell"]}),
+            ),
+            ModelResponse::text("loaded the tools"),
+        ]);
+        let opts = KimetsuAgentOpts {
+            tool_loadout: ToolLoadout::Dynamic,
+            ..KimetsuAgentOpts::for_tests()
+        };
+
+        let report = run_model_agent("prepare to edit", &mut runtime, &mut provider, opts, None)
+            .expect("run");
+
+        assert_eq!(report.tool_calls, 1);
+        let first_tools = provider.requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(first_tools.contains(&"load_tools"));
+        assert!(first_tools.contains(&"read_file"));
+        assert!(!first_tools.contains(&"edit_file"));
+        assert!(!first_tools.contains(&"shell_command"));
+
+        let second_tools = provider.requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(second_tools.contains(&"edit_file"));
+        assert!(second_tools.contains(&"apply_patch"));
+        assert!(second_tools.contains(&"shell_command"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn read_only_loadout_does_not_advertise_edit_or_shell_tools() {
+        let root = temp_root("readonly_tools");
+        let mut runtime = ToolRuntime::new(&root, RunId::new()).expect("runtime");
+        let mut provider = MockProvider::new([ModelResponse::text("repo summary")]);
+        let opts = KimetsuAgentOpts {
+            tool_loadout: ToolLoadout::ReadOnly,
+            ..KimetsuAgentOpts::for_tests()
+        };
+
+        run_model_agent(
+            "summarize the repo",
+            &mut runtime,
+            &mut provider,
+            opts,
+            None,
+        )
+        .expect("run");
+
+        let tools = provider.requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&"read_file"));
+        assert!(tools.contains(&"search_files"));
+        assert!(!tools.contains(&"load_tools"));
+        assert!(!tools.contains(&"edit_file"));
+        assert!(!tools.contains(&"shell_command"));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3614,5 +3840,15 @@ mod tests {
         // Unknown / typo tool names also don't count.
         assert!(!is_useful_tool("unknown_tool"));
         assert!(!is_useful_tool(""));
+    }
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("kimetsu_{label}_{nanos}"));
+        fs::create_dir_all(&root).expect("root");
+        root
     }
 }
