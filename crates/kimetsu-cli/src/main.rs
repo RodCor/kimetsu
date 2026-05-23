@@ -3,6 +3,8 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod doctor;
+
 use clap::{Args, Parser, Subcommand};
 use kimetsu_agent::bench::{BenchOptions, run_benchmark};
 use kimetsu_agent::pipeline::{CodingRunOptions, run_coding};
@@ -65,6 +67,30 @@ enum Command {
     /// MP-18 verify) with a stdin/stdout transport. No dependency on
     /// Terminal-Bench.
     Chat(ChatArgs),
+    /// v0.4.6: kimetsu doctor — automated wire-health check.
+    ///
+    /// Validates that every kimetsu subsystem the chat REPL + MCP
+    /// sidecar rely on actually works against the current workspace
+    /// + user state. Hermetic by default; safe to run in CI.
+    ///
+    /// Run after upgrading kimetsu, after changing
+    /// `KIMETSU_BRAIN_EMBEDDER`, or whenever something looks
+    /// off — doctor surfaces the actionable fix.
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Workspace to validate. Defaults to current directory.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Emit JSON instead of the human report. Used by CI + hooks.
+    #[arg(long)]
+    json: bool,
+    /// Skip the MCP spawn check. Useful when running inside a
+    /// sandbox where spawning is disallowed.
+    #[arg(long)]
+    skip_mcp: bool,
 }
 
 #[derive(Debug, Args)]
@@ -576,7 +602,36 @@ fn run() -> KimetsuResult<()> {
         Command::Mcp { command } => mcp(command),
         Command::Plugin { command } => plugin(command),
         Command::Chat(args) => chat(args),
+        Command::Doctor(args) => doctor_cmd(args),
     }
+}
+
+/// v0.4.6: `kimetsu doctor` entry point. Runs the full health
+/// suite + prints either the human or JSON report.
+///
+/// Exit codes:
+///   0 — all checks passed or warned.
+///   1 — at least one Fail.
+///   2 — internal doctor error (couldn't even run the checks).
+fn doctor_cmd(args: DoctorArgs) -> KimetsuResult<()> {
+    let opts = doctor::DoctorOptions {
+        json: args.json,
+        skip_mcp: args.skip_mcp,
+    };
+    let workspace = match args.workspace.canonicalize() {
+        Ok(p) => p,
+        Err(_) => args.workspace.clone(),
+    };
+    let report = doctor::run(&workspace, opts.clone())?;
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        doctor::print_human(&report);
+    }
+    if !report.ok() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// v0.3: `kimetsu chat` subcommand. Reuses the kimetsu-agent runtime

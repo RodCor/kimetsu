@@ -1536,6 +1536,7 @@ dependencies = [
  "kimetsu-brain",
  "kimetsu-chat",
  "kimetsu-core",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
