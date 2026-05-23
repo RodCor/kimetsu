@@ -1,5 +1,6 @@
 pub mod benchmark;
 pub mod context;
+pub mod embeddings;
 pub mod ingest;
 pub mod lock;
 pub mod project;

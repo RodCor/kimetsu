@@ -13,6 +13,7 @@ use ulid::Ulid;
 
 use crate::benchmark;
 use crate::context::{self, ContextBundle, ContextRequest};
+use crate::embeddings;
 use crate::ingest::{self, RepoIngestSummary};
 use crate::lock::ProjectLock;
 use crate::projector;
@@ -413,6 +414,13 @@ pub fn add_memory(
     writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, accepted, finished])?;
+
+    // v0.4.2: post-projection embedding write. Pre-v0.4.3 the default
+    // is `NoopEmbedder`, which short-circuits and leaves the embedding
+    // column NULL — exact v0.4.1 behavior. v0.4.3 swaps the default to
+    // a real embedder (fastembed) and rows start landing with vectors.
+    let embedder = embeddings::open_default_embedder();
+    embeddings::embed_and_persist(&conn, &memory_id, text, embedder.as_ref())?;
 
     Ok(memory_id)
 }

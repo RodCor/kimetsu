@@ -8,6 +8,39 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::embeddings::{
+    self, DEFAULT_HYBRID_ALPHA, Embedder, cosine_similarity, decode_embedding,
+};
+
+/// v0.4.2: a pre-computed query embedding paired with the producing
+/// model's id. Threaded down into [`memory_candidates`] so each row
+/// can decide whether to contribute a cosine term (only when the
+/// row's `embedding_model` matches the active query's `model_id`).
+#[derive(Debug, Clone)]
+struct QueryEmbedding {
+    vector: Vec<f32>,
+    model_id: String,
+}
+
+impl QueryEmbedding {
+    fn from_embedder(embedder: &dyn Embedder, query: &str) -> Option<Self> {
+        if embedder.is_noop() {
+            return None;
+        }
+        match embedder.embed(query) {
+            Ok(v) if v.len() == embedder.dim() => Some(Self {
+                vector: v,
+                model_id: embedder.model_id().to_string(),
+            }),
+            // NotImplemented / dim-mismatch / load failure → silently
+            // skip the cosine blend. v0.4.2 surfaces no warning here
+            // by design — the broker stays usable on best-effort
+            // semantic retrieval.
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextCapsule {
     pub id: String,
@@ -72,6 +105,11 @@ pub fn retrieve_context(
 /// brain at `~/.kimetsu/brain.db`); the slice shape leaves room for
 /// future scope tiers (team brain, org brain) without breaking the
 /// signature.
+///
+/// v0.4.2: uses [`embeddings::open_default_embedder`] for the cosine
+/// term. Pre-v0.4.3 the default is `NoopEmbedder`, which short-
+/// circuits the cosine path so retrieval stays FTS-only — exact
+/// v0.4.1 behavior. v0.4.3 swaps the default to a real embedder.
 pub fn retrieve_context_multi(
     conn: &Connection,
     repo_root: &str,
@@ -79,10 +117,36 @@ pub fn retrieve_context_multi(
     request: ContextRequest,
     extra_memory_conns: &[&Connection],
 ) -> KimetsuResult<ContextBundle> {
+    let embedder = embeddings::open_default_embedder();
+    retrieve_context_with_embedder(
+        conn,
+        repo_root,
+        weights,
+        request,
+        extra_memory_conns,
+        embedder.as_ref(),
+    )
+}
+
+/// v0.4.2: explicit-embedder variant. Lets tests inject `StubEmbedder`
+/// or any other [`Embedder`] without going through
+/// [`embeddings::open_default_embedder`]. v0.4.3 callers (chat REPL,
+/// MCP server) can also use this directly to hold one embedder
+/// instance for the lifetime of a session instead of paying the
+/// model-load cost on every retrieval.
+pub fn retrieve_context_with_embedder(
+    conn: &Connection,
+    repo_root: &str,
+    weights: &BrokerWeights,
+    request: ContextRequest,
+    extra_memory_conns: &[&Connection],
+    embedder: &dyn Embedder,
+) -> KimetsuResult<ContextBundle> {
+    let query_embedding = QueryEmbedding::from_embedder(embedder, &request.query);
     let mut candidates = Vec::new();
-    candidates.extend(memory_candidates(conn, &request.query)?);
+    candidates.extend(memory_candidates(conn, &request.query, query_embedding.as_ref())?);
     for extra in extra_memory_conns {
-        candidates.extend(memory_candidates(extra, &request.query)?);
+        candidates.extend(memory_candidates(extra, &request.query, query_embedding.as_ref())?);
     }
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
@@ -163,30 +227,39 @@ pub fn search_repo_files(
     Ok(capsules)
 }
 
-fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candidate>> {
+fn memory_candidates(
+    conn: &Connection,
+    query: &str,
+    query_embedding: Option<&QueryEmbedding>,
+) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
     if let Some(fts_query) = fts_query(query) {
-        let candidates = memory_fts_candidates(conn, &query_tokens, &fts_query, 80)?;
+        let candidates =
+            memory_fts_candidates(conn, &query_tokens, &fts_query, 80, query_embedding)?;
         if !candidates.is_empty() {
             return Ok(candidates);
         }
     }
 
-    latest_memory_candidates(conn, &query_tokens, 200)
+    latest_memory_candidates(conn, &query_tokens, 200, query_embedding)
 }
 
 fn latest_memory_candidates(
     conn: &Connection,
     query_tokens: &[String],
     limit: u32,
+    query_embedding: Option<&QueryEmbedding>,
 ) -> KimetsuResult<Vec<Candidate>> {
     // MP-4d: exclude invalidated memories from retrieval. The row stays in
     // brain.db so `memory list` and replay can still see the history; only
     // the broker filters it out.
+    //
+    // v0.4.2: SELECT now also pulls the optional embedding + model id
+    // so we can blend a cosine score with the lexical match.
     let mut stmt = conn.prepare_cached(
         "
         SELECT memory_id, scope, kind, text, confidence, created_at,
-               use_count, usefulness_score
+               use_count, usefulness_score, embedding, embedding_model
         FROM memories
         WHERE invalidated_at IS NULL
         ORDER BY created_at DESC
@@ -204,13 +277,26 @@ fn latest_memory_candidates(
             row.get::<_, String>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, f64>(7)?,
+            row.get::<_, Option<Vec<u8>>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
 
     let mut candidates = Vec::new();
     for row in rows {
-        let (memory_id, scope, kind, text, confidence, created_at, use_count, usefulness_score) =
-            row?;
+        let (
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            embedding,
+            embedding_model,
+        ) = row?;
+        let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
         if let Some(candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
@@ -222,6 +308,7 @@ fn latest_memory_candidates(
             use_count,
             usefulness_score,
             None,
+            cosine,
         ) {
             candidates.push(candidate);
         }
@@ -234,11 +321,13 @@ fn memory_fts_candidates(
     query_tokens: &[String],
     fts_query: &str,
     limit: u32,
+    query_embedding: Option<&QueryEmbedding>,
 ) -> KimetsuResult<Vec<Candidate>> {
     let mut stmt = conn.prepare_cached(
         "
         SELECT m.memory_id, m.scope, m.kind, m.text, m.confidence, m.created_at,
-               m.use_count, m.usefulness_score, bm25(memories_fts) AS rank
+               m.use_count, m.usefulness_score, bm25(memories_fts) AS rank,
+               m.embedding, m.embedding_model
         FROM memories_fts
         JOIN memories m
           ON m.memory_id = memories_fts.memory_id
@@ -260,6 +349,8 @@ fn memory_fts_candidates(
             row.get::<_, i64>(6)?,
             row.get::<_, f64>(7)?,
             row.get::<_, f64>(8)?,
+            row.get::<_, Option<Vec<u8>>>(9)?,
+            row.get::<_, Option<String>>(10)?,
         ))
     })?;
 
@@ -275,8 +366,11 @@ fn memory_fts_candidates(
             use_count,
             usefulness_score,
             rank,
+            embedding,
+            embedding_model,
         ) = row?;
         let fts_relevance = (-rank as f32).max(0.0);
+        let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
         if let Some(candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
@@ -288,11 +382,41 @@ fn memory_fts_candidates(
             use_count,
             usefulness_score,
             Some(fts_relevance),
+            cosine,
         ) {
             candidates.push(candidate);
         }
     }
     Ok(candidates)
+}
+
+/// v0.4.2: cosine helper used by both the FTS and latest-memory
+/// retrieval branches. Returns `Some(score in [-1, 1])` when a
+/// non-null embedding is present AND its `embedding_model` matches
+/// the active `query_embedding`'s model id. Otherwise None — the
+/// caller treats None as "lexical only".
+///
+/// Cross-model rows are intentionally NOT blended: a row embedded
+/// with `stub-d8` and a query embedded with `bge-small-en-v1.5`
+/// produce meaningless dot products. Falling back to FTS for those
+/// rows keeps hybrid retrieval safe across schema upgrades and
+/// `kimetsu brain reindex` migrations (v0.4.3).
+fn compute_cosine(
+    query_embedding: Option<&QueryEmbedding>,
+    row_bytes: Option<&[u8]>,
+    row_model: Option<&str>,
+) -> Option<f32> {
+    let q = query_embedding?;
+    let bytes = row_bytes?;
+    let model = row_model?;
+    if model != q.model_id {
+        return None;
+    }
+    let row_vec = match decode_embedding(bytes, Some(q.vector.len())) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    Some(cosine_similarity(&q.vector, &row_vec))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -307,9 +431,35 @@ fn memory_row_to_candidate(
     use_count: i64,
     usefulness_score: f64,
     raw_relevance_override: Option<f32>,
+    cosine_score: Option<f32>,
 ) -> Option<Candidate> {
     let lexical = lexical_relevance(query_tokens, &format!("{kind} {text}"));
-    let raw_relevance = raw_relevance_override.unwrap_or(lexical).max(lexical);
+    let lexical_term = raw_relevance_override.unwrap_or(lexical).max(lexical);
+
+    // v0.4.2: hybrid blend.
+    //   final = (1 - α) * lexical + α * normalized_cosine
+    // where normalized_cosine maps [-1, 1] -> [0, 1] so it composes
+    // with the lexical relevance scale.
+    //
+    // When cosine_score is None (NoopEmbedder, NULL row embedding,
+    // cross-model mismatch), the cosine term drops out and the
+    // candidate scores lexical-only — exact v0.4.1 behavior. The
+    // caller's gate `raw_relevance <= 0.0 && !query_tokens.is_empty()`
+    // still works because in the no-cosine path `raw_relevance ==
+    // lexical_term`.
+    let raw_relevance = match cosine_score {
+        Some(c) => {
+            let normalized_cos = ((c + 1.0) * 0.5).clamp(0.0, 1.0);
+            (1.0 - DEFAULT_HYBRID_ALPHA) * lexical_term + DEFAULT_HYBRID_ALPHA * normalized_cos
+        }
+        None => lexical_term,
+    };
+
+    // Drop the row when neither lexical nor cosine had any signal —
+    // an empty query OR a candidate that didn't match any of the
+    // search terms. The cosine-only path is still allowed through
+    // (raw_relevance > 0) for semantic-only matches against rows
+    // whose words don't textually overlap the query.
     if raw_relevance <= 0.0 && !query_tokens.is_empty() {
         return None;
     }
@@ -973,5 +1123,193 @@ mod tests {
         assert!(set.contains("project"));
         // "the" is len=3, included; "a" or "i" would be excluded.
         assert!(set.contains("the"));
+    }
+
+    // ----- v0.4.2: hybrid retrieval end-to-end -----
+
+    /// Helper: open an in-memory brain.db, initialize schema, insert
+    /// a memory row (post-projector shape) plus its embedding +
+    /// embedding_model and the matching FTS entry.
+    fn insert_memory_with_embedding(
+        conn: &rusqlite::Connection,
+        memory_id: &str,
+        text: &str,
+        embedder: &dyn embeddings::Embedder,
+    ) {
+        let normalized = kimetsu_core::memory::normalize_memory_text(text);
+        conn.execute(
+            "
+            INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text, confidence,
+                source_event_id, provenance_snapshot_json, created_at,
+                use_count, usefulness_score, embedding, embedding_model
+            )
+            VALUES (?1, 'global_user', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                    '2026-05-01T00:00:00Z', 0, 0.0, ?4, ?5)
+            ",
+            rusqlite::params![
+                memory_id,
+                text,
+                normalized,
+                embeddings::encode_embedding(&embedder.embed(text).expect("embed test row")),
+                embedder.model_id(),
+            ],
+        )
+        .expect("insert memory");
+        conn.execute(
+            "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, 'fact', 'global_user')",
+            rusqlite::params![memory_id, text],
+        )
+        .expect("insert fts row");
+    }
+
+    /// v0.4.2: the cosine blend changes retrieval ranking when two
+    /// memories tie lexically but differ semantically (via the stub
+    /// embedder's hashed-bucket vectors).
+    ///
+    /// Setup: two memories, neither containing the query's literal
+    /// words. With pure FTS, neither matches and we fall back to
+    /// latest-memory ranking. With the stub embedder enabled, the
+    /// memory that's "semantically closer" to the query (shares
+    /// hash buckets) outranks the other.
+    #[test]
+    fn hybrid_retrieval_uses_cosine_score_to_rerank() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+
+        insert_memory_with_embedding(&conn, "m_rg", "use ripgrep for code search", &stub);
+        insert_memory_with_embedding(
+            &conn,
+            "m_unrelated",
+            "cookie recipe with chocolate chips",
+            &stub,
+        );
+
+        // Query shares words with m_rg but not m_unrelated. FTS will
+        // already prefer m_rg here; we use that as the baseline.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &stub,
+        )
+        .expect("retrieve");
+
+        let memory_handles: Vec<_> = bundle
+            .capsules
+            .iter()
+            .filter(|c| c.expansion_handle.starts_with("memory:"))
+            .collect();
+        assert!(
+            !memory_handles.is_empty(),
+            "at least one memory should surface"
+        );
+        // The semantically-relevant memory must rank first.
+        assert_eq!(
+            memory_handles[0].expansion_handle,
+            "memory:m_rg",
+            "ripgrep memory should outrank the cookie recipe; ranked: {:?}",
+            memory_handles
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// v0.4.2: when a row's stored `embedding_model` doesn't match
+    /// the active query embedder's id, the row's cosine contribution
+    /// is skipped — falling back to FTS-only for that row. Critical
+    /// for safety across `kimetsu brain reindex` migrations (v0.4.3)
+    /// where some rows might be embedded with the new model and some
+    /// with the old.
+    #[test]
+    fn hybrid_retrieval_skips_cosine_on_model_id_mismatch() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+        insert_memory_with_embedding(&conn, "m_xref", "use ripgrep for code search", &stub);
+
+        // Stomp the row's embedding_model with a synthetic id that
+        // doesn't match the active embedder. Simulates a `kimetsu
+        // brain reindex` mid-migration where some rows are on the
+        // new model and some on the old.
+        conn.execute(
+            "UPDATE memories SET embedding_model = 'bge-small-en-v1.5' WHERE memory_id = 'm_xref'",
+            [],
+        )
+        .expect("force model_id mismatch");
+
+        // Query through the stub embedder. Its model_id is "stub-d8";
+        // the row's is "bge-small-en-v1.5". The cosine path MUST be
+        // skipped for this row; FTS still surfaces it on the lexical
+        // match because retrieval doesn't crash on cross-model rows.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &stub,
+        )
+        .expect("retrieve");
+
+        assert!(
+            bundle
+                .capsules
+                .iter()
+                .any(|c| c.expansion_handle == "memory:m_xref"),
+            "cross-model row should still match lexically (cosine skipped, FTS works)"
+        );
+    }
+
+    /// v0.4.2: with [`NoopEmbedder`] the retrieval path is identical
+    /// to v0.4.1 — no cosine term contributes, stored embeddings (if
+    /// any) are ignored. Regression guard so the default build
+    /// behaves identically to pre-v0.4.2.
+    #[test]
+    fn hybrid_retrieval_with_noop_embedder_is_lexical_only() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+        // Two memories, both with non-null embeddings.
+        insert_memory_with_embedding(&conn, "m_a", "use ripgrep", &stub);
+        insert_memory_with_embedding(&conn, "m_b", "use ripgrep too", &stub);
+
+        // Query through the Noop default. QueryEmbedding will be
+        // None → no cosine blend → exact FTS ranking.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        let count = bundle
+            .capsules
+            .iter()
+            .filter(|c| c.expansion_handle.starts_with("memory:"))
+            .count();
+        assert_eq!(count, 2, "both memories should surface via FTS");
     }
 }

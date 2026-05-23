@@ -139,6 +139,17 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     // the trace. The broker excludes invalidated rows from retrieval.
     add_column_if_missing(conn, "memories", "invalidated_at TEXT")?;
     add_column_if_missing(conn, "memories", "invalidated_reason TEXT")?;
+    // v0.4.2: hybrid retrieval scaffolding.
+    //   * `embedding`        — little-endian f32 BLOB, NULL on pre-v0.4.2 rows
+    //   * `embedding_model`  — opaque model id ("bge-small-en-v1.5",
+    //                          "stub-d8", "noop"), NULL when no embedding
+    //                          was produced (e.g. NoopEmbedder).
+    // Retrieval reads both: when `embedding` is non-NULL AND
+    // `embedding_model` matches the active embedder's id, the cosine
+    // score contributes to ranking. Otherwise the row is scored
+    // lexical-only (FTS) — exact v0.4.1 behavior, no regression.
+    add_column_if_missing(conn, "memories", "embedding BLOB")?;
+    add_column_if_missing(conn, "memories", "embedding_model TEXT")?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_memories_active_created

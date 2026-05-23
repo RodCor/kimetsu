@@ -39,6 +39,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+use crate::embeddings;
 use crate::project::MemoryRow;
 use crate::schema;
 
@@ -160,6 +161,13 @@ pub fn add_user_memory(
         ",
         rusqlite::params![memory_id, text, kind.to_string()],
     )?;
+
+    // v0.4.2: post-insert embedding update. Same Noop default as
+    // `project::add_memory`; v0.4.3 will flip the default once
+    // fastembed is wired.
+    let embedder = embeddings::open_default_embedder();
+    embeddings::embed_and_persist(conn, &memory_id, text, embedder.as_ref())?;
+
     Ok(memory_id)
 }
 
