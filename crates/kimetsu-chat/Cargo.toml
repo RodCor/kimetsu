@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Interactive REPL chat client + MCP sidecar + cross-harness bridge for kimetsu. Installs into Claude Code and Codex as a brain-managed memory layer."
+keywords = ["kimetsu", "chat", "mcp", "claude-code", "codex"]
+categories = ["development-tools", "command-line-utilities"]
 
 # Interactive REPL transport for kimetsu.
 #

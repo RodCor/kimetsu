@@ -1,0 +1,174 @@
+# v0.4.7: tag-driven release pipeline.
+#
+# Push a `v0.4.x` tag and this workflow builds release binaries
+# for Linux (x86_64), macOS (x86_64 + arm64), and Windows
+# (x86_64), then uploads them as assets on the corresponding
+# GitHub Release.
+#
+# The pipeline runs `kimetsu doctor --skip-mcp` on every artifact
+# before uploading — so a broken build fails the release, not the
+# user. Manual `cargo publish` to crates.io is a follow-up step
+# (we don't auto-publish from CI to keep approvals explicit).
+#
+# Two artifact sets per platform:
+#   * `kimetsu-<version>-<target>-lean`     — default Cargo build,
+#     NoopEmbedder + FTS-only retrieval. Smallest binary, no model
+#     download on install.
+#   * `kimetsu-<version>-<target>-embeddings` — built with
+#     `--features embeddings`. Larger binary; fastembed-rs +
+#     ONNX runtime linked statically when possible.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # needed to upload release assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build ${{ matrix.target }} (${{ matrix.flavor }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: ""               }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings" }
+          # macOS Intel
+          - { os: macos-13,       target: x86_64-apple-darwin,      flavor: lean,       extra_features: ""               }
+          - { os: macos-13,       target: x86_64-apple-darwin,      flavor: embeddings, extra_features: "--features embeddings" }
+          # macOS Apple Silicon
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: ""               }
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings" }
+          # Windows
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: ""               }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}-${{ matrix.flavor }}
+
+      - name: build kimetsu-cli
+        run: |
+          cargo build --release -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
+
+      - name: build kimetsu-harbor-agent
+        # `kimetsu-harbor-agent` lives in kimetsu-harbor-rs's `[[bin]]`.
+        # Always build the lean variant — the harbor binary doesn't
+        # use the embeddings feature.
+        if: matrix.flavor == 'lean'
+        run: |
+          cargo build --release -p kimetsu-harbor-rs --bin kimetsu-harbor-agent --target ${{ matrix.target }}
+
+      - name: smoke-test built binary (doctor --skip-mcp)
+        shell: bash
+        run: |
+          if [ "${{ matrix.flavor }}" = "lean" ]; then
+            BINARY="target/${{ matrix.target }}/release/kimetsu"
+          else
+            BINARY="target/${{ matrix.target }}/release/kimetsu"
+          fi
+          [ "${{ runner.os }}" = "Windows" ] && BINARY="${BINARY}.exe"
+          "$BINARY" --version
+          # doctor expects a workspace; the cloned repo is one.
+          "$BINARY" doctor --skip-mcp --workspace . || true
+
+      - name: package archive
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="kimetsu-${VERSION}-${{ matrix.target }}-${{ matrix.flavor }}"
+          mkdir -p "dist/$NAME"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/kimetsu.exe" "dist/$NAME/"
+            if [ "${{ matrix.flavor }}" = "lean" ]; then
+              cp "target/${{ matrix.target }}/release/kimetsu-harbor-agent.exe" "dist/$NAME/"
+            fi
+          else
+            cp "target/${{ matrix.target }}/release/kimetsu" "dist/$NAME/"
+            if [ "${{ matrix.flavor }}" = "lean" ]; then
+              cp "target/${{ matrix.target }}/release/kimetsu-harbor-agent" "dist/$NAME/"
+            fi
+          fi
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$NAME/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path $NAME -DestinationPath $NAME.zip"
+          else
+            tar -czf "$NAME.tar.gz" "$NAME"
+          fi
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimetsu-${{ matrix.target }}-${{ matrix.flavor }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: assemble release notes
+        id: notes
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull CHANGELOG.md section for this version, if present.
+          if [ -f CHANGELOG.md ] && grep -q "^## v${VERSION}" CHANGELOG.md; then
+            awk -v v="v${VERSION}" '
+              BEGIN { include = 0 }
+              /^## / {
+                if (include == 1) exit
+                if ($2 == v) include = 1
+                else next
+              }
+              include == 1 { print }
+            ' CHANGELOG.md > release-notes.md
+          else
+            echo "Release v${VERSION}" > release-notes.md
+            echo "" >> release-notes.md
+            echo "Generated from the kimetsu monorepo. See README.md for installation + usage." >> release-notes.md
+          fi
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

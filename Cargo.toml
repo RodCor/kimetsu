@@ -10,10 +10,21 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+# v0.4.7: distribution-ready metadata. Each member crate picks up
+# everything below except the per-crate `description`, `keywords`,
+# and `categories` which live in each `[package]` block since
+# crates.io enforces them per crate.
+version = "0.4.7"
 edition = "2024"
-license = "UNLICENSED"
+# Rust ecosystem dual-license (matches tokio, serde, fastembed-rs,
+# etc.). UNLICENSED would block crates.io entirely.
+license = "MIT OR Apache-2.0"
 authors = ["Kimetsu contributors"]
+repository = "https://github.com/RodCor/kimetsu"
+homepage = "https://github.com/RodCor/kimetsu"
+documentation = "https://github.com/RodCor/kimetsu/tree/main/docs"
+readme = "README.md"
+rust-version = "1.85"
 
 [workspace.dependencies]
 base64 = "0.22"

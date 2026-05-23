@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Project + user-scope memory, hybrid retrieval (lexical + cosine), ambient context, secret redaction at ingest for kimetsu."
+keywords = ["kimetsu", "memory", "rag", "retrieval", "embeddings"]
+categories = ["database", "development-tools"]
 
 [features]
 # v0.4.3: opt into the local fastembed-rs embedder so kimetsu can do

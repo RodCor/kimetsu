@@ -44,22 +44,43 @@ chat or bridge path.
 
 ## Quick Start
 
-Clone the repo, set a local token, then start chat.
+### Install
 
-PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
-cargo run -p kimetsu-cli -- chat --workspace .
-```
-
-Bash:
+Pick whichever flavor matches your appetite:
 
 ```bash
+# 1. Lean install — FTS-only retrieval, no model download (~30s).
+cargo install kimetsu-cli
+
+# 2. With local semantic retrieval — pulls fastembed-rs + ONNX
+#    runtime; first-run downloads BGE-small (~67 MB).
+cargo install kimetsu-cli --features embeddings
+
+# 3. From source (anyone tracking `main` or a branch):
+cargo install --path crates/kimetsu-cli [--features embeddings]
+```
+
+Once installed, `kimetsu` is on your PATH. Confirm it's healthy:
+
+```bash
+kimetsu --version
+kimetsu doctor
+```
+
+Pre-built binaries for Linux / macOS / Windows ride on each
+GitHub Release — drop one into `~/.local/bin` if you'd rather
+skip the Rust toolchain.
+
+### First chat
+
+```bash
+# Anywhere you have CLAUDE_CODE_OAUTH_TOKEN exported:
+kimetsu chat --workspace .
+
+# Or use the workspace .env file:
 cp .env.example .env
-$EDITOR .env
-cargo run -p kimetsu-cli -- chat --workspace .
+$EDITOR .env       # set CLAUDE_CODE_OAUTH_TOKEN
+kimetsu chat --workspace .
 ```
 
 `.env` should contain:
@@ -70,22 +91,16 @@ CLAUDE_CODE_OAUTH_TOKEN=<your-token>
 OPENAI_API_KEY=<your-openai-key>
 ```
 
-Kimetsu resolves tokens in this order:
+Token resolution order: process environment first, workspace `.env` second.
 
-1. Current process environment.
-2. Workspace `.env` file passed by `--workspace`.
-
-Build a release binary:
+### Pick a semantic model (when built with `--features embeddings`)
 
 ```bash
-cargo build --release -p kimetsu-cli
-target/release/kimetsu chat --workspace .
-```
-
-On Windows the release binary is:
-
-```powershell
-target\release\kimetsu.exe chat --workspace .
+export KIMETSU_BRAIN_EMBEDDER=bge-small-en-v1.5   # default: 384 dim, English
+export KIMETSU_BRAIN_EMBEDDER=bge-m3              # 1024 dim, multilingual, larger
+export KIMETSU_BRAIN_EMBEDDER=jina-v2-base-code   # 768 dim, code-tuned
+export KIMETSU_BRAIN_EMBEDDER=noop                # force off
+kimetsu brain reindex                              # backfill embeddings on existing memories
 ```
 
 ## Bridge Quick Start
