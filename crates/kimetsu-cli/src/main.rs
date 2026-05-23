@@ -243,6 +243,30 @@ enum BrainCommand {
     },
     Rebuild,
     Stats,
+    /// v0.4.3: backfill missing or stale embeddings on memory rows.
+    /// Run after upgrading kimetsu (so pre-v0.4.2 rows pick up
+    /// vectors) or after changing the embedder model via
+    /// `KIMETSU_BRAIN_EMBEDDER=<id>`.
+    Reindex(ReindexArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReindexArgs {
+    /// Which DB(s) to reindex: `project`, `user`, or `all`.
+    #[arg(long, default_value = "all")]
+    scope: String,
+    /// Count what would change but don't write.
+    #[arg(long)]
+    dry_run: bool,
+    /// Re-embed even rows that already carry the active model id
+    /// (useful after a fastembed model file update where bytes
+    /// changed but the model id didn't).
+    #[arg(long)]
+    force: bool,
+    /// Stop after this many rows are written. Useful for incremental
+    /// reindex on huge brains over multiple invocations.
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -943,7 +967,76 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             Ok(())
         }
         BrainCommand::Stats => stats(),
+        BrainCommand::Reindex(args) => reindex_brain(args),
     }
+}
+
+/// v0.4.3: `kimetsu brain reindex` — backfill missing / stale
+/// embeddings. The interesting cases:
+///
+///   * NoopEmbedder (default Cargo build OR
+///     `KIMETSU_BRAIN_EMBEDDER=noop`): we print a hint and exit.
+///     Without a real embedder there's nothing to reindex against.
+///   * Real embedder + dry-run: counts how many rows are stale per
+///     scope without writing.
+///   * Real embedder + apply: walks both project and (optionally)
+///     user brains, re-embeds candidate rows in created_at order,
+///     prints a summary per scope.
+fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
+    let scope = kimetsu_brain::reindex::ReindexScope::parse(&args.scope)?;
+    let opts = kimetsu_brain::reindex::ReindexOptions {
+        scope,
+        dry_run: args.dry_run,
+        force: args.force,
+        limit: args.limit,
+    };
+    let report = kimetsu_brain::reindex::reindex_all(&env::current_dir()?, opts)?;
+
+    if report.embedder_noop {
+        println!(
+            "[reindex] active embedder is `noop` — nothing to do. \
+             Build kimetsu with `--features embeddings` and unset \
+             KIMETSU_BRAIN_EMBEDDER=noop to enable semantic retrieval."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "[reindex] model={} dry_run={} force={} scope={:?}{}",
+        report.embedder_model_id,
+        args.dry_run,
+        args.force,
+        scope,
+        args.limit
+            .map(|n| format!(" limit={n}"))
+            .unwrap_or_default(),
+    );
+    for sub in [&report.project, &report.user] {
+        if !sub.opened {
+            println!("  {}: skipped (scope filter or DB unavailable)", sub.scope);
+            continue;
+        }
+        let action = if args.dry_run { "candidates" } else { "updated" };
+        let count = if args.dry_run { sub.candidates } else { sub.updated };
+        println!(
+            "  {}: total={} {}={} failed={}",
+            sub.scope, sub.total, action, count, sub.failed
+        );
+    }
+    println!(
+        "[reindex] {} total {} across project + user",
+        if args.dry_run {
+            report.candidates_total()
+        } else {
+            report.updated_total()
+        },
+        if args.dry_run {
+            "candidates"
+        } else {
+            "updated"
+        },
+    );
+    Ok(())
 }
 
 fn stats() -> KimetsuResult<()> {

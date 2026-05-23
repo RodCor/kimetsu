@@ -415,12 +415,15 @@ pub fn add_memory(
 
     projector::apply_events(&conn, &[started, accepted, finished])?;
 
-    // v0.4.2: post-projection embedding write. Pre-v0.4.3 the default
-    // is `NoopEmbedder`, which short-circuits and leaves the embedding
-    // column NULL — exact v0.4.1 behavior. v0.4.3 swaps the default to
-    // a real embedder (fastembed) and rows start landing with vectors.
+    // v0.4.2: post-projection embedding write. v0.4.3 wired the
+    // default embedder behind a feature flag — see
+    // `embeddings::open_default_embedder`. Default build: NoopEmbedder
+    // (column stays NULL, FTS only). `--features embeddings` build:
+    // fastembed-rs BGE-small by default, configurable via
+    // KIMETSU_BRAIN_EMBEDDER. The embedder is cached in a
+    // process-static OnceLock so we only pay model-load cost once.
     let embedder = embeddings::open_default_embedder();
-    embeddings::embed_and_persist(&conn, &memory_id, text, embedder.as_ref())?;
+    embeddings::embed_and_persist(&conn, &memory_id, text, embedder)?;
 
     Ok(memory_id)
 }

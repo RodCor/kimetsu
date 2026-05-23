@@ -162,11 +162,12 @@ pub fn add_user_memory(
         rusqlite::params![memory_id, text, kind.to_string()],
     )?;
 
-    // v0.4.2: post-insert embedding update. Same Noop default as
-    // `project::add_memory`; v0.4.3 will flip the default once
-    // fastembed is wired.
+    // v0.4.2: post-insert embedding update. v0.4.3 swapped the
+    // default behind the `embeddings` feature flag — same Noop
+    // behavior on the default build, fastembed-rs BGE-small when
+    // the feature is on.
     let embedder = embeddings::open_default_embedder();
-    embeddings::embed_and_persist(conn, &memory_id, text, embedder.as_ref())?;
+    embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
 
     Ok(memory_id)
 }

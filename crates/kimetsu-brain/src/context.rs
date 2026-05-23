@@ -124,7 +124,7 @@ pub fn retrieve_context_multi(
         weights,
         request,
         extra_memory_conns,
-        embedder.as_ref(),
+        embedder,
     )
 }
 

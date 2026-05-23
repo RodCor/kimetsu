@@ -5,8 +5,23 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# v0.4.3: opt into the local fastembed-rs embedder so kimetsu can do
+# semantic retrieval (cosine over BGE / Jina-Code dense vectors).
+# Default OFF: the lean build keeps the NoopEmbedder + FTS-only
+# retrieval that v0.4.2 ships, so `cargo install kimetsu-cli`
+# without --features embeddings never downloads a model.
+default = []
+embeddings = ["dep:fastembed"]
+
 [dependencies]
 blake3.workspace = true
+# v0.4.3: fastembed-rs ships ONNX runtime + tokenizers + the model
+# loader. Behind the `embeddings` feature so the default build
+# stays dep-light (and so the Windows ort C++ runtime isn't
+# required to build kimetsu). Pinned to 5.* — that's the line that
+# supports BGE-M3 + Jina-v2-base-code alongside BGE-small.
+fastembed = { version = "5", optional = true }
 ignore.workspace = true
 kimetsu-core = { path = "../kimetsu-core" }
 rusqlite.workspace = true

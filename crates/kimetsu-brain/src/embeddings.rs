@@ -219,11 +219,213 @@ impl Embedder for StubEmbedder {
 
 /// Open the production-default embedder.
 ///
-/// v0.4.2: always [`NoopEmbedder`]. v0.4.3 will switch this to a
-/// fastembed-backed BGE-small when the `embeddings` Cargo feature is
-/// enabled (and back to Noop when it isn't).
-pub fn open_default_embedder() -> Box<dyn Embedder> {
+/// Resolution (v0.4.3):
+///   1. `KIMETSU_BRAIN_EMBEDDER=noop|off|none` → always `NoopEmbedder`,
+///      regardless of Cargo features. Useful for CI, hooks, and
+///      transient subprocesses that shouldn't pay the model-load
+///      cost.
+///   2. Cargo feature `embeddings` enabled →
+///      [`fastembed_backend::open_cached`] returns a process-wide
+///      cached [`FastembedEmbedder`] for the model picked by
+///      [`pick_builtin_model_from_env`] (default `bge-small-en-v1.5`,
+///      `bge-m3` or `jina-v2-base-code` opt-in via env). On model
+///      load failure (network, disk, ort runtime missing) we log
+///      and fall through to Noop so the brain stays usable on FTS
+///      alone.
+///   3. Cargo feature `embeddings` disabled → `NoopEmbedder`,
+///      identical to v0.4.2 build.
+///
+/// The returned trait object is borrowed from a process-static
+/// `OnceLock`; production callers get model-load cost paid exactly
+/// once over the process lifetime. Tests that need a different
+/// embedder must use [`crate::context::retrieve_context_with_embedder`]
+/// with an explicit [`StubEmbedder`] (or any other [`Embedder`])
+/// instead of going through this function.
+pub fn open_default_embedder() -> &'static (dyn Embedder + Send + Sync) {
+    static CACHE: std::sync::OnceLock<Box<dyn Embedder + Send + Sync>> =
+        std::sync::OnceLock::new();
+    let embedder = CACHE.get_or_init(build_default_embedder);
+    embedder.as_ref()
+}
+
+fn build_default_embedder() -> Box<dyn Embedder + Send + Sync> {
+    if env_disables_embedder() {
+        return Box::new(NoopEmbedder);
+    }
+    #[cfg(feature = "embeddings")]
+    {
+        match fastembed_backend::open_cached() {
+            Ok(handle) => return Box::new(handle),
+            Err(err) => {
+                eprintln!(
+                    "kimetsu-brain: fastembed init failed ({err}); falling back to NoopEmbedder. \
+                     Retrieval will stay FTS-only this session. Re-run with \
+                     KIMETSU_BRAIN_EMBEDDER=noop to silence this warning."
+                );
+            }
+        }
+    }
     Box::new(NoopEmbedder)
+}
+
+/// v0.4.3: env-driven kill switch. Truthy values (1/true/yes/on)
+/// force-disable the embedder for this process; "noop", "off",
+/// "none" do the same. Anything else (or unset) leaves the
+/// `embeddings` feature in control.
+fn env_disables_embedder() -> bool {
+    match std::env::var("KIMETSU_BRAIN_EMBEDDER") {
+        Ok(value) => {
+            let v = value.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "noop" | "off" | "none" | "0" | "false" | "no")
+        }
+        Err(_) => false,
+    }
+}
+
+/// v0.4.3: pick which builtin model to load from the env, returning
+/// a stable identifier. Used both by the fastembed backend (to map
+/// id → `EmbeddingModel`) and by `kimetsu brain reindex` (to label
+/// new rows with the right `embedding_model`).
+///
+/// Resolution:
+///   * unset / "" / "default" / "bge-small" / "bge-small-en-v1.5"
+///     → `"bge-small-en-v1.5"` (384 dim, ~67 MB int8, English)
+///   * "bge-m3"
+///     → `"bge-m3"` (1024 dim, ~600 MB int8, multilingual)
+///   * "jina-code" / "jina-v2-base-code" /
+///     "jina-embeddings-v2-base-code"
+///     → `"jina-v2-base-code"` (768 dim, ~165 MB int8, English +
+///     code-tuned)
+///   * anything else falls back to bge-small with a warning.
+pub fn pick_builtin_model_from_env() -> &'static str {
+    let raw = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+    let v = raw
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match v.as_str() {
+        "" | "default" | "bge-small" | "bge-small-en-v1.5" => "bge-small-en-v1.5",
+        "bge-m3" | "m3" => "bge-m3",
+        "jina-code" | "jina-v2-base-code" | "jina-embeddings-v2-base-code" => "jina-v2-base-code",
+        // "noop"/etc. are handled by env_disables_embedder; this
+        // function shouldn't be called in those cases but defensively
+        // pick the lean default.
+        "noop" | "off" | "none" | "0" | "false" | "no" => "bge-small-en-v1.5",
+        other => {
+            eprintln!(
+                "kimetsu-brain: unknown KIMETSU_BRAIN_EMBEDDER={other:?}, \
+                 falling back to bge-small-en-v1.5"
+            );
+            "bge-small-en-v1.5"
+        }
+    }
+}
+
+// v0.4.3: real fastembed-backed embedder. Lives behind the
+// `embeddings` Cargo feature so the default build skips the
+// ~50-transitive-crate dep tree (ONNX runtime, tokenizers, etc).
+#[cfg(feature = "embeddings")]
+mod fastembed_backend {
+    use super::{Embedder, EmbedderError, pick_builtin_model_from_env};
+    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// fastembed-backed embedder. Wraps the ONNX runtime in a
+    /// `Mutex` because `TextEmbedding::embed` takes `&mut self`.
+    /// The lock window is short (one inference per call); the
+    /// chat REPL's threads serialize cleanly through it.
+    pub struct FastembedEmbedder {
+        model_id: &'static str,
+        dim: usize,
+        engine: Mutex<TextEmbedding>,
+    }
+
+    impl FastembedEmbedder {
+        pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            let (kind, model_id, dim) = match builtin_id {
+                "bge-m3" => (EmbeddingModel::BGEM3, "bge-m3", 1024),
+                "jina-v2-base-code" => (
+                    EmbeddingModel::JinaEmbeddingsV2BaseCode,
+                    "jina-v2-base-code",
+                    768,
+                ),
+                // bge-small-en-v1.5 is the default + fallback.
+                _ => (EmbeddingModel::BGESmallENV15, "bge-small-en-v1.5", 384),
+            };
+            let opts = InitOptions::new(kind).with_show_download_progress(false);
+            let engine = TextEmbedding::try_new(opts)
+                .map_err(|e| EmbedderError::LoadFailed(format!("fastembed init: {e}")))?;
+            Ok(Self {
+                model_id,
+                dim,
+                engine: Mutex::new(engine),
+            })
+        }
+    }
+
+    impl Embedder for FastembedEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            let mut guard = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut out = guard
+                .embed(vec![text], None)
+                .map_err(|e| EmbedderError::EmbedFailed(format!("fastembed embed: {e}")))?;
+            let vec = out
+                .pop()
+                .ok_or_else(|| EmbedderError::EmbedFailed("empty result".into()))?;
+            if vec.len() != self.dim {
+                return Err(EmbedderError::DimMismatch {
+                    expected: self.dim,
+                    got: vec.len(),
+                });
+            }
+            Ok(vec)
+        }
+
+        fn model_id(&self) -> &str {
+            self.model_id
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
+        }
+    }
+
+    /// Shared handle. `open_default_embedder` boxes this into a
+    /// `dyn Embedder` and stashes it in a process-static `OnceLock`,
+    /// so we only call into ONNX once per process.
+    #[derive(Clone)]
+    pub struct EmbedderHandle(Arc<FastembedEmbedder>);
+
+    impl Embedder for EmbedderHandle {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            self.0.embed(text)
+        }
+        fn model_id(&self) -> &str {
+            self.0.model_id()
+        }
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+    }
+
+    /// Open (or return the cached) fastembed embedder for the model
+    /// picked by `KIMETSU_BRAIN_EMBEDDER`. Errors here propagate up
+    /// to `open_default_embedder`, which falls back to Noop +
+    /// prints a one-line warning.
+    pub fn open_cached() -> Result<EmbedderHandle, EmbedderError> {
+        static CELL: OnceLock<Result<Arc<FastembedEmbedder>, EmbedderError>> = OnceLock::new();
+        let init = CELL.get_or_init(|| {
+            let builtin = pick_builtin_model_from_env();
+            FastembedEmbedder::try_open(builtin).map(Arc::new)
+        });
+        match init {
+            Ok(arc) => Ok(EmbedderHandle(arc.clone())),
+            Err(err) => Err(err.clone()),
+        }
+    }
 }
 
 // --------- math helpers ---------
@@ -458,11 +660,15 @@ mod tests {
         assert!(err.to_string().contains("does not match expected"));
     }
 
+    /// v0.4.3: under the default Cargo build (no `embeddings` feature)
+    /// `open_default_embedder` MUST return Noop so a `cargo install
+    /// kimetsu-cli` user doesn't accidentally start downloading a
+    /// model from $HOME. Skip when `--features embeddings` is on —
+    /// that build path has its own integration tests (run with
+    /// `cargo test --features embeddings -- --ignored`).
+    #[cfg(not(feature = "embeddings"))]
     #[test]
-    fn open_default_embedder_returns_noop_pre_v043() {
-        // Until v0.4.3 wires fastembed, the default MUST be Noop so
-        // production builds don't accidentally start downloading
-        // models from the host's home dir.
+    fn open_default_embedder_returns_noop_on_default_build() {
         let e = open_default_embedder();
         assert!(e.is_noop());
         assert_eq!(e.dim(), 0);
@@ -470,5 +676,85 @@ mod tests {
             e.embed("anything").unwrap_err(),
             EmbedderError::NotImplemented
         ));
+    }
+
+    /// v0.4.3: env kill-switch works even when the `embeddings`
+    /// feature is on — `KIMETSU_BRAIN_EMBEDDER=noop` returns Noop
+    /// regardless. Tests the env parser directly rather than going
+    /// through the cached `open_default_embedder`, which would
+    /// otherwise be poisoned by whatever the previous test in the
+    /// process initialized.
+    #[test]
+    fn env_disables_embedder_recognizes_off_values() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        for value in ["noop", "off", "NONE", "0", "false", "no"] {
+            // SAFETY: serialized via the shared brain test env lock.
+            unsafe {
+                std::env::set_var("KIMETSU_BRAIN_EMBEDDER", value);
+            }
+            assert!(env_disables_embedder(), "value {value:?} must disable");
+        }
+        for value in ["", "default", "bge-small", "bge-m3", "jina-code"] {
+            unsafe {
+                std::env::set_var("KIMETSU_BRAIN_EMBEDDER", value);
+            }
+            assert!(
+                !env_disables_embedder(),
+                "value {value:?} must NOT disable"
+            );
+        }
+        // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// v0.4.3: model picker maps the user-facing env string onto a
+    /// stable model id used by both fastembed init AND the
+    /// `embedding_model` column on each memory row.
+    #[test]
+    fn pick_builtin_model_from_env_handles_aliases() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        let cases = [
+            ("", "bge-small-en-v1.5"),
+            ("default", "bge-small-en-v1.5"),
+            ("bge-small", "bge-small-en-v1.5"),
+            ("BGE-SMALL-EN-V1.5", "bge-small-en-v1.5"),
+            ("bge-m3", "bge-m3"),
+            ("M3", "bge-m3"),
+            ("jina-code", "jina-v2-base-code"),
+            ("jina-v2-base-code", "jina-v2-base-code"),
+            ("jina-embeddings-v2-base-code", "jina-v2-base-code"),
+            // Unknown values fall back to bge-small with a warning.
+            ("totally-made-up", "bge-small-en-v1.5"),
+        ];
+        for (input, expected) in cases {
+            // SAFETY: serialized via the shared brain test env lock.
+            unsafe {
+                std::env::set_var("KIMETSU_BRAIN_EMBEDDER", input);
+            }
+            assert_eq!(
+                pick_builtin_model_from_env(),
+                expected,
+                "input {input:?} -> expected {expected}"
+            );
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
     }
 }
