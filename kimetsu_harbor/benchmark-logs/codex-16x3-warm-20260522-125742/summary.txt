@@ -1,0 +1,4 @@
+Benchmark started: 2026-05-22T12:57:42.7781056-03:00
+TaskLimit=16 Concurrency=2 Model=gpt-5.5 CodexVersion=0.128.0
+
+=== required warm_policy=full_warm codex-16x3-warm-required-20260522-125742 start 2026-05-22T12:57:42.7876210-03:00 ===

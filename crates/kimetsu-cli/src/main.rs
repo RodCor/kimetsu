@@ -210,6 +210,10 @@ struct PluginInstallArgs {
     target: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// Host instruction mode: optional recommends Kimetsu brain first;
+    /// required treats missing brain context as a setup blocker for broad work.
+    #[arg(long, default_value = "optional")]
+    mode: String,
     #[arg(long)]
     force: bool,
 }
@@ -255,6 +259,9 @@ struct ContextArgs {
     stage: String,
     #[arg(long, default_value_t = 6000)]
     budget_tokens: u32,
+    /// Print machine-readable JSON for hooks and harness wrappers.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -639,18 +646,21 @@ fn mcp(command: McpCommand) -> KimetsuResult<()> {
 }
 
 fn plugin(command: PluginCommand) -> KimetsuResult<()> {
-    use kimetsu_chat::{BridgeTarget, plugin_install};
+    use kimetsu_chat::{BridgeTarget, PluginMode, plugin_install};
 
     match command {
         PluginCommand::Install(args) => {
             let workspace = args.workspace.canonicalize()?;
             let target = BridgeTarget::parse(&args.target)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
-            let report = plugin_install(&workspace, target, args.force)
+            let mode = PluginMode::parse(&args.mode)
+                .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            let report = plugin_install(&workspace, target, mode, args.force)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             println!(
-                "installed Kimetsu plugin surface for {}",
-                report.target.as_str()
+                "installed Kimetsu plugin surface for {} in {} mode",
+                report.target.as_str(),
+                report.mode.as_str()
             );
             for file in report.files {
                 println!("  {}", file.display());
@@ -885,6 +895,23 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
                 &args.query,
                 args.budget_tokens,
             )?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "stage": bundle.stage,
+                        "query": args.query,
+                        "budget_tokens": bundle.budget_tokens,
+                        "used_tokens": bundle.used_tokens,
+                        "capsule_count": bundle.capsules.len(),
+                        "excluded_count": bundle.excluded.len(),
+                        "capsules": bundle.capsules,
+                        "excluded": bundle.excluded,
+                    }))?
+                );
+                return Ok(());
+            }
             println!(
                 "stage: {} used_tokens: {}/{} capsules: {} excluded: {}",
                 bundle.stage,
@@ -1565,6 +1592,15 @@ mod tests {
     /// typed reason, one stays pending; summary line accounts for all three.
     #[test]
     fn interactive_loop_accepts_rejects_and_skips_from_scripted_input() {
+        // v0.4.1: review flow asserts on project-DB row counts.
+        // Disable user-brain so `accept_proposal(GlobalUser)` lands
+        // in the project DB instead of `~/.kimetsu/brain.db`.
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            interactive_loop_accepts_rejects_and_skips_from_scripted_input_body();
+        });
+    }
+
+    fn interactive_loop_accepts_rejects_and_skips_from_scripted_input_body() {
         // ulid-named temp dir to avoid collisions when tests run concurrently.
         let root = std::env::temp_dir().join(format!("kimetsu-cli-test-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project");
@@ -1695,6 +1731,13 @@ mod tests {
     /// the remaining pending proposals.
     #[test]
     fn interactive_loop_quit_preserves_partial_decisions() {
+        // v0.4.1: see sibling test for rationale.
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            interactive_loop_quit_preserves_partial_decisions_body();
+        });
+    }
+
+    fn interactive_loop_quit_preserves_partial_decisions_body() {
         let root = std::env::temp_dir().join(format!("kimetsu-cli-test-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project");
         project::init_project(&root, false).expect("init project");

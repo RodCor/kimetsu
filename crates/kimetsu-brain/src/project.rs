@@ -8,15 +8,17 @@ use kimetsu_core::ids::RunId;
 use kimetsu_core::memory::{MemoryKind, MemoryScope, normalize_memory_text};
 use kimetsu_core::paths::{ProjectPaths, default_project_id};
 use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use ulid::Ulid;
 
+use crate::benchmark;
 use crate::context::{self, ContextBundle, ContextRequest};
 use crate::ingest::{self, RepoIngestSummary};
 use crate::lock::ProjectLock;
 use crate::projector;
 use crate::schema;
 use crate::trace::{self, TraceWriter};
+use crate::user_brain;
 
 #[derive(Debug, Clone)]
 pub struct InitSummary {
@@ -82,6 +84,16 @@ pub struct AcceptOverrides {
     pub confidence: Option<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordedBenchmarkOutcome {
+    pub memory_id: String,
+    pub task_slug: Option<String>,
+    pub kind: MemoryKind,
+    pub text: String,
+    pub proposal_id: Option<String>,
+    pub proposal_text: Option<String>,
+}
+
 pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
     let paths = ProjectPaths::discover(start)?;
     fs::create_dir_all(&paths.runs_dir)?;
@@ -129,16 +141,64 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
     Ok((paths, config, conn))
 }
 
+pub fn load_project_readonly(
+    start: &Path,
+) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
+    let paths = ProjectPaths::discover(start)?;
+    let config = load_config(&paths)?;
+    if config.kimetsu.schema_version != KIMETSU_SCHEMA_VERSION {
+        return Err(format!(
+            "project.toml schema version {} does not match expected {}",
+            config.kimetsu.schema_version, KIMETSU_SCHEMA_VERSION
+        )
+        .into());
+    }
+
+    let conn = Connection::open_with_flags(&paths.brain_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    schema::validate(&conn)?;
+    Ok((paths, config, conn))
+}
+
 pub struct BrainSession {
     paths: ProjectPaths,
     config: ProjectConfig,
     conn: Connection,
+    /// v0.4.1: user-scope brain at `~/.kimetsu/brain.db`. Opened
+    /// lazily during session construction; `None` when the user
+    /// brain is disabled (`KIMETSU_USER_BRAIN=0`), no home dir is
+    /// resolvable, or — for the read-only constructor — the file
+    /// hasn't been created yet. Retrieval merges memories from this
+    /// connection alongside the project DB; repo files and manifests
+    /// stay project-only.
+    user_conn: Option<Connection>,
     repo_root: String,
 }
 
 impl BrainSession {
     pub fn open(start: &Path) -> KimetsuResult<Self> {
         let (paths, config, conn) = load_project(start)?;
+        // Read/write user brain — created on demand so a v0.4 binary
+        // running on a v0.3 home dir provisions the file the first
+        // time the user actually writes a GlobalUser memory.
+        let user_conn = user_brain::open_user_brain()?;
+        Self::from_parts(paths, config, conn, user_conn)
+    }
+
+    pub fn open_readonly(start: &Path) -> KimetsuResult<Self> {
+        let (paths, config, conn) = load_project_readonly(start)?;
+        // Read-only path skips file creation — if the user brain
+        // doesn't exist yet we just retrieve from the project DB
+        // alone, no surprise file under $HOME.
+        let user_conn = user_brain::open_user_brain_readonly()?;
+        Self::from_parts(paths, config, conn, user_conn)
+    }
+
+    fn from_parts(
+        paths: ProjectPaths,
+        config: ProjectConfig,
+        conn: Connection,
+        user_conn: Option<Connection>,
+    ) -> KimetsuResult<Self> {
         let repo_root = paths
             .repo_root
             .canonicalize()?
@@ -148,6 +208,7 @@ impl BrainSession {
             paths,
             config,
             conn,
+            user_conn,
             repo_root,
         })
     }
@@ -158,7 +219,13 @@ impl BrainSession {
         query: &str,
         budget_tokens: u32,
     ) -> KimetsuResult<ContextBundle> {
-        context::retrieve_context(
+        // v0.4.1: merge user-brain memories into the candidate set
+        // when the user DB is open. The multi-conn path normalizes
+        // both candidate streams together so a user-brain capsule
+        // and a project-brain capsule are comparable on the same
+        // `raw_relevance` scale before scoring.
+        let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        context::retrieve_context_multi(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
@@ -167,11 +234,20 @@ impl BrainSession {
                 query: query.to_string(),
                 budget_tokens,
             },
+            &extras,
         )
     }
 
     pub fn repo_root(&self) -> &Path {
         &self.paths.repo_root
+    }
+
+    /// v0.4.1: expose the user-brain connection so callers (e.g.
+    /// `kimetsu brain status`) can report counts/paths without
+    /// re-opening the file. Returns None when the user brain is
+    /// disabled or unresolvable.
+    pub fn user_conn(&self) -> Option<&Connection> {
+        self.user_conn.as_ref()
     }
 }
 
@@ -246,6 +322,20 @@ pub fn add_memory(
     kind: MemoryKind,
     text: &str,
 ) -> KimetsuResult<String> {
+    // v0.4.1: GlobalUser memories route to `~/.kimetsu/brain.db` when
+    // the user brain is enabled. The user-brain write path is
+    // intentionally simpler (no run rows, no trace events, no project
+    // lock) because there's no project to attribute them to.
+    //
+    // If the user brain is disabled (KIMETSU_USER_BRAIN=0) OR
+    // unreachable (no $HOME), fall through to the project DB so
+    // backward compat is preserved — existing scripts that wrote
+    // GlobalUser memories into the project keep working.
+    if scope == MemoryScope::GlobalUser
+        && let Some(user_conn) = user_brain::open_user_brain()?
+    {
+        return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
+    }
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory add", Some(run_id))?;
@@ -329,6 +419,17 @@ pub fn add_memory(
 
 pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
     let (_paths, _config, conn) = load_project(start)?;
+    let mut memories = list_memories_from_conn(&conn)?;
+    // v0.4.1: merge user-brain rows so the user sees their portable
+    // capsules alongside the per-repo ones. We read user brain via
+    // the read-only path (no file-create side-effect on list).
+    if let Some(user_conn) = user_brain::open_user_brain_readonly()? {
+        memories.extend(user_brain::list_user_memories(&user_conn)?);
+    }
+    Ok(memories)
+}
+
+fn list_memories_from_conn(conn: &Connection) -> KimetsuResult<Vec<MemoryRow>> {
     let mut stmt = conn.prepare(
         "
         SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
@@ -693,6 +794,115 @@ pub fn retrieve_context(
     BrainSession::open(start)?.retrieve_context(stage, query, budget_tokens)
 }
 
+pub fn retrieve_context_readonly(
+    start: &Path,
+    stage: &str,
+    query: &str,
+    budget_tokens: u32,
+) -> KimetsuResult<ContextBundle> {
+    BrainSession::open_readonly(start)?.retrieve_context(stage, query, budget_tokens)
+}
+
+pub fn retrieve_benchmark_context_readonly(
+    start: &Path,
+    task: &str,
+    dataset: &str,
+    task_slug: Option<&str>,
+    warm_policy: benchmark::BenchmarkWarmPolicy,
+    stage: &str,
+    budget_tokens: u32,
+    require_benchmark_memory: bool,
+    max_capsules: usize,
+) -> KimetsuResult<benchmark::BenchmarkBrainContext> {
+    let normalized_slug = task_slug
+        .and_then(benchmark::normalize_task_slug)
+        .or_else(|| benchmark::normalize_task_slug(task));
+    let query = benchmark::benchmark_query(task, dataset, normalized_slug.as_deref(), warm_policy);
+    let bundle =
+        BrainSession::open_readonly(start)?.retrieve_context(stage, &query, budget_tokens)?;
+    Ok(benchmark::build_benchmark_context(
+        bundle,
+        task,
+        dataset,
+        &query,
+        normalized_slug,
+        warm_policy,
+        require_benchmark_memory,
+        max_capsules,
+    ))
+}
+
+pub fn record_benchmark_outcome(
+    start: &Path,
+    outcome: benchmark::BenchmarkOutcome,
+) -> KimetsuResult<RecordedBenchmarkOutcome> {
+    let task_slug = outcome
+        .task_slug
+        .clone()
+        .or_else(|| benchmark::normalize_task_slug(&outcome.task));
+    let kind = benchmark::outcome_memory_kind(&outcome);
+    let text = benchmark::outcome_memory_text(&outcome);
+    let memory_id = add_memory(start, MemoryScope::GlobalUser, kind, &text)?;
+    let (proposal_id, proposal_text) = match outcome.generalization.as_ref() {
+        Some(proposal) if proposal.role.is_generalizable() => {
+            let (proposal_id, proposal_text) = propose_benchmark_memory(start, &outcome, proposal)?;
+            (Some(proposal_id), Some(proposal_text))
+        }
+        _ => (None, None),
+    };
+    Ok(RecordedBenchmarkOutcome {
+        memory_id,
+        task_slug,
+        kind,
+        text,
+        proposal_id,
+        proposal_text,
+    })
+}
+
+fn propose_benchmark_memory(
+    start: &Path,
+    outcome: &benchmark::BenchmarkOutcome,
+    proposal: &benchmark::BenchmarkMemoryProposal,
+) -> KimetsuResult<(String, String)> {
+    let (paths, config, conn) = load_project(start)?;
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "benchmark memory proposal", Some(run_id))?;
+    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
+    let proposal_id = Ulid::new().to_string();
+    let text = benchmark::proposal_memory_text(outcome, proposal);
+    let kind = benchmark::proposal_memory_kind(proposal);
+    let rationale = if proposal.rationale.trim().is_empty() {
+        "generalized from benchmark outcome".to_string()
+    } else {
+        proposal.rationale.trim().to_string()
+    };
+
+    let started = admin_started_event(&paths, &config, run_id, "benchmark memory proposal")?;
+    writer.append(&started, true)?;
+
+    let proposed = Event::new(
+        run_id,
+        "memory.proposed",
+        serde_json::json!({
+            "proposal_id": proposal_id,
+            "scope": "global_user",
+            "kind": kind.to_string(),
+            "text": text,
+            "rationale": rationale,
+            "proposed_confidence": proposal.confidence.clamp(0.0, 1.0),
+            "source_event_ids": [],
+        }),
+    );
+    writer.append(&proposed, true)?;
+
+    let finished = admin_finished_event(run_id);
+    writer.append(&finished, true)?;
+
+    projector::apply_events(&conn, &[started, proposed, finished])?;
+    Ok((proposal_id, text))
+}
+
 pub fn accept_proposal(
     start: &Path,
     proposal_id: &str,
@@ -947,37 +1157,46 @@ mod tests {
     use std::fs;
 
     use super::*;
+    // v0.4.1: pre-v0.4 tests assume `MemoryScope::GlobalUser` writes
+    // land in the project DB. With user-brain routing on by default
+    // that's no longer true — wrap each affected test in
+    // `with_user_brain_disabled` so it sees v0.3.5 routing. Tests
+    // that specifically exercise the user-brain path live in
+    // `user_brain::tests` and opt-in via `with_user_brain_at`.
+    use crate::user_brain::with_user_brain_disabled;
 
     #[test]
     fn memory_add_survives_projection_rebuild_from_trace() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
-        fs::create_dir_all(&root).expect("create temp project");
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
 
-        init_project(&root, false).expect("init project");
-        let memory_id = add_memory(
-            &root,
-            MemoryScope::GlobalUser,
-            MemoryKind::Preference,
-            "User prefers Rust for core infrastructure.",
-        )
-        .expect("add memory");
+            init_project(&root, false).expect("init project");
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Preference,
+                "User prefers Rust for core infrastructure.",
+            )
+            .expect("add memory");
 
-        let memories = list_memories(&root).expect("list memories");
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].memory_id, memory_id);
+            let memories = list_memories(&root).expect("list memories");
+            assert_eq!(memories.len(), 1);
+            assert_eq!(memories[0].memory_id, memory_id);
 
-        let event_count = rebuild_projection(&root).expect("rebuild projection");
-        assert_eq!(event_count, 3);
+            let event_count = rebuild_projection(&root).expect("rebuild projection");
+            assert_eq!(event_count, 3);
 
-        let memories = list_memories(&root).expect("list rebuilt memories");
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].memory_id, memory_id);
-        assert_eq!(
-            memories[0].text,
-            "User prefers Rust for core infrastructure."
-        );
+            let memories = list_memories(&root).expect("list rebuilt memories");
+            assert_eq!(memories.len(), 1);
+            assert_eq!(memories[0].memory_id, memory_id);
+            assert_eq!(
+                memories[0].text,
+                "User prefers Rust for core infrastructure."
+            );
 
-        fs::remove_dir_all(root).expect("remove temp project");
+            fs::remove_dir_all(root).expect("remove temp project");
+        });
     }
 
     #[test]
@@ -1055,74 +1274,76 @@ mod tests {
 
     #[test]
     fn run_finished_increments_usefulness_for_injected_memories() {
-        // MP-4a outcome attribution: a memory in the context of a run.finished
-        // gains +1 usefulness and +1 use_count; per-run counting means the
-        // same memory injected into two stages of one run still counts once.
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
-        fs::create_dir_all(&root).expect("create temp project");
-        init_project(&root, false).expect("init project");
-        let memory_id = add_memory(
-            &root,
-            MemoryScope::GlobalUser,
-            MemoryKind::Preference,
-            "Prefer ripgrep over grep.",
-        )
-        .expect("add memory");
+        with_user_brain_disabled(|| {
+            // MP-4a outcome attribution: a memory in the context of a run.finished
+            // gains +1 usefulness and +1 use_count; per-run counting means the
+            // same memory injected into two stages of one run still counts once.
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Preference,
+                "Prefer ripgrep over grep.",
+            )
+            .expect("add memory");
 
-        {
-            let (paths, _config, conn) = load_project(&root).expect("load");
-            let run_id = RunId::new();
-            let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id).expect("trace");
-            let evs: Vec<Event> = vec![
-                Event::new(
-                    run_id,
-                    "run.started",
-                    serde_json::json!({"project_id": "test", "task": "x"}),
-                ),
-                Event::new(
-                    run_id,
-                    "context.injected",
-                    serde_json::json!({
-                        "stage": "localization",
-                        "capsule_handles": [format!("memory:{memory_id}")],
-                        "memory_ids": [memory_id.clone()],
-                        "prior_run_ids": [],
-                        "file_paths": [],
-                    }),
-                ),
-                Event::new(
-                    run_id,
-                    "context.injected",
-                    serde_json::json!({
-                        "stage": "patch_plan",
-                        "capsule_handles": [format!("memory:{memory_id}")],
-                        "memory_ids": [memory_id.clone()],
-                        "prior_run_ids": [],
-                        "file_paths": [],
-                    }),
-                ),
-                Event::new(
-                    run_id,
-                    "run.finished",
-                    serde_json::json!({"status": "success", "total_cost_usd": 0.1}),
-                ),
-            ];
-            for ev in &evs {
-                writer.append(ev, true).expect("append");
+            {
+                let (paths, _config, conn) = load_project(&root).expect("load");
+                let run_id = RunId::new();
+                let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id).expect("trace");
+                let evs: Vec<Event> = vec![
+                    Event::new(
+                        run_id,
+                        "run.started",
+                        serde_json::json!({"project_id": "test", "task": "x"}),
+                    ),
+                    Event::new(
+                        run_id,
+                        "context.injected",
+                        serde_json::json!({
+                            "stage": "localization",
+                            "capsule_handles": [format!("memory:{memory_id}")],
+                            "memory_ids": [memory_id.clone()],
+                            "prior_run_ids": [],
+                            "file_paths": [],
+                        }),
+                    ),
+                    Event::new(
+                        run_id,
+                        "context.injected",
+                        serde_json::json!({
+                            "stage": "patch_plan",
+                            "capsule_handles": [format!("memory:{memory_id}")],
+                            "memory_ids": [memory_id.clone()],
+                            "prior_run_ids": [],
+                            "file_paths": [],
+                        }),
+                    ),
+                    Event::new(
+                        run_id,
+                        "run.finished",
+                        serde_json::json!({"status": "success", "total_cost_usd": 0.1}),
+                    ),
+                ];
+                for ev in &evs {
+                    writer.append(ev, true).expect("append");
+                }
+                projector::apply_events(&conn, &evs).expect("project");
             }
-            projector::apply_events(&conn, &evs).expect("project");
-        }
 
-        let memories = list_memories(&root).expect("list memories");
-        let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
-        assert_eq!(m.use_count, 1, "per-run counting: 2 stages count once");
-        assert!(
-            (m.usefulness_score - 1.0).abs() < f32::EPSILON,
-            "expected usefulness_score = 1.0, got {}",
-            m.usefulness_score
-        );
+            let memories = list_memories(&root).expect("list memories");
+            let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
+            assert_eq!(m.use_count, 1, "per-run counting: 2 stages count once");
+            assert!(
+                (m.usefulness_score - 1.0).abs() < f32::EPSILON,
+                "expected usefulness_score = 1.0, got {}",
+                m.usefulness_score
+            );
 
-        fs::remove_dir_all(root).expect("remove temp project");
+            fs::remove_dir_all(root).expect("remove temp project");
+        });
     }
 
     #[test]
@@ -1465,46 +1686,48 @@ mod tests {
     /// brain.db for replay/audit.
     #[test]
     fn invalidated_memory_is_excluded_from_broker_retrieval() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
-        fs::create_dir_all(&root).expect("create temp project");
-        init_project(&root, false).expect("init project");
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
 
-        let memory_id = add_memory(
-            &root,
-            MemoryScope::GlobalUser,
-            MemoryKind::Preference,
-            "Prefer ripgrep over grep for repo search.",
-        )
-        .expect("add memory");
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Preference,
+                "Prefer ripgrep over grep for repo search.",
+            )
+            .expect("add memory");
 
-        // Sanity: broker surfaces it pre-invalidation.
-        let pre = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
-            .expect("pre context");
-        assert!(
-            pre.capsules
-                .iter()
-                .any(|c| c.expansion_handle == format!("memory:{memory_id}")),
-            "memory must appear before invalidation: {:?}",
-            pre.capsules
-        );
+            // Sanity: broker surfaces it pre-invalidation.
+            let pre = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
+                .expect("pre context");
+            assert!(
+                pre.capsules
+                    .iter()
+                    .any(|c| c.expansion_handle == format!("memory:{memory_id}")),
+                "memory must appear before invalidation: {:?}",
+                pre.capsules
+            );
 
-        invalidate_memory(&root, &memory_id, Some("no longer accurate")).expect("invalidate");
+            invalidate_memory(&root, &memory_id, Some("no longer accurate")).expect("invalidate");
 
-        let post = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
-            .expect("post context");
-        assert!(
-            post.capsules
-                .iter()
-                .all(|c| c.expansion_handle != format!("memory:{memory_id}")),
-            "invalidated memory must not be retrieved: {:?}",
-            post.capsules
-        );
+            let post = retrieve_context(&root, "localization", "ripgrep grep search", 1200)
+                .expect("post context");
+            assert!(
+                post.capsules
+                    .iter()
+                    .all(|c| c.expansion_handle != format!("memory:{memory_id}")),
+                "invalidated memory must not be retrieved: {:?}",
+                post.capsules
+            );
 
-        // The row itself still exists in brain.db.
-        let memories = list_memories(&root).expect("list");
-        assert!(memories.iter().any(|m| m.memory_id == memory_id));
+            // The row itself still exists in brain.db.
+            let memories = list_memories(&root).expect("list");
+            assert!(memories.iter().any(|m| m.memory_id == memory_id));
 
-        fs::remove_dir_all(root).expect("remove temp project");
+            fs::remove_dir_all(root).expect("remove temp project");
+        });
     }
 
     /// MP-6: `list_memories_top` returns invalidated_at IS NULL memories
@@ -1586,6 +1809,12 @@ mod tests {
     /// why the memory left.
     #[test]
     fn prune_low_usefulness_dry_run_then_apply() {
+        with_user_brain_disabled(|| {
+            prune_low_usefulness_dry_run_then_apply_body();
+        });
+    }
+
+    fn prune_low_usefulness_dry_run_then_apply_body() {
         let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
@@ -1734,6 +1963,12 @@ mod tests {
     /// carrying a non-empty decided_reason.
     #[test]
     fn batch_review_accepts_filtered_subset_and_rejects_remainder() {
+        with_user_brain_disabled(|| {
+            batch_review_accepts_filtered_subset_and_rejects_remainder_body();
+        });
+    }
+
+    fn batch_review_accepts_filtered_subset_and_rejects_remainder_body() {
         let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");

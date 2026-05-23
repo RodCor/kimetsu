@@ -58,8 +58,32 @@ pub fn retrieve_context(
     weights: &BrokerWeights,
     request: ContextRequest,
 ) -> KimetsuResult<ContextBundle> {
+    retrieve_context_multi(conn, repo_root, weights, request, &[])
+}
+
+/// v0.4.1: multi-conn variant. `extra_memory_conns` is searched for
+/// memory candidates only (repo files + manifests stay project-local).
+/// The candidate stream is concatenated BEFORE normalization so the
+/// blended set is normalized together — keeping a user-brain capsule
+/// and a project-brain capsule comparable on the same `raw_relevance`
+/// scale.
+///
+/// Today `extra_memory_conns` carries at most one entry (the user
+/// brain at `~/.kimetsu/brain.db`); the slice shape leaves room for
+/// future scope tiers (team brain, org brain) without breaking the
+/// signature.
+pub fn retrieve_context_multi(
+    conn: &Connection,
+    repo_root: &str,
+    weights: &BrokerWeights,
+    request: ContextRequest,
+    extra_memory_conns: &[&Connection],
+) -> KimetsuResult<ContextBundle> {
     let mut candidates = Vec::new();
     candidates.extend(memory_candidates(conn, &request.query)?);
+    for extra in extra_memory_conns {
+        candidates.extend(memory_candidates(extra, &request.query)?);
+    }
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
 

@@ -117,16 +117,16 @@ cargo run -p kimetsu-cli -- bridge export reviewer claude --workspace .
 Install Kimetsu as a local MCP sidecar for host harnesses:
 
 ```bash
-cargo run -p kimetsu-cli -- plugin install claude --workspace .
-cargo run -p kimetsu-cli -- plugin install codex --workspace .
+cargo run -p kimetsu-cli -- plugin install claude --mode optional --workspace .
+cargo run -p kimetsu-cli -- plugin install codex --mode required --workspace .
 ```
 
 The installers create workspace-local config only:
 
 | command | writes |
 |---------|--------|
-| `kimetsu plugin install claude` | `.claude/mcp.json`, `.claude/commands/kimetsu/bridge.md`, `.claude/commands/kimetsu/delegate.md` |
-| `kimetsu plugin install codex` | `.codex/mcp.json`, `.codex/skills/kimetsu-bridge/SKILL.md` |
+| `kimetsu plugin install claude --mode <mode>` | `.claude/mcp.json`, `.claude/commands/kimetsu/bridge.md`, `.claude/commands/kimetsu/delegate.md`, `.claude/hooks/pre-turn.*`, `.claude/hooks/post-turn.*` |
+| `kimetsu plugin install codex --mode <mode>` | `.codex/mcp.json`, `.codex/skills/kimetsu-bridge/SKILL.md`, `.codex/hooks/pre-turn.*`, `.codex/hooks/post-turn.*` |
 
 Both MCP configs point at:
 
@@ -134,8 +134,14 @@ Both MCP configs point at:
 kimetsu mcp serve --workspace .
 ```
 
-That sidecar exposes bridge status, skill search, import, export, sync, and
-plugin install tools to the host harness.
+Mode defaults to `optional`, which recommends Kimetsu brain first and writes
+soft-audit hooks. `required` writes stronger host instructions and hooks that
+treat missing Kimetsu brain context as a setup blocker for non-trivial tasks;
+benchmark wrappers can still add transcript-level enforcement.
+
+That sidecar exposes Kimetsu brain context, benchmark playbooks, outcome
+recording, and memory curation tools first, then bridge status, skill search,
+import, export, sync, and plugin install tools to the host harness.
 
 ## Chat Usage
 
@@ -368,16 +374,47 @@ cargo run -p kimetsu-cli -- bridge sync --workspace .
 Install Kimetsu as a local MCP sidecar for a host harness:
 
 ```bash
-cargo run -p kimetsu-cli -- plugin install claude --workspace .
-cargo run -p kimetsu-cli -- plugin install codex --workspace .
+cargo run -p kimetsu-cli -- plugin install claude --mode optional --workspace .
+cargo run -p kimetsu-cli -- plugin install codex --mode required --workspace .
 cargo run -p kimetsu-cli -- mcp serve --workspace .
 ```
 
 `plugin install claude` writes a `.claude/mcp.json` entry plus Kimetsu command
 prompts under `.claude/commands/kimetsu`. `plugin install codex` writes a
 `.codex/mcp.json` entry plus a Codex-compatible `kimetsu-bridge` skill. The
-MCP server exposes bridge status, skill search/import/export/sync, and plugin
-install tools so Claude Code or Codex can call Kimetsu as a live sidecar.
+MCP server exposes Kimetsu brain context, benchmark playbooks, outcome
+recording, and memory curation tools first, then bridge status, skill
+search/import/export/sync, and plugin install tools so Claude Code or Codex can
+call Kimetsu as a live sidecar.
+
+Use `--mode optional` when Kimetsu should be an available memory/brain helper.
+Use `--mode required` when the installed host artifact should tell Codex or
+Claude Code to load Kimetsu brain context before non-trivial work and to stop
+for setup when Kimetsu is unavailable. Both modes install `pre-turn` and
+`post-turn` hooks. The pre-turn hook calls `kimetsu brain context --json`; the
+post-turn hook checks the per-session marker under `.kimetsu/hooks/usage/`.
+Required hooks fail the turn on missing context, while optional hooks only warn.
+Benchmark-grade enforcement can additionally inspect those markers or MCP
+transcripts in a wrapper such as the Terminal-Bench Harbor adapter.
+
+For Terminal-Bench harnesses, the main MCP entry point is
+`kimetsu_benchmark_context`: pass the task text and dataset, then use the
+returned `playbook_markdown` before broad exploration. After an attempt, call
+`kimetsu_benchmark_record_outcome` with pass/fail/error status, commands,
+pitfalls, and verification steps. This records exact attempts as
+`memory_role=episodic`; add `generalized_memory` with
+`memory_role=semantic_operator` or `anti_pattern` only for reusable tactics or
+warnings that should be reviewed before becoming durable memory. For other
+host tasks, call `kimetsu_brain_context` with the current task as `query` and
+use the returned memory/repo/manifest capsules before planning or editing.
+`kimetsu_brain_status`, `kimetsu_brain_memory_top`, and the proposal accept/reject/invalidate tools
+expose Kimetsu's brain management loop without forcing Codex or Claude Code to
+run the full Kimetsu agent.
+
+Benchmark calls also accept `warm_policy`: `cold_brain` excludes accepted
+memory capsules, `reactive_warm` leaves Kimetsu available without requiring
+task memory up front, and `full_warm` is the pre-task playbook injection used
+for required-mode comparisons.
 
 Bridge commands are intentionally file-based. Imported skills keep their whole
 bundle, not only `SKILL.md`, so scripts, references, templates, and assets stay
@@ -404,6 +441,7 @@ Useful brain commands:
 cargo run -p kimetsu-cli -- brain ingest-repo .
 cargo run -p kimetsu-cli -- brain search "build failures"
 cargo run -p kimetsu-cli -- brain context "where is chat configured?"
+cargo run -p kimetsu-cli -- brain context "where is chat configured?" --json
 cargo run -p kimetsu-cli -- brain memory list
 cargo run -p kimetsu-cli -- brain memory proposals
 cargo run -p kimetsu-cli -- brain memory review

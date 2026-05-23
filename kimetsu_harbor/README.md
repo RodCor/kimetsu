@@ -128,6 +128,128 @@ harbor run `
 Per the v0.2 ship gate (docs/V0.2-PLAN.md MP-8): three runs per mode within
 Â±5pp over a 1-week window. Stability matters more than peak accuracy.
 
+## Codex + Kimetsu MCP run
+
+Harbor 0.7.x includes a built-in `codex` agent with `--mcp-config` and
+`--skill` support. On the WSL setup from `SETUP-WSL.md`, run Codex inside
+Terminal-Bench while exposing Kimetsu as an MCP sidecar:
+
+```powershell
+.\kimetsu_harbor\run-codex-kimetsu-wsl.ps1 -TaskLimit 16 -Concurrency 2 -Model gpt-5.5
+```
+
+The script:
+
+- rebuilds the Linux `target/release/kimetsu` binary if it is missing or stale;
+- builds a static `target/x86_64-unknown-linux-musl/release/kimetsu` binary for
+  benchmark containers, so the MCP helper is not tied to the WSL host glibc;
+- prepares the Kimetsu brain repo index for the WSL path root when missing
+  (`KIMETSU_BRAIN_PREP=auto`, set `0` to skip or `1` to force re-ingest);
+- bind-mounts `/mnt/e/Kimetsu` into each benchmark container, read-only by default;
+- generates a Harbor MCP config equivalent to `codex-kimetsu-mcp.wsl.json`;
+- points Codex at `kimetsu_harbor/kimetsu-mcp-stdio.sh`, a no-argument wrapper
+  that avoids Harbor's Codex adapter flattening MCP command arguments into one
+  non-executable command string. The wrapper prefers the static musl binary and
+  falls back to `target/release/kimetsu`;
+- exposes `kimetsu_harbor/kimetsu-brain-context.sh` as a fallback helper for
+  harnesses that receive the MCP config but do not surface external MCP tools to
+  the model. Set `KIMETSU_TOOL_NAME=kimetsu_benchmark_context` to request the
+  benchmark playbook tool instead of the generic brain context tool;
+- probes `tools/list` inside `debian:bookworm` before launching a model run and
+  fails fast if `kimetsu_brain_context` or `kimetsu_benchmark_context` is not
+  visible;
+- injects `.codex/skills/kimetsu-bridge` as a Harbor skill;
+- appends a Kimetsu mode instruction with `--extra-instruction-path`;
+- in `required` mode, uses `kimetsu_harbor.codex_kimetsu_agent:CodexKimetsuRequired`
+  to fetch `kimetsu_benchmark_context` before Codex starts and prepend the
+  returned Kimetsu Benchmark Playbook to the task prompt;
+- uploads the host Codex auth JSON from `/mnt/c/Users/rodri/.codex/auth.json`.
+
+Three Kimetsu MCP modes are supported:
+
+| mode | behavior |
+|------|----------|
+| `optional` | Kimetsu is available as memory/brain context. For Terminal-Bench, the agent should call `kimetsu_benchmark_context`; for other work it may call `kimetsu_brain_context` or related tools when useful. |
+| `required` | Kimetsu brain usage is enforced outside the model loop. Harbor calls the mounted MCP stdio helper before Codex starts, writes `kimetsu-brain-*` artifacts into the trial logs, and prepends a compact benchmark playbook to the task. Codex still receives the MCP config and bridge skill for follow-up calls. |
+| `none` | Baseline Codex run. The runner does not pass a Kimetsu MCP config, bridge skill, extra instruction, or Kimetsu repo mount. |
+
+Benchmark brain warmth is tracked separately from the MCP availability mode:
+
+| warm policy | behavior |
+|-------------|----------|
+| `cold_brain` | Broker/repo/prior-run grounding is allowed, but accepted memory capsules are excluded from the playbook. This mirrors the older `brain_on_cold` research condition. |
+| `reactive_warm` | Kimetsu memory is available when the model or harness asks for it, but task-specific benchmark memory is not required up front. This maps to optional/reactive usage. |
+| `full_warm` | The playbook is fetched before Codex starts and may include task-specific benchmark memories. This is the required-mode prefetch condition. |
+
+Required Codex prefetch defaults to `KIMETSU_BRAIN_WARM_POLICY=full_warm`.
+Set `KIMETSU_BRAIN_WARM_POLICY=cold_brain` to measure a brain-on cold run, or
+`reactive_warm` when comparing against the reactive-warm Claude Code research.
+
+The mode files live in `kimetsu_harbor/kimetsu-mcp-optional.md` and
+`kimetsu_harbor/kimetsu-mcp-required.md`. They are plain Harbor extra
+instructions, so they can be reused with any MCP-capable Harbor agent such as
+Codex or Claude Code:
+
+```bash
+harbor run -d terminal-bench/terminal-bench-2 -a codex \
+  --mcp-config /path/to/kimetsu-mcp.json \
+  --extra-instruction-path kimetsu_harbor/kimetsu-mcp-required.md
+```
+
+Codex should treat Kimetsu's brain as the primary value of this MCP sidecar.
+For Terminal-Bench, call `kimetsu_benchmark_context` with the task text and
+dataset, then use the returned `playbook_markdown` as working context before
+solving. For non-benchmark work, call `kimetsu_brain_context` early with the
+task text. After a benchmark attempt, call `kimetsu_benchmark_record_outcome`
+with pass/fail/error status, key commands, pitfalls, and verification so
+future runs retrieve exact episodic evidence. When the attempt reveals a
+transferable tactic or warning, also pass `generalized_memory` with
+`memory_role=semantic_operator` or `anti_pattern`, plus optional `task_family`,
+`applies_to`, `does_not_apply_to`, and review rationale fields. Kimetsu keeps
+that generalized memory pending until review, so the durable brain improves
+without overfitting to one Terminal-Bench slug. Use `kimetsu_brain_status`,
+`kimetsu_brain_memory_top`, and the proposal accept/reject/invalidate tools
+when inspecting or curating the memory pool. Bridge tools such as
+`kimetsu_skills_search` remain available for portable skill lookup and setup.
+
+Required mode defaults to `KIMETSU_CODEX_ENFORCE_BRAIN=auto`, which enables
+the prefetch wrapper only for `KIMETSU_MCP_MODE=required`. Set
+`KIMETSU_CODEX_ENFORCE_BRAIN=0` to fall back to prompt-only required mode, or
+`KIMETSU_CODEX_ENFORCE_BRAIN=1` to force prefetch for any Kimetsu-enabled mode.
+Required mode fails fast if the brain call itself fails. Set
+`KIMETSU_REQUIRE_NONEMPTY_BRAIN=1` only when you want zero retrieved capsules to
+fail the task before Codex starts.
+Set `KIMETSU_REQUIRE_BENCHMARK_MEMORY=1` when you want strict benchmark mode to
+fail unless `kimetsu_benchmark_context` retrieves at least one exact-slug
+episodic memory or generalized semantic/anti-pattern benchmark memory.
+
+Useful overrides:
+
+```bash
+TASK_LIMIT=1 N_CONCURRENT=1 JOB_NAME=codex-kimetsu-smoke KIMETSU_MCP_MODE=required \
+  bash /mnt/e/Kimetsu/kimetsu_harbor/run-codex-kimetsu-bench.sh
+```
+
+The static container binary build uses the Rust `x86_64-unknown-linux-musl`
+target. If WSL does not already have the musl C toolchain, install it once with
+`apt-get update && apt-get install -y musl-tools`, or set
+`KIMETSU_CONTAINER_BINARY_BUILD=0` only after building the binary yourself.
+
+Preflight only, with no model call:
+
+```powershell
+.\kimetsu_harbor\run-codex-kimetsu-wsl.ps1 -Preflight
+```
+
+Required-mode one-task smoke from PowerShell:
+
+```powershell
+.\kimetsu_harbor\run-codex-kimetsu-wsl.ps1 -TaskLimit 1 -Concurrency 1 -KimetsuMode required -JobName codex-kimetsu-required-smoke
+```
+
+Set `KIMETSU_MOUNT_READ_ONLY=0` only if the benchmark intentionally needs
+Codex to call Kimetsu bridge tools that write to the mounted Kimetsu workspace.
+
 ## Adapter status
 
 `kimetsu-harbor-agent` owns the benchmark-only JSON-RPC entry point.
@@ -162,3 +284,8 @@ contract changes, update `_normalize_exec_result` and the smoke test's
 - **`environment object has no exec`**: You're driving the adapter with
   something that doesn't quack like Harbor's environment. The smoke
   test demonstrates the minimum surface area.
+- **`GLIBC_2.39 not found` from `kimetsu-brain-context.sh`**: The helper is
+  running the host glibc binary inside an older Terminal-Bench container. Re-run
+  the benchmark wrapper so it builds
+  `target/x86_64-unknown-linux-musl/release/kimetsu`, then confirm preflight
+  lists `kimetsu_brain_context`.

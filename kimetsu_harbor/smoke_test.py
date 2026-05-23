@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import platform
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -41,13 +42,21 @@ class FakeEnvironment:
         self.calls.append(cmd)
         # We don't actually need to run the command for the stub agent
         # (it only sends one echo), but doing so proves the round-trip.
-        completed = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-        )
+        if platform.system() == "Windows":
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+            )
+        else:
+            completed = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+            )
         return {
             "exit_code": completed.returncode,
             "stdout": completed.stdout,

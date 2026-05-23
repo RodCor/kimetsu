@@ -164,6 +164,23 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+pub fn validate(conn: &Connection) -> KimetsuResult<()> {
+    let schema_version: i64 = conn.query_row(
+        "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if schema_version != KIMETSU_SCHEMA_VERSION {
+        return Err(format!(
+            "brain.db schema version {schema_version} does not match expected {KIMETSU_SCHEMA_VERSION}; run `kimetsu brain rebuild`"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 fn add_column_if_missing(conn: &Connection, table: &str, column_def: &str) -> KimetsuResult<()> {
     let column_name = column_def
         .split_whitespace()

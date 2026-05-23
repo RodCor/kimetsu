@@ -1,0 +1,13 @@
+Benchmark started: 2026-05-22T13:05:42.8478932-03:00
+TaskLimit=16 Concurrency=2 Model=gpt-5.5 CodexVersion=0.128.0
+
+=== required warm_policy=full_warm codex-16x3-warm2-required-20260522-130542 start 2026-05-22T13:05:42.8592753-03:00 ===
+=== required exit=0 end 2026-05-22T14:36:17.0755768-03:00 log=E:\Kimetsu\kimetsu_harbor\benchmark-logs\codex-16x3-warm2-20260522-130542\required.log ===
+
+=== optional warm_policy=reactive_warm codex-16x3-warm2-optional-20260522-130542 start 2026-05-22T14:36:17.0775750-03:00 ===
+=== optional exit=0 end 2026-05-22T15:56:15.7555031-03:00 log=E:\Kimetsu\kimetsu_harbor\benchmark-logs\codex-16x3-warm2-20260522-130542\optional.log ===
+
+=== none warm_policy=cold_brain codex-16x3-warm2-none-20260522-130542 start 2026-05-22T15:56:15.7580084-03:00 ===
+=== none exit=0 end 2026-05-22T17:21:58.4123932-03:00 log=E:\Kimetsu\kimetsu_harbor\benchmark-logs\codex-16x3-warm2-20260522-130542\none.log ===
+Benchmark finished: 2026-05-22T17:21:58.4164091-03:00
+Logs: E:\Kimetsu\kimetsu_harbor\benchmark-logs\codex-16x3-warm2-20260522-130542

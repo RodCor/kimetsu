@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Interactive REPL transport for kimetsu.
 //!
 //! v0.3 — `kimetsu chat`: turn the agent runtime that's been validated
@@ -29,7 +31,7 @@ pub mod skills;
 pub mod ui;
 
 pub use bridge::{
-    BridgeTarget, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
+    BridgeTarget, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
     plugin_install,
 };
 pub use commands::SlashCommand;

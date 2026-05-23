@@ -7,7 +7,7 @@ use clap::Parser;
 use kimetsu_agent::claude_code::ClaudeCodeProvider;
 use kimetsu_agent::harness::{KimetsuAgentOpts, run_model_agent};
 use kimetsu_agent::tools::{ShellExecutor, ToolRuntime, ToolRuntimeConfig};
-use kimetsu_brain::project;
+use kimetsu_brain::{benchmark, project};
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::ids::RunId;
@@ -144,36 +144,57 @@ fn resolve_brain_context(cli_path: Option<&Path>, task: &str) -> KimetsuResult<O
         return Ok(None);
     }
 
-    let bundle = project::retrieve_context(&project_dir, "harbor", task, 2000).map_err(|err| {
+    let dataset = std::env::var("KIMETSU_HARBOR_DATASET")
+        .or_else(|_| std::env::var("HARBOR_DATASET"))
+        .unwrap_or_else(|_| benchmark::DEFAULT_BENCHMARK_DATASET.to_string());
+    let task_slug = std::env::var("KIMETSU_BENCHMARK_TASK_SLUG").ok();
+    let warm_policy = std::env::var("KIMETSU_BRAIN_WARM_POLICY")
+        .or_else(|_| std::env::var("KIMETSU_BENCHMARK_WARM_POLICY"))
+        .ok()
+        .as_deref()
+        .and_then(benchmark::BenchmarkWarmPolicy::parse)
+        .unwrap_or(benchmark::BenchmarkWarmPolicy::FullWarm);
+    let require_benchmark_memory = env_bool("KIMETSU_REQUIRE_BENCHMARK_MEMORY");
+    let brain_context = project::retrieve_benchmark_context_readonly(
+        &project_dir,
+        task,
+        &dataset,
+        task_slug.as_deref(),
+        warm_policy,
+        "harbor",
+        2500,
+        require_benchmark_memory,
+        8,
+    )
+    .map_err(|err| {
         format!(
-            "failed to retrieve broker context from {}: {err}",
+            "failed to retrieve benchmark brain context from {}: {err}",
             project_dir.display()
         )
     })?;
 
-    if bundle.capsules.is_empty() {
-        return Ok(Some(
-            "(no broker capsules retrieved: project has no memories or no relevance hit)"
-                .to_string(),
-        ));
+    if require_benchmark_memory && !brain_context.required_ok {
+        return Err(format!(
+            "benchmark brain context for {} did not include a task-specific benchmark memory",
+            brain_context
+                .task_slug
+                .as_deref()
+                .unwrap_or("<unknown-task>")
+        )
+        .into());
     }
 
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Retrieved {} capsule(s) within a {}-token budget ({} tokens used):\n",
-        bundle.capsules.len(),
-        bundle.budget_tokens,
-        bundle.used_tokens,
-    ));
-    for (i, c) in bundle.capsules.iter().enumerate() {
-        out.push_str(&format!(
-            "[{idx}] {kind} (score {score:.2}, scope_weight {sw:.2})\n  {summary}\n",
-            idx = i + 1,
-            kind = c.kind,
-            score = c.score,
-            sw = c.scope_weight,
-            summary = c.summary,
-        ));
-    }
-    Ok(Some(out))
+    Ok(Some(brain_context.playbook_markdown))
+}
+
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
