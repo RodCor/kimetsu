@@ -814,6 +814,7 @@ pub fn retrieve_context_readonly(
     BrainSession::open_readonly(start)?.retrieve_context(stage, query, budget_tokens)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn retrieve_benchmark_context_readonly(
     start: &Path,
     task: &str,
@@ -825,10 +826,46 @@ pub fn retrieve_benchmark_context_readonly(
     require_benchmark_memory: bool,
     max_capsules: usize,
 ) -> KimetsuResult<benchmark::BenchmarkBrainContext> {
+    retrieve_benchmark_context_readonly_with_ambient(
+        start,
+        task,
+        dataset,
+        task_slug,
+        warm_policy,
+        stage,
+        budget_tokens,
+        require_benchmark_memory,
+        max_capsules,
+        None,
+    )
+}
+
+/// v0.4.4: variant that appends an optional ambient-context suffix to
+/// the canonical benchmark query AFTER slug detection. Used by the
+/// MCP `kimetsu_benchmark_context` tool so the workspace fingerprint
+/// (git branch, dirty files, recent edits) contributes to retrieval
+/// without corrupting the slug parser.
+#[allow(clippy::too_many_arguments)]
+pub fn retrieve_benchmark_context_readonly_with_ambient(
+    start: &Path,
+    task: &str,
+    dataset: &str,
+    task_slug: Option<&str>,
+    warm_policy: benchmark::BenchmarkWarmPolicy,
+    stage: &str,
+    budget_tokens: u32,
+    require_benchmark_memory: bool,
+    max_capsules: usize,
+    ambient_suffix: Option<&str>,
+) -> KimetsuResult<benchmark::BenchmarkBrainContext> {
     let normalized_slug = task_slug
         .and_then(benchmark::normalize_task_slug)
         .or_else(|| benchmark::normalize_task_slug(task));
-    let query = benchmark::benchmark_query(task, dataset, normalized_slug.as_deref(), warm_policy);
+    let mut query =
+        benchmark::benchmark_query(task, dataset, normalized_slug.as_deref(), warm_policy);
+    if let Some(suffix) = ambient_suffix.filter(|s| !s.trim().is_empty()) {
+        query.push_str(suffix);
+    }
     let bundle =
         BrainSession::open_readonly(start)?.retrieve_context(stage, &query, budget_tokens)?;
     Ok(benchmark::build_benchmark_context(

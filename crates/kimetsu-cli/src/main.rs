@@ -286,6 +286,12 @@ struct ContextArgs {
     /// Print machine-readable JSON for hooks and harness wrappers.
     #[arg(long)]
     json: bool,
+    /// v0.4.4: skip the ambient workspace fingerprint (git branch,
+    /// dirty files, recent edits). Default behavior augments the
+    /// query with that suffix so hooks calling with terse queries
+    /// like "continue" or "fix it" still surface useful capsules.
+    #[arg(long)]
+    no_ambient: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -913,10 +919,26 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             Ok(())
         }
         BrainCommand::Context(args) => {
+            let cwd = env::current_dir()?;
+            // v0.4.4: auto-augment with ambient workspace context
+            // (git branch + dirty files + recent edits) unless the
+            // caller opts out via --no-ambient or
+            // `KIMETSU_BRAIN_AMBIENT=off`. The augmentation appends
+            // a short, lexically + semantically retrievable suffix
+            // to the query before retrieval — see
+            // `kimetsu_brain::ambient::augment_query`.
+            let (effective_query, ambient_payload) =
+                if !args.no_ambient && kimetsu_brain::ambient::ambient_enabled() {
+                    let ctx = kimetsu_brain::ambient::collect(&cwd);
+                    let augmented = kimetsu_brain::ambient::augment_query(&args.query, &ctx);
+                    (augmented, Some(ctx))
+                } else {
+                    (args.query.clone(), None)
+                };
             let bundle = project::retrieve_context(
-                &env::current_dir()?,
+                &cwd,
                 &args.stage,
-                &args.query,
+                &effective_query,
                 args.budget_tokens,
             )?;
             if args.json {
@@ -926,6 +948,8 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
                         "ok": true,
                         "stage": bundle.stage,
                         "query": args.query,
+                        "augmented_query": effective_query,
+                        "ambient": ambient_payload,
                         "budget_tokens": bundle.budget_tokens,
                         "used_tokens": bundle.used_tokens,
                         "capsule_count": bundle.capsules.len(),

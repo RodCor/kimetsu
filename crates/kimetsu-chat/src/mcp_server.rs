@@ -425,7 +425,17 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         .unwrap_or("localization");
     let budget_tokens = u32_arg(arguments, "budget_tokens", 6000, 500, 30000);
 
-    match project::retrieve_context_readonly(workspace, stage, query, budget_tokens) {
+    // v0.4.4: auto-collect ambient workspace context (git branch,
+    // dirty files, recent edits) and append a short retrieval
+    // suffix to the query. Callers can disable per-call by passing
+    // `include_ambient: false`, OR globally via
+    // `KIMETSU_BRAIN_AMBIENT=off`. The full ambient block is
+    // surfaced in the response so the model knows what augmented
+    // its retrieval.
+    let (effective_query, ambient_payload) =
+        augment_with_ambient(workspace, query, arguments, "include_ambient");
+
+    match project::retrieve_context_readonly(workspace, stage, &effective_query, budget_tokens) {
         Ok(bundle) => json!({
             "ok": true,
             "usage": {
@@ -439,6 +449,8 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             },
             "stage": bundle.stage,
             "query": query,
+            "augmented_query": effective_query,
+            "ambient": ambient_payload,
             "budget_tokens": bundle.budget_tokens,
             "used_tokens": bundle.used_tokens,
             "capsule_count": bundle.capsules.len(),
@@ -448,6 +460,28 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         }),
         Err(err) => brain_unavailable_json(workspace, &err.to_string()),
     }
+}
+
+/// v0.4.4: shared ambient-augmentation helper for the brain + benchmark
+/// MCP tools.
+///
+/// Returns `(effective_query, ambient_payload)`. The payload is JSON
+/// (or `null` when ambient is disabled either per-call or globally),
+/// safe to embed directly into the response.
+fn augment_with_ambient(
+    workspace: &Path,
+    query: &str,
+    arguments: &Value,
+    arg_key: &str,
+) -> (String, Value) {
+    let include = bool_arg(arguments, arg_key, true);
+    if !include || !kimetsu_brain::ambient::ambient_enabled() {
+        return (query.to_string(), json!(null));
+    }
+    let ctx = kimetsu_brain::ambient::collect(workspace);
+    let augmented = kimetsu_brain::ambient::augment_query(query, &ctx);
+    let payload = serde_json::to_value(&ctx).unwrap_or(json!(null));
+    (augmented, payload)
 }
 
 fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
@@ -483,7 +517,22 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     let max_capsules = u32_arg(arguments, "max_capsules", 8, 1, 20) as usize;
     let require_benchmark_memory = bool_arg(arguments, "require_benchmark_memory", false);
 
-    match project::retrieve_benchmark_context_readonly(
+    // v0.4.4: collect ambient context and pass its rendered suffix
+    // into the brain so it appends AFTER slug detection (otherwise
+    // the suffix would confuse `normalize_task_slug`). The full
+    // ambient block is also surfaced in the response payload.
+    let include_ambient = bool_arg(arguments, "include_ambient", true);
+    let ambient_ctx = if include_ambient && kimetsu_brain::ambient::ambient_enabled() {
+        Some(kimetsu_brain::ambient::collect(workspace))
+    } else {
+        None
+    };
+    let ambient_suffix = ambient_ctx
+        .as_ref()
+        .map(kimetsu_brain::ambient::render_as_query_suffix)
+        .filter(|s| !s.is_empty());
+
+    match project::retrieve_benchmark_context_readonly_with_ambient(
         workspace,
         task,
         &dataset,
@@ -493,6 +542,7 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
         budget_tokens,
         require_benchmark_memory,
         max_capsules,
+        ambient_suffix.as_deref(),
     ) {
         Ok(context) => {
             let ok = context.required_ok;
@@ -514,6 +564,7 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
                 "task_slug": context.task_slug,
                 "warm_policy": context.warm_policy.as_str(),
                 "query": context.query,
+                "ambient": ambient_ctx,
                 "stage": context.stage,
                 "budget_tokens": context.budget_tokens,
                 "used_tokens": context.used_tokens,
