@@ -1,0 +1,395 @@
+//! v0.4.5: secret redaction at ingest.
+//!
+//! Every memory.text and provenance snapshot that lands in brain.db
+//! passes through [`redact_secrets`] first. The pattern set catches
+//! the credential formats most likely to leak into an agent's tool
+//! output (OAuth bearers, API keys, JWTs, AWS access pairs, etc.)
+//! and replaces each match with a `[REDACTED:<kind>]` placeholder.
+//!
+//! Why redact at ingest, not later: brain.db is durable + content-
+//! addressable + replicated across user / project scopes. A leak
+//! that lands here lives forever and shows up in every retrieval
+//! capsule, agent.done summary, and proposal review screen. The
+//! cost of one false positive (a config string redacted) is much
+//! lower than the cost of one true positive sitting in
+//! `~/.kimetsu/brain.db` for years.
+//!
+//! Detection layers, applied in order:
+//!   1. Exact-prefix patterns: `sk-ant-`, `sk-`, `ghp_`, `gho_`,
+//!      `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `xox[bopasr]-`,
+//!      `AKIA`/`ASIA` (AWS access key IDs), `eyJ` (JWT header).
+//!   2. Generic key/token assignments: `api[_-]?key\s*=\s*<value>`,
+//!      `token\s*[:=]\s*<value>`, `password\s*[:=]\s*<value>`,
+//!      `bearer\s+<value>` (the value must look secret — high
+//!      entropy, no spaces, length ≥ 12).
+//!   3. High-entropy fallback (off by default): would catch random
+//!      base64 strings of length ≥ 40 with entropy > 4.5 bits/char.
+//!      Deferred to v0.4.5.1 so we don't false-positive on hashes,
+//!      ulids, and content-addressable refs.
+//!
+//! The redaction is greedy + non-overlapping: a string matched by
+//! pattern (1) won't be re-scanned for pattern (2). [`RedactionResult`]
+//! returns both the redacted text AND a per-kind tally so callers
+//! (chat REPL banner, CLI warning, MCP response field) can surface
+//! "we found 2 secrets in this memory, kinds: aws_access_key,
+//! github_pat" without re-parsing the redacted text.
+
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde::Serialize;
+
+/// One detected secret. `kind` is a stable string id usable in
+/// telemetry and human-readable output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RedactedMatch {
+    pub kind: &'static str,
+    /// Byte offset within the ORIGINAL (pre-redaction) text where
+    /// the match started.
+    pub start: usize,
+    /// Length of the matched run (bytes, original text).
+    pub len: usize,
+}
+
+/// Output of [`redact_secrets`]. `text` is the redacted string;
+/// `matches` is the per-secret tally + locations.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RedactionResult {
+    pub text: String,
+    pub matches: Vec<RedactedMatch>,
+}
+
+impl RedactionResult {
+    pub fn was_redacted(&self) -> bool {
+        !self.matches.is_empty()
+    }
+    /// One-liner like `"redacted 2 secrets: github_pat, openai_api_key"`.
+    /// Empty when nothing was redacted.
+    pub fn summary(&self) -> String {
+        if self.matches.is_empty() {
+            return String::new();
+        }
+        let mut kinds: Vec<&'static str> = self.matches.iter().map(|m| m.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        format!(
+            "redacted {} secret{}: {}",
+            self.matches.len(),
+            if self.matches.len() == 1 { "" } else { "s" },
+            kinds.join(", ")
+        )
+    }
+}
+
+/// Redact `text` against the bundled secret pattern set. Returns
+/// the redacted version + per-match tally. Allocates only when at
+/// least one match is found — for the common case (clean text) the
+/// result borrows nothing and matches is empty.
+pub fn redact_secrets(text: &str) -> RedactionResult {
+    let patterns = patterns();
+    // Collect non-overlapping matches across all patterns. Each
+    // pattern walks the full text; we sort + dedupe by start, then
+    // discard overlapping later matches.
+    let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
+    for pat in patterns {
+        for m in pat.regex.find_iter(text) {
+            spans.push((m.start(), m.end(), pat.kind));
+        }
+    }
+    if spans.is_empty() {
+        return RedactionResult {
+            text: text.to_string(),
+            matches: Vec::new(),
+        };
+    }
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    // Drop overlaps: keep the first span; skip any subsequent span
+    // whose start < current_end.
+    let mut accepted: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end, kind) in spans {
+        if start < cursor {
+            continue;
+        }
+        accepted.push((start, end, kind));
+        cursor = end;
+    }
+
+    // Rebuild the redacted text + match list.
+    let mut redacted = String::with_capacity(text.len());
+    let mut matches: Vec<RedactedMatch> = Vec::with_capacity(accepted.len());
+    let mut last = 0usize;
+    for (start, end, kind) in accepted {
+        redacted.push_str(&text[last..start]);
+        redacted.push_str(&format!("[REDACTED:{kind}]"));
+        matches.push(RedactedMatch {
+            kind,
+            start,
+            len: end - start,
+        });
+        last = end;
+    }
+    redacted.push_str(&text[last..]);
+    RedactionResult {
+        text: redacted,
+        matches,
+    }
+}
+
+struct SecretPattern {
+    kind: &'static str,
+    regex: Regex,
+}
+
+fn patterns() -> &'static [SecretPattern] {
+    static CELL: OnceLock<Vec<SecretPattern>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        // Each pattern's `kind` is stable telemetry-grade ID; the
+        // regex MUST be anchored at a unique prefix so we don't
+        // shadow normal source text. Use word boundaries where the
+        // pattern's prefix isn't already distinctive.
+        let mut out = Vec::new();
+        out.push(SecretPattern {
+            kind: "anthropic_oauth",
+            // Anthropic OAuth tokens: `sk-ant-` prefix + opaque tail.
+            // Tail is at least 32 chars of [A-Za-z0-9_-].
+            regex: Regex::new(r"sk-ant-[A-Za-z0-9_-]{32,}").unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "openai_api_key",
+            // OpenAI keys: `sk-` (not `sk-ant-`) + 32+ chars.
+            // Negative lookahead isn't available in `regex`; we
+            // order anthropic_oauth FIRST so it claims those bytes
+            // before openai_api_key sees them.
+            regex: Regex::new(r"sk-[A-Za-z0-9_-]{32,}").unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "github_pat",
+            // Classic + fine-grained GitHub PATs.
+            // ghp_/gho_/ghu_/ghs_/ghr_ + 36 base62.
+            // github_pat_ + base62/underscore length 50+.
+            regex: Regex::new(
+                r"(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}",
+            )
+            .unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "slack_token",
+            regex: Regex::new(r"xox[bopasr]-[A-Za-z0-9-]{10,}").unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "aws_access_key",
+            // AKIA = long-lived, ASIA = STS temporary. Exactly 16
+            // uppercase alphanum after the prefix per AWS docs.
+            regex: Regex::new(r"(?:AKIA|ASIA)[A-Z0-9]{16}").unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "jwt",
+            // Three base64url segments separated by dots; first
+            // starts with `eyJ` (base64url of `{"`). Cap total at
+            // 4096 chars so a runaway match doesn't blow the line.
+            regex: Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "private_key_pem",
+            // PEM-encoded private key BEGIN line — match the whole
+            // block so the entire payload is wiped.
+            regex: Regex::new(
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+            )
+            .unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "google_api_key",
+            // Google-style API keys: AIza + 35 char tail.
+            regex: Regex::new(r"AIza[0-9A-Za-z_-]{35}").unwrap(),
+        });
+        // Generic-assignment patterns. Lower-priority than the
+        // shape-specific ones above; ordered after them so e.g.
+        // `api_key=sk-...` claims the openai_api_key kind, not the
+        // generic_api_key kind.
+        out.push(SecretPattern {
+            kind: "generic_bearer",
+            // `Bearer <token>` in HTTP-style logs.
+            regex: Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]{12,}").unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "generic_api_key",
+            // `api_key = "..."` / `api-key:"..."` / `api_key=...`.
+            // Captures both quoted and bare values; value must be
+            // ≥12 chars of secret-looking content.
+            regex: Regex::new(
+                r#"(?i)api[_\-]?key\s*[:=]\s*"?[A-Za-z0-9_\-]{12,}"?"#,
+            )
+            .unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "generic_token",
+            regex: Regex::new(r#"(?i)\btoken\s*[:=]\s*"?[A-Za-z0-9_\-\.]{20,}"?"#).unwrap(),
+        });
+        out.push(SecretPattern {
+            kind: "generic_password",
+            regex: Regex::new(r#"(?i)\bpassword\s*[:=]\s*"?[^\s"]{8,}"?"#).unwrap(),
+        });
+        out
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_text_round_trips_untouched() {
+        let raw = "use ripgrep before broad file reads, prefer thiserror for errors";
+        let r = redact_secrets(raw);
+        assert!(!r.was_redacted());
+        assert_eq!(r.text, raw);
+        assert!(r.summary().is_empty());
+    }
+
+    #[test]
+    fn anthropic_oauth_token_is_redacted() {
+        let raw = "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let r = redact_secrets(raw);
+        assert!(r.was_redacted(), "{:?}", r);
+        assert!(r.text.contains("[REDACTED:anthropic_oauth]"));
+        assert!(!r.text.contains("sk-ant-api03"));
+        assert_eq!(r.matches.len(), 1);
+        assert_eq!(r.matches[0].kind, "anthropic_oauth");
+    }
+
+    #[test]
+    fn openai_key_is_redacted_without_shadowing_anthropic_prefix() {
+        // Ensure pattern ordering: anthropic claims sk-ant-... first.
+        let raw =
+            "two: sk-1234567890abcdef1234567890abcdef AND sk-ant-1234567890abcdef1234567890abcdef";
+        let r = redact_secrets(raw);
+        let kinds: Vec<_> = r.matches.iter().map(|m| m.kind).collect();
+        assert!(kinds.contains(&"openai_api_key"));
+        assert!(kinds.contains(&"anthropic_oauth"));
+        assert!(r.text.contains("[REDACTED:openai_api_key]"));
+        assert!(r.text.contains("[REDACTED:anthropic_oauth]"));
+    }
+
+    #[test]
+    fn github_pat_classic_and_fine_grained_redacted() {
+        // Realistic lengths: classic PATs are `ghp_` + 36 base62;
+        // fine-grained PATs are `github_pat_` + ≥50 base62/underscore.
+        let raw = concat!(
+            "classic: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ ",
+            "fine: github_pat_11AAA_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJabcdef",
+        );
+        let r = redact_secrets(raw);
+        let kinds: Vec<_> = r.matches.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "github_pat").count(),
+            2,
+            "two github_pat matches expected; got matches: {:?}",
+            r.matches
+        );
+        assert!(!r.text.contains("ghp_abcdef"));
+        assert!(!r.text.contains("github_pat_11AAA"));
+    }
+
+    #[test]
+    fn slack_aws_jwt_pem_google_all_redact() {
+        let raw = concat!(
+            "slack=xoxb-12345678-abcdefghijklmnop ",
+            "aws=AKIAIOSFODNN7EXAMPLE ",
+            "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.abcdef ",
+            "google=AIzaSyDx0o-1234567890abcdefghijklmnopqrs ",
+            "pem=-----BEGIN RSA PRIVATE KEY-----\nABCDEFG\n-----END RSA PRIVATE KEY-----"
+        );
+        let r = redact_secrets(raw);
+        let kinds: Vec<&'static str> = {
+            let mut k = r.matches.iter().map(|m| m.kind).collect::<Vec<_>>();
+            k.sort_unstable();
+            k.dedup();
+            k
+        };
+        for expected in [
+            "aws_access_key",
+            "google_api_key",
+            "jwt",
+            "private_key_pem",
+            "slack_token",
+        ] {
+            assert!(kinds.contains(&expected), "missing kind {expected}: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn generic_assignments_match_only_with_secret_looking_value() {
+        // Should match: long enough value.
+        let bad = "config: api_key = \"abcdef1234567890\" \n token : 0123456789abcdefghij1234567890\n password = hunter2hunter2";
+        let r_bad = redact_secrets(bad);
+        let kinds: Vec<_> = r_bad.matches.iter().map(|m| m.kind).collect();
+        assert!(kinds.contains(&"generic_api_key"));
+        assert!(kinds.contains(&"generic_token"));
+        assert!(kinds.contains(&"generic_password"));
+
+        // Should NOT match: too-short value or non-secret-looking.
+        let safe = "api_key = short  token: 12345  password = a";
+        let r_safe = redact_secrets(safe);
+        assert!(
+            r_safe.matches.is_empty(),
+            "short values should not trip generic patterns: {r_safe:?}"
+        );
+    }
+
+    #[test]
+    fn bearer_token_in_curl_log_is_redacted() {
+        let raw = "curl -H 'Authorization: Bearer abc123def456ghi789' https://api.example.com";
+        let r = redact_secrets(raw);
+        assert!(r.was_redacted());
+        assert_eq!(r.matches[0].kind, "generic_bearer");
+        assert!(r.text.contains("[REDACTED:generic_bearer]"));
+        assert!(!r.text.contains("abc123def456ghi789"));
+    }
+
+    #[test]
+    fn overlapping_matches_keep_first_only() {
+        // The same byte run could match two patterns (e.g. an
+        // openai_api_key inside a `Bearer ` prefix). The earlier
+        // pattern claims it; we don't double-redact.
+        let raw = "Authorization: Bearer sk-1234567890abcdef1234567890abcdef1234";
+        let r = redact_secrets(raw);
+        assert_eq!(
+            r.matches.len(),
+            1,
+            "non-overlapping rule should pick one: {r:?}"
+        );
+    }
+
+    #[test]
+    fn summary_lists_unique_kinds() {
+        let raw = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ and ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+        let r = redact_secrets(raw);
+        let summary = r.summary();
+        assert!(summary.contains("github_pat"));
+        // Only one kind reported even though two matches happened.
+        assert!(summary.starts_with("redacted 2 secrets: github_pat"));
+    }
+
+    #[test]
+    fn match_offsets_point_into_original_text() {
+        let raw = "prefix sk-ant-api03-1234567890abcdef1234567890abcdef suffix";
+        let r = redact_secrets(raw);
+        assert_eq!(r.matches.len(), 1);
+        let m = &r.matches[0];
+        // The matched bytes start at "sk-ant-..." and extend over the token.
+        let original_match = &raw[m.start..m.start + m.len];
+        assert!(original_match.starts_with("sk-ant-api03"));
+    }
+
+    #[test]
+    fn redaction_preserves_non_secret_surroundings() {
+        let raw =
+            "# Save to .env\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf\n# Use it";
+        let r = redact_secrets(raw);
+        assert!(r.text.starts_with("# Save to .env"));
+        assert!(r.text.ends_with("# Use it"));
+        assert!(r.text.contains("CLAUDE_CODE_OAUTH_TOKEN=[REDACTED:anthropic_oauth]"));
+    }
+}

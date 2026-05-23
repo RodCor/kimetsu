@@ -41,6 +41,7 @@ use ulid::Ulid;
 
 use crate::embeddings;
 use crate::project::MemoryRow;
+use crate::redact;
 use crate::schema;
 
 /// Open (and create if missing) the user-scope brain.db. Returns
@@ -103,6 +104,19 @@ pub fn add_user_memory(
     text: &str,
     confidence: f32,
 ) -> KimetsuResult<String> {
+    // v0.4.5: defense-in-depth redaction for external callers who
+    // bypass `project::add_memory` and write to the user brain
+    // directly. Redacting twice is idempotent — `[REDACTED:foo]`
+    // doesn't match any pattern — so doubling-up with
+    // `add_memory`'s upstream call is safe + cheap.
+    let redaction = redact::redact_secrets(text);
+    if redaction.was_redacted() {
+        eprintln!(
+            "kimetsu-brain (user): {}",
+            redaction.summary()
+        );
+    }
+    let text = redaction.text.as_str();
     let normalized = normalize_memory_text(text);
     // Same dedup rule as project add_memory: active row with same
     // (scope, kind, normalized_text) collapses.

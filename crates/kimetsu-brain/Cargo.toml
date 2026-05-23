@@ -24,6 +24,10 @@ blake3.workspace = true
 fastembed = { version = "5", optional = true }
 ignore.workspace = true
 kimetsu-core = { path = "../kimetsu-core" }
+# v0.4.5: regex backs the secret-redaction patterns in
+# `kimetsu_brain::redact`. The crate is already a workspace pin
+# elsewhere; we just opt this crate into it now.
+regex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

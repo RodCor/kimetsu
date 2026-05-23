@@ -6,6 +6,7 @@ pub mod ingest;
 pub mod lock;
 pub mod project;
 pub mod projector;
+pub mod redact;
 pub mod reindex;
 pub mod schema;
 pub mod trace;

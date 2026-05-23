@@ -17,6 +17,7 @@ use crate::embeddings;
 use crate::ingest::{self, RepoIngestSummary};
 use crate::lock::ProjectLock;
 use crate::projector;
+use crate::redact;
 use crate::schema;
 use crate::trace::{self, TraceWriter};
 use crate::user_brain;
@@ -323,6 +324,24 @@ pub fn add_memory(
     kind: MemoryKind,
     text: &str,
 ) -> KimetsuResult<String> {
+    // v0.4.5: redact secrets at the ingest boundary. The redaction
+    // pipeline catches Anthropic/OpenAI/GitHub/AWS/Slack/Google
+    // credentials, JWTs, PEM blocks, and generic `api_key=...` /
+    // `bearer ...` / `token: ...` assignments. A leak that lands in
+    // brain.db is durable, replicated across user / project scopes,
+    // and shows up in every retrieval — better to false-positive on
+    // a config string than to leak a real key.
+    //
+    // On a hit we replace the bytes with `[REDACTED:<kind>]` and
+    // print a one-liner to stderr so the operator notices. We do
+    // NOT fail the write: keeping the user memorable (the rest of
+    // the text) is more useful than rejecting outright.
+    let redaction = redact::redact_secrets(text);
+    if redaction.was_redacted() {
+        eprintln!("kimetsu-brain: {}", redaction.summary());
+    }
+    let text = redaction.text.as_str();
+
     // v0.4.1: GlobalUser memories route to `~/.kimetsu/brain.db` when
     // the user brain is enabled. The user-brain write path is
     // intentionally simpler (no run rows, no trace events, no project
@@ -918,13 +937,26 @@ fn propose_benchmark_memory(
     let _lock = ProjectLock::acquire(&paths, "benchmark memory proposal", Some(run_id))?;
     let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let proposal_id = Ulid::new().to_string();
-    let text = benchmark::proposal_memory_text(outcome, proposal);
+    // v0.4.5: redact secrets in the proposal text + rationale before
+    // they hit the trace + memory_proposals table. Benchmark outcomes
+    // pull from tool output, which is exactly where a model-leaked
+    // token would surface.
+    let raw_text = benchmark::proposal_memory_text(outcome, proposal);
+    let text_redaction = redact::redact_secrets(&raw_text);
+    if text_redaction.was_redacted() {
+        eprintln!(
+            "kimetsu-brain (benchmark proposal): {}",
+            text_redaction.summary()
+        );
+    }
+    let text = text_redaction.text;
     let kind = benchmark::proposal_memory_kind(proposal);
-    let rationale = if proposal.rationale.trim().is_empty() {
+    let rationale_raw = if proposal.rationale.trim().is_empty() {
         "generalized from benchmark outcome".to_string()
     } else {
         proposal.rationale.trim().to_string()
     };
+    let rationale = redact::redact_secrets(&rationale_raw).text;
 
     let started = admin_started_event(&paths, &config, run_id, "benchmark memory proposal")?;
     writer.append(&started, true)?;
@@ -1244,6 +1276,51 @@ mod tests {
             );
 
             fs::remove_dir_all(root).expect("remove temp project");
+        });
+    }
+
+    /// v0.4.5 end-to-end: secrets in `add_memory` text never reach
+    /// brain.db. The redacted row keeps the surrounding context so
+    /// the memory is still useful — only the credential is scrubbed.
+    #[test]
+    fn add_memory_redacts_secrets_before_persist() {
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let raw = "Add CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf to .env";
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Command,
+                raw,
+            )
+            .expect("add memory");
+
+            let memories = list_memories(&root).expect("list");
+            let stored = memories
+                .iter()
+                .find(|m| m.memory_id == memory_id)
+                .expect("memory present");
+            assert!(
+                !stored.text.contains("sk-ant-api03"),
+                "raw secret must NOT survive to brain.db: {}",
+                stored.text
+            );
+            assert!(
+                stored.text.contains("[REDACTED:anthropic_oauth]"),
+                "placeholder must be present: {}",
+                stored.text
+            );
+            assert!(
+                stored.text.contains("CLAUDE_CODE_OAUTH_TOKEN")
+                    && stored.text.contains(".env"),
+                "non-secret context must be preserved: {}",
+                stored.text
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
         });
     }
 
