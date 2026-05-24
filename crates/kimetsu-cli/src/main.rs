@@ -338,6 +338,20 @@ enum MemoryCommand {
     /// MP-6: bulk-invalidate memories whose outcome attribution says they
     /// hurt more than they help. Safe-by-default: dry-run unless --apply.
     Prune(PruneArgs),
+    /// v0.5.1: per-run memory attribution. Walks `memory_citations` +
+    /// `context.injected` events to surface which memories the model
+    /// actually leveraged vs which were silent passengers.
+    Blame(BlameArgs),
+}
+
+#[derive(Debug, Args)]
+struct BlameArgs {
+    /// The run id to inspect (a ULID; the kind printed in chat session
+    /// output and trace files).
+    run_id: String,
+    /// Emit JSON for hooks + CI consumers.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1245,6 +1259,7 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
         MemoryCommand::Review(args) => review_proposals(args),
         MemoryCommand::Top(args) => memory_top(args),
         MemoryCommand::Prune(args) => memory_prune(args),
+        MemoryCommand::Blame(args) => memory_blame(args),
     }
 }
 
@@ -1284,6 +1299,64 @@ fn memory_top(args: TopArgs) -> KimetsuResult<()> {
             m.memory_id, m.scope, m.kind, m.use_count, m.usefulness_score, ratio, m.text
         );
     }
+    Ok(())
+}
+
+/// v0.5.1: `kimetsu brain memory blame <run-id>` — print the per-memory
+/// attribution for a single run. Cited memories show the model's
+/// rationale + turn; silent passengers show that they were retrieved but
+/// never reached for. `--json` emits the full BlameReport for CI / hooks.
+fn memory_blame(args: BlameArgs) -> KimetsuResult<()> {
+    let cwd = env::current_dir()?;
+    let report = project::blame_run(&cwd, args.run_id.trim())?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!("[blame] run {}", report.run_id);
+    print!("[blame] outcome: {}", report.outcome);
+    if let Some(cat) = report.failure_category.as_deref() {
+        print!(" (category: {cat})");
+    }
+    println!();
+
+    if report.cited.is_empty() && report.silent_passengers.is_empty() {
+        println!(
+            "[blame] no memories were retrieved or cited for this run. \
+             Either the run pre-dates v0.5.1, the brain was off \
+             (`--project` unset), or no `context.injected` events fired."
+        );
+        return Ok(());
+    }
+
+    if !report.cited.is_empty() {
+        println!("\n  cited memories ({} total) — earned strong ±1.0 signal:", report.cited.len());
+        for c in &report.cited {
+            let rationale = c
+                .rationale
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!("  // {s}"))
+                .unwrap_or_default();
+            println!(
+                "    {} [{}:{}] turn={}{}",
+                c.memory_id, c.scope, c.kind, c.turn, rationale
+            );
+            println!("      {}", c.text_preview);
+        }
+    }
+
+    if !report.silent_passengers.is_empty() {
+        println!(
+            "\n  silent passengers ({} total) — earned weak ±0.1 signal (model didn't cite):",
+            report.silent_passengers.len()
+        );
+        for s in &report.silent_passengers {
+            println!("    {} [{}:{}]", s.memory_id, s.scope, s.kind);
+            println!("      {}", s.text_preview);
+        }
+    }
+    println!();
     Ok(())
 }
 

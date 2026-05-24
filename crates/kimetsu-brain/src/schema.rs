@@ -156,6 +156,40 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             ON memories (invalidated_at, created_at);
         ",
     )?;
+    // v0.5.1: per-run, per-turn memory citation log.
+    //
+    // The model emits a `memory.cited` event (via the `cite_memory`
+    // tool) when it consciously leveraged a retrieved capsule. The
+    // projector mirrors each event into this table so the
+    // `kimetsu brain memory blame <run-id>` CLI + MCP tool can
+    // walk attribution without re-scanning the `events` table.
+    //
+    // Multiple citations per turn are allowed (a turn can use
+    // several memories). The PK includes `turn` so re-cites of the
+    // same memory across turns don't collide.
+    //
+    // Usefulness scoring upgrade (v0.5.1 sibling change in
+    // `projector::apply_run_finished` / `apply_run_failed`): cited
+    // memories get the full +/-1 delta; retrieved-but-not-cited
+    // memories get a weaker +/-0.1 — the strong signal goes to
+    // memories the model actually reasoned with, the weak signal
+    // stays for the silent passengers.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_citations (
+            run_id     TEXT NOT NULL,
+            memory_id  TEXT NOT NULL,
+            turn       INTEGER NOT NULL,
+            cited_at   TEXT NOT NULL,
+            rationale  TEXT,
+            PRIMARY KEY (run_id, memory_id, turn)
+        );
+        CREATE INDEX IF NOT EXISTS idx_citations_run
+            ON memory_citations (run_id);
+        CREATE INDEX IF NOT EXISTS idx_citations_memory
+            ON memory_citations (memory_id);
+        ",
+    )?;
     ensure_memories_fts_shape(conn)?;
     ensure_repo_manifests_fts_shape(conn)?;
 

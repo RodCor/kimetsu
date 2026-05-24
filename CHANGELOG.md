@@ -6,6 +6,106 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.5.0 — the brain learns from outcomes: citations + blame
+
+v0.5's north star: make the brain *get smarter over time* from
+real run data. v0.5.0 ships the foundation — per-memory
+attribution — that v0.5.1 (decay) and v0.5.2 (conflict detection)
+build on. See `docs/V0.5-PLAN.md` for the full arc.
+
+PROBLEM
+  Until v0.4.x the brain's usefulness signal was per-run, all-or-
+  nothing: every memory in a run's `context.injected` event got
+  +1 on `run.finished` or -1 on `run.failed`. A run that
+  succeeded thanks to 1 of 10 retrieved memories rewarded all
+  10 equally. Noise compounded over time — retrieved-and-ignored
+  memories accumulated the same usefulness score as
+  retrieved-and-pivotal ones.
+
+WHAT v0.5.0 ADDS
+  * New tool `cite_memory(memory_id, rationale?)`. The model
+    calls it during a turn when it consciously leveraged a
+    retrieved capsule. Best-effort metadata — forgetting to cite
+    doesn't fail the turn. Multiple citations per turn are fine.
+  * New `memory.cited` event kind. The agent loop accumulates
+    `cite_memory` calls into `recorded_citations` (annotated with
+    the turn index), and the transport surface (chat REPL, harbor
+    binary) emits one `memory.cited` event per citation to the
+    trace at run wrap-up.
+  * New schema: `memory_citations` table linking
+    `(run_id, memory_id, turn)` with `cited_at` + optional
+    `rationale`. Idempotent migration via `CREATE TABLE IF NOT
+    EXISTS`; pre-v0.5.0 brain.db files pick up the table on first
+    open with the new binary.
+  * Projector handler `apply_memory_cited` mirrors each event
+    into the new table.
+  * Usefulness scoring split — cited memories get the strong
+    ±1.0 delta, silent passengers (retrieved-but-not-cited)
+    get the weak ±0.1 delta. Encourages models to actually use
+    `cite_memory` and keeps the strong signal aimed at memories
+    that actually contributed.
+
+USER SURFACE: blame
+  * `kimetsu brain memory blame <run-id> [--json]` CLI:
+    prints cited memories with rationale + turn, then silent
+    passengers with their text previews. JSON output for
+    hooks/CI.
+  * `kimetsu_brain_memory_blame` MCP tool: same backend
+    (`project::blame_run`), JSON-shaped for Claude Code / Codex
+    to consume. Listed in the 16+1 = 17 kimetsu_* tools advertised
+    by `tools/list`.
+
+NEW BRAIN API
+  * `project::blame_run(start, run_id) -> BlameReport` walks
+    `memory_citations` + `context.injected` events + the terminal
+    run event, looks up each memory's text from project + user
+    brains, returns `BlameReport { run_id, outcome,
+    failure_category, cited, silent_passengers }`.
+
+TESTS (3 new in brain, 1 net new since v0.4.11)
+  brain::project::tests::
+    run_finished_increments_usefulness_for_injected_memories
+      Updated: now emits `memory.cited` so the test demonstrates
+      the strong +1.0 signal path.
+    run_failed_decrements_usefulness_unless_gate
+      Updated: same — adds a citation so the failure penalty
+      hits at strong -1.0.
+    run_finished_gives_weak_signal_to_silent_passenger_memories  (NEW)
+      Asserts: retrieved + uncited memory ends up at +0.1, not
+      +1.0, on run.finished.
+    blame_run_separates_cited_from_silent_passengers  (NEW)
+      End-to-end: writes a run with 2 retrieved memories
+      (1 cited, 1 silent), calls blame_run, asserts the cited
+      one appears under `cited` with rationale + turn, the
+      silent one under `silent_passengers`.
+
+VERIFIED
+  cargo test --workspace        227 / 227 passing
+  cargo metadata --no-deps      clean at 0.5.0
+
+UPGRADE NOTES
+  * Pre-v0.5.0 chat / harbor runs continue to work — they just
+    won't emit `memory.cited` events, so all their retrieved
+    memories will be treated as silent passengers (±0.1 each).
+    If you want the old "everything in context gets ±1" behavior
+    back, the rule lives in
+    `kimetsu_brain::projector::apply_memory_usefulness_for_run`.
+  * Existing brain.db files don't need migration beyond opening
+    them with the v0.5.0 binary — the `memory_citations` table
+    is created on first open.
+  * `kimetsu brain memory blame` on a pre-v0.5.0 run will
+    typically show 0 cited + all retrieved as silent passengers
+    (since no `memory.cited` events fired).
+
+NEXT (in flight)
+  * v0.5.1 — decay: usefulness multiplier degrades over time
+    via `last_useful_at` + half-life curve. Memories that helped
+    6 months ago no longer outvote ones that helped yesterday.
+  * v0.5.2 — conflict detection at ingest: new memories whose
+    embedding is close to an existing memory but whose text
+    disagrees get surfaced as proposals instead of silently
+    accepted.
+
 ## v0.4.11 — drop x86_64-apple-darwin from the release matrix
 
 The v0.4.10 release pipeline got stuck because two GitHub Actions

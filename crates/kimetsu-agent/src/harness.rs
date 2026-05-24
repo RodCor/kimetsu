@@ -138,6 +138,7 @@ const FULL_TOOL_NAMES: &[&str] = &[
     "plan",
     "think",
     "record_deviation",
+    "cite_memory",
     "shell_background",
     "shell_status",
     "shell_output",
@@ -354,6 +355,13 @@ pub fn run_model_agent(
     // MP-18: accumulate record_deviation calls across the run. Surfaced in
     // agent.done's context for downstream brain-curation flows.
     let mut recorded_deviations: Vec<Value> = Vec::new();
+    // v0.5.1: per-turn memory citations. Each entry is the raw
+    // `cite_memory` tool input plus the turn it was emitted on.
+    // The transport surface (chat REPL, harbor binary) walks this
+    // list at run wrap-up and emits one `memory.cited` event per
+    // entry into the trace, which the projector turns into rows
+    // in `memory_citations` for the `blame` CLI / MCP tool.
+    let mut recorded_citations: Vec<Value> = Vec::new();
     // MP-17m.2: outer-loop stall heartbeat. Counts consecutive turns
     // since the model last fired a USEFUL tool call. Reset on workspace-
     // touching tool calls (shell/file/git). Pure think/plan turns or
@@ -460,6 +468,17 @@ pub fn run_model_agent(
                     task_plan = Some(call.input.clone());
                 } else if name == "record_deviation" {
                     recorded_deviations.push(call.input.clone());
+                } else if name == "cite_memory" {
+                    // v0.5.1: accumulate citations with the turn
+                    // index — the transport surface emits each
+                    // as a `memory.cited` event after the loop
+                    // exits so the brain projector can attribute
+                    // outcomes per-memory.
+                    let mut entry = call.input.clone();
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("turn".to_string(), serde_json::json!(turn));
+                    }
+                    recorded_citations.push(entry);
                 }
                 let result_value = kimetsu_dispatch_tool(runtime, &name, call.input.clone());
                 messages.push(ModelMessage::tool_result(call.id, name, result_value));
@@ -575,6 +594,13 @@ pub fn run_model_agent(
         // curation pipeline can propose them as memory rows.
         "verify_iterations": verify_iterations,
         "recorded_deviations": recorded_deviations,
+        // v0.5.1: per-turn memory citations the model emitted via
+        // the `cite_memory` tool. Transport surface (chat / harbor)
+        // walks this list at run wrap-up and emits one
+        // `memory.cited` event per entry to the trace so the
+        // projector populates `memory_citations` rows for the
+        // `kimetsu brain memory blame <run-id>` CLI.
+        "recorded_citations": recorded_citations,
     });
 
     Ok(ModelAgentReport {
@@ -726,7 +752,7 @@ fn tool_names_for_profile(profile: &str) -> Vec<String> {
             "shell_stop",
         ],
         "image" | "vision" => vec!["view_image"],
-        "memory" | "verify_loop" => vec!["record_deviation"],
+        "memory" | "verify_loop" => vec!["record_deviation", "cite_memory"],
         "all" | "full" => FULL_TOOL_NAMES.to_vec(),
         _ => Vec::new(),
     }
@@ -1194,6 +1220,34 @@ fn kimetsu_all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["thought"],
             }),
         },
+        // ---------- v0.5.1: per-turn memory citation ----------
+        ToolDefinition {
+            name: "cite_memory".to_string(),
+            description: "Mark which brain memory you consciously leveraged this \
+                turn. Best-effort metadata — nothing fails if you forget to call \
+                it, but citations are what the brain uses to decide which memories \
+                actually helped. The strong usefulness signal (±1.0 on \
+                run.finished / run.failed) goes to cited memories; uncited but \
+                retrieved memories get a weaker ±0.1. Call once per memory per \
+                turn that you used; multiple citations per turn are fine. \
+                Pass the `memory_id` exactly as it appeared in your retrieved \
+                context (look for `memory:<id>` in capsule expansion handles \
+                or the `id` field of memory capsules).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": "The memory's id from your retrieved context (e.g. `01J9XYZABCDEF...`)."
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Optional short note on HOW you used the memory. Helps the `kimetsu brain memory blame` reviewer understand the attribution."
+                    }
+                },
+                "required": ["memory_id"],
+            }),
+        },
         // ---------- MP-18: brain-powered goal verify ----------
         ToolDefinition {
             name: "record_deviation".to_string(),
@@ -1358,6 +1412,7 @@ pub fn kimetsu_dispatch_tool(
         "view_image" => kimetsu_view_image(runtime, &input),
         // MP-18: brain-powered goal verify
         "record_deviation" => kimetsu_record_deviation(&input),
+        "cite_memory" => kimetsu_cite_memory(&input),
         other => json!({
             "error": format!(
                 "unsupported tool `{other}`; pick one of \
@@ -2439,6 +2494,34 @@ fn kimetsu_record_deviation(input: &Value) -> Value {
         "missing": missing,
         "where_deviated": where_deviated,
         "lesson_for_next_time": lesson,
+    })
+}
+
+/// v0.5.1: cite_memory — record which retrieved memory the model
+/// consciously leveraged this turn. Best-effort metadata: a missing
+/// or empty `memory_id` just returns an error result, doesn't fail
+/// the turn. The agent loop sweeps `cite_memory` calls out of the
+/// tool-call stream and accumulates them in `recorded_citations`
+/// (with the turn index injected). The transport surface (chat
+/// REPL / harbor binary) then emits one `memory.cited` event per
+/// citation to the trace at run wrap-up; the brain projector
+/// populates `memory_citations` rows so `kimetsu brain memory
+/// blame` can attribute outcomes per-memory.
+fn kimetsu_cite_memory(input: &Value) -> Value {
+    let Some(memory_id) = input_str(input, "memory_id") else {
+        return json!({ "error": "cite_memory requires `memory_id`" });
+    };
+    let memory_id = memory_id.trim();
+    if memory_id.is_empty() {
+        return json!({ "error": "cite_memory: `memory_id` must be non-empty" });
+    }
+    // `rationale` is optional. We pass it through verbatim so the
+    // run trace + blame output show the model's reasoning.
+    let rationale = input_str(input, "rationale").unwrap_or_default();
+    json!({
+        "cited": true,
+        "memory_id": memory_id,
+        "rationale": if rationale.is_empty() { Value::Null } else { json!(rationale) },
     })
 }
 

@@ -96,6 +96,48 @@ pub struct RecordedBenchmarkOutcome {
     pub proposal_text: Option<String>,
 }
 
+// v0.5.1: blame surface — per-run memory attribution. Both the CLI
+// (`kimetsu brain memory blame <run-id>`) and the MCP tool
+// (`kimetsu_brain_memory_blame`) consume `BlameReport`.
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlameReport {
+    pub run_id: String,
+    /// Terminal outcome of the run: "success" (run.finished),
+    /// "failed" (run.failed), "aborted" (run.aborted), or "unknown"
+    /// (no terminal event found yet).
+    pub outcome: String,
+    /// Failure category when outcome is "failed" (e.g. "Gate",
+    /// "Implementation"). None otherwise.
+    pub failure_category: Option<String>,
+    /// Memories the model explicitly cited via `cite_memory`,
+    /// ordered by turn.
+    pub cited: Vec<CitedMemory>,
+    /// Memories that were retrieved into the run's context but
+    /// never cited. They got the weak ±0.1 signal instead of ±1.0.
+    pub silent_passengers: Vec<SilentMemory>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CitedMemory {
+    pub memory_id: String,
+    pub turn: i64,
+    pub rationale: Option<String>,
+    pub cited_at: String,
+    /// Truncated memory text for human-readable output.
+    pub text_preview: String,
+    pub scope: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SilentMemory {
+    pub memory_id: String,
+    pub text_preview: String,
+    pub scope: String,
+    pub kind: String,
+}
+
 pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
     let paths = ProjectPaths::discover(start)?;
     fs::create_dir_all(&paths.runs_dir)?;
@@ -457,6 +499,205 @@ pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
         memories.extend(user_brain::list_user_memories(&user_conn)?);
     }
     Ok(memories)
+}
+
+/// v0.5.1: per-run memory attribution. Walks `memory_citations`,
+/// the run's `context.injected` events, and (when present) the
+/// terminal run.finished/failed/aborted event to produce a
+/// `BlameReport` that surfaces which memories the model actually
+/// reasoned with vs which were silent passengers.
+///
+/// Lookups across user + project brains are merged so a cited
+/// user-scope memory shows its text even when the run lived in a
+/// project brain.
+pub fn blame_run(start: &Path, run_id: &str) -> KimetsuResult<BlameReport> {
+    let (_paths, _config, conn) = load_project(start)?;
+    let user_conn = user_brain::open_user_brain_readonly()?;
+
+    // 1. Terminal outcome.
+    let (outcome, failure_category) = run_outcome(&conn, run_id)?;
+
+    // 2. Cited memories — ordered by turn.
+    let cited_rows: Vec<(String, i64, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "
+            SELECT memory_id, turn, rationale, cited_at
+            FROM memory_citations
+            WHERE run_id = ?1
+            ORDER BY turn ASC, cited_at ASC
+            ",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+
+    let mut cited: Vec<CitedMemory> = Vec::with_capacity(cited_rows.len());
+    let mut cited_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (memory_id, turn, rationale, cited_at) in cited_rows {
+        cited_set.insert(memory_id.clone());
+        let (text, scope, kind) = resolve_memory(&conn, user_conn.as_ref(), &memory_id);
+        cited.push(CitedMemory {
+            memory_id,
+            turn,
+            rationale,
+            cited_at,
+            text_preview: text_preview(&text, 120),
+            scope,
+            kind,
+        });
+    }
+
+    // 3. Silent passengers — retrieved but not cited.
+    let retrieved_ids = collect_injected_memory_ids_for_blame(&conn, run_id)?;
+    let mut silent: Vec<SilentMemory> = Vec::new();
+    for memory_id in retrieved_ids {
+        if cited_set.contains(&memory_id) {
+            continue;
+        }
+        let (text, scope, kind) = resolve_memory(&conn, user_conn.as_ref(), &memory_id);
+        silent.push(SilentMemory {
+            memory_id,
+            text_preview: text_preview(&text, 120),
+            scope,
+            kind,
+        });
+    }
+
+    Ok(BlameReport {
+        run_id: run_id.to_string(),
+        outcome,
+        failure_category,
+        cited,
+        silent_passengers: silent,
+    })
+}
+
+fn run_outcome(
+    conn: &Connection,
+    run_id: &str,
+) -> KimetsuResult<(String, Option<String>)> {
+    // Pull the most recent terminal event for the run, if any.
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "
+            SELECT kind, payload_json
+            FROM events
+            WHERE run_id = ?1
+              AND kind IN ('run.finished', 'run.failed', 'run.aborted')
+            ORDER BY ts DESC
+            LIMIT 1
+            ",
+            rusqlite::params![run_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((kind, payload_json)) => {
+            let outcome = match kind.as_str() {
+                "run.finished" => "success".to_string(),
+                "run.failed" => "failed".to_string(),
+                "run.aborted" => "aborted".to_string(),
+                other => other.to_string(),
+            };
+            let category = if kind == "run.failed" {
+                serde_json::from_str::<serde_json::Value>(&payload_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("category")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
+            } else {
+                None
+            };
+            (outcome, category)
+        }
+        None => ("unknown".to_string(), None),
+    })
+}
+
+fn collect_injected_memory_ids_for_blame(
+    conn: &Connection,
+    run_id: &str,
+) -> KimetsuResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT payload_json
+        FROM events
+        WHERE run_id = ?1 AND kind = 'context.injected'
+        ",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![run_id], |row| row.get::<_, String>(0))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        let payload_json = row?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        if let Some(ids) = payload.get("memory_ids").and_then(|v| v.as_array()) {
+            for id in ids {
+                if let Some(s) = id.as_str()
+                    && !s.is_empty()
+                {
+                    seen.insert(s.to_string());
+                }
+            }
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Look up a memory's (text, scope, kind) across the project conn
+/// and the optional user-brain conn. Returns
+/// ("<unknown — deleted?>", "", "") when the row isn't found in
+/// either DB (e.g. invalidated + GC'd, or a typo'd memory_id in
+/// the citation).
+fn resolve_memory(
+    project_conn: &Connection,
+    user_conn: Option<&Connection>,
+    memory_id: &str,
+) -> (String, String, String) {
+    let q = "SELECT text, scope, kind FROM memories WHERE memory_id = ?1";
+    let try_conn = |conn: &Connection| -> Option<(String, String, String)> {
+        conn.query_row(q, rusqlite::params![memory_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()
+        .ok()
+        .flatten()
+    };
+    try_conn(project_conn)
+        .or_else(|| user_conn.and_then(try_conn))
+        .unwrap_or_else(|| {
+            (
+                "<unknown — deleted or invalid memory_id>".to_string(),
+                String::new(),
+                String::new(),
+            )
+        })
+}
+
+fn text_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(max_chars).collect();
+        format!("{head}…")
+    }
 }
 
 fn list_memories_from_conn(conn: &Connection) -> KimetsuResult<Vec<MemoryRow>> {
@@ -1400,9 +1641,13 @@ mod tests {
     #[test]
     fn run_finished_increments_usefulness_for_injected_memories() {
         with_user_brain_disabled(|| {
-            // MP-4a outcome attribution: a memory in the context of a run.finished
-            // gains +1 usefulness and +1 use_count; per-run counting means the
-            // same memory injected into two stages of one run still counts once.
+            // MP-4a outcome attribution + v0.5.1 citation split:
+            // a memory that is BOTH injected (in context.injected) AND
+            // cited (via memory.cited from the cite_memory tool) earns
+            // the strong +1.0 usefulness delta on run.finished.
+            //
+            // Per-run counting: the same memory injected into two
+            // stages of one run still counts once.
             let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
@@ -1446,6 +1691,17 @@ mod tests {
                             "file_paths": [],
                         }),
                     ),
+                    // v0.5.1: model explicitly cited the memory in
+                    // turn 3 — earns the strong +1.0 delta.
+                    Event::new(
+                        run_id,
+                        "memory.cited",
+                        serde_json::json!({
+                            "memory_id": memory_id,
+                            "turn": 3,
+                            "rationale": "using rg from memory",
+                        }),
+                    ),
                     Event::new(
                         run_id,
                         "run.finished",
@@ -1463,11 +1719,160 @@ mod tests {
             assert_eq!(m.use_count, 1, "per-run counting: 2 stages count once");
             assert!(
                 (m.usefulness_score - 1.0).abs() < f32::EPSILON,
-                "expected usefulness_score = 1.0, got {}",
+                "expected strong-signal usefulness_score = 1.0, got {}",
                 m.usefulness_score
             );
 
             fs::remove_dir_all(root).expect("remove temp project");
+        });
+    }
+
+    /// v0.5.1: silent-passenger path. A memory that was retrieved
+    /// (in context.injected) but the model never cited gets the
+    /// weak +0.1 delta on run.finished, not the full +1.0.
+    /// Encourages the model to actually call `cite_memory`.
+    #[test]
+    fn run_finished_gives_weak_signal_to_silent_passenger_memories() {
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Preference,
+                "Silent passenger memory.",
+            )
+            .expect("add memory");
+
+            {
+                let (paths, _config, conn) = load_project(&root).expect("load");
+                let run_id = RunId::new();
+                let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id).expect("trace");
+                let evs: Vec<Event> = vec![
+                    Event::new(
+                        run_id,
+                        "run.started",
+                        serde_json::json!({"project_id": "test", "task": "x"}),
+                    ),
+                    Event::new(
+                        run_id,
+                        "context.injected",
+                        serde_json::json!({
+                            "stage": "localization",
+                            "memory_ids": [memory_id.clone()],
+                            "prior_run_ids": [],
+                            "file_paths": [],
+                        }),
+                    ),
+                    // NO memory.cited event for this memory.
+                    Event::new(
+                        run_id,
+                        "run.finished",
+                        serde_json::json!({"status": "success", "total_cost_usd": 0.1}),
+                    ),
+                ];
+                for ev in &evs {
+                    writer.append(ev, true).expect("append");
+                }
+                projector::apply_events(&conn, &evs).expect("project");
+            }
+
+            let memories = list_memories(&root).expect("list memories");
+            let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
+            assert_eq!(m.use_count, 1);
+            assert!(
+                (m.usefulness_score - 0.1).abs() < 1e-5,
+                "silent passenger should get +0.1, got {}",
+                m.usefulness_score
+            );
+        });
+    }
+
+    /// v0.5.1 end-to-end: `blame_run` walks memory_citations +
+    /// context.injected + terminal events and surfaces per-memory
+    /// attribution. Cited memories appear under `cited`, retrieved-
+    /// but-uncited under `silent_passengers`, and the outcome
+    /// reflects the run's terminal event.
+    #[test]
+    fn blame_run_separates_cited_from_silent_passengers() {
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+            let cited_id = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Preference,
+                "prefer ripgrep over grep",
+            )
+            .expect("add cited");
+            let silent_id = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Convention,
+                "use cargo nextest for tests",
+            )
+            .expect("add silent");
+
+            let run_id = RunId::new();
+            {
+                let (paths, _config, conn) = load_project(&root).expect("load");
+                let (mut writer, _run_paths) =
+                    TraceWriter::create(&paths, run_id).expect("trace");
+                let evs: Vec<Event> = vec![
+                    Event::new(
+                        run_id,
+                        "run.started",
+                        serde_json::json!({"project_id": "test", "task": "x"}),
+                    ),
+                    Event::new(
+                        run_id,
+                        "context.injected",
+                        serde_json::json!({
+                            "stage": "localization",
+                            "memory_ids": [cited_id.clone(), silent_id.clone()],
+                            "prior_run_ids": [],
+                            "file_paths": [],
+                        }),
+                    ),
+                    Event::new(
+                        run_id,
+                        "memory.cited",
+                        serde_json::json!({
+                            "memory_id": cited_id,
+                            "turn": 4,
+                            "rationale": "used the rg pattern",
+                        }),
+                    ),
+                    Event::new(
+                        run_id,
+                        "run.finished",
+                        serde_json::json!({"status": "success", "total_cost_usd": 0.1}),
+                    ),
+                ];
+                for ev in &evs {
+                    writer.append(ev, true).expect("append");
+                }
+                projector::apply_events(&conn, &evs).expect("project");
+            }
+
+            let report = blame_run(&root, &run_id.to_string()).expect("blame");
+            assert_eq!(report.outcome, "success");
+            assert!(report.failure_category.is_none());
+            assert_eq!(report.cited.len(), 1, "exactly one cited memory");
+            let cited = &report.cited[0];
+            assert_eq!(cited.memory_id, cited_id);
+            assert_eq!(cited.turn, 4);
+            assert_eq!(cited.rationale.as_deref(), Some("used the rg pattern"));
+            assert!(cited.text_preview.contains("ripgrep"));
+
+            assert_eq!(report.silent_passengers.len(), 1);
+            let silent = &report.silent_passengers[0];
+            assert_eq!(silent.memory_id, silent_id);
+            assert!(silent.text_preview.contains("nextest"));
+
+            fs::remove_dir_all(root).expect("cleanup");
         });
     }
 
@@ -1525,7 +1930,8 @@ mod tests {
             }
             projector::apply_events(&conn, &gate_events).expect("project gate-fail");
 
-            // Second run: real implementation failure -> -1.
+            // Second run: real implementation failure + the memory
+            // was cited via memory.cited -> -1.0 strong signal.
             let impl_run = RunId::new();
             let (mut writer2, _) = TraceWriter::create(&paths, impl_run).expect("trace");
             let impl_events: Vec<Event> = vec![
@@ -1543,6 +1949,17 @@ mod tests {
                         "memory_ids": [memory_id.clone()],
                         "prior_run_ids": [],
                         "file_paths": [],
+                    }),
+                ),
+                // v0.5.1: cite the memory so this run earns the
+                // strong -1.0 penalty (the brain pushed wrong).
+                Event::new(
+                    impl_run,
+                    "memory.cited",
+                    serde_json::json!({
+                        "memory_id": memory_id,
+                        "turn": 2,
+                        "rationale": "trusted the memory's pattern",
                     }),
                 ),
                 Event::new(

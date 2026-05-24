@@ -36,6 +36,8 @@ const BRAIN_MEMORY_REJECT_DESCRIPTION: &str = "Reject a pending Kimetsu memory p
 
 const BRAIN_MEMORY_INVALIDATE_DESCRIPTION: &str = "Retire an accepted Kimetsu memory so the broker stops retrieving it. Use when a memory is stale, wrong, harmful, or contradicted by newer evidence. This writes a memory.invalidated event.";
 
+const BRAIN_MEMORY_BLAME_DESCRIPTION: &str = "v0.5.1: per-run memory attribution. Pass a run_id (ULID printed in chat sessions / trace files) to surface which memories the model explicitly cited via the cite_memory tool (strong ±1.0 usefulness signal) vs which were silently retrieved but never cited (weak ±0.1 signal). Use after a run feels off to learn whether a misleading memory was responsible, or after a clean run to see which memories actually earned their keep.";
+
 const BRAIN_INGEST_REPO_DESCRIPTION: &str = "Index the repository into Kimetsu brain.db so future kimetsu_brain_context calls can retrieve repo snippets and manifests. Use during setup or after major repo changes. This writes repo.ingested events.";
 
 const BRIDGE_STATUS_DESCRIPTION: &str = "Use when deciding whether portable skills/extensions can help the current task. Lists capabilities discovered in this workspace and across user harness roots, plus where each is installed for Kimetsu, Codex, and Claude Code. For Terminal-Bench memory/context, prefer kimetsu_benchmark_context first; for other work, prefer kimetsu_brain_context first.";
@@ -220,6 +222,7 @@ fn call_tool(
         "kimetsu_brain_memory_accept" => kimetsu_brain_memory_accept(workspace, &arguments),
         "kimetsu_brain_memory_reject" => kimetsu_brain_memory_reject(workspace, &arguments),
         "kimetsu_brain_memory_invalidate" => kimetsu_brain_memory_invalidate(workspace, &arguments),
+        "kimetsu_brain_memory_blame" => kimetsu_brain_memory_blame(workspace, &arguments),
         "kimetsu_brain_ingest_repo" => kimetsu_brain_ingest_repo(workspace, &arguments),
         "kimetsu_bridge_status" => {
             let scan = bridge_scan(workspace, skills)?;
@@ -737,6 +740,30 @@ fn kimetsu_brain_memory_invalidate(workspace: &Path, arguments: &Value) -> Resul
     }))
 }
 
+/// v0.5.1: `kimetsu_brain_memory_blame` — per-run memory attribution
+/// surfaced to the host harness. Same backend as the CLI
+/// `kimetsu brain memory blame <run-id>`, JSON-shaped for Claude
+/// Code / Codex to consume directly.
+fn kimetsu_brain_memory_blame(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let run_id = string_arg(arguments, "run_id")?;
+    let report = project::blame_run(workspace, run_id.trim())
+        .map_err(|err| format!("kimetsu brain memory blame: {err}"))?;
+    let json = serde_json::to_value(&report)
+        .map_err(|err| format!("serialize blame report: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "usage": {
+            "how_to_use": "Read `cited` first — those are the memories the model consciously used during the run. `silent_passengers` were retrieved into context but the model never called cite_memory on them, so they only earned the weak ±0.1 usefulness signal.",
+            "next_steps": [
+                "If a cited memory ended in a failed run, consider whether the memory is wrong — `kimetsu_brain_memory_invalidate` retires it.",
+                "If a silent passenger consistently shows up and never gets cited, it's noise; consider invalidating or rewording it.",
+                "Patterns across many runs are easier to see via `kimetsu_brain_memory_top` (usefulness ranking)."
+            ]
+        },
+        "report": json,
+    }))
+}
+
 fn kimetsu_brain_ingest_repo(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let path = optional_string_arg(arguments, "path")
         .map(PathBuf::from)
@@ -1125,6 +1152,17 @@ fn tool_definitions() -> Value {
                     "reason": { "type": "string" }
                 },
                 "required": ["memory_id"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_memory_blame",
+            "description": BRAIN_MEMORY_BLAME_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" }
+                },
+                "required": ["run_id"]
             }
         },
         {
