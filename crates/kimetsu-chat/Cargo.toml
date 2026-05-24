@@ -4,6 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Interactive REPL chat client + MCP sidecar + cross-harness bridge for kimetsu. Installs into Claude Code and Codex as a brain-managed memory layer."
+keywords = ["kimetsu", "chat", "mcp", "claude-code", "codex"]
+categories = ["development-tools", "command-line-utilities"]
+
+[features]
+# v0.4.8: passthrough so `kimetsu-cli --features embeddings` can
+# light up semantic retrieval inside the chat REPL. Bare
+# `kimetsu-chat` consumers (none today, but the bridge plugin
+# would qualify) can also opt in directly.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
 
 # Interactive REPL transport for kimetsu.
 #
@@ -17,8 +33,11 @@ authors.workspace = true
 # surface, not a benchmark harness.
 
 [dependencies]
-kimetsu-agent = { path = "../kimetsu-agent" }
-kimetsu-brain = { path = "../kimetsu-brain" }
-kimetsu-core = { path = "../kimetsu-core" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.5.2" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.5.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.5.2" }
+base64.workspace = true
+crossterm.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

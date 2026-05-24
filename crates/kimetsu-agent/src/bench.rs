@@ -96,12 +96,12 @@ struct BenchTaskResult {
     irrelevant_context_loaded: u32,
     included_handles: Vec<String>,
     dry_run: Option<DryRunBenchMetrics>,
-    /// MP-1.6: only populated for BrainOnAutoWarm. Lists every memory the
+    /// MP-1.6: only populated for OnAutoWarm. Lists every memory the
     /// seed phase auto-accepted into the project's brain so the followup
     /// phase's regression is auditable against the exact text injected.
     #[serde(default)]
     auto_accepted_memories: Vec<AutoAcceptedMemory>,
-    /// MP-1.6: only populated for BrainOnAutoWarm. Path to the saved
+    /// MP-1.6: only populated for OnAutoWarm. Path to the saved
     /// seed-phase trace.jsonl (under the bench artifact dir) so triage does
     /// not require keeping the temp fixture alive.
     #[serde(default)]
@@ -189,40 +189,40 @@ struct ModelBenchConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchMode {
-    BrainOff,
-    BrainOnCold,
-    BrainOnWarm,
+    Off,
+    OnCold,
+    OnWarm,
     /// MP-3: run the seed pipeline first, auto-accept high-confidence personal
     /// proposals from its trace, reset the source files, then run the
     /// follow-up pipeline. Memories carried across phases are *only* what the
     /// agent itself proposed -- no hand-curated warm seed.
-    BrainOnAutoWarm,
-    /// MP-1.7 ablation: same flow as BrainOnAutoWarm, but after auto-accept
+    OnAutoWarm,
+    /// MP-1.7 ablation: same flow as OnAutoWarm, but after auto-accept
     /// the bench wipes the `memories` projection so the followup phase
     /// surfaces only repo_file / repo_manifest / prior_run capsules. Lets
     /// the report quantify how much of auto_warm's win is memory vs
     /// prior-run trace persistence.
-    BrainOnAutoWarmNoMemory,
+    OnAutoWarmNoMemory,
 }
 
 impl BenchMode {
     fn all() -> [Self; 5] {
         [
-            Self::BrainOff,
-            Self::BrainOnCold,
-            Self::BrainOnWarm,
-            Self::BrainOnAutoWarm,
-            Self::BrainOnAutoWarmNoMemory,
+            Self::Off,
+            Self::OnCold,
+            Self::OnWarm,
+            Self::OnAutoWarm,
+            Self::OnAutoWarmNoMemory,
         ]
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::BrainOff => "brain_off",
-            Self::BrainOnCold => "brain_on_cold",
-            Self::BrainOnWarm => "brain_on_warm",
-            Self::BrainOnAutoWarm => "brain_on_auto_warm",
-            Self::BrainOnAutoWarmNoMemory => "brain_on_auto_warm_no_memory",
+            Self::Off => "brain_off",
+            Self::OnCold => "brain_on_cold",
+            Self::OnWarm => "brain_on_warm",
+            Self::OnAutoWarm => "brain_on_auto_warm",
+            Self::OnAutoWarmNoMemory => "brain_on_auto_warm_no_memory",
         }
     }
 }
@@ -240,7 +240,11 @@ fn print_bench_provenance() {
         .ok()
         .and_then(|p| std::fs::metadata(&p).ok())
         .and_then(|m| m.modified().ok())
-        .and_then(|t| time::OffsetDateTime::from(t).format(&time::format_description::well_known::Rfc3339).ok())
+        .and_then(|t| {
+            time::OffsetDateTime::from(t)
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
         .unwrap_or_else(|| "<unknown>".to_string());
     eprintln!(
         "kimetsu_bench provenance: version={} binary={} built_at={}",
@@ -366,7 +370,7 @@ fn run_task_mode(
     if let Some(model_config) = model_config {
         configure_fixture_model(&repo, model_config, remaining_cost_usd)?;
     }
-    if mode == BenchMode::BrainOnWarm {
+    if mode == BenchMode::OnWarm {
         project::add_memory(
             &repo,
             MemoryScope::Repo,
@@ -383,7 +387,7 @@ fn run_task_mode(
     // followup task. The seed-phase trace is preserved as an artifact so the
     // report can audit which memories carried over.
     //
-    // MP-1.7 ablation: `BrainOnAutoWarmNoMemory` does the same flow but
+    // MP-1.7 ablation: `OnAutoWarmNoMemory` does the same flow but
     // wipes the `memories` projection between seed and followup. The
     // run.finished events from the seed phase stay in the canonical trace,
     // so the broker can still surface a `prior_run` capsule -- only memory
@@ -391,10 +395,7 @@ fn run_task_mode(
     // isolates the actual contribution of accepted memories.
     let mut auto_accepted: Vec<AutoAcceptedMemory> = Vec::new();
     let mut seed_trace_artifact: Option<String> = None;
-    if matches!(
-        mode,
-        BenchMode::BrainOnAutoWarm | BenchMode::BrainOnAutoWarmNoMemory
-    ) {
+    if matches!(mode, BenchMode::OnAutoWarm | BenchMode::OnAutoWarmNoMemory) {
         let seed_result = run_pipeline_phase(&repo, task, task.seed_task, mode, model_config)?;
         seed_trace_artifact = Some(copy_seed_trace_artifact(
             output_dir,
@@ -403,7 +404,7 @@ fn run_task_mode(
             &seed_result.trace_path,
         )?);
         auto_accepted = auto_accept_pending_proposals(&repo)?;
-        if mode == BenchMode::BrainOnAutoWarmNoMemory {
+        if mode == BenchMode::OnAutoWarmNoMemory {
             wipe_memory_projection(&repo)?;
         }
         // Reset source files so the followup phase has a fresh surface.
@@ -411,7 +412,7 @@ fn run_task_mode(
         project::ingest_repo(&repo)?;
     }
 
-    let measured_capsules = if mode == BenchMode::BrainOff {
+    let measured_capsules = if mode == BenchMode::Off {
         Vec::new()
     } else {
         project::retrieve_context(&repo, "patch_plan", task.followup_task, 420)?.capsules
@@ -425,17 +426,13 @@ fn run_task_mode(
             relevance: c.relevance,
         })
         .collect();
-    let pipeline_result =
-        run_pipeline_phase(&repo, task, task.followup_task, mode, model_config)?;
+    let pipeline_result = run_pipeline_phase(&repo, task, task.followup_task, mode, model_config)?;
     let metrics = dry_run_metrics(output_dir, task, mode, &pipeline_result.trace_path)?;
     let mut result = evaluate_capsules(task, mode, measured_capsules, Some(metrics));
     result.injected_capsules = injected_capsules;
-    if matches!(
-        mode,
-        BenchMode::BrainOnAutoWarm | BenchMode::BrainOnAutoWarmNoMemory
-    ) {
+    if matches!(mode, BenchMode::OnAutoWarm | BenchMode::OnAutoWarmNoMemory) {
         // Surface the memory text and IDs the seed phase accepted, plus the
-        // seed-phase trace path. For BrainOnAutoWarmNoMemory we still record
+        // seed-phase trace path. For OnAutoWarmNoMemory we still record
         // what would have been carried over so the report shows what the
         // ablation is actually withholding.
         result.accepted_memories_used = result
@@ -500,7 +497,7 @@ fn run_pipeline_phase(
         dry_run: task.dry_run,
         allow_high_risk: true,
         disable_model: model_config.is_none(),
-        disable_broker: mode == BenchMode::BrainOff,
+        disable_broker: mode == BenchMode::Off,
         model_key_override: model_config.map(|model| model.model_key.clone()),
     });
     match pipeline_result {
@@ -508,15 +505,13 @@ fn run_pipeline_phase(
         Err(err) => {
             let kimetsu_dir = repo.join(".kimetsu");
             let runs_dir = kimetsu_dir.join("runs");
-            let last_run = fs::read_dir(&runs_dir)
-                .ok()
-                .and_then(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .map(|entry| entry.path())
-                        .filter(|path| path.is_dir())
-                        .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
-                });
+            let last_run = fs::read_dir(&runs_dir).ok().and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
+            });
             let Some(run_dir) = last_run else {
                 return Err(err);
             };
@@ -1240,7 +1235,7 @@ fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
 
     let mut out = String::new();
     out.push_str("## Falsifiable Claim — warm vs off\n\n");
-    out.push_str("docs/MVP.md threshold: a warm mode beats off on **at least one** of\n");
+    out.push_str("docs/archive/MVP.md threshold: a warm mode beats off on **at least one** of\n");
     out.push_str("- ≥20% fewer total tool calls\n");
     out.push_str("- ≥15 pp success-rate uplift\n");
     out.push_str("- strictly fewer verification retries\n\n");
@@ -1401,10 +1396,12 @@ fn render_report(report: &BenchReport) -> String {
     for result in &report.results {
         let dry_run = result.dry_run.as_ref();
         let terminal_display = dry_run
-            .map(|metrics| match (&metrics.terminal_kind, &metrics.failure_category) {
-                (k, Some(cat)) if k == "run.failed" => format!("run.failed({cat})"),
-                (k, _) => k.clone(),
-            })
+            .map(
+                |metrics| match (&metrics.terminal_kind, &metrics.failure_category) {
+                    (k, Some(cat)) if k == "run.failed" => format!("run.failed({cat})"),
+                    (k, _) => k.clone(),
+                },
+            )
             .unwrap_or_else(|| "not_run".to_string());
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.2} | {} | {} | {} | {} | {} |\n",
@@ -1826,10 +1823,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "Cargo.toml",
                     "[package]\nname = \"kimetsu-bench-rename\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
                 ),
-                file(
-                    "src/lib.rs",
-                    "pub mod users;\n",
-                ),
+                file("src/lib.rs", "pub mod users;\n"),
                 file(
                     "src/users.rs",
                     "#[derive(Debug, PartialEq, Eq)]\npub struct User {\n    pub id: u32,\n    pub name: String,\n}\n\npub fn get_user(id: u32) -> Option<User> {\n    if id == 1 {\n        Some(User { id, name: \"alice\".to_string() })\n    } else {\n        None\n    }\n}\n",
@@ -1858,10 +1852,7 @@ fn bench_tasks() -> Vec<BenchTask> {
                     "Cargo.toml",
                     "[package]\nname = \"kimetsu-bench-two-file\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
                 ),
-                file(
-                    "src/lib.rs",
-                    "pub mod area;\npub mod perimeter;\n",
-                ),
+                file("src/lib.rs", "pub mod area;\npub mod perimeter;\n"),
                 file(
                     "src/area.rs",
                     "/// BUG: returns width + height instead of width * height.\npub fn area(width: u32, height: u32) -> u32 {\n    width + height\n}\n",
@@ -2032,7 +2023,10 @@ mod tests {
             use_count: 4,
             usefulness_score: -4.0,
         };
-        assert!(!auto_accept_policy_allows(&proposal, &[bad_shadow.clone()]));
+        assert!(!auto_accept_policy_allows(
+            &proposal,
+            std::slice::from_ref(&bad_shadow)
+        ));
 
         // Small sample (use_count < 3) does NOT shadow even when ratio is bad.
         let small_sample = ProposalShadow {

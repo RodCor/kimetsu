@@ -2,7 +2,7 @@
 # MP-15d — daily stability gauntlet for the v0.2 gate-3 evidence.
 #
 # Designed to run unattended from cron. Each daily firing:
-#   1. Rebuilds the kimetsu Linux binary (incremental cargo).
+#   1. Rebuilds the Harbor adapter Linux binary (incremental cargo).
 #   2. Runs the 16-task no-brain leg.
 #   3. Runs the 16-task brain leg with the curated memory pool.
 #   4. Logs to /home/kimetsu/stability-logs/stability-YYYY-MM-DD.log
@@ -68,13 +68,13 @@ export KIMETSU_HARBOR_PROVIDER_TIMEOUT_SECS
 # Build.
 cd "$REPO"
 log "build..."
-if ! cargo build -p kimetsu-cli --release >>"$LOG" 2>&1; then
+if ! cargo build -p kimetsu-harbor-rs --release >>"$LOG" 2>&1; then
     log "FATAL: cargo build failed"
     exit 4
 fi
-export KIMETSU_BIN="$REPO/target/release/kimetsu"
+export KIMETSU_HARBOR_BIN="$REPO/target/release/kimetsu-harbor-agent"
 export KIMETSU_HARBOR_MODEL="claude-opus-4-7"
-log "binary: $KIMETSU_BIN ($(stat -c %s "$KIMETSU_BIN") bytes)"
+log "binary: $KIMETSU_HARBOR_BIN ($(stat -c %s "$KIMETSU_HARBOR_BIN") bytes)"
 
 # MP-17d: k=2 multi-attempt toggle. Default k=1 keeps cost predictable;
 # bump via STABILITY_K=2 (or higher) in the cron environment when you

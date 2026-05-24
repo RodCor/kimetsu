@@ -176,7 +176,7 @@ pub struct TokenUsage {
     /// ephemeral cache entry was created during this request. High
     /// cache_creation alongside low cache_read means we're paying full
     /// freight on every call — see the per-call TempCommandDir + missing
-    /// `--continue` story documented in docs/V0.3-PLAN.md. Defaulted to 0 for
+    /// `--continue` story documented in docs/archive/V0.3-PLAN.md. Defaulted to 0 for
     /// providers that don't surface it (so existing tests keep passing).
     #[serde(default)]
     pub cache_creation_input_tokens: u32,

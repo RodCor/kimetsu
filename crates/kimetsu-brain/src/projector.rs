@@ -43,8 +43,52 @@ fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         "memory.proposed" => apply_memory_proposed(conn, event),
         "memory.rejected" => apply_memory_rejected(conn, event),
         "memory.invalidated" => apply_memory_invalidated(conn, event),
+        // v0.5.1: per-turn memory citation. The model emits this
+        // via the `cite_memory` tool when it consciously leveraged
+        // a retrieved capsule. Best-effort — a missing or
+        // malformed payload just no-ops.
+        "memory.cited" => apply_memory_cited(conn, event),
         _ => Ok(()),
     }
+}
+
+fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(memory_id) = event
+        .payload
+        .get("memory_id")
+        .and_then(|value| value.as_str())
+    else {
+        // No memory_id -> drop. Citations are best-effort metadata,
+        // not load-bearing — silently skipping malformed payloads
+        // keeps the run from breaking.
+        return Ok(());
+    };
+    let turn = event
+        .payload
+        .get("turn")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let rationale = event
+        .payload
+        .get("rationale")
+        .and_then(|value| value.as_str());
+    let cited_at = ts_text(event)?;
+    conn.execute(
+        "
+        INSERT OR REPLACE INTO memory_citations (
+            run_id, memory_id, turn, cited_at, rationale
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ",
+        params![
+            event.run_id.to_string(),
+            memory_id,
+            turn,
+            cited_at,
+            rationale,
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
@@ -130,20 +174,35 @@ fn apply_terminal_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// MP-4a outcome attribution: when a run terminates, look up every
-/// `context.injected` event the run emitted, collect the unique memory ids,
-/// and update each memory's `use_count` and `usefulness_score`.
+/// MP-4a + v0.5.1 outcome attribution: when a run terminates, walk every
+/// `context.injected` event AND every `memory.cited` event the run emitted,
+/// split the unique memory ids into "cited" vs "silent passenger", and
+/// update each memory's `use_count` + `usefulness_score`.
 ///
-/// Delta rules (per docs/MEMORY-USEFULNESS.md):
-///   run.finished                 -> +1 (helped) and +1 use
-///   run.failed (cat != "Gate")   -> -1 (hurt)   and +1 use
-///   run.failed (cat == "Gate")   ->  no update (graceful early-exit;
-///                                   the plan-create existence guard
-///                                   doesn't reflect on the memory)
-///   run.aborted                  ->  no update (user-initiated stop)
+/// Delta rules:
+///   run.finished:
+///     cited memory     -> +1.0 usefulness (matches MP-4a baseline)
+///     silent passenger -> +0.1 usefulness (weaker signal — it was on
+///                         screen but the model didn't reach for it)
+///   run.failed (cat != "Gate"):
+///     cited memory     -> -1.0 usefulness (the brain pushed wrong)
+///     silent passenger -> -0.1 usefulness (was retrieved, didn't help)
+///   run.failed (cat == "Gate"):
+///     no update (graceful early-exit; the plan-create existence guard
+///     doesn't reflect on the memory)
+///   run.aborted:
+///     no update (user-initiated stop)
+///
+/// Pre-v0.5.1 behavior: cited == silent (both got the full ±1). When no
+/// `memory.cited` events exist (e.g. older runs, models that never call
+/// `cite_memory`), every retrieved memory is treated as a silent
+/// passenger — i.e. weak ±0.1 instead of strong ±1. This is intentional:
+/// without citation evidence we shouldn't claim a memory "helped." The
+/// blame command surfaces the discrepancy so operators can encourage
+/// citation usage where the brain is under-rewarding good capsules.
 fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
-    let delta: i64 = match event.kind.as_str() {
-        "run.finished" => 1,
+    let (strong, weak): (f64, f64) = match event.kind.as_str() {
+        "run.finished" => (1.0, 0.1),
         "run.failed" => {
             let category = event
                 .payload
@@ -153,18 +212,26 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
             if category == "Gate" {
                 return Ok(());
             }
-            -1
+            (-1.0, -0.1)
         }
         _ => return Ok(()), // run.aborted, anything else: no update
     };
 
     let run_id = event.run_id.to_string();
-    let memory_ids = collect_injected_memory_ids(conn, &run_id)?;
-    if memory_ids.is_empty() {
+    let retrieved = collect_injected_memory_ids(conn, &run_id)?;
+    if retrieved.is_empty() {
         return Ok(());
     }
+    let cited = collect_cited_memory_ids(conn, &run_id)?;
+    let ts = ts_text(event)?;
+    // v0.5.1: bump `last_useful_at` only on cited + run.finished.
+    // Cited + run.failed doesn't count (the memory misled the
+    // model). Silent passengers never bump regardless of outcome.
+    let bump_last_useful = event.kind == "run.finished";
 
-    for memory_id in memory_ids {
+    for memory_id in &retrieved {
+        let is_cited = cited.contains(memory_id);
+        let delta = if is_cited { strong } else { weak };
         conn.execute(
             "
             UPDATE memories
@@ -173,10 +240,44 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
                 last_used_at = ?3
             WHERE memory_id = ?1
             ",
-            params![memory_id, delta as f64, ts_text(event)?],
+            params![memory_id, delta, ts],
         )?;
+        if is_cited && bump_last_useful {
+            // v0.5.1: separate column for the decay reference. We
+            // intentionally only touch it for confirmed successful
+            // citations so the half-life curve in `usefulness_-
+            // multiplier` reflects when the memory was last
+            // PROVEN to help — not just when it was retrieved.
+            conn.execute(
+                "UPDATE memories SET last_useful_at = ?2 WHERE memory_id = ?1",
+                params![memory_id, ts],
+            )?;
+        }
     }
     Ok(())
+}
+
+/// v0.5.1: walk this run's `memory_citations` rows and return the unique
+/// memory ids that the model explicitly cited via the `cite_memory` tool.
+/// Used by `apply_memory_usefulness_for_run` to give the strong delta
+/// only to memories that actually contributed to the model's reasoning.
+fn collect_cited_memory_ids(
+    conn: &Connection,
+    run_id: &str,
+) -> KimetsuResult<std::collections::BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT DISTINCT memory_id
+        FROM memory_citations
+        WHERE run_id = ?1
+        ",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+    let mut out = std::collections::BTreeSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
 }
 
 /// Walk this run's `context.injected` events and return the unique memory
@@ -199,10 +300,10 @@ fn collect_injected_memory_ids(conn: &Connection, run_id: &str) -> KimetsuResult
         let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
         if let Some(ids) = payload.get("memory_ids").and_then(|v| v.as_array()) {
             for id in ids {
-                if let Some(id_str) = id.as_str() {
-                    if !id_str.is_empty() {
-                        seen.insert(id_str.to_string());
-                    }
+                if let Some(id_str) = id.as_str()
+                    && !id_str.is_empty()
+                {
+                    seen.insert(id_str.to_string());
                 }
             }
         }
@@ -273,8 +374,12 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     )?;
 
     conn.execute(
-        "INSERT INTO memories_fts (text, kind, scope) VALUES (?1, ?2, ?3)",
-        params![text, kind, scope],
+        "DELETE FROM memories_fts WHERE memory_id = ?1",
+        params![memory_id],
+    )?;
+    conn.execute(
+        "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
+        params![memory_id, text, kind, scope],
     )?;
     Ok(())
 }

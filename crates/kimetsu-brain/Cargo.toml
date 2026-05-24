@@ -4,11 +4,38 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Project + user-scope memory, hybrid retrieval (lexical + cosine), ambient context, secret redaction at ingest for kimetsu."
+keywords = ["kimetsu", "memory", "rag", "retrieval", "embeddings"]
+categories = ["database", "development-tools"]
+
+[features]
+# v0.4.3: opt into the local fastembed-rs embedder so kimetsu can do
+# semantic retrieval (cosine over BGE / Jina-Code dense vectors).
+# Default OFF: the lean build keeps the NoopEmbedder + FTS-only
+# retrieval that v0.4.2 ships, so `cargo install kimetsu-cli`
+# without --features embeddings never downloads a model.
+default = []
+embeddings = ["dep:fastembed"]
 
 [dependencies]
 blake3.workspace = true
+# v0.4.3: fastembed-rs ships ONNX runtime + tokenizers + the model
+# loader. Behind the `embeddings` feature so the default build
+# stays dep-light (and so the Windows ort C++ runtime isn't
+# required to build kimetsu). Pinned to 5.* — that's the line that
+# supports BGE-M3 + Jina-v2-base-code alongside BGE-small.
+fastembed = { version = "5", optional = true }
 ignore.workspace = true
-kimetsu-core = { path = "../kimetsu-core" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.5.2" }
+# v0.4.5: regex backs the secret-redaction patterns in
+# `kimetsu_brain::redact`. The crate is already a workspace pin
+# elsewhere; we just opt this crate into it now.
+regex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,7 +1,14 @@
+pub mod ambient;
+pub mod benchmark;
+pub mod conflict;
 pub mod context;
+pub mod embeddings;
 pub mod ingest;
 pub mod lock;
 pub mod project;
 pub mod projector;
+pub mod redact;
+pub mod reindex;
 pub mod schema;
 pub mod trace;
+pub mod user_brain;

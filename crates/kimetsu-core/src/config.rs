@@ -90,6 +90,22 @@ pub struct BrokerWeights {
     pub patch_plan: Option<StageWeights>,
     pub verification: Option<StageWeights>,
     pub review: Option<StageWeights>,
+    /// v0.5.1: half-life (in days) for the usefulness-decay
+    /// multiplier. A memory's effective usefulness contribution
+    /// decays as `exp(-ln(2) * age_days / half_life)` where age is
+    /// measured from `last_useful_at` if present, else
+    /// `created_at`. 30 days = a 6-month-old useful memory ends
+    /// up at ~1.5% of its original weight; tune lower for faster-
+    /// changing repos, higher for slow-evolving ones.
+    ///
+    /// `#[serde(default)]` keeps pre-v0.5.1 project.toml files
+    /// loading cleanly — they get the 30-day default.
+    #[serde(default = "default_decay_half_life_days")]
+    pub decay_half_life_days: f32,
+}
+
+fn default_decay_half_life_days() -> f32 {
+    30.0
 }
 
 impl Default for BrokerWeights {
@@ -123,6 +139,7 @@ impl Default for BrokerWeights {
                 freshness: 0.20,
                 scope: 0.10,
             }),
+            decay_half_life_days: default_decay_half_life_days(),
         }
     }
 }

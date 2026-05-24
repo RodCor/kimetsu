@@ -1,21 +1,21 @@
 """Kimetsu â†” Harbor adapter (MP-7b).
 
-Bridges the Rust `kimetsu agent --harbor-mode` binary into Harbor's
+Bridges the Rust `kimetsu-harbor-agent` benchmark binary into Harbor's
 external-agent interface so Terminal-Bench can grade Kimetsu against
 the same tasks it grades Claude Code / Cursor / etc. on.
 
 The contract is:
 
   Harbor              â”€ instruction, environment â”€â”€> KimetsuAgent.run
-  KimetsuAgent.run    â”€ spawns kimetsu agent --harbor-mode --task â”€> subprocess
-  kimetsu subprocess  â”€ JSON-RPC tool.exec on stdout â”€â”€>            this adapter
+  KimetsuAgent.run    â”€ spawns kimetsu-harbor-agent --task â”€> subprocess
+  harbor subprocess   â”€ JSON-RPC tool.exec on stdout â”€â”€>            this adapter
   this adapter        â”€ environment.exec(...) â”€â”€>                   Harbor environment
   Harbor environment  â”€ {exit_code, stdout, stderr} â”€â”€>             this adapter
-  this adapter        â”€ JSON-RPC reply on subprocess.stdin â”€â”€>      kimetsu subprocess
-  kimetsu subprocess  â”€ JSON-RPC agent.done on stdout â”€â”€>           this adapter
+  this adapter        â”€ JSON-RPC reply on subprocess.stdin â”€â”€>      harbor subprocess
+  harbor subprocess   â”€ JSON-RPC agent.done on stdout â”€â”€>           this adapter
   KimetsuAgent.run    â”€ populated context â”€â”€>                       Harbor
 
-Protocol details live in `crates/kimetsu-agent/src/harbor.rs`. Only
+Protocol details live in `crates/kimetsu-harbor-rs/src/protocol.rs`. Only
 `tool.exec` and `agent.done` exist in v0.2; read/write/diff are all
 expressed as shell commands so the adapter only needs to translate one
 method.
@@ -27,7 +27,7 @@ Compatibility notes:
   back to safe defaults. Update `_normalize_exec_result` below when the
   exact contract is pinned down.
 - Harbor's `BaseAgent.run` is documented as `async`, so this adapter
-  uses asyncio. The kimetsu binary itself is sync (line-by-line JSON
+  uses asyncio. The Harbor adapter binary itself is sync (line-by-line JSON
   on stdin/stdout), but asyncio.create_subprocess_exec wraps it so we
   can `await` reads without blocking Harbor's event loop.
 """
@@ -72,33 +72,48 @@ except Exception:  # noqa: BLE001
 
 # --- Configuration ---------------------------------------------------------
 
-DEFAULT_KIMETSU_BIN_CANDIDATES: tuple[str, ...] = (
-    "kimetsu",
-    "kimetsu.exe",
-    "/usr/local/bin/kimetsu",
-    "target/release/kimetsu",
-    "target/release/kimetsu.exe",
-    "target/debug/kimetsu",
-    "target/debug/kimetsu.exe",
+WINDOWS_HARBOR_AGENT_BIN_CANDIDATES: tuple[str, ...] = (
+    "kimetsu-harbor-agent.exe",
+    "target/release/kimetsu-harbor-agent.exe",
+    "target/debug/kimetsu-harbor-agent.exe",
+    "kimetsu-harbor-agent",
+    "target/release/kimetsu-harbor-agent",
+    "target/debug/kimetsu-harbor-agent",
+    "/usr/local/bin/kimetsu-harbor-agent",
+)
+
+POSIX_HARBOR_AGENT_BIN_CANDIDATES: tuple[str, ...] = (
+    "kimetsu-harbor-agent",
+    "/usr/local/bin/kimetsu-harbor-agent",
+    "target/release/kimetsu-harbor-agent",
+    "target/debug/kimetsu-harbor-agent",
+    "kimetsu-harbor-agent.exe",
+    "target/release/kimetsu-harbor-agent.exe",
+    "target/debug/kimetsu-harbor-agent.exe",
 )
 
 PROTOCOL_VERSION = "0.1"
 
 
-def resolve_kimetsu_binary() -> str:
-    """Find the kimetsu binary. KIMETSU_BIN env var wins; then we walk a
+def resolve_harbor_agent_binary() -> str:
+    """Find the Harbor adapter binary. KIMETSU_HARBOR_BIN env var wins; then we walk a
     fixed list of common locations relative to CWD; finally we fall back
     to whatever `shutil.which` finds on PATH. Raises if nothing matches
     so the bench fails loudly rather than hanging."""
-    override = os.environ.get("KIMETSU_BIN")
+    override = os.environ.get("KIMETSU_HARBOR_BIN")
     if override:
         if not os.path.isfile(override):
             raise FileNotFoundError(
-                f"KIMETSU_BIN={override!r} does not exist or is not a file"
+                f"KIMETSU_HARBOR_BIN={override!r} does not exist or is not a file"
             )
         return override
 
-    for candidate in DEFAULT_KIMETSU_BIN_CANDIDATES:
+    candidates = (
+        WINDOWS_HARBOR_AGENT_BIN_CANDIDATES
+        if os.name == "nt"
+        else POSIX_HARBOR_AGENT_BIN_CANDIDATES
+    )
+    for candidate in candidates:
         path = shutil.which(candidate)
         if path:
             return path
@@ -106,8 +121,8 @@ def resolve_kimetsu_binary() -> str:
             return os.path.abspath(candidate)
 
     raise FileNotFoundError(
-        "could not locate the kimetsu binary; set KIMETSU_BIN or build "
-        "with `cargo build -p kimetsu-cli --release`"
+        "could not locate kimetsu-harbor-agent; set KIMETSU_HARBOR_BIN or build "
+        "with `cargo build -p kimetsu-harbor-rs --release`"
     )
 
 
@@ -204,12 +219,12 @@ def _format_shell_command(program: str, args: Iterable[str]) -> str:
 # --- The adapter -----------------------------------------------------------
 
 class KimetsuAgent(BaseAgent):
-    """Harbor external-agent wrapper around `kimetsu agent --harbor-mode`.
+    """Harbor external-agent wrapper around `kimetsu-harbor-agent`.
 
     Mode selection (MP-7d):
     - default: spawn kimetsu with the real model loop (claude_code
       provider). `CLAUDE_CODE_OAUTH_TOKEN` must be set in the
-      environment when the kimetsu binary starts.
+      environment when kimetsu-harbor-agent starts.
     - `KIMETSU_HARBOR_STUB=1`: pass `--stub` so the binary runs the
       protocol-only multi-step stub (no model calls). Used by the smoke
       test on machines without API credentials.
@@ -240,20 +255,20 @@ class KimetsuAgent(BaseAgent):
     ) -> None:
         """Drive one Terminal-Bench task end-to-end.
 
-        Spawns the kimetsu binary, pumps JSON-RPC frames until we receive
+        Spawns kimetsu-harbor-agent, pumps JSON-RPC frames until we receive
         `agent.done`, then returns. `context` is whatever Harbor expects
         us to populate; we treat it as a mapping if possible and fall back
         to setting attributes otherwise.
         """
-        binary = resolve_kimetsu_binary()
-        argv = [binary, "agent", "--harbor-mode", "--task", instruction]
+        binary = resolve_harbor_agent_binary()
+        argv = [binary, "--task", instruction]
         if os.environ.get("KIMETSU_HARBOR_STUB"):
             argv.append("--stub")
         model_override = os.environ.get("KIMETSU_HARBOR_MODEL")
         if model_override:
             argv.extend(["--model", model_override])
 
-        logger.info("starting kimetsu agent: argv=%r", argv)
+        logger.info("starting kimetsu harbor agent: argv=%r", argv)
 
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -292,7 +307,7 @@ class KimetsuAgent(BaseAgent):
                         except asyncio.TimeoutError:
                             exit_code = -1
                     raise RuntimeError(
-                        "kimetsu agent exited before emitting agent.done: "
+                        "kimetsu-harbor-agent exited before emitting agent.done: "
                         f"exit={exit_code}; stderr={stderr_bytes.decode(errors='replace')[:2000]}"
                     )
                 try:
@@ -307,15 +322,17 @@ class KimetsuAgent(BaseAgent):
                     program = params.get("program", "")
                     args = params.get("args", []) or []
                     cwd = params.get("cwd")
+                    timeout_secs = params.get("timeout_secs")
                     cmd = _format_shell_command(program, args)
                     logger.debug("forwarding tool.exec to environment: %s (cwd=%s)", cmd, cwd)
 
                     exec_result = await self._invoke_environment_exec(
-                        environment, cmd, cwd=cwd
+                        environment, cmd, cwd=cwd, timeout_secs=timeout_secs
                     )
                     tool_calls.append({
                         "program": program,
                         "args": list(args),
+                        "timeout_secs": timeout_secs,
                         "exit_code": exec_result.exit_code,
                     })
 
@@ -394,6 +411,7 @@ class KimetsuAgent(BaseAgent):
         cmd: str,
         *,
         cwd: str | None,
+        timeout_secs: Any,
     ) -> ExecResult:
         """Best-effort call into Harbor's environment.exec.
 
@@ -420,10 +438,22 @@ class KimetsuAgent(BaseAgent):
         kwargs: dict[str, Any] = {}
         if cwd:
             kwargs["cwd"] = cwd
+        if timeout_secs is not None:
+            try:
+                kwargs["timeout_sec"] = int(timeout_secs)
+            except (TypeError, ValueError):
+                pass
         try:
             raw = environment.exec(cmd, **kwargs)
         except TypeError:
-            raw = environment.exec(cmd)
+            if "timeout_sec" in kwargs:
+                kwargs.pop("timeout_sec", None)
+                try:
+                    raw = environment.exec(cmd, **kwargs)
+                except TypeError:
+                    raw = environment.exec(cmd)
+            else:
+                raw = environment.exec(cmd)
         if asyncio.iscoroutine(raw):
             raw = await raw
         return _normalize_exec_result(raw)

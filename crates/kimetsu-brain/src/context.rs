@@ -8,6 +8,39 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::embeddings::{
+    self, DEFAULT_HYBRID_ALPHA, Embedder, cosine_similarity, decode_embedding,
+};
+
+/// v0.4.2: a pre-computed query embedding paired with the producing
+/// model's id. Threaded down into [`memory_candidates`] so each row
+/// can decide whether to contribute a cosine term (only when the
+/// row's `embedding_model` matches the active query's `model_id`).
+#[derive(Debug, Clone)]
+struct QueryEmbedding {
+    vector: Vec<f32>,
+    model_id: String,
+}
+
+impl QueryEmbedding {
+    fn from_embedder(embedder: &dyn Embedder, query: &str) -> Option<Self> {
+        if embedder.is_noop() {
+            return None;
+        }
+        match embedder.embed(query) {
+            Ok(v) if v.len() == embedder.dim() => Some(Self {
+                vector: v,
+                model_id: embedder.model_id().to_string(),
+            }),
+            // NotImplemented / dim-mismatch / load failure → silently
+            // skip the cosine blend. v0.4.2 surfaces no warning here
+            // by design — the broker stays usable on best-effort
+            // semantic retrieval.
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextCapsule {
     pub id: String,
@@ -58,8 +91,74 @@ pub fn retrieve_context(
     weights: &BrokerWeights,
     request: ContextRequest,
 ) -> KimetsuResult<ContextBundle> {
+    retrieve_context_multi(conn, repo_root, weights, request, &[])
+}
+
+/// v0.4.1: multi-conn variant. `extra_memory_conns` is searched for
+/// memory candidates only (repo files + manifests stay project-local).
+/// The candidate stream is concatenated BEFORE normalization so the
+/// blended set is normalized together — keeping a user-brain capsule
+/// and a project-brain capsule comparable on the same `raw_relevance`
+/// scale.
+///
+/// Today `extra_memory_conns` carries at most one entry (the user
+/// brain at `~/.kimetsu/brain.db`); the slice shape leaves room for
+/// future scope tiers (team brain, org brain) without breaking the
+/// signature.
+///
+/// v0.4.2: uses [`embeddings::open_default_embedder`] for the cosine
+/// term. Pre-v0.4.3 the default is `NoopEmbedder`, which short-
+/// circuits the cosine path so retrieval stays FTS-only — exact
+/// v0.4.1 behavior. v0.4.3 swaps the default to a real embedder.
+pub fn retrieve_context_multi(
+    conn: &Connection,
+    repo_root: &str,
+    weights: &BrokerWeights,
+    request: ContextRequest,
+    extra_memory_conns: &[&Connection],
+) -> KimetsuResult<ContextBundle> {
+    let embedder = embeddings::open_default_embedder();
+    retrieve_context_with_embedder(
+        conn,
+        repo_root,
+        weights,
+        request,
+        extra_memory_conns,
+        embedder,
+    )
+}
+
+/// v0.4.2: explicit-embedder variant. Lets tests inject `StubEmbedder`
+/// or any other [`Embedder`] without going through
+/// [`embeddings::open_default_embedder`]. v0.4.3 callers (chat REPL,
+/// MCP server) can also use this directly to hold one embedder
+/// instance for the lifetime of a session instead of paying the
+/// model-load cost on every retrieval.
+pub fn retrieve_context_with_embedder(
+    conn: &Connection,
+    repo_root: &str,
+    weights: &BrokerWeights,
+    request: ContextRequest,
+    extra_memory_conns: &[&Connection],
+    embedder: &dyn Embedder,
+) -> KimetsuResult<ContextBundle> {
+    let query_embedding = QueryEmbedding::from_embedder(embedder, &request.query);
+    let half_life_days = weights.decay_half_life_days;
     let mut candidates = Vec::new();
-    candidates.extend(memory_candidates(conn, &request.query)?);
+    candidates.extend(memory_candidates(
+        conn,
+        &request.query,
+        query_embedding.as_ref(),
+        half_life_days,
+    )?);
+    for extra in extra_memory_conns {
+        candidates.extend(memory_candidates(
+            extra,
+            &request.query,
+            query_embedding.as_ref(),
+            half_life_days,
+        )?);
+    }
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
 
@@ -139,23 +238,60 @@ pub fn search_repo_files(
     Ok(capsules)
 }
 
-fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candidate>> {
+fn memory_candidates(
+    conn: &Connection,
+    query: &str,
+    query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
+) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
+    if let Some(fts_query) = fts_query(query) {
+        let candidates = memory_fts_candidates(
+            conn,
+            &query_tokens,
+            &fts_query,
+            80,
+            query_embedding,
+            half_life_days,
+        )?;
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+
+    latest_memory_candidates(conn, &query_tokens, 200, query_embedding, half_life_days)
+}
+
+fn latest_memory_candidates(
+    conn: &Connection,
+    query_tokens: &[String],
+    limit: u32,
+    query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
+) -> KimetsuResult<Vec<Candidate>> {
     // MP-4d: exclude invalidated memories from retrieval. The row stays in
     // brain.db so `memory list` and replay can still see the history; only
     // the broker filters it out.
-    let mut stmt = conn.prepare(
+    //
+    // v0.4.2: SELECT now also pulls the optional embedding + model id
+    // so we can blend a cosine score with the lexical match.
+    //
+    // v0.5.1: SELECT also pulls `last_useful_at` so the broker can
+    // apply the half-life decay term (memories that helped recently
+    // outvote memories that haven't been confirmed useful in months).
+    let mut stmt = conn.prepare_cached(
         "
         SELECT memory_id, scope, kind, text, confidence, created_at,
-               use_count, usefulness_score
+               use_count, usefulness_score, embedding, embedding_model,
+               last_useful_at
         FROM memories
         WHERE invalidated_at IS NULL
         ORDER BY created_at DESC
-        LIMIT 200
+        LIMIT ?1
         ",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![limit], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -165,50 +301,278 @@ fn memory_candidates(conn: &Connection, query: &str) -> KimetsuResult<Vec<Candid
             row.get::<_, String>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, f64>(7)?,
+            row.get::<_, Option<Vec<u8>>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
         ))
     })?;
 
     let mut candidates = Vec::new();
     for row in rows {
-        let (memory_id, scope, kind, text, confidence, created_at, use_count, usefulness_score) =
-            row?;
-        let raw_relevance = lexical_relevance(&query_tokens, &format!("{kind} {text}"));
-        if raw_relevance <= 0.0 && !query_tokens.is_empty() {
-            continue;
+        let (
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            embedding,
+            embedding_model,
+            last_useful_at,
+        ) = row?;
+        let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
+        if let Some(candidate) = memory_row_to_candidate(
+            query_tokens,
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            last_useful_at,
+            half_life_days,
+            None,
+            cosine,
+        ) {
+            candidates.push(candidate);
         }
-
-        let freshness = freshness(&created_at);
-        let scope_weight = scope_weight(&scope);
-        // MP-4b: bias raw_relevance by usefulness so memories that have
-        // consistently helped surface higher and memories that have
-        // consistently hurt surface lower. small_sample_threshold=3 means
-        // a fresh memory gets neutral treatment until it has data; the
-        // multiplier envelope is [0.5, 1.5] so a single memory cannot
-        // dominate the budget in either direction.
-        let multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
-        let biased_relevance = raw_relevance * multiplier;
-        candidates.push(Candidate {
-            raw_relevance: biased_relevance,
-            capsule: ContextCapsule {
-                id: new_id().to_string(),
-                kind: "memory".to_string(),
-                summary: format!("{scope}:{kind} - {text}"),
-                token_estimate: estimate_tokens(&text) + 8,
-                expansion_handle: format!("memory:{memory_id}"),
-                provenance: vec![ProvenanceRef {
-                    source: "Memory".to_string(),
-                    id: memory_id,
-                    excerpt: Some(excerpt(&text)),
-                }],
-                confidence,
-                freshness,
-                relevance: 0.0,
-                scope_weight,
-                score: 0.0,
-            },
-        });
     }
     Ok(candidates)
+}
+
+fn memory_fts_candidates(
+    conn: &Connection,
+    query_tokens: &[String],
+    fts_query: &str,
+    limit: u32,
+    query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
+) -> KimetsuResult<Vec<Candidate>> {
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT m.memory_id, m.scope, m.kind, m.text, m.confidence, m.created_at,
+               m.use_count, m.usefulness_score, bm25(memories_fts) AS rank,
+               m.embedding, m.embedding_model, m.last_useful_at
+        FROM memories_fts
+        JOIN memories m
+          ON m.memory_id = memories_fts.memory_id
+        WHERE m.invalidated_at IS NULL
+          AND memories_fts MATCH ?1
+        ORDER BY rank
+        LIMIT ?2
+        ",
+    )?;
+
+    let rows = stmt.query_map(params![fts_query, limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f32>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, f64>(7)?,
+            row.get::<_, f64>(8)?,
+            row.get::<_, Option<Vec<u8>>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            rank,
+            embedding,
+            embedding_model,
+            last_useful_at,
+        ) = row?;
+        let fts_relevance = (-rank as f32).max(0.0);
+        let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
+        if let Some(candidate) = memory_row_to_candidate(
+            query_tokens,
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            use_count,
+            usefulness_score,
+            last_useful_at,
+            half_life_days,
+            Some(fts_relevance),
+            cosine,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+/// v0.4.2: cosine helper used by both the FTS and latest-memory
+/// retrieval branches. Returns `Some(score in [-1, 1])` when a
+/// non-null embedding is present AND its `embedding_model` matches
+/// the active `query_embedding`'s model id. Otherwise None — the
+/// caller treats None as "lexical only".
+///
+/// Cross-model rows are intentionally NOT blended: a row embedded
+/// with `stub-d8` and a query embedded with `bge-small-en-v1.5`
+/// produce meaningless dot products. Falling back to FTS for those
+/// rows keeps hybrid retrieval safe across schema upgrades and
+/// `kimetsu brain reindex` migrations (v0.4.3).
+fn compute_cosine(
+    query_embedding: Option<&QueryEmbedding>,
+    row_bytes: Option<&[u8]>,
+    row_model: Option<&str>,
+) -> Option<f32> {
+    let q = query_embedding?;
+    let bytes = row_bytes?;
+    let model = row_model?;
+    if model != q.model_id {
+        return None;
+    }
+    let row_vec = match decode_embedding(bytes, Some(q.vector.len())) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    Some(cosine_similarity(&q.vector, &row_vec))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_row_to_candidate(
+    query_tokens: &[String],
+    memory_id: String,
+    scope: String,
+    kind: String,
+    text: String,
+    confidence: f32,
+    created_at: String,
+    use_count: i64,
+    usefulness_score: f64,
+    last_useful_at: Option<String>,
+    half_life_days: f32,
+    raw_relevance_override: Option<f32>,
+    cosine_score: Option<f32>,
+) -> Option<Candidate> {
+    let lexical = lexical_relevance(query_tokens, &format!("{kind} {text}"));
+    let lexical_term = raw_relevance_override.unwrap_or(lexical).max(lexical);
+
+    // v0.4.2: hybrid blend.
+    //   final = (1 - α) * lexical + α * normalized_cosine
+    // where normalized_cosine maps [-1, 1] -> [0, 1] so it composes
+    // with the lexical relevance scale.
+    //
+    // When cosine_score is None (NoopEmbedder, NULL row embedding,
+    // cross-model mismatch), the cosine term drops out and the
+    // candidate scores lexical-only — exact v0.4.1 behavior. The
+    // caller's gate `raw_relevance <= 0.0 && !query_tokens.is_empty()`
+    // still works because in the no-cosine path `raw_relevance ==
+    // lexical_term`.
+    let raw_relevance = match cosine_score {
+        Some(c) => {
+            let normalized_cos = ((c + 1.0) * 0.5).clamp(0.0, 1.0);
+            (1.0 - DEFAULT_HYBRID_ALPHA) * lexical_term + DEFAULT_HYBRID_ALPHA * normalized_cos
+        }
+        None => lexical_term,
+    };
+
+    // Drop the row when neither lexical nor cosine had any signal —
+    // an empty query OR a candidate that didn't match any of the
+    // search terms. The cosine-only path is still allowed through
+    // (raw_relevance > 0) for semantic-only matches against rows
+    // whose words don't textually overlap the query.
+    if raw_relevance <= 0.0 && !query_tokens.is_empty() {
+        return None;
+    }
+
+    let freshness = freshness(&created_at);
+    let scope_weight = scope_weight(&scope);
+    // v0.5.1: usefulness multiplier with half-life decay applied to
+    // the *deviation from neutral*. A 6-month-old memory that scored
+    // 1.5 (max boost) decays toward 1.0 (neutral) — NOT toward 0,
+    // because losing confidence in old signal shouldn't penalize a
+    // memory below a brand-new memory with zero history.
+    let raw_multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
+    let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
+    let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
+    let biased_relevance = raw_relevance * multiplier;
+    Some(Candidate {
+        raw_relevance: biased_relevance,
+        capsule: ContextCapsule {
+            id: new_id().to_string(),
+            kind: "memory".to_string(),
+            summary: format!("{scope}:{kind} - {text}"),
+            token_estimate: estimate_tokens(&text) + 8,
+            expansion_handle: format!("memory:{memory_id}"),
+            provenance: vec![ProvenanceRef {
+                source: "Memory".to_string(),
+                id: memory_id,
+                excerpt: Some(excerpt(&text)),
+            }],
+            confidence,
+            freshness,
+            relevance: 0.0,
+            scope_weight,
+            score: 0.0,
+        },
+    })
+}
+
+/// v0.5.1: half-life decay factor applied to the *deviation from
+/// neutral* of [`usefulness_multiplier`]. Returns a value in `[0.0,
+/// 1.0]` where 1.0 = "use full envelope" (memory was confirmed useful
+/// recently) and 0.0 = "treat as neutral" (memory's confirmation is
+/// ancient).
+///
+/// Reference timestamp:
+///   * `last_useful_at` (set by the projector when a cited memory's
+///     run ended in run.finished) if present
+///   * fallback to `created_at` so a brand-new memory that's never
+///     been cited yet decays from its birthday — same shape, but
+///     starts fresh.
+///
+/// Math:
+///   decay = exp(-ln(2) * age_days / half_life_days)
+/// so at age == half_life the contribution is halved, at 2*half_life
+/// it's quartered, etc.
+///
+/// Safety rails:
+///   * `half_life_days <= 0` disables decay (returns 1.0) so an
+///     operator can opt out via project.toml.
+///   * Unparseable RFC3339 timestamps return 1.0 — fail-open so a
+///     corrupted row doesn't get silently demoted out of retrieval.
+pub(crate) fn usefulness_decay(
+    last_useful_at: Option<&str>,
+    created_at: &str,
+    half_life_days: f32,
+) -> f32 {
+    if half_life_days <= 0.0 {
+        return 1.0;
+    }
+    let reference = last_useful_at.unwrap_or(created_at);
+    let Ok(reference_ts) =
+        OffsetDateTime::parse(reference, &time::format_description::well_known::Rfc3339)
+    else {
+        return 1.0;
+    };
+    let age = OffsetDateTime::now_utc() - reference_ts;
+    let age_days = (age.whole_seconds().max(0) as f32) / 86_400.0;
+    let exponent = -std::f32::consts::LN_2 * age_days / half_life_days;
+    exponent.exp().clamp(0.0, 1.0)
 }
 
 /// MP-4b multiplier in [0.5, 1.5] derived from a memory's outcome history.
@@ -246,7 +610,7 @@ fn repo_file_candidates(
         return Ok(Vec::new());
     };
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT path, snippet, language_guess, bm25(repo_files_fts) AS rank
         FROM repo_files_fts
@@ -300,8 +664,15 @@ fn manifest_candidates(
     repo_root: &str,
     query: &str,
 ) -> KimetsuResult<Vec<Candidate>> {
+    if let Some(fts_query) = fts_query(query) {
+        let candidates = manifest_fts_candidates(conn, repo_root, &fts_query, 30)?;
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+
     let query_tokens = query_tokens(query);
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT manifest_path, manifest_kind, parsed_summary_json
         FROM repo_manifests
@@ -326,6 +697,62 @@ fn manifest_candidates(
         if raw_relevance <= 0.0 && !query_tokens.is_empty() {
             continue;
         }
+        let summary = format!("{path} manifest ({kind})");
+        let token_estimate = estimate_tokens(&summary) + 8;
+        candidates.push(Candidate {
+            raw_relevance,
+            capsule: ContextCapsule {
+                id: new_id().to_string(),
+                kind: "repo_manifest".to_string(),
+                summary,
+                token_estimate,
+                expansion_handle: format!("file:{path}"),
+                provenance: vec![ProvenanceRef {
+                    source: "Manifest".to_string(),
+                    id: path,
+                    excerpt: Some(excerpt(&summary_json)),
+                }],
+                confidence: 0.95,
+                freshness: 1.0,
+                relevance: 0.0,
+                scope_weight: 0.9,
+                score: 0.0,
+            },
+        });
+    }
+    Ok(candidates)
+}
+
+fn manifest_fts_candidates(
+    conn: &Connection,
+    repo_root: &str,
+    fts_query: &str,
+    limit: u32,
+) -> KimetsuResult<Vec<Candidate>> {
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT manifest_path, manifest_kind, parsed_summary_json,
+               bm25(repo_manifests_fts) AS rank
+        FROM repo_manifests_fts
+        WHERE repo_root = ?1 AND repo_manifests_fts MATCH ?2
+        ORDER BY rank
+        LIMIT ?3
+        ",
+    )?;
+
+    let rows = stmt.query_map(params![repo_root, fts_query, limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, f64>(3)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (path, kind, summary_json, rank) = row?;
+        let raw_relevance = (-rank as f32).max(0.0);
         let summary = format!("{path} manifest ({kind})");
         let token_estimate = estimate_tokens(&summary) + 8;
         candidates.push(Candidate {
@@ -451,15 +878,38 @@ fn query_tokens(query: &str) -> Vec<String> {
 // surface preferentially.
 const CLASS_HINTS: &[(&[&str], &[&str])] = &[
     (
-        &["build", "compile", "make", "cargo", "cmake", "configure", "install", "train", "benchmark", "test suite", "ray trace", "render"],
-        &["shell_background", "shell_status", "shell_output", "shell_stop", "long_running"],
+        &[
+            "build",
+            "compile",
+            "make",
+            "cargo",
+            "cmake",
+            "configure",
+            "install",
+            "train",
+            "benchmark",
+            "test suite",
+            "ray trace",
+            "render",
+        ],
+        &[
+            "shell_background",
+            "shell_status",
+            "shell_output",
+            "shell_stop",
+            "long_running",
+        ],
     ),
     (
-        &["edit", "modify", "change", "fix", "update", "patch", "refactor", "rename"],
+        &[
+            "edit", "modify", "change", "fix", "update", "patch", "refactor", "rename",
+        ],
         &["edit_file", "apply_patch", "old_string", "new_string"],
     ),
     (
-        &["read", "inspect", "review", "analyze", "examine", "view", "show"],
+        &[
+            "read", "inspect", "review", "analyze", "examine", "view", "show",
+        ],
         &["read_file", "offset", "limit", "multi_read"],
     ),
     (
@@ -471,21 +921,30 @@ const CLASS_HINTS: &[(&[&str], &[&str])] = &[
         &["plan", "todos"],
     ),
     (
-        &["verify", "check", "ensure", "validate", "pass test", "verifier"],
+        &[
+            "verify",
+            "check",
+            "ensure",
+            "validate",
+            "pass test",
+            "verifier",
+        ],
         &["finish", "verifier", "verification"],
     ),
     (
-        &["image", "png", "jpeg", "jpg", "pdf", "diagram", "screenshot"],
+        &[
+            "image",
+            "png",
+            "jpeg",
+            "jpg",
+            "pdf",
+            "diagram",
+            "screenshot",
+        ],
         &["view_image", "base64", "sha256"],
     ),
-    (
-        &["delete", "remove", "rm "],
-        &["delete_file", "recursive"],
-    ),
-    (
-        &["rename", "move file", "mv "],
-        &["move_file"],
-    ),
+    (&["delete", "remove", "rm "], &["delete_file", "recursive"]),
+    (&["rename", "move file", "mv "], &["move_file"]),
 ];
 
 fn fts_query(query: &str) -> Option<String> {
@@ -514,10 +973,7 @@ fn fts_query(query: &str) -> Option<String> {
 /// manifest) get a 0.5 similarity floor so redundancy is only penalized
 /// within-kind (a memory and a repo_file aren't really redundant even
 /// if they share words).
-fn apply_mmr_diversity(
-    mut sorted: Vec<ContextCapsule>,
-    lambda: f32,
-) -> Vec<ContextCapsule> {
+fn apply_mmr_diversity(mut sorted: Vec<ContextCapsule>, lambda: f32) -> Vec<ContextCapsule> {
     if sorted.len() <= 1 {
         return sorted;
     }
@@ -633,15 +1089,18 @@ mod tests {
         // use_count = 1, ratio = 1.0 -> confidence 1/3, blend toward 1.5
         // expected = 1.0 * 2/3 + 1.5 * 1/3 = 1.1667
         let one_use = usefulness_multiplier(1.0, 1);
-        assert!((one_use - 1.16666666).abs() < 1e-4, "got {one_use}");
+        assert!((one_use - 1.166_666_6).abs() < 1e-4, "got {one_use}");
         // use_count = 2, ratio = 1.0 -> confidence 2/3, blend toward 1.5
         // expected = 1.0 * 1/3 + 1.5 * 2/3 = 1.3333
         let two_uses = usefulness_multiplier(2.0, 2);
-        assert!((two_uses - 1.33333333).abs() < 1e-4, "got {two_uses}");
+        assert!((two_uses - 1.333_333_4).abs() < 1e-4, "got {two_uses}");
         // use_count = 2 with ratio = -1.0 should pull toward the penalty side.
         let two_uses_bad = usefulness_multiplier(-2.0, 2);
         // expected = 1.0 * 1/3 + 0.5 * 2/3 = 0.6667
-        assert!((two_uses_bad - 0.66666666).abs() < 1e-4, "got {two_uses_bad}");
+        assert!(
+            (two_uses_bad - 0.666_666_7).abs() < 1e-4,
+            "got {two_uses_bad}"
+        );
     }
 
     /// MP-4b: at use_count >= 3 the multiplier maps ratio in [-1, 1] linearly
@@ -730,8 +1189,10 @@ mod tests {
 
     #[test]
     fn jaccard_partial_overlap() {
-        let a: std::collections::HashSet<String> =
-            ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        let a: std::collections::HashSet<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let b: std::collections::HashSet<String> =
             ["bar", "qux"].iter().map(|s| s.to_string()).collect();
         // intersection = {bar} = 1, union = {foo,bar,baz,qux} = 4
@@ -747,5 +1208,453 @@ mod tests {
         assert!(set.contains("project"));
         // "the" is len=3, included; "a" or "i" would be excluded.
         assert!(set.contains("the"));
+    }
+
+    // ----- v0.4.2: hybrid retrieval end-to-end -----
+
+    /// Helper: open an in-memory brain.db, initialize schema, insert
+    /// a memory row (post-projector shape) plus its embedding +
+    /// embedding_model and the matching FTS entry.
+    fn insert_memory_with_embedding(
+        conn: &rusqlite::Connection,
+        memory_id: &str,
+        text: &str,
+        embedder: &dyn embeddings::Embedder,
+    ) {
+        let normalized = kimetsu_core::memory::normalize_memory_text(text);
+        conn.execute(
+            "
+            INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text, confidence,
+                source_event_id, provenance_snapshot_json, created_at,
+                use_count, usefulness_score, embedding, embedding_model
+            )
+            VALUES (?1, 'global_user', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                    '2026-05-01T00:00:00Z', 0, 0.0, ?4, ?5)
+            ",
+            rusqlite::params![
+                memory_id,
+                text,
+                normalized,
+                embeddings::encode_embedding(&embedder.embed(text).expect("embed test row")),
+                embedder.model_id(),
+            ],
+        )
+        .expect("insert memory");
+        conn.execute(
+            "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, 'fact', 'global_user')",
+            rusqlite::params![memory_id, text],
+        )
+        .expect("insert fts row");
+    }
+
+    /// v0.4.2: the cosine blend changes retrieval ranking when two
+    /// memories tie lexically but differ semantically (via the stub
+    /// embedder's hashed-bucket vectors).
+    ///
+    /// Setup: two memories, neither containing the query's literal
+    /// words. With pure FTS, neither matches and we fall back to
+    /// latest-memory ranking. With the stub embedder enabled, the
+    /// memory that's "semantically closer" to the query (shares
+    /// hash buckets) outranks the other.
+    #[test]
+    fn hybrid_retrieval_uses_cosine_score_to_rerank() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+
+        insert_memory_with_embedding(&conn, "m_rg", "use ripgrep for code search", &stub);
+        insert_memory_with_embedding(
+            &conn,
+            "m_unrelated",
+            "cookie recipe with chocolate chips",
+            &stub,
+        );
+
+        // Query shares words with m_rg but not m_unrelated. FTS will
+        // already prefer m_rg here; we use that as the baseline.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &stub,
+        )
+        .expect("retrieve");
+
+        let memory_handles: Vec<_> = bundle
+            .capsules
+            .iter()
+            .filter(|c| c.expansion_handle.starts_with("memory:"))
+            .collect();
+        assert!(
+            !memory_handles.is_empty(),
+            "at least one memory should surface"
+        );
+        // The semantically-relevant memory must rank first.
+        assert_eq!(
+            memory_handles[0].expansion_handle,
+            "memory:m_rg",
+            "ripgrep memory should outrank the cookie recipe; ranked: {:?}",
+            memory_handles
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// v0.4.2: when a row's stored `embedding_model` doesn't match
+    /// the active query embedder's id, the row's cosine contribution
+    /// is skipped — falling back to FTS-only for that row. Critical
+    /// for safety across `kimetsu brain reindex` migrations (v0.4.3)
+    /// where some rows might be embedded with the new model and some
+    /// with the old.
+    #[test]
+    fn hybrid_retrieval_skips_cosine_on_model_id_mismatch() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+        insert_memory_with_embedding(&conn, "m_xref", "use ripgrep for code search", &stub);
+
+        // Stomp the row's embedding_model with a synthetic id that
+        // doesn't match the active embedder. Simulates a `kimetsu
+        // brain reindex` mid-migration where some rows are on the
+        // new model and some on the old.
+        conn.execute(
+            "UPDATE memories SET embedding_model = 'bge-small-en-v1.5' WHERE memory_id = 'm_xref'",
+            [],
+        )
+        .expect("force model_id mismatch");
+
+        // Query through the stub embedder. Its model_id is "stub-d8";
+        // the row's is "bge-small-en-v1.5". The cosine path MUST be
+        // skipped for this row; FTS still surfaces it on the lexical
+        // match because retrieval doesn't crash on cross-model rows.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &stub,
+        )
+        .expect("retrieve");
+
+        assert!(
+            bundle
+                .capsules
+                .iter()
+                .any(|c| c.expansion_handle == "memory:m_xref"),
+            "cross-model row should still match lexically (cosine skipped, FTS works)"
+        );
+    }
+
+    // ----- v0.5.1: usefulness decay -----
+
+    /// v0.5.1: `half_life_days <= 0` is the operator opt-out hatch.
+    /// Decay must short-circuit to 1.0 so the usefulness multiplier
+    /// is unmodified — exact pre-v0.5.1 behavior for projects that
+    /// set `decay_half_life_days = 0` in project.toml.
+    #[test]
+    fn usefulness_decay_disabled_when_half_life_is_zero_or_negative() {
+        // Even a 5-year-old reference returns 1.0 with decay disabled.
+        let ancient = "2021-01-01T00:00:00Z";
+        assert!((usefulness_decay(Some(ancient), ancient, 0.0) - 1.0).abs() < f32::EPSILON);
+        assert!((usefulness_decay(Some(ancient), ancient, -1.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// v0.5.1: unparseable timestamps return 1.0 (fail-open). A
+    /// corrupted row shouldn't get silently dropped out of retrieval
+    /// just because its `last_useful_at` got mangled.
+    #[test]
+    fn usefulness_decay_returns_one_on_unparseable_timestamps() {
+        assert!((usefulness_decay(Some("not-a-date"), "also-not", 30.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// v0.5.1: a memory whose reference timestamp is "now" (no age)
+    /// decays by zero — full contribution.
+    #[test]
+    fn usefulness_decay_full_at_zero_age() {
+        // Use a timestamp from the future so age clamps to 0.
+        let future = "2099-01-01T00:00:00Z";
+        let d = usefulness_decay(Some(future), future, 30.0);
+        assert!((d - 1.0).abs() < f32::EPSILON, "got {d}");
+    }
+
+    /// v0.5.1: at age == half_life, decay = 0.5; at age = 2 * half_life,
+    /// decay = 0.25. Computed by setting `last_useful_at` to (now - days)
+    /// using OffsetDateTime arithmetic — the only way to get a stable
+    /// "now-relative" timestamp without freezing the clock.
+    #[test]
+    fn usefulness_decay_follows_half_life_curve() {
+        let half_life = 10.0_f32;
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+
+        // age = half_life -> decay ~= 0.5
+        let one_half_life_ago =
+            (now - time::Duration::seconds((half_life * 86_400.0) as i64))
+                .format(fmt)
+                .expect("format");
+        let d1 = usefulness_decay(Some(&one_half_life_ago), &one_half_life_ago, half_life);
+        assert!(
+            (d1 - 0.5).abs() < 0.01,
+            "expected ~0.5 at one half-life, got {d1}"
+        );
+
+        // age = 2 * half_life -> decay ~= 0.25
+        let two_half_lives_ago =
+            (now - time::Duration::seconds((2.0 * half_life * 86_400.0) as i64))
+                .format(fmt)
+                .expect("format");
+        let d2 = usefulness_decay(
+            Some(&two_half_lives_ago),
+            &two_half_lives_ago,
+            half_life,
+        );
+        assert!(
+            (d2 - 0.25).abs() < 0.01,
+            "expected ~0.25 at two half-lives, got {d2}"
+        );
+    }
+
+    /// v0.5.1: when `last_useful_at` is None the function falls back to
+    /// `created_at`. A 1-day-old never-cited memory should still get
+    /// nearly-full decay (close to 1.0) for a 30-day half-life.
+    #[test]
+    fn usefulness_decay_falls_back_to_created_at_when_last_useful_is_none() {
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let one_day_ago = (now - time::Duration::seconds(86_400))
+            .format(fmt)
+            .expect("format");
+        let d = usefulness_decay(None, &one_day_ago, 30.0);
+        // exp(-ln(2) / 30) ≈ 0.977
+        assert!(
+            (d - 0.977).abs() < 0.01,
+            "expected ~0.977 for 1-day-old created_at under 30d half-life, got {d}"
+        );
+    }
+
+    /// v0.5.1: end-to-end retrieval test. Two memories with identical
+    /// lexical match, identical use_count, identical (max) usefulness
+    /// score — one cited yesterday, one cited a year ago. Decay must
+    /// rank the recent one first.
+    #[test]
+    fn aged_cited_memory_ranks_below_recently_cited_memory() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let one_day_ago = (now - time::Duration::seconds(86_400))
+            .format(fmt)
+            .expect("format");
+        let one_year_ago = (now - time::Duration::seconds(365 * 86_400))
+            .format(fmt)
+            .expect("format");
+
+        // Both memories say "use ripgrep for code search", both have
+        // use_count = 5, usefulness_score = 5 (max boost → 1.5
+        // multiplier). The only difference is `last_useful_at`.
+        for (mid, last_useful) in
+            [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)]
+        {
+            let text = "use ripgrep for code search";
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at,
+                    use_count, usefulness_score, last_useful_at
+                )
+                VALUES (?1, 'global_user', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                        '2024-01-01T00:00:00Z', 5, 5.0, ?4)
+                ",
+                rusqlite::params![mid, text, normalized, last_useful],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+
+        // Default broker weights → 30-day half-life. 1 year ≈ 12 half-lives.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        let mem_order: Vec<&str> = bundle
+            .capsules
+            .iter()
+            .filter_map(|c| {
+                c.expansion_handle
+                    .strip_prefix("memory:")
+                    .map(|s| s)
+            })
+            .collect();
+        assert_eq!(
+            mem_order.first().copied(),
+            Some("m_recent"),
+            "recently-cited memory must rank first under decay; got order {mem_order:?}"
+        );
+    }
+
+    /// v0.5.1: with decay disabled (half_life = 0) the aged + recent
+    /// memories tie and the deterministic tiebreaker (id) decides —
+    /// proves the ranking flip in the previous test is *caused* by
+    /// decay, not by some unrelated side effect of the timestamp.
+    #[test]
+    fn aged_cited_memory_does_not_decay_when_half_life_is_zero() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let one_day_ago = (now - time::Duration::seconds(86_400))
+            .format(fmt)
+            .expect("format");
+        let one_year_ago = (now - time::Duration::seconds(365 * 86_400))
+            .format(fmt)
+            .expect("format");
+
+        for (mid, last_useful) in
+            [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)]
+        {
+            let text = "use ripgrep for code search";
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at,
+                    use_count, usefulness_score, last_useful_at
+                )
+                VALUES (?1, 'global_user', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                        '2024-01-01T00:00:00Z', 5, 5.0, ?4)
+                ",
+                rusqlite::params![mid, text, normalized, last_useful],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+
+        // Disable decay via broker config.
+        let mut weights = kimetsu_core::config::BrokerWeights::default();
+        weights.decay_half_life_days = 0.0;
+
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        // Both memories should surface. With decay disabled, their
+        // scores are identical (same multiplier, same lexical match,
+        // same freshness band since both created_at are equal). The
+        // sort tiebreaker falls back to id, so m_aged < m_recent
+        // alphabetically.
+        let scores: Vec<(String, f32)> = bundle
+            .capsules
+            .iter()
+            .filter_map(|c| {
+                c.expansion_handle
+                    .strip_prefix("memory:")
+                    .map(|id| (id.to_string(), c.score))
+            })
+            .collect();
+        assert_eq!(scores.len(), 2, "both memories should surface");
+        let recent_score = scores
+            .iter()
+            .find(|(id, _)| id == "m_recent")
+            .map(|(_, s)| *s)
+            .expect("m_recent present");
+        let aged_score = scores
+            .iter()
+            .find(|(id, _)| id == "m_aged")
+            .map(|(_, s)| *s)
+            .expect("m_aged present");
+        // With decay off, the two multipliers are equal → scores match.
+        assert!(
+            (recent_score - aged_score).abs() < 1e-4,
+            "with decay disabled the two memories should tie on score: recent={recent_score} aged={aged_score}"
+        );
+    }
+
+    /// v0.4.2: with [`NoopEmbedder`] the retrieval path is identical
+    /// to v0.4.1 — no cosine term contributes, stored embeddings (if
+    /// any) are ignored. Regression guard so the default build
+    /// behaves identically to pre-v0.4.2.
+    #[test]
+    fn hybrid_retrieval_with_noop_embedder_is_lexical_only() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+        // Two memories, both with non-null embeddings.
+        insert_memory_with_embedding(&conn, "m_a", "use ripgrep", &stub);
+        insert_memory_with_embedding(&conn, "m_b", "use ripgrep too", &stub);
+
+        // Query through the Noop default. QueryEmbedding will be
+        // None → no cosine blend → exact FTS ranking.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        let count = bundle
+            .capsules
+            .iter()
+            .filter(|c| c.expansion_handle.starts_with("memory:"))
+            .count();
+        assert_eq!(count, 2, "both memories should surface via FTS");
     }
 }

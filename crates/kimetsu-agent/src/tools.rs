@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use serde_json::Value;
 use similar::TextDiff;
 
 const TRACE_STRING_CAP_BYTES: usize = 64 * 1024;
+const SHELL_ARTIFACT_THRESHOLD_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeConfig {
@@ -22,6 +24,7 @@ pub struct ToolRuntimeConfig {
     pub model_output_cap_bytes: usize,
     pub disk_output_cap_bytes: usize,
     pub redact_secrets: bool,
+    pub trace_fsync: bool,
     pub env_allowlist_extra: Vec<String>,
 }
 
@@ -33,6 +36,7 @@ impl Default for ToolRuntimeConfig {
             model_output_cap_bytes: 64 * 1024,
             disk_output_cap_bytes: 256 * 1024 * 1024,
             redact_secrets: true,
+            trace_fsync: true,
             env_allowlist_extra: Vec::new(),
         }
     }
@@ -67,11 +71,11 @@ pub struct RawShellOutput {
 
 /// MP-7c: pluggable shell backend. `LocalShellExecutor` (default) runs
 /// the subprocess via `std::process::Command::new` on the host machine.
-/// `HarborShellExecutor` (in `crate::harbor`) proxies the call through
-/// the kimetsu↔Harbor JSON-RPC protocol so commands actually run inside
-/// Harbor's container during Terminal-Bench grading.
+/// Benchmark adapters can supply their own executor; for example
+/// `kimetsu-harbor-rs` proxies calls through the Kimetsu/Harbor JSON-RPC
+/// protocol so commands run inside the Terminal-Bench container.
 ///
-/// The trait is intentionally narrow — only `execute` — so adding a new
+/// The trait is intentionally narrow - only `execute` - so adding a new
 /// backend (Daytona, Vercel Sandbox, etc.) is one impl block.
 pub trait ShellExecutor {
     fn execute(
@@ -83,7 +87,7 @@ pub trait ShellExecutor {
 }
 
 /// Default executor: runs the subprocess locally. Behavior is identical
-/// to what `shell_command_inner` did before MP-7c — `env_clear` plus an
+/// to what `shell_command_inner` did before MP-7c - `env_clear` plus an
 /// allowlist of host env vars, hard timeout with process-tree kill.
 pub struct LocalShellExecutor;
 
@@ -147,8 +151,8 @@ pub struct ToolRuntime {
     active_plan: Option<ToolPatchPlan>,
     config: ToolRuntimeConfig,
     /// MP-7c: backend that actually runs `shell_command` invocations.
-    /// `LocalShellExecutor` is the default; harbor mode swaps in
-    /// `HarborShellExecutor` to route through the JSON-RPC bridge.
+    /// `LocalShellExecutor` is the default; benchmark adapters can swap in
+    /// a transport-specific executor to route through their bridge.
     shell_executor: Box<dyn ShellExecutor>,
 }
 
@@ -182,8 +186,8 @@ impl ToolRuntime {
         self
     }
 
-    /// MP-7c: swap the shell backend. Pass a `HarborShellExecutor` to
-    /// route every `shell_command` call through Harbor's container; pass
+    /// MP-7c: swap the shell backend. Benchmark adapters use this to route
+    /// `shell_command` calls through their container; pass
     /// `LocalShellExecutor` (the default) for normal host-side runs.
     pub fn with_shell_executor(mut self, executor: Box<dyn ShellExecutor>) -> Self {
         self.shell_executor = executor;
@@ -234,6 +238,29 @@ impl ToolRuntime {
         let call = self.begin_tool("read_file", &input)?;
         let started = Instant::now();
         let result = self.read_file_inner(&input);
+        self.finish_tool(call, started, result)
+    }
+
+    pub fn read_file_lines(
+        &mut self,
+        input: ReadFileLinesInput,
+    ) -> KimetsuResult<ReadFileLinesOutput> {
+        let call = self.begin_tool("read_file", &input)?;
+        let started = Instant::now();
+        let result = self.read_file_lines_inner(&input).map(|mut output| {
+            output.duration_ms = started.elapsed().as_millis() as u64;
+            output
+        });
+        self.finish_tool(call, started, result)
+    }
+
+    pub fn multi_read_lines(
+        &mut self,
+        input: MultiReadLinesInput,
+    ) -> KimetsuResult<MultiReadLinesOutput> {
+        let call = self.begin_tool("multi_read", &input)?;
+        let started = Instant::now();
+        let result = self.multi_read_lines_inner(&input);
         self.finish_tool(call, started, result)
     }
 
@@ -319,7 +346,7 @@ impl ToolRuntime {
             }),
         );
         if let Some(writer) = &mut self.trace_writer {
-            writer.append(&event, true)?;
+            writer.append(&event, self.config.trace_fsync)?;
         }
         Ok(ToolCallTrace {
             tool_call_id,
@@ -347,7 +374,7 @@ impl ToolRuntime {
                     }),
                 );
                 if let Some(writer) = &mut self.trace_writer {
-                    writer.append(&event, true)?;
+                    writer.append(&event, self.config.trace_fsync)?;
                 }
                 Ok(output)
             }
@@ -364,7 +391,7 @@ impl ToolRuntime {
                     }),
                 );
                 if let Some(writer) = &mut self.trace_writer {
-                    writer.append(&event, true)?;
+                    writer.append(&event, self.config.trace_fsync)?;
                 }
                 Err(err)
             }
@@ -391,6 +418,84 @@ impl ToolRuntime {
             truncated,
             hash: blake3::hash(&bytes).to_hex().to_string(),
             size: bytes.len() as u64,
+        })
+    }
+
+    fn read_file_lines_inner(
+        &self,
+        input: &ReadFileLinesInput,
+    ) -> KimetsuResult<ReadFileLinesOutput> {
+        let path = normalize_repo_path(&input.path)?;
+        reject_protected_repo_path(&path)?;
+        let full_path = self.resolve_existing(&path)?;
+        if full_path.is_dir() {
+            return Err("path_is_directory".into());
+        }
+        if looks_binary_prefix(&full_path)? {
+            return Err("binary".into());
+        }
+
+        let offset = input.offset.max(1);
+        let limit = input.limit;
+        let end_line = offset.saturating_add(limit).saturating_sub(1);
+        let file = fs::File::open(&full_path)?;
+        let mut reader = BufReader::new(file);
+        let mut buf = String::new();
+        let mut content = String::new();
+        let mut line_no = 0u32;
+        let mut returned = 0u32;
+
+        loop {
+            buf.clear();
+            let read = reader.read_line(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            line_no = line_no.saturating_add(1);
+            if line_no >= offset && line_no <= end_line {
+                content.push_str(&buf);
+                returned = returned.saturating_add(1);
+            }
+        }
+
+        let truncated = line_no > end_line;
+        Ok(ReadFileLinesOutput {
+            path,
+            content,
+            offset,
+            limit,
+            lines_returned: returned,
+            lines_total: Some(line_no),
+            truncated,
+            duration_ms: 0,
+        })
+    }
+
+    fn multi_read_lines_inner(
+        &self,
+        input: &MultiReadLinesInput,
+    ) -> KimetsuResult<MultiReadLinesOutput> {
+        let started = Instant::now();
+        let mut files = Vec::with_capacity(input.files.len());
+        for file in &input.files {
+            let file_started = Instant::now();
+            match self.read_file_lines_inner(file) {
+                Ok(mut output) => {
+                    output.duration_ms = file_started.elapsed().as_millis() as u64;
+                    files.push(serde_json::to_value(output)?);
+                }
+                Err(err) => {
+                    files.push(serde_json::json!({
+                        "error": err.to_string(),
+                        "path": file.path.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(MultiReadLinesOutput {
+            files_returned: files.len() as u32,
+            duration_ms: started.elapsed().as_millis() as u64,
+            files,
         })
     }
 
@@ -474,25 +579,35 @@ impl ToolRuntime {
         validate_command_policy(input)?;
 
         // MP-7c: subprocess work delegated to the shell executor. The
-        // executor decides whether to run locally or proxy via the
-        // Harbor JSON-RPC bridge; everything around it (redaction,
+        // executor decides whether to run locally or proxy through a
+        // transport bridge; everything around it (redaction,
         // artifact write-out, capped summaries) is pipeline-side and
         // identical regardless of where the command ran.
         let raw = self
             .shell_executor
             .execute(&self.repo_root, input, &self.config)?;
 
-        let mut stdout = String::from_utf8_lossy(&raw.stdout).to_string();
-        let mut stderr = String::from_utf8_lossy(&raw.stderr).to_string();
-        if self.config.redact_secrets {
-            stdout = redact_text(&stdout);
-            stderr = redact_text(&stderr);
-        }
-
-        let capped_stdout = cap_string(&stdout, self.config.model_output_cap_bytes);
-        let capped_stderr = cap_string(&stderr, self.config.model_output_cap_bytes);
-        let (stdout_artifact, stderr_artifact) =
-            self.write_stream_artifacts(stdout.as_bytes(), stderr.as_bytes())?;
+        let capped_stdout = summarize_shell_stream(
+            &raw.stdout,
+            self.config.model_output_cap_bytes,
+            self.config.redact_secrets,
+        );
+        let capped_stderr = summarize_shell_stream(
+            &raw.stderr,
+            self.config.model_output_cap_bytes,
+            self.config.redact_secrets,
+        );
+        let unexpected_exit = raw.exit_code != input.expected_exit.unwrap_or(0);
+        let stdout_artifact_needed =
+            should_write_shell_artifact(&raw.stdout, unexpected_exit, raw.timed_out);
+        let stderr_artifact_needed =
+            should_write_shell_artifact(&raw.stderr, unexpected_exit, raw.timed_out);
+        let (stdout_artifact, stderr_artifact) = self.write_stream_artifacts(
+            &raw.stdout,
+            stdout_artifact_needed,
+            &raw.stderr,
+            stderr_artifact_needed,
+        )?;
 
         Ok(ShellCommandOutput {
             exit_code: raw.exit_code,
@@ -702,27 +817,47 @@ impl ToolRuntime {
     fn write_stream_artifacts(
         &self,
         stdout: &[u8],
+        write_stdout: bool,
         stderr: &[u8],
+        write_stderr: bool,
     ) -> KimetsuResult<(Option<String>, Option<String>)> {
         let Some(run_paths) = &self.run_paths else {
             return Ok((None, None));
         };
+        if !write_stdout && !write_stderr {
+            return Ok((None, None));
+        }
         fs::create_dir_all(&run_paths.artifacts_dir)?;
         let id = EventId(new_id()).to_string();
-        let stdout_path = run_paths.artifacts_dir.join(format!("{id}.stdout"));
-        let stderr_path = run_paths.artifacts_dir.join(format!("{id}.stderr"));
-        fs::write(
-            &stdout_path,
-            cap_bytes(stdout, self.config.disk_output_cap_bytes),
-        )?;
-        fs::write(
-            &stderr_path,
-            cap_bytes(stderr, self.config.disk_output_cap_bytes),
-        )?;
-        Ok((
-            Some(format!("artifacts/{id}.stdout")),
-            Some(format!("artifacts/{id}.stderr")),
-        ))
+        let stdout_artifact = if write_stdout {
+            let stdout_path = run_paths.artifacts_dir.join(format!("{id}.stdout"));
+            fs::write(
+                &stdout_path,
+                shell_artifact_bytes(
+                    stdout,
+                    self.config.disk_output_cap_bytes,
+                    self.config.redact_secrets,
+                ),
+            )?;
+            Some(format!("artifacts/{id}.stdout"))
+        } else {
+            None
+        };
+        let stderr_artifact = if write_stderr {
+            let stderr_path = run_paths.artifacts_dir.join(format!("{id}.stderr"));
+            fs::write(
+                &stderr_path,
+                shell_artifact_bytes(
+                    stderr,
+                    self.config.disk_output_cap_bytes,
+                    self.config.redact_secrets,
+                ),
+            )?;
+            Some(format!("artifacts/{id}.stderr"))
+        } else {
+            None
+        };
+        Ok((stdout_artifact, stderr_artifact))
     }
 }
 
@@ -745,6 +880,37 @@ pub struct ReadFileOutput {
     pub truncated: bool,
     pub hash: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadFileLinesInput {
+    pub path: String,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadFileLinesOutput {
+    pub path: String,
+    pub content: String,
+    pub offset: u32,
+    pub limit: u32,
+    pub lines_returned: u32,
+    pub lines_total: Option<u32>,
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiReadLinesInput {
+    pub files: Vec<ReadFileLinesInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiReadLinesOutput {
+    pub files: Vec<Value>,
+    pub files_returned: u32,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -991,6 +1157,13 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..scan_len].contains(&0)
 }
 
+fn looks_binary_prefix(path: &Path) -> KimetsuResult<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut buf = [0u8; 8192];
+    let read = std::io::Read::read(&mut file, &mut buf)?;
+    Ok(buf[..read].contains(&0))
+}
+
 fn validate_command_policy(input: &CommandSpec) -> KimetsuResult<()> {
     let program = Path::new(&input.program)
         .file_name()
@@ -1156,6 +1329,31 @@ fn cap_bytes(value: &[u8], max_bytes: usize) -> &[u8] {
     &value[..value.len().min(max_bytes)]
 }
 
+fn summarize_shell_stream(bytes: &[u8], max_bytes: usize, redact: bool) -> String {
+    let mut summary = String::from_utf8_lossy(cap_bytes(bytes, max_bytes)).to_string();
+    if redact {
+        summary = redact_text(&summary);
+    }
+    if bytes.len() > max_bytes {
+        summary.push_str("\n<truncated>");
+    }
+    summary
+}
+
+fn should_write_shell_artifact(bytes: &[u8], unexpected_exit: bool, timed_out: bool) -> bool {
+    !bytes.is_empty()
+        && (unexpected_exit || timed_out || bytes.len() > SHELL_ARTIFACT_THRESHOLD_BYTES)
+}
+
+fn shell_artifact_bytes(bytes: &[u8], max_bytes: usize, redact: bool) -> Vec<u8> {
+    let capped = cap_bytes(bytes, max_bytes);
+    if redact {
+        redact_text(&String::from_utf8_lossy(capped)).into_bytes()
+    } else {
+        capped.to_vec()
+    }
+}
+
 fn redact_value(value: Value, enabled: bool) -> Value {
     if !enabled {
         return cap_value_strings(value);
@@ -1242,6 +1440,39 @@ mod tests {
             })
             .expect("read file");
         assert!(read.content.contains("hello"));
+        let sliced = runtime
+            .read_file_lines(ReadFileLinesInput {
+                path: "src.txt".to_string(),
+                offset: 2,
+                limit: 1,
+            })
+            .expect("read file lines");
+        assert_eq!(sliced.content, "world\n");
+        assert_eq!(sliced.lines_total, Some(2));
+        let multi = runtime
+            .multi_read_lines(MultiReadLinesInput {
+                files: vec![
+                    ReadFileLinesInput {
+                        path: "src.txt".to_string(),
+                        offset: 1,
+                        limit: 1,
+                    },
+                    ReadFileLinesInput {
+                        path: "missing.txt".to_string(),
+                        offset: 1,
+                        limit: 1,
+                    },
+                ],
+            })
+            .expect("multi read lines");
+        assert_eq!(multi.files_returned, 2);
+        assert!(
+            multi.files[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("hello")
+        );
+        assert!(multi.files[1]["error"].as_str().is_some());
         assert!(
             runtime
                 .read_file(ReadFileInput {

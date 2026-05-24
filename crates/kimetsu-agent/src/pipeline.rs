@@ -255,7 +255,11 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 budget_tokens: config.broker.default_budget_tokens,
             },
         )?;
-        (localization_context, patch_context, "Context capsules retrieved.")
+        (
+            localization_context,
+            patch_context,
+            "Context capsules retrieved.",
+        )
     };
     // MP-4a: emit a `context.injected` event per stage so the projector can
     // correlate accepted memories with terminal outcomes. The projector reads
@@ -484,48 +488,49 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
     const MAX_VERIFICATION_ATTEMPTS: u32 = 3;
     if !options.dry_run {
         'attempts: loop {
-        attempt = attempt.saturating_add(1);
-        stage_entered(
-            &mut writer,
-            &mut events,
-            run_id,
-            CodingStage::Implementation,
-        )?;
-        if options.disable_model {
-            emit(
+            attempt = attempt.saturating_add(1);
+            stage_entered(
                 &mut writer,
                 &mut events,
-                Event::new(
-                    run_id,
-                    "model.skipped",
-                    serde_json::json!({
-                        "stage": CodingStage::Implementation.as_str(),
-                        "provider": config.model.provider,
-                        "model": config.model.model,
-                        "reason": "disabled_by_options",
-                        "api_key_env": config.model.api_key_env,
-                    }),
-                ),
+                run_id,
+                CodingStage::Implementation,
             )?;
-            emit(
-                &mut writer,
-                &mut events,
-                Event::new(
-                    run_id,
-                    "run.failed",
-                    serde_json::json!({
-                        "category": "Model",
-                        "message": "implementation requires model access; remove --no-model or use --dry-run",
-                        "failed_stage": CodingStage::Implementation.as_str(),
-                    }),
-                ),
-            )?;
-            projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
-            return Err(
-                "implementation requires model access; remove --no-model or use --dry-run".into(),
-            );
-        }
-        let provider_selection: KimetsuResult<Option<Box<dyn ModelProvider>>> =
+            if options.disable_model {
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "model.skipped",
+                        serde_json::json!({
+                            "stage": CodingStage::Implementation.as_str(),
+                            "provider": config.model.provider,
+                            "model": config.model.model,
+                            "reason": "disabled_by_options",
+                            "api_key_env": config.model.api_key_env,
+                        }),
+                    ),
+                )?;
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "run.failed",
+                        serde_json::json!({
+                            "category": "Model",
+                            "message": "implementation requires model access; remove --no-model or use --dry-run",
+                            "failed_stage": CodingStage::Implementation.as_str(),
+                        }),
+                    ),
+                )?;
+                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                return Err(
+                    "implementation requires model access; remove --no-model or use --dry-run"
+                        .into(),
+                );
+            }
+            let provider_selection: KimetsuResult<Option<Box<dyn ModelProvider>>> =
             match config.model.provider.as_str() {
                 "anthropic" => AnthropicProvider::from_config_with_key(
                     &paths.repo_root,
@@ -544,389 +549,396 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 )
                 .into()),
             };
-        let provider = match provider_selection {
-            Ok(Some(provider)) => provider,
-            Ok(None) => {
-                emit(
-                    &mut writer,
-                    &mut events,
-                    Event::new(
-                        run_id,
-                        "model.skipped",
-                        serde_json::json!({
-                            "stage": CodingStage::Implementation.as_str(),
-                            "provider": config.model.provider,
-                            "model": config.model.model,
-                            "reason": "missing_api_key",
-                            "api_key_env": config.model.api_key_env,
-                        }),
-                    ),
-                )?;
-                emit(
-                    &mut writer,
-                    &mut events,
-                    Event::new(
-                        run_id,
-                        "run.failed",
-                        serde_json::json!({
-                            "category": "Model",
-                            "message": "implementation requires a configured model API key",
-                            "failed_stage": CodingStage::Implementation.as_str(),
-                        }),
-                    ),
-                )?;
-                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
-                return Err("implementation requires a configured model API key".into());
-            }
-            Err(err) => {
-                emit(
-                    &mut writer,
-                    &mut events,
-                    Event::new(
-                        run_id,
-                        "run.failed",
-                        serde_json::json!({
-                            "category": "Model",
-                            "message": err.to_string(),
-                            "failed_stage": CodingStage::Implementation.as_str(),
-                        }),
-                    ),
-                )?;
-                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
-                return Err(err);
-            }
-        };
-
-        let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
-            .with_stage(CodingStage::Implementation.as_str())
-            .with_config(tool_runtime_config(&config))
-            .with_trace(writer, run_paths.clone());
-        runtime.set_patch_plan(tool_patch_plan(&patch_plan));
-        let loop_config = AgentLoopConfig {
-            stage: CodingStage::Implementation.as_str().to_string(),
-            tools: implementation_tool_definitions(),
-            max_model_turns: config.run.max_total_model_turns,
-            max_tool_calls: config.run.max_total_tool_calls,
-            max_cost_usd: config.run.max_total_cost_usd,
-            max_output_tokens: config.model.max_output_tokens,
-            temperature: config.model.temperature,
-        };
-        let mut loop_runner = AgentLoop::new(provider, runtime, loop_config);
-        let loop_result = loop_runner.run(build_implementation_messages(
-            &options.task,
-            &patch_plan,
-            &patch_context,
-            last_failure_context.as_deref(),
-        )?);
-        let runtime = loop_runner.into_runtime();
-        let Some((restored_writer, _)) = runtime.into_trace() else {
-            return Err("implementation runtime lost trace writer".into());
-        };
-        writer = restored_writer;
-
-        match loop_result {
-            Ok(outcome) => {
-                stage_completed(
-                    &mut writer,
-                    &mut events,
-                    run_id,
-                    CodingStage::Implementation,
-                    serde_json::json!({
-                        "summary": "Implementation agent loop completed.",
-                        "model_turns": outcome.model_turns,
-                        "tool_calls": outcome.tool_calls,
-                        "usage": outcome.usage,
-                    }),
-                )?;
-                implementation_outcome = Some(outcome);
-            }
-            Err(err) => {
-                emit(
-                    &mut writer,
-                    &mut events,
-                    Event::new(
-                        run_id,
-                        "run.failed",
-                        serde_json::json!({
-                            "category": "Implementation",
-                            "message": err.to_string(),
-                            "failed_stage": CodingStage::Implementation.as_str(),
-                        }),
-                    ),
-                )?;
-                projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
-                return Err(err);
-            }
-        }
-
-        // === Verification stage (inside retry loop) ===
-        if patch_plan.verification_commands.is_empty() {
-            break 'attempts;
-        }
-        stage_entered(&mut writer, &mut events, run_id, CodingStage::Verification)?;
-
-        let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
-            .with_stage(CodingStage::Verification.as_str())
-            .with_config(tool_runtime_config(&config))
-            .with_trace(writer, run_paths.clone());
-
-        let mut failures: u32 = 0;
-        let mut command_results: Vec<serde_json::Value> = Vec::new();
-        let mut first_failure_payload: Option<serde_json::Value> = None;
-
-        for command in &patch_plan.verification_commands {
-            let expected = command.expected_exit.unwrap_or(0);
-            let label = if command.args.is_empty() {
-                command.program.clone()
-            } else {
-                format!("{} {}", command.program, command.args.join(" "))
+            let provider = match provider_selection {
+                Ok(Some(provider)) => provider,
+                Ok(None) => {
+                    emit(
+                        &mut writer,
+                        &mut events,
+                        Event::new(
+                            run_id,
+                            "model.skipped",
+                            serde_json::json!({
+                                "stage": CodingStage::Implementation.as_str(),
+                                "provider": config.model.provider,
+                                "model": config.model.model,
+                                "reason": "missing_api_key",
+                                "api_key_env": config.model.api_key_env,
+                            }),
+                        ),
+                    )?;
+                    emit(
+                        &mut writer,
+                        &mut events,
+                        Event::new(
+                            run_id,
+                            "run.failed",
+                            serde_json::json!({
+                                "category": "Model",
+                                "message": "implementation requires a configured model API key",
+                                "failed_stage": CodingStage::Implementation.as_str(),
+                            }),
+                        ),
+                    )?;
+                    projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                    return Err("implementation requires a configured model API key".into());
+                }
+                Err(err) => {
+                    emit(
+                        &mut writer,
+                        &mut events,
+                        Event::new(
+                            run_id,
+                            "run.failed",
+                            serde_json::json!({
+                                "category": "Model",
+                                "message": err.to_string(),
+                                "failed_stage": CodingStage::Implementation.as_str(),
+                            }),
+                        ),
+                    )?;
+                    projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                    return Err(err);
+                }
             };
-            verification_tool_calls = verification_tool_calls.saturating_add(1);
-            match runtime.shell_command(command.clone()) {
-                Ok(output) => {
-                    let passed = output.exit_code == expected
-                        && !output.timed_out
-                        && !output.killed_for_policy;
-                    let payload = serde_json::json!({
-                        "kind": "verification",
-                        "command": label,
-                        "exit_code": output.exit_code,
-                        "expected_exit": expected,
-                        "duration_ms": output.duration_ms,
-                        "timed_out": output.timed_out,
-                        "killed_for_policy": output.killed_for_policy,
-                        "stdout_summary": output.stdout_summary,
-                        "stderr_summary": output.stderr_summary,
-                    });
-                    let kind = if passed { "gate.passed" } else { "gate.failed" };
-                    runtime
-                        .append_trace_event(&Event::new(run_id, kind, payload.clone()), true)?;
-                    if !passed {
+
+            let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
+                .with_stage(CodingStage::Implementation.as_str())
+                .with_config(tool_runtime_config(&config))
+                .with_trace(writer, run_paths.clone());
+            runtime.set_patch_plan(tool_patch_plan(&patch_plan));
+            let loop_config = AgentLoopConfig {
+                stage: CodingStage::Implementation.as_str().to_string(),
+                tools: implementation_tool_definitions(),
+                max_model_turns: config.run.max_total_model_turns,
+                max_tool_calls: config.run.max_total_tool_calls,
+                max_cost_usd: config.run.max_total_cost_usd,
+                max_output_tokens: config.model.max_output_tokens,
+                temperature: config.model.temperature,
+            };
+            let mut loop_runner = AgentLoop::new(provider, runtime, loop_config);
+            let loop_result = loop_runner.run(build_implementation_messages(
+                &options.task,
+                &patch_plan,
+                &patch_context,
+                last_failure_context.as_deref(),
+            )?);
+            let runtime = loop_runner.into_runtime();
+            let Some((restored_writer, _)) = runtime.into_trace() else {
+                return Err("implementation runtime lost trace writer".into());
+            };
+            writer = restored_writer;
+
+            match loop_result {
+                Ok(outcome) => {
+                    stage_completed(
+                        &mut writer,
+                        &mut events,
+                        run_id,
+                        CodingStage::Implementation,
+                        serde_json::json!({
+                            "summary": "Implementation agent loop completed.",
+                            "model_turns": outcome.model_turns,
+                            "tool_calls": outcome.tool_calls,
+                            "usage": outcome.usage,
+                        }),
+                    )?;
+                    implementation_outcome = Some(outcome);
+                }
+                Err(err) => {
+                    emit(
+                        &mut writer,
+                        &mut events,
+                        Event::new(
+                            run_id,
+                            "run.failed",
+                            serde_json::json!({
+                                "category": "Implementation",
+                                "message": err.to_string(),
+                                "failed_stage": CodingStage::Implementation.as_str(),
+                            }),
+                        ),
+                    )?;
+                    projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+                    return Err(err);
+                }
+            }
+
+            // === Verification stage (inside retry loop) ===
+            if patch_plan.verification_commands.is_empty() {
+                break 'attempts;
+            }
+            stage_entered(&mut writer, &mut events, run_id, CodingStage::Verification)?;
+
+            let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
+                .with_stage(CodingStage::Verification.as_str())
+                .with_config(tool_runtime_config(&config))
+                .with_trace(writer, run_paths.clone());
+
+            let mut failures: u32 = 0;
+            let mut command_results: Vec<serde_json::Value> = Vec::new();
+            let mut first_failure_payload: Option<serde_json::Value> = None;
+
+            for command in &patch_plan.verification_commands {
+                let expected = command.expected_exit.unwrap_or(0);
+                let label = if command.args.is_empty() {
+                    command.program.clone()
+                } else {
+                    format!("{} {}", command.program, command.args.join(" "))
+                };
+                verification_tool_calls = verification_tool_calls.saturating_add(1);
+                match runtime.shell_command(command.clone()) {
+                    Ok(output) => {
+                        let passed = output.exit_code == expected
+                            && !output.timed_out
+                            && !output.killed_for_policy;
+                        let payload = serde_json::json!({
+                            "kind": "verification",
+                            "command": label,
+                            "exit_code": output.exit_code,
+                            "expected_exit": expected,
+                            "duration_ms": output.duration_ms,
+                            "timed_out": output.timed_out,
+                            "killed_for_policy": output.killed_for_policy,
+                            "stdout_summary": output.stdout_summary,
+                            "stderr_summary": output.stderr_summary,
+                        });
+                        let kind = if passed { "gate.passed" } else { "gate.failed" };
+                        runtime
+                            .append_trace_event(&Event::new(run_id, kind, payload.clone()), true)?;
+                        if !passed {
+                            failures = failures.saturating_add(1);
+                            if first_failure_payload.is_none() {
+                                first_failure_payload = Some(payload.clone());
+                            }
+                        }
+                        command_results.push(payload);
+                    }
+                    Err(err) => {
+                        let payload = serde_json::json!({
+                            "kind": "verification",
+                            "command": label,
+                            "error": err.to_string(),
+                        });
+                        runtime.append_trace_event(
+                            &Event::new(run_id, "gate.failed", payload.clone()),
+                            true,
+                        )?;
                         failures = failures.saturating_add(1);
                         if first_failure_payload.is_none() {
                             first_failure_payload = Some(payload.clone());
                         }
+                        command_results.push(payload);
                     }
-                    command_results.push(payload);
-                }
-                Err(err) => {
-                    let payload = serde_json::json!({
-                        "kind": "verification",
-                        "command": label,
-                        "error": err.to_string(),
-                    });
-                    runtime.append_trace_event(
-                        &Event::new(run_id, "gate.failed", payload.clone()),
-                        true,
-                    )?;
-                    failures = failures.saturating_add(1);
-                    if first_failure_payload.is_none() {
-                        first_failure_payload = Some(payload.clone());
-                    }
-                    command_results.push(payload);
                 }
             }
-        }
 
-        let Some((restored_writer, _)) = runtime.into_trace() else {
-            return Err("verification runtime lost trace writer".into());
-        };
-        writer = restored_writer;
+            let Some((restored_writer, _)) = runtime.into_trace() else {
+                return Err("verification runtime lost trace writer".into());
+            };
+            writer = restored_writer;
 
-        let summary_payload = serde_json::json!({
-            "summary": format!(
-                "Ran {} verification command(s); {} failure(s) on attempt {}.",
-                patch_plan.verification_commands.len(),
-                failures,
-                attempt
-            ),
-            "attempt": attempt,
-            "commands_run": patch_plan.verification_commands.len(),
-            "failures": failures,
-            "results": command_results.clone(),
-        });
-        stage_completed(
-            &mut writer,
-            &mut events,
-            run_id,
-            CodingStage::Verification,
-            summary_payload.clone(),
-        )?;
-        verification_summary = Some(summary_payload);
+            let summary_payload = serde_json::json!({
+                "summary": format!(
+                    "Ran {} verification command(s); {} failure(s) on attempt {}.",
+                    patch_plan.verification_commands.len(),
+                    failures,
+                    attempt
+                ),
+                "attempt": attempt,
+                "commands_run": patch_plan.verification_commands.len(),
+                "failures": failures,
+                "results": command_results.clone(),
+            });
+            stage_completed(
+                &mut writer,
+                &mut events,
+                run_id,
+                CodingStage::Verification,
+                summary_payload.clone(),
+            )?;
+            verification_summary = Some(summary_payload);
 
-        if failures == 0 {
-            break 'attempts;
-        }
+            if failures == 0 {
+                break 'attempts;
+            }
 
-        let current_fingerprint = first_failure_payload
-            .as_ref()
-            .map(verification_failure_fingerprint);
-        let same_fingerprint_twice = match (
-            last_failure_fingerprint.as_ref(),
-            current_fingerprint.as_ref(),
-        ) {
-            (Some(prev), Some(curr)) => prev == curr,
-            _ => false,
-        };
+            let current_fingerprint = first_failure_payload
+                .as_ref()
+                .map(verification_failure_fingerprint);
+            let same_fingerprint_twice = match (
+                last_failure_fingerprint.as_ref(),
+                current_fingerprint.as_ref(),
+            ) {
+                (Some(prev), Some(curr)) => prev == curr,
+                _ => false,
+            };
 
-        if attempt < MAX_VERIFICATION_ATTEMPTS && !same_fingerprint_twice {
-            last_failure_fingerprint = current_fingerprint;
-            last_failure_context = Some(render_retry_context(
-                attempt,
-                &command_results,
-                first_failure_payload.as_ref(),
-            ));
+            if attempt < MAX_VERIFICATION_ATTEMPTS && !same_fingerprint_twice {
+                last_failure_fingerprint = current_fingerprint;
+                last_failure_context = Some(render_retry_context(
+                    attempt,
+                    &command_results,
+                    first_failure_payload.as_ref(),
+                ));
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "verification.retry",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "fingerprint": last_failure_fingerprint,
+                            "failures": failures,
+                        }),
+                    ),
+                )?;
+                continue 'attempts;
+            }
+
+            let stop_reason = if same_fingerprint_twice {
+                "same_failure_fingerprint_twice"
+            } else {
+                "retry_budget_exhausted"
+            };
             emit(
                 &mut writer,
                 &mut events,
                 Event::new(
                     run_id,
-                    "verification.retry",
+                    "run.failed",
                     serde_json::json!({
-                        "attempt": attempt,
-                        "next_attempt": attempt + 1,
-                        "fingerprint": last_failure_fingerprint,
-                        "failures": failures,
+                        "category": "Verification",
+                        "message": format!(
+                            "{failures} verification command(s) failed on attempt {attempt}; stop_reason: {stop_reason}"
+                        ),
+                        "failed_stage": CodingStage::Verification.as_str(),
+                        "attempts_used": attempt,
+                        "stop_reason": stop_reason,
                     }),
                 ),
             )?;
-            continue 'attempts;
-        }
-
-        let stop_reason = if same_fingerprint_twice {
-            "same_failure_fingerprint_twice"
-        } else {
-            "retry_budget_exhausted"
-        };
-        emit(
-            &mut writer,
-            &mut events,
-            Event::new(
-                run_id,
-                "run.failed",
-                serde_json::json!({
-                    "category": "Verification",
-                    "message": format!(
-                        "{failures} verification command(s) failed on attempt {attempt}; stop_reason: {stop_reason}"
-                    ),
-                    "failed_stage": CodingStage::Verification.as_str(),
-                    "attempts_used": attempt,
-                    "stop_reason": stop_reason,
-                }),
-            ),
-        )?;
-        projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
-        return Err(format!(
-            "verification gate failed after {attempt} attempt(s): {stop_reason}"
-        )
-        .into());
+            projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+            return Err(format!(
+                "verification gate failed after {attempt} attempt(s): {stop_reason}"
+            )
+            .into());
         }
     }
 
-    let memory_proposal_summary: Option<MemoryProposalSummary> =
-        if !options.dry_run && implementation_outcome.is_some() && !options.disable_model {
-            stage_entered(&mut writer, &mut events, run_id, CodingStage::MemoryProposal)?;
-            let existing_memories = load_existing_memories_for_proposal(&conn).unwrap_or_default();
-            let proposed = match try_model_memory_proposals(
-                &mut writer,
-                &mut events,
-                &run_paths,
-                &paths,
-                &config,
-                options.model_key_override.as_deref(),
-                run_id,
-                &options.task,
-                &patch_plan,
-                verification_summary.as_ref(),
-                &existing_memories,
-            ) {
-                Ok(summary) => summary,
-                Err(err) => {
-                    emit(
-                        &mut writer,
-                        &mut events,
-                        Event::new(
-                            run_id,
-                            "memory_proposal.error",
-                            serde_json::json!({
-                                "stage": CodingStage::MemoryProposal.as_str(),
-                                "message": err.to_string(),
-                            }),
-                        ),
-                    )?;
-                    None
-                }
-            };
-
-            if let Some(summary) = proposed.as_ref() {
-                for proposal in &summary.accepted {
-                    emit(
-                        &mut writer,
-                        &mut events,
-                        Event::new(
-                            run_id,
-                            "memory.proposed",
-                            serde_json::json!({
-                                "proposal_id": proposal.proposal_id,
-                                "scope": proposal.scope,
-                                "kind": proposal.kind,
-                                "text": proposal.text,
-                                "rationale": proposal.rationale,
-                                "proposed_confidence": proposal.confidence,
-                                "source_event_ids": [],
-                            }),
-                        ),
-                    )?;
-                }
+    let memory_proposal_summary: Option<MemoryProposalSummary> = if !options.dry_run
+        && implementation_outcome.is_some()
+        && !options.disable_model
+    {
+        stage_entered(
+            &mut writer,
+            &mut events,
+            run_id,
+            CodingStage::MemoryProposal,
+        )?;
+        let existing_memories = load_existing_memories_for_proposal(&conn).unwrap_or_default();
+        let proposed = match try_model_memory_proposals(
+            &mut writer,
+            &mut events,
+            &run_paths,
+            &paths,
+            &config,
+            options.model_key_override.as_deref(),
+            run_id,
+            &options.task,
+            &patch_plan,
+            verification_summary.as_ref(),
+            &existing_memories,
+        ) {
+            Ok(summary) => summary,
+            Err(err) => {
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "memory_proposal.error",
+                        serde_json::json!({
+                            "stage": CodingStage::MemoryProposal.as_str(),
+                            "message": err.to_string(),
+                        }),
+                    ),
+                )?;
+                None
             }
-
-            let stage_payload = match proposed.as_ref() {
-                Some(summary) => {
-                    let filtered_examples: Vec<serde_json::Value> = summary
-                        .filtered_examples
-                        .iter()
-                        .map(|f| {
-                            serde_json::json!({
-                                "reason": f.reason,
-                                "scope": f.scope,
-                                "kind": f.kind,
-                                "confidence": f.confidence,
-                                "text": f.text,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "summary": format!(
-                            "{} raw, {} accepted, {} filtered_identifier, {} filtered_dedup, {} filtered_invalid.",
-                            summary.raw_count,
-                            summary.accepted.len(),
-                            summary.filtered_identifier,
-                            summary.filtered_dedup,
-                            summary.filtered_invalid,
-                        ),
-                        "raw_count": summary.raw_count,
-                        "accepted": summary.accepted.len() as u32,
-                        "filtered_identifier": summary.filtered_identifier,
-                        "filtered_dedup": summary.filtered_dedup,
-                        "filtered_invalid": summary.filtered_invalid,
-                        "filtered_examples": filtered_examples,
-                    })
-                }
-                None => serde_json::json!({
-                    "summary": "MemoryProposal skipped (no provider or skipped on disable_model).",
-                }),
-            };
-            stage_completed(
-                &mut writer,
-                &mut events,
-                run_id,
-                CodingStage::MemoryProposal,
-                stage_payload,
-            )?;
-            proposed
-        } else {
-            None
         };
+
+        if let Some(summary) = proposed.as_ref() {
+            for proposal in &summary.accepted {
+                emit(
+                    &mut writer,
+                    &mut events,
+                    Event::new(
+                        run_id,
+                        "memory.proposed",
+                        serde_json::json!({
+                            "proposal_id": proposal.proposal_id,
+                            "scope": proposal.scope,
+                            "kind": proposal.kind,
+                            "text": proposal.text,
+                            "rationale": proposal.rationale,
+                            "proposed_confidence": proposal.confidence,
+                            "source_event_ids": [],
+                        }),
+                    ),
+                )?;
+            }
+        }
+
+        let stage_payload = match proposed.as_ref() {
+            Some(summary) => {
+                let filtered_examples: Vec<serde_json::Value> = summary
+                    .filtered_examples
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "reason": f.reason,
+                            "scope": f.scope,
+                            "kind": f.kind,
+                            "confidence": f.confidence,
+                            "text": f.text,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "summary": format!(
+                        "{} raw, {} accepted, {} filtered_identifier, {} filtered_dedup, {} filtered_invalid.",
+                        summary.raw_count,
+                        summary.accepted.len(),
+                        summary.filtered_identifier,
+                        summary.filtered_dedup,
+                        summary.filtered_invalid,
+                    ),
+                    "raw_count": summary.raw_count,
+                    "accepted": summary.accepted.len() as u32,
+                    "filtered_identifier": summary.filtered_identifier,
+                    "filtered_dedup": summary.filtered_dedup,
+                    "filtered_invalid": summary.filtered_invalid,
+                    "filtered_examples": filtered_examples,
+                })
+            }
+            None => serde_json::json!({
+                "summary": "MemoryProposal skipped (no provider or skipped on disable_model).",
+            }),
+        };
+        stage_completed(
+            &mut writer,
+            &mut events,
+            run_id,
+            CodingStage::MemoryProposal,
+            stage_payload,
+        )?;
+        proposed
+    } else {
+        None
+    };
 
     stage_entered(&mut writer, &mut events, run_id, CodingStage::FinalReport)?;
     let final_report = render_coding_report(
@@ -1023,6 +1035,7 @@ fn load_text_provider(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_model_patch_plan(
     writer: &mut TraceWriter,
     events: &mut Vec<Event>,
@@ -1198,6 +1211,7 @@ pub(crate) struct FilteredProposalExample {
     pub confidence: f32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_model_memory_proposals(
     writer: &mut TraceWriter,
     events: &mut Vec<Event>,
@@ -1262,10 +1276,7 @@ fn try_model_memory_proposals(
     )?;
 
     let raw_text = response.text.as_deref().unwrap_or("");
-    let envelope: MemoryProposalEnvelope = match parse_structured_json(raw_text) {
-        Ok(env) => env,
-        Err(_) => MemoryProposalEnvelope::default(),
-    };
+    let envelope: MemoryProposalEnvelope = parse_structured_json(raw_text).unwrap_or_default();
 
     Ok(Some(filter_memory_proposals(
         envelope.proposals,
@@ -1359,7 +1370,7 @@ fn filter_memory_proposals(
         .map(|p| p.to_lowercase())
         .collect();
 
-    let mut record_filtered =
+    let record_filtered =
         |summary: &mut MemoryProposalSummary, raw: &RawMemoryProposal, reason: &'static str| {
             if summary.filtered_examples.len() < MAX_FILTERED_EXAMPLES {
                 summary.filtered_examples.push(FilteredProposalExample {
@@ -1644,6 +1655,7 @@ fn tool_runtime_config(config: &ProjectConfig) -> ToolRuntimeConfig {
         model_output_cap_bytes: ToolRuntimeConfig::default().model_output_cap_bytes,
         disk_output_cap_bytes: ToolRuntimeConfig::default().disk_output_cap_bytes,
         redact_secrets: config.shell.redact_secrets,
+        trace_fsync: true,
         env_allowlist_extra: config.shell.env_allowlist_extra.clone(),
     }
 }
@@ -2040,6 +2052,7 @@ fn load_existing_memories_for_proposal(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_coding_report(
     task: &str,
     run_id: RunId,
@@ -2130,6 +2143,7 @@ fn verification_failure_fingerprint(payload: &serde_json::Value) -> String {
     blake3::hash(raw.as_bytes()).to_hex().to_string()
 }
 
+#[allow(clippy::while_let_on_iterator)]
 fn normalize_for_fingerprint(line: &str) -> String {
     // Strip ANSI escape sequences (CSI: ESC [ ... letter; OSC: ESC ] ... BEL/ST).
     let mut without_ansi = String::with_capacity(line.len());
@@ -2166,12 +2180,14 @@ fn normalize_for_fingerprint(line: &str) -> String {
     // identical errors from different tempdirs share a fingerprint. The path
     // body deliberately excludes `:` so that `:line:col` suffixes (Windows or
     // Unix style) are left for the digit-collapsing step below.
-    let path_re = regex::Regex::new(r#"(?x)
+    let path_re = regex::Regex::new(
+        r#"(?x)
         (?:
             [a-zA-Z]:[\\/][^\s'"`<>:]*
           | /(?:[a-zA-Z0-9._\-]+/)+[a-zA-Z0-9._\-]+
         )
-    "#)
+    "#,
+    )
     .expect("path regex compiles");
     let no_paths = path_re.replace_all(&without_ansi, "<path>");
 
@@ -2321,7 +2337,9 @@ fn render_verification_section(
         .unwrap_or(0);
 
     let mut lines = Vec::new();
-    lines.push(format!("Ran {commands_run} command(s); {failures} failure(s)."));
+    lines.push(format!(
+        "Ran {commands_run} command(s); {failures} failure(s)."
+    ));
 
     if let Some(results) = summary.get("results").and_then(|v| v.as_array()) {
         for result in results {
@@ -2341,8 +2359,14 @@ fn render_verification_section(
                 .get("expected_exit")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let status = if exit_code == expected { "pass" } else { "fail" };
-            lines.push(format!("- {status} `{command}` exit={exit_code} expected={expected}"));
+            let status = if exit_code == expected {
+                "pass"
+            } else {
+                "fail"
+            };
+            lines.push(format!(
+                "- {status} `{command}` exit={exit_code} expected={expected}"
+            ));
         }
     }
 
@@ -2449,13 +2473,8 @@ mod tests {
         );
         assert!(events.iter().any(|event| event.kind == "run.finished"));
         // Dry-run skips Verification.
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.kind == "stage.entered"
-                    && event.payload.get("stage").and_then(|s| s.as_str())
-                        == Some("verification"))
-        );
+        assert!(!events.iter().any(|event| event.kind == "stage.entered"
+            && event.payload.get("stage").and_then(|s| s.as_str()) == Some("verification")));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -2635,7 +2654,11 @@ mod tests {
             confidence: 0.0, // model omitted; default should now be 0.7
         };
         let summary = filter_memory_proposals(vec![long_generic], RunId::new(), &plan, &[]);
-        assert_eq!(summary.accepted.len(), 1, "long guidance should not be filtered as path-specific");
+        assert_eq!(
+            summary.accepted.len(),
+            1,
+            "long guidance should not be filtered as path-specific"
+        );
         assert!(
             (summary.accepted[0].confidence - 0.7).abs() < f32::EPSILON,
             "missing confidence should default to 0.7 after MP-1.5"
@@ -2768,8 +2791,13 @@ mod tests {
             normalized_text: "use rg over grep".into(),
             text: "Use rg over grep".into(),
         };
-        let request =
-            build_memory_proposal_request(&config, "fix bug", &plan, None, &[existing.clone()]);
+        let request = build_memory_proposal_request(
+            &config,
+            "fix bug",
+            &plan,
+            None,
+            std::slice::from_ref(&existing),
+        );
         let user_text = request
             .messages
             .iter()

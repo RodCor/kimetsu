@@ -173,12 +173,12 @@ fn format_task_brief(task: &SweBenchTask) -> String {
         brief.push_str("\n\nHints:\n");
         brief.push_str(hints);
     }
-    if let Some(fail_to_pass) = task.fail_to_pass.as_ref() {
-        if !fail_to_pass.is_empty() {
-            brief.push_str("\n\nMust pass after fix:\n");
-            for case in fail_to_pass {
-                brief.push_str(&format!("- {case}\n"));
-            }
+    if let Some(fail_to_pass) = task.fail_to_pass.as_ref()
+        && !fail_to_pass.is_empty()
+    {
+        brief.push_str("\n\nMust pass after fix:\n");
+        for case in fail_to_pass {
+            brief.push_str(&format!("- {case}\n"));
         }
     }
     brief

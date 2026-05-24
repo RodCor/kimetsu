@@ -4,6 +4,7 @@ use std::time::Duration;
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
+use kimetsu_core::secret::SecretString;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,7 +20,11 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: Client,
-    api_key: String,
+    // v0.4.9: SecretString — same rationale as ClaudeCodeProvider.
+    // Debug / Display / serde all emit "[REDACTED]"; cleartext
+    // only flows out via expose_secret() at the HTTP header
+    // injection below.
+    api_key: SecretString,
     model: String,
 }
 
@@ -51,7 +56,7 @@ impl AnthropicProvider {
 
         Ok(Some(Self {
             client,
-            api_key,
+            api_key: SecretString::new(api_key),
             model: config.model.model.clone(),
         }))
     }
@@ -67,7 +72,11 @@ impl ModelProvider for AnthropicProvider {
         let response = self
             .client
             .post(MESSAGES_URL)
-            .header("x-api-key", &self.api_key)
+            // v0.4.9: explicit cleartext leak point for the HTTP
+            // header. The reqwest client never logs header values
+            // by default; if a future caller adds request logging
+            // this is the line to add redaction at.
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&body)
@@ -294,6 +303,25 @@ impl From<AnthropicUsage> for TokenUsage {
 mod tests {
     use super::*;
     use crate::model::{ModelMessage, ToolDefinition};
+
+    /// v0.4.9 regression guard. Mirror of the ClaudeCodeProvider
+    /// test — `#[derive(Debug)]` must not leak `api_key`.
+    #[test]
+    fn debug_format_does_not_leak_api_key() {
+        let token = "sk-ant-api03-DEFINITELY-LEAKED-IF-BROKEN-1234567890";
+        let provider = AnthropicProvider {
+            client: Client::new(),
+            api_key: SecretString::new(token),
+            model: "claude-opus-4-7".into(),
+        };
+        let dbg = format!("{:?}", provider);
+        assert!(
+            !dbg.contains("DEFINITELY-LEAKED-IF-BROKEN"),
+            "Debug-print MUST NOT include the inner token: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"));
+        assert!(dbg.contains("claude-opus-4-7"));
+    }
 
     #[test]
     fn request_maps_system_and_tool_blocks_to_anthropic_shape() {

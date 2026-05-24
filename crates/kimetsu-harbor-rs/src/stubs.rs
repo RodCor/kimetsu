@@ -1,9 +1,8 @@
 //! Stub agent runners for harbor mode.
 //!
-//! v0.3.2 — moved from `kimetsu-agent::harbor`. Used by
-//! `kimetsu agent --harbor-mode --stub` so the python adapter can be
-//! smoke-tested on machines without API credentials. The kimetsu-cli
-//! `--stub` path calls into here.
+//! v0.3.2 â€” moved from `kimetsu-agent::harness`. Used by
+//! `kimetsu-harbor-agent --stub` so the Python adapter can be
+//! smoke-tested on machines without API credentials.
 
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
@@ -13,8 +12,8 @@ use kimetsu_agent::tools::CommandSpec;
 use kimetsu_core::KimetsuResult;
 use serde_json::json;
 
-use crate::protocol::{AgentDoneParams, HARBOR_PROTOCOL_VERSION, ToolExecParams, ToolExecResult};
 use crate::protocol::default_timeout_secs;
+use crate::protocol::{AgentDoneParams, HARBOR_PROTOCOL_VERSION, ToolExecParams, ToolExecResult};
 use crate::session::HarborSession;
 
 /// MP-7a stub agent loop. Exists so we can wire the CLI subcommand and

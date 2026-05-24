@@ -4,11 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Transport-neutral agent runtime for kimetsu: tools, prompts, verify-loop, providers (claude_code, anthropic)."
+keywords = ["kimetsu", "agent", "llm", "anthropic", "claude"]
+categories = ["development-tools"]
+
+[features]
+# v0.4.8: `kimetsu-agent` pulls `kimetsu-brain` for retrieval inside
+# the pipeline's coding run. Forwarding `embeddings` here lets the
+# top-level `kimetsu-cli --features embeddings` build pull a fully
+# embedder-aware pipeline path.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
 
 [dependencies]
 blake3.workspace = true
-kimetsu-brain = { path = "../kimetsu-brain" }
-kimetsu-core = { path = "../kimetsu-core" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.5.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.5.2" }
 regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
