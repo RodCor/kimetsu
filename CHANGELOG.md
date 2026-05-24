@@ -6,6 +6,81 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.4.9 — SecretString for provider tokens + automated crates.io publish
+
+SECURITY
+  Both `ClaudeCodeProvider` and `AnthropicProvider` previously held
+  `api_key: String` and derived `#[derive(Debug)]`. Any `{:?}`
+  print of either struct — panic backtrace, `dbg!` left in a debug
+  session, `tracing::debug!(?provider)` from a future telemetry
+  pass — would have written the raw OAuth token / API key to
+  stderr or the log sink.
+
+  v0.4.9 introduces `kimetsu_core::secret::SecretString` whose
+  `Debug` / `Display` / `serde::Serialize` impls all emit
+  `"[REDACTED; len=N]"`. Cleartext is only reachable via
+  `expose_secret()` — every caller is now greppable in code
+  review.
+
+  Provider fields converted:
+    ClaudeCodeProvider.api_key: String -> SecretString
+    AnthropicProvider.api_key: String -> SecretString
+
+  Cleartext leak points (greppable, intentional):
+    crates/kimetsu-agent/src/claude_code.rs
+      .env("CLAUDE_CODE_OAUTH_TOKEN", self.api_key.expose_secret())  (2 sites)
+      redact_token(..., self.api_key.expose_secret())                (3 sites)
+    crates/kimetsu-agent/src/anthropic.rs
+      .header("x-api-key", self.api_key.expose_secret())             (1 site)
+
+  Regression guards:
+    kimetsu_core::secret::tests
+      debug_format_never_includes_inner_value
+      display_emits_redaction_marker
+      serialize_emits_redaction_marker
+      expose_secret_returns_cleartext
+      parent_struct_derive_debug_does_not_leak
+    kimetsu_agent::claude_code::tests::debug_format_does_not_leak_api_key
+    kimetsu_agent::anthropic::tests::debug_format_does_not_leak_api_key
+
+  Pre-existing v0.4.5 `kimetsu_brain::redact` already covers the
+  ingest-side leak surface (token strings in memory text); this
+  patch closes the in-memory-struct surface.
+
+DISTRIBUTION
+  Per-crate Cargo.toml: every `path = "../kimetsu-X"` now also
+  declares `version = "0.4.9"`. Required for `cargo publish`
+  to resolve cross-crate deps via the registry instead of the
+  local path.
+
+  .github/workflows/release.yml gains a `publish-crates` job
+  that runs after the binary matrix + GH Release succeed. The
+  job uses `${{ secrets.CARGO_REGISTRY_TOKEN }}` and publishes
+  the six crates in dependency order with a 30-second sleep
+  between each so the crates.io index can propagate:
+    kimetsu-core -> kimetsu-brain -> kimetsu-agent
+                 -> kimetsu-harbor-rs -> kimetsu-chat
+                 -> kimetsu-cli
+
+  ONE-TIME SETUP (operator action):
+    gh secret set CARGO_REGISTRY_TOKEN < <(cat path/to/token)
+  Or via the GitHub UI: Settings -> Secrets -> Actions.
+  The job hard-errors with an actionable message if the secret
+  is missing, so a misconfigured pipeline fails fast.
+
+  After this tag ships, end-users can:
+    cargo install kimetsu-cli
+    cargo install kimetsu-cli --features embeddings
+
+  v0.4.7 + v0.4.8 GH Releases exist but were never published to
+  crates.io (the workflow didn't have the publish job). v0.4.9 is
+  the first crates.io-published version.
+
+NEXT
+  Smoke-validate with `kimetsu doctor` against a fresh
+  `cargo install kimetsu-cli` to confirm the registry flow works
+  end-to-end. If anything breaks per-platform, cut v0.4.9.1.
+
 ## v0.4.8 — release-pipeline patch
 
 The v0.4.7 release workflow failed across every platform with:

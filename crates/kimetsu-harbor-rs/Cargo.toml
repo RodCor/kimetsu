@@ -32,8 +32,8 @@ embeddings = ["kimetsu-brain/embeddings"]
 
 [dependencies]
 clap.workspace = true
-kimetsu-agent = { path = "../kimetsu-agent" }
-kimetsu-brain = { path = "../kimetsu-brain" }
-kimetsu-core = { path = "../kimetsu-core" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.4.9" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.4.9" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.4.9" }
 serde.workspace = true
 serde_json.workspace = true

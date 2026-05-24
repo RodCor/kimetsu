@@ -172,3 +172,101 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crates:
+    # v0.4.9: serial cargo publish to crates.io after the binary
+    # matrix + GH Release succeed. Gated on:
+    #   (a) tag push (handled by `if`)
+    #   (b) the `release` job succeeding (handled by `needs`)
+    #   (c) CARGO_REGISTRY_TOKEN secret being set on the repo
+    #
+    # Crate publish order is dictated by the dep DAG:
+    #   kimetsu-core      (no kimetsu deps)
+    #   kimetsu-brain     (needs core)
+    #   kimetsu-agent     (needs brain + core)
+    #   kimetsu-harbor-rs (needs agent + brain + core)
+    #   kimetsu-chat      (needs agent + brain + core)
+    #   kimetsu-cli       (needs agent + brain + chat + core)
+    #
+    # `cargo publish --no-verify` skips the local rebuild that
+    # cargo does by default — the binary matrix already verified
+    # everything builds clean against this tag. `sleep 30` between
+    # publishes gives crates.io's index time to propagate so the
+    # next crate can resolve the just-published dep.
+    name: publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: verify CARGO_REGISTRY_TOKEN secret is set
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set. Skipping crates.io publish."
+            echo "::error::Add the secret via: gh secret set CARGO_REGISTRY_TOKEN"
+            exit 1
+          fi
+          echo "CARGO_REGISTRY_TOKEN is set (length: ${#CARGO_REGISTRY_TOKEN})"
+
+      - name: publish kimetsu-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p kimetsu-core --no-verify
+          sleep 30
+
+      - name: publish kimetsu-brain
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p kimetsu-brain --no-verify
+          sleep 30
+
+      - name: publish kimetsu-agent
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p kimetsu-agent --no-verify
+          sleep 30
+
+      - name: publish kimetsu-harbor-rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p kimetsu-harbor-rs --no-verify
+          sleep 30
+
+      - name: publish kimetsu-chat
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p kimetsu-chat --no-verify
+          sleep 30
+
+      - name: publish kimetsu-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p kimetsu-cli --no-verify
+
+      - name: summary
+        run: |
+          echo "## crates.io publish — v${GITHUB_REF_NAME#v} ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Published 6 crates in dependency order:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for c in kimetsu-core kimetsu-brain kimetsu-agent kimetsu-harbor-rs kimetsu-chat kimetsu-cli; do
+            echo "- [\`${c}\`](https://crates.io/crates/${c}/${GITHUB_REF_NAME#v})" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli --features embeddings" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

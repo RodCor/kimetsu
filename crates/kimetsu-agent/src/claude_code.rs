@@ -13,6 +13,7 @@ use kimetsu_core::KimetsuResult;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::ids::new_id;
+use kimetsu_core::secret::SecretString;
 use serde::Deserialize;
 
 use crate::agent_loop::extract_json_object;
@@ -23,7 +24,15 @@ use crate::model::{
 
 #[derive(Debug)]
 pub struct ClaudeCodeProvider {
-    api_key: String,
+    // v0.4.9: wrapped in SecretString so Debug / Display / serde
+    // emit "[REDACTED]" instead of the raw OAuth token. The bare
+    // `String` field this replaces was a latent leak — any
+    // `{:?}` print of the provider (panic backtrace, dbg!,
+    // tracing::debug!(?provider)) would have written the token to
+    // stderr. Cleartext is now reachable only via
+    // `api_key.expose_secret()`, and those callers are
+    // greppable.
+    api_key: SecretString,
     model: String,
     timeout: Duration,
     // MP-15b: `--max-budget-usd` removed from the claude CLI invocation.
@@ -205,7 +214,10 @@ impl ClaudeCodeProvider {
         let persistent_enabled = claude_persistent_enabled(persistent_default);
 
         Ok(Some(Self {
-            api_key: secret,
+            // v0.4.9: wrap the freshly-resolved token so it can't
+            // leak via Debug. From here on `self.api_key` only
+            // discloses cleartext through `expose_secret()`.
+            api_key: SecretString::new(secret),
             model: config.model.model.clone(),
             timeout: Duration::from_secs(config.model.request_timeout_secs),
             work_dir: Arc::new(work_dir),
@@ -352,7 +364,13 @@ impl ClaudeCodeProvider {
             .current_dir(work_dir.path())
             .env("CLAUDE_CONFIG_DIR", &config_dir)
             .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
-            .env("CLAUDE_CODE_OAUTH_TOKEN", &self.api_key)
+            // v0.4.9: explicit cleartext leak point. The token is
+            // passed via Command env to the child `claude` process
+            // (the only secure way to hand it to a subprocess on
+            // every platform). Rust's std::process never logs env
+            // values, so this stays on the right side of the
+            // SecretString boundary.
+            .env("CLAUDE_CODE_OAUTH_TOKEN", self.api_key.expose_secret())
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
             .arg("-p")
@@ -463,7 +481,7 @@ impl ModelProvider for ClaudeCodeProvider {
                 Err(err) => {
                     eprintln!(
                         "claude_code persistent path failed, falling back to one-shot: {}",
-                        redact_token(&err.to_string(), &self.api_key),
+                        redact_token(&err.to_string(), self.api_key.expose_secret()),
                     );
                     // Make sure any half-dead session is dropped so the
                     // next call respawns cleanly.
@@ -522,7 +540,10 @@ impl ModelProvider for ClaudeCodeProvider {
                 .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
                 // Route the configured token through the OAuth env var; the local
                 // `claude` CLI accepts OAuth for non-`--bare` invocations.
-                .env("CLAUDE_CODE_OAUTH_TOKEN", &self.api_key)
+                // v0.4.9: explicit cleartext leak point (same as the
+                // persistent-session spawn — Rust's std::process
+                // env doesn't log values).
+                .env("CLAUDE_CODE_OAUTH_TOKEN", self.api_key.expose_secret())
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("ANTHROPIC_AUTH_TOKEN")
                 .arg("-p")
@@ -600,7 +621,7 @@ impl ModelProvider for ClaudeCodeProvider {
                 run_with_timeout_stdin(build_command(), &prompt, self.timeout).map_err(|err| {
                     redact_token(
                         &format!("claude_code provider failed: {err}"),
-                        &self.api_key,
+                        self.api_key.expose_secret(),
                     )
                 })?;
 
@@ -638,7 +659,7 @@ impl ModelProvider for ClaudeCodeProvider {
                             .unwrap_or_else(|| "signal".to_string()),
                         output_summary(&output)
                     ),
-                    &self.api_key,
+                    self.api_key.expose_secret(),
                 );
                 if transient && attempt < MAX_ATTEMPTS {
                     let backoff = BASE_BACKOFF_SECS * (1u64 << (attempt - 1));
@@ -1189,6 +1210,37 @@ mod tests {
     use super::*;
     use crate::model::{ModelMessage, ToolChoice, ToolDefinition};
     use serde_json::json;
+
+    /// v0.4.9 regression guard: `#[derive(Debug)]` on the provider
+    /// MUST NOT leak `api_key`. SecretString's Debug emits
+    /// "[REDACTED; len=N]". If anyone replaces the field type with
+    /// a bare `String`, this test fails loudly before the next
+    /// release tag.
+    #[test]
+    fn debug_format_does_not_leak_api_key() {
+        let token = "sk-ant-api03-DEFINITELY-LEAKED-IF-BROKEN-1234567890";
+        let provider = ClaudeCodeProvider {
+            api_key: SecretString::new(token),
+            model: "claude-opus-4-7".into(),
+            timeout: Duration::from_secs(60),
+            work_dir: Arc::new(TempCommandDir::create().expect("tempdir")),
+            session: None,
+            persistent_enabled: false,
+        };
+        let dbg = format!("{:?}", provider);
+        assert!(
+            !dbg.contains("DEFINITELY-LEAKED-IF-BROKEN"),
+            "Debug-print MUST NOT include the inner token: {dbg}"
+        );
+        assert!(
+            !dbg.contains("sk-ant-api03"),
+            "Debug-print MUST NOT include the inner token prefix: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "marker missing: {dbg}");
+        // Model + non-secret fields should still surface for
+        // diagnostic value.
+        assert!(dbg.contains("claude-opus-4-7"));
+    }
 
     #[test]
     fn parses_success_json() {
