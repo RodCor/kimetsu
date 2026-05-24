@@ -6,6 +6,49 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.4.11 — drop x86_64-apple-darwin from the release matrix
+
+The v0.4.10 release pipeline got stuck because two GitHub Actions
+matrix jobs queued indefinitely:
+
+```
+build x86_64-apple-darwin (lean)        — queued, never started
+build x86_64-apple-darwin (embeddings)  — queued, never started
+```
+
+As of late 2026, `macos-13` (Intel) runners are deprecated on the
+GitHub Actions free tier and queue indefinitely without an SLA.
+Apple Silicon (`macos-14` and newer, arm64) is the dominant
+architecture and runs fine. Sitting in the queue for hours
+blocked the `release` job → blocked the `publish-crates` job →
+nothing actually shipped.
+
+Fix in v0.4.11:
+
+* `.github/workflows/release.yml` matrix drops the two
+  `x86_64-apple-darwin` entries. The release matrix now ships
+  6 archives (down from 8):
+    * x86_64-unknown-linux-gnu   (lean + embeddings)
+    * aarch64-apple-darwin       (lean + embeddings)  ← Apple Silicon
+    * x86_64-pc-windows-msvc     (lean + embeddings)
+* Users on Intel Macs can still `cargo install kimetsu-cli`
+  (with or without `--features embeddings`) — the source build
+  is target-portable. They just don't get a pre-built binary.
+* If GitHub re-provisions `macos-13` capacity in the future, we
+  add it back; if x86_64 mac demand spikes, we can also cross-
+  compile from `macos-14` (arm64 host) — a v0.5 follow-up.
+
+No code changes. v0.4.9's SecretString + v0.4.10's harbor-rs
+publish exclusion both carry forward.
+
+OPERATOR ACTION
+  Cancel the stuck v0.4.10 workflow run on GitHub Actions
+  (it'll never complete with those queued macOS jobs):
+    gh run cancel <run-id>
+    # or click "Cancel workflow" in the Actions tab UI
+
+  Then v0.4.11's tag push fires a fresh, clean run.
+
 ## v0.4.10 — kimetsu-harbor-rs stays out of crates.io
 
 The v0.4.9 publish pipeline included `kimetsu-harbor-rs` in the

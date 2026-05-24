@@ -44,10 +44,14 @@ jobs:
           # Linux
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: ""               }
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings" }
-          # macOS Intel
-          - { os: macos-13,       target: x86_64-apple-darwin,      flavor: lean,       extra_features: ""               }
-          - { os: macos-13,       target: x86_64-apple-darwin,      flavor: embeddings, extra_features: "--features embeddings" }
           # macOS Apple Silicon
+          #
+          # v0.4.11: x86_64-apple-darwin (macos-13) runners were
+          # dropped from the matrix. As of late 2026 those runners
+          # are deprecated + under-provisioned on GitHub's free
+          # tier and the jobs queue indefinitely. Apple Silicon
+          # is the dominant Mac architecture now; users on Intel
+          # Macs can `cargo install kimetsu-cli` from source.
           - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: ""               }
           - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings" }
           # Windows
