@@ -6,6 +6,70 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.5.4 — doc consolidation: HOW-KIMETSU-WORKS.md replaces the docs/ sprawl
+
+Second commit of the v0.5.3-v0.5.5 harbor refactor arc. Cleans up
+`kimetsu/docs/` so users see exactly one conceptual reference — not
+22 files of planning, postmortems, and historical roadmaps.
+
+WHAT v0.5.4 ADDS
+  * `docs/HOW-KIMETSU-WORKS.md` (~600 lines). Single conceptual
+    reference covering: the brain (events → projector → memories),
+    the broker (scoring math + decay + MMR), citations + blame
+    (v0.5.0), decay (v0.5.1), conflict detection (v0.5.2), the 18
+    kimetsu_* MCP tools, the bridge, doctor, config schema, and
+    "what kimetsu is NOT." Consolidates the prior KIMETSU-CHAT,
+    MEMORY-PROPOSALS, MEMORY-USEFULNESS, DEPENDENCIES into one
+    self-contained reference.
+
+WHAT v0.5.4 DELETES FROM THIS REPO
+  * `docs/V0.3.4-SHIP.md`, `docs/V0.3.5-PERF.md`, `docs/V0.4-ROADMAP.md`,
+    `docs/V0.5-PLAN.md`, `docs/SWEBENCH.md` — historical planning + ship docs.
+  * `docs/KIMETSU-CHAT.md`, `docs/MEMORY-PROPOSALS.md`,
+    `docs/MEMORY-USEFULNESS.md`, `docs/DEPENDENCIES.md` — content
+    folded into HOW-KIMETSU-WORKS.md.
+  * `docs/archive/` entire subtree (14 files: MP-4 through MP-15
+    results, MVP, V0.2 plan/ship, V0.3 plan).
+
+WHERE THEY WENT
+  * All 22 files were copied to `docs/history/` in the private
+    `github.com/RodCor/kimetsu-bench` repo (v0.5.4 commit on that
+    side: "Adopt historical planning + ship docs from kimetsu repo").
+    Their git history through v0.5.3 stays in this repo for bisects
+    + archaeology.
+
+README + CHANGELOG TOUCHED
+  * README's "Documentation Map" section now points at one file:
+    `docs/HOW-KIMETSU-WORKS.md` + the per-release CHANGELOG +
+    per-crate `src/lib.rs` doc comments. Stale references to
+    deleted docs removed.
+  * CHANGELOG's v0.5.0 + v0.3 + v0.2 + v0.1 entries dropped their
+    "see X.md" references; the X.md files are gone. The notes below
+    each version still stand alone.
+
+NET DELTA
+  * kimetsu/docs/: 22 files → 1 file.
+  * No code changes; no API change; no test count change.
+  * cargo test --workspace      258 / 258 passing  (unchanged from v0.5.3)
+  * cargo build --workspace     clean at 0.5.4
+
+UPGRADE NOTES
+  * If you've been bookmarking specific historical docs:
+      - Need V0.5-PLAN.md, V0.4-ROADMAP.md, MP-* results? They're in
+        the private bench repo. Ping for access.
+      - Need KIMETSU-CHAT / MEMORY-PROPOSALS / MEMORY-USEFULNESS /
+        DEPENDENCIES content? It's all in
+        `docs/HOW-KIMETSU-WORKS.md` now (sections 1, 4, 4, 10).
+  * Pre-v0.5.4 commit hashes still reference the files in their
+    original locations — `git log` + `git show` work normally on
+    history.
+
+NEXT (in flight)
+  * v0.5.5 — Layer 2 driver implementation lands in kimetsu-bench
+    (Python Harbor shim + BenchmarkDriver trait + Terminal-Bench
+    impl + kbench CLI). The kimetsu_harbor/ directory in this repo
+    gets deleted in the same release pass.
+
 ## v0.5.3 — Layer 1 of the harbor refactor: in-process e2e suite + CLI smoke
 
 First commit of the v0.5.3 harbor refactor arc. v0.5.0-v0.5.2 made
@@ -282,7 +346,8 @@ NEXT (in flight)
 v0.5's north star: make the brain *get smarter over time* from
 real run data. v0.5.0 ships the foundation — per-memory
 attribution — that v0.5.1 (decay) and v0.5.2 (conflict detection)
-build on. See `docs/V0.5-PLAN.md` for the full arc.
+build on. The arc is summarized in `docs/HOW-KIMETSU-WORKS.md`
+sections 4-6; per-release detail is in the entries below.
 
 PROBLEM
   Until v0.4.x the brain's usefulness signal was per-run, all-or-
@@ -651,24 +716,27 @@ Release was never published (the pipeline failed before upload).
 - Kill-switch: `KIMETSU_USER_BRAIN=0` falls back to v0.3.5
   behavior.
 
-## v0.3 — see [`docs/V0.3.4-SHIP.md`](docs/V0.3.4-SHIP.md) + the kimetsu-chat + bridge plugin commits
+## v0.3 — chat client + bridge plugin + prompt-cache visibility
 
 The v0.3 line introduced the chat client, the bridge plugin
 mode (MCP sidecar for Claude Code and Codex), and Anthropic
 prompt-cache visibility + the persistent claude subprocess
-that makes cache_read actually land. See the V0.3.4 ship doc
-for the deep dive on cache + persistent subprocess; the
-v0.3.5 perf pass (later commit) flipped the persistent path
-to default-on for chat.
+that makes cache_read actually land. v0.3.5 flipped the
+persistent path to default-on for chat.
 
 ## v0.2 — Terminal-Bench validation
 
 The v0.2 line ran the MP gauntlet from MP-4 through MP-18:
 broker design + retrieval scoring, the 20-tool surface,
 auto-orient pre-shell, parallel `tool_calls` envelope,
-record_deviation + iterative verify. See `docs/archive/MP-*-RESULTS.md`
-and `docs/archive/V0.2-SHIP.md`.
+record_deviation + iterative verify.
 
 ## v0.1 — initial scaffold
 
-Brain + agent + pipeline foundations. See `docs/archive/MVP.md`.
+Brain + agent + pipeline foundations.
+
+> Per-release planning + ship docs for v0.1 through v0.4 (the MP-*
+> gauntlet result notes, the MVP doc, the V0.2 / V0.3 / V0.4 plans,
+> the V0.5 plan) moved to the internal kimetsu-bench repo in v0.5.4.
+> They remained in this repo's git history through v0.5.3; check
+> commits prior to the v0.5.4 tag if you need them.

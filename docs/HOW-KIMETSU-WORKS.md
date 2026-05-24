@@ -1,0 +1,392 @@
+# How Kimetsu Works
+
+Kimetsu is a sidecar brain for coding agents. It runs alongside Claude
+Code or Codex (or as a standalone chat REPL), watches what the model
+does, learns which memories actually help, and feeds higher-signal
+context into future runs. This document explains the moving parts, in
+the order you'll encounter them.
+
+> This is the only conceptual reference in the kimetsu repo. The
+> README gets you installed; the CHANGELOG tells you what shipped
+> when; this doc tells you how it all fits together. Historical
+> planning docs + per-version postmortems live in a separate
+> internal repo — they're our lab notebook, not user documentation.
+
+---
+
+## 1. Two ways to use it
+
+**As a sidecar via MCP.** Run `kimetsu chat --mcp-server` and point
+Claude Code or Codex at it. The host agent gets ~18 kimetsu_* tools
+(brain context, citations, memory add/list/blame/conflicts, repo
+ingest, the bridge to other harnesses). Memories carry across
+sessions; learning compounds.
+
+**As a standalone REPL.** Run `kimetsu chat`. Same brain, same
+tools, just without a host harness. Useful for debugging a brain or
+running short tasks where you don't want a second agent in the loop.
+
+The CLI also has admin commands (`kimetsu brain ...`,
+`kimetsu doctor`, `kimetsu bridge ...`) that you'll use for
+maintenance — described below.
+
+---
+
+## 2. The brain
+
+Everything kimetsu remembers lives in **brain.db**, a SQLite
+database. Each project gets one at `<project>/.kimetsu/brain.db`. A
+global user brain at `~/.kimetsu/brain.db` holds memories that
+follow you across projects (set `KIMETSU_USER_BRAIN=0` to disable).
+
+The brain is event-sourced. Every run writes a trace of `Event` rows
+(JSONL). A **projector** turns those events into materialized tables
+the broker can query fast:
+
+- `runs` — one row per agent run (started_at, terminal_kind, cost).
+- `events` — every event ever written, raw.
+- `memories` — the durable knowledge. Each row carries scope
+  (`global_user`, `project`, `repo`, `run`), kind (`preference`,
+  `convention`, `command`, `failure_pattern`, `fact`), text, confidence,
+  use_count, usefulness_score, and (v0.5.1+) last_useful_at.
+- `memory_proposals` — pending suggestions awaiting human review.
+- `memory_citations` — (v0.5.0+) which memories the model cited
+  during which run, on which turn.
+- `memory_conflicts` — (v0.5.2+) ingest-time hits where a new
+  memory's embedding was too close to an existing one with
+  contradictory text.
+- `repo_files`, `repo_files_fts`, `repo_manifests`,
+  `repo_manifests_fts` — file-level indexes built by
+  `kimetsu brain ingest repo`.
+- `memories_fts` — FTS5 index of memory text for lexical retrieval.
+
+The schema is forward-additive — every column added since v0.1 uses
+`add_column_if_missing`, so an older brain.db opens cleanly under a
+newer binary without rebuilds.
+
+### Memory kinds
+
+| Kind | Use |
+|------|-----|
+| `preference` | User-stated style choices ("prefer thiserror") |
+| `convention` | Repo conventions ("always run cargo fmt") |
+| `command` | Useful shell incantations ("regen with `cargo xtask gen`") |
+| `failure_pattern` | "Don't do X, it caused Y last time" |
+| `fact` | Domain knowledge — APIs, gotchas, architectural notes |
+
+### Memory scopes
+
+| Scope | Lives | Use |
+|-------|-------|-----|
+| `run` | This run only | Ephemeral notes — discarded at end |
+| `repo` | This repo | Project conventions, code-specific facts |
+| `project` | This project (== repo today) | Synonym for repo |
+| `global_user` | User-wide brain | Personal preferences, cross-project knowledge |
+
+---
+
+## 3. The broker
+
+When a run starts (chat REPL, MCP `kimetsu_brain_context` call, or
+the agent loop's pre-stage hook), the **broker** assembles a
+context bundle. It walks both brains, scores candidates, and returns
+the top-N inside a token budget.
+
+The score is a weighted sum of four signals, plus two multipliers:
+
+```
+raw_relevance  = (1 - α) * lexical_match + α * cosine_similarity
+                                                 (where α = 0.5 default,
+                                                  cosine only fires when
+                                                  --features embeddings is on)
+
+multiplier     = usefulness_multiplier(usefulness_score, use_count)
+                 ∈ [0.5, 1.5]  blended by Bayesian smoothing
+
+decay          = exp(-ln 2 · age_days / half_life_days)   ∈ [0, 1]
+                 age measured from coalesce(last_useful_at, created_at)
+                 half_life_days default = 30, set to 0 to disable
+
+effective      = 1.0 + (multiplier - 1.0) · decay
+                 (decay attenuates the *deviation* from neutral, not
+                  the multiplier itself — a year-old +1.5 memory
+                  slides toward 1.0, NOT toward 0)
+
+final_score    = weights.relevance   · raw_relevance
+               + weights.confidence  · confidence
+               + weights.freshness   · freshness
+               + weights.scope       · scope_weight
+                 — all per-stage tunable via [broker.weights.<stage>]
+```
+
+Stages: `localization`, `patch_plan`, `verification`, `review`. Each
+has its own weight profile in `project.toml`. The broker also runs
+**MMR re-ranking** (lambda=0.7) to penalize within-kind redundancy —
+two memories that mention the same words don't both crowd the
+budget.
+
+### Lean vs embeddings builds
+
+- **Lean** (default): `cargo install kimetsu-cli`. No embedder
+  binary, no model download. Retrieval is FTS-only via the `α=0`
+  effective behavior. Conflict detection at ingest is a silent no-op.
+- **Embeddings**: `cargo install kimetsu-cli --features embeddings`.
+  Pulls fastembed-rs + ONNX runtime. Default model is BGE-small-en-v1.5;
+  set `KIMETSU_BRAIN_EMBEDDER=jina-v2-base-code` (or any
+  fastembed-rs model id) to swap. Cosine retrieval + conflict
+  detection both light up.
+
+---
+
+## 4. Citations + blame (v0.5.0)
+
+The model's biggest signal is *which memories it actually used*.
+When a memory shows up in context but the model never reaches for
+it, that's "silent passenger" data. When the model explicitly cites
+a memory before solving the problem, that's strong evidence the
+memory helped.
+
+The flow:
+
+1. The broker injects N capsules into the prompt (recorded as a
+   `context.injected` event).
+2. The model, mid-run, calls the **`cite_memory`** tool when it
+   leans on a specific memory. Multiple cites per turn are fine.
+3. At run end, the transport (chat REPL or harbor binary) emits one
+   `memory.cited` event per citation. The projector mirrors each
+   into `memory_citations`.
+4. On `run.finished`, the projector applies the usefulness deltas:
+   - **Cited memories**: ±1.0 (strong signal). Also bumps
+     `last_useful_at` to "now" on success.
+   - **Silent passengers**: ±0.1 (weak signal). Outcome-correlated,
+     but small.
+   - `run.failed` with `category = "Gate"` is treated as no signal —
+     the agent's verifier failing isn't the memory's fault.
+
+The split keeps the strong signal aimed at memories that actually
+contributed, while still giving silent passengers a small +/- so the
+broker can prune long-untouched noise.
+
+### Inspecting a run
+
+```bash
+kimetsu brain memory blame <run-id>
+```
+
+Prints cited memories first (with rationale + turn) and silent
+passengers second. `--json` for CI / hooks. The same surface is
+available as the `kimetsu_brain_memory_blame` MCP tool so a host
+agent can introspect its own runs.
+
+---
+
+## 5. Decay (v0.5.1)
+
+A memory that was useful 6 months ago shouldn't outrank one that
+was useful yesterday. The `last_useful_at` column (bumped only on
+cited + run.finished) is the reference timestamp; the broker
+applies a half-life curve to attenuate stale usefulness boosts.
+
+- Default half-life: **30 days**.
+- Configurable per-project:
+  ```toml
+  [broker.weights]
+  decay_half_life_days = 14   # faster-moving repo
+  # or
+  decay_half_life_days = 0    # disable decay entirely
+  ```
+- Critically, decay attenuates the *deviation from neutral*, not the
+  multiplier itself: a max-boosted +1.5 memory decays toward 1.0
+  (neutral, like a brand-new memory), not toward 0. Losing confidence
+  in old signal shouldn't penalize a memory below one with zero
+  history.
+
+---
+
+## 6. Conflict detection at ingest (v0.5.2)
+
+When `add_memory` (CLI or MCP) writes a new capsule, kimetsu scans
+the active brain for nearby contradictions: existing memories in
+the same scope whose embedding is close (cosine ≥ 0.8 by default)
+but whose normalized text differs.
+
+Hits land in `memory_conflicts`. The write itself is **not blocked**
+— surfacing > blocking, because a blocked write loses user intent.
+Instead the operator reviews via:
+
+```bash
+kimetsu brain memory conflicts                  # list open conflicts
+kimetsu brain memory conflicts --resolve <id> kept_new
+kimetsu brain memory conflicts --resolve <id> kept_existing
+kimetsu brain memory conflicts --resolve <id> kept_both
+```
+
+`kept_new` invalidates the existing memory. `kept_existing`
+invalidates the new one. `kept_both` is the legitimate case where
+both apply (e.g., "use anyhow in CLI binaries" + "use thiserror in
+library crates" — same shape, different scope semantically).
+
+Conflict detection is **embedder-gated**. The lean build silently
+skips it; build with `--features embeddings` to enable.
+
+The MCP surface (`kimetsu_brain_memory_conflicts`) is read-only by
+design. Resolution is CLI-only to keep the audit trail centralized —
+an agent shouldn't silently "resolve" a real contradiction it
+should have surfaced.
+
+---
+
+## 7. The MCP surface
+
+Run `kimetsu chat --mcp-server` and the host harness gets 18
+`kimetsu_*` tools:
+
+| Tool | What it does |
+|------|--------------|
+| `kimetsu_brain_context` | Retrieve a context bundle for a query/stage |
+| `kimetsu_brain_memory_add` | Persist a new memory |
+| `kimetsu_brain_memory_list` | List memories in scope, sorted by relevance |
+| `kimetsu_brain_memory_top` | Top memories by usefulness ratio |
+| `kimetsu_brain_memory_proposals` | Pending proposals awaiting review |
+| `kimetsu_brain_memory_accept` | Promote a proposal to a memory |
+| `kimetsu_brain_memory_reject` | Reject a proposal |
+| `kimetsu_brain_memory_invalidate` | Retire a memory |
+| `kimetsu_brain_memory_blame` | Per-run citation attribution (v0.5.0) |
+| `kimetsu_brain_memory_conflicts` | List open ingest conflicts (v0.5.2) |
+| `kimetsu_brain_ingest_repo` | Index repo files + manifests |
+| `kimetsu_benchmark_context` | Retrieve a task-aware playbook (benchmarks) |
+| `kimetsu_benchmark_record_outcome` | Record run outcome → proposal |
+| `kimetsu_bridge_status` | Cross-harness skill registry status |
+| `kimetsu_bridge_export` | Install a skill into Claude Code / Codex |
+| `kimetsu_skills_search` | Find skills by keyword |
+| `cite_memory` | (in-run) Mark a memory as cited (v0.5.0) |
+| `kimetsu_doctor` | Self-check the wire health |
+
+Tool input schemas + descriptions are advertised via the standard
+MCP `tools/list`. Every kimetsu_* tool returns `{"ok": true, "usage":
+{...}, ...}` so the host agent gets actionable "how to use this
+output" guidance, not just raw data.
+
+---
+
+## 8. The bridge
+
+Kimetsu also runs as a **cross-harness skill bridge**. The
+`kimetsu bridge` subcommand:
+
+- Discovers skills installed in Claude Code, Codex, and the local
+  kimetsu installation.
+- Exports a chosen skill into another harness (e.g., promote a
+  Codex skill to Claude Code).
+- Maintains a unified skill registry so the same skill works in
+  any host.
+
+`kimetsu bridge status` shows what's installed where; `kimetsu
+bridge export <skill> --to claude-code` does the install.
+
+---
+
+## 9. Doctor
+
+`kimetsu doctor` is the wire-health check. Validates that every
+subsystem actually works against the current workspace + user state:
+
+- Project paths resolve.
+- brain.db opens + schema matches.
+- User brain reachable (or correctly disabled).
+- Embedder loads (or correctly defaults to NoopEmbedder on lean).
+- MCP server can spawn (skipped with `--skip-mcp` for sandboxes).
+- Bridge can scan host harnesses.
+
+Hermetic by default — safe in CI. JSON output (`--json`) for
+hooks. Run after upgrading kimetsu or whenever something looks off.
+
+---
+
+## 10. Configuration
+
+Project config lives in `<project>/project.toml`:
+
+```toml
+[kimetsu]
+project_id = "my-project"
+schema_version = 1
+
+[model]
+provider = "anthropic"        # or "claude_code"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.50
+confidence = 0.20
+freshness = 0.20
+scope = 0.10
+decay_half_life_days = 30.0   # v0.5.1; 0 to disable
+
+[broker.weights.localization]
+relevance = 0.70              # heavier on relevance for the localization stage
+confidence = 0.10
+freshness = 0.10
+scope = 0.10
+
+# similar overrides for [broker.weights.patch_plan],
+# [broker.weights.verification], [broker.weights.review]
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = ["RUSTFLAGS", "CARGO_HOME"]
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524_288
+extra_skip_dirs = []
+max_total_files = 50_000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0    # advisory under subscription providers
+```
+
+Environment variables that override at runtime:
+
+| Variable | Effect |
+|----------|--------|
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` | Provider credentials |
+| `KIMETSU_USER_BRAIN=0` | Disable the user brain (project-only memories) |
+| `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick the embedder (or disable) |
+| `KIMETSU_HARBOR_PROJECT` | Project to retrieve brain context from in Harbor mode |
+
+---
+
+## 11. What kimetsu is NOT
+
+- It's not a model. It runs on top of one (Anthropic, Claude Code OAuth).
+- It's not a sandbox. Tools run on the host machine (or via the
+  Harbor JSON-RPC transport when benchmarked against Terminal-Bench).
+- It's not a multi-agent framework. There's one agent per run; the
+  brain is the cross-run continuity.
+- It's not a vector DB. The brain is SQLite + FTS5 + optional cosine.
+  Single file per project. Backups are `cp brain.db`.
+
+---
+
+## 12. Where to go next
+
+- Run `kimetsu doctor` to verify your install.
+- Read the **CHANGELOG** for what each version shipped (v0.5.0
+  citations, v0.5.1 decay, v0.5.2 conflicts, v0.5.3 e2e suite).
+- Look at the per-crate `src/lib.rs` doc comments for module-level
+  detail (`kimetsu-brain`, `kimetsu-agent`, `kimetsu-chat`,
+  `kimetsu-cli`, `kimetsu-core`).
+- For anything benchmark / impact-measurement related, the bench
+  surface lives in a separate internal repo — that's by design
+  (see "Lean vs embeddings" + the v0.5.4 entry in CHANGELOG).

@@ -587,7 +587,7 @@ Brain and memory metrics:
 
 ## Latest Recorded Benchmark Results
 
-The most recent recorded Terminal-Bench slice in `docs/archive/MP-14-RESULTS.md`
+The most recent recorded Terminal-Bench slice
 uses `terminal-bench/terminal-bench-2`, a 16-task slice, `claude-opus-4-7`,
 `-l 16 -n 2 -k 1`, and retry-on-5xx provider handling.
 
@@ -622,7 +622,7 @@ repeatable development slice used to compare Kimetsu modes and cost behavior.
 
 ## Performance Work Already Landed
 
-Recent performance changes are summarized in `docs/V0.3.5-PERF.md`:
+The v0.3.5 performance pass landed these:
 
 - Simple greetings and identity questions are answered locally with no model
   call or tool prompt.
@@ -646,10 +646,17 @@ Recent performance changes are summarized in `docs/V0.3.5-PERF.md`:
 
 ## Documentation Map
 
-- `docs/KIMETSU-CHAT.md`: chat setup, terminal UI, credentials, and skills.
-- `docs/archive/V0.3-PLAN.md`: chat product split and Harbor separation.
-- `docs/V0.3.5-PERF.md`: latest performance work.
-- `docs/archive/MP-14-RESULTS.md`: latest recorded Terminal-Bench comparison.
-- `docs/archive/MP-13G-RESULTS.md`: retry-on-5xx brain rerun.
-- `kimetsu_harbor/README.md`: Harbor adapter setup and benchmark runs.
-- `docs/SWEBENCH.md`: SWE-bench integration plan.
+- [`docs/HOW-KIMETSU-WORKS.md`](docs/HOW-KIMETSU-WORKS.md): the
+  conceptual reference. The brain, the broker, citations, decay,
+  conflict detection, MCP surface, the bridge, doctor, and config —
+  all in one place.
+- [`CHANGELOG.md`](CHANGELOG.md): per-release notes (v0.5.0
+  citations, v0.5.1 decay, v0.5.2 conflicts, v0.5.3 e2e suite, ...).
+- Per-crate `src/lib.rs` doc comments for module-level detail
+  (`kimetsu-brain`, `kimetsu-agent`, `kimetsu-chat`, `kimetsu-cli`,
+  `kimetsu-core`).
+
+> Historical planning docs (v0.2 / v0.3 / v0.4 / v0.5 plans, MP-*
+> result notes) and the internal benchmark orchestrator live in a
+> separate private repo by design — they're our lab notebook, not
+> user documentation. v0.5.4 introduced this split.
