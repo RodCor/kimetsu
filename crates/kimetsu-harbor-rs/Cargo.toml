@@ -12,6 +12,14 @@ rust-version.workspace = true
 description = "Terminal-Bench / Harbor transport adapter for kimetsu. Ships the `kimetsu-harbor-agent` benchmark binary."
 keywords = ["kimetsu", "harbor", "terminal-bench", "benchmark"]
 categories = ["development-tools"]
+# v0.4.10: this crate is benchmark-only and clone-and-build only.
+# `kimetsu-cli` (the user-facing binary) doesn't depend on it, so
+# end users never need it from crates.io. Publishing it would imply
+# a backward-compat commitment for a Terminal-Bench operator tool
+# that's still iterating internally. The release pipeline still
+# builds + ships the `kimetsu-harbor-agent` binary in each GH
+# Release archive, so benchmark users can grab it from there.
+publish = false
 
 [features]
 # v0.4.8: forwarded so the `kimetsu-cli --features embeddings`
@@ -32,8 +40,8 @@ embeddings = ["kimetsu-brain/embeddings"]
 
 [dependencies]
 clap.workspace = true
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.4.9" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.4.9" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.4.9" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.4.10" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.4.10" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.4.10" }
 serde.workspace = true
 serde_json.workspace = true

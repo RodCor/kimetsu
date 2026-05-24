@@ -6,6 +6,35 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.4.10 — kimetsu-harbor-rs stays out of crates.io
+
+The v0.4.9 publish pipeline included `kimetsu-harbor-rs` in the
+registry rollout. Reviewing pre-flight, that was wrong:
+
+  * `kimetsu-cli` (the binary `cargo install kimetsu-cli` produces)
+    does not depend on `kimetsu-harbor-rs`. End users never reach
+    it through the registry path.
+  * Harbor is a Terminal-Bench operator tool, still iterating
+    internally. Publishing implies API stability we don't want
+    to commit to yet.
+  * The `kimetsu-harbor-agent` binary that benchmark operators
+    actually use ships in every GH Release archive built by the
+    matrix job (lean flavor). That stays.
+
+Fixes in v0.4.10:
+
+  * `crates/kimetsu-harbor-rs/Cargo.toml` adds `publish = false`.
+    A manual `cargo publish -p kimetsu-harbor-rs` now refuses
+    outright with a clear error.
+  * `.github/workflows/release.yml` drops the
+    `publish kimetsu-harbor-rs` step. The publish-crates job now
+    walks 5 crates (core → brain → agent → chat → cli), not 6.
+  * Summary block updated: "Published 5 crates" + an explicit
+    note that harbor-rs is intentionally not published.
+
+No code changes. No new tests. v0.4.9's SecretString + automated
+publish work all carries forward.
+
 ## v0.4.9 — SecretString for provider tokens + automated crates.io publish
 
 SECURITY

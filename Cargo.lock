@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-agent"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "blake3",
  "kimetsu-brain",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-brain"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "blake3",
  "fastembed",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-chat"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-cli"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "clap",
  "kimetsu-agent",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-core"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-harbor-rs"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "clap",
  "kimetsu-agent",
