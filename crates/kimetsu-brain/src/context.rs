@@ -143,10 +143,21 @@ pub fn retrieve_context_with_embedder(
     embedder: &dyn Embedder,
 ) -> KimetsuResult<ContextBundle> {
     let query_embedding = QueryEmbedding::from_embedder(embedder, &request.query);
+    let half_life_days = weights.decay_half_life_days;
     let mut candidates = Vec::new();
-    candidates.extend(memory_candidates(conn, &request.query, query_embedding.as_ref())?);
+    candidates.extend(memory_candidates(
+        conn,
+        &request.query,
+        query_embedding.as_ref(),
+        half_life_days,
+    )?);
     for extra in extra_memory_conns {
-        candidates.extend(memory_candidates(extra, &request.query, query_embedding.as_ref())?);
+        candidates.extend(memory_candidates(
+            extra,
+            &request.query,
+            query_embedding.as_ref(),
+            half_life_days,
+        )?);
     }
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
@@ -231,17 +242,24 @@ fn memory_candidates(
     conn: &Connection,
     query: &str,
     query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
 ) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
     if let Some(fts_query) = fts_query(query) {
-        let candidates =
-            memory_fts_candidates(conn, &query_tokens, &fts_query, 80, query_embedding)?;
+        let candidates = memory_fts_candidates(
+            conn,
+            &query_tokens,
+            &fts_query,
+            80,
+            query_embedding,
+            half_life_days,
+        )?;
         if !candidates.is_empty() {
             return Ok(candidates);
         }
     }
 
-    latest_memory_candidates(conn, &query_tokens, 200, query_embedding)
+    latest_memory_candidates(conn, &query_tokens, 200, query_embedding, half_life_days)
 }
 
 fn latest_memory_candidates(
@@ -249,6 +267,7 @@ fn latest_memory_candidates(
     query_tokens: &[String],
     limit: u32,
     query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
 ) -> KimetsuResult<Vec<Candidate>> {
     // MP-4d: exclude invalidated memories from retrieval. The row stays in
     // brain.db so `memory list` and replay can still see the history; only
@@ -256,10 +275,15 @@ fn latest_memory_candidates(
     //
     // v0.4.2: SELECT now also pulls the optional embedding + model id
     // so we can blend a cosine score with the lexical match.
+    //
+    // v0.5.1: SELECT also pulls `last_useful_at` so the broker can
+    // apply the half-life decay term (memories that helped recently
+    // outvote memories that haven't been confirmed useful in months).
     let mut stmt = conn.prepare_cached(
         "
         SELECT memory_id, scope, kind, text, confidence, created_at,
-               use_count, usefulness_score, embedding, embedding_model
+               use_count, usefulness_score, embedding, embedding_model,
+               last_useful_at
         FROM memories
         WHERE invalidated_at IS NULL
         ORDER BY created_at DESC
@@ -279,6 +303,7 @@ fn latest_memory_candidates(
             row.get::<_, f64>(7)?,
             row.get::<_, Option<Vec<u8>>>(8)?,
             row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
         ))
     })?;
 
@@ -295,6 +320,7 @@ fn latest_memory_candidates(
             usefulness_score,
             embedding,
             embedding_model,
+            last_useful_at,
         ) = row?;
         let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
         if let Some(candidate) = memory_row_to_candidate(
@@ -307,6 +333,8 @@ fn latest_memory_candidates(
             created_at,
             use_count,
             usefulness_score,
+            last_useful_at,
+            half_life_days,
             None,
             cosine,
         ) {
@@ -322,12 +350,13 @@ fn memory_fts_candidates(
     fts_query: &str,
     limit: u32,
     query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
 ) -> KimetsuResult<Vec<Candidate>> {
     let mut stmt = conn.prepare_cached(
         "
         SELECT m.memory_id, m.scope, m.kind, m.text, m.confidence, m.created_at,
                m.use_count, m.usefulness_score, bm25(memories_fts) AS rank,
-               m.embedding, m.embedding_model
+               m.embedding, m.embedding_model, m.last_useful_at
         FROM memories_fts
         JOIN memories m
           ON m.memory_id = memories_fts.memory_id
@@ -351,6 +380,7 @@ fn memory_fts_candidates(
             row.get::<_, f64>(8)?,
             row.get::<_, Option<Vec<u8>>>(9)?,
             row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
 
@@ -368,6 +398,7 @@ fn memory_fts_candidates(
             rank,
             embedding,
             embedding_model,
+            last_useful_at,
         ) = row?;
         let fts_relevance = (-rank as f32).max(0.0);
         let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
@@ -381,6 +412,8 @@ fn memory_fts_candidates(
             created_at,
             use_count,
             usefulness_score,
+            last_useful_at,
+            half_life_days,
             Some(fts_relevance),
             cosine,
         ) {
@@ -430,6 +463,8 @@ fn memory_row_to_candidate(
     created_at: String,
     use_count: i64,
     usefulness_score: f64,
+    last_useful_at: Option<String>,
+    half_life_days: f32,
     raw_relevance_override: Option<f32>,
     cosine_score: Option<f32>,
 ) -> Option<Candidate> {
@@ -466,7 +501,14 @@ fn memory_row_to_candidate(
 
     let freshness = freshness(&created_at);
     let scope_weight = scope_weight(&scope);
-    let multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
+    // v0.5.1: usefulness multiplier with half-life decay applied to
+    // the *deviation from neutral*. A 6-month-old memory that scored
+    // 1.5 (max boost) decays toward 1.0 (neutral) — NOT toward 0,
+    // because losing confidence in old signal shouldn't penalize a
+    // memory below a brand-new memory with zero history.
+    let raw_multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
+    let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
+    let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
     let biased_relevance = raw_relevance * multiplier;
     Some(Candidate {
         raw_relevance: biased_relevance,
@@ -488,6 +530,49 @@ fn memory_row_to_candidate(
             score: 0.0,
         },
     })
+}
+
+/// v0.5.1: half-life decay factor applied to the *deviation from
+/// neutral* of [`usefulness_multiplier`]. Returns a value in `[0.0,
+/// 1.0]` where 1.0 = "use full envelope" (memory was confirmed useful
+/// recently) and 0.0 = "treat as neutral" (memory's confirmation is
+/// ancient).
+///
+/// Reference timestamp:
+///   * `last_useful_at` (set by the projector when a cited memory's
+///     run ended in run.finished) if present
+///   * fallback to `created_at` so a brand-new memory that's never
+///     been cited yet decays from its birthday — same shape, but
+///     starts fresh.
+///
+/// Math:
+///   decay = exp(-ln(2) * age_days / half_life_days)
+/// so at age == half_life the contribution is halved, at 2*half_life
+/// it's quartered, etc.
+///
+/// Safety rails:
+///   * `half_life_days <= 0` disables decay (returns 1.0) so an
+///     operator can opt out via project.toml.
+///   * Unparseable RFC3339 timestamps return 1.0 — fail-open so a
+///     corrupted row doesn't get silently demoted out of retrieval.
+pub(crate) fn usefulness_decay(
+    last_useful_at: Option<&str>,
+    created_at: &str,
+    half_life_days: f32,
+) -> f32 {
+    if half_life_days <= 0.0 {
+        return 1.0;
+    }
+    let reference = last_useful_at.unwrap_or(created_at);
+    let Ok(reference_ts) =
+        OffsetDateTime::parse(reference, &time::format_description::well_known::Rfc3339)
+    else {
+        return 1.0;
+    };
+    let age = OffsetDateTime::now_utc() - reference_ts;
+    let age_days = (age.whole_seconds().max(0) as f32) / 86_400.0;
+    let exponent = -std::f32::consts::LN_2 * age_days / half_life_days;
+    exponent.exp().clamp(0.0, 1.0)
 }
 
 /// MP-4b multiplier in [0.5, 1.5] derived from a memory's outcome history.
@@ -1272,6 +1357,266 @@ mod tests {
                 .iter()
                 .any(|c| c.expansion_handle == "memory:m_xref"),
             "cross-model row should still match lexically (cosine skipped, FTS works)"
+        );
+    }
+
+    // ----- v0.5.1: usefulness decay -----
+
+    /// v0.5.1: `half_life_days <= 0` is the operator opt-out hatch.
+    /// Decay must short-circuit to 1.0 so the usefulness multiplier
+    /// is unmodified — exact pre-v0.5.1 behavior for projects that
+    /// set `decay_half_life_days = 0` in project.toml.
+    #[test]
+    fn usefulness_decay_disabled_when_half_life_is_zero_or_negative() {
+        // Even a 5-year-old reference returns 1.0 with decay disabled.
+        let ancient = "2021-01-01T00:00:00Z";
+        assert!((usefulness_decay(Some(ancient), ancient, 0.0) - 1.0).abs() < f32::EPSILON);
+        assert!((usefulness_decay(Some(ancient), ancient, -1.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// v0.5.1: unparseable timestamps return 1.0 (fail-open). A
+    /// corrupted row shouldn't get silently dropped out of retrieval
+    /// just because its `last_useful_at` got mangled.
+    #[test]
+    fn usefulness_decay_returns_one_on_unparseable_timestamps() {
+        assert!((usefulness_decay(Some("not-a-date"), "also-not", 30.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// v0.5.1: a memory whose reference timestamp is "now" (no age)
+    /// decays by zero — full contribution.
+    #[test]
+    fn usefulness_decay_full_at_zero_age() {
+        // Use a timestamp from the future so age clamps to 0.
+        let future = "2099-01-01T00:00:00Z";
+        let d = usefulness_decay(Some(future), future, 30.0);
+        assert!((d - 1.0).abs() < f32::EPSILON, "got {d}");
+    }
+
+    /// v0.5.1: at age == half_life, decay = 0.5; at age = 2 * half_life,
+    /// decay = 0.25. Computed by setting `last_useful_at` to (now - days)
+    /// using OffsetDateTime arithmetic — the only way to get a stable
+    /// "now-relative" timestamp without freezing the clock.
+    #[test]
+    fn usefulness_decay_follows_half_life_curve() {
+        let half_life = 10.0_f32;
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+
+        // age = half_life -> decay ~= 0.5
+        let one_half_life_ago =
+            (now - time::Duration::seconds((half_life * 86_400.0) as i64))
+                .format(fmt)
+                .expect("format");
+        let d1 = usefulness_decay(Some(&one_half_life_ago), &one_half_life_ago, half_life);
+        assert!(
+            (d1 - 0.5).abs() < 0.01,
+            "expected ~0.5 at one half-life, got {d1}"
+        );
+
+        // age = 2 * half_life -> decay ~= 0.25
+        let two_half_lives_ago =
+            (now - time::Duration::seconds((2.0 * half_life * 86_400.0) as i64))
+                .format(fmt)
+                .expect("format");
+        let d2 = usefulness_decay(
+            Some(&two_half_lives_ago),
+            &two_half_lives_ago,
+            half_life,
+        );
+        assert!(
+            (d2 - 0.25).abs() < 0.01,
+            "expected ~0.25 at two half-lives, got {d2}"
+        );
+    }
+
+    /// v0.5.1: when `last_useful_at` is None the function falls back to
+    /// `created_at`. A 1-day-old never-cited memory should still get
+    /// nearly-full decay (close to 1.0) for a 30-day half-life.
+    #[test]
+    fn usefulness_decay_falls_back_to_created_at_when_last_useful_is_none() {
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let one_day_ago = (now - time::Duration::seconds(86_400))
+            .format(fmt)
+            .expect("format");
+        let d = usefulness_decay(None, &one_day_ago, 30.0);
+        // exp(-ln(2) / 30) ≈ 0.977
+        assert!(
+            (d - 0.977).abs() < 0.01,
+            "expected ~0.977 for 1-day-old created_at under 30d half-life, got {d}"
+        );
+    }
+
+    /// v0.5.1: end-to-end retrieval test. Two memories with identical
+    /// lexical match, identical use_count, identical (max) usefulness
+    /// score — one cited yesterday, one cited a year ago. Decay must
+    /// rank the recent one first.
+    #[test]
+    fn aged_cited_memory_ranks_below_recently_cited_memory() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let one_day_ago = (now - time::Duration::seconds(86_400))
+            .format(fmt)
+            .expect("format");
+        let one_year_ago = (now - time::Duration::seconds(365 * 86_400))
+            .format(fmt)
+            .expect("format");
+
+        // Both memories say "use ripgrep for code search", both have
+        // use_count = 5, usefulness_score = 5 (max boost → 1.5
+        // multiplier). The only difference is `last_useful_at`.
+        for (mid, last_useful) in
+            [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)]
+        {
+            let text = "use ripgrep for code search";
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at,
+                    use_count, usefulness_score, last_useful_at
+                )
+                VALUES (?1, 'global_user', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                        '2024-01-01T00:00:00Z', 5, 5.0, ?4)
+                ",
+                rusqlite::params![mid, text, normalized, last_useful],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+
+        // Default broker weights → 30-day half-life. 1 year ≈ 12 half-lives.
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        let mem_order: Vec<&str> = bundle
+            .capsules
+            .iter()
+            .filter_map(|c| {
+                c.expansion_handle
+                    .strip_prefix("memory:")
+                    .map(|s| s)
+            })
+            .collect();
+        assert_eq!(
+            mem_order.first().copied(),
+            Some("m_recent"),
+            "recently-cited memory must rank first under decay; got order {mem_order:?}"
+        );
+    }
+
+    /// v0.5.1: with decay disabled (half_life = 0) the aged + recent
+    /// memories tie and the deterministic tiebreaker (id) decides —
+    /// proves the ranking flip in the previous test is *caused* by
+    /// decay, not by some unrelated side effect of the timestamp.
+    #[test]
+    fn aged_cited_memory_does_not_decay_when_half_life_is_zero() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let one_day_ago = (now - time::Duration::seconds(86_400))
+            .format(fmt)
+            .expect("format");
+        let one_year_ago = (now - time::Duration::seconds(365 * 86_400))
+            .format(fmt)
+            .expect("format");
+
+        for (mid, last_useful) in
+            [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)]
+        {
+            let text = "use ripgrep for code search";
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at,
+                    use_count, usefulness_score, last_useful_at
+                )
+                VALUES (?1, 'global_user', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                        '2024-01-01T00:00:00Z', 5, 5.0, ?4)
+                ",
+                rusqlite::params![mid, text, normalized, last_useful],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+
+        // Disable decay via broker config.
+        let mut weights = kimetsu_core::config::BrokerWeights::default();
+        weights.decay_half_life_days = 0.0;
+
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "ripgrep search".to_string(),
+                budget_tokens: 4000,
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        // Both memories should surface. With decay disabled, their
+        // scores are identical (same multiplier, same lexical match,
+        // same freshness band since both created_at are equal). The
+        // sort tiebreaker falls back to id, so m_aged < m_recent
+        // alphabetically.
+        let scores: Vec<(String, f32)> = bundle
+            .capsules
+            .iter()
+            .filter_map(|c| {
+                c.expansion_handle
+                    .strip_prefix("memory:")
+                    .map(|id| (id.to_string(), c.score))
+            })
+            .collect();
+        assert_eq!(scores.len(), 2, "both memories should surface");
+        let recent_score = scores
+            .iter()
+            .find(|(id, _)| id == "m_recent")
+            .map(|(_, s)| *s)
+            .expect("m_recent present");
+        let aged_score = scores
+            .iter()
+            .find(|(id, _)| id == "m_aged")
+            .map(|(_, s)| *s)
+            .expect("m_aged present");
+        // With decay off, the two multipliers are equal → scores match.
+        assert!(
+            (recent_score - aged_score).abs() < 1e-4,
+            "with decay disabled the two memories should tie on score: recent={recent_score} aged={aged_score}"
         );
     }
 

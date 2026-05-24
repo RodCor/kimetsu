@@ -31,7 +31,7 @@ blake3.workspace = true
 # supports BGE-M3 + Jina-v2-base-code alongside BGE-small.
 fastembed = { version = "5", optional = true }
 ignore.workspace = true
-kimetsu-core = { path = "../kimetsu-core", version = "0.5.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.5.1" }
 # v0.4.5: regex backs the secret-redaction patterns in
 # `kimetsu_brain::redact`. The crate is already a workspace pin
 # elsewhere; we just opt this crate into it now.

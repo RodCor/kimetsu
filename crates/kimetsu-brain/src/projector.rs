@@ -224,9 +224,14 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
     }
     let cited = collect_cited_memory_ids(conn, &run_id)?;
     let ts = ts_text(event)?;
+    // v0.5.1: bump `last_useful_at` only on cited + run.finished.
+    // Cited + run.failed doesn't count (the memory misled the
+    // model). Silent passengers never bump regardless of outcome.
+    let bump_last_useful = event.kind == "run.finished";
 
     for memory_id in &retrieved {
-        let delta = if cited.contains(memory_id) { strong } else { weak };
+        let is_cited = cited.contains(memory_id);
+        let delta = if is_cited { strong } else { weak };
         conn.execute(
             "
             UPDATE memories
@@ -237,6 +242,17 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
             ",
             params![memory_id, delta, ts],
         )?;
+        if is_cited && bump_last_useful {
+            // v0.5.1: separate column for the decay reference. We
+            // intentionally only touch it for confirmed successful
+            // citations so the half-life curve in `usefulness_-
+            // multiplier` reflects when the memory was last
+            // PROVEN to help — not just when it was retrieved.
+            conn.execute(
+                "UPDATE memories SET last_useful_at = ?2 WHERE memory_id = ?1",
+                params![memory_id, ts],
+            )?;
+        }
     }
     Ok(())
 }

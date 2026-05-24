@@ -6,6 +6,100 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.5.1 — usefulness decay: recency-weighted memory ranking
+
+Second beat of the v0.5 arc. v0.5.0 gave us *which* memories
+helped; v0.5.1 makes "helped" age out. A memory that proved
+useful 6 months ago shouldn't outrank one that proved useful
+yesterday — yet under the v0.5.0 multiplier they tied, because
+the boost was permanent. Long-running repos accumulated stale
+boosters that crowded out fresh signal.
+
+WHAT v0.5.1 ADDS
+  * New column `memories.last_useful_at TEXT NULL`. Bumped by
+    the projector ONLY on `(memory cited) AND (run.finished)` —
+    cited + run.failed doesn't count (the memory misled the
+    model), silent passengers never bump regardless of outcome.
+    Distinct from `last_used_at` which still bumps on every
+    retrieval. NULL on pre-v0.5.1 rows and on rows never
+    cited successfully; the broker falls back to `created_at`
+    for those.
+  * New broker config `[broker.weights] decay_half_life_days`,
+    default 30.0. `#[serde(default)]` so pre-v0.5.1 project.toml
+    files keep loading cleanly. Set to 0 to disable decay.
+  * New helper `kimetsu_brain::context::usefulness_decay(
+    last_useful_at, created_at, half_life_days) -> f32` returning
+    `exp(-ln(2) * age_days / half_life)` clamped to `[0, 1]`.
+    Fail-open: unparseable timestamps and non-positive half-lives
+    return 1.0 so retrieval never silently drops rows.
+
+THE DECAY SHAPE
+  decay attenuates the *deviation* from neutral, not the
+  multiplier itself:
+    effective = 1.0 + (raw_multiplier - 1.0) * decay
+  At decay=1.0 a memory with the max +1.5 boost stays at +1.5.
+  At decay=0.0 (very old) it slides back to 1.0 (neutral) —
+  same as a brand-new memory with zero history. Critically NOT
+  zero: losing confidence in old signal shouldn't penalize a
+  memory *below* a fresh one. Symmetric for the penalty side
+  too: old penalties also fade toward neutral.
+
+CALL CHAIN PLUMBING
+  * `retrieve_context_with_embedder` reads
+    `weights.decay_half_life_days` and threads it through
+    `memory_candidates` → `{latest, fts}_memory_candidates` →
+    `memory_row_to_candidate`.
+  * Both retrieval SQL queries now also SELECT `last_useful_at`.
+
+TESTS (7 new in brain, all in context.rs)
+  context::tests::
+    usefulness_decay_disabled_when_half_life_is_zero_or_negative
+      Operator opt-out hatch: half_life <= 0 returns 1.0.
+    usefulness_decay_returns_one_on_unparseable_timestamps
+      Fail-open guard for corrupted rows.
+    usefulness_decay_full_at_zero_age
+      Future-timestamp (negative age clamped to 0) returns 1.0.
+    usefulness_decay_follows_half_life_curve
+      Asserts decay ≈ 0.5 at one half-life, ≈ 0.25 at two
+      half-lives, computed against a real OffsetDateTime::now_utc.
+    usefulness_decay_falls_back_to_created_at_when_last_useful_is_none
+      Brand-new never-cited memories decay from their birthday,
+      not from a hard 1.0 floor.
+    aged_cited_memory_ranks_below_recently_cited_memory
+      End-to-end: two FTS-tied memories, one cited yesterday and
+      one cited a year ago — recent must rank first under the
+      default 30-day half-life.
+    aged_cited_memory_does_not_decay_when_half_life_is_zero
+      Companion regression: with decay off, the same two
+      memories tie on score. Proves the v0.5.1 flip is caused
+      by decay, not by some unrelated timestamp side effect.
+
+VERIFIED
+  cargo test -p kimetsu-brain    86 / 86 passing  (was 79)
+  cargo build --workspace        clean at 0.5.1
+
+UPGRADE NOTES
+  * Existing brain.db files: `last_useful_at` column added
+    idempotently on first open with the v0.5.1 binary. All
+    pre-v0.5.1 memories start at NULL → they decay from their
+    `created_at` until the next successful citation refreshes
+    them. No data loss; ranking will shift toward recently
+    confirmed memories.
+  * Existing project.toml files: no edit required.
+    `decay_half_life_days = 30.0` applies automatically. To
+    opt out, add `decay_half_life_days = 0.0` under
+    `[broker.weights]`.
+  * Tune the half-life per repo: lower (e.g. 14) for fast-
+    moving codebases where knowledge ages quickly; higher
+    (e.g. 90) for slow-evolving ones where old playbooks
+    still apply.
+
+NEXT (in flight)
+  * v0.5.2 — conflict detection at ingest: new memories whose
+    embedding is close to an existing memory but whose text
+    disagrees get surfaced as conflict proposals instead of
+    silently accepted. Cosine threshold default 0.8.
+
 ## v0.5.0 — the brain learns from outcomes: citations + blame
 
 v0.5's north star: make the brain *get smarter over time* from
@@ -99,8 +193,7 @@ UPGRADE NOTES
 
 NEXT (in flight)
   * v0.5.1 — decay: usefulness multiplier degrades over time
-    via `last_useful_at` + half-life curve. Memories that helped
-    6 months ago no longer outvote ones that helped yesterday.
+    via `last_useful_at` + half-life curve. (Shipped above.)
   * v0.5.2 — conflict detection at ingest: new memories whose
     embedding is close to an existing memory but whose text
     disagrees get surfaced as proposals instead of silently

@@ -150,6 +150,21 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     // lexical-only (FTS) — exact v0.4.1 behavior, no regression.
     add_column_if_missing(conn, "memories", "embedding BLOB")?;
     add_column_if_missing(conn, "memories", "embedding_model TEXT")?;
+    // v0.5.1: timestamp of the most recent time this memory was
+    // cited AND the citing run ended in run.finished. Used by the
+    // broker's decay term: `effective = base * exp(-ln(2) *
+    // age_days / half_life)` so a memory that helped 6 months ago
+    // doesn't outvote one that helped yesterday.
+    //
+    // Distinct from `last_used_at` (bumped on every retrieval) —
+    // `last_useful_at` only tracks confirmed successful uses
+    // attributed via the v0.5.0 cite_memory tool.
+    //
+    // NULL on pre-v0.5.1 rows + on memories that have never been
+    // cited successfully. Retrieval falls back to `created_at` for
+    // the decay reference timestamp so brand-new memories don't
+    // get penalized for never having been cited yet.
+    add_column_if_missing(conn, "memories", "last_useful_at TEXT")?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_memories_active_created
