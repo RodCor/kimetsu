@@ -13,6 +13,14 @@ description = "Transport-neutral agent runtime for kimetsu: tools, prompts, veri
 keywords = ["kimetsu", "agent", "llm", "anthropic", "claude"]
 categories = ["development-tools"]
 
+[features]
+# v0.4.8: `kimetsu-agent` pulls `kimetsu-brain` for retrieval inside
+# the pipeline's coding run. Forwarding `embeddings` here lets the
+# top-level `kimetsu-cli --features embeddings` build pull a fully
+# embedder-aware pipeline path.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
+
 [dependencies]
 blake3.workspace = true
 kimetsu-brain = { path = "../kimetsu-brain" }

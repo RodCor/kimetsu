@@ -13,6 +13,24 @@ description = "Top-level `kimetsu` binary: chat client, MCP sidecar, bridge for 
 keywords = ["kimetsu", "cli", "ai", "chat", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+# v0.4.8: re-export the brain crate's `embeddings` feature so
+# `cargo install kimetsu-cli --features embeddings` propagates down
+# the dep chain. Without this, `cargo` complains about an unknown
+# feature on `kimetsu-cli` — Cargo doesn't auto-forward features
+# across workspace dep chains, even when the consumer wires the
+# upstream feature explicitly.
+#
+# Fan-out covers every kimetsu-* dep that kimetsu-cli actually
+# imports (kimetsu-harbor-rs is NOT among them — that crate's
+# binary is built separately by the release workflow).
+default = []
+embeddings = [
+    "kimetsu-agent/embeddings",
+    "kimetsu-brain/embeddings",
+    "kimetsu-chat/embeddings",
+]
+
 [[bin]]
 name = "kimetsu"
 path = "src/main.rs"

@@ -6,7 +6,40 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## v0.4.7 — distribution path (in flight)
+## v0.4.8 — release-pipeline patch
+
+The v0.4.7 release workflow failed across every platform with:
+
+```
+error: the package 'kimetsu-cli' does not contain this feature: embeddings
+help: package with the missing feature: kimetsu-brain
+```
+
+Cargo doesn't auto-forward features across workspace dep chains —
+the `embeddings` feature lived on `kimetsu-brain` but the release
+matrix called `cargo build -p kimetsu-cli --features embeddings`,
+which can't propagate down to a dep.
+
+v0.4.8 adds a passthrough `embeddings` feature on every crate
+that depends on `kimetsu-brain` — `kimetsu-cli`,
+`kimetsu-chat`, `kimetsu-agent`, `kimetsu-harbor-rs`. Each one
+declares:
+
+```toml
+[features]
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
+```
+
+`kimetsu-cli` in particular fans out to all four downstreams so
+`cargo install kimetsu-cli --features embeddings` builds the
+whole tree on the embeddings code path.
+
+No behavior change beyond unblocking the release pipeline. The
+v0.4.7 tag stays in git history but its corresponding GitHub
+Release was never published (the pipeline failed before upload).
+
+## v0.4.7 — distribution path
 
 - **Per-crate `Cargo.toml` metadata** filled in for crates.io
   publish: `description`, `repository`, `homepage`,

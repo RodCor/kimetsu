@@ -13,6 +13,14 @@ description = "Interactive REPL chat client + MCP sidecar + cross-harness bridge
 keywords = ["kimetsu", "chat", "mcp", "claude-code", "codex"]
 categories = ["development-tools", "command-line-utilities"]
 
+[features]
+# v0.4.8: passthrough so `kimetsu-cli --features embeddings` can
+# light up semantic retrieval inside the chat REPL. Bare
+# `kimetsu-chat` consumers (none today, but the bridge plugin
+# would qualify) can also opt in directly.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
+
 # Interactive REPL transport for kimetsu.
 #
 # Wraps the protocol-agnostic agent core (`kimetsu-agent`) in a

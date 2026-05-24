@@ -13,6 +13,14 @@ description = "Terminal-Bench / Harbor transport adapter for kimetsu. Ships the 
 keywords = ["kimetsu", "harbor", "terminal-bench", "benchmark"]
 categories = ["development-tools"]
 
+[features]
+# v0.4.8: forwarded so the `kimetsu-cli --features embeddings`
+# umbrella build keeps the harbor binary on the same retrieval
+# stack as chat. Benchmark runs that want the lean lexical-only
+# build can keep using the default feature set.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
+
 # Terminal-Bench / Harbor transport adapter for kimetsu.
 #
 # Owns the line-oriented JSON-RPC transport and the dedicated
