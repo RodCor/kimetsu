@@ -6,7 +6,7 @@ glue only. The user-facing Kimetsu CLI is the Rust `kimetsu` binary; Harbor
 uses the separate Rust `kimetsu-harbor-agent` binary over a line-oriented
 JSON-RPC protocol.
 
-This is MP-7b in `docs/V0.2-PLAN.md`. The protocol spec lives in
+This is MP-7b in `docs/archive/V0.2-PLAN.md`. The protocol spec lives in
 `crates/kimetsu-harbor-rs/src/protocol.rs`.
 
 ## Pieces
@@ -88,7 +88,7 @@ Once Harbor + an environment are set up:
 # 1. Sanity: oracle run confirms Harbor + environment are wired up.
 harbor run --dataset terminal-bench/terminal-bench-2 -a oracle -n 4
 
-# 2. Kimetsu's three-mode gauntlet (per docs/V0.2-PLAN.md MP-8).
+# 2. Kimetsu's three-mode gauntlet (per docs/archive/V0.2-PLAN.md MP-8).
 #
 # a) Bare Claude Code baseline (no kimetsu wrapper).
 harbor run --dataset terminal-bench/terminal-bench-2 \
@@ -125,7 +125,7 @@ harbor run `
   -n 4
 ```
 
-Per the v0.2 ship gate (docs/V0.2-PLAN.md MP-8): three runs per mode within
+Per the v0.2 ship gate (docs/archive/V0.2-PLAN.md MP-8): three runs per mode within
 Â±5pp over a 1-week window. Stability matters more than peak accuracy.
 
 ## Codex + Kimetsu MCP run

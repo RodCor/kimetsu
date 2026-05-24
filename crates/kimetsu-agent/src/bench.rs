@@ -1235,7 +1235,7 @@ fn render_falsifiable_claim_summary(report: &BenchReport) -> String {
 
     let mut out = String::new();
     out.push_str("## Falsifiable Claim — warm vs off\n\n");
-    out.push_str("docs/MVP.md threshold: a warm mode beats off on **at least one** of\n");
+    out.push_str("docs/archive/MVP.md threshold: a warm mode beats off on **at least one** of\n");
     out.push_str("- ≥20% fewer total tool calls\n");
     out.push_str("- ≥15 pp success-rate uplift\n");
     out.push_str("- strictly fewer verification retries\n\n");

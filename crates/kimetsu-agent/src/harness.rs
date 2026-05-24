@@ -853,7 +853,7 @@ impl MessageMessage {
 // MP-12: composed-tool surface for the Kimetsu harness.
 //
 // The bare Claude-Code agent in MP-10b had 18.75 pp accuracy advantage
-// over the kimetsu wrapper. The docs/MP-11-RESULTS.md verdict traced it to
+// over the kimetsu wrapper. The docs/archive/MP-11-RESULTS.md verdict traced it to
 // a tool-surface gap: bare CC exposes Bash + Edit + Read + Glob + Grep
 // + Write etc.; kimetsu exposed only `shell_command`. Common operations
 // (read file -> edit -> verify) required 3-4 shell turns instead of one

@@ -326,14 +326,31 @@ cargo run -p kimetsu-cli -- bridge sync --workspace .
 Install Kimetsu as the local MCP sidecar for host harnesses:
 
 ```pwsh
-cargo run -p kimetsu-cli -- plugin install claude --workspace .
-cargo run -p kimetsu-cli -- plugin install codex --workspace .
+cargo run -p kimetsu-cli -- plugin install claude --mode optional --workspace .
+cargo run -p kimetsu-cli -- plugin install codex --mode required --workspace .
 cargo run -p kimetsu-cli -- mcp serve --workspace .
 ```
+
+`--mode optional` makes Kimetsu brain the recommended first step and installs
+soft-audit hooks. `--mode required` writes stronger Codex/Claude Code artifacts
+plus hooks that treat missing Kimetsu brain context as a setup blocker for
+non-trivial tasks unless the user explicitly waives Kimetsu.
 
 The MCP server exposes:
 
 ```text
+kimetsu_brain_status
+kimetsu_brain_context
+kimetsu_benchmark_context
+kimetsu_benchmark_record_outcome
+kimetsu_brain_memory_list
+kimetsu_brain_memory_top
+kimetsu_brain_memory_add
+kimetsu_brain_memory_proposals
+kimetsu_brain_memory_accept
+kimetsu_brain_memory_reject
+kimetsu_brain_memory_invalidate
+kimetsu_brain_ingest_repo
 kimetsu_bridge_status
 kimetsu_skills_search
 kimetsu_bridge_import
@@ -342,5 +359,29 @@ kimetsu_bridge_sync
 kimetsu_plugin_install
 ```
 
-Claude Code and Codex can use that sidecar at runtime, while the bridge handles
-the file-level portability work for skills and future extension types.
+Claude Code and Codex should call `kimetsu_benchmark_context` first on
+Terminal-Bench tasks to retrieve a compact benchmark playbook and task-specific
+outcome memories. Pass `warm_policy` as `cold_brain`, `reactive_warm`, or
+`full_warm` when reproducing Claude Code brain-condition research. The
+benchmark playbook ranks accepted `memory_role=semantic_operator` and
+`memory_role=anti_pattern` memories ahead of exact episodic run summaries.
+Those generalized memories are intended to transfer across task families; exact
+`memory_role=episodic` outcomes are useful evidence but should not dominate the
+plan.
+
+For other broad tasks, call `kimetsu_brain_context` early to retrieve Kimetsu's
+broker-ranked memory/repo/manifest capsules. After a benchmark attempt, call
+`kimetsu_benchmark_record_outcome` so future runs can reuse the commands,
+pitfalls, and verification steps. This always writes an accepted episodic
+outcome memory. If the run revealed a reusable tactic or warning, also pass
+`generalized_memory` with `memory_role=semantic_operator` or `anti_pattern`,
+plus optional `task_family`, `applies_to`, `does_not_apply_to`,
+`evidence_for`, `evidence_against`, and `generalization_rationale`. Kimetsu
+stores that as a pending memory proposal so a human can accept only the lessons
+that are broad enough to help future tasks. The bridge tools then handle
+file-level portability work for skills and future extension types.
+
+MCP descriptions and installed skills can make brain-first behavior explicit,
+while generated hooks add runtime enforcement where the host runs local hooks.
+Benchmark wrappers can additionally inspect `.kimetsu/hooks/usage/` markers or
+MCP transcripts.

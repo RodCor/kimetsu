@@ -587,7 +587,7 @@ Brain and memory metrics:
 
 ## Latest Recorded Benchmark Results
 
-The most recent recorded Terminal-Bench slice in `docs/MP-14-RESULTS.md`
+The most recent recorded Terminal-Bench slice in `docs/archive/MP-14-RESULTS.md`
 uses `terminal-bench/terminal-bench-2`, a 16-task slice, `claude-opus-4-7`,
 `-l 16 -n 2 -k 1`, and retry-on-5xx provider handling.
 
@@ -647,9 +647,9 @@ Recent performance changes are summarized in `docs/V0.3.5-PERF.md`:
 ## Documentation Map
 
 - `docs/KIMETSU-CHAT.md`: chat setup, terminal UI, credentials, and skills.
-- `docs/V0.3-PLAN.md`: chat product split and Harbor separation.
+- `docs/archive/V0.3-PLAN.md`: chat product split and Harbor separation.
 - `docs/V0.3.5-PERF.md`: latest performance work.
-- `docs/MP-14-RESULTS.md`: latest recorded Terminal-Bench comparison.
-- `docs/MP-13G-RESULTS.md`: retry-on-5xx brain rerun.
+- `docs/archive/MP-14-RESULTS.md`: latest recorded Terminal-Bench comparison.
+- `docs/archive/MP-13G-RESULTS.md`: retry-on-5xx brain rerun.
 - `kimetsu_harbor/README.md`: Harbor adapter setup and benchmark runs.
 - `docs/SWEBENCH.md`: SWE-bench integration plan.

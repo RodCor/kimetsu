@@ -153,9 +153,9 @@ to default-on for chat.
 The v0.2 line ran the MP gauntlet from MP-4 through MP-18:
 broker design + retrieval scoring, the 20-tool surface,
 auto-orient pre-shell, parallel `tool_calls` envelope,
-record_deviation + iterative verify. See `docs/MP-*-RESULTS.md`
-and `docs/V0.2-SHIP.md`.
+record_deviation + iterative verify. See `docs/archive/MP-*-RESULTS.md`
+and `docs/archive/V0.2-SHIP.md`.
 
 ## v0.1 — initial scaffold
 
-Brain + agent + pipeline foundations. See `docs/MVP.md`.
+Brain + agent + pipeline foundations. See `docs/archive/MVP.md`.
