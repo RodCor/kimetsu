@@ -6,10 +6,13 @@
 *.log
 **/*.rs.bk
 
+# Working files this repo's tooling (and Claude Code) leaves behind.
 .git-commit-msg.tmp
 .commit-msg.tmp
+/.commit-msg-*.txt
 
 # Ad-hoc orchestration / probe scripts used while running gauntlets in WSL.
+# All of MP-15 / MP-17 lived in these; v0.2 closed those gauntlets out.
 /.mp*.sh
 /.wsl-*.sh
 /.harbor-*.sh
@@ -18,7 +21,13 @@
 # Harbor / Terminal-Bench artifacts (per-run, large, regenerable)
 /jobs/
 /.bench-pid
+/.bench-run.log
 /.bench-stdout.log
 /.bench-stderr.log
+# v0.4.7 cleanup: codex benchmark logs are pure runtime outputs;
+# regenerable, large, and noisy in PRs.
+/kimetsu_harbor/benchmark-logs/
+
+# Python adapter side-files.
 **/__pycache__/
 *.pyc
