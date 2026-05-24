@@ -6,6 +6,126 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.5.2 — conflict detection at ingest: contradictions surface, don't silently compete
+
+Third and final beat of the v0.5 arc. v0.5.0 attributed which memories
+helped; v0.5.1 made stale boosters age out; v0.5.2 stops contradictory
+memories from accumulating in the first place. "Use anyhow" and "use
+thiserror" no longer both live in the brain quietly competing for
+retrieval slots — the second write surfaces the conflict at ingest
+time so the operator can decide which to keep.
+
+WHAT v0.5.2 ADDS
+  * New module `kimetsu_brain::conflict`. Top-level surface:
+    `find_potential_conflicts(conn, scope, text, embedder, top_k,
+    threshold)` returns `ConflictHit` rows whose cosine >= threshold
+    AND whose normalized text differs from the incoming text.
+    Defaults: `DEFAULT_CONFLICT_THRESHOLD = 0.8`, `DEFAULT_TOP_K = 3`.
+  * Embedder gating. `embedder.is_noop()` short-circuits to zero
+    hits, so lean builds keep exact pre-v0.5.2 behavior. Cross-model
+    rows (embedding_model != active embedder id) are silently
+    skipped — cosine across models is meaningless. A subsequent
+    `kimetsu brain reindex` rehydrates them and the next ingest
+    catches the conflict.
+  * New schema: `memory_conflicts` table linking
+    `(new_memory_id, existing_memory_id)` with `similarity`,
+    `scope`, `kind`, `detected_at`, optional `resolved_at` +
+    `resolution`. UNIQUE on the pair so re-scans stay idempotent.
+    Created via `CREATE TABLE IF NOT EXISTS`; pre-v0.5.2 brain.db
+    files pick it up on first open.
+  * Wiring: both `project::add_memory` and `user_brain::add_user_memory`
+    call `conflict::detect_and_record` after the post-insert
+    embedding write. On a hit, one line to stderr — never blocks
+    the write (surfacing > blocking; a blocked write loses user
+    intent, a logged write loses nothing).
+
+USER SURFACE: conflicts
+  * `kimetsu brain memory conflicts [--limit N] [--json]` CLI:
+    lists open conflicts merged from project + user brains,
+    sorted by detected_at DESC. Each row shows similarity, scope,
+    kind, and a one-line preview of both texts so the contradiction
+    is visible at a glance.
+  * `kimetsu brain memory conflicts --resolve <id> <kept_new|
+    kept_existing|kept_both>`: settles a single conflict. With
+    `kept_new` the existing memory is invalidated; with
+    `kept_existing` the new memory is invalidated; with
+    `kept_both` neither is touched (legit case where both apply
+    in different contexts). Idempotent — a second resolve on the
+    same id returns false without rewriting `invalidated_at`.
+  * `kimetsu_brain_memory_conflicts` MCP tool (read-only): same
+    backend, JSON-shaped for Claude Code / Codex. Resolution is
+    deliberately CLI-only to keep the audit trail centralized.
+    Brings the kimetsu_* MCP catalog to 18 tools.
+
+NEW BRAIN API
+  * `conflict::find_potential_conflicts(...)` — pure detection.
+  * `conflict::record_conflict(...)` — idempotent insert keyed on
+    the memory pair.
+  * `conflict::detect_and_record(...)` — convenience wrapper used
+    by the ingest path, returns the count of newly-recorded hits.
+  * `conflict::list_unresolved_conflicts(conn, limit)` — joined
+    with both memories' text for rich display.
+  * `conflict::resolve_conflict(conn, conflict_id, resolution)` —
+    settles a row, invalidates the losing side, returns true if
+    something changed.
+  * `project::list_conflicts(start, limit) -> Vec<ScopedConflict>`
+    merges project + user brain rows with a `source` label.
+  * `project::resolve_conflict(start, id, resolution)` — project
+    DB first, user brain fallback. Acquires the project lock.
+
+TESTS (12 new in brain — 10 conflict module + 1 project integration + 1 wrapper)
+  conflict::tests (10)
+    noop_embedder_returns_no_conflicts
+    cross_model_rows_are_skipped
+    exact_match_is_not_flagged_as_conflict
+    similar_but_different_text_is_flagged
+    record_conflict_is_idempotent
+    list_unresolved_excludes_resolved_rows
+    resolve_conflict_invalidates_loser_side
+    resolve_conflict_is_idempotent
+    detect_and_record_noop_writes_nothing
+    resolve_conflict_rejects_invalid_resolution_strings
+  project::tests (1)
+    add_memory_under_noop_embedder_writes_no_conflicts
+      End-to-end regression: NoopEmbedder path produces zero
+      conflicts, exercises list_conflicts + resolve_conflict
+      wrappers (unknown id returns false, invalid resolution
+      string errors out).
+
+VERIFIED
+  cargo test --workspace      239 / 239 passing
+    (was 227 at v0.5.0, 239 now: +12 conflict tests)
+  cargo build --workspace     clean at 0.5.2
+
+UPGRADE NOTES
+  * Existing brain.db files: `memory_conflicts` table created
+    idempotently on first open with the v0.5.2 binary. No
+    backfill — conflicts are only detected at fresh ingest.
+  * Lean (default) builds: conflict detection is a silent no-op.
+    Build with `--features embeddings` to enable. (Same gate as
+    semantic retrieval.)
+  * Threshold tuning: 0.8 cosine is BGE-small-en-v1.5's empirical
+    "same concept" floor. If you see false positives in
+    `kimetsu brain memory conflicts`, the surfaced pairs are
+    similar-but-correct (e.g. two legit preferences for different
+    contexts) — resolve as `kept_both` to silence them. If you see
+    false negatives (a real contradiction sneaking through),
+    raise the threshold via a future config knob (deferred until
+    real data justifies the surface).
+  * The MCP tool is read-only by design. Operators resolve from
+    the CLI; the host harness can list and reason about open
+    conflicts but cannot apply resolutions. This keeps the audit
+    trail centralized and prevents an agent from silently
+    "resolving" a real contradiction it should have surfaced.
+
+THE v0.5 ARC IS COMPLETE
+  v0.5.0 — citations: the brain knows *which* memories helped.
+  v0.5.1 — decay:     stale "useful" boosters age toward neutral.
+  v0.5.2 — conflicts: contradictory writes surface, don't compete.
+  Together: the brain learns from outcomes, ages out stale signal,
+  and stops accumulating noise. Pitch sharpens from "memory that
+  follows you" to "memory that follows you AND improves on its own."
+
 ## v0.5.1 — usefulness decay: recency-weighted memory ranking
 
 Second beat of the v0.5 arc. v0.5.0 gave us *which* memories
@@ -95,10 +215,7 @@ UPGRADE NOTES
     still apply.
 
 NEXT (in flight)
-  * v0.5.2 — conflict detection at ingest: new memories whose
-    embedding is close to an existing memory but whose text
-    disagrees get surfaced as conflict proposals instead of
-    silently accepted. Cosine threshold default 0.8.
+  * v0.5.2 — conflict detection at ingest. (Shipped above.)
 
 ## v0.5.0 — the brain learns from outcomes: citations + blame
 
@@ -191,13 +308,9 @@ UPGRADE NOTES
     typically show 0 cited + all retrieved as silent passengers
     (since no `memory.cited` events fired).
 
-NEXT (in flight)
-  * v0.5.1 — decay: usefulness multiplier degrades over time
-    via `last_useful_at` + half-life curve. (Shipped above.)
-  * v0.5.2 — conflict detection at ingest: new memories whose
-    embedding is close to an existing memory but whose text
-    disagrees get surfaced as proposals instead of silently
-    accepted.
+NEXT (shipped)
+  * v0.5.1 — usefulness decay. (Shipped above.)
+  * v0.5.2 — conflict detection at ingest. (Shipped above.)
 
 ## v0.4.11 — drop x86_64-apple-darwin from the release matrix
 

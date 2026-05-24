@@ -38,6 +38,8 @@ const BRAIN_MEMORY_INVALIDATE_DESCRIPTION: &str = "Retire an accepted Kimetsu me
 
 const BRAIN_MEMORY_BLAME_DESCRIPTION: &str = "v0.5.1: per-run memory attribution. Pass a run_id (ULID printed in chat sessions / trace files) to surface which memories the model explicitly cited via the cite_memory tool (strong ±1.0 usefulness signal) vs which were silently retrieved but never cited (weak ±0.1 signal). Use after a run feels off to learn whether a misleading memory was responsible, or after a clean run to see which memories actually earned their keep.";
 
+const BRAIN_MEMORY_CONFLICTS_DESCRIPTION: &str = "v0.5.2: list open memory-conflict hits detected at ingest. When a new memory's embedding is close (cosine >= 0.8 by default) to an existing memory in the same scope but their normalized text differs, the brain logs a conflict so an operator can decide which version to keep. Returns up to `limit` conflicts (default 50) merged from project + user brains. Use this before adding contradictory guidance so you don't end up with both 'use anyhow' and 'use thiserror' silently competing in retrieval.";
+
 const BRAIN_INGEST_REPO_DESCRIPTION: &str = "Index the repository into Kimetsu brain.db so future kimetsu_brain_context calls can retrieve repo snippets and manifests. Use during setup or after major repo changes. This writes repo.ingested events.";
 
 const BRIDGE_STATUS_DESCRIPTION: &str = "Use when deciding whether portable skills/extensions can help the current task. Lists capabilities discovered in this workspace and across user harness roots, plus where each is installed for Kimetsu, Codex, and Claude Code. For Terminal-Bench memory/context, prefer kimetsu_benchmark_context first; for other work, prefer kimetsu_brain_context first.";
@@ -223,6 +225,9 @@ fn call_tool(
         "kimetsu_brain_memory_reject" => kimetsu_brain_memory_reject(workspace, &arguments),
         "kimetsu_brain_memory_invalidate" => kimetsu_brain_memory_invalidate(workspace, &arguments),
         "kimetsu_brain_memory_blame" => kimetsu_brain_memory_blame(workspace, &arguments),
+        "kimetsu_brain_memory_conflicts" => {
+            kimetsu_brain_memory_conflicts(workspace, &arguments)
+        }
         "kimetsu_brain_ingest_repo" => kimetsu_brain_ingest_repo(workspace, &arguments),
         "kimetsu_bridge_status" => {
             let scan = bridge_scan(workspace, skills)?;
@@ -764,6 +769,41 @@ fn kimetsu_brain_memory_blame(workspace: &Path, arguments: &Value) -> Result<Val
     }))
 }
 
+/// v0.5.2: `kimetsu_brain_memory_conflicts` — list open conflict
+/// hits across project + user brains. Same backend as the CLI
+/// `kimetsu brain memory conflicts`, JSON-shaped for the host
+/// harness. Read-only by design: actual resolution stays on the
+/// CLI to keep the audit trail centralized.
+fn kimetsu_brain_memory_conflicts(
+    workspace: &Path,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(50);
+    let open = project::list_conflicts(workspace, limit)
+        .map_err(|err| format!("kimetsu brain memory conflicts: {err}"))?;
+    let conflicts = serde_json::to_value(&open)
+        .map_err(|err| format!("serialize conflicts: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "usage": {
+            "how_to_use": "Walk the list and look for pairs whose `new_text` directly contradicts `existing_text` (e.g. 'use anyhow' vs 'use thiserror'). For each true contradiction, the operator runs `kimetsu brain memory conflicts --resolve <conflict_id> <kept_new|kept_existing|kept_both>` from the CLI to settle it (resolution happens off this read-only MCP tool to keep the audit trail centralized).",
+            "next_steps": [
+                "If both memories are correct in different contexts, choose kept_both — neither is invalidated.",
+                "If the new memory supersedes the existing one, choose kept_new — the existing memory is invalidated.",
+                "If the existing memory is the authoritative version, choose kept_existing — the new memory is invalidated.",
+                "If the list looks suspiciously empty: a) you may be on the lean build where conflict detection is a no-op, or b) no contradictory writes have happened yet."
+            ]
+        },
+        "limit": limit,
+        "open_count": open.len(),
+        "conflicts": conflicts,
+    }))
+}
+
 fn kimetsu_brain_ingest_repo(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let path = optional_string_arg(arguments, "path")
         .map(PathBuf::from)
@@ -1163,6 +1203,16 @@ fn tool_definitions() -> Value {
                     "run_id": { "type": "string" }
                 },
                 "required": ["run_id"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_memory_conflicts",
+            "description": BRAIN_MEMORY_CONFLICTS_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+                }
             }
         },
         {

@@ -205,6 +205,43 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             ON memory_citations (memory_id);
         ",
     )?;
+    // v0.5.2: conflict-detection log. When `add_memory` (or
+    // `add_user_memory`) inserts a new capsule whose embedding is
+    // close to an existing capsule in the same scope but whose
+    // normalized text differs, the conflict is logged here for
+    // operator review via `kimetsu brain memory conflicts`.
+    //
+    // We use `INSERT OR IGNORE` on (new_memory_id,
+    // existing_memory_id) so a re-scan over the same pair stays
+    // idempotent. `resolved_at` IS NULL marks an open conflict;
+    // `resolution` stores `'kept_new'`, `'kept_existing'`, or
+    // `'kept_both'` after operator decision.
+    //
+    // Embedder-only: conflict detection runs ONLY when a real
+    // embedder is available (cosine math requires it). NoopEmbedder
+    // builds silently skip the scan and never write to this table,
+    // so pre-v0.5.2 brain.db files opened by a lean build see no
+    // new rows.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_conflicts (
+            conflict_id        TEXT PRIMARY KEY,
+            new_memory_id      TEXT NOT NULL,
+            existing_memory_id TEXT NOT NULL,
+            scope              TEXT NOT NULL,
+            kind               TEXT NOT NULL,
+            similarity         REAL NOT NULL,
+            detected_at        TEXT NOT NULL,
+            resolved_at        TEXT,
+            resolution         TEXT,
+            UNIQUE (new_memory_id, existing_memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conflicts_unresolved
+            ON memory_conflicts (resolved_at, detected_at);
+        CREATE INDEX IF NOT EXISTS idx_conflicts_new_memory
+            ON memory_conflicts (new_memory_id);
+        ",
+    )?;
     ensure_memories_fts_shape(conn)?;
     ensure_repo_manifests_fts_shape(conn)?;
 

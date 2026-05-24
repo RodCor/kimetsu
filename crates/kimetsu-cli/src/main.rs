@@ -342,6 +342,26 @@ enum MemoryCommand {
     /// `context.injected` events to surface which memories the model
     /// actually leveraged vs which were silent passengers.
     Blame(BlameArgs),
+    /// v0.5.2: list and resolve conflict-detection hits surfaced at
+    /// ingest. With `--list` (the default) renders open conflicts;
+    /// `--resolve <id> <kept_new|kept_existing|kept_both>` settles one.
+    Conflicts(ConflictsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConflictsArgs {
+    /// Resolve a conflict by id. Takes a second positional argument:
+    /// `kept_new` (invalidates the existing memory), `kept_existing`
+    /// (invalidates the new memory), or `kept_both` (no invalidation).
+    /// When unset, the command lists open conflicts.
+    #[arg(long, value_names = ["CONFLICT_ID", "RESOLUTION"], num_args = 2)]
+    resolve: Option<Vec<String>>,
+    /// Cap the number of open conflicts shown per brain. Default 50.
+    #[arg(long, default_value_t = 50)]
+    limit: u32,
+    /// Emit JSON for hooks + CI consumers.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1260,6 +1280,7 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
         MemoryCommand::Top(args) => memory_top(args),
         MemoryCommand::Prune(args) => memory_prune(args),
         MemoryCommand::Blame(args) => memory_blame(args),
+        MemoryCommand::Conflicts(args) => memory_conflicts(args),
     }
 }
 
@@ -1358,6 +1379,96 @@ fn memory_blame(args: BlameArgs) -> KimetsuResult<()> {
     }
     println!();
     Ok(())
+}
+
+/// v0.5.2: `kimetsu brain memory conflicts` — list or resolve
+/// conflict-detection hits surfaced at ingest. Without `--resolve` it
+/// lists open conflicts (project + user brains merged), with the
+/// origin brain shown per row so the operator knows where the
+/// resolution will land. `--resolve <id> <resolution>` settles one
+/// conflict and (for `kept_new` / `kept_existing`) invalidates the
+/// losing side.
+fn memory_conflicts(args: ConflictsArgs) -> KimetsuResult<()> {
+    let cwd = env::current_dir()?;
+
+    if let Some(resolve_args) = args.resolve.as_ref() {
+        // num_args = 2 ensures clap delivers exactly 2 values.
+        let conflict_id = resolve_args[0].trim();
+        let resolution = resolve_args[1].trim();
+        let updated = project::resolve_conflict(&cwd, conflict_id, resolution)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "conflict_id": conflict_id,
+                    "resolution": resolution,
+                    "updated": updated,
+                })
+            );
+            return Ok(());
+        }
+        if updated {
+            println!(
+                "[conflicts] resolved {conflict_id} as {resolution} (losing side, if any, invalidated)"
+            );
+        } else {
+            println!(
+                "[conflicts] no open conflict with id {conflict_id} (already resolved, or unknown id)"
+            );
+        }
+        return Ok(());
+    }
+
+    let open = project::list_conflicts(&cwd, args.limit)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&open)?);
+        return Ok(());
+    }
+
+    if open.is_empty() {
+        println!(
+            "[conflicts] no open conflicts. \
+             Either no contradictory memories have been ingested, \
+             the embedder is the lean NoopEmbedder (build with \
+             `--features embeddings` to enable detection), or all \
+             prior conflicts have been resolved."
+        );
+        return Ok(());
+    }
+
+    println!("[conflicts] {} open conflict(s):", open.len());
+    for scoped in &open {
+        let c = &scoped.report;
+        println!(
+            "  {} [{}] {} <-> {} (similarity {:.3}, scope={}, kind={}, detected {})",
+            c.conflict_id,
+            scoped.source,
+            c.new_memory_id,
+            c.existing_memory_id,
+            c.similarity,
+            c.scope,
+            c.kind,
+            c.detected_at,
+        );
+        println!("    new:      {}", preview_inline(&c.new_text));
+        println!("    existing: {}", preview_inline(&c.existing_text));
+    }
+    println!(
+        "\nResolve with: kimetsu brain memory conflicts --resolve <id> <kept_new|kept_existing|kept_both>"
+    );
+    Ok(())
+}
+
+/// One-line truncate-and-collapse for CLI rendering of memory text.
+/// Keeps the conflict listing scannable when capsules are long-form.
+fn preview_inline(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = collapsed.chars().take(140).collect();
+    if collapsed.chars().count() > 140 {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 /// MP-6: dry-run by default. Without `--apply` it prints the prune list

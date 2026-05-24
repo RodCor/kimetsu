@@ -33,12 +33,13 @@ use std::path::PathBuf;
 
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::ids::RunId;
-use kimetsu_core::memory::{MemoryKind, normalize_memory_text};
+use kimetsu_core::memory::{MemoryKind, MemoryScope, normalize_memory_text};
 use kimetsu_core::paths::{user_brain_db_path, user_brain_enabled, user_kimetsu_dir};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+use crate::conflict;
 use crate::embeddings;
 use crate::project::MemoryRow;
 use crate::redact;
@@ -182,6 +183,27 @@ pub fn add_user_memory(
     // the feature is on.
     let embedder = embeddings::open_default_embedder();
     embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
+
+    // v0.5.2: conflict detection for user-brain writes too. The
+    // user brain ships the same `memory_conflicts` schema (shared
+    // `schema::initialize`), so an operator's `kimetsu brain
+    // memory conflicts` walks the project AND user brains via the
+    // existing multi-brain plumbing. Best-effort: NoopEmbedder
+    // returns 0 hits; failures are logged, not raised.
+    let conflicts = conflict::detect_and_record(
+        conn,
+        &memory_id,
+        &MemoryScope::GlobalUser,
+        &kind.to_string(),
+        text,
+        embedder,
+    );
+    if conflicts > 0 {
+        eprintln!(
+            "kimetsu-brain (user): memory {memory_id} conflicts with {conflicts} existing memor{} (run `kimetsu brain memory conflicts` to review)",
+            if conflicts == 1 { "y" } else { "ies" }
+        );
+    }
 
     Ok(memory_id)
 }

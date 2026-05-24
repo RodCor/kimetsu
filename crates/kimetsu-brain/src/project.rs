@@ -12,6 +12,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use ulid::Ulid;
 
 use crate::benchmark;
+use crate::conflict;
 use crate::context::{self, ContextBundle, ContextRequest};
 use crate::embeddings;
 use crate::ingest::{self, RepoIngestSummary};
@@ -485,6 +486,27 @@ pub fn add_memory(
     // process-static OnceLock so we only pay model-load cost once.
     let embedder = embeddings::open_default_embedder();
     embeddings::embed_and_persist(&conn, &memory_id, text, embedder)?;
+
+    // v0.5.2: conflict detection at ingest. Scans for high-cosine,
+    // different-text neighbors in the same scope and logs each pair
+    // to `memory_conflicts` for operator review via
+    // `kimetsu brain memory conflicts`. Best-effort: NoopEmbedder
+    // (lean build) returns 0 hits; embedder failures degrade to a
+    // stderr line, never to a failed insert.
+    let conflicts = conflict::detect_and_record(
+        &conn,
+        &memory_id,
+        &scope,
+        &kind.to_string(),
+        text,
+        embedder,
+    );
+    if conflicts > 0 {
+        eprintln!(
+            "kimetsu-brain: memory {memory_id} conflicts with {conflicts} existing memor{} (run `kimetsu brain memory conflicts` to review)",
+            if conflicts == 1 { "y" } else { "ies" }
+        );
+    }
 
     Ok(memory_id)
 }
@@ -1394,6 +1416,72 @@ pub fn rebuild_projection(start: &Path) -> KimetsuResult<usize> {
 pub fn clear_lock(start: &Path) -> KimetsuResult<bool> {
     let paths = ProjectPaths::discover(start)?;
     crate::lock::clear_force(&paths)
+}
+
+/// v0.5.2: list open conflict-detection hits across the project brain
+/// and (when enabled) the user brain. Each `ConflictReport` carries a
+/// `source` label so the CLI can render which brain originated it —
+/// resolve takes a separate code path per brain since the row only
+/// lives in one DB.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScopedConflict {
+    /// Either "project" or "user". Determines which DB `resolve_conflict`
+    /// must target when the operator chooses to apply a resolution.
+    pub source: String,
+    #[serde(flatten)]
+    pub report: conflict::ConflictReport,
+}
+
+/// Merge open conflicts from project + user brains. `limit` is applied
+/// per-brain, so the worst case is `limit * 2` rows returned — the CLI
+/// can re-truncate on display if needed.
+pub fn list_conflicts(start: &Path, limit: u32) -> KimetsuResult<Vec<ScopedConflict>> {
+    let mut out = Vec::new();
+    let (_paths, _config, project_conn) = load_project_readonly(start)?;
+    for report in conflict::list_unresolved_conflicts(&project_conn, limit)? {
+        out.push(ScopedConflict {
+            source: "project".to_string(),
+            report,
+        });
+    }
+    if let Some(user_conn) = user_brain::open_user_brain_readonly()? {
+        for report in conflict::list_unresolved_conflicts(&user_conn, limit)? {
+            out.push(ScopedConflict {
+                source: "user".to_string(),
+                report,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.report.detected_at.cmp(&a.report.detected_at));
+    Ok(out)
+}
+
+/// Resolve a single open conflict by id with one of `kept_new`,
+/// `kept_existing`, or `kept_both`. The conflict can live in either
+/// the project brain or the user brain — we try project first, and on
+/// "not found" fall through to user. Returns Ok(true) if a row was
+/// updated.
+///
+/// We deliberately don't emit a `memory.invalidated` trace event here
+/// even though `kept_new` / `kept_existing` invalidates one side. The
+/// `memory_conflicts` row IS the audit trail; double-recording would
+/// duplicate state across two systems. Operators who want the trace-
+/// event-style record can use `kimetsu brain memory invalidate` instead.
+pub fn resolve_conflict(
+    start: &Path,
+    conflict_id: &str,
+    resolution: &str,
+) -> KimetsuResult<bool> {
+    let (paths, _config, project_conn) = load_project(start)?;
+    let _lock = ProjectLock::acquire(&paths, "brain memory conflict resolve", None)?;
+    if conflict::resolve_conflict(&project_conn, conflict_id, resolution)? {
+        return Ok(true);
+    }
+    drop(project_conn); // release before opening user brain (avoid pseudo-conflict on flock semantics)
+    if let Some(user_conn) = user_brain::open_user_brain()? {
+        return conflict::resolve_conflict(&user_conn, conflict_id, resolution);
+    }
+    Ok(false)
 }
 
 fn load_pending_proposal(conn: &Connection, proposal_id: &str) -> KimetsuResult<ProposalRow> {
@@ -2652,5 +2740,62 @@ mod tests {
         }
 
         fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    /// v0.5.2: end-to-end regression for the lean (NoopEmbedder)
+    /// build. `add_memory` must NOT write any rows to
+    /// `memory_conflicts` when the embedder is a no-op, and the
+    /// `list_conflicts` / `resolve_conflict` wrappers must return
+    /// the empty/false answer rather than panicking on a missing
+    /// table or a malformed query.
+    ///
+    /// Real semantic-conflict detection is exercised exhaustively
+    /// in `crate::conflict::tests` with a StubEmbedder; this test
+    /// guards the project-level plumbing only.
+    #[test]
+    fn add_memory_under_noop_embedder_writes_no_conflicts() {
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            // Two near-duplicate memories. Under NoopEmbedder no
+            // conflict is detected; the two rows simply both exist
+            // (and don't collide via the dedup gate because their
+            // normalized texts differ).
+            let _m1 = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Preference,
+                "Prefer thiserror for library error types.",
+            )
+            .expect("add m1");
+            let _m2 = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Preference,
+                "Prefer anyhow for library error types.",
+            )
+            .expect("add m2");
+
+            let open = list_conflicts(&root, 50).expect("list_conflicts");
+            assert!(
+                open.is_empty(),
+                "noop embedder must not generate conflicts; got {} rows",
+                open.len()
+            );
+
+            // Resolving a non-existent id should return false, not error.
+            let resolved = resolve_conflict(&root, "does-not-exist", "kept_both")
+                .expect("resolve_conflict on unknown id");
+            assert!(!resolved, "unknown conflict id should resolve to false");
+
+            // Invalid resolution strings should be rejected up front.
+            let err = resolve_conflict(&root, "does-not-exist", "garbage")
+                .expect_err("invalid resolution should error");
+            assert!(format!("{err}").contains("invalid conflict resolution"));
+
+            fs::remove_dir_all(root).expect("remove temp project");
+        });
     }
 }
