@@ -1,0 +1,29 @@
+[package]
+name = "kimetsu-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "v0.5.3: in-process end-to-end test suite for the kimetsu agent loop + brain pipeline. Not published — integration test harness only."
+keywords = ["kimetsu", "testing", "internal"]
+categories = ["development-tools::testing"]
+# v0.5.3: this crate is a test harness, not a library users consume.
+# Stays out of crates.io for the same reason kimetsu-harbor-rs does.
+publish = false
+
+[dependencies]
+# Real (non-dev) deps so the test fixtures + scripted provider can be
+# re-exported from `kimetsu_e2e::prelude` to the integration tests in
+# `tests/`. Integration tests treat this crate as a normal library.
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.5.3" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.5.3" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.5.3" }
+rusqlite.workspace = true
+serde_json.workspace = true
+time.workspace = true
+ulid.workspace = true

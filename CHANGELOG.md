@@ -6,6 +6,66 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.5.3 — Layer 1 of the harbor refactor: in-process e2e suite + CLI smoke
+
+First commit of the v0.5.3 harbor refactor arc. v0.5.0-v0.5.2 made
+the brain learn from outcomes; v0.5.3 makes it possible to verify the
+agent loop + brain pipeline still works *before pushing*, without API
+keys or Docker. Catches the wiring-level regressions that per-crate
+unit tests miss by construction.
+
+WHAT v0.5.3 ADDS
+  * New workspace crate `kimetsu-e2e` (publish = false, integration
+    test harness only). Provides `ScriptedProvider` (pure-Rust builder
+    over `MockProvider`), `TempProject` (per-test scratch project
+    that wraps `project::init_project` + auto-cleanup), and brain-
+    state assertion helpers.
+  * Four scenario files in `crates/kimetsu-e2e/tests/`:
+      golden_path.rs   one tool call + done (the smallest viable smoke)
+      citations.rs     cite_memory → recorded_citations → memory_citations
+      decay.rs         half-life ranking flip via the broker
+      conflicts.rs     list_conflicts + resolve_conflict wrappers
+    8 tests total. Runs in well under a second.
+  * `crates/kimetsu-cli/tests/cli_smoke.rs` — 5 subprocess smoke
+    tests that catch CLI argparse / subcommand / --help drift
+    (no model calls, no network).
+  * `KimetsuAgentOpts::for_tests()` is now `pub` (was `#[cfg(test)]`)
+    so integration tests in `kimetsu-e2e` can use the same
+    scripted-MockProvider-friendly settings as the harness's
+    internal tests.
+
+LAYER-2 (BENCHMARK) BOOTSTRAP
+  * `/bench/` added to .gitignore. The internal benchmark
+    orchestrator lives in a separate private repo
+    (`github.com/RodCor/kimetsu-bench`) cloned into `./bench/` of
+    the kimetsu working tree. Not in kimetsu's workspace; not in
+    any release archive; invisible to `cargo install kimetsu-cli`.
+    Subsequent v0.5.3.x commits land the driver impls there, the
+    Python Harbor adapter migrates over, and `kimetsu_harbor/` gets
+    deleted from this repo.
+
+WHY TWO LAYERS
+  * Layer 1 (this commit): in-process, deterministic, sub-second.
+    Runs every push. Catches "did I break the wiring?"
+  * Layer 2 (next commits, separate repo): real Claude Code / Codex
+    against real Terminal-Bench tasks with kimetsu MCP attached vs
+    detached. Comparative impact measurement. Runs on-demand.
+
+TESTS
+  cargo test --workspace      258 / 258 passing
+    (was 239 at v0.5.2; +13 from the new e2e + cli_smoke layers)
+  cargo build --workspace     clean at 0.5.3
+
+UPGRADE NOTES
+  * No user-visible API changes. Pre-push gate gets stronger.
+
+NEXT (in flight)
+  * v0.5.4 — consolidate docs into a single HOW-KIMETSU-WORKS.md;
+    historical planning + ship docs migrate to the internal
+    kimetsu-bench repo.
+  * v0.5.5 — delete kimetsu_harbor/ from this repo (Python Harbor
+    shim moved to kimetsu-bench in v0.5.4).
+
 ## v0.5.2 — conflict detection at ingest: contradictions surface, don't silently compete
 
 Third and final beat of the v0.5 arc. v0.5.0 attributed which memories

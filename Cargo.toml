@@ -5,6 +5,7 @@ members = [
     "crates/kimetsu-chat",
     "crates/kimetsu-cli",
     "crates/kimetsu-core",
+    "crates/kimetsu-e2e",
     "crates/kimetsu-harbor-rs",
 ]
 resolver = "3"
@@ -14,7 +15,7 @@ resolver = "3"
 # everything below except the per-crate `description`, `keywords`,
 # and `categories` which live in each `[package]` block since
 # crates.io enforces them per crate.
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 # Rust ecosystem dual-license (matches tokio, serde, fastembed-rs,
 # etc.). UNLICENSED would block crates.io entirely.

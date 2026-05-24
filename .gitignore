@@ -31,3 +31,9 @@
 # Python adapter side-files.
 **/__pycache__/
 *.pyc
+
+# v0.5.3: kimetsu-bench is a separate private repo cloned at ./bench/.
+# It owns the internal benchmark orchestrator, the Python Harbor shim,
+# and historical planning docs that don't belong in the user-facing
+# kimetsu repo. See github.com/RodCor/kimetsu-bench (private).
+/bench/

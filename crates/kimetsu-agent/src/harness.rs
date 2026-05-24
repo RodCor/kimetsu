@@ -220,7 +220,11 @@ impl KimetsuAgentOpts {
         }
     }
 
-    #[cfg(test)]
+    /// v0.5.3: dropped the `#[cfg(test)]` gate so `kimetsu-e2e`'s
+    /// integration tests can use the same scripted-MockProvider-friendly
+    /// settings. Disables auto-orient, the min-actions-before-finish
+    /// gate, and the self-verify nudge so scripted ModelProvider
+    /// responses run unmodified.
     pub fn for_tests() -> Self {
         Self {
             turn_budget: DEFAULT_MODEL_TURN_BUDGET,
