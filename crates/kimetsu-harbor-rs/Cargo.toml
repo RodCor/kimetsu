@@ -35,13 +35,15 @@ embeddings = ["kimetsu-brain/embeddings"]
 # `kimetsu-harbor-agent` benchmark binary. The product CLI lives in
 # `kimetsu-cli` and does not depend on this crate.
 #
-# Library name uses `_rs` suffix to avoid collision with the python
-# adapter directory `kimetsu_harbor/` at the workspace root.
+# Library name uses `_rs` suffix to avoid historical collision with
+# the python Harbor adapter directory; that adapter moved to the
+# internal kimetsu-bench repo in v0.5.5 along with the benchmark
+# orchestrator.
 
 [dependencies]
 clap.workspace = true
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.5.4" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.5.4" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.5.4" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.5.5" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.5.5" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.5.5" }
 serde.workspace = true
 serde_json.workspace = true

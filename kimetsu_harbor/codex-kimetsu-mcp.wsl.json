@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "kimetsu": {
-      "transport": "stdio",
-      "command": "/mnt/e/Kimetsu/kimetsu_harbor/kimetsu-mcp-stdio.sh",
-      "args": []
-    }
-  }
-}

@@ -6,6 +6,91 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.5.5 — delete kimetsu_harbor/: harbor refactor arc complete
+
+Final commit of the v0.5.3-v0.5.5 harbor refactor arc. The Python
+Harbor adapter + benchmark glue moved to the internal kimetsu-bench
+repo in v0.5.4's sibling commit; this commit deletes the orphan
+directory from kimetsu and finishes the cleanup.
+
+DELETED FROM THIS REPO
+  kimetsu_harbor/                          (entire directory)
+    ├── codex_kimetsu_agent.py            (311 LOC — Codex variant
+    │                                      that diverged from the
+    │                                      canonical adapter)
+    ├── kimetsu_agent.py                   (459 LOC — moved to
+    │                                      kimetsu-bench/python/)
+    ├── smoke_test.py                      (145 LOC — replaced by
+    │                                      crates/kimetsu-e2e in
+    │                                      v0.5.3)
+    ├── kimetsu-mcp-stdio.sh               (1-line shim)
+    ├── codex-kimetsu-mcp.wsl.json         (Codex MCP config)
+    ├── kimetsu-mcp-required.md            (user-facing setup doc)
+    ├── kimetsu-mcp-optional.md            (user-facing setup doc)
+    ├── README.md                          (Harbor adapter setup)
+    ├── SETUP-WSL.md                       (WSL setup)
+    ├── __init__.py                        (package marker)
+    └── archive/                           (one-shot scripts +
+                                            historical orchestration)
+
+Net: ~900 LOC of glue + ~10 setup docs removed from the user-facing
+repo. The functional pieces (kimetsu_agent.py) survive in
+kimetsu-bench/python/ where they belong — they're benchmark infra,
+not product code.
+
+ALSO REMOVED
+  .gitignore: `/kimetsu_harbor/benchmark-logs/` rule (path no
+  longer exists; bench logs land in kimetsu-bench/runs/ which
+  has its own .gitignore in that repo).
+  crates/kimetsu-harbor-rs/Cargo.toml: updated the `_rs` suffix
+  comment (it used to explain a collision with kimetsu_harbor/;
+  now explains the legacy historical reason).
+
+WHAT SURVIVES IN KIMETSU REPO (unchanged)
+  * crates/kimetsu-harbor-rs/ — JSON-RPC transport + the
+    `kimetsu-harbor-agent` binary. publish = false. The bench
+    consumes it as a normal cargo path dep.
+  * CI release matrix still builds `kimetsu-harbor-agent` for
+    each platform (Linux, macOS-arm64, Windows × lean/embeddings)
+    so a future bench operator can grab a prebuilt binary from a
+    GH release archive instead of building from source.
+
+THE HARBOR REFACTOR ARC IS COMPLETE
+  v0.5.3 — Layer 1: in-process e2e suite + CLI smoke (+13 tests,
+           all under 1s, no API keys / no Docker).
+  v0.5.4 — Doc consolidation: HOW-KIMETSU-WORKS.md replaces the
+           22-file docs/ sprawl; historical planning + ship docs
+           moved to internal kimetsu-bench repo.
+  v0.5.5 — kimetsu_harbor/ deleted; the Python Harbor adapter is
+           now in the internal kimetsu-bench repo alongside the
+           Layer 2 orchestrator + driver trait.
+
+THE NEW SHAPE
+  Public kimetsu repo:
+    docs/HOW-KIMETSU-WORKS.md              one conceptual reference
+    crates/                                product code + e2e tests
+    crates/kimetsu-harbor-rs/              JSON-RPC transport (publish=false)
+    CHANGELOG.md, README.md, LICENSE-*     standard repo metadata
+  Internal kimetsu-bench repo:
+    src/                                   BenchmarkDriver + kbench CLI
+    src/drivers/terminal_bench.rs          first driver (Terminal-Bench)
+    python/kimetsu_agent.py                Harbor adapter shim
+    docs/history/                          v0.2-v0.5 planning + ship docs
+  Pre-push gate: `cargo test --workspace`  (258 tests, ~1s for e2e + cli smoke)
+  Impact measurement: `cd bench && cargo run -- --driver tb ...`
+
+VERIFIED
+  cargo test --workspace      258 / 258 passing  (unchanged from v0.5.3)
+  cargo build --workspace     clean at 0.5.5
+
+UPGRADE NOTES
+  * If you had local scripts referencing `kimetsu_harbor/` paths,
+    update them to point at the bench repo (or ping for access
+    to the private repo).
+  * The `kimetsu-harbor-agent` binary at `target/release/kimetsu-harbor-agent`
+    is unchanged. Its source still lives at
+    `crates/kimetsu-harbor-rs/src/bin/kimetsu-harbor-agent.rs`.
+
 ## v0.5.4 — doc consolidation: HOW-KIMETSU-WORKS.md replaces the docs/ sprawl
 
 Second commit of the v0.5.3-v0.5.5 harbor refactor arc. Cleans up

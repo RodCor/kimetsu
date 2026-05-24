@@ -24,9 +24,9 @@
 /.bench-run.log
 /.bench-stdout.log
 /.bench-stderr.log
-# v0.4.7 cleanup: codex benchmark logs are pure runtime outputs;
-# regenerable, large, and noisy in PRs.
-/kimetsu_harbor/benchmark-logs/
+# v0.5.5: dropped /kimetsu_harbor/benchmark-logs/ — the directory it
+# applied to was deleted when the Python Harbor adapter moved to the
+# internal kimetsu-bench repo.
 
 # Python adapter side-files.
 **/__pycache__/
