@@ -225,6 +225,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             used_tokens: 0,
             capsules: Vec::new(),
             excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
         };
         let empty_plan = ContextBundle {
             stage: CodingStage::PatchPlan.as_str().to_string(),
@@ -232,6 +234,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             used_tokens: 0,
             capsules: Vec::new(),
             excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
         };
         (empty_loc, empty_plan, "Broker disabled (brain_off).")
     } else {
@@ -243,6 +247,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 stage: CodingStage::Localization.as_str().to_string(),
                 query: options.task.clone(),
                 budget_tokens: config.broker.default_budget_tokens,
+                ..Default::default()
             },
         )?;
         let patch_context = context::retrieve_context(
@@ -253,6 +258,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 stage: CodingStage::PatchPlan.as_str().to_string(),
                 query: options.task.clone(),
                 budget_tokens: config.broker.default_budget_tokens,
+                ..Default::default()
             },
         )?;
         (

@@ -63,11 +63,28 @@ pub struct ProvenanceRef {
     pub excerpt: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContextRequest {
     pub stage: String,
     pub query: String,
     pub budget_tokens: u32,
+    /// v0.6: domain-hint tags. Capsules whose text or kind contains any
+    /// of these strings receive a 1.4× score boost, pushing on-domain
+    /// capsules above the `min_score` threshold when they would otherwise
+    /// be filtered out.
+    pub tags: Vec<String>,
+    /// v0.6: minimum composite score for inclusion. When > 0.0 and the
+    /// top-scoring capsule falls below this threshold, `ContextBundle`
+    /// is returned with `skipped: true` and an empty capsule list —
+    /// zero tokens injected. 0.0 (default) disables the check.
+    pub min_score: f32,
+    /// v0.6: hard cap on returned capsules regardless of token budget.
+    /// 0 = no cap (budget-only limit, prior behaviour).
+    pub max_capsules: usize,
+    /// v0.6: role-preference boost. Capsules whose `kind` matches one
+    /// of these strings receive an additional 1.3× multiplier after the
+    /// tag boost (e.g. `["semantic_operator", "anti_pattern"]` for bench).
+    pub prefer_roles: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +94,12 @@ pub struct ContextBundle {
     pub used_tokens: u32,
     pub capsules: Vec<ContextCapsule>,
     pub excluded: Vec<ContextCapsule>,
+    /// v0.6: true when the top capsule score was below `min_score`.
+    /// All capsules are empty; no tokens were injected.
+    pub skipped: bool,
+    /// v0.6: best composite score observed before the skip check.
+    /// Useful for diagnostics ("why was the brain silent?").
+    pub top_score: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +187,26 @@ pub fn retrieve_context_with_embedder(
 
     normalize_and_score(&mut candidates, weights_for_stage(weights, &request.stage));
 
+    // v0.6: apply tag boost (1.4×) and role-preference boost (1.3×) after
+    // normalisation so the multipliers operate on the [0,1]-normalised score
+    // rather than the raw pre-normalisation values.
+    if !request.tags.is_empty() || !request.prefer_roles.is_empty() {
+        let tags_lc: Vec<String> = request.tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+        for c in &mut candidates {
+            let summary_lc = c.capsule.summary.to_ascii_lowercase();
+            if !tags_lc.is_empty()
+                && tags_lc.iter().any(|t| summary_lc.contains(t.as_str()))
+            {
+                c.capsule.score *= 1.4;
+            }
+            if !request.prefer_roles.is_empty()
+                && request.prefer_roles.iter().any(|r| c.capsule.kind.contains(r.as_str()))
+            {
+                c.capsule.score *= 1.3;
+            }
+        }
+    }
+
     let mut capsules = candidates
         .into_iter()
         .map(|candidate| candidate.capsule)
@@ -183,6 +226,21 @@ pub fn retrieve_context_with_embedder(
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    // v0.6: confidence-aware skip — if the top score is below the caller's
+    // threshold, return an empty bundle immediately. Zero tokens injected.
+    let top_score = capsules.first().map(|c| c.score).unwrap_or(0.0);
+    if request.min_score > 0.0 && top_score < request.min_score {
+        return Ok(ContextBundle {
+            stage: request.stage,
+            budget_tokens: request.budget_tokens,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: capsules,
+            skipped: true,
+            top_score,
+        });
+    }
+
     // MP-17 #13: Maximal-Marginal-Relevance (MMR) re-ranking — when two
     // capsules look very similar (same tokens in the summary), keep the
     // higher-scoring one but push the redundant ones down so the budget
@@ -196,6 +254,11 @@ pub fn retrieve_context_with_embedder(
     let mut excluded = Vec::new();
 
     for capsule in capsules {
+        // v0.6: max_capsules cap (0 = disabled)
+        if request.max_capsules > 0 && included.len() >= request.max_capsules {
+            excluded.push(capsule);
+            continue;
+        }
         if used_tokens.saturating_add(capsule.token_estimate) <= capsule_budget {
             used_tokens += capsule.token_estimate;
             included.push(capsule);
@@ -210,6 +273,8 @@ pub fn retrieve_context_with_embedder(
         used_tokens,
         capsules: included,
         excluded,
+        skipped: false,
+        top_score,
     })
 }
 
@@ -1282,6 +1347,7 @@ mod tests {
                 stage: "localization".to_string(),
                 query: "ripgrep search".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
             &[],
             &stub,
@@ -1345,6 +1411,7 @@ mod tests {
                 stage: "localization".to_string(),
                 query: "ripgrep search".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
             &[],
             &stub,
@@ -1504,6 +1571,7 @@ mod tests {
                 stage: "localization".to_string(),
                 query: "ripgrep search".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
             &[],
             &embeddings::NoopEmbedder,
@@ -1582,6 +1650,7 @@ mod tests {
                 stage: "localization".to_string(),
                 query: "ripgrep search".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
             &[],
             &embeddings::NoopEmbedder,
@@ -1644,6 +1713,7 @@ mod tests {
                 stage: "localization".to_string(),
                 query: "ripgrep".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
             &[],
             &embeddings::NoopEmbedder,

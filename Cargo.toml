@@ -15,12 +15,12 @@ resolver = "3"
 # everything below except the per-crate `description`, `keywords`,
 # and `categories` which live in each `[package]` block since
 # crates.io enforces them per crate.
-version = "0.5.5"
+version = "0.6.0"
 edition = "2024"
 # Rust ecosystem dual-license (matches tokio, serde, fastembed-rs,
 # etc.). UNLICENSED would block crates.io entirely.
 license = "MIT OR Apache-2.0"
-authors = ["Kimetsu contributors"]
+authors = ["Rodrigo Cordoba"]
 repository = "https://github.com/RodCor/kimetsu"
 homepage = "https://github.com/RodCor/kimetsu"
 documentation = "https://github.com/RodCor/kimetsu/tree/main/docs"

@@ -264,21 +264,24 @@ impl BrainSession {
         query: &str,
         budget_tokens: u32,
     ) -> KimetsuResult<ContextBundle> {
-        // v0.4.1: merge user-brain memories into the candidate set
-        // when the user DB is open. The multi-conn path normalizes
-        // both candidate streams together so a user-brain capsule
-        // and a project-brain capsule are comparable on the same
-        // `raw_relevance` scale before scoring.
+        self.retrieve_context_with_request(ContextRequest {
+            stage: stage.to_string(),
+            query: query.to_string(),
+            budget_tokens,
+            ..Default::default()
+        })
+    }
+
+    /// v0.6: full-request variant used by `kimetsu_brain_context` MCP tool
+    /// and `retrieve_context_readonly_with_request` to expose `tags`,
+    /// `min_score`, `max_capsules`, and `prefer_roles`.
+    pub fn retrieve_context_with_request(&self, request: ContextRequest) -> KimetsuResult<ContextBundle> {
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_multi(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
-            ContextRequest {
-                stage: stage.to_string(),
-                query: query.to_string(),
-                budget_tokens,
-            },
+            request,
             &extras,
         )
     }
@@ -509,6 +512,54 @@ pub fn add_memory(
     }
 
     Ok(memory_id)
+}
+
+/// v0.6: write a `memory.proposed` event (pending proposal) without
+/// accepting it immediately. Used by `kimetsu_brain_record` when confidence
+/// is low and the lesson needs human review before entering the retrieval pool.
+/// Returns the `proposal_id`.
+pub fn propose_memory(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+) -> KimetsuResult<String> {
+    let redaction = redact::redact_secrets(text);
+    if redaction.was_redacted() {
+        eprintln!("kimetsu-brain: {}", redaction.summary());
+    }
+    let text = redaction.text.as_str();
+    let (paths, config, conn) = load_project(start)?;
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "memory propose", Some(run_id))?;
+    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
+    let proposal_id = Ulid::new().to_string();
+
+    let started = admin_started_event(&paths, &config, run_id, "memory propose")?;
+    writer.append(&started, true)?;
+
+    let proposed = Event::new(
+        run_id,
+        "memory.proposed",
+        serde_json::json!({
+            "proposal_id": proposal_id,
+            "scope": scope.to_string(),
+            "kind": kind.to_string(),
+            "text": text,
+            "rationale": rationale,
+            "proposed_confidence": confidence.clamp(0.0, 1.0),
+            "source_event_ids": [],
+        }),
+    );
+    writer.append(&proposed, true)?;
+
+    let finished = admin_finished_event(run_id);
+    writer.append(&finished, true)?;
+
+    projector::apply_events(&conn, &[started, proposed, finished])?;
+    Ok(proposal_id)
 }
 
 pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
@@ -1094,6 +1145,15 @@ pub fn retrieve_context_readonly(
     budget_tokens: u32,
 ) -> KimetsuResult<ContextBundle> {
     BrainSession::open_readonly(start)?.retrieve_context(stage, query, budget_tokens)
+}
+
+/// v0.6: variant that accepts a full `ContextRequest` so callers can use
+/// the new `tags`, `min_score`, `max_capsules`, and `prefer_roles` fields.
+pub fn retrieve_context_readonly_with_request(
+    start: &Path,
+    request: ContextRequest,
+) -> KimetsuResult<ContextBundle> {
+    BrainSession::open_readonly(start)?.retrieve_context_with_request(request)
 }
 
 #[allow(clippy::too_many_arguments)]

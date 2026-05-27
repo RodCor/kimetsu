@@ -248,6 +248,10 @@ struct PluginInstallArgs {
 struct InitArgs {
     #[arg(long)]
     force: bool,
+    /// v0.6: skip writing .claude/CLAUDE.md and .claude/settings.json.
+    /// Use when you manage Claude Code configuration manually.
+    #[arg(long)]
+    no_hooks: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -269,11 +273,36 @@ enum BrainCommand {
     },
     Rebuild,
     Stats,
+    /// v0.6: brain health summary — memory counts, domain groups,
+    /// pending proposals, unresolved conflicts, and usefulness bands.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// v0.6: Claude Code UserPromptSubmit hook. Reads JSON from stdin
+    /// (`{"prompt":"...","..."}`), retrieves relevant brain context, and
+    /// prints it to stdout for injection into the conversation.
+    /// Exits 0 silently when the brain has nothing above threshold.
+    ContextHook(ContextHookArgs),
     /// v0.4.3: backfill missing or stale embeddings on memory rows.
     /// Run after upgrading kimetsu (so pre-v0.4.2 rows pick up
     /// vectors) or after changing the embedder model via
     /// `KIMETSU_BRAIN_EMBEDDER=<id>`.
     Reindex(ReindexArgs),
+}
+
+#[derive(Debug, Args)]
+struct ContextHookArgs {
+    /// Minimum relevance score for capsule inclusion (0.0-1.0). Default 0.20.
+    #[arg(long, default_value_t = 0.20)]
+    min_score: f32,
+    /// Maximum capsules to inject. Default 2.
+    #[arg(long, default_value_t = 2usize)]
+    max_capsules: usize,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -937,7 +966,8 @@ fn chat(args: ChatArgs) -> KimetsuResult<()> {
 }
 
 fn init(args: InitArgs) -> KimetsuResult<()> {
-    let summary = project::init_project(&env::current_dir()?, args.force)?;
+    let cwd = env::current_dir()?;
+    let summary = project::init_project(&cwd, args.force)?;
 
     println!("project_id: {}", summary.project_id);
     println!("repo_root: {}", summary.repo_root.display());
@@ -967,6 +997,64 @@ fn init(args: InitArgs) -> KimetsuResult<()> {
             "hint: set {} before running model-backed commands",
             summary.api_key_env
         );
+    }
+
+    if !args.no_hooks {
+        write_claude_hooks(&summary.repo_root)?;
+    }
+
+    Ok(())
+}
+
+const CLAUDE_MD_CONTENT: &str = r#"# Kimetsu brain
+
+You have a persistent memory brain attached via MCP (tools prefixed `mcp__kimetsu__`).
+
+- **Before non-trivial tasks**: call `kimetsu_brain_context` with a short query. If the brain
+  has relevant prior knowledge it will return it. If not (`skipped: true`), proceed as normal —
+  this is zero overhead.
+- **After solving a non-obvious problem**: call `kimetsu_brain_record` with what you learned
+  and 2-5 domain tags. Keep lessons concrete and actionable, not platitudes.
+
+Do not call either tool on simple/one-liner tasks. The brain is for things that required real
+effort or that you would want to remember next session.
+"#;
+
+const CLAUDE_SETTINGS_CONTENT: &str = r#"{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kimetsu brain context-hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+fn write_claude_hooks(repo_root: &std::path::Path) -> KimetsuResult<()> {
+    let claude_dir = repo_root.join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+
+    let claude_md = claude_dir.join("CLAUDE.md");
+    if !claude_md.exists() {
+        std::fs::write(&claude_md, CLAUDE_MD_CONTENT)?;
+        println!("claude_hooks: wrote {}", claude_md.display());
+    } else {
+        println!("claude_hooks: kept existing {}", claude_md.display());
+    }
+
+    let settings_json = claude_dir.join("settings.json");
+    if !settings_json.exists() {
+        std::fs::write(&settings_json, CLAUDE_SETTINGS_CONTENT)?;
+        println!("claude_hooks: wrote {}", settings_json.display());
+    } else {
+        println!("claude_hooks: kept existing {}", settings_json.display());
     }
 
     Ok(())
@@ -1080,6 +1168,8 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             Ok(())
         }
         BrainCommand::Stats => stats(),
+        BrainCommand::Status { json } => brain_status(json),
+        BrainCommand::ContextHook(args) => brain_context_hook(args),
         BrainCommand::Reindex(args) => reindex_brain(args),
     }
 }
@@ -1149,6 +1239,123 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
             "updated"
         },
     );
+    Ok(())
+}
+
+/// v0.6: `kimetsu brain status` — brain health at a glance.
+fn brain_status(json: bool) -> KimetsuResult<()> {
+    let cwd = env::current_dir()?;
+    let memories = project::list_memories(&cwd)?;
+    let proposals = project::list_proposals(
+        &cwd,
+        project::ProposalFilter { status: Some("pending".to_string()), limit: 200, ..Default::default() },
+    )?;
+    let conflicts = project::list_conflicts(&cwd, 200)?;
+
+    let healthy: Vec<_> = memories.iter().filter(|m| m.usefulness_score >= 0.2).collect();
+    let fading: Vec<_> = memories.iter().filter(|m| m.usefulness_score >= 0.0 && m.usefulness_score < 0.2).collect();
+    let stale: Vec<_> = memories.iter().filter(|m| m.usefulness_score < 0.0).collect();
+
+    // Domain grouping: extract first [tags: ...] prefix from text
+    let mut domain_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for m in &memories {
+        let domain = if let Some(rest) = m.text.strip_prefix("[tags: ") {
+            rest.split(']').next().unwrap_or("other").split_whitespace().next().unwrap_or("other").to_string()
+        } else {
+            m.kind.clone()
+        };
+        *domain_counts.entry(domain).or_insert(0) += 1;
+    }
+    let mut domain_list: Vec<(String, usize)> = domain_counts.into_iter().collect();
+    domain_list.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_domains: Vec<String> = domain_list.iter().take(6).map(|(d, n)| format!("{} ({})", d, n)).collect();
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "memories": memories.len(),
+            "pending_proposals": proposals.len(),
+            "open_conflicts": conflicts.len(),
+            "healthy": healthy.len(),
+            "fading": fading.len(),
+            "stale": stale.len(),
+            "top_domains": top_domains,
+        }))?);
+    } else {
+        println!("brain: {} memories active, {} pending proposals, {} conflicts",
+            memories.len(), proposals.len(), conflicts.len());
+        if !top_domains.is_empty() {
+            println!("domains: {}", top_domains.join(", "));
+        }
+        println!("health:  {} healthy (usefulness >= 0.2)", healthy.len());
+        println!("         {} fading  (0 <= usefulness < 0.2)", fading.len());
+        println!("         {} stale   (usefulness < 0, candidate for prune)", stale.len());
+        if stale.len() > 3 {
+            println!("hint: run `kimetsu brain memory prune` to clean stale entries");
+        }
+    }
+    Ok(())
+}
+
+/// v0.6: `kimetsu brain context-hook` — Claude Code UserPromptSubmit hook.
+/// Reads `{"prompt":"..."}` JSON from stdin, retrieves relevant capsules,
+/// prints them to stdout for injection. Silent (exit 0) when brain has nothing.
+fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
+    use std::io::Read;
+    use kimetsu_brain::context::ContextRequest;
+
+    let workspace = args.workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Read hook JSON from stdin
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap_or(0);
+
+    // Extract the prompt text from the hook payload
+    let prompt = if input.trim().is_empty() {
+        String::new()
+    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
+        v.get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    } else {
+        // Plain text fallback
+        input.trim().to_string()
+    };
+
+    // Too short to be meaningful
+    if prompt.len() < 10 {
+        return Ok(());
+    }
+
+    let request = ContextRequest {
+        stage: "localization".to_string(),
+        query: prompt,
+        budget_tokens: 2000,
+        min_score: args.min_score,
+        max_capsules: args.max_capsules,
+        ..Default::default()
+    };
+
+    let bundle = match project::retrieve_context_readonly_with_request(&workspace, request) {
+        Ok(b) => b,
+        Err(_) => return Ok(()), // Brain not initialized — silent fail
+    };
+
+    if bundle.skipped || bundle.capsules.is_empty() {
+        return Ok(()); // Nothing relevant — zero output
+    }
+
+    println!("[Kimetsu brain] Relevant knowledge for this task:");
+    for capsule in &bundle.capsules {
+        // Strip the "scope:kind - " prefix from the summary for readability
+        let text = capsule.summary
+            .splitn(3, " - ")
+            .nth(1)
+            .unwrap_or(&capsule.summary);
+        println!("{}", text);
+    }
+
     Ok(())
 }
 
