@@ -24,10 +24,8 @@ categories = ["command-line-utilities", "development-tools"]
 # Fan-out covers every kimetsu-* dep that kimetsu-cli actually
 # imports (kimetsu-harbor-rs is NOT among them — that crate's
 # binary is built separately by the release workflow).
-# v0.7: embeddings remain opt-in on Windows because the fastembed/ort prebuilts
-# require VS2022 C++ runtime symbols absent from VS2019 BuildTools. Enable with
-# `cargo build --features embeddings` after installing VS2022 BuildTools or on Linux/Mac.
-default = []
+# v0.7.1: embeddings on by default (requires VS2022 C++ runtime — ort prebuilts).
+default = ["embeddings"]
 embeddings = [
     "kimetsu-agent/embeddings",
     "kimetsu-brain/embeddings",
