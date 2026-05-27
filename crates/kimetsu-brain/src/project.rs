@@ -562,6 +562,97 @@ pub fn propose_memory(
     Ok(proposal_id)
 }
 
+/// v0.7: outcome of a `propose_or_merge_memory` call.
+#[derive(Debug)]
+pub enum ProposeResult {
+    Added(String),      // memory_id — new memory, directly accepted
+    Proposed(String),   // proposal_id — pending for review (low confidence)
+    Merged(String),     // memory_id of the existing memory that was updated
+    Duplicate(String),  // memory_id of the identical existing memory
+}
+
+/// v0.7: capture a lesson, automatically deduplicating against the existing brain.
+///
+/// Decision tree:
+/// 1. Exact normalized-text match → `Duplicate` (no write).
+/// 2. Cosine similarity ≥ 0.85 with an existing memory → `Merged` (append & re-embed).
+/// 3. confidence ≥ 0.7 and no close match → `Added` (direct acceptance).
+/// 4. confidence < 0.7 → `Proposed` (pending for human review).
+///
+/// Step 2 only fires when the embedder is active (bge-small or similar). In lean builds
+/// the cosine scan returns nothing and the function falls through to step 3/4.
+pub fn propose_or_merge_memory(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+) -> KimetsuResult<ProposeResult> {
+    let redaction = redact::redact_secrets(text);
+    if redaction.was_redacted() {
+        eprintln!("kimetsu-brain: {}", redaction.summary());
+    }
+    let text = redaction.text.as_str();
+
+    // Step 1: exact normalized-text dedup (same as add_memory).
+    {
+        let (_, _, ro_conn) = load_project_readonly(start)?;
+        let normalized = normalize_memory_text(text);
+        let existing: Option<String> = ro_conn
+            .query_row(
+                "SELECT memory_id FROM memories
+                 WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
+                   AND invalidated_at IS NULL
+                 LIMIT 1",
+                rusqlite::params![scope.to_string(), kind.to_string(), normalized],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(ProposeResult::Duplicate(id));
+        }
+    }
+
+    // Step 2: semantic dedup — look for a high-cosine existing memory.
+    let embedder = embeddings::open_default_embedder();
+    {
+        let (_, _, ro_conn) = load_project_readonly(start)?;
+        let conflicts =
+            conflict::find_potential_conflicts(&ro_conn, &scope, text, embedder, 1, 0.85)?;
+        if let Some(hit) = conflicts.into_iter().next() {
+            // Append the new lesson to the existing memory and re-embed it.
+            let (paths, _config, conn) = load_project(start)?;
+            let run_id = RunId::new();
+            let _lock = ProjectLock::acquire(&paths, "memory merge", Some(run_id))?;
+            let merged_text = format!("{}\n\nAlso: {text}", hit.existing_text);
+            let new_normalized = normalize_memory_text(&merged_text);
+            conn.execute(
+                "UPDATE memories
+                 SET text = ?1, normalized_text = ?2, use_count = use_count + 1
+                 WHERE memory_id = ?3",
+                rusqlite::params![merged_text, new_normalized, hit.existing_memory_id],
+            )?;
+            embeddings::embed_and_persist(
+                &conn,
+                &hit.existing_memory_id,
+                &merged_text,
+                embedder,
+            )?;
+            return Ok(ProposeResult::Merged(hit.existing_memory_id));
+        }
+    }
+
+    // Step 3/4: no close match found — accept or propose based on confidence.
+    if confidence >= 0.7 {
+        let memory_id = add_memory(start, scope, kind, text)?;
+        Ok(ProposeResult::Added(memory_id))
+    } else {
+        let proposal_id = propose_memory(start, scope, kind, text, confidence, rationale)?;
+        Ok(ProposeResult::Proposed(proposal_id))
+    }
+}
+
 pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
     let (_paths, _config, conn) = load_project(start)?;
     let mut memories = list_memories_from_conn(&conn)?;

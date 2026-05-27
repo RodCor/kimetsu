@@ -24,6 +24,9 @@ categories = ["command-line-utilities", "development-tools"]
 # Fan-out covers every kimetsu-* dep that kimetsu-cli actually
 # imports (kimetsu-harbor-rs is NOT among them — that crate's
 # binary is built separately by the release workflow).
+# v0.7: embeddings remain opt-in on Windows because the fastembed/ort prebuilts
+# require VS2022 C++ runtime symbols absent from VS2019 BuildTools. Enable with
+# `cargo build --features embeddings` after installing VS2022 BuildTools or on Linux/Mac.
 default = []
 embeddings = [
     "kimetsu-agent/embeddings",
@@ -37,10 +40,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.6.0" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.6.0" }
-kimetsu-chat = { path = "../kimetsu-chat", version = "0.6.0" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.6.0" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.7.0" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.0" }
+kimetsu-chat = { path = "../kimetsu-chat", version = "0.7.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.7.0" }
 # v0.4.6: `kimetsu doctor` serializes its report struct so --json
 # output can be piped into CI / hooks.
 serde.workspace = true

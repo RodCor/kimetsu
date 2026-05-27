@@ -285,6 +285,11 @@ enum BrainCommand {
     /// prints it to stdout for injection into the conversation.
     /// Exits 0 silently when the brain has nothing above threshold.
     ContextHook(ContextHookArgs),
+    /// v0.7: Claude Code Stop hook. Reads session JSON from stdin,
+    /// counts kimetsu_brain_record calls made this session, and
+    /// prints a summary banner. Exits 0 silently for short sessions
+    /// with nothing to report.
+    StopHook(StopHookArgs),
     /// v0.4.3: backfill missing or stale embeddings on memory rows.
     /// Run after upgrading kimetsu (so pre-v0.4.2 rows pick up
     /// vectors) or after changing the embedder model via
@@ -300,6 +305,13 @@ struct ContextHookArgs {
     /// Maximum capsules to inject. Default 2.
     #[arg(long, default_value_t = 2usize)]
     max_capsules: usize,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct StopHookArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1032,6 +1044,17 @@ const CLAUDE_SETTINGS_CONTENT: &str = r#"{
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kimetsu brain stop-hook"
+          }
+        ]
+      }
     ]
   }
 }
@@ -1170,6 +1193,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Stats => stats(),
         BrainCommand::Status { json } => brain_status(json),
         BrainCommand::ContextHook(args) => brain_context_hook(args),
+        BrainCommand::StopHook(args) => brain_stop_hook(args),
         BrainCommand::Reindex(args) => reindex_brain(args),
     }
 }
@@ -1356,6 +1380,63 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         println!("{}", text);
     }
 
+    Ok(())
+}
+
+/// v0.7: Claude Code Stop hook. Reads session JSON from stdin, counts
+/// kimetsu_brain_record calls in the transcript, and prints a summary
+/// banner. Silent exit when the session was short or nothing to report.
+fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
+    use std::io::Read;
+
+    let _workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap_or(0);
+
+    // Parse the session JSON from Claude Code's Stop hook payload.
+    let session: serde_json::Value =
+        serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
+
+    // Count kimetsu_brain_record tool calls in the transcript.
+    let transcript = session
+        .get("transcript")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    let turn_count = transcript.len();
+    let recorded: usize = transcript
+        .iter()
+        .flat_map(|msg| {
+            msg.get("content")
+                .and_then(|c| c.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .filter(|block| {
+            block
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n == "kimetsu_brain_record")
+                .unwrap_or(false)
+        })
+        .count();
+
+    if recorded > 0 {
+        println!(
+            "[Kimetsu] {} lesson{} recorded this session.",
+            recorded,
+            if recorded == 1 { "" } else { "s" }
+        );
+    } else if turn_count > 4 {
+        println!(
+            "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
+        );
+    }
+    // Short sessions (≤4 turns) exit silently — no nagging for quick lookups.
     Ok(())
 }
 

@@ -422,6 +422,32 @@ fn kimetsu_brain_status(workspace: &Path) -> Value {
     })
 }
 
+/// v0.7: shared argument parsing for retrieval MCP tools. Callers pass
+/// their own defaults for `budget_tokens` and `max_capsules` since bench
+/// and brain use different values (2500/8 vs 6000/3).
+struct SharedRetrievalArgs {
+    stage: String,
+    budget_tokens: u32,
+    max_capsules: usize,
+}
+
+fn parse_shared_retrieval_args(
+    arguments: &Value,
+    default_budget: u32,
+    default_max_capsules: u32,
+) -> SharedRetrievalArgs {
+    SharedRetrievalArgs {
+        stage: arguments
+            .get("stage")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("localization")
+            .to_string(),
+        budget_tokens: u32_arg(arguments, "budget_tokens", default_budget, 500, 30000),
+        max_capsules: u32_arg(arguments, "max_capsules", default_max_capsules, 1, 20) as usize,
+    }
+}
+
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
     use kimetsu_brain::context::ContextRequest;
 
@@ -437,23 +463,16 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
         });
     }
-    let stage = arguments
-        .get("stage")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("localization");
-    let budget_tokens = u32_arg(arguments, "budget_tokens", 6000, 500, 30000);
-    // v0.6: new retrieval controls.
+    let shared = parse_shared_retrieval_args(arguments, 6000, 3);
+    let stage = shared.stage.as_str();
+    let budget_tokens = shared.budget_tokens;
+    let max_capsules = shared.max_capsules;
+    // v0.6: score threshold and role preference controls.
     let min_score = arguments
         .get("min_score")
         .and_then(Value::as_f64)
         .map(|v| v.clamp(0.0, 1.0) as f32)
         .unwrap_or(0.15);
-    let max_capsules = arguments
-        .get("max_capsules")
-        .and_then(Value::as_u64)
-        .map(|v| v.clamp(1, 20) as usize)
-        .unwrap_or(3);
     let tags: Vec<String> = arguments
         .get("tags")
         .and_then(Value::as_array)
@@ -591,33 +610,51 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
         _ => MemoryKind::Fact, // semantic_operator and default both stored as Fact
     };
 
-    if confidence >= 0.7 {
-        match project::add_memory(workspace, MemoryScope::Project, kind, &full_text) {
-            Ok(memory_id) => json!({
-                "ok": true,
-                "memory_id": memory_id,
-                "kind": kind_str,
-                "was_proposal": false,
-                "lesson": lesson,
-                "tags": tags,
-                "usage": "Memory accepted into brain. Future kimetsu_brain_context calls with matching queries will retrieve it."
-            }),
-            Err(err) => json!({ "ok": false, "error": err.to_string() }),
-        }
-    } else {
-        // Low confidence → propose for human review
-        match project::propose_memory(workspace, MemoryScope::Project, kind, &full_text, confidence, "low-confidence lesson from kimetsu_brain_record") {
-            Ok(proposal_id) => json!({
-                "ok": true,
-                "proposal_id": proposal_id,
-                "kind": kind_str,
-                "was_proposal": true,
-                "lesson": lesson,
-                "tags": tags,
-                "usage": "Memory proposed for review. Run `kimetsu brain memory proposals` to accept or reject."
-            }),
-            Err(err) => json!({ "ok": false, "error": err.to_string() }),
-        }
+    match project::propose_or_merge_memory(
+        workspace,
+        MemoryScope::Project,
+        kind,
+        &full_text,
+        confidence,
+        "lesson from kimetsu_brain_record",
+    ) {
+        Ok(project::ProposeResult::Added(memory_id)) => json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "result": "added",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Memory accepted into brain. Future kimetsu_brain_context calls with matching queries will retrieve it."
+        }),
+        Ok(project::ProposeResult::Merged(memory_id)) => json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "result": "merged",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Similar memory already exists and was updated with this lesson. No duplicate created."
+        }),
+        Ok(project::ProposeResult::Duplicate(memory_id)) => json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "result": "duplicate",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Identical memory already in brain. No write needed."
+        }),
+        Ok(project::ProposeResult::Proposed(proposal_id)) => json!({
+            "ok": true,
+            "proposal_id": proposal_id,
+            "result": "proposed",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Memory proposed for review (low confidence). Run `kimetsu brain memory review` to accept or reject."
+        }),
+        Err(err) => json!({ "ok": false, "error": err.to_string() }),
     }
 }
 
@@ -643,6 +680,8 @@ fn augment_with_ambient(
     (augmented, payload)
 }
 
+/// Prefer `kimetsu_brain_context` with `prefer_roles: ["semantic_operator","anti_pattern"]`
+/// in new code; this wrapper will be removed in v0.8.
 fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     let task = arguments
         .get("task")
@@ -667,14 +706,12 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
         .as_deref()
         .and_then(benchmark::BenchmarkWarmPolicy::parse)
         .unwrap_or_default();
-    let stage = arguments
-        .get("stage")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("localization");
-    let budget_tokens = u32_arg(arguments, "budget_tokens", 2500, 500, 30000);
-    let max_capsules = u32_arg(arguments, "max_capsules", 8, 1, 20) as usize;
     let require_benchmark_memory = bool_arg(arguments, "require_benchmark_memory", false);
+
+    let shared = parse_shared_retrieval_args(arguments, 2500, 8);
+    let stage = shared.stage.as_str();
+    let budget_tokens = shared.budget_tokens;
+    let max_capsules = shared.max_capsules;
 
     // v0.4.4: collect ambient context and pass its rendered suffix
     // into the brain so it appends AFTER slug detection (otherwise
@@ -1650,26 +1687,28 @@ mod tests {
 
     #[test]
     fn benchmark_context_required_reports_missing_task_memory() {
-        let root = temp_root("kimetsu-mcp-benchmark-empty");
-        fs::create_dir_all(&root).expect("create temp root");
-        project::init_project(&root, false).expect("init project");
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-benchmark-empty");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
 
-        let result = call_tool(
-            "kimetsu_benchmark_context",
-            json!({
-                "task": "compile-compcert build and test CompCert",
-                "warm_policy": "full_warm",
-                "require_benchmark_memory": true,
-                "budget_tokens": 4000
-            }),
-            &root,
-            &SkillConfig::default(),
-        )
-        .expect("benchmark context");
+            let result = call_tool(
+                "kimetsu_benchmark_context",
+                json!({
+                    "task": "compile-compcert build and test CompCert",
+                    "warm_policy": "full_warm",
+                    "require_benchmark_memory": true,
+                    "budget_tokens": 4000
+                }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("benchmark context");
 
-        assert_eq!(result["ok"].as_bool(), Some(false));
-        assert_eq!(result["required_ok"].as_bool(), Some(false));
-        fs::remove_dir_all(root).expect("remove temp root");
+            assert_eq!(result["ok"].as_bool(), Some(false));
+            assert_eq!(result["required_ok"].as_bool(), Some(false));
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
     }
 
     #[test]
