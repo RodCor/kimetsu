@@ -1868,6 +1868,261 @@ fn bench_tasks() -> Vec<BenchTask> {
             ],
             dry_run: false,
         },
+        // ── Python family ────────────────────────────────────────────────
+        BenchTask {
+            id: "python_type_hint",
+            category: "python",
+            seed_task: "Add type annotations to the transform function.",
+            followup_task: "Use Optional for the nullable return type in transform.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Type annotations and Optional returns for transform live in src/transform.py; import Optional from typing.",
+            relevant_handles: vec!["file:src/transform.py"],
+            files: vec![
+                file(
+                    "pyproject.toml",
+                    "[project]\nname = \"bench\"\nversion = \"0.1.0\"\n",
+                ),
+                file(
+                    "src/transform.py",
+                    "def transform(value, multiplier=1):\n    if value is None:\n        return None\n    return value * multiplier\n",
+                ),
+                file(
+                    "src/config.py",
+                    "import os\ndef load_config():\n    return {}\n",
+                ),
+                file(
+                    "src/fetch.py",
+                    "def fetch_data(url):\n    return []\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "python_async_gather",
+            category: "python",
+            seed_task: "Fetch multiple URLs concurrently using asyncio.",
+            followup_task: "Cap concurrency with a semaphore to avoid overloading the server.",
+            memory_kind: MemoryKind::FailurePattern,
+            warm_memory: "Concurrent fetches use asyncio.gather in src/fetcher.py; wrap coroutines with asyncio.Semaphore to cap parallelism.",
+            relevant_handles: vec!["file:src/fetcher.py"],
+            files: vec![
+                file(
+                    "pyproject.toml",
+                    "[project]\nname = \"bench\"\nversion = \"0.1.0\"\n",
+                ),
+                file(
+                    "src/fetcher.py",
+                    "import asyncio\nasync def fetch_one(session, url: str) -> bytes:\n    return b\"\"\nasync def fetch_all(urls: list[str]) -> list[bytes]:\n    return []\n",
+                ),
+                file(
+                    "src/transform.py",
+                    "def transform(value: bytes) -> str:\n    return value.decode()\n",
+                ),
+                file(
+                    "src/config.py",
+                    "MAX_CONCURRENCY: int = 10\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "python_env_config",
+            category: "python",
+            seed_task: "Read database URL from environment with a fallback default.",
+            followup_task: "Raise ConfigError when required variables are missing.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Environment variable loading with validation lives in src/config.py; raise ConfigError on missing required vars, use os.getenv for optional ones.",
+            relevant_handles: vec!["file:src/config.py"],
+            files: vec![
+                file(
+                    "pyproject.toml",
+                    "[project]\nname = \"bench\"\nversion = \"0.1.0\"\n",
+                ),
+                file(
+                    "src/config.py",
+                    "import os\nclass ConfigError(Exception): pass\ndef load_config() -> dict:\n    return {\"db_url\": os.getenv(\"DATABASE_URL\", \"sqlite:///dev.db\")}\n",
+                ),
+                file(
+                    "src/db.py",
+                    "def connect(url: str): pass\n",
+                ),
+                file(
+                    "src/fetcher.py",
+                    "async def fetch_all(urls: list[str]) -> list[bytes]:\n    return []\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        // ── Go family ────────────────────────────────────────────────────
+        BenchTask {
+            id: "go_error_wrap",
+            category: "go",
+            seed_task: "Add context to errors returned from the store layer.",
+            followup_task: "Wrap errors so callers can use errors.Is to detect storage failures.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Error wrapping with fmt.Errorf and the %w verb belongs in store/store.go; enables callers to use errors.Is and errors.As for unwrapping.",
+            relevant_handles: vec!["file:store/store.go"],
+            files: vec![
+                file(
+                    "go.mod",
+                    "module bench\n\ngo 1.22\n",
+                ),
+                file(
+                    "store/store.go",
+                    "package store\n\nimport \"errors\"\n\nvar ErrNotFound = errors.New(\"not found\")\n\nfunc Get(id string) (string, error) {\n\treturn \"\", ErrNotFound\n}\n",
+                ),
+                file(
+                    "handler/handler.go",
+                    "package handler\n\nfunc Handle(id string) error { return nil }\n",
+                ),
+                file(
+                    "main.go",
+                    "package main\n\nfunc main() {}\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "go_interface_impl",
+            category: "go",
+            seed_task: "Implement the Writer interface for the file logger.",
+            followup_task: "Make FileLogger also satisfy io.Closer so it can be deferred in cleanup.",
+            memory_kind: MemoryKind::Fact,
+            warm_memory: "FileLogger Write and Close method implementations live in logger/file.go; Write appends to the file handle, Close flushes and closes it.",
+            relevant_handles: vec!["file:logger/file.go"],
+            files: vec![
+                file(
+                    "go.mod",
+                    "module bench\n\ngo 1.22\n",
+                ),
+                file(
+                    "logger/file.go",
+                    "package logger\n\nimport \"os\"\n\ntype FileLogger struct{ f *os.File }\n\nfunc NewFileLogger(path string) (*FileLogger, error) {\n\tf, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tif err != nil { return nil, err }\n\treturn &FileLogger{f: f}, nil\n}\n",
+                ),
+                file(
+                    "logger/logger.go",
+                    "package logger\n\ntype Logger interface {\n\tWrite(p []byte) (n int, err error)\n\tClose() error\n}\n",
+                ),
+                file(
+                    "main.go",
+                    "package main\n\nfunc main() {}\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "go_table_test",
+            category: "go",
+            seed_task: "Add table-driven tests for the parser edge cases.",
+            followup_task: "Use t.Run subtests so each table entry gets a named test result.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Table-driven tests with t.Run subtests follow the pattern in parser/parser_test.go; each entry has a name, input, and want field.",
+            relevant_handles: vec!["file:parser/parser_test.go"],
+            files: vec![
+                file(
+                    "go.mod",
+                    "module bench\n\ngo 1.22\n",
+                ),
+                file(
+                    "parser/parser.go",
+                    "package parser\n\nfunc Parse(input string) (int, error) {\n\tif input == \"\" { return 0, nil }\n\treturn len(input), nil\n}\n",
+                ),
+                file(
+                    "parser/parser_test.go",
+                    "package parser\n\nimport \"testing\"\n\nfunc TestParse(t *testing.T) {\n\tif _, err := Parse(\"hello\"); err != nil {\n\t\tt.Fatal(err)\n\t}\n}\n",
+                ),
+                file(
+                    "main.go",
+                    "package main\n\nfunc main() {}\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        // ── C family ─────────────────────────────────────────────────────
+        BenchTask {
+            id: "c_make_target",
+            category: "c",
+            seed_task: "Add a 'test' target to the Makefile.",
+            followup_task: "Make the 'test' target depend on 'all' so the binary is built before running.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Makefile test target depends on 'all' and runs ./build/run_tests; use $(CC) with -Wall -Wextra for the all target.",
+            relevant_handles: vec!["file:Makefile"],
+            files: vec![
+                file(
+                    "Makefile",
+                    "CC = gcc\nCFLAGS = -Wall -Wextra\nall:\n\t$(CC) $(CFLAGS) -o build/parser src/parser.c src/main.c\n",
+                ),
+                file(
+                    "src/parser.c",
+                    "#include \"../include/parser.h\"\nint parse_input(const char *s) { return s ? 1 : 0; }\n",
+                ),
+                file(
+                    "include/parser.h",
+                    "#ifndef PARSER_H\n#define PARSER_H\nint parse_input(const char *s);\n#endif\n",
+                ),
+                file(
+                    "src/main.c",
+                    "#include <stdio.h>\n#include \"../include/parser.h\"\nint main(void) { return 0; }\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "c_header_guard",
+            category: "c",
+            seed_task: "Add include guards to the tokenizer header.",
+            followup_task: "Use the filename-based macro TOKENIZER_H for the guard.",
+            memory_kind: MemoryKind::Convention,
+            warm_memory: "Include guards in include/tokenizer.h follow the TOKENIZER_H macro pattern: #ifndef TOKENIZER_H / #define TOKENIZER_H / ... / #endif.",
+            relevant_handles: vec!["file:include/tokenizer.h"],
+            files: vec![
+                file(
+                    "Makefile",
+                    "CC = gcc\nall:\n\t$(CC) -o build/out src/tokenizer.c src/main.c\n",
+                ),
+                file(
+                    "include/tokenizer.h",
+                    "typedef struct { const char *start; int len; } Token;\nToken next_token(const char *src, int pos);\n",
+                ),
+                file(
+                    "src/tokenizer.c",
+                    "#include \"../include/tokenizer.h\"\nToken next_token(const char *src, int pos) { Token t = {src + pos, 0}; return t; }\n",
+                ),
+                file(
+                    "src/main.c",
+                    "#include \"../include/tokenizer.h\"\nint main(void) { return 0; }\n",
+                ),
+            ],
+            dry_run: true,
+        },
+        BenchTask {
+            id: "c_null_guard",
+            category: "c",
+            seed_task: "Add a null pointer check before the first dereference in parse_input.",
+            followup_task: "Return PARSE_ERR_NULL instead of segfaulting when input is null.",
+            memory_kind: MemoryKind::FailurePattern,
+            warm_memory: "Null pointer guard in src/parser.c parse_input checks the input parameter at the top of the function and returns PARSE_ERR_NULL (-1) immediately.",
+            relevant_handles: vec!["file:src/parser.c"],
+            files: vec![
+                file(
+                    "Makefile",
+                    "CC = gcc\nall:\n\t$(CC) -o build/parser src/parser.c src/main.c\n",
+                ),
+                file(
+                    "src/parser.c",
+                    "#include \"../include/parser.h\"\n#define PARSE_ERR_NULL -1\nint parse_input(const char *s) {\n\treturn s[0] == '\\0' ? 0 : 1;\n}\n",
+                ),
+                file(
+                    "include/parser.h",
+                    "#ifndef PARSER_H\n#define PARSER_H\nint parse_input(const char *s);\n#endif\n",
+                ),
+                file(
+                    "src/main.c",
+                    "#include \"../include/parser.h\"\nint main(void) { return 0; }\n",
+                ),
+            ],
+            dry_run: true,
+        },
     ]
 }
 
@@ -1893,7 +2148,7 @@ mod tests {
         })
         .expect("run benchmark");
 
-        assert_eq!(report.task_count, 16);
+        assert_eq!(report.task_count, 25);
         assert!(report.report_path.exists());
         assert!(report.results_path.exists());
         let warm = report
