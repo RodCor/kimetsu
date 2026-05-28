@@ -18,8 +18,10 @@ categories = ["development-tools", "command-line-utilities"]
 # light up semantic retrieval inside the chat REPL. Bare
 # `kimetsu-chat` consumers (none today, but the bridge plugin
 # would qualify) can also opt in directly.
-# v0.7.1: on by default — see kimetsu-cli for VS2022 requirement.
-default = ["embeddings"]
+# v0.7.1: embeddings default lives in kimetsu-cli only; library crates
+# stay lean so --no-default-features on kimetsu-cli cuts ORT cleanly
+# (needed for WSL2 Linux builds where glibc < 2.38).
+default = []
 embeddings = ["kimetsu-brain/embeddings"]
 
 # Interactive REPL transport for kimetsu.
