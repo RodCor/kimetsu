@@ -1568,6 +1568,12 @@ fn kimetsu_write_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "write_file requires `path`" });
     };
+    // Sandbox guard: the composed-shell path below runs with cwd=repo_root, so
+    // an absolute or `..` path would escape the workspace. Reject it the same
+    // way move_file / delete_file do.
+    if let Err(err) = check_workspace_path("path", path) {
+        return json!({ "error": err });
+    }
     let Some(content) = input_str(input, "content") else {
         return json!({ "error": "write_file requires `content`" });
     };
@@ -1619,6 +1625,11 @@ fn kimetsu_edit_file(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> 
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "edit_file requires `path`" });
     };
+    // Sandbox guard: the base64 read/write commands below run with cwd=repo_root,
+    // so an absolute or `..` path would escape the workspace.
+    if let Err(err) = check_workspace_path("path", path) {
+        return json!({ "error": err });
+    }
     // Single-edit shape: {path, old_string, new_string, replace_all?}.
     // Multi-edit shape: {path, edits: [{old_string, new_string, replace_all?}, ...]}.
     let edits: Vec<EditOp> = if let Some(arr) = input.get("edits").and_then(Value::as_array) {
@@ -1829,6 +1840,14 @@ fn kimetsu_apply_patch(runtime: &mut crate::tools::ToolRuntime, input: &Value) -
     } else {
         (diff_raw.to_string(), "unified")
     };
+
+    // Sandbox guard: reject diffs whose post-strip target paths escape the
+    // workspace (absolute or `..`), regardless of whether `cwd` is contained.
+    if let Some(bad) = diff_target_escapes(&diff, strip) {
+        return json!({
+            "error": format!("apply_patch: diff target `{bad}` escapes the workspace (absolute or `..` path)"),
+        });
+    }
 
     let encoded = base64_encode(diff.as_bytes());
     let cmd = format!(
@@ -2218,6 +2237,11 @@ fn kimetsu_glob(runtime: &mut crate::tools::ToolRuntime, input: &Value) -> Value
         return json!({ "error": "glob requires `pattern`" });
     };
     let path = input_str(input, "path").unwrap_or(".");
+    // Sandbox guard: `find` runs with cwd=repo_root; reject roots that escape
+    // the workspace via an absolute prefix or `..` segment.
+    if let Err(err) = check_workspace_path("path", path) {
+        return json!({ "error": err });
+    }
     let max_entries = input_u32(input, "max_entries", GLOB_DEFAULT_MAX_ENTRIES);
     // POSIX find treats `**` as `*/*` rather than recursive-everything. We
     // recurse by default; collapse `**` to `*` for matching purposes.
@@ -2589,6 +2613,52 @@ fn check_workspace_path(label: &str, p: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Drop `strip` leading path components, mimicking GNU `patch -p<strip>`:
+/// each step removes everything up to and including the next `/`.
+fn strip_path_components(path: &str, strip: u32) -> &str {
+    let mut s = path;
+    for _ in 0..strip {
+        match s.find('/') {
+            Some(idx) => s = &s[idx + 1..],
+            None => break,
+        }
+    }
+    s
+}
+
+/// Sandbox guard for `apply_patch`: GNU `patch` applies the diff's own target
+/// paths (after `-p<strip>`) relative to cwd, so a diff header pointing at
+/// `/etc/...` or `../../outside` would write outside the workspace even though
+/// the cwd itself is contained. Inspect every `---`/`+++` header and reject the
+/// patch if any post-strip target escapes the workspace. Returns the offending
+/// raw path on rejection.
+fn diff_target_escapes(diff: &str, strip: u32) -> Option<String> {
+    for line in diff.lines() {
+        let rest = line
+            .strip_prefix("+++ ")
+            .or_else(|| line.strip_prefix("--- "));
+        let Some(rest) = rest else { continue };
+        // Header form: "<path>\t<timestamp>" or "<path> <timestamp>"; take the
+        // first whitespace-delimited token as the filename.
+        let token = rest
+            .split(['\t', ' '])
+            .next()
+            .unwrap_or(rest)
+            .trim_matches('"');
+        if token.is_empty() || token == "/dev/null" {
+            continue;
+        }
+        let stripped = strip_path_components(token, strip);
+        if stripped.is_empty() {
+            continue;
+        }
+        if check_workspace_path("diff target", stripped).is_err() {
+            return Some(token.to_string());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3113,6 +3183,12 @@ fn kimetsu_view_image(runtime: &mut crate::tools::ToolRuntime, input: &Value) ->
     let Some(path) = input_str(input, "path") else {
         return json!({ "error": "view_image requires `path`" });
     };
+    // Sandbox guard: the script below runs with cwd=repo_root, so an absolute
+    // or `..` path would read files outside the workspace and exfiltrate them
+    // (size/sha/base64) back to the model.
+    if let Err(err) = check_workspace_path("path", path) {
+        return json!({ "error": err });
+    }
     let include_b64 = input
         .get("include_base64")
         .and_then(Value::as_bool)
@@ -3515,6 +3591,64 @@ mod tests {
         assert!(check_workspace_path("p", "ok/path/../bad").is_err());
         assert!(check_workspace_path("p", "ok/path").is_ok());
         assert!(check_workspace_path("p", "deep/nested/file.rs").is_ok());
+    }
+
+    #[test]
+    fn strip_path_components_mimics_patch_p() {
+        assert_eq!(strip_path_components("a/src/lib.rs", 1), "src/lib.rs");
+        assert_eq!(strip_path_components("a/b/c.rs", 2), "c.rs");
+        assert_eq!(strip_path_components("/etc/passwd", 0), "/etc/passwd");
+        assert_eq!(strip_path_components("/etc/passwd", 1), "etc/passwd");
+        // strip larger than depth: stop at last component.
+        assert_eq!(strip_path_components("only", 3), "only");
+    }
+
+    #[test]
+    fn diff_target_escapes_detects_traversal() {
+        // Absolute target with strip=0 escapes.
+        let abs = "--- /etc/passwd\n+++ /etc/passwd\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(diff_target_escapes(abs, 0).as_deref(), Some("/etc/passwd"));
+        // `..` traversal escapes.
+        let dotdot = "--- a/../../outside\n+++ b/../../outside\n";
+        assert!(diff_target_escapes(dotdot, 1).is_some());
+        // After strip=1 an absolute `a/...` becomes workspace-relative: safe.
+        let safe = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(diff_target_escapes(safe, 1).is_none());
+        // /dev/null (new-file add) is ignored.
+        let add = "--- /dev/null\n+++ b/notes/new.md\n";
+        assert!(diff_target_escapes(add, 1).is_none());
+    }
+
+    #[test]
+    fn file_tools_reject_workspace_escape() {
+        let root = temp_root("sandbox_escape");
+        let mut runtime = ToolRuntime::new(&root, RunId::new()).expect("runtime");
+        for path in ["/etc/passwd", "../../etc/passwd", "ok/../../bad"] {
+            let w = kimetsu_write_file(&mut runtime, &json!({"path": path, "content": "x"}));
+            assert!(w.get("error").is_some(), "write_file allowed {path}");
+            let e = kimetsu_edit_file(
+                &mut runtime,
+                &json!({"path": path, "old_string": "a", "new_string": "b"}),
+            );
+            assert!(e.get("error").is_some(), "edit_file allowed {path}");
+            let g = kimetsu_glob(&mut runtime, &json!({"pattern": "*.rs", "path": path}));
+            assert!(g.get("error").is_some(), "glob allowed {path}");
+            let v = kimetsu_view_image(&mut runtime, &json!({"path": path}));
+            assert!(v.get("error").is_some(), "view_image allowed {path}");
+        }
+        // apply_patch with an absolute diff target is rejected before execution.
+        let ap = kimetsu_apply_patch(
+            &mut runtime,
+            &json!({"diff": "--- /etc/cron.d/x\n+++ /etc/cron.d/x\n@@ -1 +1 @@\n-a\n+b\n", "strip": 0}),
+        );
+        assert!(
+            ap.get("error")
+                .and_then(Value::as_str)
+                .map(|e| e.contains("escapes the workspace"))
+                .unwrap_or(false),
+            "apply_patch allowed absolute diff target: {ap:?}"
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     // ----- MP-16 unit tests (pure-Rust paths) -----

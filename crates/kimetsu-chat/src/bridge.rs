@@ -564,7 +564,7 @@ pub fn bridge_import_skill(
 ) -> Result<BridgeExtension, String> {
     let workspace = normalize_path(workspace);
     let registry = SkillRegistry::discover(&workspace, config)?;
-    let skill = registry.resolve_or_manifest(selection)?;
+    let skill = registry.resolve_or_manifest_contained(selection)?;
     import_skill_manifest(&workspace, &skill, force)
 }
 
@@ -784,7 +784,7 @@ fn resolve_bridge_skill_source(
         return Ok(extension.root.clone());
     }
     let registry = SkillRegistry::discover(workspace, config)?;
-    Ok(registry.resolve_or_manifest(selection)?.root)
+    Ok(registry.resolve_or_manifest_contained(selection)?.root)
 }
 
 fn write_mcp_config(path: &Path, force: bool) -> Result<(), String> {

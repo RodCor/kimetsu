@@ -232,7 +232,13 @@ fn index_file(
 
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let snippet_len = bytes.len().min(4096);
-    let snippet = String::from_utf8_lossy(&bytes[..snippet_len]).to_string();
+    let raw_snippet = String::from_utf8_lossy(&bytes[..snippet_len]).to_string();
+    // Redact secrets before the snippet lands in brain.db. `is_secret_path`
+    // only filters by filename, so an API key hardcoded inside an ordinary
+    // source file (config.ts, settings.py, ...) would otherwise be stored
+    // verbatim and surface in every future retrieval capsule. This mirrors the
+    // redaction applied on the memory/proposal write paths in `project.rs`.
+    let snippet = crate::redact::redact_secrets(&raw_snippet).text;
     let mtime = metadata
         .modified()
         .ok()
@@ -372,4 +378,40 @@ fn manifest_record(path: &str, snippet: &str, hash: &str, mtime: &str) -> Option
         hash: hash.to_string(),
         mtime: mtime.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn index_file_redacts_secrets_in_snippet() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let repo_root = std::env::temp_dir().join(format!("kimetsu_ingest_redact_{nanos}"));
+        fs::create_dir_all(&repo_root).expect("repo root");
+        // A secret hardcoded in an ordinary (non-secret-named) source file.
+        let secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let file = repo_root.join("config.ts");
+        fs::write(&file, format!("export const KEY = \"{secret}\";\n")).expect("write file");
+
+        let indexed = index_file(&repo_root, &file, 1_000_000)
+            .expect("index_file")
+            .expect("file should be indexed");
+
+        assert!(
+            indexed.snippet.contains("[REDACTED:anthropic_oauth]"),
+            "snippet not redacted: {}",
+            indexed.snippet
+        );
+        assert!(
+            !indexed.snippet.contains(secret),
+            "raw secret leaked into snippet"
+        );
+
+        fs::remove_dir_all(&repo_root).ok();
+    }
 }
