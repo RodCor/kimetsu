@@ -264,21 +264,24 @@ impl BrainSession {
         query: &str,
         budget_tokens: u32,
     ) -> KimetsuResult<ContextBundle> {
-        // v0.4.1: merge user-brain memories into the candidate set
-        // when the user DB is open. The multi-conn path normalizes
-        // both candidate streams together so a user-brain capsule
-        // and a project-brain capsule are comparable on the same
-        // `raw_relevance` scale before scoring.
+        self.retrieve_context_with_request(ContextRequest {
+            stage: stage.to_string(),
+            query: query.to_string(),
+            budget_tokens,
+            ..Default::default()
+        })
+    }
+
+    /// v0.6: full-request variant used by `kimetsu_brain_context` MCP tool
+    /// and `retrieve_context_readonly_with_request` to expose `tags`,
+    /// `min_score`, `max_capsules`, and `prefer_roles`.
+    pub fn retrieve_context_with_request(&self, request: ContextRequest) -> KimetsuResult<ContextBundle> {
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_multi(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
-            ContextRequest {
-                stage: stage.to_string(),
-                query: query.to_string(),
-                budget_tokens,
-            },
+            request,
             &extras,
         )
     }
@@ -509,6 +512,145 @@ pub fn add_memory(
     }
 
     Ok(memory_id)
+}
+
+/// v0.6: write a `memory.proposed` event (pending proposal) without
+/// accepting it immediately. Used by `kimetsu_brain_record` when confidence
+/// is low and the lesson needs human review before entering the retrieval pool.
+/// Returns the `proposal_id`.
+pub fn propose_memory(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+) -> KimetsuResult<String> {
+    let redaction = redact::redact_secrets(text);
+    if redaction.was_redacted() {
+        eprintln!("kimetsu-brain: {}", redaction.summary());
+    }
+    let text = redaction.text.as_str();
+    let (paths, config, conn) = load_project(start)?;
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "memory propose", Some(run_id))?;
+    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
+    let proposal_id = Ulid::new().to_string();
+
+    let started = admin_started_event(&paths, &config, run_id, "memory propose")?;
+    writer.append(&started, true)?;
+
+    let proposed = Event::new(
+        run_id,
+        "memory.proposed",
+        serde_json::json!({
+            "proposal_id": proposal_id,
+            "scope": scope.to_string(),
+            "kind": kind.to_string(),
+            "text": text,
+            "rationale": rationale,
+            "proposed_confidence": confidence.clamp(0.0, 1.0),
+            "source_event_ids": [],
+        }),
+    );
+    writer.append(&proposed, true)?;
+
+    let finished = admin_finished_event(run_id);
+    writer.append(&finished, true)?;
+
+    projector::apply_events(&conn, &[started, proposed, finished])?;
+    Ok(proposal_id)
+}
+
+/// v0.7: outcome of a `propose_or_merge_memory` call.
+#[derive(Debug)]
+pub enum ProposeResult {
+    Added(String),      // memory_id — new memory, directly accepted
+    Proposed(String),   // proposal_id — pending for review (low confidence)
+    Merged(String),     // memory_id of the existing memory that was updated
+    Duplicate(String),  // memory_id of the identical existing memory
+}
+
+/// v0.7: capture a lesson, automatically deduplicating against the existing brain.
+///
+/// Decision tree:
+/// 1. Exact normalized-text match → `Duplicate` (no write).
+/// 2. Cosine similarity ≥ 0.85 with an existing memory → `Merged` (append & re-embed).
+/// 3. confidence ≥ 0.7 and no close match → `Added` (direct acceptance).
+/// 4. confidence < 0.7 → `Proposed` (pending for human review).
+///
+/// Step 2 only fires when the embedder is active (bge-small or similar). In lean builds
+/// the cosine scan returns nothing and the function falls through to step 3/4.
+pub fn propose_or_merge_memory(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+) -> KimetsuResult<ProposeResult> {
+    let redaction = redact::redact_secrets(text);
+    if redaction.was_redacted() {
+        eprintln!("kimetsu-brain: {}", redaction.summary());
+    }
+    let text = redaction.text.as_str();
+
+    // Step 1: exact normalized-text dedup (same as add_memory).
+    {
+        let (_, _, ro_conn) = load_project_readonly(start)?;
+        let normalized = normalize_memory_text(text);
+        let existing: Option<String> = ro_conn
+            .query_row(
+                "SELECT memory_id FROM memories
+                 WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
+                   AND invalidated_at IS NULL
+                 LIMIT 1",
+                rusqlite::params![scope.to_string(), kind.to_string(), normalized],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(ProposeResult::Duplicate(id));
+        }
+    }
+
+    // Step 2: semantic dedup — look for a high-cosine existing memory.
+    let embedder = embeddings::open_default_embedder();
+    {
+        let (_, _, ro_conn) = load_project_readonly(start)?;
+        let conflicts =
+            conflict::find_potential_conflicts(&ro_conn, &scope, text, embedder, 1, 0.85)?;
+        if let Some(hit) = conflicts.into_iter().next() {
+            // Append the new lesson to the existing memory and re-embed it.
+            let (paths, _config, conn) = load_project(start)?;
+            let run_id = RunId::new();
+            let _lock = ProjectLock::acquire(&paths, "memory merge", Some(run_id))?;
+            let merged_text = format!("{}\n\nAlso: {text}", hit.existing_text);
+            let new_normalized = normalize_memory_text(&merged_text);
+            conn.execute(
+                "UPDATE memories
+                 SET text = ?1, normalized_text = ?2, use_count = use_count + 1
+                 WHERE memory_id = ?3",
+                rusqlite::params![merged_text, new_normalized, hit.existing_memory_id],
+            )?;
+            embeddings::embed_and_persist(
+                &conn,
+                &hit.existing_memory_id,
+                &merged_text,
+                embedder,
+            )?;
+            return Ok(ProposeResult::Merged(hit.existing_memory_id));
+        }
+    }
+
+    // Step 3/4: no close match found — accept or propose based on confidence.
+    if confidence >= 0.7 {
+        let memory_id = add_memory(start, scope, kind, text)?;
+        Ok(ProposeResult::Added(memory_id))
+    } else {
+        let proposal_id = propose_memory(start, scope, kind, text, confidence, rationale)?;
+        Ok(ProposeResult::Proposed(proposal_id))
+    }
 }
 
 pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
@@ -1094,6 +1236,15 @@ pub fn retrieve_context_readonly(
     budget_tokens: u32,
 ) -> KimetsuResult<ContextBundle> {
     BrainSession::open_readonly(start)?.retrieve_context(stage, query, budget_tokens)
+}
+
+/// v0.6: variant that accepts a full `ContextRequest` so callers can use
+/// the new `tags`, `min_score`, `max_capsules`, and `prefer_roles` fields.
+pub fn retrieve_context_readonly_with_request(
+    start: &Path,
+    request: ContextRequest,
+) -> KimetsuResult<ContextBundle> {
+    BrainSession::open_readonly(start)?.retrieve_context_with_request(request)
 }
 
 #[allow(clippy::too_many_arguments)]

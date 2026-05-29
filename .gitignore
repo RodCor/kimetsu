@@ -37,3 +37,4 @@
 # and historical planning docs that don't belong in the user-facing
 # kimetsu repo. See github.com/RodCor/kimetsu-bench (private).
 /bench/
+.claude/*.lock

@@ -12,12 +12,20 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a cross-harness sidecar for brain-managed context and portable agent capabilities. Its main value is the Kimetsu brain: retrieved memories, prior outcome signals, repo context, and memory proposal management that can make repeated work cheaper and more consistent. Recommended workflow: call kimetsu_brain_context early on non-trivial coding, review, setup, or broad repository tasks with a concise task query; for Terminal-Bench or other benchmark tasks, call kimetsu_benchmark_context so Kimetsu can detect the task slug, prioritize benchmark memories, and return a compact playbook. Set warm_policy to cold_brain, reactive_warm, or full_warm when reproducing benchmark brain-condition research. Call kimetsu_benchmark_record_outcome after benchmark attempts to write an accepted episodic outcome memory and, when there is a transferable lesson, a pending semantic_operator or anti_pattern memory proposal for human review. Use kimetsu_bridge_status and kimetsu_skills_search when the task may need portable skills from Codex, Claude Code, Agents, or Kimetsu. Bridge tools discover/install capabilities; brain tools retrieve and curate durable context.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
-const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Use the returned capsule summaries as extra working context before planning or editing.";
+const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. v0.6: returns skipped:true (zero tokens) when no capsule is relevant above min_score threshold — safe to call on every non-trivial task without overhead concern.";
 
+// TODO (v0.6+): fold benchmark-tag filtering + semantic_operator/anti_pattern
+// preference into kimetsu_brain_context so kimetsu_benchmark_context becomes
+// redundant. The split today exists because gauntlets accumulate episodic
+// "run X scored Y" memories fast and pollute generic retrieval. Once the
+// broker can apply the bench filter on-demand (e.g. a `prefer_roles=...` arg,
+// or implicit detection of bench task slugs), benchmark_context can be
+// removed and downstream tools (kimetsu-bench/) stop having to nudge Claude
+// toward bench-specific MCP surface.
 const BENCHMARK_CONTEXT_DESCRIPTION: &str = "Benchmark-specific Kimetsu brain tool. Use first for Terminal-Bench tasks. It detects or accepts a task slug, retrieves broker-ranked context with benchmark tags, prioritizes accepted semantic_operator and anti_pattern memories over exact episodic run summaries, and returns a compact playbook that Codex/Claude Code should follow before broad exploration. Set warm_policy to cold_brain, reactive_warm, or full_warm to match the benchmark condition being measured.";
 
 const BENCHMARK_RECORD_OUTCOME_DESCRIPTION: &str = "Record a benchmark attempt in Kimetsu brain. This always writes an accepted memory_role=episodic outcome summary for the exact task. Optionally pass generalized_memory with memory_role=semantic_operator or anti_pattern to create a pending human-review memory proposal for a reusable tactic or warning that should transfer beyond one task slug.";
@@ -213,6 +221,7 @@ fn call_tool(
     match name {
         "kimetsu_brain_status" => Ok(kimetsu_brain_status(workspace)),
         "kimetsu_brain_context" => Ok(kimetsu_brain_context(workspace, &arguments)),
+        "kimetsu_brain_record" => Ok(kimetsu_brain_record(workspace, &arguments)),
         "kimetsu_benchmark_context" => Ok(kimetsu_benchmark_context(workspace, &arguments)),
         "kimetsu_benchmark_record_outcome" => {
             kimetsu_benchmark_record_outcome(workspace, &arguments)
@@ -413,7 +422,35 @@ fn kimetsu_brain_status(workspace: &Path) -> Value {
     })
 }
 
+/// v0.7: shared argument parsing for retrieval MCP tools. Callers pass
+/// their own defaults for `budget_tokens` and `max_capsules` since bench
+/// and brain use different values (2500/8 vs 6000/3).
+struct SharedRetrievalArgs {
+    stage: String,
+    budget_tokens: u32,
+    max_capsules: usize,
+}
+
+fn parse_shared_retrieval_args(
+    arguments: &Value,
+    default_budget: u32,
+    default_max_capsules: u32,
+) -> SharedRetrievalArgs {
+    SharedRetrievalArgs {
+        stage: arguments
+            .get("stage")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("localization")
+            .to_string(),
+        budget_tokens: u32_arg(arguments, "budget_tokens", default_budget, 500, 30000),
+        max_capsules: u32_arg(arguments, "max_capsules", default_max_capsules, 1, 20) as usize,
+    }
+}
+
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
+    use kimetsu_brain::context::ContextRequest;
+
     let query = arguments
         .get("query")
         .and_then(Value::as_str)
@@ -426,12 +463,34 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
         });
     }
-    let stage = arguments
-        .get("stage")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("localization");
-    let budget_tokens = u32_arg(arguments, "budget_tokens", 6000, 500, 30000);
+    let shared = parse_shared_retrieval_args(arguments, 6000, 3);
+    let stage = shared.stage.as_str();
+    let budget_tokens = shared.budget_tokens;
+    let max_capsules = shared.max_capsules;
+    // v0.6: score threshold and role preference controls.
+    let min_score = arguments
+        .get("min_score")
+        .and_then(Value::as_f64)
+        .map(|v| v.clamp(0.0, 1.0) as f32)
+        .unwrap_or(0.15);
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let prefer_roles: Vec<String> = arguments
+        .get("prefer_roles")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // v0.4.4: auto-collect ambient workspace context (git branch,
     // dirty files, recent edits) and append a short retrieval
@@ -443,9 +502,32 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
     let (effective_query, ambient_payload) =
         augment_with_ambient(workspace, query, arguments, "include_ambient");
 
-    match project::retrieve_context_readonly(workspace, stage, &effective_query, budget_tokens) {
+    let request = ContextRequest {
+        stage: stage.to_string(),
+        query: effective_query.clone(),
+        budget_tokens,
+        tags,
+        min_score,
+        max_capsules,
+        prefer_roles,
+    };
+
+    match project::retrieve_context_readonly_with_request(workspace, request) {
+        Ok(bundle) if bundle.skipped => json!({
+            "ok": true,
+            "skipped": true,
+            "top_score": bundle.top_score,
+            "min_score": min_score,
+            "capsule_count": 0,
+            "capsules": [],
+            "usage": {
+                "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
+            }
+        }),
         Ok(bundle) => json!({
             "ok": true,
+            "skipped": false,
+            "top_score": bundle.top_score,
             "usage": {
                 "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
                 "next_steps": [
@@ -467,6 +549,112 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             "excluded": bundle.excluded,
         }),
         Err(err) => brain_unavailable_json(workspace, &err.to_string()),
+    }
+}
+
+/// v0.6: general-purpose capture tool. Records a concrete, reusable
+/// lesson into the brain — the counterpart to `kimetsu_brain_context`.
+/// Use after solving a non-obvious problem that required real effort or
+/// that you'd want to remember next session. Do NOT call for trivial or
+/// well-known knowledge already in training data.
+fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
+    let lesson = match arguments.get("lesson").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
+            return json!({
+                "ok": false,
+                "error": "missing `lesson`",
+                "usage": "Pass a concrete, actionable rule, e.g. {\"lesson\":\"Never open a SQLite WAL DB before fixing the WAL — it deletes the WAL on close\",\"tags\":[\"sqlite\",\"wal\",\"recovery\"]}."
+            });
+        }
+    };
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let context_note = arguments
+        .get("context")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let confidence = arguments
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .map(|v| v.clamp(0.0, 1.0) as f32)
+        .unwrap_or(0.8);
+    let kind_str = arguments
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("semantic_operator");
+
+    // Prefix tags into the lesson text so FTS picks them up without schema change.
+    let tag_prefix = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("[tags: {}] ", tags.join(" "))
+    };
+    let full_text = if context_note.is_empty() {
+        format!("{tag_prefix}{lesson}")
+    } else {
+        format!("{tag_prefix}{lesson} (context: {context_note})")
+    };
+
+    let kind = match kind_str {
+        "anti_pattern" => MemoryKind::FailurePattern,
+        "convention" => MemoryKind::Convention,
+        _ => MemoryKind::Fact, // semantic_operator and default both stored as Fact
+    };
+
+    match project::propose_or_merge_memory(
+        workspace,
+        MemoryScope::Project,
+        kind,
+        &full_text,
+        confidence,
+        "lesson from kimetsu_brain_record",
+    ) {
+        Ok(project::ProposeResult::Added(memory_id)) => json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "result": "added",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Memory accepted into brain. Future kimetsu_brain_context calls with matching queries will retrieve it."
+        }),
+        Ok(project::ProposeResult::Merged(memory_id)) => json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "result": "merged",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Similar memory already exists and was updated with this lesson. No duplicate created."
+        }),
+        Ok(project::ProposeResult::Duplicate(memory_id)) => json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "result": "duplicate",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Identical memory already in brain. No write needed."
+        }),
+        Ok(project::ProposeResult::Proposed(proposal_id)) => json!({
+            "ok": true,
+            "proposal_id": proposal_id,
+            "result": "proposed",
+            "kind": kind_str,
+            "lesson": lesson,
+            "tags": tags,
+            "usage": "Memory proposed for review (low confidence). Run `kimetsu brain memory review` to accept or reject."
+        }),
+        Err(err) => json!({ "ok": false, "error": err.to_string() }),
     }
 }
 
@@ -492,6 +680,8 @@ fn augment_with_ambient(
     (augmented, payload)
 }
 
+/// Prefer `kimetsu_brain_context` with `prefer_roles: ["semantic_operator","anti_pattern"]`
+/// in new code; this wrapper will be removed in v0.8.
 fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     let task = arguments
         .get("task")
@@ -516,14 +706,12 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
         .as_deref()
         .and_then(benchmark::BenchmarkWarmPolicy::parse)
         .unwrap_or_default();
-    let stage = arguments
-        .get("stage")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("localization");
-    let budget_tokens = u32_arg(arguments, "budget_tokens", 2500, 500, 30000);
-    let max_capsules = u32_arg(arguments, "max_capsules", 8, 1, 20) as usize;
     let require_benchmark_memory = bool_arg(arguments, "require_benchmark_memory", false);
+
+    let shared = parse_shared_retrieval_args(arguments, 2500, 8);
+    let stage = shared.stage.as_str();
+    let budget_tokens = shared.budget_tokens;
+    let max_capsules = shared.max_capsules;
 
     // v0.4.4: collect ambient context and pass its rendered suffix
     // into the brain so it appends AFTER slug detection (otherwise
@@ -1037,9 +1225,32 @@ fn tool_definitions() -> Value {
                         "type": "string",
                         "enum": ["localization", "patch_plan", "implementation", "verification", "review"]
                     },
-                    "budget_tokens": { "type": "integer", "minimum": 500, "maximum": 30000 }
+                    "budget_tokens": { "type": "integer", "minimum": 500, "maximum": 30000 },
+                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "v0.6: skip threshold — if the best capsule scores below this, return empty (zero tokens injected). Default 0.15." },
+                    "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "v0.6: hard cap on returned capsules. Default 3." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "v0.6: domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
+                    "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "v0.6: boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
                 },
                 "required": ["query"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_record",
+            "description": "v0.6: record a concrete, reusable lesson into the brain. Call after solving a non-obvious problem that required real effort. Do NOT call for trivial or well-known knowledge. High-confidence lessons (≥0.7) are accepted immediately; low-confidence go to pending proposals.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lesson": { "type": "string", "description": "The generalizable rule in concrete, actionable form." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "2-5 domain keywords (e.g. [\"rust\",\"linker\",\"windows\"])." },
+                    "context": { "type": "string", "description": "Optional: what problem triggered this lesson." },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "How confident you are this generalizes. Default 0.8." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["semantic_operator", "anti_pattern", "convention"],
+                        "description": "semantic_operator for positive rules, anti_pattern for things to avoid, convention for style/project norms. Default semantic_operator."
+                    }
+                },
+                "required": ["lesson", "tags"]
             }
         },
         {
@@ -1476,26 +1687,28 @@ mod tests {
 
     #[test]
     fn benchmark_context_required_reports_missing_task_memory() {
-        let root = temp_root("kimetsu-mcp-benchmark-empty");
-        fs::create_dir_all(&root).expect("create temp root");
-        project::init_project(&root, false).expect("init project");
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-benchmark-empty");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
 
-        let result = call_tool(
-            "kimetsu_benchmark_context",
-            json!({
-                "task": "compile-compcert build and test CompCert",
-                "warm_policy": "full_warm",
-                "require_benchmark_memory": true,
-                "budget_tokens": 4000
-            }),
-            &root,
-            &SkillConfig::default(),
-        )
-        .expect("benchmark context");
+            let result = call_tool(
+                "kimetsu_benchmark_context",
+                json!({
+                    "task": "compile-compcert build and test CompCert",
+                    "warm_policy": "full_warm",
+                    "require_benchmark_memory": true,
+                    "budget_tokens": 4000
+                }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("benchmark context");
 
-        assert_eq!(result["ok"].as_bool(), Some(false));
-        assert_eq!(result["required_ok"].as_bool(), Some(false));
-        fs::remove_dir_all(root).expect("remove temp root");
+            assert_eq!(result["ok"].as_bool(), Some(false));
+            assert_eq!(result["required_ok"].as_bool(), Some(false));
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
     }
 
     #[test]

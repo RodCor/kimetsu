@@ -74,6 +74,7 @@ fn aged_cited_memory_ranks_below_recently_cited_under_default_half_life() {
                 stage: "localization".to_string(),
                 query: "anthropic caching".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
         )
         .expect("retrieve");
@@ -149,6 +150,7 @@ fn decay_can_be_disabled_via_broker_weights() {
                 stage: "localization".to_string(),
                 query: "disable decay knob".to_string(),
                 budget_tokens: 4000,
+                ..Default::default()
             },
         )
         .expect("retrieve");

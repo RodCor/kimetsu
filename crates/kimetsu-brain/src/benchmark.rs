@@ -691,6 +691,8 @@ mod tests {
             used_tokens: 20,
             capsules: vec![repo, memory],
             excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
         };
 
         let context = build_benchmark_context(
@@ -781,6 +783,8 @@ mod tests {
             used_tokens: 20,
             capsules: vec![repo, episodic, semantic],
             excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
         };
 
         let context = build_benchmark_context(
@@ -816,6 +820,8 @@ mod tests {
             used_tokens: 20,
             capsules: vec![semantic],
             excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
         };
 
         let context = build_benchmark_context(
@@ -849,6 +855,8 @@ mod tests {
             used_tokens: 20,
             capsules: vec![memory, repo],
             excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
         };
 
         let context = build_benchmark_context(

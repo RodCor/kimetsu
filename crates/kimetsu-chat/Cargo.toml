@@ -18,6 +18,9 @@ categories = ["development-tools", "command-line-utilities"]
 # light up semantic retrieval inside the chat REPL. Bare
 # `kimetsu-chat` consumers (none today, but the bridge plugin
 # would qualify) can also opt in directly.
+# v0.7.1: embeddings default lives in kimetsu-cli only; library crates
+# stay lean so --no-default-features on kimetsu-cli cuts ORT cleanly
+# (needed for WSL2 Linux builds where glibc < 2.38).
 default = []
 embeddings = ["kimetsu-brain/embeddings"]
 
@@ -33,9 +36,9 @@ embeddings = ["kimetsu-brain/embeddings"]
 # surface, not a benchmark harness.
 
 [dependencies]
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.5.5" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.5.5" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.5.5" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.7.0" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.7.0" }
 base64.workspace = true
 crossterm.workspace = true
 reqwest.workspace = true
