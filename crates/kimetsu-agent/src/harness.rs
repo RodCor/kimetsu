@@ -1527,6 +1527,13 @@ fn kimetsu_search_files(runtime: &mut crate::tools::ToolRuntime, input: &Value) 
         return json!({ "error": "search_files requires `pattern`" });
     };
     let path = input_str(input, "path").unwrap_or(".");
+    // Sandbox guard: `grep -r` runs with cwd=repo_root; an absolute or `..`
+    // path would recursively read files outside the workspace and exfiltrate
+    // their contents (path/line/text) back to the model. Reject it the same way
+    // write_file / glob / view_image do.
+    if let Err(err) = check_workspace_path("path", path) {
+        return json!({ "error": err });
+    }
     let max_matches = input_u32(input, "max_matches", SEARCH_FILES_DEFAULT_MAX_MATCHES);
     let glob = input_str(input, "glob");
 
@@ -3635,6 +3642,11 @@ mod tests {
             assert!(g.get("error").is_some(), "glob allowed {path}");
             let v = kimetsu_view_image(&mut runtime, &json!({"path": path}));
             assert!(v.get("error").is_some(), "view_image allowed {path}");
+            let s = kimetsu_search_files(
+                &mut runtime,
+                &json!({"pattern": "secret", "path": path}),
+            );
+            assert!(s.get("error").is_some(), "search_files allowed {path}");
         }
         // apply_patch with an absolute diff target is rejected before execution.
         let ap = kimetsu_apply_patch(
