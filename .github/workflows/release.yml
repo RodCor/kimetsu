@@ -210,7 +210,12 @@ jobs:
     name: publish to crates.io
     needs: release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Gated on the repo variable PUBLISH_CRATES == 'true' (in addition to
+    # the tag push). Left unset for the v0.7.0 smoke-test release so the
+    # GitHub Release + binaries ship without a permanent crates.io publish.
+    # To enable crates.io publishing: `gh variable set PUBLISH_CRATES --body true`
+    # (or set it in repo Settings → Variables), then re-run / re-tag.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_CRATES == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
