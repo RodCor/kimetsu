@@ -17,10 +17,18 @@ the order you'll encounter them.
 ## 1. Two ways to use it
 
 **As a sidecar via MCP.** Run `kimetsu chat --mcp-server` and point
-Claude Code or Codex at it. The host agent gets ~18 kimetsu_* tools
-(brain context, citations, memory add/list/blame/conflicts, repo
-ingest, the bridge to other harnesses). Memories carry across
+Claude Code or Codex at it. The host agent gets ~24 kimetsu_* tools
+(brain context + record, citations, memory add/list/blame/conflicts,
+repo ingest, the bridge to other harnesses). Memories carry across
 sessions; learning compounds.
+
+The intended loop is two calls: **`kimetsu_brain_context`** early on a
+non-trivial task (zero overhead when the brain has nothing — it returns
+`skipped: true`), then **`kimetsu_brain_record`** after solving a
+non-obvious problem worth remembering. On Claude Code these can fire
+automatically: `kimetsu init` installs a `UserPromptSubmit` hook that
+calls `context-hook` before each turn and a `Stop` hook that calls
+`stop-hook` to summarize what was captured (see §7).
 
 **As a standalone REPL.** Run `kimetsu chat`. Same brain, same
 tools, just without a host harness. Useful for debugging a brain or
@@ -48,13 +56,12 @@ the broker can query fast:
 - `memories` — the durable knowledge. Each row carries scope
   (`global_user`, `project`, `repo`, `run`), kind (`preference`,
   `convention`, `command`, `failure_pattern`, `fact`), text, confidence,
-  use_count, usefulness_score, and (v0.5.1+) last_useful_at.
+  use_count, usefulness_score, and last_useful_at.
 - `memory_proposals` — pending suggestions awaiting human review.
-- `memory_citations` — (v0.5.0+) which memories the model cited
-  during which run, on which turn.
-- `memory_conflicts` — (v0.5.2+) ingest-time hits where a new
-  memory's embedding was too close to an existing one with
-  contradictory text.
+- `memory_citations` — which memories the model cited during which
+  run, on which turn.
+- `memory_conflicts` — ingest-time hits where a new memory's
+  embedding was too close to an existing one with contradictory text.
 - `repo_files`, `repo_files_fts`, `repo_manifests`,
   `repo_manifests_fts` — file-level indexes built by
   `kimetsu brain ingest repo`.
@@ -125,20 +132,27 @@ has its own weight profile in `project.toml`. The broker also runs
 two memories that mention the same words don't both crowd the
 budget.
 
-### Lean vs embeddings builds
+### Embeddings vs lean builds
 
-- **Lean** (default): `cargo install kimetsu-cli`. No embedder
-  binary, no model download. Retrieval is FTS-only via the `α=0`
-  effective behavior. Conflict detection at ingest is a silent no-op.
-- **Embeddings**: `cargo install kimetsu-cli --features embeddings`.
-  Pulls fastembed-rs + ONNX runtime. Default model is BGE-small-en-v1.5;
-  set `KIMETSU_BRAIN_EMBEDDER=jina-v2-base-code` (or any
-  fastembed-rs model id) to swap. Cosine retrieval + conflict
-  detection both light up.
+- **Embeddings** (default for the CLI): `cargo install kimetsu-cli`
+  ships with `--features embeddings` on. Pulls fastembed-rs + ONNX
+  runtime; needs the VS2022 C++ runtime on Windows (ort prebuilts).
+  Default model is BGE-small-en-v1.5; set
+  `KIMETSU_BRAIN_EMBEDDER=jina-v2-base-code` (or any fastembed-rs
+  model id) to swap. Cosine retrieval, semantic dedup, and conflict
+  detection all light up. The ~24 MB model downloads to
+  `~/.cache/huggingface/` on first embed call, then caches.
+- **Lean**: `cargo install kimetsu-cli --no-default-features`. No
+  embedder binary, no model download. Retrieval is FTS-only via the
+  `α=0` effective behavior. Semantic dedup and conflict detection at
+  ingest become silent no-ops. The library crates
+  (`kimetsu-brain`, `kimetsu-chat`) default to lean so downstream
+  consumers stay slim; only the `kimetsu-cli` binary opts embeddings
+  in by default.
 
 ---
 
-## 4. Citations + blame (v0.5.0)
+## 4. Citations + blame
 
 The model's biggest signal is *which memories it actually used*.
 When a memory shows up in context but the model never reaches for
@@ -180,7 +194,7 @@ agent can introspect its own runs.
 
 ---
 
-## 5. Decay (v0.5.1)
+## 5. Decay
 
 A memory that was useful 6 months ago shouldn't outrank one that
 was useful yesterday. The `last_useful_at` column (bumped only on
@@ -195,7 +209,7 @@ applies a half-life curve to attenuate stale usefulness boosts.
   # or
   decay_half_life_days = 0    # disable decay entirely
   ```
-- Critically, decay attenuates the *deviation from neutral*, not the
+- Decay attenuates the *deviation from neutral*, not the
   multiplier itself: a max-boosted +1.5 memory decays toward 1.0
   (neutral, like a brand-new memory), not toward 0. Losing confidence
   in old signal shouldn't penalize a memory below one with zero
@@ -203,12 +217,29 @@ applies a half-life curve to attenuate stale usefulness boosts.
 
 ---
 
-## 6. Conflict detection at ingest (v0.5.2)
+## 6. Semantic dedup + conflict detection at ingest
 
-When `add_memory` (CLI or MCP) writes a new capsule, kimetsu scans
-the active brain for nearby contradictions: existing memories in
-the same scope whose embedding is close (cosine ≥ 0.8 by default)
-but whose normalized text differs.
+When a new capsule arrives via `kimetsu_brain_record` (the capture
+tool host agents call after solving something), kimetsu first runs
+**semantic dedup** through `propose_or_merge_memory`:
+
+1. **Exact dup** — identical normalized text in the same scope/kind
+   short-circuits; the existing memory's use_count bumps, nothing new
+   is written.
+2. **Near dup** — if an existing memory in scope is within cosine
+   ≥ 0.85, the new text is *merged into* it (appended as "Also: …")
+   rather than creating a near-twin. This is what stops a brain from
+   filling with ten rephrasings of the same lesson over a gauntlet.
+3. **High confidence** (≥ 0.7) with no near-dup → accepted directly.
+4. **Lower confidence** → filed as a proposal for human review.
+
+Dedup is embedder-gated; the lean build skips steps 1-2's semantic
+match and falls through to accept/propose.
+
+Separately, when `add_memory` writes a capsule, kimetsu scans the
+active brain for nearby *contradictions*: existing memories in the
+same scope whose embedding is close (cosine ≥ 0.8 by default) but
+whose normalized text differs.
 
 Hits land in `memory_conflicts`. The write itself is **not blocked**
 — surfacing > blocking, because a blocked write loses user intent.
@@ -238,34 +269,54 @@ should have surfaced.
 
 ## 7. The MCP surface
 
-Run `kimetsu chat --mcp-server` and the host harness gets 18
-`kimetsu_*` tools:
+Run `kimetsu chat --mcp-server` and the host harness gets ~24
+`kimetsu_*` tools. The ones you'll actually reach for:
 
 | Tool | What it does |
 |------|--------------|
-| `kimetsu_brain_context` | Retrieve a context bundle for a query/stage |
-| `kimetsu_brain_memory_add` | Persist a new memory |
+| `kimetsu_brain_context` | Retrieve a context bundle for a query/stage (returns `skipped: true` when nothing relevant — zero overhead) |
+| `kimetsu_brain_record` | Capture a lesson after a non-obvious solve; runs semantic dedup (§6) |
+| `kimetsu_brain_status` | Brain health + memory counts at a glance |
+| `kimetsu_brain_memory_add` | Persist a new memory directly |
 | `kimetsu_brain_memory_list` | List memories in scope, sorted by relevance |
 | `kimetsu_brain_memory_top` | Top memories by usefulness ratio |
 | `kimetsu_brain_memory_proposals` | Pending proposals awaiting review |
-| `kimetsu_brain_memory_accept` | Promote a proposal to a memory |
-| `kimetsu_brain_memory_reject` | Reject a proposal |
+| `kimetsu_brain_memory_accept` / `_reject` | Promote / reject a proposal |
 | `kimetsu_brain_memory_invalidate` | Retire a memory |
-| `kimetsu_brain_memory_blame` | Per-run citation attribution (v0.5.0) |
-| `kimetsu_brain_memory_conflicts` | List open ingest conflicts (v0.5.2) |
+| `kimetsu_brain_memory_blame` | Per-run citation attribution |
+| `kimetsu_brain_memory_conflicts` | List open ingest conflicts |
 | `kimetsu_brain_ingest_repo` | Index repo files + manifests |
-| `kimetsu_benchmark_context` | Retrieve a task-aware playbook (benchmarks) |
+| `kimetsu_benchmark_context` | Retrieve a task-aware playbook (biases toward `semantic_operator` + `anti_pattern` roles) |
 | `kimetsu_benchmark_record_outcome` | Record run outcome → proposal |
-| `kimetsu_bridge_status` | Cross-harness skill registry status |
-| `kimetsu_bridge_export` | Install a skill into Claude Code / Codex |
-| `kimetsu_skills_search` | Find skills by keyword |
-| `cite_memory` | (in-run) Mark a memory as cited (v0.5.0) |
-| `kimetsu_doctor` | Self-check the wire health |
+| `kimetsu_bridge_status` / `_export` / `_import` / `_sync` | Cross-harness skill registry + install/sync |
+| `kimetsu_skills_search` / `kimetsu_skill` | Find / invoke a portable skill |
+| `cite_memory` | (in-run) Mark a memory as cited |
 
 Tool input schemas + descriptions are advertised via the standard
 MCP `tools/list`. Every kimetsu_* tool returns `{"ok": true, "usage":
 {...}, ...}` so the host agent gets actionable "how to use this
 output" guidance, not just raw data.
+
+### Claude Code hooks
+
+The MCP tools work whether or not the model decides to call them. To
+make the loop reliable, `kimetsu init` writes two hooks into the
+project's `.claude/settings.json` (skipped if the file already
+exists):
+
+- **`UserPromptSubmit` → `kimetsu brain context-hook`** fires before
+  each turn. It reads the prompt from stdin, retrieves a context
+  bundle, and injects it — so the model sees relevant memories without
+  having to remember to ask. Zero-overhead: when the brain has nothing,
+  the hook emits nothing.
+- **`Stop` → `kimetsu brain stop-hook`** fires when a turn ends. It
+  walks the transcript, counts `kimetsu_brain_record` calls, and prints
+  a one-line post-turn banner — either confirming how many lessons were
+  captured or nudging the model to record one after a non-trivial,
+  un-captured session.
+
+Both are plain CLI subcommands, so the same hooks work under any
+harness that can run a command on a prompt/stop event.
 
 ---
 
@@ -328,7 +379,7 @@ relevance = 0.50
 confidence = 0.20
 freshness = 0.20
 scope = 0.10
-decay_half_life_days = 30.0   # v0.5.1; 0 to disable
+decay_half_life_days = 30.0   # 0 to disable
 
 [broker.weights.localization]
 relevance = 0.70              # heavier on relevance for the localization stage
@@ -382,11 +433,12 @@ Environment variables that override at runtime:
 ## 12. Where to go next
 
 - Run `kimetsu doctor` to verify your install.
-- Read the **CHANGELOG** for what each version shipped (v0.5.0
-  citations, v0.5.1 decay, v0.5.2 conflicts, v0.5.3 e2e suite).
+- Read the **CHANGELOG** for the per-version history — this doc
+  describes how kimetsu works today; the CHANGELOG tells you when each
+  piece landed.
 - Look at the per-crate `src/lib.rs` doc comments for module-level
   detail (`kimetsu-brain`, `kimetsu-agent`, `kimetsu-chat`,
   `kimetsu-cli`, `kimetsu-core`).
 - For anything benchmark / impact-measurement related, the bench
   surface lives in a separate internal repo — that's by design
-  (see "Lean vs embeddings" + the v0.5.4 entry in CHANGELOG).
+  (see "Embeddings vs lean builds" above).

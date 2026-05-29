@@ -6,6 +6,63 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.7.0 — semantic dedup, embeddings by default, session hooks
+
+The release that makes knowledge transfer reliable end-to-end:
+capture without duplication, retrieve without asking, and surface
+what was learned each session.
+
+ADDED
+  * **Semantic dedup at capture.** `propose_or_merge_memory` (new in
+    `kimetsu-brain`) runs before any memory is written. Exact dups
+    short-circuit; near-dups (cosine ≥ 0.85, same scope) merge into
+    the existing memory instead of spawning a near-twin. High-confidence
+    novel lessons are accepted directly; the rest file as proposals.
+    `kimetsu_brain_record` returns which branch was taken
+    (`added | merged | duplicate | proposed`). This stops a brain from
+    filling with ten rephrasings of the same lesson over a gauntlet.
+  * **Embeddings on by default for the CLI.** `cargo install kimetsu-cli`
+    now ships `--features embeddings` (fastembed-rs + ONNX, BGE-small-en-v1.5).
+    Cosine retrieval, semantic dedup, and conflict detection all light up
+    out of the box. Build lean with `--no-default-features`. Library crates
+    (`kimetsu-brain`, `kimetsu-chat`) stay lean by default so downstream
+    consumers don't inherit the ONNX runtime — only the binary opts in.
+  * **`Stop` hook for session summary.** `kimetsu brain stop-hook` walks
+    the transcript, counts `kimetsu_brain_record` calls, and prints a
+    post-turn banner — confirming captures or nudging when a non-trivial
+    session recorded nothing. `kimetsu init` now writes both the
+    `UserPromptSubmit` and `Stop` hooks into `.claude/settings.json`.
+
+CHANGED
+  * `kimetsu_benchmark_context` shares argument parsing with
+    `kimetsu_brain_context` via an extracted `parse_retrieval_args`
+    helper — ~50 lines of duplicated stage/budget/ambient handling
+    removed. No behavior change for bench callers.
+
+NOTE
+  * On Windows the embeddings flavor needs the VS2022 C++ runtime
+    (ort prebuilts). The default model (~24 MB) downloads to
+    `~/.cache/huggingface/` on first embed call, then caches.
+
+## v0.6.0 — zero-overhead knowledge transfer
+
+Retrieval and capture become silent by default and only speak up when
+they have something worth saying.
+
+ADDED
+  * **`kimetsu_brain_context` zero-overhead contract.** When the brain
+    has nothing relevant it returns `skipped: true` and injects nothing —
+    so a host agent can call it on every non-trivial task without paying
+    a context tax on cold brains.
+  * **`kimetsu_brain_record` capture tool.** The host agent's path to
+    persisting a concrete lesson (plus 2-5 domain tags) after solving a
+    non-obvious problem. Pairs with `kimetsu_brain_context` as the
+    intended two-call loop.
+  * **`UserPromptSubmit` context hook.** `kimetsu brain context-hook`
+    reads the prompt from stdin and injects a context bundle before each
+    Claude Code turn, so retrieval happens whether or not the model
+    remembers to ask.
+
 ## v0.5.5 — delete kimetsu_harbor/: harbor refactor arc complete
 
 Final commit of the v0.5.3-v0.5.5 harbor refactor arc. The Python
