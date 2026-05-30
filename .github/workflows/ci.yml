@@ -81,20 +81,23 @@ jobs:
       # the gate fast and dependency-light; the embeddings flavor is
       # built + smoke-tested in release.yml.
       #
-      # The brain suite exercises the per-user GlobalUser brain at
-      # $HOME/.kimetsu and takes a writer lock on ~/.kimetsu/project.lock.
-      # Run multi-threaded (cargo's default), concurrent tests contend on
-      # that shared lock and one panics. Point HOME/TMP/GIT ceiling at a
-      # throwaway dir under the runner temp and serialize so each test gets
-      # an isolated project root.
-      - name: cargo test (isolated, serial)
+      # The brain suite touches the per-user GlobalUser brain at
+      # ~/.kimetsu and takes a writer lock on ~/.kimetsu/project.lock.
+      # Cargo runs each crate's test binary in parallel, so two binaries
+      # doing a GlobalUser op contend on that one shared lock and panic
+      # ("project writer lock is already held"). Overriding $HOME does NOT
+      # help on Linux — the home crate resolves the home dir via getpwuid
+      # (/etc/passwd), ignoring $HOME. The robust, platform-independent fix
+      # is to disable the user brain for the test run (KIMETSU_USER_BRAIN=0,
+      # the same toggle the per-test `with_user_brain_disabled` helper sets);
+      # every test then uses only its own unique per-test project root, so
+      # there is no shared lock to contend on. --test-threads=1 is
+      # belt-and-suspenders against intra-binary ordering assumptions.
+      - name: cargo test
         shell: bash
-        run: |
-          ISO="${RUNNER_TEMP:-/tmp}/kimetsu-test-home"
-          mkdir -p "$ISO"
-          export HOME="$ISO" TMPDIR="$ISO" TMP="$ISO" TEMP="$ISO"
-          export GIT_CEILING_DIRECTORIES="$ISO"
-          cargo test --workspace --locked -- --test-threads=1
+        env:
+          KIMETSU_USER_BRAIN: "0"
+        run: cargo test --workspace --locked -- --test-threads=1
 
   audit:
     name: cargo-audit (RUSTSEC)
@@ -104,6 +107,12 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2024-0384: `instant` is unmaintained (not an exploitable
+          # vulnerability). It enters only transitively through the embeddings
+          # feature: fastembed -> sled 0.34 -> parking_lot 0.11 -> instant.
+          # No upgrade path until fastembed bumps sled; the lean default build
+          # doesn't pull it at all. Re-evaluate when fastembed updates.
+          ignore: RUSTSEC-2024-0384
 
   deny:
     name: cargo-deny (licenses + bans)
