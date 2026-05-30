@@ -136,7 +136,7 @@ Required workflow:
 6. Call `kimetsu_bridge_status` and `kimetsu_skills_search` only when a portable skill or extension may help.
 7. Continue the actual task with Claude Code's normal file, shell, edit, and verification tools.
 
-Required mode: the installed pre-turn hook calls Kimetsu brain context and the post-turn hook audits the marker. Treat missing Kimetsu access as a setup blocker for non-trivial tasks unless the user explicitly waives Kimetsu or the task is trivial.
+Required mode: the installed Claude Code `UserPromptSubmit` hook calls Kimetsu brain context and the `Stop` hook nudges memory recording. Treat missing Kimetsu access as a setup blocker for non-trivial tasks unless the user explicitly waives Kimetsu or the task is trivial.
 "#;
 
 const CLAUDE_DELEGATE_COMMAND_OPTIONAL: &str = r#"# Kimetsu Delegate
@@ -173,7 +173,7 @@ Optional mode:
 - Kimetsu brain is the preferred first step for non-trivial work.
 - If native MCP tools are unavailable and the task is small, note that Kimetsu brain context was unavailable and continue.
 - For broad work, fix the plugin/MCP setup first so `kimetsu_brain_context` is available.
-- Installed hooks attempt to load `kimetsu brain context --json` and write audit markers under `.kimetsu/hooks/usage/`, but optional mode does not block on hook failure.
+- Installed Codex hooks use `.codex/hooks.json` and the `UserPromptSubmit` event to run `kimetsu brain context-hook --workspace .`. Optional mode does not block when Kimetsu returns no relevant context.
 
 Kimetsu brain tools retrieve and manage durable context. Kimetsu bridge tools discover and install reusable capabilities. Continue the actual task with the host harness's normal file, shell, edit, and verification tools.
 "#;
@@ -198,284 +198,9 @@ Required mode:
 - Treat missing Kimetsu MCP access as a setup blocker for non-trivial tasks.
 - Continue without Kimetsu only when the user explicitly waives it or the task is trivial.
 - State whether `kimetsu_benchmark_context` or `kimetsu_brain_context` was called and how many capsules were returned when reporting benchmark or audit results.
-- Installed pre-turn and post-turn hooks call `kimetsu brain context --json` and audit markers under `.kimetsu/hooks/usage/`; benchmark wrappers can additionally inspect those markers or MCP transcripts.
+- Installed Codex hooks use `.codex/hooks.json` and the `UserPromptSubmit` event to run `kimetsu brain context-hook --workspace .`; benchmark wrappers should inspect MCP transcripts for required Kimetsu usage.
 
 Kimetsu brain tools retrieve and manage durable context. Kimetsu bridge tools discover and install reusable capabilities. Continue the actual task with the host harness's normal file, shell, edit, and verification tools after loading Kimetsu context.
-"#;
-
-const KIMETSU_HOOK_PS1_TEMPLATE: &str = r#"$ErrorActionPreference = "Stop"
-
-$mode = "__KIMETSU_MODE__"
-$event = if ($env:KIMETSU_HOOK_EVENT) { $env:KIMETSU_HOOK_EVENT } else { "pre-turn" }
-$workspace = if ($env:KIMETSU_WORKSPACE) { $env:KIMETSU_WORKSPACE } else { (Get-Location).Path }
-$inputText = if ($env:KIMETSU_INPUT) { $env:KIMETSU_INPUT } else { "" }
-$sessionId = if ($env:KIMETSU_SESSION_ID) { $env:KIMETSU_SESSION_ID } else { "unknown" }
-$usageDir = Join-Path $workspace ".kimetsu\hooks\usage"
-$usageFile = Join-Path $usageDir "$sessionId.jsonl"
-
-New-Item -ItemType Directory -Force -Path $usageDir | Out-Null
-
-function Get-KimetsuInputHash {
-    param([string]$Text)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-        ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
-    } finally {
-        $sha.Dispose()
-    }
-}
-
-function Test-KimetsuTrivial {
-    param([string]$Text)
-    $trimmed = $Text.Trim()
-    if ($trimmed.Length -eq 0) { return $true }
-    $lower = $trimmed.ToLowerInvariant()
-    if ($trimmed.Length -le 16 -and $lower -match "^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|status)$") {
-        return $true
-    }
-    return $false
-}
-
-$inputHash = Get-KimetsuInputHash $inputText
-
-function Write-KimetsuUsage {
-    param(
-        [string]$Status,
-        [string]$Reason,
-        [object]$CapsuleCount
-    )
-    $record = [ordered]@{
-        timestamp = (Get-Date).ToUniversalTime().ToString("o")
-        event = $event
-        mode = $mode
-        status = $Status
-        reason = $Reason
-        session_id = $sessionId
-        input_sha256 = $inputHash
-        capsule_count = $CapsuleCount
-        tool = "kimetsu brain context"
-    }
-    ($record | ConvertTo-Json -Compress) | Add-Content -Path $usageFile
-}
-
-function Resolve-KimetsuBin {
-    if ($env:KIMETSU_BIN) { return $env:KIMETSU_BIN }
-    $debugExe = Join-Path $workspace "target\debug\kimetsu.exe"
-    if (Test-Path $debugExe) { return $debugExe }
-    $releaseExe = Join-Path $workspace "target\release\kimetsu.exe"
-    if (Test-Path $releaseExe) { return $releaseExe }
-    return "kimetsu"
-}
-
-function Complete-KimetsuFailure {
-    param([string]$Reason)
-    Write-KimetsuUsage "error" $Reason $null
-    if ($mode -eq "required") {
-        Write-Error $Reason
-        exit 1
-    }
-    Write-Warning $Reason
-    exit 0
-}
-
-if (Test-KimetsuTrivial $inputText) {
-    Write-KimetsuUsage "skipped" "trivial input" $null
-    exit 0
-}
-
-if ($event -eq "post-turn") {
-    $found = $false
-    if (Test-Path $usageFile) {
-        foreach ($line in Get-Content $usageFile) {
-            try {
-                $record = $line | ConvertFrom-Json
-                if ($record.event -eq "pre-turn" -and $record.status -eq "ok" -and $record.input_sha256 -eq $inputHash) {
-                    $found = $true
-                    break
-                }
-            } catch {
-                continue
-            }
-        }
-    }
-    if ($found) {
-        Write-KimetsuUsage "audit-ok" "pre-turn brain context marker found" $null
-        exit 0
-    }
-    $reason = "missing pre-turn kimetsu_brain_context marker for this input"
-    Write-KimetsuUsage "audit-missing" $reason $null
-    if ($mode -eq "required") {
-        Write-Error $reason
-        exit 1
-    }
-    Write-Warning $reason
-    exit 0
-}
-
-if ($event -ne "pre-turn") {
-    Write-KimetsuUsage "ignored" "unsupported hook event" $null
-    exit 0
-}
-
-$kimetsu = Resolve-KimetsuBin
-$query = $inputText.Trim()
-$stage = if ($env:KIMETSU_BRAIN_STAGE) { $env:KIMETSU_BRAIN_STAGE } else { "localization" }
-$budget = if ($env:KIMETSU_BRAIN_BUDGET_TOKENS) { $env:KIMETSU_BRAIN_BUDGET_TOKENS } else { "4000" }
-
-Push-Location $workspace
-try {
-    $output = & $kimetsu brain context $query --stage $stage --budget-tokens $budget --json 2>&1
-    $exitCode = $LASTEXITCODE
-} catch {
-    $output = $_.Exception.Message
-    $exitCode = 1
-} finally {
-    Pop-Location
-}
-
-if ($exitCode -ne 0) {
-    Complete-KimetsuFailure "kimetsu brain context failed: $output"
-}
-
-try {
-    $payload = ($output | Out-String) | ConvertFrom-Json
-    $capsuleCount = [int]$payload.capsule_count
-} catch {
-    Complete-KimetsuFailure "kimetsu brain context returned invalid JSON"
-}
-
-Write-KimetsuUsage "ok" "brain context loaded" $capsuleCount
-Write-Output "kimetsu brain context capsules=$capsuleCount"
-exit 0
-"#;
-
-const KIMETSU_HOOK_SH_TEMPLATE: &str = r#"#!/usr/bin/env bash
-set -u
-
-mode="__KIMETSU_MODE__"
-event="${KIMETSU_HOOK_EVENT:-pre-turn}"
-workspace="${KIMETSU_WORKSPACE:-$PWD}"
-input_text="${KIMETSU_INPUT:-}"
-session_id="${KIMETSU_SESSION_ID:-unknown}"
-usage_dir="$workspace/.kimetsu/hooks/usage"
-usage_file="$usage_dir/$session_id.jsonl"
-mkdir -p "$usage_dir"
-
-json_escape() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])'
-  else
-    sed 's/\\/\\\\/g; s/"/\\"/g'
-  fi
-}
-
-hash_input() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$1" | sha256sum | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'
-  else
-    printf ''
-  fi
-}
-
-input_hash="$(hash_input "$input_text")"
-
-write_usage() {
-  status="$1"
-  reason="$2"
-  capsule_count="${3:-null}"
-  [ -n "$capsule_count" ] || capsule_count="null"
-  timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  esc_event="$(printf '%s' "$event" | json_escape)"
-  esc_mode="$(printf '%s' "$mode" | json_escape)"
-  esc_status="$(printf '%s' "$status" | json_escape)"
-  esc_reason="$(printf '%s' "$reason" | json_escape)"
-  esc_session="$(printf '%s' "$session_id" | json_escape)"
-  esc_hash="$(printf '%s' "$input_hash" | json_escape)"
-  printf '{"timestamp":"%s","event":"%s","mode":"%s","status":"%s","reason":"%s","session_id":"%s","input_sha256":"%s","capsule_count":%s,"tool":"kimetsu brain context"}\n' \
-    "$timestamp" "$esc_event" "$esc_mode" "$esc_status" "$esc_reason" "$esc_session" "$esc_hash" "$capsule_count" >> "$usage_file"
-}
-
-is_trivial() {
-  trimmed="$(printf '%s' "$input_text" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-  [ -n "$trimmed" ] || return 0
-  lower="$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')"
-  case "$lower" in
-    hi|hello|hey|thanks|"thank you"|ok|okay|yes|no|status)
-      [ "${#trimmed}" -le 16 ] && return 0
-      ;;
-  esac
-  return 1
-}
-
-resolve_kimetsu_bin() {
-  if [ -n "${KIMETSU_BIN:-}" ]; then
-    printf '%s' "$KIMETSU_BIN"
-  elif [ -x "$workspace/target/debug/kimetsu" ]; then
-    printf '%s' "$workspace/target/debug/kimetsu"
-  elif [ -x "$workspace/target/release/kimetsu" ]; then
-    printf '%s' "$workspace/target/release/kimetsu"
-  else
-    printf '%s' "kimetsu"
-  fi
-}
-
-fail_or_warn() {
-  reason="$1"
-  write_usage "error" "$reason" "null"
-  if [ "$mode" = "required" ]; then
-    printf '%s\n' "$reason" >&2
-    exit 1
-  fi
-  printf '%s\n' "$reason" >&2
-  exit 0
-}
-
-if is_trivial; then
-  write_usage "skipped" "trivial input" "null"
-  exit 0
-fi
-
-if [ "$event" = "post-turn" ]; then
-  if [ -f "$usage_file" ] && grep -F '"event":"pre-turn"' "$usage_file" | grep -F '"status":"ok"' | grep -F "\"input_sha256\":\"$input_hash\"" >/dev/null 2>&1; then
-    write_usage "audit-ok" "pre-turn brain context marker found" "null"
-    exit 0
-  fi
-  reason="missing pre-turn kimetsu_brain_context marker for this input"
-  write_usage "audit-missing" "$reason" "null"
-  if [ "$mode" = "required" ]; then
-    printf '%s\n' "$reason" >&2
-    exit 1
-  fi
-  printf '%s\n' "$reason" >&2
-  exit 0
-fi
-
-if [ "$event" != "pre-turn" ]; then
-  write_usage "ignored" "unsupported hook event" "null"
-  exit 0
-fi
-
-kimetsu_bin="$(resolve_kimetsu_bin)"
-stage="${KIMETSU_BRAIN_STAGE:-localization}"
-budget="${KIMETSU_BRAIN_BUDGET_TOKENS:-4000}"
-query="$(printf '%s' "$input_text" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-
-if output="$(cd "$workspace" && "$kimetsu_bin" brain context "$query" --stage "$stage" --budget-tokens "$budget" --json 2>&1)"; then
-  capsule_count="$(printf '%s\n' "$output" | sed -n 's/.*"capsule_count":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
-  if [ -z "$capsule_count" ]; then
-    fail_or_warn "kimetsu brain context returned invalid JSON"
-  fi
-  write_usage "ok" "brain context loaded" "$capsule_count"
-  printf 'kimetsu brain context capsules=%s\n' "$capsule_count"
-  exit 0
-fi
-
-fail_or_warn "kimetsu brain context failed: $output"
 "#;
 
 pub fn bridge_scan(workspace: &Path, config: &SkillConfig) -> Result<BridgeScan, String> {
@@ -616,7 +341,9 @@ pub fn plugin_install(
     let mut files = Vec::new();
     match target {
         BridgeTarget::ClaudeCode => {
-            let mcp = workspace.join(".claude").join("mcp.json");
+            // Claude Code reads project-scoped MCP servers from `.mcp.json` at
+            // the workspace root, NOT `.claude/mcp.json`.
+            let mcp = workspace.join(".mcp.json");
             write_mcp_config(&mcp, force)?;
             files.push(normalize_path(&mcp));
 
@@ -643,18 +370,15 @@ pub fn plugin_install(
                 force,
             )?;
             files.push(normalize_path(&delegate));
-            write_plugin_hooks(
-                &workspace,
-                BridgeTarget::ClaudeCode,
-                mode,
-                force,
-                &mut files,
-            )?;
+            // Claude Code hooks live in `.claude/settings.json` under the
+            // `hooks` key (keyed by real events, fed via stdin JSON) — not
+            // standalone `.ps1`/`.sh` files driven by env vars.
+            write_claude_settings(&workspace, force, &mut files)?;
         }
         BridgeTarget::Codex => {
-            let mcp = workspace.join(".codex").join("mcp.json");
-            write_mcp_config(&mcp, force)?;
-            files.push(normalize_path(&mcp));
+            let config = workspace.join(".codex").join("config.toml");
+            write_codex_config(&config, force)?;
+            files.push(normalize_path(&config));
 
             let skill = workspace
                 .join(".codex")
@@ -670,7 +394,7 @@ pub fn plugin_install(
                 force,
             )?;
             files.push(normalize_path(&skill));
-            write_plugin_hooks(&workspace, BridgeTarget::Codex, mode, force, &mut files)?;
+            write_codex_hooks(&workspace, force, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
             let dir = workspace.join(".kimetsu").join("extensions");
@@ -689,39 +413,52 @@ pub fn extensions_root(workspace: &Path) -> PathBuf {
     workspace.join(".kimetsu").join("extensions")
 }
 
-fn write_plugin_hooks(
+fn write_codex_hooks(
     workspace: &Path,
-    target: BridgeTarget,
-    mode: PluginMode,
     force: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    let hooks_root = match target {
-        BridgeTarget::ClaudeCode => workspace.join(".claude").join("hooks"),
-        BridgeTarget::Codex => workspace.join(".codex").join("hooks"),
-        BridgeTarget::Kimetsu => workspace.join(".kimetsu").join("hooks"),
-    };
-    let ext = hook_file_extension();
-    let script = kimetsu_hook_script(mode);
-    for event in ["pre-turn", "post-turn"] {
-        let hook = hooks_root.join(format!("{event}.{ext}"));
-        write_text_file(&hook, &script, force)?;
-        files.push(normalize_path(&hook));
-    }
-    Ok(())
-}
-
-fn hook_file_extension() -> &'static str {
-    if cfg!(windows) { "ps1" } else { "sh" }
-}
-
-fn kimetsu_hook_script(mode: PluginMode) -> String {
-    let template = if cfg!(windows) {
-        KIMETSU_HOOK_PS1_TEMPLATE
+    let hooks = workspace.join(".codex").join("hooks.json");
+    let mut root = if hooks.is_file() {
+        let text =
+            fs::read_to_string(&hooks).map_err(|err| format!("read {}: {err}", hooks.display()))?;
+        serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|err| format!("parse {}: {err}", hooks.display()))?
     } else {
-        KIMETSU_HOOK_SH_TEMPLATE
+        serde_json::json!({})
     };
-    template.replace("__KIMETSU_MODE__", mode.as_str())
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must be a JSON object", hooks.display()))?;
+    let hooks_value = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} `hooks` must be a JSON object", hooks.display()))?;
+    if hooks_obj.contains_key("UserPromptSubmit") && !force {
+        return Err(format!(
+            "{} already defines UserPromptSubmit hooks; pass --force",
+            hooks.display()
+        ));
+    }
+    hooks_obj.insert(
+        "UserPromptSubmit".to_string(),
+        serde_json::json!([{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "kimetsu brain context-hook --workspace .",
+                "statusMessage": "Loading Kimetsu brain context",
+                "timeout": 30
+            }]
+        }]),
+    );
+    let text = serde_json::to_string_pretty(&root)
+        .map_err(|err| format!("serialize Codex hooks: {err}"))?;
+    write_text_file(&hooks, &text, true)?;
+    files.push(normalize_path(&hooks));
+    Ok(())
 }
 
 fn import_skill_manifest(
@@ -823,6 +560,129 @@ fn write_mcp_config(path: &Path, force: bool) -> Result<(), String> {
     insert_mcp_server(root_obj, "mcpServers", server, path)?;
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize MCP config: {err}"))?;
+    write_text_file(path, &text, true)
+}
+
+fn write_codex_config(path: &Path, force: bool) -> Result<(), String> {
+    let mut root = if path.is_file() {
+        let text =
+            fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        toml::from_str::<toml::Value>(&text)
+            .map_err(|err| format!("parse {}: {err}", path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let root_table = root
+        .as_table_mut()
+        .ok_or_else(|| format!("{} must be a TOML table", path.display()))?;
+    let servers_value = root_table
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let servers = servers_value
+        .as_table_mut()
+        .ok_or_else(|| format!("{} `mcp_servers` must be a TOML table", path.display()))?;
+    if servers.contains_key("kimetsu") && !force {
+        return Err(format!(
+            "{} already has a kimetsu MCP server; pass --force",
+            path.display()
+        ));
+    }
+
+    let mut kimetsu = toml::map::Map::new();
+    kimetsu.insert(
+        "command".to_string(),
+        toml::Value::String("kimetsu".to_string()),
+    );
+    kimetsu.insert(
+        "args".to_string(),
+        toml::Value::Array(vec![
+            toml::Value::String("mcp".to_string()),
+            toml::Value::String("serve".to_string()),
+            toml::Value::String("--workspace".to_string()),
+            toml::Value::String(".".to_string()),
+        ]),
+    );
+    servers.insert("kimetsu".to_string(), toml::Value::Table(kimetsu));
+
+    let text =
+        toml::to_string_pretty(&root).map_err(|err| format!("serialize Codex config: {err}"))?;
+    write_text_file(path, &text, true)
+}
+
+/// `.claude/CLAUDE.md` body teaching the agent to use the brain MCP tools.
+const CLAUDE_MD_CONTENT: &str = r#"# Kimetsu brain
+
+You have a persistent memory brain attached via MCP (tools prefixed `mcp__kimetsu__`).
+
+- **Before non-trivial tasks**: call `kimetsu_brain_context` with a short query. If the brain
+  has relevant prior knowledge it will return it. If not (`skipped: true`), proceed as normal —
+  this is zero overhead.
+- **After solving a non-obvious problem**: call `kimetsu_brain_record` with what you learned
+  and 2-5 domain tags. Keep lessons concrete and actionable, not platitudes.
+
+Do not call either tool on simple/one-liner tasks. The brain is for things that required real
+effort or that you would want to remember next session.
+"#;
+
+/// Write the Claude Code surface that lives under `.claude/`: the brain
+/// `CLAUDE.md` guidance and the `settings.json` hook registration.
+fn write_claude_settings(
+    workspace: &Path,
+    force: bool,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let claude_dir = workspace.join(".claude");
+    fs::create_dir_all(&claude_dir)
+        .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
+
+    // CLAUDE.md: only seed when missing so we never clobber user edits.
+    let claude_md = claude_dir.join("CLAUDE.md");
+    if !claude_md.is_file() {
+        write_text_file(&claude_md, CLAUDE_MD_CONTENT, force)?;
+    }
+    files.push(normalize_path(&claude_md));
+
+    let settings = claude_dir.join("settings.json");
+    write_claude_hooks(&settings, force)?;
+    files.push(normalize_path(&settings));
+    Ok(())
+}
+
+/// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks into `.claude/settings.json`,
+/// preserving any other settings already present.
+fn write_claude_hooks(path: &Path, force: bool) -> Result<(), String> {
+    let mut root = if path.is_file() {
+        let text =
+            fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|err| format!("parse {}: {err}", path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
+    if root_obj.contains_key("hooks") && !force {
+        return Err(format!(
+            "{} already defines hooks; pass --force",
+            path.display()
+        ));
+    }
+    root_obj.insert(
+        "hooks".to_string(),
+        serde_json::json!({
+            "UserPromptSubmit": [{
+                "matcher": "",
+                "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
+            }],
+            "Stop": [{
+                "matcher": "",
+                "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
+            }]
+        }),
+    );
+    let text = serde_json::to_string_pretty(&root)
+        .map_err(|err| format!("serialize Claude settings: {err}"))?;
     write_text_file(path, &text, true)
 }
 
@@ -990,14 +850,21 @@ mod tests {
         assert!(optional_text.contains("kimetsu_benchmark_context"));
         assert!(optional_text.contains("kimetsu_benchmark_record_outcome"));
         assert!(!optional_text.contains("kimetsu_harbor"));
-        let hook_ext = hook_file_extension();
-        let pre_turn_hook = root.join(format!(".codex/hooks/pre-turn.{hook_ext}"));
-        let post_turn_hook = root.join(format!(".codex/hooks/post-turn.{hook_ext}"));
-        assert!(pre_turn_hook.is_file());
-        assert!(post_turn_hook.is_file());
-        let optional_hook = fs::read_to_string(&pre_turn_hook).expect("optional hook");
-        assert!(optional_hook.contains("optional"));
-        assert!(optional_hook.contains("brain context"));
+        let codex_config = root.join(".codex/config.toml");
+        let config_text = fs::read_to_string(&codex_config).expect("codex config");
+        assert!(config_text.contains("[mcp_servers.kimetsu]"));
+        assert!(config_text.contains("command = \"kimetsu\""));
+
+        let hooks_path = root.join(".codex/hooks.json");
+        assert!(hooks_path.is_file());
+        let hooks_text = fs::read_to_string(&hooks_path).expect("codex hooks");
+        let hooks_json: serde_json::Value = serde_json::from_str(&hooks_text).expect("hooks json");
+        assert_eq!(
+            hooks_json["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
+            Some("kimetsu brain context-hook --workspace .")
+        );
+        assert!(!root.join(".codex/mcp.json").exists());
+        assert!(!root.join(".codex/hooks/pre-turn.ps1").exists());
 
         let required = plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, true)
             .expect("required install");
@@ -1008,13 +875,10 @@ mod tests {
         assert!(required_text.contains("kimetsu_benchmark_context"));
         assert!(required_text.contains("kimetsu_benchmark_record_outcome"));
         assert!(!required_text.contains("kimetsu_harbor"));
-        let required_hook = fs::read_to_string(&pre_turn_hook).expect("required hook");
-        assert!(required_hook.contains("required"));
-        assert!(required_hook.contains("kimetsu brain context"));
         assert!(required.files.iter().any(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("pre-turn."))
+                .map(|name| name == "hooks.json")
                 .unwrap_or(false)
         }));
 
