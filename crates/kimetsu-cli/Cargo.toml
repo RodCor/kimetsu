@@ -38,10 +38,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.7.0" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.0" }
-kimetsu-chat = { path = "../kimetsu-chat", version = "0.7.0" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.7.0" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "0.7.2" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.2" }
+kimetsu-chat = { path = "../kimetsu-chat", version = "0.7.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.7.2" }
 # v0.4.6: `kimetsu doctor` serializes its report struct so --json
 # output can be piped into CI / hooks.
 serde.workspace = true

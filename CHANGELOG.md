@@ -6,6 +6,25 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.7.2 — remove kimetsu-harbor-rs; first crates.io publish of the v0.7 line
+
+Maintenance + distribution release, layered on top of the v0.7.1 security
+hardening (path-traversal guards + URL-credential redaction).
+
+REMOVED
+  * **`kimetsu-harbor-rs`** — the Terminal-Bench JSON-RPC transport adapter
+    and its `kimetsu-harbor-agent` binary. The benchmark harness drives
+    Harbor's built-in `claude-code` agent via `--mcp-config` (since the
+    v0.5.5 refactor), so the custom transport binary was dead code. No
+    published crate depended on it (`kimetsu-cli`, `-chat`, `-agent`,
+    `-brain`, `-core` are unaffected); not a breaking change for
+    `cargo install kimetsu-cli` users.
+
+CHANGED
+  * Release workflow no longer builds or bundles `kimetsu-harbor-agent`.
+  * First crates.io publish of the v0.7 series (v0.6.0 / v0.7.0 / v0.7.1
+    shipped binaries + GitHub Releases only).
+
 ## v0.7.0 — semantic dedup, embeddings by default, session hooks
 
 The release that makes knowledge transfer reliable end-to-end:

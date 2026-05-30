@@ -74,14 +74,6 @@ jobs:
         run: |
           cargo build --release -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
 
-      - name: build kimetsu-harbor-agent
-        # `kimetsu-harbor-agent` lives in kimetsu-harbor-rs's `[[bin]]`.
-        # Always build the lean variant — the harbor binary doesn't
-        # use the embeddings feature.
-        if: matrix.flavor == 'lean'
-        run: |
-          cargo build --release -p kimetsu-harbor-rs --bin kimetsu-harbor-agent --target ${{ matrix.target }}
-
       - name: smoke-test built binary (doctor --skip-mcp)
         shell: bash
         run: |
@@ -103,14 +95,8 @@ jobs:
           mkdir -p "dist/$NAME"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/kimetsu.exe" "dist/$NAME/"
-            if [ "${{ matrix.flavor }}" = "lean" ]; then
-              cp "target/${{ matrix.target }}/release/kimetsu-harbor-agent.exe" "dist/$NAME/"
-            fi
           else
             cp "target/${{ matrix.target }}/release/kimetsu" "dist/$NAME/"
-            if [ "${{ matrix.flavor }}" = "lean" ]; then
-              cp "target/${{ matrix.target }}/release/kimetsu-harbor-agent" "dist/$NAME/"
-            fi
           fi
           cp LICENSE-MIT LICENSE-APACHE README.md "dist/$NAME/"
           cd dist
