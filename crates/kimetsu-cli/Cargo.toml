@@ -24,8 +24,10 @@ categories = ["command-line-utilities", "development-tools"]
 # Fan-out covers every kimetsu-* dep that kimetsu-cli actually
 # imports (kimetsu-harbor-rs is NOT among them — that crate's
 # binary is built separately by the release workflow).
-# v0.7.1: embeddings on by default (requires VS2022 C++ runtime — ort prebuilts).
-default = ["embeddings"]
+# v0.7.3: keep the default install lean so `cargo install kimetsu-cli`
+# works on every supported target. Embeddings remain available with
+# `--features embeddings` on targets where `ort` ships prebuilts.
+default = []
 embeddings = [
     "kimetsu-agent/embeddings",
     "kimetsu-brain/embeddings",
