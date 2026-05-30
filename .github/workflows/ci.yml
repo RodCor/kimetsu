@@ -76,23 +76,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-test-${{ matrix.os }}
-      # Library crates default to the lean (FTS-only) feature set, so the
-      # workspace test build does not pull the ONNX runtime. This keeps
-      # the gate fast and dependency-light; the embeddings flavor is
-      # built + smoke-tested in release.yml.
+      # `cargo test --workspace` feature-unifies the whole graph: a
+      # consumer crate (kimetsu-cli) enables `kimetsu-brain/embeddings`,
+      # so kimetsu-brain -- and its own test binary -- is built WITH the
+      # ONNX/fastembed flavor, not the lean default. Tests must therefore
+      # be embedder-agnostic; they are. (The lean FTS-only flavor is built
+      # + smoke-tested separately in release.yml.)
       #
-      # The brain suite touches the per-user GlobalUser brain at
-      # ~/.kimetsu and takes a writer lock on ~/.kimetsu/project.lock.
-      # Cargo runs each crate's test binary in parallel, so two binaries
-      # doing a GlobalUser op contend on that one shared lock and panic
-      # ("project writer lock is already held"). Overriding $HOME does NOT
-      # help on Linux — the home crate resolves the home dir via getpwuid
-      # (/etc/passwd), ignoring $HOME. The robust, platform-independent fix
-      # is to disable the user brain for the test run (KIMETSU_USER_BRAIN=0,
-      # the same toggle the per-test `with_user_brain_disabled` helper sets);
-      # every test then uses only its own unique per-test project root, so
-      # there is no shared lock to contend on. --test-threads=1 is
-      # belt-and-suspenders against intra-binary ordering assumptions.
+      # KIMETSU_USER_BRAIN=0 keeps the suite hermetic: brain tests never
+      # touch the runner's real ~/.kimetsu. --test-threads=1 keeps the
+      # run deterministic (no cross-test races on shared on-disk state).
       - name: cargo test
         shell: bash
         env:
