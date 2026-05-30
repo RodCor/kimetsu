@@ -2871,27 +2871,32 @@ mod tests {
         fs::remove_dir_all(root).expect("remove temp project");
     }
 
-    /// v0.5.2: end-to-end regression for the lean (NoopEmbedder)
-    /// build. `add_memory` must NOT write any rows to
-    /// `memory_conflicts` when the embedder is a no-op, and the
-    /// `list_conflicts` / `resolve_conflict` wrappers must return
-    /// the empty/false answer rather than panicking on a missing
-    /// table or a malformed query.
+    /// End-to-end regression for the add -> list_conflicts ->
+    /// resolve_conflict plumbing. It must be AGNOSTIC to which
+    /// embedder backs the build: `cargo test --workspace`
+    /// feature-unifies `embeddings` into this crate (kimetsu-cli
+    /// enables `kimetsu-brain/embeddings`), so
+    /// `open_default_embedder()` returns the real fastembed model
+    /// here, not the noop. The two memories below are therefore on
+    /// unrelated topics: cosine stays well under the 0.82 conflict
+    /// threshold for any real embedder, and the noop build trivially
+    /// records zero -- so `list_conflicts` is deterministically empty
+    /// either way.
     ///
-    /// Real semantic-conflict detection is exercised exhaustively
-    /// in `crate::conflict::tests` with a StubEmbedder; this test
-    /// guards the project-level plumbing only.
+    /// Real near-duplicate semantic detection is exercised
+    /// exhaustively in `crate::conflict::tests` with a StubEmbedder;
+    /// this test guards the project-level plumbing only.
     #[test]
-    fn add_memory_under_noop_embedder_writes_no_conflicts() {
+    fn add_memory_distinct_texts_no_conflicts() {
         with_user_brain_disabled(|| {
             let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
 
-            // Two near-duplicate memories. Under NoopEmbedder no
-            // conflict is detected; the two rows simply both exist
-            // (and don't collide via the dedup gate because their
-            // normalized texts differ).
+            // Two memories on unrelated topics: neither the noop nor
+            // a real embedder flags them as conflicting (cosine well
+            // under the 0.82 threshold), and they don't collide via
+            // the exact-text dedup gate, so both rows simply coexist.
             let _m1 = add_memory(
                 &root,
                 MemoryScope::GlobalUser,
@@ -2903,14 +2908,14 @@ mod tests {
                 &root,
                 MemoryScope::GlobalUser,
                 MemoryKind::Preference,
-                "Prefer anyhow for library error types.",
+                "Cache HTTP responses with a one-hour TTL.",
             )
             .expect("add m2");
 
             let open = list_conflicts(&root, 50).expect("list_conflicts");
             assert!(
                 open.is_empty(),
-                "noop embedder must not generate conflicts; got {} rows",
+                "distinct-topic memories must not conflict; got {} rows",
                 open.len()
             );
 

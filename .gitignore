@@ -38,3 +38,8 @@
 # kimetsu repo. See github.com/RodCor/kimetsu-bench (private).
 /bench/
 .claude/*.lock
+# fastembed model cache created by tests/runs
+.fastembed_cache/
+**/.fastembed_cache/
+.claude/
+.codex/

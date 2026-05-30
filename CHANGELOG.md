@@ -371,7 +371,7 @@ TESTS (12 new in brain — 10 conflict module + 1 project integration + 1 wrappe
     detect_and_record_noop_writes_nothing
     resolve_conflict_rejects_invalid_resolution_strings
   project::tests (1)
-    add_memory_under_noop_embedder_writes_no_conflicts
+    add_memory_distinct_texts_no_conflicts
       End-to-end regression: NoopEmbedder path produces zero
       conflicts, exercises list_conflicts + resolve_conflict
       wrappers (unknown id returns false, invalid resolution
