@@ -9,13 +9,14 @@
 # user. Manual `cargo publish` to crates.io is a follow-up step
 # (we don't auto-publish from CI to keep approvals explicit).
 #
-# Two artifact sets per platform:
+# Artifact flavors:
 #   * `kimetsu-<version>-<target>-lean` — built with
 #     `--no-default-features`: NoopEmbedder + FTS-only retrieval.
 #     Smallest binary, no model download on install.
-#   * `kimetsu-<version>-<target>-embeddings` — default build.
+#   * `kimetsu-<version>-<target>-embeddings` — opt-in semantic build.
 #     Larger binary; fastembed-rs + ONNX runtime linked statically
-#     when possible.
+#     when possible. Not built for x86_64-apple-darwin because `ort`
+#     does not publish a prebuilt ONNX Runtime for that target.
 
 name: release
 
@@ -42,16 +43,15 @@ jobs:
         include:
           # Linux
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: "--no-default-features" }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings" }
           # macOS Intel
           - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features" }
-          - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: embeddings, extra_features: "" }
           # macOS Apple Silicon
           - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features" }
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "" }
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings" }
           # Windows
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: "--no-default-features" }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings" }
     steps:
       - uses: actions/checkout@v4
 
@@ -255,8 +255,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli" >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli --no-default-features  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli --features embeddings  # semantic build where ort supports the target" >> $GITHUB_STEP_SUMMARY
           echo "kimetsu update --check" >> $GITHUB_STEP_SUMMARY
           echo "kimetsu uninstall --dry-run" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

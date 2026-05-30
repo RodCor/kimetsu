@@ -81,22 +81,24 @@ detection? See **[docs/HOW-KIMETSU-WORKS.md](docs/HOW-KIMETSU-WORKS.md)**.
 Kimetsu is a single Rust binary. Pick your flavor:
 
 ```bash
-# Default — semantic search enabled (fastembed + ONNX; first run downloads BGE-small)
+# Default lean build — fast lexical (FTS) retrieval, no model download
 cargo install kimetsu-cli
 
-# Lean — fast lexical (FTS) retrieval, no model download
-cargo install kimetsu-cli --no-default-features
+# Semantic build — fastembed + ONNX; first run downloads BGE-small
+cargo install kimetsu-cli --features embeddings
 
 # From source
-cargo install --path crates/kimetsu-cli   # add --no-default-features for lean
+cargo install --path crates/kimetsu-cli   # add --features embeddings for semantic search
 ```
 
 Prefer not to touch the Rust toolchain? Pre-built binaries for
 **Linux / macOS / Windows** ship on every
 [GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put
 `kimetsu` / `kimetsu.exe` somewhere on `PATH` (`~/.local/bin`, `/usr/local/bin`,
-or `%USERPROFILE%\.cargo\bin`). macOS prebuilt archives are published for both
-Intel and Apple Silicon.
+or `%USERPROFILE%\.cargo\bin`). Lean archives are published for Linux,
+macOS Intel, macOS Apple Silicon, and Windows. Embeddings archives are
+published where ONNX Runtime prebuilts are available: Linux x86_64,
+macOS Apple Silicon, and Windows x86_64.
 
 Confirm it's healthy:
 

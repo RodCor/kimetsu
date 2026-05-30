@@ -671,11 +671,26 @@ fn select_asset<'a>(
 }
 
 fn default_flavor() -> &'static str {
-    if cfg!(feature = "embeddings") {
+    default_flavor_for(
+        env::consts::OS,
+        env::consts::ARCH,
+        cfg!(feature = "embeddings"),
+    )
+}
+
+fn default_flavor_for(os: &str, arch: &str, embeddings_enabled: bool) -> &'static str {
+    if embeddings_enabled && embeddings_assets_supported(os, arch) {
         "embeddings"
     } else {
         "lean"
     }
+}
+
+fn embeddings_assets_supported(os: &str, arch: &str) -> bool {
+    matches!(
+        (os, arch),
+        ("linux", "x86_64") | ("macos", "aarch64") | ("windows", "x86_64")
+    )
 }
 
 fn release_target() -> Option<&'static str> {
@@ -751,5 +766,16 @@ mod tests {
             asset.name,
             "kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip"
         );
+    }
+
+    #[test]
+    fn auto_flavor_falls_back_to_lean_for_intel_macos() {
+        assert_eq!(
+            default_flavor_for("macos", "x86_64", true),
+            "lean",
+            "the release workflow does not publish x86_64 macOS embeddings assets"
+        );
+        assert_eq!(default_flavor_for("macos", "aarch64", true), "embeddings");
+        assert_eq!(default_flavor_for("linux", "x86_64", false), "lean");
     }
 }
