@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn encode_decode_embedding_round_trip() {
-        let vec = vec![0.1f32, -0.2, 3.14, -0.000_001, 42.0];
+        let vec = vec![0.1f32, -0.2, 3.125, -0.000_001, 42.0];
         let blob = encode_embedding(&vec);
         assert_eq!(blob.len(), vec.len() * 4);
         let back = decode_embedding(&blob, Some(vec.len())).expect("decode");

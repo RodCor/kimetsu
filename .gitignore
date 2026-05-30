@@ -41,3 +41,5 @@
 # fastembed model cache created by tests/runs
 .fastembed_cache/
 **/.fastembed_cache/
+.claude/
+.codex/

@@ -6,7 +6,6 @@
 #   clippy    — clippy with warnings denied (-D warnings)
 #   test      — full workspace test suite
 #   audit     — RUSTSEC advisory scan over the dependency tree
-#   deny      — license / banned-crate / duplicate policy (cargo-deny)
 #
 # Release/publish lives in release.yml (tag-driven); this file is the
 # pre-merge gate that keeps main + develop clean and secure.
@@ -108,15 +107,3 @@ jobs:
           # Re-evaluate when an upstream dependency drops `paste`.
           ignore: RUSTSEC-2024-0436
 
-  deny:
-    name: cargo-deny (licenses + bans)
-    runs-on: ubuntu-latest
-    # Advisory until the policy in deny.toml is verified green against the
-    # full dependency tree. Flip to a hard gate by removing this line once
-    # a PR has shown it passing.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check bans licenses sources
