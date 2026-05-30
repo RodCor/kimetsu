@@ -81,21 +81,22 @@ detection? See **[docs/HOW-KIMETSU-WORKS.md](docs/HOW-KIMETSU-WORKS.md)**.
 Kimetsu is a single Rust binary. Pick your flavor:
 
 ```bash
-# Lean — fast lexical (FTS) retrieval, no model download (~30s build)
+# Default — semantic search enabled (fastembed + ONNX; first run downloads BGE-small)
 cargo install kimetsu-cli
 
-# With local semantic search — pulls fastembed + ONNX, first run
-# downloads BGE-small (~67 MB). Cosine retrieval + conflict detection light up.
-cargo install kimetsu-cli --features embeddings
+# Lean — fast lexical (FTS) retrieval, no model download
+cargo install kimetsu-cli --no-default-features
 
 # From source
-cargo install --path crates/kimetsu-cli   # add --features embeddings if you like
+cargo install --path crates/kimetsu-cli   # add --no-default-features for lean
 ```
 
 Prefer not to touch the Rust toolchain? Pre-built binaries for
 **Linux / macOS / Windows** ship on every
-[GitHub Release](https://github.com/RodCor/kimetsu/releases) — drop one in
-`~/.local/bin`.
+[GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put
+`kimetsu` / `kimetsu.exe` somewhere on `PATH` (`~/.local/bin`, `/usr/local/bin`,
+or `%USERPROFILE%\.cargo\bin`). macOS prebuilt archives are published for both
+Intel and Apple Silicon.
 
 Confirm it's healthy:
 
@@ -103,6 +104,23 @@ Confirm it's healthy:
 kimetsu --version
 kimetsu doctor      # checks paths, brain.db, embedder, MCP, bridge
 ```
+
+Check for updates:
+
+```bash
+kimetsu update --check
+kimetsu update          # updates discovered kimetsu binaries on PATH/current install
+kimetsu uninstall --dry-run
+kimetsu uninstall --yes # removes discovered kimetsu binaries
+```
+
+`kimetsu update` downloads the matching GitHub Release archive for your
+platform and flavor, then updates the current executable plus verified
+`kimetsu` copies in known install locations such as Cargo bin, `~/.local/bin`,
+`/usr/local/bin`, or `%USERPROFILE%\.cargo\bin`. It does not scan the whole
+disk. `kimetsu uninstall` removes those same verified binaries; it leaves
+project `.kimetsu/` directories and the user brain intact unless you explicitly
+pass `--delete-user-data`.
 
 **Prerequisites:** Rust 1.85+ (stable) and a Claude or OpenAI credential
 (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). That's it for chat — Docker,
@@ -154,8 +172,7 @@ kimetsu brain memory top          # most useful memories so far
 | **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as ~18 tools. |
 
 Built as a small Rust workspace (`kimetsu-cli`, `-chat`, `-agent`, `-brain`,
-`-core`, plus a benchmark-only Harbor adapter). Lint + tests run clean on every
-change.
+and `-core`). Lint + tests run clean on every change.
 
 ---
 
@@ -171,6 +188,5 @@ change.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) — your
-choice. The same dual license used across the Rust ecosystem (tokio, serde,
-fastembed-rs).
+Dual-licensed under [MIT](docs/LICENSE-MIT) or [Apache-2.0](docs/LICENSE-APACHE) — your
+choice.

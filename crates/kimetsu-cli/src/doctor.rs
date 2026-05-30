@@ -385,7 +385,7 @@ fn check_embedder_default() -> CheckReport {
                 name: "default embedder loads",
                 category: "retrieval",
                 outcome: Outcome::Warn {
-                    reason: "no `embeddings` feature — semantic retrieval off. Reinstall with `cargo install kimetsu-cli --features embeddings` for cosine blend.".into(),
+                    reason: "no `embeddings` feature - semantic retrieval off. Reinstall with `cargo install kimetsu-cli` for the default semantic build.".into(),
                 },
                 detail: Some("NoopEmbedder (FTS-only retrieval)".into()),
             }
@@ -428,42 +428,48 @@ fn check_mcp_tools_advertised(_workspace: &Path, skip: bool) -> CheckReport {
 }
 
 fn check_hooks_installed(workspace: &Path) -> CheckReport {
-    // Soft check: see whether `.claude/hooks/pre-turn*` or
-    // `.codex/hooks/pre-turn*` is present. If neither is, suggest
-    // `kimetsu plugin install`. Not having hooks isn't a failure —
-    // most users will run the chat REPL directly, not call
-    // kimetsu_brain_context through Claude Code's pre-turn hook.
-    let candidates = [
-        ".claude/hooks/pre-turn.sh",
-        ".claude/hooks/pre-turn.ps1",
-        ".codex/hooks/pre-turn.sh",
-        ".codex/hooks/pre-turn.ps1",
-        ".kimetsu/hooks/pre-turn.sh",
-        ".kimetsu/hooks/pre-turn.ps1",
-    ];
     let mut found = Vec::new();
-    for rel in candidates {
-        if workspace.join(rel).exists() {
-            found.push(rel);
-        }
+
+    let claude_settings = workspace.join(".claude").join("settings.json");
+    if file_contains_all(
+        &claude_settings,
+        &["UserPromptSubmit", "kimetsu brain context-hook"],
+    ) {
+        found.push(".claude/settings.json");
     }
+
+    let codex_hooks = workspace.join(".codex").join("hooks.json");
+    if file_contains_all(
+        &codex_hooks,
+        &["UserPromptSubmit", "kimetsu brain context-hook"],
+    ) {
+        found.push(".codex/hooks.json");
+    }
+
     if found.is_empty() {
         CheckReport {
-            name: "pre-turn hook installed",
+            name: "host brain hook installed",
             category: "plugin",
             outcome: Outcome::Skip {
-                reason: "no .claude/.codex/.kimetsu hooks — run `kimetsu plugin install claude` (or codex) to enable pre-turn brain injection".into(),
+                reason: "no Claude/Codex brain hook config found - run `kimetsu plugin install claude` or `kimetsu plugin install codex` to enable prompt-time brain injection".into(),
             },
             detail: None,
         }
     } else {
         CheckReport {
-            name: "pre-turn hook installed",
+            name: "host brain hook installed",
             category: "plugin",
             outcome: Outcome::Pass,
             detail: Some(format!("{} hook(s): {}", found.len(), found.join(", "))),
         }
     }
+}
+
+fn file_contains_all(path: &Path, needles: &[&str]) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    needles.iter().all(|needle| text.contains(needle))
 }
 
 fn embeddings_feature_enabled() -> bool {
@@ -572,5 +578,63 @@ mod tests {
         assert_ne!(warn, fail);
         assert_ne!(warn, skip);
         assert_ne!(fail, skip);
+    }
+
+    #[test]
+    fn doctor_detects_current_codex_hooks_json() {
+        let tmp = tempdir_in_test("kimetsu-doctor-codex-hooks");
+        let codex_dir = tmp.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("mkdir");
+        std::fs::write(
+            codex_dir.join("hooks.json"),
+            r#"{
+              "hooks": {
+                "UserPromptSubmit": [{
+                  "hooks": [{
+                    "type": "command",
+                    "command": "kimetsu brain context-hook --workspace ."
+                  }]
+                }]
+              }
+            }"#,
+        )
+        .expect("write hooks");
+
+        let report = check_hooks_installed(&tmp);
+        assert!(matches!(report.outcome, Outcome::Pass), "{report:?}");
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains(".codex/hooks.json")
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn doctor_rejects_legacy_pre_turn_scripts() {
+        let tmp = tempdir_in_test("kimetsu-doctor-legacy-hooks");
+        let legacy_dir = tmp.join(".codex").join("hooks");
+        std::fs::create_dir_all(&legacy_dir).expect("mkdir");
+        std::fs::write(
+            legacy_dir.join("pre-turn.ps1"),
+            "kimetsu brain context-hook --workspace .",
+        )
+        .expect("write legacy hook");
+
+        let report = check_hooks_installed(&tmp);
+        assert!(matches!(report.outcome, Outcome::Skip { .. }), "{report:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    fn tempdir_in_test(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        tmp
     }
 }

@@ -1,9 +1,8 @@
 # v0.4.7: tag-driven release pipeline.
 #
-# Push a `v0.4.x` tag and this workflow builds release binaries
-# for Linux (x86_64), macOS (x86_64 + arm64), and Windows
-# (x86_64), then uploads them as assets on the corresponding
-# GitHub Release.
+# Push a `vX.Y.Z` tag and this workflow builds release binaries
+# for Linux (x86_64), macOS (x86_64 + arm64), and Windows (x86_64),
+# then uploads them as assets on the corresponding GitHub Release.
 #
 # The pipeline runs `kimetsu doctor --skip-mcp` on every artifact
 # before uploading — so a broken build fails the release, not the
@@ -11,12 +10,12 @@
 # (we don't auto-publish from CI to keep approvals explicit).
 #
 # Two artifact sets per platform:
-#   * `kimetsu-<version>-<target>-lean`     — default Cargo build,
-#     NoopEmbedder + FTS-only retrieval. Smallest binary, no model
-#     download on install.
-#   * `kimetsu-<version>-<target>-embeddings` — built with
-#     `--features embeddings`. Larger binary; fastembed-rs +
-#     ONNX runtime linked statically when possible.
+#   * `kimetsu-<version>-<target>-lean` — built with
+#     `--no-default-features`: NoopEmbedder + FTS-only retrieval.
+#     Smallest binary, no model download on install.
+#   * `kimetsu-<version>-<target>-embeddings` — default build.
+#     Larger binary; fastembed-rs + ONNX runtime linked statically
+#     when possible.
 
 name: release
 
@@ -42,21 +41,17 @@ jobs:
       matrix:
         include:
           # Linux
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: ""               }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: "--no-default-features" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "" }
+          # macOS Intel
+          - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features" }
+          - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: embeddings, extra_features: "" }
           # macOS Apple Silicon
-          #
-          # v0.4.11: x86_64-apple-darwin (macos-13) runners were
-          # dropped from the matrix. As of late 2026 those runners
-          # are deprecated + under-provisioned on GitHub's free
-          # tier and the jobs queue indefinitely. Apple Silicon
-          # is the dominant Mac architecture now; users on Intel
-          # Macs can `cargo install kimetsu-cli` from source.
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: ""               }
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings" }
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features" }
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "" }
           # Windows
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: ""               }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: "--no-default-features" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "" }
     steps:
       - uses: actions/checkout@v4
 
@@ -72,10 +67,12 @@ jobs:
 
       - name: build kimetsu-cli
         run: |
-          cargo build --release -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
+          cargo build --release --locked -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
 
       - name: smoke-test built binary (doctor --skip-mcp)
         shell: bash
+        env:
+          KIMETSU_USER_BRAIN: "0"
         run: |
           if [ "${{ matrix.flavor }}" = "lean" ]; then
             BINARY="target/${{ matrix.target }}/release/kimetsu"
@@ -85,7 +82,7 @@ jobs:
           [ "${{ runner.os }}" = "Windows" ] && BINARY="${BINARY}.exe"
           "$BINARY" --version
           # doctor expects a workspace; the cloned repo is one.
-          "$BINARY" doctor --skip-mcp --workspace . || true
+          "$BINARY" doctor --skip-mcp --workspace .
 
       - name: package archive
         shell: bash
@@ -98,7 +95,11 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/kimetsu" "dist/$NAME/"
           fi
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$NAME/"
+          MIT_LICENSE="LICENSE-MIT"
+          APACHE_LICENSE="LICENSE-APACHE"
+          [ -f "$MIT_LICENSE" ] || MIT_LICENSE="docs/LICENSE-MIT"
+          [ -f "$APACHE_LICENSE" ] || APACHE_LICENSE="docs/LICENSE-APACHE"
+          cp "$MIT_LICENSE" "$APACHE_LICENSE" README.md "dist/$NAME/"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path $NAME -DestinationPath $NAME.zip"
@@ -164,22 +165,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-crates:
-    # v0.4.9: serial cargo publish to crates.io after the binary
+    # Serial cargo publish to crates.io after the binary
     # matrix + GH Release succeed. Gated on:
     #   (a) tag push (handled by `if`)
     #   (b) the `release` job succeeding (handled by `needs`)
     #   (c) CARGO_REGISTRY_TOKEN secret being set on the repo
-    #
-    # v0.4.10: kimetsu-harbor-rs is intentionally NOT published.
-    # It's marked `publish = false` in its Cargo.toml because:
-    #   * `kimetsu-cli` (the user-facing binary that powers
-    #     `cargo install kimetsu-cli`) doesn't depend on it.
-    #   * It's a Terminal-Bench operator tool, still iterating
-    #     internally; publishing implies backward-compat we don't
-    #     want to commit to yet.
-    # The `kimetsu-harbor-agent` binary still ships in every
-    # GH Release archive (built by the lean matrix above), so
-    # benchmark users can grab it from there.
     #
     # Crate publish order matches the user-facing dep DAG:
     #   kimetsu-core   (no kimetsu deps)
@@ -266,5 +256,7 @@ jobs:
           echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "cargo install kimetsu-cli" >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli --features embeddings" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli --no-default-features  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "kimetsu update --check" >> $GITHUB_STEP_SUMMARY
+          echo "kimetsu uninstall --dry-run" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
