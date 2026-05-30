@@ -297,6 +297,41 @@ impl SkillRegistry {
         }
     }
 
+    /// Like [`resolve_or_manifest`], but rejects resolutions whose skill root
+    /// lives outside the workspace and all configured skill roots.
+    ///
+    /// Used by the bridge import/export paths, whose `selection` arrives from
+    /// untrusted MCP input. The raw-path branches of `resolve_or_manifest`
+    /// accept any existing filesystem path, so without this guard a
+    /// prompt-injected agent could point `selection` at an arbitrary host
+    /// directory that happens to contain a `SKILL.md` (e.g. `~/secrets`) and
+    /// have its entire tree — including adjacent secret files — copied into the
+    /// workspace, where it becomes agent-readable. Legitimate skills are
+    /// discovered under configured roots and resolve by name, so they are
+    /// unaffected.
+    pub fn resolve_or_manifest_contained(&self, selection: &str) -> Result<SkillManifest, String> {
+        let manifest = self.resolve_or_manifest(selection)?;
+        if self.root_is_allowed(&manifest.root) {
+            Ok(manifest)
+        } else {
+            Err(format!(
+                "skill `{selection}` resolves to `{}`, which is outside the workspace and configured skill roots",
+                manifest.root.display()
+            ))
+        }
+    }
+
+    fn root_is_allowed(&self, candidate: &Path) -> bool {
+        let candidate = normalize_path(candidate);
+        if candidate.starts_with(&self.workspace) {
+            return true;
+        }
+        self.roots
+            .iter()
+            .filter(|root| root.exists)
+            .any(|root| candidate.starts_with(normalize_path(&root.path)))
+    }
+
     pub fn install_as_kimetsu(
         &self,
         selection: &str,
@@ -1434,6 +1469,49 @@ mod tests {
             .expect("resolve installed preference");
         assert_eq!(resolved.source, SkillSource::Kimetsu);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolve_contained_rejects_paths_outside_workspace_and_roots() {
+        let root = temp_root("skill_contained");
+        // A legitimate in-workspace skill (resolvable by name and by path).
+        let inside = root.join(".codex/skills/helper");
+        fs::create_dir_all(&inside).expect("inside dir");
+        fs::write(
+            inside.join("SKILL.md"),
+            "---\nname: helper\ndescription: In-workspace skill.\n---\n# Helper",
+        )
+        .expect("write inside skill");
+
+        // An attacker-pointed directory OUTSIDE the workspace that happens to
+        // contain a SKILL.md alongside a "secret" file.
+        let outside = temp_root("skill_contained_outside");
+        fs::write(outside.join("secret.txt"), "sk-ant-api03-SECRET").expect("write secret");
+        fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: evil\ndescription: Outside the workspace.\n---\n# Evil",
+        )
+        .expect("write outside skill");
+
+        let registry = SkillRegistry::discover(&root, &SkillConfig::default()).expect("discover");
+
+        // In-workspace skill resolves fine by name under the contained path.
+        assert!(registry.resolve_or_manifest_contained("helper").is_ok());
+
+        let outside_selection = outside.to_string_lossy().to_string();
+        // The un-guarded resolver accepts the arbitrary outside path...
+        assert!(registry.resolve_or_manifest(&outside_selection).is_ok());
+        // ...but the contained resolver used by the bridge import/export rejects it.
+        let err = registry
+            .resolve_or_manifest_contained(&outside_selection)
+            .expect_err("outside path must be rejected");
+        assert!(
+            err.contains("outside the workspace"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 
     fn temp_root(label: &str) -> PathBuf {

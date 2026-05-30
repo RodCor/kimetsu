@@ -204,6 +204,17 @@ fn patterns() -> &'static [SecretPattern] {
             // Google-style API keys: AIza + 35 char tail.
             regex: Regex::new(r"AIza[0-9A-Za-z_-]{35}").unwrap(),
         });
+        out.push(SecretPattern {
+            kind: "url_credentials",
+            // Credentials embedded in a connection-string URI:
+            // `scheme://user:password@host`. Common in env dumps and
+            // `.env` snippets (DATABASE_URL=postgres://u:p@host, redis://,
+            // amqp://, mongodb://, ...). The generic `password=` rule does
+            // NOT match this shape, so without it the password lands in
+            // brain.db in cleartext. Redact the `scheme://user:pass@` run;
+            // the host stays readable.
+            regex: Regex::new(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s:/@]{4,}@").unwrap(),
+        });
         // Generic-assignment patterns. Lower-priority than the
         // shape-specific ones above; ordered after them so e.g.
         // `api_key=sk-...` claims the openai_api_key kind, not the
@@ -270,6 +281,26 @@ mod tests {
         assert!(kinds.contains(&"anthropic_oauth"));
         assert!(r.text.contains("[REDACTED:openai_api_key]"));
         assert!(r.text.contains("[REDACTED:anthropic_oauth]"));
+    }
+
+    #[test]
+    fn url_embedded_credentials_are_redacted() {
+        let raw = "DATABASE_URL=postgres://admin:S3cr3tP4ssw0rd@db.internal:5432/prod";
+        let r = redact_secrets(raw);
+        assert!(r.was_redacted(), "{:?}", r);
+        assert!(r.text.contains("[REDACTED:url_credentials]"));
+        assert!(!r.text.contains("S3cr3tP4ssw0rd"));
+        // Host stays readable; only the credentials run is wiped.
+        assert!(r.text.contains("db.internal:5432/prod"));
+
+        // Other common schemes are covered too.
+        let redis = redact_secrets("redis://default:An0therSecret123@cache:6379");
+        assert!(redis.text.contains("[REDACTED:url_credentials]"));
+        assert!(!redis.text.contains("An0therSecret123"));
+
+        // A URL without credentials must NOT be redacted.
+        let clean = redact_secrets("see https://example.com/path?x=1 for docs");
+        assert!(!clean.was_redacted(), "{:?}", clean);
     }
 
     #[test]
