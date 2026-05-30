@@ -1135,12 +1135,8 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
                 } else {
                     (args.query.clone(), None)
                 };
-            let bundle = project::retrieve_context(
-                &cwd,
-                &args.stage,
-                &effective_query,
-                args.budget_tokens,
-            )?;
+            let bundle =
+                project::retrieve_context(&cwd, &args.stage, &effective_query, args.budget_tokens)?;
             if args.json {
                 println!(
                     "{}",
@@ -1243,8 +1239,16 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
             println!("  {}: skipped (scope filter or DB unavailable)", sub.scope);
             continue;
         }
-        let action = if args.dry_run { "candidates" } else { "updated" };
-        let count = if args.dry_run { sub.candidates } else { sub.updated };
+        let action = if args.dry_run {
+            "candidates"
+        } else {
+            "updated"
+        };
+        let count = if args.dry_run {
+            sub.candidates
+        } else {
+            sub.updated
+        };
         println!(
             "  {}: total={} {}={} failed={}",
             sub.scope, sub.total, action, count, sub.failed
@@ -1272,19 +1276,38 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
     let memories = project::list_memories(&cwd)?;
     let proposals = project::list_proposals(
         &cwd,
-        project::ProposalFilter { status: Some("pending".to_string()), limit: 200, ..Default::default() },
+        project::ProposalFilter {
+            status: Some("pending".to_string()),
+            limit: 200,
+            ..Default::default()
+        },
     )?;
     let conflicts = project::list_conflicts(&cwd, 200)?;
 
-    let healthy: Vec<_> = memories.iter().filter(|m| m.usefulness_score >= 0.2).collect();
-    let fading: Vec<_> = memories.iter().filter(|m| m.usefulness_score >= 0.0 && m.usefulness_score < 0.2).collect();
-    let stale: Vec<_> = memories.iter().filter(|m| m.usefulness_score < 0.0).collect();
+    let healthy: Vec<_> = memories
+        .iter()
+        .filter(|m| m.usefulness_score >= 0.2)
+        .collect();
+    let fading: Vec<_> = memories
+        .iter()
+        .filter(|m| m.usefulness_score >= 0.0 && m.usefulness_score < 0.2)
+        .collect();
+    let stale: Vec<_> = memories
+        .iter()
+        .filter(|m| m.usefulness_score < 0.0)
+        .collect();
 
     // Domain grouping: extract first [tags: ...] prefix from text
     let mut domain_counts: std::collections::BTreeMap<String, usize> = Default::default();
     for m in &memories {
         let domain = if let Some(rest) = m.text.strip_prefix("[tags: ") {
-            rest.split(']').next().unwrap_or("other").split_whitespace().next().unwrap_or("other").to_string()
+            rest.split(']')
+                .next()
+                .unwrap_or("other")
+                .split_whitespace()
+                .next()
+                .unwrap_or("other")
+                .to_string()
         } else {
             m.kind.clone()
         };
@@ -1292,27 +1315,41 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
     }
     let mut domain_list: Vec<(String, usize)> = domain_counts.into_iter().collect();
     domain_list.sort_by(|a, b| b.1.cmp(&a.1));
-    let top_domains: Vec<String> = domain_list.iter().take(6).map(|(d, n)| format!("{} ({})", d, n)).collect();
+    let top_domains: Vec<String> = domain_list
+        .iter()
+        .take(6)
+        .map(|(d, n)| format!("{} ({})", d, n))
+        .collect();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "memories": memories.len(),
-            "pending_proposals": proposals.len(),
-            "open_conflicts": conflicts.len(),
-            "healthy": healthy.len(),
-            "fading": fading.len(),
-            "stale": stale.len(),
-            "top_domains": top_domains,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "memories": memories.len(),
+                "pending_proposals": proposals.len(),
+                "open_conflicts": conflicts.len(),
+                "healthy": healthy.len(),
+                "fading": fading.len(),
+                "stale": stale.len(),
+                "top_domains": top_domains,
+            }))?
+        );
     } else {
-        println!("brain: {} memories active, {} pending proposals, {} conflicts",
-            memories.len(), proposals.len(), conflicts.len());
+        println!(
+            "brain: {} memories active, {} pending proposals, {} conflicts",
+            memories.len(),
+            proposals.len(),
+            conflicts.len()
+        );
         if !top_domains.is_empty() {
             println!("domains: {}", top_domains.join(", "));
         }
         println!("health:  {} healthy (usefulness >= 0.2)", healthy.len());
         println!("         {} fading  (0 <= usefulness < 0.2)", fading.len());
-        println!("         {} stale   (usefulness < 0, candidate for prune)", stale.len());
+        println!(
+            "         {} stale   (usefulness < 0, candidate for prune)",
+            stale.len()
+        );
         if stale.len() > 3 {
             println!("hint: run `kimetsu brain memory prune` to clean stale entries");
         }
@@ -1324,10 +1361,11 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
 /// Reads `{"prompt":"..."}` JSON from stdin, retrieves relevant capsules,
 /// prints them to stdout for injection. Silent (exit 0) when brain has nothing.
 fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
-    use std::io::Read;
     use kimetsu_brain::context::ContextRequest;
+    use std::io::Read;
 
-    let workspace = args.workspace
+    let workspace = args
+        .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
 
     // Read hook JSON from stdin
@@ -1373,7 +1411,8 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     println!("[Kimetsu brain] Relevant knowledge for this task:");
     for capsule in &bundle.capsules {
         // Strip the "scope:kind - " prefix from the summary for readability
-        let text = capsule.summary
+        let text = capsule
+            .summary
             .splitn(3, " - ")
             .nth(1)
             .unwrap_or(&capsule.summary);
@@ -1639,7 +1678,10 @@ fn memory_blame(args: BlameArgs) -> KimetsuResult<()> {
     }
 
     if !report.cited.is_empty() {
-        println!("\n  cited memories ({} total) — earned strong ±1.0 signal:", report.cited.len());
+        println!(
+            "\n  cited memories ({} total) — earned strong ±1.0 signal:",
+            report.cited.len()
+        );
         for c in &report.cited {
             let rationale = c
                 .rationale

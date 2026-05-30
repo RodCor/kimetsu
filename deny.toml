@@ -1,0 +1,41 @@
+# cargo-deny policy for the kimetsu workspace.
+# Run locally with: cargo install cargo-deny && cargo deny check
+#
+# Scope of the CI `deny` job: bans, licenses, sources. Advisories are
+# handled by the dedicated cargo-audit (RUSTSEC) job in ci.yml.
+
+[graph]
+all-features = true
+
+[licenses]
+# Allow the standard permissive set used across the Rust ecosystem. The
+# workspace itself is "MIT OR Apache-2.0". Add to this list (with a note)
+# if a new dependency introduces another OSI/FSF-approved license.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate transitive versions are common in large trees; surface them
+# without failing the build.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io and the git deps we explicitly vet are allowed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

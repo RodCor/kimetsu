@@ -12,9 +12,9 @@
 //! tests every wire from agent → harness → projector → memory row.
 
 use kimetsu_brain::projector;
+use kimetsu_brain::user_brain::with_user_brain_disabled;
 use kimetsu_core::event::Event;
 use kimetsu_e2e::prelude::*;
-use kimetsu_brain::user_brain::with_user_brain_disabled;
 
 #[test]
 fn cite_memory_tool_call_lands_in_report_context_with_turn_index() {

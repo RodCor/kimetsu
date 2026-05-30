@@ -51,21 +51,19 @@ fn list_and_resolve_conflict_wrappers_compose_against_a_real_project() {
             existing_text: "Prefer thiserror for library error types.".to_string(),
             similarity: 0.92,
         };
-        let conflict_id = conflict::record_conflict(
-            &conn,
-            &new_id,
-            &MemoryScope::Repo,
-            "preference",
-            &hit,
-        )
-        .expect("record conflict");
+        let conflict_id =
+            conflict::record_conflict(&conn, &new_id, &MemoryScope::Repo, "preference", &hit)
+                .expect("record conflict");
         drop(conn);
 
         // Smoke-check: list_conflicts surfaces the row through the
         // project wrapper (which merges project + user brains).
         let open = project::list_conflicts(project.root(), 50).expect("list_conflicts");
         assert_eq!(open.len(), 1, "exactly one open conflict expected");
-        assert_eq!(open[0].source, "project", "conflict should be sourced from project brain");
+        assert_eq!(
+            open[0].source, "project",
+            "conflict should be sourced from project brain"
+        );
         assert_eq!(open[0].report.new_memory_id, new_id);
         assert_eq!(open[0].report.existing_memory_id, existing_id);
         assert!(
@@ -77,7 +75,10 @@ fn list_and_resolve_conflict_wrappers_compose_against_a_real_project() {
         // Resolve with kept_new — existing memory should be invalidated.
         let resolved = project::resolve_conflict(project.root(), &conflict_id, "kept_new")
             .expect("resolve_conflict");
-        assert!(resolved, "resolve_conflict should return true on first apply");
+        assert!(
+            resolved,
+            "resolve_conflict should return true on first apply"
+        );
 
         // Post-conditions:
         //   * list_conflicts returns empty (resolved row excluded)
@@ -139,14 +140,9 @@ fn re_resolving_same_conflict_is_idempotent_through_project_wrapper() {
             existing_text: "Use spaces for indentation.".to_string(),
             similarity: 0.88,
         };
-        let conflict_id = conflict::record_conflict(
-            &conn,
-            &new_id,
-            &MemoryScope::Repo,
-            "preference",
-            &hit,
-        )
-        .expect("record");
+        let conflict_id =
+            conflict::record_conflict(&conn, &new_id, &MemoryScope::Repo, "preference", &hit)
+                .expect("record");
         drop(conn);
 
         assert!(

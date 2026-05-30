@@ -167,6 +167,9 @@ mod tests {
             "parent struct's derived Debug must NOT leak nested SecretString: {dbg}"
         );
         assert!(dbg.contains("REDACTED"));
-        assert!(dbg.contains("claude-opus"), "non-secret fields should print");
+        assert!(
+            dbg.contains("claude-opus"),
+            "non-secret fields should print"
+        );
     }
 }

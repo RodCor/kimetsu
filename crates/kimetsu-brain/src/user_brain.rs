@@ -112,10 +112,7 @@ pub fn add_user_memory(
     // `add_memory`'s upstream call is safe + cheap.
     let redaction = redact::redact_secrets(text);
     if redaction.was_redacted() {
-        eprintln!(
-            "kimetsu-brain (user): {}",
-            redaction.summary()
-        );
+        eprintln!("kimetsu-brain (user): {}", redaction.summary());
     }
     let text = redaction.text.as_str();
     let normalized = normalize_memory_text(text);
@@ -391,11 +388,10 @@ mod tests {
         let tmp = tempdir_in_test("kimetsu-user-brain-4");
         with_user_brain_at(&tmp, || {
             let conn = open_user_brain().expect("open").expect("enabled");
-            let first = add_user_memory(&conn, MemoryKind::Preference, "use thiserror", 1.0)
-                .expect("add");
-            let second =
-                add_user_memory(&conn, MemoryKind::Preference, "  use   thiserror  ", 1.0)
-                    .expect("add normalized dup");
+            let first =
+                add_user_memory(&conn, MemoryKind::Preference, "use thiserror", 1.0).expect("add");
+            let second = add_user_memory(&conn, MemoryKind::Preference, "  use   thiserror  ", 1.0)
+                .expect("add normalized dup");
             assert_eq!(first, second, "normalized-text dedup must hit");
             // List back what we wrote.
             let rows = list_user_memories(&conn).expect("list");

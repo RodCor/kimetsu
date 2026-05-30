@@ -348,10 +348,7 @@ mod tests {
             ..Default::default()
         };
         let suffix = render_as_query_suffix(&ctx);
-        assert!(
-            suffix.contains("src/embeddings.rs"),
-            "got {suffix}"
-        );
+        assert!(suffix.contains("src/embeddings.rs"), "got {suffix}");
         assert!(
             suffix.contains("crates/kimetsu-brain/src/ambient.rs"),
             "got {suffix}"
@@ -453,10 +450,7 @@ mod tests {
         // Build a fake workspace with `.kimetsu/` content next to
         // real source files; the walker must surface the source
         // files only.
-        let root = std::env::temp_dir().join(format!(
-            "kimetsu-ambient-test-{}",
-            ulid::Ulid::new()
-        ));
+        let root = std::env::temp_dir().join(format!("kimetsu-ambient-test-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".kimetsu/runs")).unwrap();
         std::fs::write(root.join("src/a.rs"), "// a").unwrap();
@@ -469,7 +463,11 @@ mod tests {
             ".kimetsu/ entries should be filtered out: {:?}",
             files
         );
-        assert!(files.iter().any(|p| p.ends_with("a.rs") || p.ends_with("b.rs")));
+        assert!(
+            files
+                .iter()
+                .any(|p| p.ends_with("a.rs") || p.ends_with("b.rs"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

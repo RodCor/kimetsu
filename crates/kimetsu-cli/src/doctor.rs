@@ -524,25 +524,19 @@ mod tests {
                 CheckReport {
                     name: "b",
                     category: "x",
-                    outcome: Outcome::Warn {
-                        reason: "w".into(),
-                    },
+                    outcome: Outcome::Warn { reason: "w".into() },
                     detail: None,
                 },
                 CheckReport {
                     name: "c",
                     category: "y",
-                    outcome: Outcome::Fail {
-                        reason: "f".into(),
-                    },
+                    outcome: Outcome::Fail { reason: "f".into() },
                     detail: None,
                 },
                 CheckReport {
                     name: "d",
                     category: "y",
-                    outcome: Outcome::Skip {
-                        reason: "s".into(),
-                    },
+                    outcome: Outcome::Skip { reason: "s".into() },
                     detail: None,
                 },
             ],

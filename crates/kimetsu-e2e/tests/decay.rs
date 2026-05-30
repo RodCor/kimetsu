@@ -108,10 +108,7 @@ fn decay_can_be_disabled_via_broker_weights() {
             .format(fmt)
             .expect("format");
 
-        for (mid, last_useful) in [
-            ("m_recent_off", &recent),
-            ("m_aged_off", &aged),
-        ] {
+        for (mid, last_useful) in [("m_recent_off", &recent), ("m_aged_off", &aged)] {
             let text = "regression guard for the disable-decay knob";
             let normalized = normalize_memory_text(text);
             conn.execute(
