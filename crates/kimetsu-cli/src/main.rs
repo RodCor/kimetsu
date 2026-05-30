@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 mod doctor;
+mod update;
 
 use clap::{Args, Parser, Subcommand};
 use kimetsu_agent::bench::{BenchOptions, run_benchmark};
@@ -77,6 +78,11 @@ enum Command {
     /// `KIMETSU_BRAIN_EMBEDDER`, or whenever something looks
     /// off — doctor surfaces the actionable fix.
     Doctor(DoctorArgs),
+    /// Check GitHub Releases for a newer Kimetsu and update discovered
+    /// local installs.
+    Update(UpdateArgs),
+    /// Remove discovered Kimetsu executables from this machine.
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +97,36 @@ struct DoctorArgs {
     /// sandbox where spawning is disallowed.
     #[arg(long)]
     skip_mcp: bool,
+}
+
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// Only check whether a newer release exists; do not install it.
+    #[arg(long)]
+    check: bool,
+    /// Print the installs that would be updated without writing files.
+    #[arg(long)]
+    dry_run: bool,
+    /// Reinstall even when the latest release is the current version.
+    #[arg(long)]
+    force: bool,
+    /// Release flavor to install. `auto` preserves this binary's build flavor.
+    #[arg(long, default_value = "auto")]
+    flavor: String,
+}
+
+#[derive(Debug, Args)]
+struct UninstallArgs {
+    /// Print the installs that would be removed without deleting anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm removal. Required unless --dry-run is used.
+    #[arg(long)]
+    yes: bool,
+    /// Also remove the user Kimetsu brain directory (~/.kimetsu or
+    /// KIMETSU_USER_BRAIN_DIR). Project .kimetsu directories are never removed.
+    #[arg(long)]
+    delete_user_data: bool,
 }
 
 #[derive(Debug, Args)]
@@ -678,7 +714,27 @@ fn run() -> KimetsuResult<()> {
         Command::Plugin { command } => plugin(command),
         Command::Chat(args) => chat(args),
         Command::Doctor(args) => doctor_cmd(args),
+        Command::Update(args) => update_cmd(args),
+        Command::Uninstall(args) => uninstall_cmd(args),
     }
+}
+
+fn update_cmd(args: UpdateArgs) -> KimetsuResult<()> {
+    let flavor = update::UpdateFlavor::parse(&args.flavor)?;
+    update::run(update::UpdateOptions {
+        check: args.check,
+        dry_run: args.dry_run,
+        force: args.force,
+        flavor,
+    })
+}
+
+fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
+    update::uninstall(update::UninstallOptions {
+        dry_run: args.dry_run,
+        yes: args.yes,
+        delete_user_data: args.delete_user_data,
+    })
 }
 
 /// v0.4.6: `kimetsu doctor` entry point. Runs the full health
@@ -1357,9 +1413,10 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v0.6: `kimetsu brain context-hook` — Claude Code UserPromptSubmit hook.
+/// v0.6: `kimetsu brain context-hook` — UserPromptSubmit hook.
 /// Reads `{"prompt":"..."}` JSON from stdin, retrieves relevant capsules,
-/// prints them to stdout for injection. Silent (exit 0) when brain has nothing.
+/// prints Codex/Claude-compatible hook JSON to stdout for injection.
+/// Silent (exit 0) when brain has nothing.
 fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     use kimetsu_brain::context::ContextRequest;
     use std::io::Read;
@@ -1408,7 +1465,7 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         return Ok(()); // Nothing relevant — zero output
     }
 
-    println!("[Kimetsu brain] Relevant knowledge for this task:");
+    let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
     for capsule in &bundle.capsules {
         // Strip the "scope:kind - " prefix from the summary for readability
         let text = capsule
@@ -1416,10 +1473,28 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             .splitn(3, " - ")
             .nth(1)
             .unwrap_or(&capsule.summary);
-        println!("{}", text);
+        additional_context.push('\n');
+        additional_context.push_str(text);
     }
 
+    print_user_prompt_submit_context(&additional_context)?;
     Ok(())
+}
+
+fn print_user_prompt_submit_context(additional_context: &str) -> KimetsuResult<()> {
+    let output = user_prompt_submit_context_output(additional_context);
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+fn user_prompt_submit_context_output(additional_context: &str) -> serde_json::Value {
+    serde_json::json!({
+        "continue": true,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": additional_context,
+        },
+    })
 }
 
 /// v0.7: Claude Code Stop hook. Reads session JSON from stdin, counts
@@ -2271,6 +2346,23 @@ mod tests {
     use kimetsu_core::ids::RunId;
     use std::fs;
     use std::io::Cursor;
+
+    #[test]
+    fn context_hook_output_is_user_prompt_submit_json() {
+        let value = user_prompt_submit_context_output("Kimetsu context");
+        assert_eq!(value["continue"], true);
+        assert_eq!(
+            value["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(
+            value["hookSpecificOutput"]["additionalContext"],
+            "Kimetsu context"
+        );
+
+        let text = serde_json::to_string(&value).expect("json");
+        assert!(text.starts_with('{'), "{text}");
+    }
 
     /// MP-5b: end-to-end driver test for the interactive loop. Inject three
     /// pending proposals, script `a\nr\nbecause noisy\ns\n` as stdin input,

@@ -49,10 +49,53 @@ fn kimetsu_help_lists_top_level_subcommands() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Spot-check the key user-facing subcommands.
     // If one of these disappears, --help drift caught at PR time.
-    for expected in ["init", "brain", "chat", "doctor", "bridge", "mcp"] {
+    for expected in [
+        "init",
+        "brain",
+        "chat",
+        "doctor",
+        "bridge",
+        "mcp",
+        "update",
+        "uninstall",
+    ] {
         assert!(
             stdout.contains(expected),
             "kimetsu --help should mention `{expected}`; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn kimetsu_uninstall_help_lists_confirmation_flags() {
+    let output = Command::new(kimetsu_bin())
+        .args(["uninstall", "--help"])
+        .output()
+        .expect("spawn kimetsu uninstall --help");
+    assert!(output.status.success(), "uninstall --help should exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in ["--yes", "--dry-run", "--delete-user-data"] {
+        assert!(
+            stdout.contains(expected),
+            "uninstall --help should mention `{expected}`; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn kimetsu_update_help_lists_check_mode() {
+    let output = Command::new(kimetsu_bin())
+        .args(["update", "--help"])
+        .output()
+        .expect("spawn kimetsu update --help");
+    assert!(output.status.success(), "update --help should exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in ["--check", "--dry-run", "--flavor"] {
+        assert!(
+            stdout.contains(expected),
+            "update --help should mention `{expected}`; got: {stdout}"
         );
     }
 }
