@@ -80,7 +80,21 @@ jobs:
       # workspace test build does not pull the ONNX runtime. This keeps
       # the gate fast and dependency-light; the embeddings flavor is
       # built + smoke-tested in release.yml.
-      - run: cargo test --workspace --locked
+      #
+      # The brain suite exercises the per-user GlobalUser brain at
+      # $HOME/.kimetsu and takes a writer lock on ~/.kimetsu/project.lock.
+      # Run multi-threaded (cargo's default), concurrent tests contend on
+      # that shared lock and one panics. Point HOME/TMP/GIT ceiling at a
+      # throwaway dir under the runner temp and serialize so each test gets
+      # an isolated project root.
+      - name: cargo test (isolated, serial)
+        shell: bash
+        run: |
+          ISO="${RUNNER_TEMP:-/tmp}/kimetsu-test-home"
+          mkdir -p "$ISO"
+          export HOME="$ISO" TMPDIR="$ISO" TMP="$ISO" TEMP="$ISO"
+          export GIT_CEILING_DIRECTORIES="$ISO"
+          cargo test --workspace --locked -- --test-threads=1
 
   audit:
     name: cargo-audit (RUSTSEC)
