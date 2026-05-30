@@ -267,7 +267,10 @@ mod tests {
 
     #[test]
     fn reindex_scope_parser_accepts_aliases() {
-        assert_eq!(ReindexScope::parse("project").unwrap(), ReindexScope::Project);
+        assert_eq!(
+            ReindexScope::parse("project").unwrap(),
+            ReindexScope::Project
+        );
         assert_eq!(ReindexScope::parse("repo").unwrap(), ReindexScope::Project);
         assert_eq!(ReindexScope::parse("user").unwrap(), ReindexScope::User);
         assert_eq!(ReindexScope::parse("global").unwrap(), ReindexScope::User);
@@ -350,7 +353,11 @@ mod tests {
                         |row| row.get(0),
                     )
                     .expect("fetch blob");
-                assert_eq!(blob.len(), stub.dim() * 4, "stub-d8 -> 8 floats -> 32 bytes");
+                assert_eq!(
+                    blob.len(),
+                    stub.dim() * 4,
+                    "stub-d8 -> 8 floats -> 32 bytes"
+                );
             }
         });
     }

@@ -242,8 +242,7 @@ impl Embedder for StubEmbedder {
 /// with an explicit [`StubEmbedder`] (or any other [`Embedder`])
 /// instead of going through this function.
 pub fn open_default_embedder() -> &'static (dyn Embedder + Send + Sync) {
-    static CACHE: std::sync::OnceLock<Box<dyn Embedder + Send + Sync>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<Box<dyn Embedder + Send + Sync>> = std::sync::OnceLock::new();
     let embedder = CACHE.get_or_init(build_default_embedder);
     embedder.as_ref()
 }
@@ -517,20 +516,13 @@ pub fn encode_embedding(vec: &[f32]) -> Vec<u8> {
 /// expected dimension; pass `None` to accept any length.
 pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuResult<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
-        return Err(format!(
-            "embedding blob length {} not a multiple of 4",
-            bytes.len()
-        )
-        .into());
+        return Err(format!("embedding blob length {} not a multiple of 4", bytes.len()).into());
     }
     let dim = bytes.len() / 4;
     if let Some(expected) = expected_dim
         && dim != expected
     {
-        return Err(format!(
-            "embedding blob dim {dim} does not match expected {expected}"
-        )
-        .into());
+        return Err(format!("embedding blob dim {dim} does not match expected {expected}").into());
     }
     let mut out = Vec::with_capacity(dim);
     for chunk in bytes.chunks_exact(4) {
@@ -582,7 +574,10 @@ mod tests {
         let sim = cosine_similarity(&a, &b);
         // Disjoint word sets *can* still collide in the 8-bucket
         // hash, but on average should be low. Sanity bound: not 1.0.
-        assert!(sim < 0.99, "disjoint inputs should not be near-identical: {sim}");
+        assert!(
+            sim < 0.99,
+            "disjoint inputs should not be near-identical: {sim}"
+        );
     }
 
     #[test]
@@ -701,10 +696,7 @@ mod tests {
             unsafe {
                 std::env::set_var("KIMETSU_BRAIN_EMBEDDER", value);
             }
-            assert!(
-                !env_disables_embedder(),
-                "value {value:?} must NOT disable"
-            );
+            assert!(!env_disables_embedder(), "value {value:?} must NOT disable");
         }
         // Restore.
         unsafe {

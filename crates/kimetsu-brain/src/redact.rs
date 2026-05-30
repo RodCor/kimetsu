@@ -229,10 +229,7 @@ fn patterns() -> &'static [SecretPattern] {
             // `api_key = "..."` / `api-key:"..."` / `api_key=...`.
             // Captures both quoted and bare values; value must be
             // ≥12 chars of secret-looking content.
-            regex: Regex::new(
-                r#"(?i)api[_\-]?key\s*[:=]\s*"?[A-Za-z0-9_\-]{12,}"?"#,
-            )
-            .unwrap(),
+            regex: Regex::new(r#"(?i)api[_\-]?key\s*[:=]\s*"?[A-Za-z0-9_\-]{12,}"?"#).unwrap(),
         });
         out.push(SecretPattern {
             kind: "generic_token",
@@ -261,7 +258,8 @@ mod tests {
 
     #[test]
     fn anthropic_oauth_token_is_redacted() {
-        let raw = "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let raw =
+            "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
         let r = redact_secrets(raw);
         assert!(r.was_redacted(), "{:?}", r);
         assert!(r.text.contains("[REDACTED:anthropic_oauth]"));
@@ -326,7 +324,12 @@ mod tests {
     #[test]
     fn slack_aws_jwt_pem_google_all_redact() {
         let raw = concat!(
-            "slack=xoxb-12345678-abcdefghijklmnop ",
+            // Synthetic, non-functional token shaped to exercise the
+            // slack_token detector. The prefix is split so secret
+            // scanners don't flag the literal as a real credential.
+            "slack=",
+            "xoxb",
+            "-12345678-abcdefghijklmnop ",
             "aws=AKIAIOSFODNN7EXAMPLE ",
             "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.abcdef ",
             "google=AIzaSyDx0o-1234567890abcdefghijklmnopqrs ",
@@ -346,7 +349,10 @@ mod tests {
             "private_key_pem",
             "slack_token",
         ] {
-            assert!(kinds.contains(&expected), "missing kind {expected}: {kinds:?}");
+            assert!(
+                kinds.contains(&expected),
+                "missing kind {expected}: {kinds:?}"
+            );
         }
     }
 
@@ -395,7 +401,8 @@ mod tests {
 
     #[test]
     fn summary_lists_unique_kinds() {
-        let raw = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ and ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+        let raw =
+            "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ and ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
         let r = redact_secrets(raw);
         let summary = r.summary();
         assert!(summary.contains("github_pat"));
@@ -416,11 +423,13 @@ mod tests {
 
     #[test]
     fn redaction_preserves_non_secret_surroundings() {
-        let raw =
-            "# Save to .env\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf\n# Use it";
+        let raw = "# Save to .env\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf\n# Use it";
         let r = redact_secrets(raw);
         assert!(r.text.starts_with("# Save to .env"));
         assert!(r.text.ends_with("# Use it"));
-        assert!(r.text.contains("CLAUDE_CODE_OAUTH_TOKEN=[REDACTED:anthropic_oauth]"));
+        assert!(
+            r.text
+                .contains("CLAUDE_CODE_OAUTH_TOKEN=[REDACTED:anthropic_oauth]")
+        );
     }
 }

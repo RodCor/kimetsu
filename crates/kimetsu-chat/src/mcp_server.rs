@@ -234,9 +234,7 @@ fn call_tool(
         "kimetsu_brain_memory_reject" => kimetsu_brain_memory_reject(workspace, &arguments),
         "kimetsu_brain_memory_invalidate" => kimetsu_brain_memory_invalidate(workspace, &arguments),
         "kimetsu_brain_memory_blame" => kimetsu_brain_memory_blame(workspace, &arguments),
-        "kimetsu_brain_memory_conflicts" => {
-            kimetsu_brain_memory_conflicts(workspace, &arguments)
-        }
+        "kimetsu_brain_memory_conflicts" => kimetsu_brain_memory_conflicts(workspace, &arguments),
         "kimetsu_brain_ingest_repo" => kimetsu_brain_ingest_repo(workspace, &arguments),
         "kimetsu_bridge_status" => {
             let scan = bridge_scan(workspace, skills)?;
@@ -941,8 +939,8 @@ fn kimetsu_brain_memory_blame(workspace: &Path, arguments: &Value) -> Result<Val
     let run_id = string_arg(arguments, "run_id")?;
     let report = project::blame_run(workspace, run_id.trim())
         .map_err(|err| format!("kimetsu brain memory blame: {err}"))?;
-    let json = serde_json::to_value(&report)
-        .map_err(|err| format!("serialize blame report: {err}"))?;
+    let json =
+        serde_json::to_value(&report).map_err(|err| format!("serialize blame report: {err}"))?;
     Ok(json!({
         "ok": true,
         "usage": {
@@ -962,10 +960,7 @@ fn kimetsu_brain_memory_blame(workspace: &Path, arguments: &Value) -> Result<Val
 /// `kimetsu brain memory conflicts`, JSON-shaped for the host
 /// harness. Read-only by design: actual resolution stays on the
 /// CLI to keep the audit trail centralized.
-fn kimetsu_brain_memory_conflicts(
-    workspace: &Path,
-    arguments: &Value,
-) -> Result<Value, String> {
+fn kimetsu_brain_memory_conflicts(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -973,8 +968,8 @@ fn kimetsu_brain_memory_conflicts(
         .unwrap_or(50);
     let open = project::list_conflicts(workspace, limit)
         .map_err(|err| format!("kimetsu brain memory conflicts: {err}"))?;
-    let conflicts = serde_json::to_value(&open)
-        .map_err(|err| format!("serialize conflicts: {err}"))?;
+    let conflicts =
+        serde_json::to_value(&open).map_err(|err| format!("serialize conflicts: {err}"))?;
     Ok(json!({
         "ok": true,
         "usage": {

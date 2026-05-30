@@ -29,8 +29,7 @@ impl TempProject {
     /// internally — every TempProject is a real on-disk project with
     /// a real `brain.db`.
     pub fn init(label: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("kimetsu-e2e-{label}-{}", RunId::new()));
+        let root = std::env::temp_dir().join(format!("kimetsu-e2e-{label}-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project root");
         kimetsu_brain::project::init_project(&root, false).expect("init_project");
         Self {

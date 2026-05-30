@@ -27,8 +27,7 @@ fn agent_loop_completes_a_simple_scripted_run() {
         .turn(|t| t.done("read the file; nothing else to do"))
         .build();
 
-    let mut runtime = ToolRuntime::new(project.root(), RunId::new())
-        .expect("construct runtime");
+    let mut runtime = ToolRuntime::new(project.root(), RunId::new()).expect("construct runtime");
 
     let report = run_model_agent(
         "read hello.txt and confirm",
@@ -43,7 +42,11 @@ fn agent_loop_completes_a_simple_scripted_run() {
     assert_eq!(report.turns, 2, "expected 2 turns, got {}", report.turns);
     assert_eq!(report.tool_calls, 1, "exactly one tool call expected");
     assert!(
-        report.final_text.as_deref().unwrap_or("").contains("read the file"),
+        report
+            .final_text
+            .as_deref()
+            .unwrap_or("")
+            .contains("read the file"),
         "final text didn't match the scripted done turn: {:?}",
         report.final_text
     );

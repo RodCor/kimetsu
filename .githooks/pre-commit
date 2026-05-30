@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# kimetsu pre-commit gate — keeps every commit formatted and lint-clean.
+#
+# Activate once per clone:
+#     git config core.hooksPath .githooks
+# (or run ./scripts/install-hooks.sh)
+#
+# Mirrors the CI quality gate (fmt + clippy) so red CI is caught locally.
+# The full test suite + security audit run in CI on PR, not here, to keep
+# commits fast.
+#
+# Escape hatches:
+#   SKIP_CLIPPY=1 git commit ...   # fmt only (faster)
+#   git commit --no-verify ...     # skip the hook entirely (discouraged)
+
+set -euo pipefail
+
+# Only gate Rust changes; let doc/config-only commits through fast.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found on PATH — skipping Rust checks." >&2
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo "" >&2
+    echo "pre-commit: formatting check failed. Run 'cargo fmt --all' and re-stage." >&2
+    exit 1
+fi
+
+if [ "${SKIP_CLIPPY:-0}" = "1" ]; then
+    echo "pre-commit: SKIP_CLIPPY=1 set — skipping clippy."
+    exit 0
+fi
+
+# Clippy is advisory at the hook stage (main has a small pre-existing lint
+# backlog). It runs and prints findings but does not block the commit, so
+# you see new lints you introduced without being blocked by old ones.
+# CI runs the same check on the PR. Once the backlog is cleared, switch
+# this to a blocking `cargo clippy --workspace -- -D warnings`.
+echo "pre-commit: cargo clippy --workspace (advisory)"
+cargo clippy --workspace 2>&1 | grep -E "^warning:|^error:" || true
+
+echo "pre-commit: OK (fmt enforced; clippy advisory)"

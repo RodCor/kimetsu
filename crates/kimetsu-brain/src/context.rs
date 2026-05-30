@@ -191,16 +191,21 @@ pub fn retrieve_context_with_embedder(
     // normalisation so the multipliers operate on the [0,1]-normalised score
     // rather than the raw pre-normalisation values.
     if !request.tags.is_empty() || !request.prefer_roles.is_empty() {
-        let tags_lc: Vec<String> = request.tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+        let tags_lc: Vec<String> = request
+            .tags
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
         for c in &mut candidates {
             let summary_lc = c.capsule.summary.to_ascii_lowercase();
-            if !tags_lc.is_empty()
-                && tags_lc.iter().any(|t| summary_lc.contains(t.as_str()))
-            {
+            if !tags_lc.is_empty() && tags_lc.iter().any(|t| summary_lc.contains(t.as_str())) {
                 c.capsule.score *= 1.4;
             }
             if !request.prefer_roles.is_empty()
-                && request.prefer_roles.iter().any(|r| c.capsule.kind.contains(r.as_str()))
+                && request
+                    .prefer_roles
+                    .iter()
+                    .any(|r| c.capsule.kind.contains(r.as_str()))
             {
                 c.capsule.score *= 1.3;
             }
@@ -387,7 +392,11 @@ fn latest_memory_candidates(
             embedding_model,
             last_useful_at,
         ) = row?;
-        let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
+        let cosine = compute_cosine(
+            query_embedding,
+            embedding.as_deref(),
+            embedding_model.as_deref(),
+        );
         if let Some(candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
@@ -466,7 +475,11 @@ fn memory_fts_candidates(
             last_useful_at,
         ) = row?;
         let fts_relevance = (-rank as f32).max(0.0);
-        let cosine = compute_cosine(query_embedding, embedding.as_deref(), embedding_model.as_deref());
+        let cosine = compute_cosine(
+            query_embedding,
+            embedding.as_deref(),
+            embedding_model.as_deref(),
+        );
         if let Some(candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
@@ -1446,7 +1459,9 @@ mod tests {
     /// just because its `last_useful_at` got mangled.
     #[test]
     fn usefulness_decay_returns_one_on_unparseable_timestamps() {
-        assert!((usefulness_decay(Some("not-a-date"), "also-not", 30.0) - 1.0).abs() < f32::EPSILON);
+        assert!(
+            (usefulness_decay(Some("not-a-date"), "also-not", 30.0) - 1.0).abs() < f32::EPSILON
+        );
     }
 
     /// v0.5.1: a memory whose reference timestamp is "now" (no age)
@@ -1470,10 +1485,9 @@ mod tests {
         let fmt = &time::format_description::well_known::Rfc3339;
 
         // age = half_life -> decay ~= 0.5
-        let one_half_life_ago =
-            (now - time::Duration::seconds((half_life * 86_400.0) as i64))
-                .format(fmt)
-                .expect("format");
+        let one_half_life_ago = (now - time::Duration::seconds((half_life * 86_400.0) as i64))
+            .format(fmt)
+            .expect("format");
         let d1 = usefulness_decay(Some(&one_half_life_ago), &one_half_life_ago, half_life);
         assert!(
             (d1 - 0.5).abs() < 0.01,
@@ -1481,15 +1495,11 @@ mod tests {
         );
 
         // age = 2 * half_life -> decay ~= 0.25
-        let two_half_lives_ago =
-            (now - time::Duration::seconds((2.0 * half_life * 86_400.0) as i64))
-                .format(fmt)
-                .expect("format");
-        let d2 = usefulness_decay(
-            Some(&two_half_lives_ago),
-            &two_half_lives_ago,
-            half_life,
-        );
+        let two_half_lives_ago = (now
+            - time::Duration::seconds((2.0 * half_life * 86_400.0) as i64))
+        .format(fmt)
+        .expect("format");
+        let d2 = usefulness_decay(Some(&two_half_lives_ago), &two_half_lives_ago, half_life);
         assert!(
             (d2 - 0.25).abs() < 0.01,
             "expected ~0.25 at two half-lives, got {d2}"
@@ -1535,9 +1545,7 @@ mod tests {
         // Both memories say "use ripgrep for code search", both have
         // use_count = 5, usefulness_score = 5 (max boost → 1.5
         // multiplier). The only difference is `last_useful_at`.
-        for (mid, last_useful) in
-            [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)]
-        {
+        for (mid, last_useful) in [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)] {
             let text = "use ripgrep for code search";
             let normalized = kimetsu_core::memory::normalize_memory_text(text);
             conn.execute(
@@ -1581,11 +1589,7 @@ mod tests {
         let mem_order: Vec<&str> = bundle
             .capsules
             .iter()
-            .filter_map(|c| {
-                c.expansion_handle
-                    .strip_prefix("memory:")
-                    .map(|s| s)
-            })
+            .filter_map(|c| c.expansion_handle.strip_prefix("memory:").map(|s| s))
             .collect();
         assert_eq!(
             mem_order.first().copied(),
@@ -1612,9 +1616,7 @@ mod tests {
             .format(fmt)
             .expect("format");
 
-        for (mid, last_useful) in
-            [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)]
-        {
+        for (mid, last_useful) in [("m_recent", &one_day_ago), ("m_aged", &one_year_ago)] {
             let text = "use ripgrep for code search";
             let normalized = kimetsu_core::memory::normalize_memory_text(text);
             conn.execute(

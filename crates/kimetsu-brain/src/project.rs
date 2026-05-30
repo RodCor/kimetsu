@@ -275,7 +275,10 @@ impl BrainSession {
     /// v0.6: full-request variant used by `kimetsu_brain_context` MCP tool
     /// and `retrieve_context_readonly_with_request` to expose `tags`,
     /// `min_score`, `max_capsules`, and `prefer_roles`.
-    pub fn retrieve_context_with_request(&self, request: ContextRequest) -> KimetsuResult<ContextBundle> {
+    pub fn retrieve_context_with_request(
+        &self,
+        request: ContextRequest,
+    ) -> KimetsuResult<ContextBundle> {
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_multi(
             &self.conn,
@@ -496,14 +499,8 @@ pub fn add_memory(
     // `kimetsu brain memory conflicts`. Best-effort: NoopEmbedder
     // (lean build) returns 0 hits; embedder failures degrade to a
     // stderr line, never to a failed insert.
-    let conflicts = conflict::detect_and_record(
-        &conn,
-        &memory_id,
-        &scope,
-        &kind.to_string(),
-        text,
-        embedder,
-    );
+    let conflicts =
+        conflict::detect_and_record(&conn, &memory_id, &scope, &kind.to_string(), text, embedder);
     if conflicts > 0 {
         eprintln!(
             "kimetsu-brain: memory {memory_id} conflicts with {conflicts} existing memor{} (run `kimetsu brain memory conflicts` to review)",
@@ -565,10 +562,10 @@ pub fn propose_memory(
 /// v0.7: outcome of a `propose_or_merge_memory` call.
 #[derive(Debug)]
 pub enum ProposeResult {
-    Added(String),      // memory_id — new memory, directly accepted
-    Proposed(String),   // proposal_id — pending for review (low confidence)
-    Merged(String),     // memory_id of the existing memory that was updated
-    Duplicate(String),  // memory_id of the identical existing memory
+    Added(String),     // memory_id — new memory, directly accepted
+    Proposed(String),  // proposal_id — pending for review (low confidence)
+    Merged(String),    // memory_id of the existing memory that was updated
+    Duplicate(String), // memory_id of the identical existing memory
 }
 
 /// v0.7: capture a lesson, automatically deduplicating against the existing brain.
@@ -633,12 +630,7 @@ pub fn propose_or_merge_memory(
                  WHERE memory_id = ?3",
                 rusqlite::params![merged_text, new_normalized, hit.existing_memory_id],
             )?;
-            embeddings::embed_and_persist(
-                &conn,
-                &hit.existing_memory_id,
-                &merged_text,
-                embedder,
-            )?;
+            embeddings::embed_and_persist(&conn, &hit.existing_memory_id, &merged_text, embedder)?;
             return Ok(ProposeResult::Merged(hit.existing_memory_id));
         }
     }
@@ -747,10 +739,7 @@ pub fn blame_run(start: &Path, run_id: &str) -> KimetsuResult<BlameReport> {
     })
 }
 
-fn run_outcome(
-    conn: &Connection,
-    run_id: &str,
-) -> KimetsuResult<(String, Option<String>)> {
+fn run_outcome(conn: &Connection, run_id: &str) -> KimetsuResult<(String, Option<String>)> {
     // Pull the most recent terminal event for the run, if any.
     let row: Option<(String, String)> = conn
         .query_row(
@@ -1618,11 +1607,7 @@ pub fn list_conflicts(start: &Path, limit: u32) -> KimetsuResult<Vec<ScopedConfl
 /// `memory_conflicts` row IS the audit trail; double-recording would
 /// duplicate state across two systems. Operators who want the trace-
 /// event-style record can use `kimetsu brain memory invalidate` instead.
-pub fn resolve_conflict(
-    start: &Path,
-    conflict_id: &str,
-    resolution: &str,
-) -> KimetsuResult<bool> {
+pub fn resolve_conflict(start: &Path, conflict_id: &str, resolution: &str) -> KimetsuResult<bool> {
     let (paths, _config, project_conn) = load_project(start)?;
     let _lock = ProjectLock::acquire(&paths, "brain memory conflict resolve", None)?;
     if conflict::resolve_conflict(&project_conn, conflict_id, resolution)? {
@@ -1770,13 +1755,8 @@ mod tests {
             init_project(&root, false).expect("init project");
 
             let raw = "Add CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf to .env";
-            let memory_id = add_memory(
-                &root,
-                MemoryScope::Repo,
-                MemoryKind::Command,
-                raw,
-            )
-            .expect("add memory");
+            let memory_id =
+                add_memory(&root, MemoryScope::Repo, MemoryKind::Command, raw).expect("add memory");
 
             let memories = list_memories(&root).expect("list");
             let stored = memories
@@ -1794,8 +1774,7 @@ mod tests {
                 stored.text
             );
             assert!(
-                stored.text.contains("CLAUDE_CODE_OAUTH_TOKEN")
-                    && stored.text.contains(".env"),
+                stored.text.contains("CLAUDE_CODE_OAUTH_TOKEN") && stored.text.contains(".env"),
                 "non-secret context must be preserved: {}",
                 stored.text
             );
@@ -2057,8 +2036,7 @@ mod tests {
             let run_id = RunId::new();
             {
                 let (paths, _config, conn) = load_project(&root).expect("load");
-                let (mut writer, _run_paths) =
-                    TraceWriter::create(&paths, run_id).expect("trace");
+                let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id).expect("trace");
                 let evs: Vec<Event> = vec![
                     Event::new(
                         run_id,

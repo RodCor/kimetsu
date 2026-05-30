@@ -455,7 +455,14 @@ mod tests {
         let conn = open_test_brain();
         // Insert via stub so the row has an embedding; then scan with Noop.
         let stub = StubEmbedder::new();
-        insert_memory(&conn, "m_existing", "global_user", "fact", "use thiserror for libraries", &stub);
+        insert_memory(
+            &conn,
+            "m_existing",
+            "global_user",
+            "fact",
+            "use thiserror for libraries",
+            &stub,
+        );
         let hits = find_potential_conflicts(
             &conn,
             &MemoryScope::GlobalUser,
@@ -475,7 +482,14 @@ mod tests {
     fn cross_model_rows_are_skipped() {
         let conn = open_test_brain();
         let stub = StubEmbedder::new();
-        insert_memory(&conn, "m_xmodel", "global_user", "fact", "use thiserror", &stub);
+        insert_memory(
+            &conn,
+            "m_xmodel",
+            "global_user",
+            "fact",
+            "use thiserror",
+            &stub,
+        );
         // Stomp the model id to simulate a pre-reindex row.
         conn.execute(
             "UPDATE memories SET embedding_model = 'bge-small-en-v1.5' WHERE memory_id = 'm_xmodel'",
@@ -505,7 +519,14 @@ mod tests {
     fn exact_match_is_not_flagged_as_conflict() {
         let conn = open_test_brain();
         let stub = StubEmbedder::new();
-        insert_memory(&conn, "m_exact", "global_user", "fact", "Use ripgrep", &stub);
+        insert_memory(
+            &conn,
+            "m_exact",
+            "global_user",
+            "fact",
+            "Use ripgrep",
+            &stub,
+        );
         let hits = find_potential_conflicts(
             &conn,
             &MemoryScope::GlobalUser,
@@ -590,7 +611,9 @@ mod tests {
         assert_eq!(id1, id2, "re-recording the same pair must return same id");
         // Confirm only one row landed.
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_conflicts", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM memory_conflicts", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -602,10 +625,31 @@ mod tests {
     fn list_unresolved_excludes_resolved_rows() {
         let conn = open_test_brain();
         let stub = StubEmbedder::new();
-        insert_memory(&conn, "m_new1", "global_user", "fact", "use thiserror", &stub);
+        insert_memory(
+            &conn,
+            "m_new1",
+            "global_user",
+            "fact",
+            "use thiserror",
+            &stub,
+        );
         insert_memory(&conn, "m_old1", "global_user", "fact", "use anyhow", &stub);
-        insert_memory(&conn, "m_new2", "global_user", "fact", "tabs over spaces", &stub);
-        insert_memory(&conn, "m_old2", "global_user", "fact", "spaces over tabs", &stub);
+        insert_memory(
+            &conn,
+            "m_new2",
+            "global_user",
+            "fact",
+            "tabs over spaces",
+            &stub,
+        );
+        insert_memory(
+            &conn,
+            "m_old2",
+            "global_user",
+            "fact",
+            "spaces over tabs",
+            &stub,
+        );
 
         let hit1 = ConflictHit {
             existing_memory_id: "m_old1".to_string(),
@@ -755,7 +799,14 @@ mod tests {
     fn detect_and_record_noop_writes_nothing() {
         let conn = open_test_brain();
         let stub = StubEmbedder::new();
-        insert_memory(&conn, "m_existing", "global_user", "fact", "alpha beta", &stub);
+        insert_memory(
+            &conn,
+            "m_existing",
+            "global_user",
+            "fact",
+            "alpha beta",
+            &stub,
+        );
         insert_memory(&conn, "m_new", "global_user", "fact", "alpha gamma", &stub);
         let recorded = detect_and_record(
             &conn,
@@ -767,7 +818,9 @@ mod tests {
         );
         assert_eq!(recorded, 0);
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_conflicts", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM memory_conflicts", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }

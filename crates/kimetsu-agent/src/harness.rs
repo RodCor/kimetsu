@@ -1236,7 +1236,8 @@ fn kimetsu_all_tool_definitions() -> Vec<ToolDefinition> {
                 turn that you used; multiple citations per turn are fine. \
                 Pass the `memory_id` exactly as it appeared in your retrieved \
                 context (look for `memory:<id>` in capsule expansion handles \
-                or the `id` field of memory capsules).".to_string(),
+                or the `id` field of memory capsules)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -3642,10 +3643,7 @@ mod tests {
             assert!(g.get("error").is_some(), "glob allowed {path}");
             let v = kimetsu_view_image(&mut runtime, &json!({"path": path}));
             assert!(v.get("error").is_some(), "view_image allowed {path}");
-            let s = kimetsu_search_files(
-                &mut runtime,
-                &json!({"pattern": "secret", "path": path}),
-            );
+            let s = kimetsu_search_files(&mut runtime, &json!({"pattern": "secret", "path": path}));
             assert!(s.get("error").is_some(), "search_files allowed {path}");
         }
         // apply_patch with an absolute diff target is rejected before execution.
