@@ -104,8 +104,8 @@ kimetsu --version
 kimetsu doctor      # checks paths, brain.db, embedder, MCP, bridge
 ```
 
-**Prerequisites:** Rust 1.85+ (stable) and a Claude credential
-(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). That's it for chat — Docker,
+**Prerequisites:** Rust 1.85+ (stable) and a Claude or OpenAI credential
+(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). That's it for chat — Docker,
 Harbor, and Python are only needed for benchmark runs.
 
 ---
@@ -115,7 +115,6 @@ Harbor, and Python are only needed for benchmark runs.
 ### 1. Talk to it directly
 
 ```bash
-export CLAUDE_CODE_OAUTH_TOKEN=<your-token>   # or use a workspace .env
 kimetsu chat --workspace . --project .
 ```
 
@@ -129,8 +128,8 @@ whole conversation and injects retrieved context into every turn. Inside chat,
 Wire Kimetsu into your existing agent as an MCP sidecar — one command:
 
 ```bash
-kimetsu plugin install claude --workspace .    # writes .claude/mcp.json + hooks
-kimetsu plugin install codex  --workspace .    # writes .codex/mcp.json + skill
+kimetsu plugin install claude --workspace .    # writes .mcp.json + .claude/settings.json
+kimetsu plugin install codex  --workspace .    # writes .codex/config.toml + .codex/hooks.json + skill
 ```
 
 Now your agent gets ~18 `kimetsu_*` tools (brain context, memory add/list,

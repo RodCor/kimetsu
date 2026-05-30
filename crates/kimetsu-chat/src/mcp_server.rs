@@ -60,7 +60,7 @@ const BRIDGE_EXPORT_DESCRIPTION: &str = "Export a canonical or discovered skill 
 
 const BRIDGE_SYNC_DESCRIPTION: &str = "Bulk-import all discovered non-Kimetsu skills into .kimetsu/extensions. Use for setup or migration, not during a narrow task unless the user asked to synchronize capabilities. This writes files and may touch many skill bundles.";
 
-const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/mcp.json, the kimetsu-bridge skill, and hook scripts; for claude-code, writes .claude/mcp.json, command docs, and hook scripts. Set mode=optional to recommend brain-first usage and soft-audit hooks, or mode=required to install hooks that block non-trivial work when Kimetsu brain context is unavailable. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome.";
+const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, and the kimetsu-bridge skill; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome.";
 
 #[derive(Debug, Clone)]
 pub struct McpServeConfig {
