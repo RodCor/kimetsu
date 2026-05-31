@@ -49,6 +49,30 @@ pub fn discover_repo_root(start: &Path) -> KimetsuResult<PathBuf> {
     }
 }
 
+/// v0.8: make `dir` a standalone git repository (best-effort) so
+/// [`discover_repo_root`] resolves to `dir` itself instead of climbing
+/// to an enclosing repo. Two callers:
+///   * the benchmark harness, for throwaway fixture repos — without
+///     this, a fixture created under the system temp dir on a machine
+///     whose `$HOME` (or any ancestor) is a git repo would init its
+///     brain at that ancestor and leak fixture memories into it;
+///   * tests that create isolated project roots under the temp dir.
+///
+/// Creates `dir` if needed. Returns true when git reported success; a
+/// failure (e.g. git not installed) just means the caller doesn't get
+/// isolation, which is the prior behaviour.
+pub fn git_init_boundary(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn git_root(start: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])

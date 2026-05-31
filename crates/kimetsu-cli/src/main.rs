@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 mod doctor;
+mod proactive_state;
 mod update;
 
 use clap::{Args, Parser, Subcommand};
@@ -278,6 +279,10 @@ struct PluginInstallArgs {
     mode: String,
     #[arg(long)]
     force: bool,
+    /// v0.8: skip wiring the proactive PreToolUse/PostToolUse Bash
+    /// hooks (mid-work recall). UserPromptSubmit + Stop still install.
+    #[arg(long)]
+    no_proactive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -331,6 +336,73 @@ enum BrainCommand {
     /// vectors) or after changing the embedder model via
     /// `KIMETSU_BRAIN_EMBEDDER=<id>`.
     Reindex(ReindexArgs),
+    /// v0.8: inspect or change which built-in embedding model the
+    /// brain uses. `list` shows the curated set and the active id;
+    /// `set <id>` writes it to project.toml and re-embeds the corpus.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    /// v0.8: proactive PreToolUse hook. Reads tool-call JSON from
+    /// stdin and, only for a high-confidence match against a stored
+    /// failure_pattern/convention, prints a one-line warning BEFORE a
+    /// risky Bash command runs. Exits 0 silently otherwise.
+    #[command(name = "pretool-hook")]
+    PreToolHook(ProactiveHookArgs),
+    /// v0.8: proactive PostToolUse hook. Reads tool-call JSON from
+    /// stdin and, when a Bash command failed and matches a stored
+    /// failure_pattern/command, surfaces the known fix. Exits 0
+    /// silently otherwise.
+    #[command(name = "posttool-hook")]
+    PostToolHook(ProactiveHookArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// List the curated built-in embedding models and mark the active one.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the active embedding model and re-embed the corpus.
+    Set(ModelSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct ModelSetArgs {
+    /// Built-in model id (see `kimetsu brain model list`).
+    id: String,
+    /// Write the config but skip the (potentially slow) reindex.
+    #[arg(long)]
+    no_reindex: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProactiveHookArgs {
+    /// Minimum relevance score for a proactive injection (FTS-only
+    /// scale; stricter than the reactive 0.20). Default 0.45.
+    #[arg(long, default_value_t = 0.45)]
+    min_score: f32,
+    /// Lower threshold used when a looping/repeated command is
+    /// detected (the agent is stuck — surface help more readily).
+    #[arg(long, default_value_t = 0.35)]
+    loop_min_score: f32,
+    /// Max capsules to inject. Default 1 (recall discipline).
+    #[arg(long, default_value_t = 1usize)]
+    max_capsules: usize,
+    /// Suppress further proactive injections for this many seconds
+    /// after one fires (refractory throttle). Default 90.
+    #[arg(long, default_value_t = 90u64)]
+    refractory_secs: u64,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -871,7 +943,7 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let mode = PluginMode::parse(&args.mode)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
-            let report = plugin_install(&workspace, target, mode, args.force)
+            let report = plugin_install(&workspace, target, mode, args.force, !args.no_proactive)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             println!(
                 "installed Kimetsu plugin surface for {} in {} mode",
@@ -1101,6 +1173,28 @@ const CLAUDE_SETTINGS_CONTENT: &str = r#"{
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kimetsu brain pretool-hook"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "kimetsu brain posttool-hook"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "",
@@ -1150,6 +1244,13 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
 }
 
 fn brain(command: BrainCommand) -> KimetsuResult<()> {
+    // v0.8: honor the [embedder] config (env still wins) for every
+    // command except `model set`, which sets the new selection itself.
+    // The embedder is a process-static OnceLock, so this must run
+    // before any retrieval/reindex touches it — entry is the safe spot.
+    if !matches!(command, BrainCommand::Model { .. }) {
+        apply_embedder_from_cwd();
+    }
     match command {
         BrainCommand::IngestRepo { path } => {
             let summary = project::ingest_repo(&path)?;
@@ -1247,7 +1348,200 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::ContextHook(args) => brain_context_hook(args),
         BrainCommand::StopHook(args) => brain_stop_hook(args),
         BrainCommand::Reindex(args) => reindex_brain(args),
+        BrainCommand::Model { command } => brain_model(command),
+        BrainCommand::PreToolHook(args) => proactive_hook(ProactiveEvent::PreTool, args),
+        BrainCommand::PostToolHook(args) => proactive_hook(ProactiveEvent::PostTool, args),
     }
+}
+
+/// v0.8: best-effort — load the project config from the current dir and
+/// record its `[embedder] model` so brain-internal callers resolve it
+/// (env still wins). Silently no-ops when the brain isn't initialized.
+fn apply_embedder_from_cwd() {
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&cwd)
+        && let Ok(config) = project::load_config(&paths)
+    {
+        kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
+    }
+}
+
+/// v0.8: `kimetsu brain model list|set`.
+fn brain_model(command: ModelCommand) -> KimetsuResult<()> {
+    match command {
+        ModelCommand::List { json } => brain_model_list(json),
+        ModelCommand::Set(args) => brain_model_set(args),
+    }
+}
+
+fn brain_model_list(json: bool) -> KimetsuResult<()> {
+    use kimetsu_brain::embeddings::{BUILTIN_MODELS, resolve_embedder_id};
+
+    // Resolve the active id + where it came from, best-effort.
+    let (config_model, source) = match env::current_dir()
+        .ok()
+        .and_then(|cwd| kimetsu_core::paths::ProjectPaths::discover(&cwd).ok())
+        .and_then(|paths| project::load_config(&paths).ok())
+    {
+        Some(cfg) => (Some(cfg.embedder.model.clone()), "config"),
+        None => (None, "default"),
+    };
+    let env_set = env::var("KIMETSU_BRAIN_EMBEDDER")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let source = if env_set.is_some() { "env" } else { source };
+    let active = resolve_embedder_id(config_model.as_deref());
+
+    if json {
+        let models: Vec<_> = BUILTIN_MODELS
+            .iter()
+            .map(|(id, dim, blurb)| {
+                serde_json::json!({
+                    "id": id,
+                    "dim": dim,
+                    "description": blurb,
+                    "active": *id == active,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "active": active,
+                "source": source,
+                "models": models,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("Embedding models (active resolved from {source}):");
+    for (id, dim, blurb) in BUILTIN_MODELS {
+        let marker = if *id == active { "*" } else { " " };
+        println!("  {marker} {id:<22} {dim:>5}d  {blurb}");
+    }
+    println!("\nChange with: kimetsu brain model set <id>");
+    println!("(env KIMETSU_BRAIN_EMBEDDER always overrides the config field)");
+    Ok(())
+}
+
+fn brain_model_set(args: ModelSetArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::embeddings::{apply_embedder_selection, resolve_embedder_id};
+
+    // Validate against the curated set so `set` never silently falls
+    // back to the default for a typo'd id.
+    if !is_known_alias(&args.id) {
+        return Err(format!(
+            "unknown embedder id `{}`. Run `kimetsu brain model list` for the options.",
+            args.id
+        )
+        .into());
+    }
+    let canonical = resolve_embedder_id(Some(&args.id));
+
+    let workspace = args.workspace.clone().unwrap_or(env::current_dir()?);
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+    let mut config = project::load_config(&paths)?;
+    let previous = config.embedder.model.clone();
+    let prev_dim = dim_for(resolve_embedder_id(Some(&previous)));
+    let new_dim = dim_for(canonical);
+
+    config.embedder.model = canonical.to_string();
+    std::fs::write(&paths.project_toml, config.to_toml()?)?;
+
+    // Fresh CLI process: the embedder OnceLock is not yet initialized,
+    // so recording the override here means the reindex below loads the
+    // NEW model.
+    apply_embedder_selection(Some(canonical));
+
+    let dim_changed = prev_dim != new_dim;
+
+    if args.no_reindex {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true, "model": canonical, "previous": previous,
+                    "reindexed": false, "dimension_changed": dim_changed,
+                }))?
+            );
+        } else {
+            println!(
+                "Embedder set to `{canonical}` (was `{previous}`). Skipped reindex (--no-reindex)."
+            );
+            if dim_changed {
+                println!(
+                    "Dimension changed {prev_dim}d -> {new_dim}d: run `kimetsu brain reindex --force` so cosine retrieval uses the new model."
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Re-embed with a FRESH embedder for the new model (not whatever the
+    // default cache might resolve to), so the corpus is migrated to the
+    // chosen model deterministically.
+    let embedder = kimetsu_brain::embeddings::open_embedder_for_model(canonical);
+    let report = kimetsu_brain::reindex::reindex_all_with_embedder(
+        &workspace,
+        kimetsu_brain::reindex::ReindexOptions {
+            scope: kimetsu_brain::reindex::ReindexScope::All,
+            dry_run: false,
+            force: dim_changed,
+            limit: None,
+        },
+        embedder.as_ref(),
+    )?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true, "model": canonical, "previous": previous,
+                "reindexed": !report.embedder_noop,
+                "dimension_changed": dim_changed,
+                "updated": report.updated_total(),
+                "embedder_noop": report.embedder_noop,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("Embedder set to `{canonical}` (was `{previous}`).");
+    if report.embedder_noop {
+        println!(
+            "Active embedder is `noop` (lean build or KIMETSU_BRAIN_EMBEDDER=noop): id recorded, but no vectors were produced. Build with `--features embeddings` then run `kimetsu brain reindex`."
+        );
+    } else {
+        println!(
+            "Reindexed {} memories with the new model.",
+            report.updated_total()
+        );
+    }
+    Ok(())
+}
+
+fn is_known_alias(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "default"
+            | "bge-small"
+            | "bge-small-en-v1.5"
+            | "bge-m3"
+            | "m3"
+            | "jina-code"
+            | "jina-v2-base-code"
+            | "jina-embeddings-v2-base-code"
+    )
+}
+
+fn dim_for(canonical_id: &str) -> usize {
+    kimetsu_brain::embeddings::BUILTIN_MODELS
+        .iter()
+        .find(|(id, _, _)| *id == canonical_id)
+        .map(|(_, dim, _)| *dim)
+        .unwrap_or(0)
 }
 
 /// v0.4.3: `kimetsu brain reindex` — backfill missing / stale
@@ -1554,6 +1848,216 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProactiveEvent {
+    PreTool,
+    PostTool,
+}
+
+impl ProactiveEvent {
+    fn hook_event_name(self) -> &'static str {
+        match self {
+            ProactiveEvent::PreTool => "PreToolUse",
+            ProactiveEvent::PostTool => "PostToolUse",
+        }
+    }
+}
+
+/// Harness-agnostic fields pulled from a PreToolUse/PostToolUse hook
+/// payload. Both Claude Code and Codex send this superset; parse
+/// defensively so a missing/odd field just disables the relevant path.
+struct HookToolInput {
+    session_id: Option<String>,
+    tool_name: Option<String>,
+    command: Option<String>,
+    tool_response: Option<String>,
+}
+
+fn parse_hook_tool_input(raw: &str) -> HookToolInput {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
+    let str_field = |key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    };
+    let command = v
+        .get("tool_input")
+        .and_then(|ti| ti.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    // tool_response may be a string or a structured object; stringify
+    // objects so failure detection still has something to scan.
+    let tool_response = match v.get("tool_response") {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(serde_json::Value::Null) | None => None,
+        Some(other) => Some(other.to_string()),
+    };
+    HookToolInput {
+        session_id: str_field("session_id"),
+        tool_name: str_field("tool_name"),
+        command,
+        tool_response,
+    }
+}
+
+/// v0.8: proactive PreToolUse / PostToolUse hook. Shared by both
+/// events. Lexical-FTS-only retrieval, very high score floor, one
+/// capsule, per-session dedupe + refractory + loop detection. Always
+/// exits 0; emits hook JSON only on a confident, novel match.
+fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::context::ContextRequest;
+    use std::io::Read;
+
+    let workspace = args
+        .workspace
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Resolve the .kimetsu dir; if there's no brain here, stay silent.
+    let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&workspace) else {
+        return Ok(());
+    };
+    // Honor the configured embedder id for consistency (proactive
+    // retrieval is lexical-only, but this keeps labels coherent).
+    if let Ok(config) = project::load_config(&paths) {
+        kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
+    }
+
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap_or(0);
+    if input.trim().is_empty() {
+        return Ok(());
+    }
+    let hook = parse_hook_tool_input(&input);
+
+    // Defensive tool-name gate (the hook matcher should already scope
+    // to Bash, but be safe across harness quirks).
+    if let Some(name) = hook.tool_name.as_deref()
+        && !name.eq_ignore_ascii_case("bash")
+    {
+        return Ok(());
+    }
+
+    let now = proactive_state::now_unix();
+    proactive_state::gc(&paths.kimetsu_dir, now);
+
+    // Build the retrieval query + actionable kinds per event.
+    let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
+        ProactiveEvent::PreTool => {
+            let Some(cmd) = hook.command.as_deref() else {
+                return Ok(());
+            };
+            (cmd.to_string(), &["failure_pattern", "convention"], None)
+        }
+        ProactiveEvent::PostTool => {
+            let resp = hook.tool_response.as_deref().unwrap_or("");
+            if !proactive_state::looks_like_failure(resp) {
+                return Ok(()); // only react to failures
+            }
+            let cmd = hook.command.as_deref().unwrap_or("");
+            (
+                format!("{resp} {cmd}"),
+                &["failure_pattern", "command", "convention"],
+                proactive_state::error_signature(resp),
+            )
+        }
+    };
+
+    // Load session state, record this command, decide loop mode.
+    let state_path = proactive_state::session_path(&paths.kimetsu_dir, hook.session_id.as_deref());
+    let mut state = proactive_state::load(&state_path);
+    let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(&query));
+    let seen_count = state.note_command(&norm, error_sig.as_deref(), now);
+    let loop_mode = seen_count >= proactive_state::LOOP_THRESHOLD;
+
+    // Refractory throttle — unless the agent is clearly looping, stay
+    // quiet for a window after the last injection. Persist the loop
+    // counter increment even on a silent exit.
+    if !loop_mode && state.in_refractory(now, args.refractory_secs) {
+        proactive_state::save(&state_path, &state);
+        return Ok(());
+    }
+
+    let min_score = if loop_mode {
+        args.loop_min_score
+    } else {
+        args.min_score
+    };
+
+    let request = ContextRequest {
+        stage: "localization".to_string(),
+        query,
+        budget_tokens: 600,
+        min_score,
+        max_capsules: args.max_capsules.max(1),
+        kinds: kinds.iter().map(|k| k.to_string()).collect(),
+        ..Default::default()
+    };
+
+    let bundle = match project::retrieve_proactive_readonly(&workspace, request) {
+        Ok(b) => b,
+        Err(_) => {
+            proactive_state::save(&state_path, &state);
+            return Ok(());
+        }
+    };
+
+    let Some(capsule) = bundle
+        .capsules
+        .iter()
+        .find(|c| !state.is_surfaced(&c.expansion_handle))
+    else {
+        // Nothing relevant, or the only match already surfaced this
+        // session (it's already in working memory).
+        proactive_state::save(&state_path, &state);
+        return Ok(());
+    };
+
+    let body = capsule
+        .summary
+        .splitn(3, " - ")
+        .nth(1)
+        .unwrap_or(&capsule.summary);
+    let header = proactive_header(event, loop_mode);
+    let additional_context = format!("{header}\n{body}");
+
+    print_tool_use_context(event, &additional_context)?;
+
+    state.mark_surfaced(&capsule.expansion_handle);
+    state.record_injection(now);
+    proactive_state::save(&state_path, &state);
+    Ok(())
+}
+
+fn proactive_header(event: ProactiveEvent, loop_mode: bool) -> &'static str {
+    match (event, loop_mode) {
+        (_, true) => {
+            "You appear to be repeating a failing command. Kimetsu brain recalls a relevant lesson:"
+        }
+        (ProactiveEvent::PreTool, false) => {
+            "Kimetsu brain — a relevant prior failure for this command:"
+        }
+        (ProactiveEvent::PostTool, false) => "Kimetsu brain — a known fix for this failure:",
+    }
+}
+
+fn print_tool_use_context(event: ProactiveEvent, additional_context: &str) -> KimetsuResult<()> {
+    // Non-blocking inject on both harnesses: hookSpecificOutput.
+    // additionalContext with the matching hookEventName. We never set
+    // permissionDecision / decision:block — proactive recall informs,
+    // it does not gate.
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event.hook_event_name(),
+            "additionalContext": additional_context,
+        },
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
 fn stats() -> KimetsuResult<()> {
     let memories = project::list_memories(&env::current_dir()?)?;
     let runs = project::list_runs(&env::current_dir()?)?;
@@ -1611,6 +2115,7 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
                     min_confidence: args.min_confidence,
                     status: Some(args.status),
                     limit: args.limit,
+                    offset: 0,
                 },
             )?;
             if proposals.is_empty() {
@@ -1957,6 +2462,7 @@ fn review_proposals(args: ReviewArgs) -> KimetsuResult<()> {
             min_confidence: args.min_confidence,
             status: Some("pending".to_string()),
             limit: args.limit,
+            offset: 0,
         },
     )?;
 
@@ -2382,6 +2888,8 @@ mod tests {
         // ulid-named temp dir to avoid collisions when tests run concurrently.
         let root = std::env::temp_dir().join(format!("kimetsu-cli-test-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project");
+        // Isolate from any enclosing git repo (see git_init_boundary).
+        kimetsu_core::paths::git_init_boundary(&root);
         project::init_project(&root, false).expect("init project");
 
         // Inject 3 pending proposals via the brain's event-sourced path.
@@ -2518,6 +3026,8 @@ mod tests {
     fn interactive_loop_quit_preserves_partial_decisions_body() {
         let root = std::env::temp_dir().join(format!("kimetsu-cli-test-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project");
+        // Isolate from any enclosing git repo (see git_init_boundary).
+        kimetsu_core::paths::git_init_boundary(&root);
         project::init_project(&root, false).expect("init project");
 
         let proposals: [(&str, &str, &str, f32, &str); 3] = [

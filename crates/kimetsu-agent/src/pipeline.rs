@@ -2422,6 +2422,8 @@ mod tests {
     fn dry_run_pipeline_writes_trace_patch_plan_and_report() {
         let root = std::env::temp_dir().join(format!("kimetsu-pipeline-test-{}", new_id()));
         fs::create_dir_all(root.join("src")).expect("create src");
+        // Isolate from any enclosing git repo (see git_init_boundary).
+        kimetsu_core::paths::git_init_boundary(&root);
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",

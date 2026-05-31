@@ -336,6 +336,7 @@ pub fn plugin_install(
     target: BridgeTarget,
     mode: PluginMode,
     force: bool,
+    proactive: bool,
 ) -> Result<PluginInstallReport, String> {
     let workspace = normalize_path(workspace);
     let mut files = Vec::new();
@@ -373,7 +374,7 @@ pub fn plugin_install(
             // Claude Code hooks live in `.claude/settings.json` under the
             // `hooks` key (keyed by real events, fed via stdin JSON) — not
             // standalone `.ps1`/`.sh` files driven by env vars.
-            write_claude_settings(&workspace, force, &mut files)?;
+            write_claude_settings(&workspace, force, proactive, &mut files)?;
         }
         BridgeTarget::Codex => {
             let config = workspace.join(".codex").join("config.toml");
@@ -394,7 +395,7 @@ pub fn plugin_install(
                 force,
             )?;
             files.push(normalize_path(&skill));
-            write_codex_hooks(&workspace, force, &mut files)?;
+            write_codex_hooks(&workspace, force, proactive, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
             let dir = workspace.join(".kimetsu").join("extensions");
@@ -416,6 +417,7 @@ pub fn extensions_root(workspace: &Path) -> PathBuf {
 fn write_codex_hooks(
     workspace: &Path,
     force: bool,
+    proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let hooks = workspace.join(".codex").join("hooks.json");
@@ -454,6 +456,35 @@ fn write_codex_hooks(
             }]
         }]),
     );
+    if proactive {
+        // v0.8: Codex supports PreToolUse/PostToolUse with a regex
+        // matcher on tool name (Bash). Both surface a relevant memory
+        // via hookSpecificOutput.additionalContext without blocking.
+        hooks_obj.insert(
+            "PreToolUse".to_string(),
+            serde_json::json!([{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "kimetsu brain pretool-hook --workspace .",
+                    "statusMessage": "Kimetsu proactive check",
+                    "timeout": 15
+                }]
+            }]),
+        );
+        hooks_obj.insert(
+            "PostToolUse".to_string(),
+            serde_json::json!([{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "kimetsu brain posttool-hook --workspace .",
+                    "statusMessage": "Kimetsu proactive check",
+                    "timeout": 15
+                }]
+            }]),
+        );
+    }
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Codex hooks: {err}"))?;
     write_text_file(&hooks, &text, true)?;
@@ -629,6 +660,7 @@ effort or that you would want to remember next session.
 fn write_claude_settings(
     workspace: &Path,
     force: bool,
+    proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let claude_dir = workspace.join(".claude");
@@ -643,14 +675,15 @@ fn write_claude_settings(
     files.push(normalize_path(&claude_md));
 
     let settings = claude_dir.join("settings.json");
-    write_claude_hooks(&settings, force)?;
+    write_claude_hooks(&settings, force, proactive)?;
     files.push(normalize_path(&settings));
     Ok(())
 }
 
-/// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks into `.claude/settings.json`,
-/// preserving any other settings already present.
-fn write_claude_hooks(path: &Path, force: bool) -> Result<(), String> {
+/// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks (plus the v0.8
+/// proactive `PreToolUse`/`PostToolUse` Bash hooks when `proactive`)
+/// into `.claude/settings.json`, preserving any other settings.
+fn write_claude_hooks(path: &Path, force: bool, proactive: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -668,19 +701,33 @@ fn write_claude_hooks(path: &Path, force: bool) -> Result<(), String> {
             path.display()
         ));
     }
-    root_obj.insert(
-        "hooks".to_string(),
-        serde_json::json!({
-            "UserPromptSubmit": [{
-                "matcher": "",
-                "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
-            }],
-            "Stop": [{
-                "matcher": "",
-                "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
-            }]
-        }),
-    );
+    let mut hooks = serde_json::json!({
+        "UserPromptSubmit": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
+        }],
+        "Stop": [{
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
+        }]
+    });
+    if proactive && let Some(map) = hooks.as_object_mut() {
+        map.insert(
+            "PreToolUse".to_string(),
+            serde_json::json!([{
+                "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": "kimetsu brain pretool-hook" }]
+            }]),
+        );
+        map.insert(
+            "PostToolUse".to_string(),
+            serde_json::json!([{
+                "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": "kimetsu brain posttool-hook" }]
+            }]),
+        );
+    }
+    root_obj.insert("hooks".to_string(), hooks);
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Claude settings: {err}"))?;
     write_text_file(path, &text, true)
@@ -840,8 +887,14 @@ mod tests {
     fn plugin_install_writes_optional_and_required_modes() {
         let root = temp_root("plugin_install_modes");
 
-        let optional = plugin_install(&root, BridgeTarget::Codex, PluginMode::Optional, false)
-            .expect("optional install");
+        let optional = plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            PluginMode::Optional,
+            false,
+            true,
+        )
+        .expect("optional install");
         assert_eq!(optional.mode, PluginMode::Optional);
         let skill_path = root.join(".codex/skills/kimetsu-bridge/SKILL.md");
         let optional_text = fs::read_to_string(&skill_path).expect("optional skill");
@@ -863,10 +916,19 @@ mod tests {
             hooks_json["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
             Some("kimetsu brain context-hook --workspace .")
         );
+        // v0.8: proactive on by default wires the Bash PreToolUse/PostToolUse hooks.
+        assert_eq!(
+            hooks_json["hooks"]["PostToolUse"][0]["matcher"].as_str(),
+            Some("Bash")
+        );
+        assert_eq!(
+            hooks_json["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
+            Some("kimetsu brain pretool-hook --workspace .")
+        );
         assert!(!root.join(".codex/mcp.json").exists());
         assert!(!root.join(".codex/hooks/pre-turn.ps1").exists());
 
-        let required = plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, true)
+        let required = plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, true, true)
             .expect("required install");
         assert_eq!(required.mode, PluginMode::Required);
         let required_text = fs::read_to_string(&skill_path).expect("required skill");
@@ -882,6 +944,28 @@ mod tests {
                 .unwrap_or(false)
         }));
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plugin_install_no_proactive_skips_tool_hooks() {
+        let root = temp_root("plugin_install_no_proactive");
+        plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            PluginMode::Optional,
+            false,
+            false,
+        )
+        .expect("install without proactive");
+        let hooks_text = fs::read_to_string(root.join(".codex/hooks.json")).expect("codex hooks");
+        let hooks_json: serde_json::Value = serde_json::from_str(&hooks_text).expect("hooks json");
+        assert!(hooks_json["hooks"]["UserPromptSubmit"].is_array());
+        assert!(
+            hooks_json["hooks"]["PreToolUse"].is_null(),
+            "proactive disabled must not write PreToolUse"
+        );
+        assert!(hooks_json["hooks"]["PostToolUse"].is_null());
         fs::remove_dir_all(root).ok();
     }
 

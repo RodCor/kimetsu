@@ -137,11 +137,20 @@ budget.
 - **Embeddings** (default for the CLI): `cargo install kimetsu-cli`
   ships with `--features embeddings` on. Pulls fastembed-rs + ONNX
   runtime; needs the VS2022 C++ runtime on Windows (ort prebuilts).
-  Default model is BGE-small-en-v1.5; set
-  `KIMETSU_BRAIN_EMBEDDER=jina-v2-base-code` (or any fastembed-rs
-  model id) to swap. Cosine retrieval, semantic dedup, and conflict
-  detection all light up. The ~24 MB model downloads to
-  `~/.cache/huggingface/` on first embed call, then caches.
+  Default model is BGE-small-en-v1.5. Cosine retrieval, semantic
+  dedup, and conflict detection all light up. The ~24 MB model
+  downloads to `~/.cache/huggingface/` on first embed call, then
+  caches.
+- **Choosing the model.** Three built-ins are curated:
+  `bge-small-en-v1.5` (384d, default), `bge-m3` (1024d, multilingual),
+  and `jina-v2-base-code` (768d, code-tuned). Resolution precedence is
+  `KIMETSU_BRAIN_EMBEDDER` env > the `[embedder]` table in
+  `project.toml` > default. Inspect/switch with `kimetsu brain model
+  list` / `kimetsu brain model set <id>` (or the `kimetsu_brain_model_list`
+  / `kimetsu_brain_model_set` MCP tools). Switching changes the vector
+  dimension, so `model set` re-embeds the corpus with the new model;
+  cross-model rows fall back to FTS until reindexed, so retrieval never
+  breaks mid-migration.
 - **Lean**: `cargo install kimetsu-cli --no-default-features`. No
   embedder binary, no model download. Retrieval is FTS-only via the
   `α=0` effective behavior. Semantic dedup and conflict detection at
@@ -269,7 +278,7 @@ should have surfaced.
 
 ## 7. The MCP surface
 
-Run `kimetsu chat --mcp-server` and the host harness gets ~24
+Run `kimetsu chat --mcp-server` and the host harness gets ~28
 `kimetsu_*` tools. The ones you'll actually reach for:
 
 | Tool | What it does |
@@ -280,11 +289,16 @@ Run `kimetsu chat --mcp-server` and the host harness gets ~24
 | `kimetsu_brain_memory_add` | Persist a new memory directly |
 | `kimetsu_brain_memory_list` | List memories in scope, sorted by relevance |
 | `kimetsu_brain_memory_top` | Top memories by usefulness ratio |
-| `kimetsu_brain_memory_proposals` | Pending proposals awaiting review |
+| `kimetsu_brain_memory_proposals` | Pending proposals awaiting review (paginated: `limit`/`offset`) |
 | `kimetsu_brain_memory_accept` / `_reject` | Promote / reject a proposal |
 | `kimetsu_brain_memory_invalidate` | Retire a memory |
+| `kimetsu_brain_memory_search` | Full-text search over memory text (paginated; filter by kind/scope) |
 | `kimetsu_brain_memory_blame` | Per-run citation attribution |
-| `kimetsu_brain_memory_conflicts` | List open ingest conflicts |
+| `kimetsu_brain_memory_conflicts` / `kimetsu_brain_conflict_resolve` | List / settle open ingest conflicts |
+| `kimetsu_brain_prune` | List (or, with `apply`, invalidate) net-negative memories |
+| `kimetsu_brain_model_list` / `kimetsu_brain_model_set` | Inspect / switch the embedding model (set re-embeds the corpus) |
+| `kimetsu_brain_reindex` | Backfill stale/missing embeddings |
+| `kimetsu_brain_config_show` | Read the parsed `project.toml` |
 | `kimetsu_brain_ingest_repo` | Index repo files + manifests |
 | `kimetsu_benchmark_context` | Retrieve a task-aware playbook (biases toward `semantic_operator` + `anti_pattern` roles) |
 | `kimetsu_benchmark_record_outcome` | Record run outcome → proposal |
@@ -316,7 +330,39 @@ exists):
   un-captured session.
 
 Both are plain CLI subcommands, so the same hooks work under any
-harness that can run a command on a prompt/stop event.
+harness that can run a command on a prompt/stop event. `kimetsu plugin
+install --target codex` writes the equivalent hooks into
+`.codex/hooks.json`.
+
+### Proactive recall (mid-work)
+
+`UserPromptSubmit` only fires between turns. v0.8 adds two **tool-level**
+hooks so the brain can surface a memory *while* the agent works — the
+way a memory "comes to you" rather than you going to fetch it. Both use
+a `matcher: "Bash"` so they only fire on shell commands (most tool calls
+spawn nothing), and both emit `hookSpecificOutput.additionalContext`
+without ever blocking:
+
+- **`PreToolUse` → `kimetsu brain pretool-hook`** runs *before* a Bash
+  command; if the command strongly matches a stored `failure_pattern` /
+  `convention`, it warns first — heading off a known mistake.
+- **`PostToolUse` → `kimetsu brain posttool-hook`** runs *after* a Bash
+  command; when the output looks like a failure, it surfaces a matching
+  `failure_pattern` / `command` fix.
+
+Discipline keeps this near-zero-cost and non-spammy: retrieval is
+**lexical-FTS-only** (no embedding-model load, so the per-call latency
+stays low), gated by a **high score floor** (0.45; 0.35 once a
+**repeated** failing command is detected), capped at **one capsule**,
+**deduped per session** (a memory surfaces at most once), and
+**throttled** by a refractory window between injections. When nothing
+clears the bar the hook prints nothing — zero tokens. Per-session state
+(surfaced ids, last injection, recent commands) lives in
+`<repo>/.kimetsu/proactive/<session_id>.json` and is GC'd after 7 days.
+
+Proactive hooks install by default with `kimetsu plugin install`; pass
+`--no-proactive` (or `proactive:false` to `kimetsu_plugin_install`) to
+wire only `UserPromptSubmit` + `Stop`.
 
 ---
 

@@ -267,18 +267,130 @@ fn build_default_embedder() -> Box<dyn Embedder + Send + Sync> {
     Box::new(NoopEmbedder)
 }
 
+/// v0.8: open a FRESH (uncached) embedder for an explicit built-in
+/// model id. Unlike [`open_default_embedder`], this bypasses the
+/// process-static cache AND the env/override resolution — the caller
+/// asked for a *specific* model (e.g. `kimetsu brain model set` and the
+/// MCP `model_set` reindex, which must re-embed with the newly-chosen
+/// model even though the running process may have a different default
+/// embedder cached). Returns [`NoopEmbedder`] on the lean build or if
+/// the model fails to load.
+pub fn open_embedder_for_model(model_id: &str) -> Box<dyn Embedder + Send + Sync> {
+    #[cfg(feature = "embeddings")]
+    {
+        match fastembed_backend::FastembedEmbedder::try_open(model_id) {
+            Ok(engine) => return Box::new(engine),
+            Err(err) => {
+                eprintln!(
+                    "kimetsu-brain: failed to open embedder `{model_id}` ({err}); \
+                     using NoopEmbedder (no vectors produced)."
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = model_id;
+    }
+    Box::new(NoopEmbedder)
+}
+
 /// v0.4.3: env-driven kill switch. Truthy values (1/true/yes/on)
 /// force-disable the embedder for this process; "noop", "off",
 /// "none" do the same. Anything else (or unset) leaves the
 /// `embeddings` feature in control.
 fn env_disables_embedder() -> bool {
     match std::env::var("KIMETSU_BRAIN_EMBEDDER") {
-        Ok(value) => {
-            let v = value.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "noop" | "off" | "none" | "0" | "false" | "no")
-        }
+        Ok(value) => is_disable_value(&value.trim().to_ascii_lowercase()),
         Err(_) => false,
     }
+}
+
+fn is_disable_value(v: &str) -> bool {
+    matches!(v, "noop" | "off" | "none" | "0" | "false" | "no")
+}
+
+/// v0.8: curated built-in embedding models, surfaced by
+/// `kimetsu brain model list` and `kimetsu_brain_model_list`. Tuple
+/// = (stable id, vector dimension, human blurb). This is the single
+/// source of truth for the selectable set; the fastembed backend
+/// maps these ids → `EmbeddingModel` in `try_open`.
+pub const BUILTIN_MODELS: &[(&str, usize, &str)] = &[
+    ("bge-small-en-v1.5", 384, "English, default, ~67 MB int8"),
+    ("bge-m3", 1024, "Multilingual, ~600 MB int8"),
+    (
+        "jina-v2-base-code",
+        768,
+        "English + code-tuned, ~165 MB int8",
+    ),
+];
+
+/// v0.8: process-global embedder override recorded by
+/// [`apply_embedder_selection`]. Brain-internal callers
+/// ([`pick_builtin_model_from_env`], the fastembed backend, reindex)
+/// have no `ProjectConfig` in hand, so the CLI/MCP layer stashes the
+/// config-selected id here once, early, before any embed happens.
+static EMBEDDER_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// v0.8: record the config-provided embedder id so brain-internal
+/// callers resolve it when `KIMETSU_BRAIN_EMBEDDER` is unset (the env
+/// var always wins). Call once, early, before the first retrieval or
+/// embed — after the embedder `OnceLock` initializes this has no
+/// effect. No-op for `None`/empty, and only the first call sticks.
+pub fn apply_embedder_selection(config_embedder: Option<&str>) {
+    if let Some(id) = config_embedder {
+        let id = id.trim();
+        if !id.is_empty() {
+            let _ = EMBEDDER_OVERRIDE.set(id.to_string());
+        }
+    }
+}
+
+/// v0.8: map any accepted alias (env value, config value, built-in
+/// id) to a stable built-in id. Unknown values warn and fall back to
+/// the lean English default. Disable values map to the default too;
+/// the *actual* disable is handled separately by
+/// [`env_disables_embedder`].
+fn map_builtin_id(v: &str) -> &'static str {
+    match v {
+        "" | "default" | "bge-small" | "bge-small-en-v1.5" => "bge-small-en-v1.5",
+        "bge-m3" | "m3" => "bge-m3",
+        "jina-code" | "jina-v2-base-code" | "jina-embeddings-v2-base-code" => "jina-v2-base-code",
+        "noop" | "off" | "none" | "0" | "false" | "no" => "bge-small-en-v1.5",
+        other => {
+            eprintln!(
+                "kimetsu-brain: unknown embedder {other:?}, \
+                 falling back to bge-small-en-v1.5"
+            );
+            "bge-small-en-v1.5"
+        }
+    }
+}
+
+/// v0.8: resolve the active built-in model id. Precedence:
+///   1. `KIMETSU_BRAIN_EMBEDDER` env (unless it's a disable value)
+///   2. the explicit `config_embedder` arg, else the override set by
+///      [`apply_embedder_selection`]
+///   3. `bge-small-en-v1.5` default
+pub fn resolve_embedder_id(config_embedder: Option<&str>) -> &'static str {
+    if let Ok(raw) = std::env::var("KIMETSU_BRAIN_EMBEDDER") {
+        let v = raw.trim().to_ascii_lowercase();
+        if !v.is_empty() && !is_disable_value(&v) {
+            return map_builtin_id(&v);
+        }
+        // empty / disable values fall through: the model *id* still
+        // resolves from config/default even when retrieval is off.
+    }
+    let cfg = config_embedder
+        .map(str::to_string)
+        .or_else(|| EMBEDDER_OVERRIDE.get().cloned());
+    if let Some(c) = cfg {
+        let v = c.trim().to_ascii_lowercase();
+        if !v.is_empty() {
+            return map_builtin_id(&v);
+        }
+    }
+    "bge-small-en-v1.5"
 }
 
 /// v0.4.3: pick which builtin model to load from the env, returning
@@ -297,27 +409,10 @@ fn env_disables_embedder() -> bool {
 ///     code-tuned)
 ///   * anything else falls back to bge-small with a warning.
 pub fn pick_builtin_model_from_env() -> &'static str {
-    let raw = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
-    let v = raw
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    match v.as_str() {
-        "" | "default" | "bge-small" | "bge-small-en-v1.5" => "bge-small-en-v1.5",
-        "bge-m3" | "m3" => "bge-m3",
-        "jina-code" | "jina-v2-base-code" | "jina-embeddings-v2-base-code" => "jina-v2-base-code",
-        // "noop"/etc. are handled by env_disables_embedder; this
-        // function shouldn't be called in those cases but defensively
-        // pick the lean default.
-        "noop" | "off" | "none" | "0" | "false" | "no" => "bge-small-en-v1.5",
-        other => {
-            eprintln!(
-                "kimetsu-brain: unknown KIMETSU_BRAIN_EMBEDDER={other:?}, \
-                 falling back to bge-small-en-v1.5"
-            );
-            "bge-small-en-v1.5"
-        }
-    }
+    // v0.8: env > config-override (set via `apply_embedder_selection`)
+    // > default. Kept as a named entry point for the fastembed backend
+    // and `reindex`, which have no `ProjectConfig` to pass.
+    resolve_embedder_id(None)
 }
 
 // v0.4.3: real fastembed-backed embedder. Lives behind the
@@ -536,6 +631,49 @@ pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_builtin_id_maps_aliases_and_defaults_unknown() {
+        assert_eq!(map_builtin_id("bge-small-en-v1.5"), "bge-small-en-v1.5");
+        assert_eq!(map_builtin_id("default"), "bge-small-en-v1.5");
+        assert_eq!(map_builtin_id("m3"), "bge-m3");
+        assert_eq!(map_builtin_id("bge-m3"), "bge-m3");
+        assert_eq!(map_builtin_id("jina-code"), "jina-v2-base-code");
+        assert_eq!(
+            map_builtin_id("jina-embeddings-v2-base-code"),
+            "jina-v2-base-code"
+        );
+        // disable values resolve to the lean default (the kill-switch
+        // is handled separately by env_disables_embedder).
+        assert_eq!(map_builtin_id("noop"), "bge-small-en-v1.5");
+        // unknown -> warn + default.
+        assert_eq!(map_builtin_id("totally-made-up"), "bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn builtin_models_table_is_consistent() {
+        // Every advertised id must map back to itself.
+        for (id, _dim, _blurb) in BUILTIN_MODELS {
+            assert_eq!(map_builtin_id(id), *id, "id {id} must be stable");
+        }
+    }
+
+    #[test]
+    fn resolve_embedder_id_uses_config_when_env_unset() {
+        // Env mutation in parallel tests is racy + unsafe in edition
+        // 2024, so we only assert the config/default paths when the env
+        // var is genuinely absent. The env-wins path is exercised
+        // manually (see the plan's verification section).
+        if std::env::var_os("KIMETSU_BRAIN_EMBEDDER").is_some() {
+            return;
+        }
+        assert_eq!(resolve_embedder_id(Some("bge-m3")), "bge-m3");
+        assert_eq!(resolve_embedder_id(Some("jina-code")), "jina-v2-base-code");
+        // unknown config value -> default.
+        assert_eq!(resolve_embedder_id(Some("nope")), "bge-small-en-v1.5");
+        // None + no override stored in this test binary -> default.
+        assert_eq!(resolve_embedder_id(None), "bge-small-en-v1.5");
+    }
 
     #[test]
     fn noop_embedder_returns_not_implemented_and_is_noop() {

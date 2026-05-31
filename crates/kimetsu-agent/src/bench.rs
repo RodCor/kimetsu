@@ -366,6 +366,10 @@ fn run_task_mode(
 ) -> KimetsuResult<BenchTaskResult> {
     let repo = fixture_root.join(format!("{}-{}", task.id, mode.as_str()));
     write_fixture_repo(&repo, task)?;
+    // Make each fixture its own git boundary so its brain initializes
+    // inside the fixture, never climbing to an enclosing repo (e.g. a
+    // dev's $HOME repo) and leaking fixture memories there.
+    kimetsu_core::paths::git_init_boundary(&repo);
     project::init_project(&repo, false)?;
     if let Some(model_config) = model_config {
         configure_fixture_model(&repo, model_config, remaining_cost_usd)?;
@@ -1881,35 +1885,42 @@ mod tests {
 
     #[test]
     fn benchmark_reports_warm_memory_reuse() {
-        let repo = std::env::temp_dir().join(format!("kimetsu-bench-report-{}", new_id()));
-        fs::create_dir_all(&repo).expect("create repo");
+        // Isolate from the developer's real user brain
+        // (`~/.kimetsu/brain.db`): the multi-task run opens many
+        // connections, and sharing the one real file serializes them
+        // into SQLITE_BUSY. Fixture repos are already git-isolated (see
+        // run_task_mode), so this only scopes the user brain.
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let repo = std::env::temp_dir().join(format!("kimetsu-bench-report-{}", new_id()));
+            fs::create_dir_all(&repo).expect("create repo");
 
-        let report = run_benchmark(BenchOptions {
-            repo: repo.clone(),
-            keep_fixtures: false,
-            model_backed: false,
-            limit: None,
-            max_cost_usd: 1.0,
-        })
-        .expect("run benchmark");
+            let report = run_benchmark(BenchOptions {
+                repo: repo.clone(),
+                keep_fixtures: false,
+                model_backed: false,
+                limit: None,
+                max_cost_usd: 1.0,
+            })
+            .expect("run benchmark");
 
-        assert_eq!(report.task_count, 16);
-        assert!(report.report_path.exists());
-        assert!(report.results_path.exists());
-        let warm = report
-            .summaries
-            .iter()
-            .find(|summary| summary.mode == "brain_on_warm")
-            .expect("warm summary");
-        assert!(warm.accepted_memories_used >= report.task_count as u32);
-        assert!(!warm.stage_profiles.is_empty());
-        assert!(
-            warm.stage_profiles
+            assert_eq!(report.task_count, 16);
+            assert!(report.report_path.exists());
+            assert!(report.results_path.exists());
+            let warm = report
+                .summaries
                 .iter()
-                .any(|profile| profile.stage == "repo_scan")
-        );
+                .find(|summary| summary.mode == "brain_on_warm")
+                .expect("warm summary");
+            assert!(warm.accepted_memories_used >= report.task_count as u32);
+            assert!(!warm.stage_profiles.is_empty());
+            assert!(
+                warm.stage_profiles
+                    .iter()
+                    .any(|profile| profile.stage == "repo_scan")
+            );
 
-        fs::remove_dir_all(repo).expect("cleanup");
+            fs::remove_dir_all(repo).expect("cleanup");
+        });
     }
 
     #[test]
