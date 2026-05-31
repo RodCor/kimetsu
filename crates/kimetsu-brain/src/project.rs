@@ -58,6 +58,18 @@ pub struct MemoryRow {
     pub usefulness_score: f32,
 }
 
+/// v0.8: a full-text search hit over memory text, returned by
+/// [`search_memories`] and the `kimetsu_brain_memory_search` MCP tool.
+/// `rank` is the BM25-derived relevance (higher = more relevant).
+#[derive(Debug, Clone)]
+pub struct MemorySearchHit {
+    pub memory_id: String,
+    pub scope: String,
+    pub kind: String,
+    pub text: String,
+    pub rank: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProposalRow {
     pub proposal_id: String,
@@ -79,6 +91,9 @@ pub struct ProposalFilter {
     pub min_confidence: Option<f32>,
     pub status: Option<String>,
     pub limit: u32,
+    /// v0.8: row offset for paginated navigation from the MCP surface.
+    /// 0 = first page (prior behaviour).
+    pub offset: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -286,6 +301,24 @@ impl BrainSession {
             &self.config.broker.weights,
             request,
             &extras,
+        )
+    }
+
+    /// v0.8: proactive (mid-work) retrieval. Pins [`NoopEmbedder`] so
+    /// it stays lexical-FTS-only — NO embedding model is loaded even in
+    /// `--features embeddings` builds, keeping the per-tool-call hook
+    /// cheap. `request.kinds` should restrict to actionable kinds; the
+    /// caller sets a high `min_score` and `max_capsules: 1` so recall is
+    /// rare and confident (the human-brain "it comes to you" model).
+    pub fn retrieve_proactive(&self, request: ContextRequest) -> KimetsuResult<ContextBundle> {
+        let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        context::retrieve_context_with_embedder(
+            &self.conn,
+            &self.repo_root,
+            &self.config.broker.weights,
+            request,
+            &extras,
+            &embeddings::NoopEmbedder,
         )
     }
 
@@ -645,13 +678,43 @@ pub fn propose_or_merge_memory(
     }
 }
 
+/// v0.8: pagination + scope filter for `list_memories_with`, surfaced
+/// by the `kimetsu_brain_memory_list` MCP tool so an agent can page
+/// through the corpus from inside Claude/Codex.
+#[derive(Debug, Clone)]
+pub struct ListOptions {
+    /// Max project rows to return. 0 → 100 (the prior default).
+    pub limit: u32,
+    /// Project-row offset (for paging). 0 → first page.
+    pub offset: u32,
+    /// Optional scope filter (global_user / project / repo / run).
+    pub scope: Option<String>,
+}
+
+impl Default for ListOptions {
+    fn default() -> Self {
+        Self {
+            limit: 100,
+            offset: 0,
+            scope: None,
+        }
+    }
+}
+
 pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
+    list_memories_with(start, ListOptions::default())
+}
+
+/// v0.8: paginated/scoped memory listing. The project page is bounded
+/// by `limit`/`offset`; the user brain's portable rows are appended
+/// only on the first page (`offset == 0`) so they appear exactly once
+/// during navigation rather than on every page.
+pub fn list_memories_with(start: &Path, opts: ListOptions) -> KimetsuResult<Vec<MemoryRow>> {
     let (_paths, _config, conn) = load_project(start)?;
-    let mut memories = list_memories_from_conn(&conn)?;
-    // v0.4.1: merge user-brain rows so the user sees their portable
-    // capsules alongside the per-repo ones. We read user brain via
-    // the read-only path (no file-create side-effect on list).
-    if let Some(user_conn) = user_brain::open_user_brain_readonly()? {
+    let mut memories = list_memories_from_conn(&conn, &opts)?;
+    if opts.offset == 0
+        && let Some(user_conn) = user_brain::open_user_brain_readonly()?
+    {
         memories.extend(user_brain::list_user_memories(&user_conn)?);
     }
     Ok(memories)
@@ -853,33 +916,42 @@ fn text_preview(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn list_memories_from_conn(conn: &Connection) -> KimetsuResult<Vec<MemoryRow>> {
-    let mut stmt = conn.prepare(
-        "
-        SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
-        FROM memories
-        ORDER BY created_at DESC
-        LIMIT 100
-        ",
-    )?;
+fn list_memories_from_conn(conn: &Connection, opts: &ListOptions) -> KimetsuResult<Vec<MemoryRow>> {
+    let limit = if opts.limit == 0 { 100 } else { opts.limit } as i64;
+    let offset = opts.offset as i64;
 
-    let rows = stmt.query_map([], |row| {
-        Ok(MemoryRow {
-            memory_id: row.get(0)?,
-            scope: row.get(1)?,
-            kind: row.get(2)?,
-            text: row.get(3)?,
-            confidence: row.get(4)?,
-            use_count: row.get(5)?,
-            usefulness_score: row.get::<_, f64>(6)? as f32,
-        })
-    })?;
+    let (sql, scope_param): (&str, Option<String>) = if let Some(scope) = opts.scope.as_deref() {
+        (
+            "
+            SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
+            FROM memories
+            WHERE lower(scope) = lower(?1)
+            ORDER BY created_at DESC
+            LIMIT ?2 OFFSET ?3
+            ",
+            Some(scope.to_string()),
+        )
+    } else {
+        (
+            "
+            SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
+            FROM memories
+            ORDER BY created_at DESC
+            LIMIT ?1 OFFSET ?2
+            ",
+            None,
+        )
+    };
 
-    let mut memories = Vec::new();
-    for row in rows {
-        memories.push(row?);
-    }
-    Ok(memories)
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if let Some(scope) = scope_param {
+        stmt.query_map(params![scope, limit, offset], map_memory_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![limit, offset], map_memory_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(rows)
 }
 
 /// MP-6: ranked list of memories sorted by the same usefulness ratio the
@@ -1140,7 +1212,10 @@ pub fn list_proposals(start: &Path, filter: ProposalFilter) -> KimetsuResult<Vec
         sql.push_str(&clauses.join(" AND "));
     }
     let limit = if filter.limit == 0 { 100 } else { filter.limit };
-    sql.push_str(&format!(" ORDER BY rowid DESC LIMIT {limit}"));
+    sql.push_str(&format!(
+        " ORDER BY rowid DESC LIMIT {limit} OFFSET {}",
+        filter.offset
+    ));
 
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -1234,6 +1309,92 @@ pub fn retrieve_context_readonly_with_request(
     request: ContextRequest,
 ) -> KimetsuResult<ContextBundle> {
     BrainSession::open_readonly(start)?.retrieve_context_with_request(request)
+}
+
+/// v0.8: read-only proactive retrieval (lexical-FTS-only, no model
+/// load). The caller builds a `ContextRequest` with `kinds` set to the
+/// actionable set, a high `min_score`, and `max_capsules: 1`.
+pub fn retrieve_proactive_readonly(
+    start: &Path,
+    request: ContextRequest,
+) -> KimetsuResult<ContextBundle> {
+    BrainSession::open_readonly(start)?.retrieve_proactive(request)
+}
+
+/// v0.8: full-text search over memory text, for navigating the corpus
+/// from the MCP surface. Project rows are paged by `limit`/`offset`;
+/// user-brain rows are appended only on the first page so they appear
+/// once. Returns empty when the query yields no FTS tokens.
+pub fn search_memories(
+    start: &Path,
+    query: &str,
+    limit: u32,
+    offset: u32,
+    kind: Option<&str>,
+    scope: Option<&str>,
+) -> KimetsuResult<Vec<MemorySearchHit>> {
+    let Some(fts) = context::fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let (_paths, _config, conn) = load_project(start)?;
+    let mut hits = search_memories_in_conn(&conn, &fts, limit, offset, kind, scope)?;
+    if offset == 0
+        && let Some(user_conn) = user_brain::open_user_brain_readonly()?
+    {
+        hits.extend(search_memories_in_conn(
+            &user_conn, &fts, limit, 0, kind, scope,
+        )?);
+    }
+    Ok(hits)
+}
+
+fn search_memories_in_conn(
+    conn: &Connection,
+    fts_query: &str,
+    limit: u32,
+    offset: u32,
+    kind: Option<&str>,
+    scope: Option<&str>,
+) -> KimetsuResult<Vec<MemorySearchHit>> {
+    let limit = if limit == 0 { 20 } else { limit } as i64;
+    let offset = offset as i64;
+    let mut sql = String::from(
+        "
+        SELECT m.memory_id, m.scope, m.kind, m.text, bm25(memories_fts) AS rank
+        FROM memories_fts
+        JOIN memories m ON m.memory_id = memories_fts.memory_id
+        WHERE m.invalidated_at IS NULL
+          AND memories_fts MATCH ?
+        ",
+    );
+    let mut bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query.to_string())];
+    if let Some(k) = kind {
+        sql.push_str(" AND m.kind = ?");
+        bind.push(Box::new(k.to_string()));
+    }
+    if let Some(s) = scope {
+        sql.push_str(" AND lower(m.scope) = lower(?)");
+        bind.push(Box::new(s.to_string()));
+    }
+    // bm25() is more-negative = more-relevant, so ascending rank is best.
+    sql.push_str(" ORDER BY rank LIMIT ? OFFSET ?");
+    bind.push(Box::new(limit));
+    bind.push(Box::new(offset));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |row| {
+        let raw_rank = row.get::<_, f64>(4)? as f32;
+        Ok(MemorySearchHit {
+            memory_id: row.get(0)?,
+            scope: row.get(1)?,
+            kind: row.get(2)?,
+            text: row.get(3)?,
+            // surface a positive relevance (higher = better) for callers.
+            rank: (-raw_rank).max(0.0),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1710,10 +1871,159 @@ mod tests {
     // `user_brain::tests` and opt-in via `with_user_brain_at`.
     use crate::user_brain::with_user_brain_disabled;
 
+    /// v0.8: create an isolated temp project root. A minimal `git init`
+    /// gives the dir its own git toplevel so `ProjectPaths::discover`
+    /// resolves to THIS dir instead of climbing to an enclosing repo
+    /// (e.g. a developer's `$HOME` git repo) — which would otherwise
+    /// make parallel tests share one brain.db + project.lock. Without
+    /// this, tests pass only when `TMP` points outside any git repo.
+    fn test_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        kimetsu_core::paths::git_init_boundary(&root);
+        root
+    }
+
+    #[test]
+    fn search_memories_paginates_and_filters_by_kind() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::FailurePattern,
+                "linker link.exe not found on windows",
+            )
+            .expect("add fp");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Command,
+                "run cargo build with the link.exe linker on PATH",
+            )
+            .expect("add cmd");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "the office plant needs watering on tuesdays",
+            )
+            .expect("add fact");
+
+            // "linker" matches the two link.exe memories, not the plant fact.
+            let hits = search_memories(&root, "linker", 10, 0, None, None).expect("search");
+            assert!(hits.len() >= 2, "expected >=2 hits, got {}", hits.len());
+            assert!(
+                hits.iter()
+                    .all(|h| h.text.to_ascii_lowercase().contains("link"))
+            );
+
+            // Pagination: two single-row pages return distinct rows.
+            let p1 = search_memories(&root, "linker", 1, 0, None, None).expect("p1");
+            let p2 = search_memories(&root, "linker", 1, 1, None, None).expect("p2");
+            assert_eq!(p1.len(), 1);
+            assert_eq!(p2.len(), 1);
+            assert_ne!(p1[0].memory_id, p2[0].memory_id, "offset must advance");
+
+            // Kind filter narrows to failure_pattern only.
+            let fp =
+                search_memories(&root, "linker", 10, 0, Some("failure_pattern"), None).expect("fp");
+            assert!(!fp.is_empty());
+            assert!(fp.iter().all(|h| h.kind == "failure_pattern"));
+
+            // A query with no FTS tokens returns empty, not an error.
+            assert!(
+                search_memories(&root, "   ", 10, 0, None, None)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn reindex_with_explicit_embedder_uses_that_model() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "alpha beta gamma",
+            )
+            .expect("add");
+            // The explicit-embedder path (used by `model set`) must
+            // re-embed with the GIVEN embedder, regardless of the
+            // process default.
+            use crate::embeddings::Embedder as _;
+            let stub = crate::embeddings::StubEmbedder::new();
+            let report = crate::reindex::reindex_all_with_embedder(
+                &root,
+                crate::reindex::ReindexOptions {
+                    scope: crate::reindex::ReindexScope::Project,
+                    dry_run: false,
+                    force: false,
+                    limit: None,
+                },
+                &stub,
+            )
+            .expect("reindex");
+            assert_eq!(report.embedder_model_id, stub.model_id());
+            assert!(
+                report.project.updated >= 1,
+                "the row should be re-embedded with the stub model"
+            );
+        });
+    }
+
+    #[test]
+    fn retrieve_proactive_returns_actionable_kind_and_excludes_others() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::FailurePattern,
+                "linker link.exe not found -> run from x64 Native Tools prompt",
+            )
+            .expect("add fp");
+            // A high-overlap FACT that would outrank lexically but is NOT an
+            // actionable kind — the kinds filter must drop it.
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "linker link.exe trivia: link.exe ships with MSVC",
+            )
+            .expect("add fact");
+
+            let request = ContextRequest {
+                stage: "localization".to_string(),
+                query: "error: linker `link.exe` not found".to_string(),
+                budget_tokens: 600,
+                min_score: 0.2,
+                max_capsules: 1,
+                kinds: vec!["failure_pattern".to_string(), "command".to_string()],
+                ..Default::default()
+            };
+            let bundle = retrieve_proactive_readonly(&root, request).expect("proactive");
+            assert!(!bundle.skipped, "should surface the failure_pattern");
+            assert_eq!(bundle.capsules.len(), 1);
+            // The single capsule must be the failure_pattern, not the fact.
+            assert!(
+                bundle.capsules[0].summary.contains("failure_pattern"),
+                "got summary: {}",
+                bundle.capsules[0].summary
+            );
+            assert!(!bundle.capsules[0].summary.contains("trivia"));
+        });
+    }
+
     #[test]
     fn memory_add_survives_projection_rebuild_from_trace() {
         with_user_brain_disabled(|| {
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
 
             init_project(&root, false).expect("init project");
@@ -1750,7 +2060,7 @@ mod tests {
     #[test]
     fn add_memory_redacts_secrets_before_persist() {
         with_user_brain_disabled(|| {
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
 
@@ -1785,7 +2095,7 @@ mod tests {
 
     #[test]
     fn repo_ingest_indexes_searchable_files_and_context_capsules() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(root.join("src")).expect("create src");
         fs::create_dir_all(root.join("target")).expect("create target");
         fs::write(
@@ -1866,7 +2176,7 @@ mod tests {
             //
             // Per-run counting: the same memory injected into two
             // stages of one run still counts once.
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
             let memory_id = add_memory(
@@ -1952,7 +2262,7 @@ mod tests {
     #[test]
     fn run_finished_gives_weak_signal_to_silent_passenger_memories() {
         with_user_brain_disabled(|| {
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
             let memory_id = add_memory(
@@ -2015,7 +2325,7 @@ mod tests {
     #[test]
     fn blame_run_separates_cited_from_silent_passengers() {
         with_user_brain_disabled(|| {
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
             let cited_id = add_memory(
@@ -2098,7 +2408,7 @@ mod tests {
         // run.failed with category != "Gate" decrements; category == "Gate"
         // is a graceful early-exit (e.g. the plan-create existence guard)
         // and must not blame memories that happened to be in context.
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
         let memory_id = add_memory(
@@ -2209,7 +2519,7 @@ mod tests {
 
     #[test]
     fn run_aborted_does_not_update_usefulness() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
         let memory_id = add_memory(
@@ -2267,7 +2577,7 @@ mod tests {
 
     #[test]
     fn list_proposals_filters_and_reject_records_reason() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
 
@@ -2390,7 +2700,7 @@ mod tests {
     /// projection rebuild (event is canonical).
     #[test]
     fn invalidate_memory_persists_invalidated_metadata_and_survives_rebuild() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
 
@@ -2446,7 +2756,7 @@ mod tests {
     #[test]
     fn invalidated_memory_is_excluded_from_broker_retrieval() {
         with_user_brain_disabled(|| {
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
 
@@ -2495,7 +2805,7 @@ mod tests {
     /// only shows entries the broker bias actually applies to.
     #[test]
     fn list_memories_top_sorts_by_usefulness_ratio_and_drops_small_samples() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
 
@@ -2574,7 +2884,7 @@ mod tests {
     }
 
     fn prune_low_usefulness_dry_run_then_apply_body() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
 
@@ -2728,7 +3038,7 @@ mod tests {
     }
 
     fn batch_review_accepts_filtered_subset_and_rejects_remainder_body() {
-        let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+        let root = test_root();
         fs::create_dir_all(&root).expect("create temp project");
         init_project(&root, false).expect("init project");
 
@@ -2889,7 +3199,7 @@ mod tests {
     #[test]
     fn add_memory_distinct_texts_no_conflicts() {
         with_user_brain_disabled(|| {
-            let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
+            let root = test_root();
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
 

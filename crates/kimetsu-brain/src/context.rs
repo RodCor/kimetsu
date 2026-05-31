@@ -85,6 +85,13 @@ pub struct ContextRequest {
     /// of these strings receive an additional 1.3× multiplier after the
     /// tag boost (e.g. `["semantic_operator", "anti_pattern"]` for bench).
     pub prefer_roles: Vec<String>,
+    /// v0.8: hard kind filter applied BEFORE scoring + capping. When
+    /// non-empty, only candidates whose capsule `kind` is in this list
+    /// survive — so a higher-ranked repo file or off-kind memory can't
+    /// consume a (often single) slot. Used by the proactive engine to
+    /// restrict recall to actionable kinds (failure_pattern, command,
+    /// convention). Empty (default) keeps all kinds, prior behaviour.
+    pub kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +191,21 @@ pub fn retrieve_context_with_embedder(
     }
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
+
+    // v0.8: proactive kind filter — restrict to actionable kinds BEFORE
+    // scoring + capping so a higher-ranked repo file or off-kind memory
+    // can't take the proactive slot and get filtered out afterwards.
+    // Memory capsules carry the generic `kind: "memory"` and encode the
+    // real memory kind in the summary prefix ("scope:kind - text"), so
+    // match against that for memories.
+    if !request.kinds.is_empty() {
+        candidates.retain(|c| {
+            request
+                .kinds
+                .iter()
+                .any(|k| capsule_matches_kind(&c.capsule, k))
+        });
+    }
 
     normalize_and_score(&mut candidates, weights_for_stage(weights, &request.stage));
 
@@ -1025,7 +1047,24 @@ const CLASS_HINTS: &[(&[&str], &[&str])] = &[
     (&["rename", "move file", "mv "], &["move_file"]),
 ];
 
-fn fts_query(query: &str) -> Option<String> {
+/// v0.8: does a capsule satisfy a requested (memory) kind? Repo/manifest
+/// capsules match only by their literal `kind`; memory capsules
+/// (`kind == "memory"`) match against the real kind embedded in their
+/// `"scope:kind - text"` summary prefix.
+fn capsule_matches_kind(capsule: &ContextCapsule, wanted: &str) -> bool {
+    if capsule.kind == wanted {
+        return true;
+    }
+    if capsule.kind == "memory"
+        && let Some((prefix, _)) = capsule.summary.split_once(" - ")
+        && let Some((_scope, mkind)) = prefix.split_once(':')
+    {
+        return mkind == wanted;
+    }
+    false
+}
+
+pub(crate) fn fts_query(query: &str) -> Option<String> {
     let tokens = query_tokens(query);
     if tokens.is_empty() {
         return None;
@@ -1148,6 +1187,34 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capsule(kind: &str, summary: &str) -> ContextCapsule {
+        ContextCapsule {
+            id: "c".into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            token_estimate: 1,
+            expansion_handle: "memory:x".into(),
+            provenance: vec![],
+            confidence: 1.0,
+            freshness: 1.0,
+            relevance: 1.0,
+            scope_weight: 1.0,
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn capsule_matches_kind_reads_memory_summary_prefix() {
+        // Memory capsule: real kind lives in the "scope:kind - text" prefix.
+        let mem = capsule("memory", "project:failure_pattern - linker not found");
+        assert!(capsule_matches_kind(&mem, "failure_pattern"));
+        assert!(!capsule_matches_kind(&mem, "command"));
+        // Non-memory capsules match only by literal kind, never via prefix.
+        let repo = capsule("repo_file", "src/lib.rs:command - run build");
+        assert!(capsule_matches_kind(&repo, "repo_file"));
+        assert!(!capsule_matches_kind(&repo, "command"));
+    }
 
     /// MP-17e: zero-use rows are neutral (no data); use_count >= 1 starts
     /// blending toward the full multiplier (Bayesian smoothing).

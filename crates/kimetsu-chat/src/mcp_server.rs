@@ -87,6 +87,14 @@ pub fn serve_mcp<R: BufRead, W: Write>(
         .workspace
         .canonicalize()
         .unwrap_or_else(|_| config.workspace.clone());
+    // v0.8: honor the [embedder] config (env still wins) before any
+    // retrieval initializes the process-static embedder. A server
+    // started after `model set` therefore loads the configured model.
+    if let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        && let Ok(project_config) = project::load_config(&paths)
+    {
+        kimetsu_brain::embeddings::apply_embedder_selection(Some(&project_config.embedder.model));
+    }
     for line in reader.lines() {
         let line = line.map_err(|err| format!("read MCP stdin: {err}"))?;
         let line = line.trim_start_matches('\u{feff}');
@@ -338,13 +346,26 @@ fn call_tool(
                 .get("force")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let report = plugin_install(workspace, target, mode, force)?;
+            // v0.8: proactive defaults on; pass proactive:false to skip
+            // the PreToolUse/PostToolUse Bash hooks.
+            let proactive = arguments
+                .get("proactive")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let report = plugin_install(workspace, target, mode, force, proactive)?;
             Ok(json!({
                 "target": report.target.as_str(),
                 "mode": report.mode.as_str(),
                 "files": report.files,
             }))
         }
+        "kimetsu_brain_model_list" => kimetsu_brain_model_list(workspace),
+        "kimetsu_brain_model_set" => kimetsu_brain_model_set(workspace, &arguments),
+        "kimetsu_brain_reindex" => kimetsu_brain_reindex(workspace, &arguments),
+        "kimetsu_brain_memory_search" => kimetsu_brain_memory_search(workspace, &arguments),
+        "kimetsu_brain_conflict_resolve" => kimetsu_brain_conflict_resolve(workspace, &arguments),
+        "kimetsu_brain_prune" => kimetsu_brain_prune(workspace, &arguments),
+        "kimetsu_brain_config_show" => kimetsu_brain_config_show(workspace),
         other => Err(format!("unknown Kimetsu MCP tool `{other}`")),
     }
 }
@@ -508,6 +529,7 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         min_score,
         max_capsules,
         prefer_roles,
+        ..Default::default()
     };
 
     match project::retrieve_context_readonly_with_request(workspace, request) {
@@ -824,12 +846,23 @@ fn kimetsu_benchmark_record_outcome(workspace: &Path, arguments: &Value) -> Resu
 }
 
 fn kimetsu_brain_memory_list(workspace: &Path, arguments: &Value) -> Result<Value, String> {
-    let limit = u32_arg(arguments, "limit", 50, 1, 100) as usize;
-    let memories = project::list_memories(workspace)
-        .map_err(|err| format!("kimetsu brain memory list: {err}"))?;
+    let limit = u32_arg(arguments, "limit", 50, 1, 100);
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let memories = project::list_memories_with(
+        workspace,
+        project::ListOptions {
+            limit,
+            offset,
+            scope: optional_string_arg(arguments, "scope"),
+        },
+    )
+    .map_err(|err| format!("kimetsu brain memory list: {err}"))?;
     Ok(json!({
-        "memories": memories.iter().take(limit).map(json_memory_row).collect::<Vec<_>>(),
-        "usage": "Use kimetsu_brain_memory_top for outcome-ranked trust signals; use memory_id with kimetsu_brain_memory_invalidate to retire stale memories."
+        "limit": limit,
+        "offset": offset,
+        "count": memories.len(),
+        "memories": memories.iter().map(json_memory_row).collect::<Vec<_>>(),
+        "usage": "Page with limit+offset. Use kimetsu_brain_memory_search to find by text, kimetsu_brain_memory_top for outcome-ranked trust signals, and kimetsu_brain_memory_invalidate to retire stale memories."
     }))
 }
 
@@ -880,6 +913,7 @@ fn kimetsu_brain_memory_proposals(workspace: &Path, arguments: &Value) -> Result
             status: optional_string_arg(arguments, "status")
                 .or_else(|| Some("pending".to_string())),
             limit: u32_arg(arguments, "limit", 50, 1, 200),
+            offset: arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32,
         },
     )
     .map_err(|err| format!("kimetsu brain memory proposals: {err}"))?;
@@ -1006,6 +1040,252 @@ fn kimetsu_brain_ingest_repo(workspace: &Path, arguments: &Value) -> Result<Valu
         "skipped_files": summary.skipped_files,
         "manifests": summary.manifests,
         "usage": "After ingest, call kimetsu_brain_context with the task query to retrieve repo-aware capsules."
+    }))
+}
+
+/// v0.8: list the curated built-in embedding models and the active id.
+fn kimetsu_brain_model_list(workspace: &Path) -> Result<Value, String> {
+    use kimetsu_brain::embeddings::{BUILTIN_MODELS, resolve_embedder_id};
+    let config_model = project::load_config(
+        &kimetsu_core::paths::ProjectPaths::discover(workspace)
+            .map_err(|err| format!("discover workspace: {err}"))?,
+    )
+    .ok()
+    .map(|cfg| cfg.embedder.model);
+    let active = resolve_embedder_id(config_model.as_deref());
+    let models: Vec<Value> = BUILTIN_MODELS
+        .iter()
+        .map(|(id, dim, blurb)| {
+            json!({ "id": id, "dim": dim, "description": blurb, "active": *id == active })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "active": active,
+        "configured": config_model,
+        "models": models,
+        "usage": "Call kimetsu_brain_model_set to change the model. Note: a switch only affects new embeddings; restart the MCP server and run kimetsu_brain_reindex (or `kimetsu brain reindex --force` from the CLI) to re-embed existing memories."
+    }))
+}
+
+/// v0.8: change the embedding model. Records it in project.toml and
+/// (unless `reindex:false`) re-embeds the corpus in-process with a
+/// FRESH embedder for the new model — independent of the model this
+/// server loaded at startup. Note: the server's *retrieval* query
+/// embedder is a process-static singleton, so semantic retrieval in
+/// THIS session keeps using the old model (cross-model rows safely fall
+/// back to FTS) until the server restarts; the stored embeddings are
+/// already migrated, so a restart fully activates the new model.
+fn kimetsu_brain_model_set(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    use kimetsu_brain::embeddings::resolve_embedder_id;
+    let id = string_arg(arguments, "id")?;
+    // Validate against known aliases so a typo doesn't silently fall
+    // back to the default model.
+    if !is_known_embedder_alias(&id) {
+        return Err(format!(
+            "unknown embedder id `{id}`. Call kimetsu_brain_model_list for options."
+        ));
+    }
+    let canonical = resolve_embedder_id(Some(&id));
+    let paths = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .map_err(|err| format!("discover workspace: {err}"))?;
+    let mut config = project::load_config(&paths).map_err(|err| format!("load config: {err}"))?;
+    let previous = config.embedder.model.clone();
+    config.embedder.model = canonical.to_string();
+    let toml = config
+        .to_toml()
+        .map_err(|err| format!("serialize config: {err}"))?;
+    std::fs::write(&paths.project_toml, toml)
+        .map_err(|err| format!("write project.toml: {err}"))?;
+
+    let do_reindex = arguments
+        .get("reindex")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !do_reindex {
+        return Ok(json!({
+            "ok": true,
+            "model": canonical,
+            "previous": previous,
+            "reindexed": false,
+            "note": "Recorded in project.toml. Passed reindex:false, so existing memories keep their old embeddings until you run kimetsu_brain_reindex or `kimetsu brain reindex --force`."
+        }));
+    }
+
+    // Re-embed with a fresh embedder for the NEW model (not the server's
+    // cached default). The candidate predicate re-embeds every row whose
+    // embedding_model != the new model — i.e. all of them.
+    let embedder = kimetsu_brain::embeddings::open_embedder_for_model(canonical);
+    let report = kimetsu_brain::reindex::reindex_all_with_embedder(
+        workspace,
+        kimetsu_brain::reindex::ReindexOptions {
+            scope: kimetsu_brain::reindex::ReindexScope::All,
+            dry_run: false,
+            force: false,
+            limit: None,
+        },
+        embedder.as_ref(),
+    )
+    .map_err(|err| format!("reindex after model set: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "model": canonical,
+        "previous": previous,
+        "reindexed": !report.embedder_noop,
+        "updated": report.updated_total(),
+        "embedder_noop": report.embedder_noop,
+        "note": if report.embedder_noop {
+            "Recorded, but this is a lean (no-embeddings) build so no vectors were produced. Reinstall with `--features embeddings` to enable semantic retrieval."
+        } else {
+            "Recorded and existing memories re-embedded with the new model. Restart the MCP server so its retrieval query embedder also switches (until then, retrieval falls back to FTS for the migrated rows)."
+        }
+    }))
+}
+
+fn is_known_embedder_alias(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "default"
+            | "bge-small"
+            | "bge-small-en-v1.5"
+            | "bge-m3"
+            | "m3"
+            | "jina-code"
+            | "jina-v2-base-code"
+            | "jina-embeddings-v2-base-code"
+    )
+}
+
+/// v0.8: backfill stale/missing embeddings using the server's CURRENT
+/// embedder (the one loaded at startup). Useful after adding memories;
+/// to switch models, see kimetsu_brain_model_set.
+fn kimetsu_brain_reindex(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let scope = kimetsu_brain::reindex::ReindexScope::parse(
+        &optional_string_arg(arguments, "scope").unwrap_or_else(|| "all".to_string()),
+    )?;
+    let report = kimetsu_brain::reindex::reindex_all(
+        workspace,
+        kimetsu_brain::reindex::ReindexOptions {
+            scope,
+            dry_run: arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            force: arguments
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+        },
+    )
+    .map_err(|err| format!("kimetsu brain reindex: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "model": report.embedder_model_id,
+        "embedder_noop": report.embedder_noop,
+        "candidates": report.candidates_total(),
+        "updated": report.updated_total(),
+    }))
+}
+
+/// v0.8: full-text search over memory text for navigating the corpus.
+fn kimetsu_brain_memory_search(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let query = string_arg(arguments, "query")?;
+    let limit = u32_arg(arguments, "limit", 20, 1, 100);
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let hits = project::search_memories(
+        workspace,
+        &query,
+        limit,
+        offset,
+        optional_string_arg(arguments, "kind").as_deref(),
+        optional_string_arg(arguments, "scope").as_deref(),
+    )
+    .map_err(|err| format!("kimetsu brain memory search: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "query": query,
+        "limit": limit,
+        "offset": offset,
+        "count": hits.len(),
+        "results": hits.iter().map(|h| json!({
+            "memory_id": h.memory_id,
+            "scope": h.scope,
+            "kind": h.kind,
+            "text": h.text,
+            "rank": h.rank,
+        })).collect::<Vec<_>>(),
+        "usage": "Page with limit+offset. Filter by kind (failure_pattern/command/convention/preference/fact) or scope (global_user/project/repo/run)."
+    }))
+}
+
+/// v0.8: settle an open memory conflict from inside the agent.
+fn kimetsu_brain_conflict_resolve(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let conflict_id = string_arg(arguments, "conflict_id")?;
+    let resolution = string_arg(arguments, "resolution")?;
+    if !matches!(
+        resolution.as_str(),
+        "kept_new" | "kept_existing" | "kept_both"
+    ) {
+        return Err("`resolution` must be one of: kept_new, kept_existing, kept_both".to_string());
+    }
+    let resolved = project::resolve_conflict(workspace, &conflict_id, &resolution)
+        .map_err(|err| format!("kimetsu brain conflict resolve: {err}"))?;
+    Ok(json!({
+        "ok": resolved,
+        "conflict_id": conflict_id,
+        "resolution": resolution,
+        "resolved": resolved,
+        "usage": if resolved { "Conflict settled. kept_new/kept_existing invalidates the losing memory; kept_both keeps both." } else { "No open conflict with that id (already resolved or unknown)." }
+    }))
+}
+
+/// v0.8: prune net-negative memories. Defaults to a dry run (apply:false).
+fn kimetsu_brain_prune(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let apply = arguments
+        .get("apply")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let summary = project::prune_low_usefulness(
+        workspace,
+        project::PruneOptions {
+            scope: optional_string_arg(arguments, "scope"),
+            min_uses: u32_arg(arguments, "min_uses", 3, 1, 1000),
+            max_ratio: optional_f32_arg(arguments, "max_ratio").unwrap_or(0.0),
+            apply,
+        },
+    )
+    .map_err(|err| format!("kimetsu brain prune: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "apply": apply,
+        "candidate_count": summary.candidates.len(),
+        "invalidated": summary.invalidated,
+        "failed": summary.failed,
+        "candidates": summary.candidates.iter().map(|c| json!({
+            "memory_id": c.memory_id,
+            "scope": c.scope,
+            "kind": c.kind,
+            "text": c.text,
+            "use_count": c.use_count,
+            "usefulness_score": c.usefulness_score,
+        })).collect::<Vec<_>>(),
+        "usage": "This is a dry run unless apply:true. Candidates are memories with usefulness_score/use_count <= max_ratio and use_count >= min_uses."
+    }))
+}
+
+/// v0.8: read-only view of the project.toml config.
+fn kimetsu_brain_config_show(workspace: &Path) -> Result<Value, String> {
+    let raw = project::config_text(workspace)
+        .map_err(|err| format!("kimetsu brain config show: {err}"))?;
+    let parsed: Value = toml::from_str(&raw).unwrap_or(Value::Null);
+    Ok(json!({
+        "ok": true,
+        "raw": raw,
+        "config": parsed,
     }))
 }
 
@@ -1489,10 +1769,86 @@ fn tool_definitions() -> Value {
                         "enum": ["optional", "required"],
                         "description": "optional recommends Kimetsu brain first; required tells the host harness to block non-trivial work until Kimetsu context is available or explicitly waived. Benchmark guidance prefers kimetsu_benchmark_context."
                     },
-                    "force": { "type": "boolean" }
+                    "force": { "type": "boolean" },
+                    "proactive": { "type": "boolean", "description": "Default true. Set false to skip the proactive PreToolUse/PostToolUse Bash hooks (mid-work recall); UserPromptSubmit + Stop still install." }
                 },
                 "required": ["target"]
             }
+        },
+        {
+            "name": "kimetsu_brain_model_list",
+            "description": "List the curated built-in embedding models and the active one. The user can switch models from here (kimetsu_brain_model_set).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "kimetsu_brain_model_set",
+            "description": "Set the brain's embedding model (a built-in id from kimetsu_brain_model_list). Records it in project.toml and (unless reindex:false) re-embeds the corpus with the new model in-process. The server's retrieval query embedder is fixed until restart, so semantic retrieval this session falls back to FTS for migrated rows; restart to fully activate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Built-in model id, e.g. bge-small-en-v1.5, bge-m3, jina-v2-base-code." },
+                    "reindex": { "type": "boolean", "description": "Default true. Re-embed existing memories with the new model now. Set false to record the id only." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_reindex",
+            "description": "Backfill stale/missing embeddings using the server's current embedder. Run after adding memories. To change models, use kimetsu_brain_model_set.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["project", "user", "all"] },
+                    "dry_run": { "type": "boolean" },
+                    "force": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1 }
+                }
+            }
+        },
+        {
+            "name": "kimetsu_brain_memory_search",
+            "description": "Full-text search over memory text. Page with limit+offset; filter by kind or scope. Use this to navigate the memory corpus.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "kind": { "type": "string", "enum": ["preference", "convention", "command", "failure_pattern", "fact"] },
+                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_conflict_resolve",
+            "description": "Settle an open memory conflict (from kimetsu_brain_memory_conflicts) by id. kept_new/kept_existing invalidates the losing memory; kept_both keeps both.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "conflict_id": { "type": "string" },
+                    "resolution": { "type": "string", "enum": ["kept_new", "kept_existing", "kept_both"] }
+                },
+                "required": ["conflict_id", "resolution"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_prune",
+            "description": "List (or with apply:true, invalidate) net-negative memories whose usefulness ratio is at or below max_ratio. Defaults to a dry run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "min_uses": { "type": "integer", "minimum": 1 },
+                    "max_ratio": { "type": "number" },
+                    "apply": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "kimetsu_brain_config_show",
+            "description": "Read the project.toml config (raw + parsed), including the active embedder, broker weights, and run limits.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ])
 }
@@ -1802,6 +2158,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+        let root = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        // Isolate from any enclosing git repo (e.g. a dev's $HOME repo)
+        // so ProjectPaths::discover resolves here, not a shared ancestor.
+        kimetsu_core::paths::git_init_boundary(&root);
+        root
     }
 }

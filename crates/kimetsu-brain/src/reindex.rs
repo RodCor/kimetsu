@@ -119,7 +119,19 @@ impl Default for ReindexOptions {
 /// rows whose stored `embedding_model` doesn't match the active
 /// embedder.
 pub fn reindex_all(repo_start: &Path, opts: ReindexOptions) -> KimetsuResult<ReindexReport> {
-    let embedder = embeddings::open_default_embedder();
+    reindex_all_with_embedder(repo_start, opts, embeddings::open_default_embedder())
+}
+
+/// v0.8: reindex against an EXPLICIT embedder rather than the process
+/// default. Used by `model set` (CLI + MCP) so the corpus is re-embedded
+/// with the freshly-chosen model — see
+/// [`embeddings::open_embedder_for_model`] — regardless of which model
+/// the running process loaded into its static cache.
+pub fn reindex_all_with_embedder(
+    repo_start: &Path,
+    opts: ReindexOptions,
+    embedder: &(dyn Embedder + Send + Sync),
+) -> KimetsuResult<ReindexReport> {
     let model_id = embedder.model_id().to_string();
     let noop = embedder.is_noop();
 

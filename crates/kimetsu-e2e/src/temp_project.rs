@@ -31,6 +31,9 @@ impl TempProject {
     pub fn init(label: &str) -> Self {
         let root = std::env::temp_dir().join(format!("kimetsu-e2e-{label}-{}", RunId::new()));
         fs::create_dir_all(&root).expect("create temp project root");
+        // Give the root its own git boundary so init_project's discover
+        // resolves here, not an enclosing repo (e.g. a dev's $HOME repo).
+        kimetsu_core::paths::git_init_boundary(&root);
         kimetsu_brain::project::init_project(&root, false).expect("init_project");
         Self {
             root,

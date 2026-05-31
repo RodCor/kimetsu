@@ -1569,6 +1569,8 @@ mod tests {
     fn temp_project() -> PathBuf {
         let root = std::env::temp_dir().join(format!("kimetsu-tools-test-{}", new_id()));
         fs::create_dir_all(&root).expect("create temp root");
+        // Isolate from any enclosing git repo (see git_init_boundary).
+        kimetsu_core::paths::git_init_boundary(&root);
         root
     }
 }

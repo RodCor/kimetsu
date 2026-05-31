@@ -6,6 +6,53 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.8.0 — proactive recall, selectable embedding model, full MCP control
+
+The release that makes the brain **proactive** and gives the agent (and user)
+full control over it from inside Claude Code / Codex.
+
+ADDED
+  * **Proactive recall (mid-work).** New `PreToolUse` / `PostToolUse` Bash hooks
+    surface a relevant memory *while the agent works*, not just on prompt:
+    - after a **failed** Bash command, surface a matching `failure_pattern` /
+      `command` fix;
+    - **before** a risky Bash command, warn from a matching `failure_pattern`;
+    - on a **repeated** failing command (loop), lower the score floor and bypass
+      the throttle so help arrives sooner.
+    Retrieval is lexical-FTS-only (no embedding-model load), gated by a high
+    score floor (0.45; loop 0.35), capped at one capsule, with per-session
+    dedupe + a refractory throttle. Token cost stays ~0 (silent when nothing
+    qualifies). Wired into both Claude Code (`.claude/settings.json`) and Codex
+    (`.codex/hooks.json`) with a `matcher: "Bash"`; opt out with
+    `kimetsu plugin install --no-proactive` (or `proactive:false` over MCP).
+    Per-session state lives in `<repo>/.kimetsu/proactive/<session_id>.json`
+    and is garbage-collected after 7 days.
+  * **Selectable embedding model.** New `[embedder]` table in `project.toml`
+    (precedence: `KIMETSU_BRAIN_EMBEDDER` env > config > default). Inspect and
+    change it with `kimetsu brain model list` / `kimetsu brain model set <id>`
+    (the latter writes the config and re-embeds the corpus with the new model).
+    Curated built-ins: `bge-small-en-v1.5` (384d, default), `bge-m3` (1024d),
+    `jina-v2-base-code` (768d).
+  * **Full MCP control surface.** New tools so an agent can manage the brain
+    without leaving Claude Code / Codex: `kimetsu_brain_model_list` /
+    `kimetsu_brain_model_set` (re-embeds in-process with the new model),
+    `kimetsu_brain_reindex`, `kimetsu_brain_memory_search` (FTS over memory
+    text), `kimetsu_brain_conflict_resolve`, `kimetsu_brain_prune`, and
+    `kimetsu_brain_config_show`. `kimetsu_brain_memory_list` and
+    `..._memory_proposals` gained `limit`/`offset` pagination.
+
+CHANGED
+  * `reindex` can now run against an explicit embedder
+    (`reindex_all_with_embedder`), so a model switch re-embeds with the chosen
+    model regardless of the process's cached default embedder.
+
+FIXED
+  * **Test isolation.** Tests created project roots under the system temp dir;
+    on a machine whose `$HOME` is itself a git repo, `ProjectPaths::discover`
+    climbed to `$HOME` and made parallel tests share one `brain.db` +
+    `project.lock`. Each test root now gets its own git boundary, so plain
+    `cargo test` is hermetic.
+
 ## v0.7.2 — remove kimetsu-harbor-rs; first crates.io publish of the v0.7 line
 
 Maintenance + distribution release, layered on top of the v0.7.1 security

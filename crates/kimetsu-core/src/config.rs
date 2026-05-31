@@ -10,6 +10,13 @@ pub struct ProjectConfig {
     pub shell: ShellSection,
     pub ingestion: IngestionSection,
     pub run: RunSection,
+    /// v0.8: which built-in embedding model the brain uses. The
+    /// `#[serde(default)]` keeps every pre-v0.8 project.toml loading
+    /// cleanly (they get the lean English default). Resolution
+    /// precedence is `KIMETSU_BRAIN_EMBEDDER` env > this field >
+    /// default; see `kimetsu_brain::embeddings::resolve_embedder_id`.
+    #[serde(default)]
+    pub embedder: EmbedderSection,
 }
 
 impl ProjectConfig {
@@ -24,6 +31,7 @@ impl ProjectConfig {
             shell: ShellSection::default(),
             ingestion: IngestionSection::default(),
             run: RunSection::default(),
+            embedder: EmbedderSection::default(),
         }
     }
 
@@ -40,6 +48,29 @@ impl ProjectConfig {
 pub struct KimetsuSection {
     pub project_id: String,
     pub schema_version: i64,
+}
+
+/// v0.8: embedding-model selection. `model` is one of the curated
+/// built-in ids exposed by `kimetsu brain model list`
+/// (`bge-small-en-v1.5`, `bge-m3`, `jina-v2-base-code`). Switching
+/// changes the vector dimension, so a `kimetsu brain reindex` is
+/// required for cosine retrieval to use the new model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedderSection {
+    #[serde(default = "default_embedder_id")]
+    pub model: String,
+}
+
+fn default_embedder_id() -> String {
+    "bge-small-en-v1.5".to_string()
+}
+
+impl Default for EmbedderSection {
+    fn default() -> Self {
+        Self {
+            model: default_embedder_id(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,5 +239,70 @@ impl Default for RunSection {
             max_total_model_turns: 30,
             max_total_cost_usd: 250.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pre-v0.8 project.toml has no `[embedder]` table. The
+    /// `#[serde(default)]` on the field must keep it loading cleanly,
+    /// defaulting to the lean English model.
+    #[test]
+    fn pre_v0_8_config_without_embedder_loads_with_default() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-v0.8 toml must load");
+        assert_eq!(config.embedder.model, "bge-small-en-v1.5");
+    }
+
+    /// `model set` writes the whole config back via `to_toml`; a
+    /// round-trip must preserve the chosen embedder (and other sections).
+    #[test]
+    fn embedder_survives_toml_round_trip() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.embedder.model = "bge-m3".to_string();
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert_eq!(reloaded.embedder.model, "bge-m3");
+        assert_eq!(reloaded.broker.default_budget_tokens, 6000);
+        assert_eq!(reloaded.kimetsu.project_id, "demo");
     }
 }
