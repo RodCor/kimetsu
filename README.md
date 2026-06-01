@@ -6,7 +6,7 @@
 
 ### Give your coding agent a memory that gets sharper every run.
 
-**Evidence-first memory for Claude Code, Codex, and the terminal.**
+**Evidence-first memory for MCP-capable coding agents and Kimetsu's own terminal chat.**
 Kimetsu sits beside your AI agent, watches what actually solves problems,
 remembers it, and feeds the high-signal context back — so the next run
 starts where the last one left off.
@@ -26,17 +26,17 @@ zero — the same wrong turns, the same re-explaining of your conventions,
 the same expensive exploration you already paid for last week.
 
 Kimetsu fixes the forgetting. It's a **sidecar brain**: a single Rust binary
-that runs next to Claude Code or Codex (or as its own terminal chat), learns
-which memories the model *actually used to win*, and lets that knowledge
-compound across runs.
+that runs next to any supported host agent through MCP (including Claude Code
+and Codex) or as its own terminal chat, learns which memories the model
+*actually used to win*, and lets that knowledge compound across runs.
 
 - **It remembers.** Project conventions, failure patterns, the exact command
   that regenerates your schema — captured once, retrieved automatically.
 - **It learns what helps.** Memories that the model cites before solving a
   problem get promoted. Silent passengers and stale advice decay and get pruned.
 - **It's cheap to be right.** On a recorded 16-task Terminal-Bench slice,
-  brain-on runs cost **~13× less per win** than bare Claude Code — $0.19/win
-  vs $2.47/win.
+  Kimetsu-enabled runs cost **~13x less per win** than the no-brain host-agent
+  baseline: $0.19/win vs $2.47/win.
 - **It's yours, on your machine.** The whole brain is one SQLite file per
   project. No vector DB, no cloud, no telemetry. Back it up with `cp`.
 
@@ -48,17 +48,16 @@ compound across runs.
 ## How it works
 
 ```
-   ┌──────────────┐        ┌──────────────────────────────────────┐
-   │  Your agent  │        │              Kimetsu brain            │
-   │ Claude Code  │  MCP   │                                       │
-   │   / Codex    │◀──────▶│   broker ──▶ scores + ranks memories  │
-   │  / kimetsu   │ ~18    │      ▲          by relevance, useful-  │
-   │     chat     │ tools  │      │          ness, freshness, scope │
-   └──────┬───────┘        │   brain.db (SQLite + FTS5 + cosine)   │
-          │                │      ▲                                 │
-          │ cite_memory    │      │ citations + outcomes feed back  │
-          └────────────────┴──────┘                                 │
-                           └────────────────────────────────────────┘
+   +----------------------------+        +------------------------------+
+   | Host agent via MCP         |        | Kimetsu brain                |
+   | (Claude Code, Codex, etc.) | <----> | broker scores + ranks       |
+   | or kimetsu chat            | tools  | memories by relevance,      |
+   |                            |        | usefulness, freshness, scope |
+   +-------------+--------------+        | brain.db (SQLite + FTS5 +   |
+                 | cite_memory           | optional cosine retrieval)   |
+                 +---------------------> | citations + outcomes feed    |
+                                          | future retrieval             |
+                                          +------------------------------+
 ```
 
 1. **Before a task**, the agent asks Kimetsu for context. The **broker**
@@ -124,9 +123,9 @@ disk. `kimetsu uninstall` removes those same verified binaries; it leaves
 project `.kimetsu/` directories and the user brain intact unless you explicitly
 pass `--delete-user-data`.
 
-**Prerequisites:** Rust 1.85+ (stable) and a Claude or OpenAI credential
-(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). That's it for chat — Docker,
-Harbor, and Python are only needed for benchmark runs.
+**Prerequisites:** Rust 1.85+ (stable) and a model credential for the surface
+you use (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`).
+That's it for chat — Docker, Harbor, and Python are only needed for benchmark runs.
 
 ---
 
@@ -143,18 +142,19 @@ whole conversation and injects retrieved context into every turn. Inside chat,
 `/help` lists everything; favorites: `/plan`, `/run`, `/verify`, `/review`,
 `/skills`, `/cost`, and `$skill <prompt>` to apply a skill.
 
-### 2. Or bolt it onto Claude Code / Codex
+### 2. Or bolt it onto a host agent
 
-Wire Kimetsu into your existing agent as an MCP sidecar — one command:
+Wire Kimetsu into any supported host as an MCP sidecar. The built-in installers
+cover Claude Code and Codex:
 
 ```bash
 kimetsu plugin install claude --workspace .    # writes .mcp.json + .claude/settings.json
 kimetsu plugin install codex  --workspace .    # writes .codex/config.toml + .codex/hooks.json + skill
 ```
 
-Now your agent gets ~18 `kimetsu_*` tools (brain context, memory add/list,
-citations, repo ingest, the cross-harness skill bridge) and starts banking
-memories across every session.
+Now your host agent gets the `kimetsu_*` MCP tools (brain context, memory
+add/list, citations, repo ingest, the cross-harness skill bridge) and starts
+banking memories across every session.
 
 ```bash
 kimetsu brain search "build failures"
@@ -170,8 +170,8 @@ kimetsu brain memory top          # most useful memories so far
 |---------|------------|
 | **`kimetsu chat`** | A full terminal coding assistant — slash commands, skills, hooks, background tasks, MCP, agents. Runs against your workspace, no Harbor required. |
 | **`kimetsu` brain** | Event-sourced project + user memory in SQLite. Citations, decay, conflict detection, FTS + optional semantic retrieval. |
-| **`kimetsu bridge`** | Cross-harness skill portability — import/export skills between Claude Code, Codex, Agents, and Kimetsu. |
-| **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as ~18 tools. |
+| **`kimetsu bridge`** | Cross-harness skill portability — import/export skills between supported hosts such as Claude Code, Codex, Agents, and Kimetsu. |
+| **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as `kimetsu_*` tools. |
 
 Built as a small Rust workspace (`kimetsu-cli`, `-chat`, `-agent`, `-brain`,
 and `-core`). Lint + tests run clean on every change.

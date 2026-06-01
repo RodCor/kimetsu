@@ -1,34 +1,29 @@
 # How Kimetsu Works
 
-Kimetsu is a sidecar brain for coding agents. It runs alongside Claude
-Code or Codex (or as a standalone chat REPL), watches what the model
-does, learns which memories actually help, and feeds higher-signal
-context into future runs. This document explains the moving parts, in
-the order you'll encounter them.
-
-> This is the only conceptual reference in the kimetsu repo. The
-> README gets you installed; the CHANGELOG tells you what shipped
-> when; this doc tells you how it all fits together. Historical
-> planning docs + per-version postmortems live in a separate
-> internal repo — they're our lab notebook, not user documentation.
-
+Kimetsu is a sidecar brain for coding agents. It runs alongside supported
+host agents through MCP (including Claude Code and Codex), or as a standalone
+chat REPL. It watches what the model does, learns which memories actually
+help, and feeds higher-signal context into future runs. This document explains
+the moving parts, in the order you'll encounter them.
 ---
 
 ## 1. Two ways to use it
 
-**As a sidecar via MCP.** Run `kimetsu chat --mcp-server` and point
-Claude Code or Codex at it. The host agent gets ~24 kimetsu_* tools
-(brain context + record, citations, memory add/list/blame/conflicts,
-repo ingest, the bridge to other harnesses). Memories carry across
-sessions; learning compounds.
+**As a sidecar via MCP.** Run `kimetsu mcp serve` directly, or let
+`kimetsu plugin install <target>` write the host config for you. The host
+agent gets `kimetsu_*` tools (brain context + record, citations, memory
+add/list/blame/conflicts, repo ingest, the bridge to other supported hosts).
+Memories carry across sessions; learning compounds.
 
 The intended loop is two calls: **`kimetsu_brain_context`** early on a
 non-trivial task (zero overhead when the brain has nothing — it returns
 `skipped: true`), then **`kimetsu_brain_record`** after solving a
-non-obvious problem worth remembering. On Claude Code these can fire
-automatically: `kimetsu init` installs a `UserPromptSubmit` hook that
-calls `context-hook` before each turn and a `Stop` hook that calls
-`stop-hook` to summarize what was captured (see §7).
+non-obvious problem worth remembering. Supported host integrations can fire
+the context step automatically: `kimetsu plugin install claude` writes
+`.claude/settings.json`, and `kimetsu plugin install codex` writes
+`.codex/hooks.json`. Both wire `UserPromptSubmit` to
+`kimetsu brain context-hook`; hosts with a supported stop event also wire
+`kimetsu brain stop-hook` to summarize what was captured (see section 7).
 
 **As a standalone REPL.** Run `kimetsu chat`. Same brain, same
 tools, just without a host harness. Useful for debugging a brain or
@@ -278,7 +273,7 @@ should have surfaced.
 
 ## 7. The MCP surface
 
-Run `kimetsu chat --mcp-server` and the host harness gets ~28
+Run `kimetsu mcp serve` and the host harness gets ~28
 `kimetsu_*` tools. The ones you'll actually reach for:
 
 | Tool | What it does |
@@ -311,28 +306,33 @@ MCP `tools/list`. Every kimetsu_* tool returns `{"ok": true, "usage":
 {...}, ...}` so the host agent gets actionable "how to use this
 output" guidance, not just raw data.
 
-### Claude Code hooks
+### Host hooks
 
 The MCP tools work whether or not the model decides to call them. To
-make the loop reliable, `kimetsu init` writes two hooks into the
-project's `.claude/settings.json` (skipped if the file already
-exists):
+make the loop reliable, Kimetsu's plugin installers write host-native
+hook config:
+
+- **Claude Code**: `.claude/settings.json`
+- **Codex**: `.codex/hooks.json`
+
+The core hook pattern is the same across hosts:
 
 - **`UserPromptSubmit` → `kimetsu brain context-hook`** fires before
   each turn. It reads the prompt from stdin, retrieves a context
   bundle, and injects it — so the model sees relevant memories without
   having to remember to ask. Zero-overhead: when the brain has nothing,
   the hook emits nothing.
-- **`Stop` → `kimetsu brain stop-hook`** fires when a turn ends. It
-  walks the transcript, counts `kimetsu_brain_record` calls, and prints
-  a one-line post-turn banner — either confirming how many lessons were
-  captured or nudging the model to record one after a non-trivial,
-  un-captured session.
+- **`Stop` → `kimetsu brain stop-hook`** fires when the host supports a
+  stop event. It walks the transcript, counts `kimetsu_brain_record`
+  calls, and prints a one-line post-turn banner — either confirming how
+  many lessons were captured or nudging the model to record one after a
+  non-trivial, un-captured session.
 
-Both are plain CLI subcommands, so the same hooks work under any
-harness that can run a command on a prompt/stop event. `kimetsu plugin
-install --target codex` writes the equivalent hooks into
-`.codex/hooks.json`.
+These are plain CLI subcommands, so the same pattern works under any
+harness that can run a command on a prompt, stop, or tool event. The
+Codex installer wires prompt-time context and proactive tool hooks; the
+Claude Code installer wires prompt-time context, stop summaries, and
+proactive tool hooks.
 
 ### Proactive recall (mid-work)
 
@@ -362,7 +362,8 @@ clears the bar the hook prints nothing — zero tokens. Per-session state
 
 Proactive hooks install by default with `kimetsu plugin install`; pass
 `--no-proactive` (or `proactive:false` to `kimetsu_plugin_install`) to
-wire only `UserPromptSubmit` + `Stop`.
+skip `PreToolUse` / `PostToolUse` and keep only prompt-time context plus any
+supported stop hook.
 
 ---
 
@@ -371,15 +372,15 @@ wire only `UserPromptSubmit` + `Stop`.
 Kimetsu also runs as a **cross-harness skill bridge**. The
 `kimetsu bridge` subcommand:
 
-- Discovers skills installed in Claude Code, Codex, and the local
-  kimetsu installation.
-- Exports a chosen skill into another harness (e.g., promote a
-  Codex skill to Claude Code).
+- Discovers skills installed in supported hosts such as Claude Code,
+  Codex, and the local kimetsu installation.
+- Exports a chosen skill into another harness (e.g., move a skill from
+  one host to another).
 - Maintains a unified skill registry so the same skill works in
   any host.
 
 `kimetsu bridge status` shows what's installed where; `kimetsu
-bridge export <skill> --to claude-code` does the install.
+bridge export <skill> --to <target>` does the install.
 
 ---
 
@@ -457,20 +458,17 @@ Environment variables that override at runtime:
 
 | Variable | Effect |
 |----------|--------|
-| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` | Provider credentials |
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_TOKEN` | Provider credentials |
 | `KIMETSU_USER_BRAIN=0` | Disable the user brain (project-only memories) |
 | `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick the embedder (or disable) |
-| `KIMETSU_HARBOR_PROJECT` | Project to retrieve brain context from in Harbor mode |
 
 ---
 
 ## 11. What kimetsu is NOT
 
-- It's not a model. It runs on top of one (Anthropic, Claude Code OAuth).
-- It's not a sandbox. Tools run on the host machine (or via the
-  Harbor JSON-RPC transport when benchmarked against Terminal-Bench).
-- It's not a multi-agent framework. There's one agent per run; the
-  brain is the cross-run continuity.
+- It's not a model. It runs through a host agent or configured model provider
+  (for example Anthropic API or Claude Code OAuth).
+- It's not a sandbox. Tools run on the host machine.
 - It's not a vector DB. The brain is SQLite + FTS5 + optional cosine.
   Single file per project. Backups are `cp brain.db`.
 
