@@ -1,4 +1,4 @@
-# kimetsu
+# kimetsu-ai
 
 A persistent memory **brain** sidecar for Claude Code and Codex. It accumulates
 generalizable knowledge across sessions and retrieves it on demand.
@@ -11,14 +11,15 @@ This npm package installs the prebuilt native `kimetsu` binary for your platform
 ## Install
 
 ```bash
-npm install -g kimetsu
+npm install -g kimetsu-ai
 kimetsu --version
 kimetsu doctor      # checks paths, brain.db, embedder, MCP, bridge
 ```
 
-npm downloads only the platform package that matches your OS/CPU
-(`@kimetsu/linux-x64`, `@kimetsu/darwin-x64`, `@kimetsu/darwin-arm64`,
-`@kimetsu/win32-x64`) via `optionalDependencies`. There is **no postinstall
+Installs the `kimetsu` command (also available as `kimetsu-ai`). npm downloads
+only the platform package that matches your OS/CPU
+(`@kimetsu-ai/linux-x64`, `@kimetsu-ai/darwin-x64`, `@kimetsu-ai/darwin-arm64`,
+`@kimetsu-ai/win32-x64`) via `optionalDependencies`. There is **no postinstall
 download** — it works under `npm install --ignore-scripts`.
 
 ### Semantic (embeddings) build
@@ -28,7 +29,7 @@ download. To opt into the semantic build (fastembed + ONNX; first run downloads
 BGE-small), set `KIMETSU_NPM_FLAVOR=embeddings`:
 
 ```bash
-KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu
+KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai
 ```
 
 With that env var set, the launcher fetches and caches the embeddings binary from

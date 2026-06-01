@@ -1,5 +1,5 @@
 {
-  "name": "kimetsu",
+  "name": "kimetsu-ai",
   "version": "0.0.0",
   "description": "Kimetsu — a persistent memory brain sidecar for Claude Code and Codex. Installs the prebuilt native binary for your platform.",
   "keywords": [
@@ -23,7 +23,8 @@
   "license": "MIT OR Apache-2.0",
   "type": "commonjs",
   "bin": {
-    "kimetsu": "bin/cli.js"
+    "kimetsu": "bin/cli.js",
+    "kimetsu-ai": "bin/cli.js"
   },
   "files": [
     "bin/cli.js",
@@ -34,9 +35,9 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@kimetsu/linux-x64": "0.0.0",
-    "@kimetsu/darwin-x64": "0.0.0",
-    "@kimetsu/darwin-arm64": "0.0.0",
-    "@kimetsu/win32-x64": "0.0.0"
+    "@kimetsu-ai/linux-x64": "0.0.0",
+    "@kimetsu-ai/darwin-x64": "0.0.0",
+    "@kimetsu-ai/darwin-arm64": "0.0.0",
+    "@kimetsu-ai/win32-x64": "0.0.0"
   }
 }
