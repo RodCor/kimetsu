@@ -48,16 +48,35 @@ and Codex) or as its own terminal chat, learns which memories the model
 ## How it works
 
 ```
-   +----------------------------+        +------------------------------+
-   | Host agent via MCP         |        | Kimetsu brain                |
-   | (Claude Code, Codex, etc.) | <----> | broker scores + ranks       |
-   | or kimetsu chat            | tools  | memories by relevance,      |
-   |                            |        | usefulness, freshness, scope |
-   +-------------+--------------+        | brain.db (SQLite + FTS5 +   |
-                 | cite_memory           | optional cosine retrieval)   |
-                 +---------------------> | citations + outcomes feed    |
-                                          | future retrieval             |
-                                          +------------------------------+
+   +----------------------------+
+   | Host agent                 |
+   | Claude Code / Codex / chat |
+   +-------------+--------------+
+                 |
+                 | asks for context
+                 v
+   +-------------+--------------+        +------------------------------+
+   | MCP tool surface           |        | Kimetsu brain                |
+   | kimetsu_brain_context      | -----> | brain.db                     |
+   | cite_memory / record       |        | SQLite + FTS5 + embeddings   |
+   +-------------+--------------+        +---------------+--------------+
+                 |                                       ^
+                 | candidates                            |
+                 v                                       |
+   +-------------+--------------+                        |
+   | Broker                     |                        |
+   | scores + ranks by:         |                        |
+   | relevance, usefulness,     |                        |
+   | freshness, scope           |                        |
+   +-------------+--------------+                        |
+                 |                                       |
+                 | top context                           |
+                 v                                       |
+   +-------------+--------------+                        |
+   | Agent run                  |                        |
+   | uses context, cites memory | -----------------------+
+   | outcomes update ranking    | citations + outcomes
+   +----------------------------+
 ```
 
 1. **Before a task**, the agent asks Kimetsu for context. The **broker**
