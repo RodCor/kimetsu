@@ -5,7 +5,6 @@ host agents through MCP (including Claude Code and Codex), or as a standalone
 chat REPL. It watches what the model does, learns which memories actually
 help, and feeds higher-signal context into future runs. This document explains
 the moving parts, in the order you'll encounter them.
----
 
 ## 1. Two ways to use it
 
