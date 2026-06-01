@@ -260,3 +260,149 @@ jobs:
           echo "kimetsu update --check" >> $GITHUB_STEP_SUMMARY
           echo "kimetsu uninstall --dry-run" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+  publish-npm:
+    # Publish the `kimetsu` npm package after the binary matrix + GH Release
+    # succeed. esbuild/turbo style: one per-platform package per target (lean
+    # binary inside, os/cpu set) plus the main `kimetsu` package that lists
+    # them as optionalDependencies. npm installs only the matching platform
+    # package; the bin/cli.js launcher execs its binary. No postinstall.
+    #
+    # Embeddings is NOT shipped as a package — it's fetched on demand by the
+    # launcher when KIMETSU_NPM_FLAVOR=embeddings is set (see npm/kimetsu).
+    #
+    # Gated, like publish-crates, on:
+    #   (a) tag push (handled by `if`)
+    #   (b) the repo variable PUBLISH_NPM == 'true'
+    #   (c) the NPM_TOKEN secret being set
+    # To enable: `gh variable set PUBLISH_NPM --body true` and
+    # `gh secret set NPM_TOKEN` (an npm automation token).
+    name: publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_NPM == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: verify NPM_TOKEN secret is set
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not set. Skipping npm publish."
+            echo "::error::Add the secret via: gh secret set NPM_TOKEN"
+            exit 1
+          fi
+          echo "NPM_TOKEN is set (length: ${#NODE_AUTH_TOKEN})"
+
+      - name: assemble + publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # npm-key  target-triple  os  cpu  binname  ext
+          PLATFORMS=(
+            "linux-x64    x86_64-unknown-linux-gnu  linux   x64    kimetsu      tar.gz"
+            "darwin-x64   x86_64-apple-darwin       darwin  x64    kimetsu      tar.gz"
+            "darwin-arm64 aarch64-apple-darwin      darwin  arm64  kimetsu      tar.gz"
+            "win32-x64    x86_64-pc-windows-msvc     win32   x64    kimetsu.exe  zip"
+          )
+
+          mkdir -p stage
+          for row in "${PLATFORMS[@]}"; do
+            read -r key target osv cpuv binname ext <<<"$row"
+            stem="kimetsu-${VERSION}-${target}-lean"
+            archive="dist/kimetsu-${target}-lean/${stem}.${ext}"
+            if [ ! -f "$archive" ]; then
+              echo "::error::missing lean artifact for ${target}: ${archive}"
+              exit 1
+            fi
+
+            tmp="$(mktemp -d)"
+            if [ "$ext" = "zip" ]; then
+              unzip -q "$archive" -d "$tmp"
+            else
+              tar -xf "$archive" -C "$tmp"
+            fi
+
+            pkgdir="stage/${key}"
+            mkdir -p "$pkgdir/bin"
+            if [ -f "$tmp/${stem}/${binname}" ]; then
+              cp "$tmp/${stem}/${binname}" "$pkgdir/bin/${binname}"
+            elif [ -f "$tmp/${binname}" ]; then
+              cp "$tmp/${binname}" "$pkgdir/bin/${binname}"
+            else
+              echo "::error::binary ${binname} not found inside ${archive}"
+              exit 1
+            fi
+            [ "$ext" = "zip" ] || chmod +x "$pkgdir/bin/${binname}"
+
+            node -e '
+              const fs = require("fs");
+              const [dir, name, version, osv, cpuv] = process.argv.slice(1);
+              fs.writeFileSync(dir + "/package.json", JSON.stringify({
+                name,
+                version,
+                description: name + " — prebuilt kimetsu binary",
+                repository: { type: "git", url: "git+https://github.com/RodCor/kimetsu.git" },
+                license: "MIT OR Apache-2.0",
+                os: [osv],
+                cpu: [cpuv],
+                files: ["bin"],
+              }, null, 2) + "\n");
+            ' "$pkgdir" "@kimetsu/${key}" "$VERSION" "$osv" "$cpuv"
+
+            echo "publishing @kimetsu/${key}@${VERSION}"
+            ( cd "$pkgdir" && npm publish --access public )
+          done
+
+      - name: stamp + publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1];
+            const p = "npm/kimetsu/package.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            j.version = version;
+            for (const k of Object.keys(j.optionalDependencies || {})) {
+              j.optionalDependencies[k] = version;
+            }
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          ' "$VERSION"
+          echo "publishing kimetsu@${VERSION}"
+          ( cd npm/kimetsu && npm publish --access public )
+
+      - name: summary
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "## npm publish — v${VERSION} ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Published the main package + 4 platform packages:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [\`kimetsu\`](https://www.npmjs.com/package/kimetsu/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
+          for k in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
+            echo "- [\`@kimetsu/${k}\`](https://www.npmjs.com/package/@kimetsu/${k}/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "npm install -g kimetsu  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu  # semantic build" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
