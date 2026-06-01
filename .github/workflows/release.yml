@@ -333,21 +333,36 @@ jobs:
 
             tmp="$(mktemp -d)"
             if [ "$ext" = "zip" ]; then
-              unzip -q "$archive" -d "$tmp"
+              # PowerShell `Compress-Archive` writes ZIP entries with backslash
+              # separators; Info-ZIP `unzip` flattens those into a literal
+              # filename so the binary can't be found by path. `7z` (preinstalled
+              # on ubuntu-latest) normalizes backslashes into real directories.
+              7z x -y -o"$tmp" "$archive" >/dev/null
             else
               tar -xf "$archive" -C "$tmp"
             fi
 
             pkgdir="stage/${key}"
             mkdir -p "$pkgdir/bin"
+            # Prefer the expected layout (`<stem>/<binname>`), then fall back to
+            # a recursive search so the step is robust to archive quirks.
             if [ -f "$tmp/${stem}/${binname}" ]; then
-              cp "$tmp/${stem}/${binname}" "$pkgdir/bin/${binname}"
+              src="$tmp/${stem}/${binname}"
             elif [ -f "$tmp/${binname}" ]; then
-              cp "$tmp/${binname}" "$pkgdir/bin/${binname}"
+              src="$tmp/${binname}"
             else
+              # Exact match, then suffix match — the latter catches a
+              # backslash-flattened basename like `<stem>\kimetsu.exe` if some
+              # extractor still mangles the Windows archive.
+              src="$(find "$tmp" -type f -name "${binname}" | head -n1)"
+              [ -z "$src" ] && src="$(find "$tmp" -type f -name "*${binname}" | head -n1)"
+            fi
+            if [ -z "${src:-}" ] || [ ! -f "$src" ]; then
               echo "::error::binary ${binname} not found inside ${archive}"
+              echo "::error::extracted tree:"; find "$tmp" -maxdepth 3 -print
               exit 1
             fi
+            cp "$src" "$pkgdir/bin/${binname}"
             [ "$ext" = "zip" ] || chmod +x "$pkgdir/bin/${binname}"
 
             node -e '
@@ -365,8 +380,14 @@ jobs:
               }, null, 2) + "\n");
             ' "$pkgdir" "@kimetsu-ai/${key}" "$VERSION" "$osv" "$cpuv"
 
-            echo "publishing @kimetsu-ai/${key}@${VERSION}"
-            ( cd "$pkgdir" && npm publish --access public )
+            # Idempotent: skip if this exact version is already on npm, so a
+            # re-run after a partial failure doesn't choke on EPUBLISHCONFLICT.
+            if npm view "@kimetsu-ai/${key}@${VERSION}" version >/dev/null 2>&1; then
+              echo "skip: @kimetsu-ai/${key}@${VERSION} already published"
+            else
+              echo "publishing @kimetsu-ai/${key}@${VERSION}"
+              ( cd "$pkgdir" && npm publish --access public )
+            fi
           done
 
       - name: stamp + publish main package
@@ -386,8 +407,12 @@ jobs:
             }
             fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
           ' "$VERSION"
-          echo "publishing kimetsu-ai@${VERSION}"
-          ( cd npm/kimetsu && npm publish --access public )
+          if npm view "kimetsu-ai@${VERSION}" version >/dev/null 2>&1; then
+            echo "skip: kimetsu-ai@${VERSION} already published"
+          else
+            echo "publishing kimetsu-ai@${VERSION}"
+            ( cd npm/kimetsu && npm publish --access public )
+          fi
 
       - name: summary
         run: |

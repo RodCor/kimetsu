@@ -6,7 +6,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## v0.8.2 — npm distribution
+## v0.8.3 — npm distribution
 
 ADDED
   * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu-ai`
@@ -22,12 +22,19 @@ ADDED
     live in [`npm/`](npm/). Installs the `kimetsu` command (also available as
     `kimetsu-ai`).
 
-## v0.8.1
+FIXED
+  * **Windows npm package.** The `publish-npm` job now extracts the Windows
+    archive with `7z` instead of `unzip` (PowerShell `Compress-Archive` uses
+    backslash path separators that `unzip` flattens), and publishing is
+    idempotent so a re-run after a partial failure skips already-published
+    versions.
 
-Release-engineering release. The `publish-npm` pipeline first landed here, but
-the npm packages themselves ship in v0.8.2 (npm registry naming: the project
-lives under the `@kimetsu-ai` scope / `kimetsu-ai` package). crates.io and the
-prebuilt binaries released as usual.
+## v0.8.1, v0.8.2
+
+Release-engineering releases on the road to the npm channel. crates.io and the
+prebuilt binaries shipped as usual in both. npm naming settled on the
+`@kimetsu-ai` scope / `kimetsu-ai` package (v0.8.1), and the complete, working
+npm packages — including Windows — ship in v0.8.3.
 
 ## v0.8.0 — proactive recall, selectable embedding model, full MCP control
 
