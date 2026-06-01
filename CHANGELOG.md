@@ -6,7 +6,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## Unreleased
+## v0.8.1 — npm distribution
 
 ADDED
   * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu`
