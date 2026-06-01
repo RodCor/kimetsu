@@ -114,11 +114,11 @@ Prefer not to touch the Rust toolchain? Two options.
 **npm** — installs the prebuilt binary for your platform, no Rust required:
 
 ```bash
-npm install -g kimetsu                                  # lean build
-KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu    # opt into the semantic build
+npm install -g kimetsu-ai                                  # lean build
+KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai    # opt into the semantic build
 ```
 
-npm pulls only the matching per-platform package (`@kimetsu/*`) via
+npm pulls only the matching per-platform package (`@kimetsu-ai/*`) via
 optionalDependencies — there's no postinstall download, so it works under
 `npm install --ignore-scripts`. The embeddings build is fetched on first run and
 is available where ONNX Runtime prebuilts exist (Linux x64, macOS Apple Silicon,

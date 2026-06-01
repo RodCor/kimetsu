@@ -4,7 +4,7 @@
 // Launcher for the `kimetsu` npm package.
 //
 // Kimetsu is a native Rust binary. npm ships it through per-platform
-// optionalDependencies (@kimetsu/<platform>-<arch>) — npm installs only the
+// optionalDependencies (@kimetsu-ai/<platform>-<arch>) — npm installs only the
 // one whose os/cpu match the host, and this launcher execs its binary,
 // forwarding all args, stdio, and the exit code.
 //
@@ -18,25 +18,25 @@ const { spawnSync } = require("child_process");
 // key = `${process.platform}-${process.arch}`
 const PLATFORMS = {
   "linux-x64": {
-    pkg: "@kimetsu/linux-x64",
+    pkg: "@kimetsu-ai/linux-x64",
     target: "x86_64-unknown-linux-gnu",
     bin: "kimetsu",
     embeddings: true,
   },
   "darwin-x64": {
-    pkg: "@kimetsu/darwin-x64",
+    pkg: "@kimetsu-ai/darwin-x64",
     target: "x86_64-apple-darwin",
     bin: "kimetsu",
     embeddings: false, // ort ships no prebuilt ONNX Runtime for x86_64 macOS
   },
   "darwin-arm64": {
-    pkg: "@kimetsu/darwin-arm64",
+    pkg: "@kimetsu-ai/darwin-arm64",
     target: "aarch64-apple-darwin",
     bin: "kimetsu",
     embeddings: true,
   },
   "win32-x64": {
-    pkg: "@kimetsu/win32-x64",
+    pkg: "@kimetsu-ai/win32-x64",
     target: "x86_64-pc-windows-msvc",
     bin: "kimetsu.exe",
     embeddings: true,

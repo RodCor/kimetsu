@@ -363,9 +363,9 @@ jobs:
                 cpu: [cpuv],
                 files: ["bin"],
               }, null, 2) + "\n");
-            ' "$pkgdir" "@kimetsu/${key}" "$VERSION" "$osv" "$cpuv"
+            ' "$pkgdir" "@kimetsu-ai/${key}" "$VERSION" "$osv" "$cpuv"
 
-            echo "publishing @kimetsu/${key}@${VERSION}"
+            echo "publishing @kimetsu-ai/${key}@${VERSION}"
             ( cd "$pkgdir" && npm publish --access public )
           done
 
@@ -386,7 +386,7 @@ jobs:
             }
             fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
           ' "$VERSION"
-          echo "publishing kimetsu@${VERSION}"
+          echo "publishing kimetsu-ai@${VERSION}"
           ( cd npm/kimetsu && npm publish --access public )
 
       - name: summary
@@ -396,13 +396,13 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Published the main package + 4 platform packages:" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- [\`kimetsu\`](https://www.npmjs.com/package/kimetsu/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
+          echo "- [\`kimetsu-ai\`](https://www.npmjs.com/package/kimetsu-ai/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
           for k in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
-            echo "- [\`@kimetsu/${k}\`](https://www.npmjs.com/package/@kimetsu/${k}/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
+            echo "- [\`@kimetsu-ai/${k}\`](https://www.npmjs.com/package/@kimetsu-ai/${k}/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
           done
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "npm install -g kimetsu  # lean build" >> $GITHUB_STEP_SUMMARY
-          echo "KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu  # semantic build" >> $GITHUB_STEP_SUMMARY
+          echo "npm install -g kimetsu-ai  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai  # semantic build" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

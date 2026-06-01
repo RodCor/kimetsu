@@ -6,20 +6,28 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## v0.8.1 — npm distribution
+## v0.8.2 — npm distribution
 
 ADDED
-  * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu`
+  * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu-ai`
     installs the prebuilt native binary for your platform, no Rust toolchain
     required. Uses the esbuild/turbo model: per-platform packages
-    (`@kimetsu/linux-x64`, `@kimetsu/darwin-x64`, `@kimetsu/darwin-arm64`,
-    `@kimetsu/win32-x64`) selected via `optionalDependencies`, with a thin
+    (`@kimetsu-ai/linux-x64`, `@kimetsu-ai/darwin-x64`, `@kimetsu-ai/darwin-arm64`,
+    `@kimetsu-ai/win32-x64`) selected via `optionalDependencies`, with a thin
     `bin/cli.js` launcher that execs the matching binary. No postinstall, so it
     works under `npm install --ignore-scripts`. The semantic build is fetched on
     demand when `KIMETSU_NPM_FLAVOR=embeddings` is set. Published from the
-    existing release pipeline (new `publish-npm` job, gated on the `PUBLISH_NPM`
+    existing release pipeline (`publish-npm` job, gated on the `PUBLISH_NPM`
     repo variable + `NPM_TOKEN` secret, mirroring the crates.io gate). Sources
-    live in [`npm/`](npm/).
+    live in [`npm/`](npm/). Installs the `kimetsu` command (also available as
+    `kimetsu-ai`).
+
+## v0.8.1
+
+Release-engineering release. The `publish-npm` pipeline first landed here, but
+the npm packages themselves ship in v0.8.2 (npm registry naming: the project
+lives under the `@kimetsu-ai` scope / `kimetsu-ai` package). crates.io and the
+prebuilt binaries released as usual.
 
 ## v0.8.0 — proactive recall, selectable embedding model, full MCP control
 
