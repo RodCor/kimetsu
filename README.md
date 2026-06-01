@@ -109,8 +109,22 @@ cargo install kimetsu-cli --features embeddings
 cargo install --path crates/kimetsu-cli   # add --features embeddings for semantic search
 ```
 
-Prefer not to touch the Rust toolchain? Pre-built binaries for
-**Linux / macOS / Windows** ship on every
+Prefer not to touch the Rust toolchain? Two options.
+
+**npm** — installs the prebuilt binary for your platform, no Rust required:
+
+```bash
+npm install -g kimetsu                                  # lean build
+KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu    # opt into the semantic build
+```
+
+npm pulls only the matching per-platform package (`@kimetsu/*`) via
+optionalDependencies — there's no postinstall download, so it works under
+`npm install --ignore-scripts`. The embeddings build is fetched on first run and
+is available where ONNX Runtime prebuilts exist (Linux x64, macOS Apple Silicon,
+Windows x64); elsewhere it falls back to lean. See [`npm/`](npm/) for details.
+
+**Pre-built archives** — for **Linux / macOS / Windows** on every
 [GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put
 `kimetsu` / `kimetsu.exe` somewhere on `PATH` (`~/.local/bin`, `/usr/local/bin`,
 or `%USERPROFILE%\.cargo\bin`). Lean archives are published for Linux,

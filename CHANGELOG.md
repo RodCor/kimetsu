@@ -6,6 +6,21 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## Unreleased
+
+ADDED
+  * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu`
+    installs the prebuilt native binary for your platform, no Rust toolchain
+    required. Uses the esbuild/turbo model: per-platform packages
+    (`@kimetsu/linux-x64`, `@kimetsu/darwin-x64`, `@kimetsu/darwin-arm64`,
+    `@kimetsu/win32-x64`) selected via `optionalDependencies`, with a thin
+    `bin/cli.js` launcher that execs the matching binary. No postinstall, so it
+    works under `npm install --ignore-scripts`. The semantic build is fetched on
+    demand when `KIMETSU_NPM_FLAVOR=embeddings` is set. Published from the
+    existing release pipeline (new `publish-npm` job, gated on the `PUBLISH_NPM`
+    repo variable + `NPM_TOKEN` secret, mirroring the crates.io gate). Sources
+    live in [`npm/`](npm/).
+
 ## v0.8.0 — proactive recall, selectable embedding model, full MCP control
 
 The release that makes the brain **proactive** and gives the agent (and user)
