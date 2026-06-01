@@ -45,10 +45,3 @@ real version (`${GITHUB_REF_NAME#v}`) into the main package and every
 `@kimetsu/*` package + `optionalDependencies` entry at publish time, so npm
 always matches the crates.io / GitHub Release for the same tag. The single
 source of truth remains `Cargo.toml` `[workspace.package] version`.
-
-## One-time maintainer setup
-
-- Own the unscoped `kimetsu` name and create the `@kimetsu` scope on npm.
-- `gh secret set NPM_TOKEN` with an **automation** publish token.
-- `gh variable set PUBLISH_NPM --body true` to enable the publish job
-  (kept off until the first publish is reviewed, mirroring `PUBLISH_CRATES`).
