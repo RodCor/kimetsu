@@ -531,7 +531,10 @@ fn upsert_kimetsu_hook(
         *entry = serde_json::Value::Array(vec![group]);
         return;
     };
-    match list.iter_mut().find(|existing| is_kimetsu_hook_group(existing)) {
+    match list
+        .iter_mut()
+        .find(|existing| is_kimetsu_hook_group(existing))
+    {
         Some(slot) => *slot = group,
         None => list.push(group),
     }
@@ -1006,7 +1009,11 @@ mod tests {
         // Second upsert (re-run): replace in place, no duplicate.
         upsert_kimetsu_hook(&mut hooks, "UserPromptSubmit", km);
         let arr = hooks["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(arr.len(), 2, "re-run is idempotent, no duplicate kimetsu group");
+        assert_eq!(
+            arr.len(),
+            2,
+            "re-run is idempotent, no duplicate kimetsu group"
+        );
         assert_eq!(arr[0]["hooks"][0]["command"], "my-own-hook");
 
         // New event with no prior array: creates it.
@@ -1018,8 +1025,14 @@ mod tests {
     #[test]
     fn install_scope_parses_aliases() {
         assert_eq!(InstallScope::parse("").unwrap(), InstallScope::Workspace);
-        assert_eq!(InstallScope::parse("workspace").unwrap(), InstallScope::Workspace);
-        assert_eq!(InstallScope::parse("Local").unwrap(), InstallScope::Workspace);
+        assert_eq!(
+            InstallScope::parse("workspace").unwrap(),
+            InstallScope::Workspace
+        );
+        assert_eq!(
+            InstallScope::parse("Local").unwrap(),
+            InstallScope::Workspace
+        );
         assert_eq!(InstallScope::parse("global").unwrap(), InstallScope::Global);
         assert_eq!(InstallScope::parse("USER").unwrap(), InstallScope::Global);
         assert_eq!(InstallScope::Workspace.as_str(), "workspace");
@@ -1099,8 +1112,15 @@ mod tests {
         assert!(!root.join(".codex/mcp.json").exists());
         assert!(!root.join(".codex/hooks/pre-turn.ps1").exists());
 
-        let required = plugin_install(&root, BridgeTarget::Codex, InstallScope::Workspace, PluginMode::Required, true, true)
-            .expect("required install");
+        let required = plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Required,
+            true,
+            true,
+        )
+        .expect("required install");
         assert_eq!(required.mode, PluginMode::Required);
         let required_text = fs::read_to_string(&skill_path).expect("required skill");
         assert!(required_text.contains("Required mode"));
@@ -1171,7 +1191,11 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 2, "user group kept + one kimetsu group, no dupes");
+        assert_eq!(
+            ups.len(),
+            2,
+            "user group kept + one kimetsu group, no dupes"
+        );
         assert_eq!(ups[0]["hooks"][0]["command"], "user-prompt-thing");
         assert_eq!(ups[1]["hooks"][0]["command"], "kimetsu brain context-hook");
         // Unrelated user event untouched.
@@ -1180,8 +1204,14 @@ mod tests {
             "user-subagent-thing"
         );
         // Kimetsu's own events present.
-        assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["command"], "kimetsu brain stop-hook");
-        assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "kimetsu brain pretool-hook");
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "kimetsu brain stop-hook"
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "kimetsu brain pretool-hook"
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -1244,13 +1274,20 @@ mod tests {
 
         // Global style: only `mcpServers`, preserving unrelated keys.
         let claude_json = root.join(".claude.json");
-        fs::write(&claude_json, serde_json::to_string(&json!({ "keepme": 1 })).unwrap()).unwrap();
+        fs::write(
+            &claude_json,
+            serde_json::to_string(&json!({ "keepme": 1 })).unwrap(),
+        )
+        .unwrap();
         write_mcp_config(&claude_json, true).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(value["keepme"], 1);
         assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
-        assert!(value.get("servers").is_none(), "global writes mcpServers only");
+        assert!(
+            value.get("servers").is_none(),
+            "global writes mcpServers only"
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -1259,14 +1296,27 @@ mod tests {
     fn plugin_install_refreshes_generated_files_without_force() {
         let root = temp_root("plugin_install_refresh");
         // First install (Codex) writes SKILL.md.
-        plugin_install(&root, BridgeTarget::Codex, InstallScope::Workspace, PluginMode::Optional, false, true).unwrap();
-        // Second install with force=false must succeed (refresh, not error).
-        plugin_install(&root, BridgeTarget::Codex, InstallScope::Workspace, PluginMode::Required, false, true).unwrap();
-
-        let skill = fs::read_to_string(
-            root.join(".codex/skills/kimetsu-bridge/SKILL.md"),
+        plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
         )
         .unwrap();
+        // Second install with force=false must succeed (refresh, not error).
+        plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Required,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let skill = fs::read_to_string(root.join(".codex/skills/kimetsu-bridge/SKILL.md")).unwrap();
         // Prove the file was overwritten with the Required variant, not left as Optional.
         assert!(
             skill.contains("Treat missing Kimetsu MCP access as a setup blocker"),

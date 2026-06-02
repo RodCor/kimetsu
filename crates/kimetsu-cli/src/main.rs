@@ -950,9 +950,15 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let mode = PluginMode::parse(&args.mode)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
-            let report =
-                plugin_install(&workspace, target, scope, mode, args.force, !args.no_proactive)
-                    .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            let report = plugin_install(
+                &workspace,
+                target,
+                scope,
+                mode,
+                args.force,
+                !args.no_proactive,
+            )
+            .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             println!(
                 "installed Kimetsu plugin surface for {} ({} scope) in {} mode",
                 report.target.as_str(),
