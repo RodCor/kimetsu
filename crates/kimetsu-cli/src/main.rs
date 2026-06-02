@@ -1898,13 +1898,13 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace).ok();
-    let auto_harvest = paths
+    let (auto_harvest, distiller_enabled) = paths
         .as_ref()
         .and_then(|p| project::load_config(p).ok())
-        .map(|c| c.learning.auto_harvest)
-        .unwrap_or(true);
+        .map(|c| (c.learning.auto_harvest, c.learning.distiller.enabled))
+        .unwrap_or((true, false));
 
-    if auto_harvest
+    if should_emit_stop_harvest_cue(auto_harvest, distiller_enabled)
         && !stop_active
         && let Some(paths) = paths.as_ref()
     {
@@ -1927,6 +1927,12 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
     );
     Ok(())
+}
+
+/// The end-of-session harvest cue fires only when auto-harvest is on AND
+/// the credentialed distiller is not handling end-of-session itself.
+fn should_emit_stop_harvest_cue(auto_harvest: bool, distiller_enabled: bool) -> bool {
+    auto_harvest && !distiller_enabled
 }
 
 /// Count `kimetsu_brain_record` tool-use blocks across transcript
@@ -3349,5 +3355,12 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn stop_cue_suppressed_when_distiller_enabled() {
+        assert!(should_emit_stop_harvest_cue(true, false));
+        assert!(!should_emit_stop_harvest_cue(true, true));
+        assert!(!should_emit_stop_harvest_cue(false, false));
     }
 }
