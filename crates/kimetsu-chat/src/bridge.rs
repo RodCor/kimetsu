@@ -900,6 +900,14 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
             "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
         }),
     );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "SessionEnd",
+        serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain session-end-hook" }]
+        }),
+    );
     if proactive {
         upsert_kimetsu_hook(
             hooks_obj,
@@ -1470,6 +1478,23 @@ mod tests {
 
         fs::remove_dir_all(ws).ok();
         fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn claude_hooks_install_session_end() {
+        let root = temp_root("claude_session_end");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        write_claude_hooks(&settings, true).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(strip_bom(&fs::read_to_string(&settings).unwrap())).unwrap();
+        assert_eq!(
+            value["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "kimetsu brain session-end-hook"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     fn temp_root(label: &str) -> PathBuf {
