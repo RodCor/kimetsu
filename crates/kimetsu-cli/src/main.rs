@@ -997,15 +997,16 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
             let interactive = args.setup_harvest
                 || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
             if matches!(target, BridgeTarget::ClaudeCode) && !args.no_setup && interactive {
-                if let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&workspace) {
-                    let stdin = std::io::stdin();
-                    let mut reader = stdin.lock();
-                    let mut stdout = std::io::stdout();
-                    if let Err(err) =
-                        harvest_setup::run_harvest_setup(&mut reader, &mut stdout, &paths)
-                    {
-                        eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
-                    }
+                // Anchor strictly at the install workspace (NOT `discover`,
+                // which climbs to an enclosing git repo and could write the
+                // distiller config + secret .env into a parent repository).
+                let paths = kimetsu_core::paths::ProjectPaths::at_root(&workspace);
+                let stdin = std::io::stdin();
+                let mut reader = stdin.lock();
+                let mut stdout = std::io::stdout();
+                if let Err(err) = harvest_setup::run_harvest_setup(&mut reader, &mut stdout, &paths)
+                {
+                    eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
                 }
             }
         }

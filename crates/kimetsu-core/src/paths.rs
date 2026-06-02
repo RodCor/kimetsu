@@ -17,11 +17,18 @@ pub struct ProjectPaths {
 
 impl ProjectPaths {
     pub fn discover(start: impl AsRef<Path>) -> KimetsuResult<Self> {
-        let start = start.as_ref();
-        let repo_root = discover_repo_root(start)?;
-        let kimetsu_dir = repo_root.join(".kimetsu");
+        let repo_root = discover_repo_root(start.as_ref())?;
+        Ok(Self::at_root(repo_root))
+    }
 
-        Ok(Self {
+    /// Build the paths anchored at an explicit `repo_root`, WITHOUT
+    /// climbing to an enclosing git repository. Use this when a command
+    /// is told exactly which directory to operate on (e.g. the install
+    /// wizard's `--workspace`), so it never writes into a parent repo.
+    pub fn at_root(repo_root: impl Into<PathBuf>) -> Self {
+        let repo_root = repo_root.into();
+        let kimetsu_dir = repo_root.join(".kimetsu");
+        Self {
             repo_root,
             project_toml: kimetsu_dir.join("project.toml"),
             brain_db: kimetsu_dir.join("brain.db"),
@@ -29,7 +36,7 @@ impl ProjectPaths {
             runs_dir: kimetsu_dir.join("runs"),
             lock_file: kimetsu_dir.join("project.lock"),
             kimetsu_dir,
-        })
+        }
     }
 }
 

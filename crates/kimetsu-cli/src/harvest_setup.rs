@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use kimetsu_brain::project;
+use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::paths::ProjectPaths;
 
 /// Run the wizard against the given reader/writer (real stdin/stdout in
@@ -29,7 +29,10 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     let harness = read_line(reader)?.trim().to_lowercase();
     match harness.as_str() {
         "codex" => {
-            writeln!(writer, "Codex distiller is not supported yet — skipping setup.")?;
+            writeln!(
+                writer,
+                "Codex distiller is not supported yet — skipping setup."
+            )?;
             return Ok(false);
         }
         // Blank defaults to claude; accept the common aliases.
@@ -86,23 +89,35 @@ fn read_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
     Ok(line)
 }
 
-/// Load (or initialize) the workspace project config and flip the
-/// distiller on with the chosen model.
+/// Flip the distiller on in the project config, anchored strictly at
+/// `paths` (the install workspace). Loads an existing `project.toml` if
+/// present, else starts from a default — it does NOT call `init_project`
+/// (which would climb to an enclosing git repo and open the brain DB), so
+/// the config + secret never land in a parent repository.
 fn apply_distiller_config(paths: &ProjectPaths, model: &str) -> std::io::Result<()> {
     // KimetsuResult's error is Box<dyn Error + Send + Sync>; it implements
     // Display, so to_string() works without naming a concrete error type.
-    let io_err =
-        |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
-    if !paths.project_toml.exists() {
-        project::init_project(&paths.repo_root, false).map_err(io_err)?;
-    }
-    let mut config = project::load_config(paths).map_err(io_err)?;
+    let io_err = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
+    let mut config = if paths.project_toml.exists() {
+        ProjectConfig::from_toml(&fs::read_to_string(&paths.project_toml)?).map_err(io_err)?
+    } else {
+        let project_id = paths
+            .repo_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        ProjectConfig::default_for_project(project_id)
+    };
     config.learning.distiller.enabled = true;
     config.learning.distiller.provider = "anthropic".to_string();
     config.learning.distiller.model = model.to_string();
     config.learning.distiller.api_key_env = "ANTHROPIC_API_KEY".to_string();
     config.learning.distiller.base_url_env = "ANTHROPIC_BASE_URL".to_string();
     let toml = config.to_toml().map_err(io_err)?;
+    if let Some(parent) = paths.project_toml.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&paths.project_toml, toml)
 }
 
@@ -152,11 +167,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    // CRITICAL: git_init_boundary makes the temp dir its own git toplevel so
-    // ProjectPaths::discover doesn't climb to the real dev repo.
+    // `at_root` anchors strictly at the temp dir (no git climbing), which is
+    // exactly how the CLI gate builds the paths in production.
     fn paths_for(root: &Path) -> ProjectPaths {
-        kimetsu_core::paths::git_init_boundary(root);
-        ProjectPaths::discover(root).expect("discover temp paths")
+        ProjectPaths::at_root(root)
     }
 
     #[test]
@@ -172,8 +186,11 @@ mod tests {
         let paths = paths_for(&root);
 
         // y -> claude -> key -> base url (LiteLLM) -> blank model (default).
-        let mut input =
-            Cursor::new("y\nclaude\nsk-litellm-123\nhttp://localhost:4000\n\n".as_bytes().to_vec());
+        let mut input = Cursor::new(
+            "y\nclaude\nsk-litellm-123\nhttp://localhost:4000\n\n"
+                .as_bytes()
+                .to_vec(),
+        );
         let mut output = Vec::new();
         let configured = run_harvest_setup(&mut input, &mut output, &paths).unwrap();
         assert!(configured);
