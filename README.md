@@ -198,6 +198,12 @@ Now your host agent gets the `kimetsu_*` MCP tools (brain context, memory
 add/list, citations, repo ingest, the cross-harness skill bridge) and starts
 banking memories across every session.
 
+Memories also get **auto-harvested**: when you fix a command that was failing,
+or finish a non-trivial session without recording anything, a Kimetsu hook cues
+the agent to dispatch a background `kimetsu-memory-harvester` subagent (a cheap
+in-agent distiller) that records the lesson for next time — no extra API key.
+Turn it off with `[learning] auto_harvest = false` in `.kimetsu/project.toml`.
+
 ```bash
 kimetsu brain search "build failures"
 kimetsu brain context "where is auth configured?"

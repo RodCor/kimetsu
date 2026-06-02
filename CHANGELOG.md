@@ -6,6 +6,28 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## Unreleased
+
+ADDED
+  * **Auto-harvested memories (in-agent).** The hooks now drive memory
+    *generation*, not just retrieval. When a command that failed earlier in the
+    session succeeds (PostToolUse), or a non-trivial session ends with nothing
+    recorded (Stop), Kimetsu emits a `[kimetsu-harvest]` cue telling the agent to
+    dispatch a new background **`kimetsu-memory-harvester`** subagent (installed
+    at `.claude/agents/`, pinned to a cheap model). The subagent distills 0–3
+    generalizable lessons and records them through the confidence-gated
+    `kimetsu_brain_record` path — no separate API key or kimetsu-side model
+    credentials, billed in-agent at the cheap model's rate, non-blocking. Cues
+    are throttled (at most ~once per resolved failure / once per session) and can
+    be disabled with `[learning] auto_harvest = false` in `project.toml`.
+
+FIXED
+  * **Stop hook read the wrong field.** The Stop hook counted
+    `kimetsu_brain_record` calls from a non-existent inline `transcript` array;
+    Claude Code actually passes a `transcript_path` to a JSONL file. It now reads
+    the JSONL (with the inline array kept as a fallback), so the "lessons
+    recorded" banner and end-of-session cue actually fire.
+
 ## v0.8.4 — non-destructive plugin install + global scope
 
 ADDED
