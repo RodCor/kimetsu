@@ -486,6 +486,16 @@ fn upsert_kimetsu_hook(
     }
 }
 
+/// Merge Kimetsu's `UserPromptSubmit` hook (plus the v0.8 proactive
+/// `PreToolUse`/`PostToolUse` Bash hooks when `proactive`) into
+/// `.codex/hooks.json`, preserving any other hooks the user has — even on
+/// the same events. Idempotent: re-running never duplicates.
+///
+/// Codex discovers hooks only from the config-layer `hooks.json` file, using
+/// real lifecycle events like `UserPromptSubmit`. The proactive
+/// `PreToolUse`/`PostToolUse` hooks use a `Bash` matcher so they fire only
+/// around shell invocations; they surface a memory check without blocking the
+/// tool call.
 fn write_codex_hooks(
     codex_dir: &Path,
     proactive: bool,
@@ -1172,6 +1182,10 @@ mod tests {
         assert_eq!(
             value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "kimetsu brain pretool-hook --workspace ."
+        );
+        assert_eq!(
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "kimetsu brain posttool-hook --workspace ."
         );
 
         fs::remove_dir_all(root).ok();
