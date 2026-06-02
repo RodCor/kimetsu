@@ -523,6 +523,8 @@ mod tests {
             "km_rd_ws_{}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+        // Intentionally NOT a git repo: exercises discover's non-repo fallback
+        // so the workspace tier finds no config and we fall through to global.
         std::fs::create_dir_all(&ws).unwrap();
         let gdir = std::env::temp_dir().join(format!(
             "km_rd_g_{}",
@@ -550,7 +552,10 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(ws.join(".kimetsu")).unwrap();
-        kimetsu_core::paths::git_init_boundary(&ws);
+        assert!(
+            kimetsu_core::paths::git_init_boundary(&ws),
+            "git_init_boundary failed — git needed for workspace isolation"
+        );
         // Use default_for_project + set distiller fields + to_toml() because
         // a partial toml with only [learning.distiller] fails to parse
         // (kimetsu/model sections are required by serde).
