@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 mod distiller;
 mod doctor;
+mod harvest_setup;
 mod proactive_state;
 mod update;
 
@@ -292,6 +293,12 @@ struct PluginInstallArgs {
     /// hooks (mid-work recall). UserPromptSubmit + Stop still install.
     #[arg(long)]
     no_proactive: bool,
+    /// Skip the interactive auto-harvest distiller setup prompt.
+    #[arg(long)]
+    no_setup: bool,
+    /// Force the auto-harvest distiller setup prompt even off a TTY.
+    #[arg(long)]
+    setup_harvest: bool,
 }
 
 #[derive(Debug, Args)]
@@ -985,6 +992,21 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
             );
             for file in report.files {
                 println!("  {}", file.display());
+            }
+            // Offer interactive distiller setup for Claude Code on a TTY.
+            let interactive = args.setup_harvest
+                || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+            if matches!(target, BridgeTarget::ClaudeCode) && !args.no_setup && interactive {
+                if let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&workspace) {
+                    let stdin = std::io::stdin();
+                    let mut reader = stdin.lock();
+                    let mut stdout = std::io::stdout();
+                    if let Err(err) =
+                        harvest_setup::run_harvest_setup(&mut reader, &mut stdout, &paths)
+                    {
+                        eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
+                    }
+                }
             }
         }
     }
