@@ -11,9 +11,10 @@ use kimetsu_agent::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ToolChoice,
 };
 use kimetsu_brain::project;
+use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
-use kimetsu_core::paths::ProjectPaths;
+use kimetsu_core::paths::{user_brain_enabled, user_kimetsu_dir, ProjectPaths};
 use serde::Deserialize;
 
 /// Max characters of transcript view fed to the distiller (keeps the
@@ -232,6 +233,76 @@ pub fn distill_and_record(
     recorded
 }
 
+/// The distiller selected for this session: which model/key/endpoint to use,
+/// and how to record (project vs the global user brain).
+pub struct ResolvedDistiller {
+    pub model: String,
+    pub key: String,
+    pub base_url: Option<String>,
+    pub timeout_secs: u64,
+    pub scope: MemoryScope,
+    pub record_start: std::path::PathBuf,
+}
+
+/// Resolve the distiller for `workspace`, preferring the workspace distiller
+/// over the global one (`~/.kimetsu`). `None` when neither is enabled +
+/// credentialed.
+pub fn resolve_distiller(workspace: &Path) -> Option<ResolvedDistiller> {
+    let global_dir = if user_brain_enabled() {
+        user_kimetsu_dir()
+    } else {
+        None
+    };
+    resolve_distiller_with(workspace, global_dir)
+}
+
+/// Testable core: `global_dir` is injected (the `~/.kimetsu` dir, or `None`).
+fn resolve_distiller_with(
+    workspace: &Path,
+    global_dir: Option<std::path::PathBuf>,
+) -> Option<ResolvedDistiller> {
+    // 1. Workspace distiller (Project scope).
+    if let Ok(paths) = ProjectPaths::discover(workspace)
+        && let Ok(config) = project::load_config(&paths)
+    {
+        let d = &config.learning.distiller;
+        if d.enabled
+            && d.provider == "anthropic"
+            && let Some(key) = resolve_env_value(&paths.repo_root, &d.api_key_env)
+        {
+            return Some(ResolvedDistiller {
+                model: d.model.clone(),
+                key,
+                base_url: resolve_env_value(&paths.repo_root, &d.base_url_env),
+                timeout_secs: config.model.request_timeout_secs,
+                scope: MemoryScope::Project,
+                record_start: paths.repo_root.clone(),
+            });
+        }
+    }
+    // 2. Global distiller (GlobalUser scope).
+    if let Some(dir) = global_dir
+        && let Ok(text) = std::fs::read_to_string(dir.join("project.toml"))
+        && let Ok(config) = ProjectConfig::from_toml(&text)
+    {
+        let d = &config.learning.distiller;
+        if d.enabled
+            && d.provider == "anthropic"
+            && let Some(key) = resolve_env_value(&dir, &d.api_key_env)
+        {
+            return Some(ResolvedDistiller {
+                model: d.model.clone(),
+                key,
+                base_url: resolve_env_value(&dir, &d.base_url_env),
+                timeout_secs: config.model.request_timeout_secs,
+                scope: MemoryScope::GlobalUser,
+                record_start: workspace.to_path_buf(),
+            });
+        }
+    }
+    None
+}
+
 /// `kimetsu brain session-end-hook` entry. Reads the SessionEnd payload
 /// from stdin, and if the distiller is enabled + credentialed, distills
 /// the transcript and records lessons. Silent no-op otherwise.
@@ -241,24 +312,6 @@ pub fn run_session_end_hook(workspace: &Path) {
     let payload: serde_json::Value =
         serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
 
-    // Resolve config at the project's git root (where the setup wizard writes
-    // when install is run at the repo root — the documented common case). A
-    // non-git-subdir install is the only mismatch, and it fails safe: the
-    // discovered root has no enabled distiller, so this is a silent no-op.
-    let Ok(paths) = ProjectPaths::discover(workspace) else {
-        return;
-    };
-    let Ok(config) = project::load_config(&paths) else {
-        return;
-    };
-    let distiller = &config.learning.distiller;
-    if !distiller.enabled || distiller.provider != "anthropic" {
-        return;
-    }
-    let Some(api_key) = resolve_env_value(&paths.repo_root, &distiller.api_key_env) else {
-        return;
-    };
-    let base_url = resolve_env_value(&paths.repo_root, &distiller.base_url_env);
     let Some(transcript_path) = payload
         .get("transcript_path")
         .and_then(|v| v.as_str())
@@ -266,19 +319,23 @@ pub fn run_session_end_hook(workspace: &Path) {
     else {
         return;
     };
+    let Some(resolved) = resolve_distiller(workspace) else {
+        return;
+    };
     let view = build_transcript_view(transcript_path, MAX_VIEW_CHARS);
     if view.trim().is_empty() {
         return;
     }
     let Ok(mut provider) = AnthropicProvider::for_distiller(
-        &distiller.model,
-        api_key,
-        base_url,
-        config.model.request_timeout_secs,
+        &resolved.model,
+        resolved.key,
+        resolved.base_url,
+        resolved.timeout_secs,
     ) else {
         return;
     };
-    let recorded = distill_and_record(&paths.repo_root, &view, &mut provider, MemoryScope::Project);
+    let recorded =
+        distill_and_record(&resolved.record_start, &view, &mut provider, resolved.scope);
     if recorded > 0 {
         println!(
             "[Kimetsu] distilled {recorded} lesson{} at session end.",
@@ -441,6 +498,88 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Write a full `project.toml` to `dir` with the distiller section configured.
+    /// Uses `ProjectConfig::default_for_project` + `to_toml()` because a partial
+    /// TOML with only `[learning.distiller]` fails to parse — the `kimetsu` and
+    /// `model` sections are required by serde (no `#[serde(default)]` on those
+    /// `ProjectConfig` fields).
+    fn write_distiller_toml(dir: &std::path::Path, enabled: bool, model: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut config = ProjectConfig::default_for_project("test");
+        config.learning.distiller.enabled = enabled;
+        config.learning.distiller.provider = "anthropic".to_string();
+        config.learning.distiller.model = model.to_string();
+        config.learning.distiller.api_key_env = "ANTHROPIC_API_KEY".to_string();
+        config.learning.distiller.base_url_env = "ANTHROPIC_BASE_URL".to_string();
+        let toml = config.to_toml().unwrap();
+        std::fs::write(dir.join("project.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn resolve_distiller_global_when_no_workspace() {
+        let ws = std::env::temp_dir().join(format!(
+            "km_rd_ws_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        let gdir = std::env::temp_dir().join(format!(
+            "km_rd_g_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        write_distiller_toml(&gdir, true, "claude-haiku-4-5");
+        std::fs::write(gdir.join(".env"), "ANTHROPIC_API_KEY=sk-global\n").unwrap();
+
+        let r = resolve_distiller_with(&ws, Some(gdir.clone())).expect("global resolved");
+        assert_eq!(r.scope, MemoryScope::GlobalUser);
+        assert_eq!(r.model, "claude-haiku-4-5");
+        assert_eq!(r.key, "sk-global");
+
+        write_distiller_toml(&gdir, false, "claude-haiku-4-5");
+        assert!(resolve_distiller_with(&ws, Some(gdir.clone())).is_none());
+
+        std::fs::remove_dir_all(ws).ok();
+        std::fs::remove_dir_all(gdir).ok();
+    }
+
+    #[test]
+    fn resolve_distiller_workspace_wins() {
+        let ws = std::env::temp_dir().join(format!(
+            "km_rd_wsw_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(ws.join(".kimetsu")).unwrap();
+        kimetsu_core::paths::git_init_boundary(&ws);
+        // Use default_for_project + set distiller fields + to_toml() because
+        // a partial toml with only [learning.distiller] fails to parse
+        // (kimetsu/model sections are required by serde).
+        {
+            let mut config = ProjectConfig::default_for_project("ws");
+            config.learning.distiller.enabled = true;
+            config.learning.distiller.provider = "anthropic".to_string();
+            config.learning.distiller.model = "ws-model".to_string();
+            config.learning.distiller.api_key_env = "ANTHROPIC_API_KEY".to_string();
+            config.learning.distiller.base_url_env = "ANTHROPIC_BASE_URL".to_string();
+            let toml = config.to_toml().unwrap();
+            std::fs::write(ws.join(".kimetsu").join("project.toml"), toml).unwrap();
+        }
+        std::fs::write(ws.join(".env"), "ANTHROPIC_API_KEY=sk-ws\n").unwrap();
+
+        let gdir = std::env::temp_dir().join(format!(
+            "km_rd_gw_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        write_distiller_toml(&gdir, true, "g-model");
+        std::fs::write(gdir.join(".env"), "ANTHROPIC_API_KEY=sk-global\n").unwrap();
+
+        let r = resolve_distiller_with(&ws, Some(gdir.clone())).expect("workspace resolved");
+        assert_eq!(r.scope, MemoryScope::Project);
+        assert_eq!(r.model, "ws-model");
+        assert_eq!(r.key, "sk-ws");
+
+        std::fs::remove_dir_all(ws).ok();
+        std::fs::remove_dir_all(gdir).ok();
     }
 
     #[test]
