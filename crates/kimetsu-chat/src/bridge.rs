@@ -747,15 +747,16 @@ fn write_claude_settings(
     files.push(normalize_path(&claude_md));
 
     let settings = claude_dir.join("settings.json");
-    write_claude_hooks(&settings, force, proactive)?;
+    write_claude_hooks(&settings, proactive)?;
     files.push(normalize_path(&settings));
     Ok(())
 }
 
 /// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks (plus the v0.8
 /// proactive `PreToolUse`/`PostToolUse` Bash hooks when `proactive`)
-/// into `.claude/settings.json`, preserving any other settings.
-fn write_claude_hooks(path: &Path, force: bool, proactive: bool) -> Result<(), String> {
+/// into `settings.json`, preserving any other hooks the user has — even
+/// on the same events. Idempotent: re-running never duplicates.
+fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -767,39 +768,48 @@ fn write_claude_hooks(path: &Path, force: bool, proactive: bool) -> Result<(), S
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
-    if root_obj.contains_key("hooks") && !force {
-        return Err(format!(
-            "{} already defines hooks; pass --force",
-            path.display()
-        ));
-    }
-    let mut hooks = serde_json::json!({
-        "UserPromptSubmit": [{
+    let hooks_value = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} `hooks` must be a JSON object", path.display()))?;
+
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        serde_json::json!({
             "matcher": "",
             "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
-        }],
-        "Stop": [{
+        }),
+    );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "Stop",
+        serde_json::json!({
             "matcher": "",
             "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
-        }]
-    });
-    if proactive && let Some(map) = hooks.as_object_mut() {
-        map.insert(
-            "PreToolUse".to_string(),
-            serde_json::json!([{
+        }),
+    );
+    if proactive {
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PreToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{ "type": "command", "command": "kimetsu brain pretool-hook" }]
-            }]),
+            }),
         );
-        map.insert(
-            "PostToolUse".to_string(),
-            serde_json::json!([{
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PostToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{ "type": "command", "command": "kimetsu brain posttool-hook" }]
-            }]),
+            }),
         );
     }
-    root_obj.insert("hooks".to_string(), hooks);
+
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Claude settings: {err}"))?;
     write_text_file(path, &text, true)
@@ -1085,6 +1095,51 @@ mod tests {
             "proactive disabled must not write PreToolUse"
         );
         assert!(hooks_json["hooks"]["PostToolUse"].is_null());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_hooks_merge_preserves_user_hooks() {
+        let root = temp_root("claude_hooks_merge");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        // User already has their own UserPromptSubmit hook and an unrelated event.
+        fs::write(
+            claude.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-prompt-thing" }] }
+                    ],
+                    "SubagentStop": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-subagent-thing" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settings = claude.join("settings.json");
+        write_claude_hooks(&settings, true).unwrap();
+        // Re-run to prove idempotency.
+        write_claude_hooks(&settings, true).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "user group kept + one kimetsu group, no dupes");
+        assert_eq!(ups[0]["hooks"][0]["command"], "user-prompt-thing");
+        assert_eq!(ups[1]["hooks"][0]["command"], "kimetsu brain context-hook");
+        // Unrelated user event untouched.
+        assert_eq!(
+            value["hooks"]["SubagentStop"][0]["hooks"][0]["command"],
+            "user-subagent-thing"
+        );
+        // Kimetsu's own events present.
+        assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["command"], "kimetsu brain stop-hook");
+        assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "kimetsu brain pretool-hook");
+
         fs::remove_dir_all(root).ok();
     }
 
