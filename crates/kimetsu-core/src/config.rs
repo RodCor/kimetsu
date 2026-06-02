@@ -89,6 +89,11 @@ impl Default for EmbedderSection {
 pub struct LearningSection {
     #[serde(default = "default_auto_harvest")]
     pub auto_harvest: bool,
+    /// Opt-in credentialed SessionEnd distiller (configured by the install
+    /// wizard). Disabled by default; `#[serde(default)]` keeps older
+    /// project.toml files loading.
+    #[serde(default)]
+    pub distiller: DistillerSection,
 }
 
 fn default_auto_harvest() -> bool {
@@ -99,6 +104,49 @@ impl Default for LearningSection {
     fn default() -> Self {
         Self {
             auto_harvest: default_auto_harvest(),
+            distiller: DistillerSection::default(),
+        }
+    }
+}
+
+/// Credentialed SessionEnd distiller config. Secret values (the API key,
+/// optional base URL) live in `.env` under the env-var names below; only
+/// non-secret selection lives here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillerSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_distiller_provider")]
+    pub provider: String,
+    #[serde(default = "default_distiller_model")]
+    pub model: String,
+    #[serde(default = "default_distiller_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_distiller_base_url_env")]
+    pub base_url_env: String,
+}
+
+fn default_distiller_provider() -> String {
+    "anthropic".to_string()
+}
+fn default_distiller_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+fn default_distiller_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+fn default_distiller_base_url_env() -> String {
+    "ANTHROPIC_BASE_URL".to_string()
+}
+
+impl Default for DistillerSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_distiller_provider(),
+            model: default_distiller_model(),
+            api_key_env: default_distiller_api_key_env(),
+            base_url_env: default_distiller_base_url_env(),
         }
     }
 }
@@ -324,6 +372,13 @@ max_total_cost_usd = 250.0
         // A pre-v0.8.5 toml has no [learning] section — auto-harvest
         // defaults on so existing installs gain the behavior on upgrade.
         assert!(config.learning.auto_harvest);
+        // A pre-distiller toml has no [learning.distiller] — defaults to off,
+        // anthropic, claude-haiku-4-5.
+        assert!(!config.learning.distiller.enabled);
+        assert_eq!(config.learning.distiller.provider, "anthropic");
+        assert_eq!(config.learning.distiller.model, "claude-haiku-4-5");
+        assert_eq!(config.learning.distiller.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(config.learning.distiller.base_url_env, "ANTHROPIC_BASE_URL");
     }
 
     /// `model set` writes the whole config back via `to_toml`; a
