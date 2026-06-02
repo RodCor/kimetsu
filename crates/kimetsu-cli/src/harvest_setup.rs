@@ -27,9 +27,17 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     write!(writer, "Harness [claude/codex] (codex not yet supported): ")?;
     writer.flush()?;
     let harness = read_line(reader)?.trim().to_lowercase();
-    if harness == "codex" {
-        writeln!(writer, "Codex distiller is not supported yet — skipping setup.")?;
-        return Ok(false);
+    match harness.as_str() {
+        "codex" => {
+            writeln!(writer, "Codex distiller is not supported yet — skipping setup.")?;
+            return Ok(false);
+        }
+        // Blank defaults to claude; accept the common aliases.
+        "" | "claude" | "claude-code" | "cc" => {}
+        other => {
+            writeln!(writer, "Unrecognized harness '{other}' — skipping setup.")?;
+            return Ok(false);
+        }
     }
 
     write!(writer, "Anthropic API key (or LiteLLM key): ")?;
@@ -55,12 +63,14 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     }
 
     apply_distiller_config(paths, &model)?;
+    // Gitignore `.env` BEFORE writing the secret into it, so the plaintext
+    // key is never on disk in a tracked/unignored file.
+    ensure_gitignored(&paths.repo_root, ".env")?;
     let env_path = paths.repo_root.join(".env");
     upsert_env_var(&env_path, "ANTHROPIC_API_KEY", &key)?;
     if !base_url.is_empty() {
         upsert_env_var(&env_path, "ANTHROPIC_BASE_URL", &base_url)?;
     }
-    ensure_gitignored(&paths.repo_root, ".env")?;
 
     writeln!(
         writer,
@@ -195,6 +205,24 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let paths = paths_for(&root);
         let mut input = Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::new();
+        assert!(!run_harvest_setup(&mut input, &mut output, &paths).unwrap());
+        assert!(!paths.repo_root.join(".env").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wizard_unrecognized_harness_aborts() {
+        let root = std::env::temp_dir().join(format!(
+            "kimetsu_wizard_bad_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = paths_for(&root);
+        let mut input = Cursor::new(b"y\ngemini\n".to_vec());
         let mut output = Vec::new();
         assert!(!run_harvest_setup(&mut input, &mut output, &paths).unwrap());
         assert!(!paths.repo_root.join(".env").exists());
