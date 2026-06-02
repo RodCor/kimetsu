@@ -378,7 +378,7 @@ pub fn plugin_install(
             // Claude Code reads project-scoped MCP servers from `.mcp.json` at
             // the workspace root, NOT `.claude/mcp.json`.
             let mcp = workspace.join(".mcp.json");
-            write_mcp_config(&mcp, force)?;
+            write_mcp_config(&mcp, false)?;
             files.push(normalize_path(&mcp));
 
             let commands = workspace.join(".claude").join("commands").join("kimetsu");
@@ -411,7 +411,7 @@ pub fn plugin_install(
         }
         BridgeTarget::Codex => {
             let config = workspace.join(".codex").join("config.toml");
-            write_codex_config(&config, force)?;
+            write_codex_config(&config)?;
             files.push(normalize_path(&config));
 
             let skill = workspace
@@ -632,7 +632,11 @@ fn resolve_bridge_skill_source(
     Ok(registry.resolve_or_manifest_contained(selection)?.root)
 }
 
-fn write_mcp_config(path: &Path, force: bool) -> Result<(), String> {
+/// Upsert the `kimetsu` MCP server into a Claude config file. Idempotent —
+/// re-running just rewrites the same entry, preserving all other keys.
+/// `only_mcp_servers` is true for `~/.claude.json` (global), which uses
+/// only the `mcpServers` key; workspace `.mcp.json` also gets `servers`.
+fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -644,34 +648,20 @@ fn write_mcp_config(path: &Path, force: bool) -> Result<(), String> {
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
-    let has_kimetsu = root_obj
-        .get("servers")
-        .and_then(|value| value.as_object())
-        .map(|map| map.contains_key("kimetsu"))
-        .unwrap_or(false)
-        || root_obj
-            .get("mcpServers")
-            .and_then(|value| value.as_object())
-            .map(|map| map.contains_key("kimetsu"))
-            .unwrap_or(false);
-    if has_kimetsu && !force {
-        return Err(format!(
-            "{} already has a kimetsu MCP server; pass --force",
-            path.display()
-        ));
-    }
     let server = serde_json::json!({
-            "command": "kimetsu",
-            "args": ["mcp", "serve", "--workspace", "."]
+        "command": "kimetsu",
+        "args": ["mcp", "serve", "--workspace", "."]
     });
-    insert_mcp_server(root_obj, "servers", server.clone(), path)?;
+    if !only_mcp_servers {
+        insert_mcp_server(root_obj, "servers", server.clone(), path)?;
+    }
     insert_mcp_server(root_obj, "mcpServers", server, path)?;
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize MCP config: {err}"))?;
     write_text_file(path, &text, true)
 }
 
-fn write_codex_config(path: &Path, force: bool) -> Result<(), String> {
+fn write_codex_config(path: &Path) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -689,12 +679,6 @@ fn write_codex_config(path: &Path, force: bool) -> Result<(), String> {
     let servers = servers_value
         .as_table_mut()
         .ok_or_else(|| format!("{} `mcp_servers` must be a TOML table", path.display()))?;
-    if servers.contains_key("kimetsu") && !force {
-        return Err(format!(
-            "{} already has a kimetsu MCP server; pass --force",
-            path.display()
-        ));
-    }
 
     let mut kimetsu = toml::map::Map::new();
     kimetsu.insert(
@@ -1187,6 +1171,32 @@ mod tests {
             value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             "kimetsu brain posttool-hook --workspace ."
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mcp_config_is_idempotent_and_scopes_keys() {
+        let root = temp_root("mcp_idempotent");
+        let mcp = root.join(".mcp.json");
+
+        // Workspace style: write both `servers` and `mcpServers`, twice, no error.
+        write_mcp_config(&mcp, false).unwrap();
+        write_mcp_config(&mcp, false).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(value["servers"]["kimetsu"]["command"], "kimetsu");
+        assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
+
+        // Global style: only `mcpServers`, preserving unrelated keys.
+        let claude_json = root.join(".claude.json");
+        fs::write(&claude_json, serde_json::to_string(&json!({ "keepme": 1 })).unwrap()).unwrap();
+        write_mcp_config(&claude_json, true).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(value["keepme"], 1);
+        assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        assert!(value.get("servers").is_none(), "global writes mcpServers only");
 
         fs::remove_dir_all(root).ok();
     }
