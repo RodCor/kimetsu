@@ -6,7 +6,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## Unreleased
+## v0.8.4 — non-destructive plugin install + global scope
 
 ADDED
   * **Global plugin install.** `kimetsu plugin install <target> --scope global`
