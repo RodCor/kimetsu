@@ -17,6 +17,11 @@ pub struct ProjectConfig {
     /// default; see `kimetsu_brain::embeddings::resolve_embedder_id`.
     #[serde(default)]
     pub embedder: EmbedderSection,
+    /// v0.8.5: automatic memory harvesting. `#[serde(default)]` keeps
+    /// pre-v0.8.5 project.toml files loading cleanly (they get
+    /// auto-harvest on).
+    #[serde(default)]
+    pub learning: LearningSection,
 }
 
 impl ProjectConfig {
@@ -32,6 +37,7 @@ impl ProjectConfig {
             ingestion: IngestionSection::default(),
             run: RunSection::default(),
             embedder: EmbedderSection::default(),
+            learning: LearningSection::default(),
         }
     }
 
@@ -69,6 +75,30 @@ impl Default for EmbedderSection {
     fn default() -> Self {
         Self {
             model: default_embedder_id(),
+        }
+    }
+}
+
+/// v0.8.5: automatic memory harvesting. When `auto_harvest` is on, the
+/// proactive PostToolUse hook and the Stop hook emit a `[kimetsu-harvest]`
+/// cue at high-signal moments (a failed-then-fixed command, or a
+/// non-trivial session that recorded nothing) telling the agent to
+/// dispatch the `kimetsu-memory-harvester` subagent. Set it false to
+/// silence those cues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningSection {
+    #[serde(default = "default_auto_harvest")]
+    pub auto_harvest: bool,
+}
+
+fn default_auto_harvest() -> bool {
+    true
+}
+
+impl Default for LearningSection {
+    fn default() -> Self {
+        Self {
+            auto_harvest: default_auto_harvest(),
         }
     }
 }
@@ -291,6 +321,9 @@ max_total_cost_usd = 250.0
 "#;
         let config = ProjectConfig::from_toml(toml).expect("pre-v0.8 toml must load");
         assert_eq!(config.embedder.model, "bge-small-en-v1.5");
+        // A pre-v0.8.5 toml has no [learning] section — auto-harvest
+        // defaults on so existing installs gain the behavior on upgrade.
+        assert!(config.learning.auto_harvest);
     }
 
     /// `model set` writes the whole config back via `to_toml`; a
