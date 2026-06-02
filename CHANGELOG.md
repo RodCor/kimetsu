@@ -6,7 +6,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## Unreleased
+## v0.9.0 — auto-harvested memories
 
 ADDED
   * **Auto-harvested memories (in-agent).** The hooks now drive memory
@@ -21,12 +21,19 @@ ADDED
     are throttled (at most ~once per resolved failure / once per session) and can
     be disabled with `[learning] auto_harvest = false` in `project.toml`.
 
+CHANGED
+  * **Cleaner help & tool menus.** Stripped internal version-history prefixes
+    (`v0.x:`, `MP-…:`) from `--help` text and the MCP tool/argument descriptions
+    so menus read as plain present-tense descriptions. (Internal code comments
+    are unchanged.)
+
 FIXED
   * **Stop hook read the wrong field.** The Stop hook counted
     `kimetsu_brain_record` calls from a non-existent inline `transcript` array;
     Claude Code actually passes a `transcript_path` to a JSONL file. It now reads
-    the JSONL (with the inline array kept as a fallback), so the "lessons
-    recorded" banner and end-of-session cue actually fire.
+    the JSONL (with the inline array kept as a fallback), counts both the bare
+    and MCP-namespaced (`mcp__kimetsu__kimetsu_brain_record`) tool names, so the
+    "lessons recorded" banner and end-of-session cue actually fire.
 
 ## v0.8.4 — non-destructive plugin install + global scope
 

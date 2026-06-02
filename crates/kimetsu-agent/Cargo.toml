@@ -23,8 +23,8 @@ embeddings = ["kimetsu-brain/embeddings"]
 
 [dependencies]
 blake3.workspace = true
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.8.0" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.8.0" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "0.9.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "0.9.0" }
 regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
