@@ -64,12 +64,12 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
-    /// v0.3: interactive REPL chat - kimetsu as a user-facing coding
+    /// Interactive REPL chat — kimetsu as a user-facing coding
     /// assistant. Reuses the full agent runtime (tools, prompts, brain,
     /// MP-18 verify) with a stdin/stdout transport. No dependency on
     /// Terminal-Bench.
     Chat(ChatArgs),
-    /// v0.4.6: kimetsu doctor — automated wire-health check.
+    /// Kimetsu doctor — automated wire-health check.
     ///
     /// Validates that every kimetsu subsystem the chat REPL + MCP
     /// sidecar rely on actually works against the current workspace
@@ -284,7 +284,7 @@ struct PluginInstallArgs {
     scope: String,
     #[arg(long)]
     force: bool,
-    /// v0.8: skip wiring the proactive PreToolUse/PostToolUse Bash
+    /// Skip wiring the proactive PreToolUse/PostToolUse Bash
     /// hooks (mid-work recall). UserPromptSubmit + Stop still install.
     #[arg(long)]
     no_proactive: bool,
@@ -294,7 +294,7 @@ struct PluginInstallArgs {
 struct InitArgs {
     #[arg(long)]
     force: bool,
-    /// v0.6: skip writing .claude/CLAUDE.md and .claude/settings.json.
+    /// Skip writing .claude/CLAUDE.md and .claude/settings.json.
     /// Use when you manage Claude Code configuration manually.
     #[arg(long)]
     no_hooks: bool,
@@ -319,42 +319,41 @@ enum BrainCommand {
     },
     Rebuild,
     Stats,
-    /// v0.6: brain health summary — memory counts, domain groups,
+    /// Brain health summary — memory counts, domain groups,
     /// pending proposals, unresolved conflicts, and usefulness bands.
     Status {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
-    /// v0.6: Claude Code UserPromptSubmit hook. Reads JSON from stdin
+    /// Claude Code UserPromptSubmit hook. Reads JSON from stdin
     /// (`{"prompt":"...","..."}`), retrieves relevant brain context, and
     /// prints it to stdout for injection into the conversation.
     /// Exits 0 silently when the brain has nothing above threshold.
     ContextHook(ContextHookArgs),
-    /// v0.7: Claude Code Stop hook. Reads session JSON from stdin,
+    /// Claude Code Stop hook. Reads session JSON from stdin,
     /// counts kimetsu_brain_record calls made this session, and
     /// prints a summary banner. Exits 0 silently for short sessions
     /// with nothing to report.
     StopHook(StopHookArgs),
-    /// v0.4.3: backfill missing or stale embeddings on memory rows.
-    /// Run after upgrading kimetsu (so pre-v0.4.2 rows pick up
-    /// vectors) or after changing the embedder model via
+    /// Backfill missing or stale embeddings on memory rows.
+    /// Run after upgrading kimetsu or after changing the embedder model via
     /// `KIMETSU_BRAIN_EMBEDDER=<id>`.
     Reindex(ReindexArgs),
-    /// v0.8: inspect or change which built-in embedding model the
+    /// Inspect or change which built-in embedding model the
     /// brain uses. `list` shows the curated set and the active id;
     /// `set <id>` writes it to project.toml and re-embeds the corpus.
     Model {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// v0.8: proactive PreToolUse hook. Reads tool-call JSON from
+    /// Proactive PreToolUse hook. Reads tool-call JSON from
     /// stdin and, only for a high-confidence match against a stored
     /// failure_pattern/convention, prints a one-line warning BEFORE a
     /// risky Bash command runs. Exits 0 silently otherwise.
     #[command(name = "pretool-hook")]
     PreToolHook(ProactiveHookArgs),
-    /// v0.8: proactive PostToolUse hook. Reads tool-call JSON from
+    /// Proactive PostToolUse hook. Reads tool-call JSON from
     /// stdin and, when a Bash command failed and matches a stored
     /// failure_pattern/command, surfaces the known fix. Exits 0
     /// silently otherwise.
@@ -466,7 +465,7 @@ struct ContextArgs {
     /// Print machine-readable JSON for hooks and harness wrappers.
     #[arg(long)]
     json: bool,
-    /// v0.4.4: skip the ambient workspace fingerprint (git branch,
+    /// Skip the ambient workspace fingerprint (git branch,
     /// dirty files, recent edits). Default behavior augments the
     /// query with that suffix so hooks calling with terse queries
     /// like "continue" or "fix it" still surface useful capsules.
@@ -482,21 +481,20 @@ enum MemoryCommand {
     Accept(AcceptArgs),
     Reject(RejectArgs),
     Invalidate(InvalidateArgs),
-    /// MP-5a: batch review pending memory proposals. The v0.2 default is
-    /// "human curates"; this subcommand is the non-interactive batch mode
-    /// (interactive TTY review lands in MP-5b).
+    /// Batch review pending memory proposals in non-interactive mode
+    /// (interactive TTY review available separately).
     Review(ReviewArgs),
-    /// MP-6: ranked memories by usefulness ratio so the user can see what
+    /// Ranked memories by usefulness ratio so the user can see what
     /// is pulling weight after curation.
     Top(TopArgs),
-    /// MP-6: bulk-invalidate memories whose outcome attribution says they
+    /// Bulk-invalidate memories whose outcome attribution says they
     /// hurt more than they help. Safe-by-default: dry-run unless --apply.
     Prune(PruneArgs),
-    /// v0.5.1: per-run memory attribution. Walks `memory_citations` +
+    /// Per-run memory attribution. Walks `memory_citations` +
     /// `context.injected` events to surface which memories the model
     /// actually leveraged vs which were silent passengers.
     Blame(BlameArgs),
-    /// v0.5.2: list and resolve conflict-detection hits surfaced at
+    /// List and resolve conflict-detection hits surfaced at
     /// ingest. With `--list` (the default) renders open conflicts;
     /// `--resolve <id> <kept_new|kept_existing|kept_both>` settles one.
     Conflicts(ConflictsArgs),
@@ -686,7 +684,7 @@ struct SweArgs {
     #[arg(long)]
     tasks: PathBuf,
     /// Caller-prepared repo path. Kimetsu does NOT clone or apply test_patch
-    /// in v0.1 â€” see docs/SWEBENCH.md for the full integration plan.
+    /// automatically — see docs/SWEBENCH.md for the full integration plan.
     #[arg(long)]
     repo: PathBuf,
     /// Run a single instance by id (default: every task).

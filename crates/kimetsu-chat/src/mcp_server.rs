@@ -16,7 +16,7 @@ const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar fo
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
-const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. v0.6: returns skipped:true (zero tokens) when no capsule is relevant above min_score threshold — safe to call on every non-trivial task without overhead concern.";
+const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Returns skipped:true (zero tokens) when no capsule is relevant above min_score threshold — safe to call on every non-trivial task without overhead concern.";
 
 // TODO (v0.6+): fold benchmark-tag filtering + semantic_operator/anti_pattern
 // preference into kimetsu_brain_context so kimetsu_benchmark_context becomes
@@ -44,9 +44,9 @@ const BRAIN_MEMORY_REJECT_DESCRIPTION: &str = "Reject a pending Kimetsu memory p
 
 const BRAIN_MEMORY_INVALIDATE_DESCRIPTION: &str = "Retire an accepted Kimetsu memory so the broker stops retrieving it. Use when a memory is stale, wrong, harmful, or contradicted by newer evidence. This writes a memory.invalidated event.";
 
-const BRAIN_MEMORY_BLAME_DESCRIPTION: &str = "v0.5.1: per-run memory attribution. Pass a run_id (ULID printed in chat sessions / trace files) to surface which memories the model explicitly cited via the cite_memory tool (strong ±1.0 usefulness signal) vs which were silently retrieved but never cited (weak ±0.1 signal). Use after a run feels off to learn whether a misleading memory was responsible, or after a clean run to see which memories actually earned their keep.";
+const BRAIN_MEMORY_BLAME_DESCRIPTION: &str = "Per-run memory attribution. Pass a run_id (ULID printed in chat sessions / trace files) to surface which memories the model explicitly cited via the cite_memory tool (strong ±1.0 usefulness signal) vs which were silently retrieved but never cited (weak ±0.1 signal). Use after a run feels off to learn whether a misleading memory was responsible, or after a clean run to see which memories actually earned their keep.";
 
-const BRAIN_MEMORY_CONFLICTS_DESCRIPTION: &str = "v0.5.2: list open memory-conflict hits detected at ingest. When a new memory's embedding is close (cosine >= 0.8 by default) to an existing memory in the same scope but their normalized text differs, the brain logs a conflict so an operator can decide which version to keep. Returns up to `limit` conflicts (default 50) merged from project + user brains. Use this before adding contradictory guidance so you don't end up with both 'use anyhow' and 'use thiserror' silently competing in retrieval.";
+const BRAIN_MEMORY_CONFLICTS_DESCRIPTION: &str = "List open memory-conflict hits detected at ingest. When a new memory's embedding is close (cosine >= 0.8 by default) to an existing memory in the same scope but their normalized text differs, the brain logs a conflict so an operator can decide which version to keep. Returns up to `limit` conflicts (default 50) merged from project + user brains. Use this before adding contradictory guidance so you don't end up with both 'use anyhow' and 'use thiserror' silently competing in retrieval.";
 
 const BRAIN_INGEST_REPO_DESCRIPTION: &str = "Index the repository into Kimetsu brain.db so future kimetsu_brain_context calls can retrieve repo snippets and manifests. Use during setup or after major repo changes. This writes repo.ingested events.";
 
@@ -1508,17 +1508,17 @@ fn tool_definitions() -> Value {
                         "enum": ["localization", "patch_plan", "implementation", "verification", "review"]
                     },
                     "budget_tokens": { "type": "integer", "minimum": 500, "maximum": 30000 },
-                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "v0.6: skip threshold — if the best capsule scores below this, return empty (zero tokens injected). Default 0.15." },
-                    "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "v0.6: hard cap on returned capsules. Default 3." },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "v0.6: domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
-                    "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "v0.6: boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
+                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Skip threshold — if the best capsule scores below this, return empty (zero tokens injected). Default 0.15." },
+                    "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Hard cap on returned capsules. Default 3." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
+                    "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "Boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "kimetsu_brain_record",
-            "description": "v0.6: record a concrete, reusable lesson into the brain. Call after solving a non-obvious problem that required real effort. Do NOT call for trivial or well-known knowledge. High-confidence lessons (≥0.7) are accepted immediately; low-confidence go to pending proposals.",
+            "description": "Record a concrete, reusable lesson into the brain. Call after solving a non-obvious problem that required real effort. Do NOT call for trivial or well-known knowledge. High-confidence lessons (≥0.7) are accepted immediately; low-confidence go to pending proposals.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
