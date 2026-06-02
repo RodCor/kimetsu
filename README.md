@@ -183,7 +183,16 @@ cover Claude Code and Codex:
 ```bash
 kimetsu plugin install claude --workspace .    # writes .mcp.json + .claude/settings.json
 kimetsu plugin install codex  --workspace .    # writes .codex/config.toml + .codex/hooks.json + skill
+
+# Install globally for every project (writes to ~/.claude, ~/.claude.json, ~/.codex):
+kimetsu plugin install claude --scope global
+kimetsu plugin install codex  --scope global
 ```
+
+`--scope` defaults to `workspace`. The installer **merges** into existing
+config: if you already have hooks — even on the same events Kimetsu uses
+(`UserPromptSubmit`, `PreToolUse`, …) — your hooks are kept and Kimetsu's are
+added alongside them. Re-running is idempotent and never needs `--force`.
 
 Now your host agent gets the `kimetsu_*` MCP tools (brain context, memory
 add/list, citations, repo ingest, the cross-harness skill bridge) and starts
