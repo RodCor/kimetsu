@@ -1000,11 +1000,17 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 // Anchor strictly at the install workspace (NOT `discover`,
                 // which climbs to an enclosing git repo and could write the
                 // distiller config + secret .env into a parent repository).
-                let paths = kimetsu_core::paths::ProjectPaths::at_root(&workspace);
+                let p = kimetsu_core::paths::ProjectPaths::at_root(&workspace);
+                let setup_target = harvest_setup::SetupTarget {
+                    project_toml: p.project_toml.clone(),
+                    env_path: p.repo_root.join(".env"),
+                    gitignore_dir: p.repo_root.clone(),
+                };
                 let stdin = std::io::stdin();
                 let mut reader = stdin.lock();
                 let mut stdout = std::io::stdout();
-                if let Err(err) = harvest_setup::run_harvest_setup(&mut reader, &mut stdout, &paths)
+                if let Err(err) =
+                    harvest_setup::run_harvest_setup(&mut reader, &mut stdout, &setup_target, "this workspace")
                 {
                     eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
                 }

@@ -5,10 +5,17 @@
 
 use std::fs;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kimetsu_core::config::ProjectConfig;
-use kimetsu_core::paths::ProjectPaths;
+
+/// Where the wizard writes the distiller config + secret. Built by the CLI gate
+/// from the install scope (workspace dir, or `~/.kimetsu`).
+pub struct SetupTarget {
+    pub project_toml: PathBuf,
+    pub env_path: PathBuf,
+    pub gitignore_dir: PathBuf,
+}
 
 /// Run the wizard against the given reader/writer (real stdin/stdout in
 /// production; scripted in tests). Returns Ok(true) when the distiller was
@@ -16,7 +23,8 @@ use kimetsu_core::paths::ProjectPaths;
 pub fn run_harvest_setup<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    paths: &ProjectPaths,
+    target: &SetupTarget,
+    scope_label: &str,
 ) -> std::io::Result<bool> {
     write!(writer, "Set up the auto-harvest distiller now? [y/N]: ")?;
     writer.flush()?;
@@ -65,20 +73,19 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
         model = "claude-haiku-4-5".to_string();
     }
 
-    apply_distiller_config(paths, &model)?;
-    // Gitignore `.env` BEFORE writing the secret into it, so the plaintext
-    // key is never on disk in a tracked/unignored file.
-    ensure_gitignored(&paths.repo_root, ".env")?;
-    let env_path = paths.repo_root.join(".env");
-    upsert_env_var(&env_path, "ANTHROPIC_API_KEY", &key)?;
+    apply_distiller_config(&target.project_toml, &model)?;
+    // Gitignore `.env` BEFORE writing the secret into it.
+    ensure_gitignored(&target.gitignore_dir, ".env")?;
+    upsert_env_var(&target.env_path, "ANTHROPIC_API_KEY", &key)?;
     if !base_url.is_empty() {
-        upsert_env_var(&env_path, "ANTHROPIC_BASE_URL", &base_url)?;
+        upsert_env_var(&target.env_path, "ANTHROPIC_BASE_URL", &base_url)?;
     }
 
     writeln!(
         writer,
-        "\u{2713} Distiller configured (model {model}). Key stored in .env (gitignored). \
-         Note: the key was entered in plain text."
+        "\u{2713} Distiller configured for {scope_label} (model {model}). \
+         Key stored in {} (gitignored). Note: the key was entered in plain text.",
+        target.env_path.display()
     )?;
     Ok(true)
 }
@@ -89,22 +96,23 @@ fn read_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
     Ok(line)
 }
 
-/// Flip the distiller on in the project config, anchored strictly at
-/// `paths` (the install workspace). Loads an existing `project.toml` if
-/// present, else starts from a default — it does NOT call `init_project`
-/// (which would climb to an enclosing git repo and open the brain DB), so
-/// the config + secret never land in a parent repository.
-fn apply_distiller_config(paths: &ProjectPaths, model: &str) -> std::io::Result<()> {
-    // KimetsuResult's error is Box<dyn Error + Send + Sync>; it implements
-    // Display, so to_string() works without naming a concrete error type.
-    let io_err = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
-    let mut config = if paths.project_toml.exists() {
-        ProjectConfig::from_toml(&fs::read_to_string(&paths.project_toml)?).map_err(io_err)?
+/// Flip the distiller on in the project config, writing to `project_toml`
+/// directly. Loads an existing `project.toml` if present, else starts from a
+/// default — it does NOT call `init_project` (which would climb to an
+/// enclosing git repo and open the brain DB), so the config + secret never
+/// land in a parent repository.
+fn apply_distiller_config(project_toml: &Path, model: &str) -> std::io::Result<()> {
+    let io_err =
+        |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
+    let mut config = if project_toml.exists() {
+        ProjectConfig::from_toml(&fs::read_to_string(project_toml)?).map_err(io_err)?
     } else {
-        let project_id = paths
-            .repo_root
-            .file_name()
-            .and_then(|name| name.to_str())
+        // <root>/.kimetsu/project.toml -> project_id from <root>.
+        let project_id = project_toml
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
             .unwrap_or("workspace")
             .to_string();
         ProjectConfig::default_for_project(project_id)
@@ -114,11 +122,10 @@ fn apply_distiller_config(paths: &ProjectPaths, model: &str) -> std::io::Result<
     config.learning.distiller.model = model.to_string();
     config.learning.distiller.api_key_env = "ANTHROPIC_API_KEY".to_string();
     config.learning.distiller.base_url_env = "ANTHROPIC_BASE_URL".to_string();
-    let toml = config.to_toml().map_err(io_err)?;
-    if let Some(parent) = paths.project_toml.parent() {
+    if let Some(parent) = project_toml.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&paths.project_toml, toml)
+    fs::write(project_toml, config.to_toml().map_err(io_err)?)
 }
 
 /// Insert or replace `NAME=value` in a `.env` file (created if missing).
@@ -167,46 +174,35 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    // `at_root` anchors strictly at the temp dir (no git climbing), which is
-    // exactly how the CLI gate builds the paths in production.
-    fn paths_for(root: &Path) -> ProjectPaths {
-        ProjectPaths::at_root(root)
+    fn target_at(dir: &Path) -> SetupTarget {
+        SetupTarget {
+            project_toml: dir.join(".kimetsu").join("project.toml"),
+            env_path: dir.join(".env"),
+            gitignore_dir: dir.to_path_buf(),
+        }
     }
 
     #[test]
     fn wizard_writes_env_and_config() {
         let root = std::env::temp_dir().join(format!(
             "kimetsu_wizard_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(root.join(".kimetsu")).unwrap();
-        let paths = paths_for(&root);
-
-        // y -> claude -> key -> base url (LiteLLM) -> blank model (default).
-        let mut input = Cursor::new(
-            "y\nclaude\nsk-litellm-123\nhttp://localhost:4000\n\n"
-                .as_bytes()
-                .to_vec(),
-        );
+        let mut input =
+            Cursor::new("y\nclaude\nsk-litellm-123\nhttp://localhost:4000\n\n".as_bytes().to_vec());
         let mut output = Vec::new();
-        let configured = run_harvest_setup(&mut input, &mut output, &paths).unwrap();
+        let configured =
+            run_harvest_setup(&mut input, &mut output, &target_at(&root), "this workspace").unwrap();
         assert!(configured);
 
-        let env = fs::read_to_string(paths.repo_root.join(".env")).unwrap();
+        let env = fs::read_to_string(root.join(".env")).unwrap();
         assert!(env.contains("ANTHROPIC_API_KEY=sk-litellm-123"));
         assert!(env.contains("ANTHROPIC_BASE_URL=http://localhost:4000"));
-        let toml = fs::read_to_string(&paths.project_toml).unwrap();
+        let toml = fs::read_to_string(root.join(".kimetsu").join("project.toml")).unwrap();
         assert!(toml.contains("enabled = true"));
         assert!(toml.contains("claude-haiku-4-5"));
-        assert!(
-            fs::read_to_string(paths.repo_root.join(".gitignore"))
-                .unwrap()
-                .contains(".env")
-        );
-
+        assert!(fs::read_to_string(root.join(".gitignore")).unwrap().contains(".env"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -220,11 +216,11 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let paths = paths_for(&root);
+        let paths = target_at(&root);
         let mut input = Cursor::new(b"n\n".to_vec());
         let mut output = Vec::new();
-        assert!(!run_harvest_setup(&mut input, &mut output, &paths).unwrap());
-        assert!(!paths.repo_root.join(".env").exists());
+        assert!(!run_harvest_setup(&mut input, &mut output, &paths, "this workspace").unwrap());
+        assert!(!root.join(".env").exists());
         fs::remove_dir_all(root).ok();
     }
 
@@ -238,11 +234,11 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let paths = paths_for(&root);
+        let paths = target_at(&root);
         let mut input = Cursor::new(b"y\ngemini\n".to_vec());
         let mut output = Vec::new();
-        assert!(!run_harvest_setup(&mut input, &mut output, &paths).unwrap());
-        assert!(!paths.repo_root.join(".env").exists());
+        assert!(!run_harvest_setup(&mut input, &mut output, &paths, "this workspace").unwrap());
+        assert!(!root.join(".env").exists());
         fs::remove_dir_all(root).ok();
     }
 
