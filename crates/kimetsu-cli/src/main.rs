@@ -277,6 +277,11 @@ struct PluginInstallArgs {
     /// required treats missing brain context as a setup blocker for broad work.
     #[arg(long, default_value = "optional")]
     mode: String,
+    /// Install scope: `workspace` (default) writes .claude/.codex in the
+    /// workspace; `global` writes to ~/.claude(.json) and ~/.codex for all
+    /// sessions.
+    #[arg(long, default_value = "workspace")]
+    scope: String,
     #[arg(long)]
     force: bool,
     /// v0.8: skip wiring the proactive PreToolUse/PostToolUse Bash
@@ -934,20 +939,24 @@ fn mcp(command: McpCommand) -> KimetsuResult<()> {
 }
 
 fn plugin(command: PluginCommand) -> KimetsuResult<()> {
-    use kimetsu_chat::{BridgeTarget, PluginMode, plugin_install};
+    use kimetsu_chat::{BridgeTarget, InstallScope, PluginMode, plugin_install};
 
     match command {
         PluginCommand::Install(args) => {
             let workspace = args.workspace.canonicalize()?;
             let target = BridgeTarget::parse(&args.target)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            let scope = InstallScope::parse(&args.scope)
+                .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let mode = PluginMode::parse(&args.mode)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
-            let report = plugin_install(&workspace, target, mode, args.force, !args.no_proactive)
-                .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            let report =
+                plugin_install(&workspace, target, scope, mode, args.force, !args.no_proactive)
+                    .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             println!(
-                "installed Kimetsu plugin surface for {} in {} mode",
+                "installed Kimetsu plugin surface for {} ({} scope) in {} mode",
                 report.target.as_str(),
+                report.scope.as_str(),
                 report.mode.as_str()
             );
             for file in report.files {

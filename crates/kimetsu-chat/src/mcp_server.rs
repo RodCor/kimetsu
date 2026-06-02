@@ -7,8 +7,8 @@ use kimetsu_core::memory::{MemoryKind, MemoryScope};
 use serde_json::{Value, json};
 
 use crate::bridge::{
-    BridgeTarget, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
-    plugin_install,
+    BridgeTarget, InstallScope, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan,
+    bridge_sync, plugin_install,
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
@@ -60,7 +60,7 @@ const BRIDGE_EXPORT_DESCRIPTION: &str = "Export a canonical or discovered skill 
 
 const BRIDGE_SYNC_DESCRIPTION: &str = "Bulk-import all discovered non-Kimetsu skills into .kimetsu/extensions. Use for setup or migration, not during a narrow task unless the user asked to synchronize capabilities. This writes files and may touch many skill bundles.";
 
-const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, and the kimetsu-bridge skill; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome.";
+const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, and the kimetsu-bridge skill; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome. Set scope=workspace (default) to install into this workspace, or scope=global to install into the user's home (~/.claude, ~/.claude.json, ~/.codex) for all sessions. Existing user hooks are preserved (merged, not replaced).";
 
 #[derive(Debug, Clone)]
 pub struct McpServeConfig {
@@ -336,6 +336,12 @@ fn call_tool(
         }
         "kimetsu_plugin_install" => {
             let target = BridgeTarget::parse(&string_arg(&arguments, "target")?)?;
+            let scope = arguments
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(InstallScope::parse)
+                .transpose()?
+                .unwrap_or_default();
             let mode = arguments
                 .get("mode")
                 .and_then(Value::as_str)
@@ -352,9 +358,10 @@ fn call_tool(
                 .get("proactive")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let report = plugin_install(workspace, target, mode, force, proactive)?;
+            let report = plugin_install(workspace, target, scope, mode, force, proactive)?;
             Ok(json!({
                 "target": report.target.as_str(),
+                "scope": report.scope.as_str(),
                 "mode": report.mode.as_str(),
                 "files": report.files,
             }))
@@ -1764,6 +1771,11 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "enum": ["claude-code", "codex"] },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["workspace", "global"],
+                        "description": "workspace (default) installs into this workspace's .claude/.codex; global installs into ~/.claude(.json) and ~/.codex for all sessions."
+                    },
                     "mode": {
                         "type": "string",
                         "enum": ["optional", "required"],

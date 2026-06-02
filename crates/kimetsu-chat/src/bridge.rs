@@ -137,6 +137,7 @@ pub struct BridgeScan {
 #[derive(Debug, Clone)]
 pub struct PluginInstallReport {
     pub target: BridgeTarget,
+    pub scope: InstallScope,
     pub mode: PluginMode,
     pub files: Vec<PathBuf>,
 }
@@ -364,29 +365,75 @@ pub fn bridge_sync(workspace: &Path, config: &SkillConfig, force: bool) -> Resul
     Ok(imported)
 }
 
+fn resolve_home() -> Result<PathBuf, String> {
+    std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "cannot resolve home directory for a global install (set HOME or USERPROFILE)"
+                .to_string()
+        })
+}
+
 pub fn plugin_install(
     workspace: &Path,
     target: BridgeTarget,
+    scope: InstallScope,
     mode: PluginMode,
     force: bool,
     proactive: bool,
+) -> Result<PluginInstallReport, String> {
+    let home = match scope {
+        InstallScope::Global => Some(resolve_home()?),
+        InstallScope::Workspace => None,
+    };
+    plugin_install_inner(
+        workspace,
+        target,
+        scope,
+        mode,
+        force,
+        proactive,
+        home.as_deref(),
+    )
+}
+
+/// `home` is `Some` for a global install (the directory that stands in for
+/// `~`), `None` for a workspace install. Kept separate from `plugin_install`
+/// so tests can inject a deterministic home without touching process env.
+fn plugin_install_inner(
+    workspace: &Path,
+    target: BridgeTarget,
+    scope: InstallScope,
+    mode: PluginMode,
+    force: bool,
+    proactive: bool,
+    home: Option<&Path>,
 ) -> Result<PluginInstallReport, String> {
     let workspace = normalize_path(workspace);
     let mut files = Vec::new();
     match target {
         BridgeTarget::ClaudeCode => {
-            // Claude Code reads project-scoped MCP servers from `.mcp.json` at
-            // the workspace root, NOT `.claude/mcp.json`.
-            let mcp = workspace.join(".mcp.json");
-            write_mcp_config(&mcp, false)?;
+            // MCP: workspace -> ./.mcp.json (servers + mcpServers);
+            // global -> ~/.claude.json (mcpServers only).
+            let (mcp, only_mcp_servers) = match home {
+                Some(home) => (home.join(".claude.json"), true),
+                None => (workspace.join(".mcp.json"), false),
+            };
+            write_mcp_config(&mcp, only_mcp_servers)?;
             files.push(normalize_path(&mcp));
 
-            let commands = workspace.join(".claude").join("commands").join("kimetsu");
+            let claude_dir = match home {
+                Some(home) => home.join(".claude"),
+                None => workspace.join(".claude"),
+            };
+            let commands = claude_dir.join("commands").join("kimetsu");
             fs::create_dir_all(&commands)
                 .map_err(|err| format!("create {}: {err}", commands.display()))?;
-            let bridge = commands.join("bridge.md");
             // Generated docs are Kimetsu-owned boilerplate (not user-editable),
             // so always overwrite them on install — unlike CLAUDE.md.
+            let bridge = commands.join("bridge.md");
             write_text_file(
                 &bridge,
                 match mode {
@@ -406,18 +453,18 @@ pub fn plugin_install(
                 true,
             )?;
             files.push(normalize_path(&delegate));
-            // Claude Code hooks live in `.claude/settings.json` under the
-            // `hooks` key (keyed by real events, fed via stdin JSON) — not
-            // standalone `.ps1`/`.sh` files driven by env vars.
-            write_claude_settings(&workspace, force, proactive, &mut files)?;
+            write_claude_settings(&claude_dir, force, proactive, &mut files)?;
         }
         BridgeTarget::Codex => {
-            let config = workspace.join(".codex").join("config.toml");
+            let codex_dir = match home {
+                Some(home) => home.join(".codex"),
+                None => workspace.join(".codex"),
+            };
+            let config = codex_dir.join("config.toml");
             write_codex_config(&config)?;
             files.push(normalize_path(&config));
 
-            let skill = workspace
-                .join(".codex")
+            let skill = codex_dir
                 .join("skills")
                 .join("kimetsu-bridge")
                 .join("SKILL.md");
@@ -430,9 +477,10 @@ pub fn plugin_install(
                 true,
             )?;
             files.push(normalize_path(&skill));
-            write_codex_hooks(&workspace.join(".codex"), proactive, &mut files)?;
+            write_codex_hooks(&codex_dir, proactive, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
+            // Kimetsu extensions are workspace-only; scope is ignored.
             let dir = workspace.join(".kimetsu").join("extensions");
             fs::create_dir_all(&dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
             files.push(normalize_path(&dir));
@@ -440,6 +488,7 @@ pub fn plugin_install(
     }
     Ok(PluginInstallReport {
         target,
+        scope,
         mode,
         files,
     })
@@ -721,19 +770,18 @@ effort or that you would want to remember next session.
 /// Write the Claude Code surface that lives under `.claude/`: the brain
 /// `CLAUDE.md` guidance and the `settings.json` hook registration.
 fn write_claude_settings(
-    workspace: &Path,
+    claude_dir: &Path,
     force: bool,
     proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    let claude_dir = workspace.join(".claude");
-    fs::create_dir_all(&claude_dir)
+    fs::create_dir_all(claude_dir)
         .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
 
-    // CLAUDE.md: only seed when missing so we never clobber user edits.
+    // CLAUDE.md: seed only when missing, unless forced — never clobber edits.
     let claude_md = claude_dir.join("CLAUDE.md");
-    if !claude_md.is_file() {
-        write_text_file(&claude_md, CLAUDE_MD_CONTENT, force)?;
+    if !claude_md.is_file() || force {
+        write_text_file(&claude_md, CLAUDE_MD_CONTENT, true)?;
     }
     files.push(normalize_path(&claude_md));
 
@@ -1010,6 +1058,7 @@ mod tests {
         let optional = plugin_install(
             &root,
             BridgeTarget::Codex,
+            InstallScope::Workspace,
             PluginMode::Optional,
             false,
             true,
@@ -1048,7 +1097,7 @@ mod tests {
         assert!(!root.join(".codex/mcp.json").exists());
         assert!(!root.join(".codex/hooks/pre-turn.ps1").exists());
 
-        let required = plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, true, true)
+        let required = plugin_install(&root, BridgeTarget::Codex, InstallScope::Workspace, PluginMode::Required, true, true)
             .expect("required install");
         assert_eq!(required.mode, PluginMode::Required);
         let required_text = fs::read_to_string(&skill_path).expect("required skill");
@@ -1073,6 +1122,7 @@ mod tests {
         plugin_install(
             &root,
             BridgeTarget::Codex,
+            InstallScope::Workspace,
             PluginMode::Optional,
             false,
             false,
@@ -1207,9 +1257,9 @@ mod tests {
     fn plugin_install_refreshes_generated_files_without_force() {
         let root = temp_root("plugin_install_refresh");
         // First install (Codex) writes SKILL.md.
-        plugin_install(&root, BridgeTarget::Codex, PluginMode::Optional, false, true).unwrap();
+        plugin_install(&root, BridgeTarget::Codex, InstallScope::Workspace, PluginMode::Optional, false, true).unwrap();
         // Second install with force=false must succeed (refresh, not error).
-        plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, false, true).unwrap();
+        plugin_install(&root, BridgeTarget::Codex, InstallScope::Workspace, PluginMode::Required, false, true).unwrap();
 
         let skill = fs::read_to_string(
             root.join(".codex/skills/kimetsu-bridge/SKILL.md"),
@@ -1222,6 +1272,52 @@ mod tests {
         );
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plugin_install_global_writes_to_home_not_workspace() {
+        let ws = temp_root("plugin_install_global_ws");
+        let home = temp_root("plugin_install_global_home");
+
+        // Claude global install into the injected home.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            true,
+            Some(home.as_path()),
+        )
+        .unwrap();
+
+        assert!(home.join(".claude/settings.json").is_file());
+        assert!(home.join(".claude/commands/kimetsu/bridge.md").is_file());
+        assert!(home.join(".claude.json").is_file());
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        assert!(value.get("servers").is_none());
+        assert!(!ws.join(".claude").exists());
+        assert!(!ws.join(".mcp.json").exists());
+
+        // Codex global install.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::Codex,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            true,
+            Some(home.as_path()),
+        )
+        .unwrap();
+        assert!(home.join(".codex/config.toml").is_file());
+        assert!(home.join(".codex/hooks.json").is_file());
+        assert!(!ws.join(".codex").exists());
+
+        fs::remove_dir_all(ws).ok();
+        fs::remove_dir_all(home).ok();
     }
 
     fn temp_root(label: &str) -> PathBuf {
