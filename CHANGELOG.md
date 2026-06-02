@@ -33,7 +33,19 @@ FIXED
     Claude Code actually passes a `transcript_path` to a JSONL file. It now reads
     the JSONL (with the inline array kept as a fallback), counts both the bare
     and MCP-namespaced (`mcp__kimetsu__kimetsu_brain_record`) tool names, so the
-    "lessons recorded" banner and end-of-session cue actually fire.
+    "lessons recorded" banner and end-of-session cue actually fire. The JSONL is
+    now streamed line-by-line so a long session's multi-MB transcript never
+    lands in memory at once.
+  * **BOM-tolerant install.** `kimetsu plugin install` now strips a leading
+    UTF-8 BOM before parsing an existing `settings.json` / `hooks.json` /
+    `config.toml` / `.mcp.json`, so a config saved by a BOM-emitting editor
+    (e.g. older Windows Notepad) no longer fails with "expected value at line 1
+    column 1".
+  * **Install polish.** `--force` help now states it overwrites an existing
+    `CLAUDE.md` (including the global `~/.claude/CLAUDE.md`); a `--scope global`
+    on the workspace-only `kimetsu` target warns instead of silently doing
+    nothing; `--workspace` is canonicalized leniently so a global install
+    doesn't fail on a missing workspace path.
 
 ## v0.8.4 — non-destructive plugin install + global scope
 
