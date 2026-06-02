@@ -558,6 +558,15 @@ fn upsert_kimetsu_hook(
 /// `PreToolUse`/`PostToolUse` hooks use a `Bash` matcher so they fire only
 /// around shell invocations; they surface a memory check without blocking the
 /// tool call.
+///
+/// Strip a leading UTF-8 BOM so `serde_json`/`toml` (which reject it) can parse
+/// config files written by BOM-emitting editors (e.g. older Windows Notepad) —
+/// otherwise an existing `settings.json` saved with a BOM fails install with
+/// "expected value at line 1 column 1".
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 fn write_codex_hooks(
     codex_dir: &Path,
     proactive: bool,
@@ -567,7 +576,7 @@ fn write_codex_hooks(
     let mut root = if hooks.is_file() {
         let text =
             fs::read_to_string(&hooks).map_err(|err| format!("read {}: {err}", hooks.display()))?;
-        serde_json::from_str::<serde_json::Value>(&text)
+        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", hooks.display()))?
     } else {
         serde_json::json!({})
@@ -702,7 +711,7 @@ fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        serde_json::from_str::<serde_json::Value>(&text)
+        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", path.display()))?
     } else {
         serde_json::json!({})
@@ -727,7 +736,7 @@ fn write_codex_config(path: &Path) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        toml::from_str::<toml::Value>(&text)
+        toml::from_str::<toml::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", path.display()))?
     } else {
         toml::Value::Table(toml::map::Map::new())
@@ -860,7 +869,7 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        serde_json::from_str::<serde_json::Value>(&text)
+        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", path.display()))?
     } else {
         serde_json::json!({})
@@ -1214,6 +1223,36 @@ mod tests {
             "proactive disabled must not write PreToolUse"
         );
         assert!(hooks_json["hooks"]["PostToolUse"].is_null());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_hooks_merge_tolerates_utf8_bom() {
+        // A settings.json saved by a BOM-emitting editor (older Notepad)
+        // must still parse + merge, not fail with "expected value at line 1".
+        let root = temp_root("claude_hooks_bom");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let body = serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "matcher": "", "hooks": [{ "type": "command", "command": "user-hook" }] }
+                ]
+            }
+        }))
+        .unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, format!("\u{feff}{body}")).unwrap(); // leading BOM
+
+        write_claude_hooks(&settings, true).expect("BOM settings.json must merge");
+
+        let value: serde_json::Value =
+            serde_json::from_str(strip_bom(&fs::read_to_string(&settings).unwrap()))
+                .expect("output parses");
+        let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "user hook kept + kimetsu appended");
+        assert_eq!(ups[0]["hooks"][0]["command"], "user-hook");
+
         fs::remove_dir_all(root).ok();
     }
 

@@ -282,6 +282,9 @@ struct PluginInstallArgs {
     /// sessions.
     #[arg(long, default_value = "workspace")]
     scope: String,
+    /// Overwrite an existing CLAUDE.md (with `--scope global` this replaces
+    /// your global ~/.claude/CLAUDE.md). MCP config, hooks, and generated docs
+    /// always refresh idempotently and never need this.
     #[arg(long)]
     force: bool,
     /// Skip wiring the proactive PreToolUse/PostToolUse Bash
@@ -941,13 +944,26 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
 
     match command {
         PluginCommand::Install(args) => {
-            let workspace = args.workspace.canonicalize()?;
+            // Canonicalize leniently: a global install doesn't use the
+            // workspace, so a missing `--workspace` path shouldn't fail it.
+            let workspace = args
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| args.workspace.clone());
             let target = BridgeTarget::parse(&args.target)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let scope = InstallScope::parse(&args.scope)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let mode = PluginMode::parse(&args.mode)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            // The kimetsu extensions target is workspace-only; warn rather
+            // than silently ignore a `--scope global` for it.
+            if matches!(scope, InstallScope::Global) && matches!(target, BridgeTarget::Kimetsu) {
+                eprintln!(
+                    "kimetsu plugin install: --scope global has no effect for the `kimetsu` target; \
+                     installing to the workspace .kimetsu/extensions."
+                );
+            }
             let report = plugin_install(
                 &workspace,
                 target,
@@ -1824,32 +1840,26 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     let session: serde_json::Value =
         serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
 
-    // Gather transcript messages. Claude Code's Stop hook sends a
-    // `transcript_path` to a JSONL file (one message per line), NOT an
-    // inline array — read that. Fall back to an inline `transcript`
-    // array for other harnesses / tests.
-    let messages: Vec<serde_json::Value> = match session
+    // Count transcript messages + recorded lessons. Claude Code's Stop
+    // hook sends a `transcript_path` to a JSONL file (one message per
+    // line), NOT an inline array — stream it line-by-line so a long
+    // session's transcript (tens of MB) never lands in memory at once.
+    // Fall back to an inline `transcript` array for other harnesses/tests.
+    let (turn_count, recorded) = match session
         .get("transcript_path")
         .and_then(|v| v.as_str())
         .filter(|p| !p.trim().is_empty())
     {
-        Some(path) => std::fs::read_to_string(path)
-            .ok()
-            .map(|text| {
-                text.lines()
-                    .filter_map(|line| serde_json::from_str(line.trim()).ok())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        None => session
-            .get("transcript")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
+        Some(path) => count_transcript_jsonl(path),
+        None => {
+            let messages: Vec<serde_json::Value> = session
+                .get("transcript")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            (messages.len(), count_brain_record_calls(&messages))
+        }
     };
-
-    let turn_count = messages.len();
-    let recorded = count_brain_record_calls(&messages);
 
     if recorded > 0 {
         println!(
@@ -1942,6 +1952,31 @@ fn count_brain_record_calls(messages: &[serde_json::Value]) -> usize {
 /// or any MCP namespace prefix (`mcp__<server>__kimetsu_brain_record`).
 fn is_brain_record_tool(name: &str) -> bool {
     name == "kimetsu_brain_record" || name.ends_with("__kimetsu_brain_record")
+}
+
+/// Stream a transcript JSONL file, returning `(message_count,
+/// brain_record_count)` without loading the whole file into memory.
+/// Best-effort: an unreadable file or malformed line is skipped, never
+/// fatal (a hook must not break the agent's turn). A leading UTF-8 BOM on
+/// the first line is tolerated.
+fn count_transcript_jsonl(path: &str) -> (usize, usize) {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return (0, 0);
+    };
+    let mut turns = 0usize;
+    let mut records = 0usize;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() {
+            continue;
+        }
+        turns += 1;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            records += count_brain_record_calls(std::slice::from_ref(&value));
+        }
+    }
+    (turns, records)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3020,6 +3055,36 @@ mod tests {
         // No record calls.
         let none = vec![serde_json::json!({ "message": { "content": [{ "name": "Bash" }] } })];
         assert_eq!(count_brain_record_calls(&none), 0);
+    }
+
+    #[test]
+    fn count_transcript_jsonl_streams_counts() {
+        let dir = std::env::temp_dir().join(format!(
+            "kimetsu_transcript_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // Leading BOM on line 1, a namespaced record call, a blank line,
+        // and a malformed line (all tolerated).
+        let body = "\u{feff}{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n\
+             {\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"mcp__kimetsu__kimetsu_brain_record\"}]}}\n\
+             \n\
+             not json\n\
+             {\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"bye\"}]}}\n";
+        fs::write(&path, body).unwrap();
+
+        let (turns, records) = count_transcript_jsonl(path.to_str().unwrap());
+        assert_eq!(turns, 4, "4 non-empty lines counted");
+        assert_eq!(records, 1, "one namespaced brain_record counted");
+
+        // Missing file is best-effort (0, 0).
+        assert_eq!(count_transcript_jsonl("/no/such/file.jsonl"), (0, 0));
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
