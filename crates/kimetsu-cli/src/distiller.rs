@@ -228,6 +228,10 @@ pub fn run_session_end_hook(workspace: &Path) {
     let payload: serde_json::Value =
         serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
 
+    // Resolve config at the project's git root (where the setup wizard writes
+    // when install is run at the repo root — the documented common case). A
+    // non-git-subdir install is the only mismatch, and it fails safe: the
+    // discovered root has no enabled distiller, so this is a silent no-op.
     let Ok(paths) = ProjectPaths::discover(workspace) else {
         return;
     };
