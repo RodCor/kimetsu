@@ -64,6 +64,39 @@ impl Default for PluginMode {
     }
 }
 
+/// Where the plugin surface is installed: the current workspace
+/// (`.claude/`, `.codex/`, `.mcp.json`) or the user's home directory
+/// (`~/.claude/`, `~/.claude.json`, `~/.codex/`) for all sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallScope {
+    Workspace,
+    Global,
+}
+
+impl InstallScope {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "workspace" | "ws" | "local" | "project" => Ok(Self::Workspace),
+            "global" | "g" | "user" | "home" => Ok(Self::Global),
+            other => Err(format!("unknown install scope `{other}`")),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Global => "global",
+        }
+    }
+}
+
+impl Default for InstallScope {
+    fn default() -> Self {
+        Self::Workspace
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeExtensionManifest {
     pub id: String,
@@ -856,6 +889,18 @@ fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_scope_parses_aliases() {
+        assert_eq!(InstallScope::parse("").unwrap(), InstallScope::Workspace);
+        assert_eq!(InstallScope::parse("workspace").unwrap(), InstallScope::Workspace);
+        assert_eq!(InstallScope::parse("Local").unwrap(), InstallScope::Workspace);
+        assert_eq!(InstallScope::parse("global").unwrap(), InstallScope::Global);
+        assert_eq!(InstallScope::parse("USER").unwrap(), InstallScope::Global);
+        assert_eq!(InstallScope::Workspace.as_str(), "workspace");
+        assert_eq!(InstallScope::Global.as_str(), "global");
+        assert!(InstallScope::parse("nope").is_err());
+    }
 
     #[test]
     fn imports_and_exports_skill_bundle() {
