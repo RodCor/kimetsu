@@ -3,6 +3,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod distiller;
 mod doctor;
 mod proactive_state;
 mod update;
@@ -362,6 +363,9 @@ enum BrainCommand {
     /// silently otherwise.
     #[command(name = "posttool-hook")]
     PostToolHook(ProactiveHookArgs),
+    /// Claude Code SessionEnd hook — runs the credentialed distiller.
+    #[command(name = "session-end-hook")]
+    SessionEndHook(StopHookArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1380,6 +1384,13 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Model { command } => brain_model(command),
         BrainCommand::PreToolHook(args) => proactive_hook(ProactiveEvent::PreTool, args),
         BrainCommand::PostToolHook(args) => proactive_hook(ProactiveEvent::PostTool, args),
+        BrainCommand::SessionEndHook(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            distiller::run_session_end_hook(&workspace);
+            Ok(())
+        }
     }
 }
 
