@@ -1861,8 +1861,11 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         );
         return Ok(());
     }
-    // Short sessions (≤4 turns) exit silently — no nagging for quick lookups.
-    if turn_count <= 4 {
+    // Short sessions exit silently — no nagging for quick lookups. The
+    // count is transcript *lines* (user/assistant/tool messages), so the
+    // bar is set above a trivial lookup exchange.
+    const MIN_TRANSCRIPT_LINES: usize = 12;
+    if turn_count < MIN_TRANSCRIPT_LINES {
         return Ok(());
     }
 
@@ -1909,7 +1912,10 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
 
 /// Count `kimetsu_brain_record` tool-use blocks across transcript
 /// messages. Tolerates both the inline message shape (`content` array)
-/// and Claude Code's JSONL shape (`message.content` array).
+/// and Claude Code's JSONL shape (`message.content` array). The tool
+/// name is matched against both the bare `kimetsu_brain_record` and the
+/// MCP-namespaced `mcp__kimetsu__kimetsu_brain_record` form that real
+/// Claude Code transcripts actually carry.
 fn count_brain_record_calls(messages: &[serde_json::Value]) -> usize {
     messages
         .iter()
@@ -1923,13 +1929,21 @@ fn count_brain_record_calls(messages: &[serde_json::Value]) -> usize {
                     blocks
                         .iter()
                         .filter(|b| {
-                            b.get("name").and_then(|n| n.as_str()) == Some("kimetsu_brain_record")
+                            b.get("name")
+                                .and_then(|n| n.as_str())
+                                .is_some_and(is_brain_record_tool)
                         })
                         .count()
                 })
                 .unwrap_or(0)
         })
         .sum()
+}
+
+/// True for the `kimetsu_brain_record` tool under either the bare name
+/// or any MCP namespace prefix (`mcp__<server>__kimetsu_brain_record`).
+fn is_brain_record_tool(name: &str) -> bool {
+    name == "kimetsu_brain_record" || name.ends_with("__kimetsu_brain_record")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2985,18 +2999,25 @@ mod tests {
         ];
         assert_eq!(count_brain_record_calls(&inline), 1);
 
-        // Claude Code JSONL shape: `message.content` array.
+        // Claude Code JSONL shape: `message.content` array, with the
+        // MCP-namespaced tool name real transcripts actually carry.
         let jsonl = vec![
             serde_json::json!({
                 "type": "assistant",
-                "message": { "content": [{ "type": "tool_use", "name": "kimetsu_brain_record" }] }
+                "message": { "content": [{ "type": "tool_use", "name": "mcp__kimetsu__kimetsu_brain_record" }] }
             }),
             serde_json::json!({
                 "type": "assistant",
-                "message": { "content": [{ "type": "tool_use", "name": "kimetsu_brain_record" }] }
+                "message": { "content": [{ "type": "tool_use", "name": "mcp__kimetsu__kimetsu_brain_record" }] }
             }),
         ];
         assert_eq!(count_brain_record_calls(&jsonl), 2);
+
+        // A differently-namespaced server prefix still matches.
+        let other_ns = vec![serde_json::json!({
+            "message": { "content": [{ "name": "mcp__brain__kimetsu_brain_record" }] }
+        })];
+        assert_eq!(count_brain_record_calls(&other_ns), 1);
 
         // No record calls.
         let none = vec![serde_json::json!({ "message": { "content": [{ "name": "Bash" }] } })];
