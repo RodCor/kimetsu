@@ -453,6 +453,14 @@ fn plugin_install_inner(
                 true,
             )?;
             files.push(normalize_path(&delegate));
+            // v0.8.5: the memory-harvester subagent the hooks cue the
+            // agent to dispatch (a cheap background Haiku distiller).
+            let agents = claude_dir.join("agents");
+            fs::create_dir_all(&agents)
+                .map_err(|err| format!("create {}: {err}", agents.display()))?;
+            let harvester = agents.join("kimetsu-memory-harvester.md");
+            write_text_file(&harvester, CLAUDE_MEMORY_HARVESTER_AGENT, true)?;
+            files.push(normalize_path(&harvester));
             write_claude_settings(&claude_dir, force, proactive, &mut files)?;
         }
         BridgeTarget::Codex => {
@@ -768,6 +776,54 @@ You have a persistent memory brain attached via MCP (tools prefixed `mcp__kimets
 
 Do not call either tool on simple/one-liner tasks. The brain is for things that required real
 effort or that you would want to remember next session.
+
+## Auto-harvesting memories
+
+A Kimetsu hook may emit a `[kimetsu-harvest]` cue (after you fix a previously
+failing command, or at the end of a non-trivial session that recorded nothing).
+When you see one, dispatch the `kimetsu-memory-harvester` subagent **in the
+background** (the Task/Agent tool with `run_in_background: true`) so it distills
+and records any durable lesson without blocking your work. It runs on a small,
+cheap model and records nothing when there's nothing worth saving.
+"#;
+
+/// v0.8.5: the memory-harvester subagent installed at
+/// `.claude/agents/kimetsu-memory-harvester.md`. A cheap, background
+/// Haiku distiller the hooks cue the main agent to dispatch — it reads
+/// the recent context, distills 0-3 generalizable lessons (favoring
+/// hard-won fixes / resolved tool failures), and records each through
+/// the confidence-gated `kimetsu_brain_record` MCP tool.
+const CLAUDE_MEMORY_HARVESTER_AGENT: &str = r#"---
+name: kimetsu-memory-harvester
+description: Distills durable, generalizable lessons from the recent session and records them to the Kimetsu brain. Dispatch in the background when a [kimetsu-harvest] hook cue appears, or after solving a non-obvious problem.
+model: haiku
+tools: mcp__kimetsu__kimetsu_brain_record, mcp__kimetsu__kimetsu_brain_context
+---
+
+You are Kimetsu's memory harvester. Given the recent conversation/session context,
+extract durable lessons worth remembering across future sessions and record them.
+
+What qualifies (record these):
+- A non-obvious fix for a command/tool that failed and was then resolved — capture
+  the root cause and the fix, generalized beyond this one repo path.
+- A convention, gotcha, or environment quirk that cost real effort to discover.
+- A reusable approach or anti-pattern confirmed by the outcome.
+
+What does NOT qualify (record nothing):
+- Trivial or well-known facts, one-liners, restatements of docs.
+- Anything specific to a single throwaway value with no general lesson.
+
+How to record:
+- For each qualifying lesson (at most 3), call `kimetsu_brain_record` with a
+  concrete, actionable `lesson`, 2-5 domain `tags`, an optional one-line
+  `context`, and a `confidence` in [0,1] (0.8 when you're sure it generalizes,
+  lower when unsure — low-confidence lessons become proposals for review).
+- Use `kind: "anti_pattern"` for things to avoid, `"convention"` for project
+  norms, otherwise the default.
+- If nothing qualifies, do nothing and finish. Quality over quantity.
+
+Constraints: do NOT modify files, run commands, or take any action other than
+calling the brain tools. Be terse. One brain call per distinct lesson.
 "#;
 
 /// Write the Claude Code surface that lives under `.claude/`: the brain
@@ -1346,6 +1402,10 @@ mod tests {
         assert!(home.join(".claude/settings.json").is_file());
         assert!(home.join(".claude/CLAUDE.md").is_file());
         assert!(home.join(".claude/commands/kimetsu/bridge.md").is_file());
+        assert!(
+            home.join(".claude/agents/kimetsu-memory-harvester.md")
+                .is_file()
+        );
         assert!(home.join(".claude.json").is_file());
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
