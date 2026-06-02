@@ -195,6 +195,7 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// confidence-gated `propose_or_merge_memory` (workspace brain); `GlobalUser`
 /// uses `add_memory`, which routes to `~/.kimetsu/brain.db` (the user brain
 /// has no proposal queue, so this is add-or-dedup). Returns the count recorded.
+/// For `GlobalUser`, `start` is ignored (the user brain is global).
 pub fn distill_and_record(
     start: &Path,
     view: &str,
