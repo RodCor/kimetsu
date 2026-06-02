@@ -204,6 +204,13 @@ the agent to dispatch a background `kimetsu-memory-harvester` subagent (a cheap
 in-agent distiller) that records the lesson for next time — no extra API key.
 Turn it off with `[learning] auto_harvest = false` in `.kimetsu/project.toml`.
 
+For a deterministic harvest that doesn't depend on the agent, `kimetsu plugin
+install claude-code` offers to set up a **SessionEnd distiller**: a cheap
+configured model (Anthropic `claude-haiku-4-5`, or a LiteLLM endpoint via
+`ANTHROPIC_BASE_URL`) that distills each session itself at the end and records
+the lessons. The wizard stores the key in a gitignored `.env`; skip it with
+`--no-setup`.
+
 ```bash
 kimetsu brain search "build failures"
 kimetsu brain context "where is auth configured?"

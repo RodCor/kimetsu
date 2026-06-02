@@ -6,7 +6,23 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## v0.9.0 — auto-harvested memories
+## Unreleased
+
+ADDED
+  * **Credentialed SessionEnd distiller (opt-in).** A second, deterministic
+    memory-harvest path alongside the v0.9.0 in-agent harvester. `kimetsu plugin
+    install claude-code` now runs an interactive wizard (on a TTY; skip with
+    `--no-setup`, force with `--setup-harvest`) that configures a cheap distiller
+    model — Anthropic (recommended `claude-haiku-4-5`) or any Anthropic-compatible
+    endpoint incl. **LiteLLM** via `ANTHROPIC_BASE_URL`. The key + base URL are
+    written to a gitignored `.env`; the selection lands in `[learning.distiller]`
+    in `project.toml`. A new `SessionEnd` hook then runs `kimetsu brain
+    session-end-hook`, which (when enabled + credentialed) distills the
+    transcript with that model and records lessons through the confidence-gated
+    `propose_or_merge_memory`. When the distiller is enabled, the Stop hook's
+    end-of-session cue is suppressed (the distiller owns end-of-session; the
+    mid-session PostToolUse resolved-failure cue stays). `AnthropicProvider`
+    gained an optional base URL for the LiteLLM case.
 
 ADDED
   * **Auto-harvested memories (in-agent).** The hooks now drive memory
