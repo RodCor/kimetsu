@@ -61,13 +61,22 @@ Applied to every event Kimetsu manages:
 - Codex: `UserPromptSubmit`, and (when `proactive`) `PreToolUse`, `PostToolUse`.
 
 Consequences:
-- Non-Kimetsu hooks on the same or other events are always preserved.
+- Non-Kimetsu hooks are always preserved — including the case where the user
+  **already has their own hook on an event Kimetsu also uses** (e.g. a custom
+  `UserPromptSubmit` or `PreToolUse` group). Kimetsu's group is added *into the
+  same event array, alongside* the existing group(s); the user's groups and
+  their inner `hooks[]` commands are never read, mutated, or dropped. Both
+  groups fire (the hooks format runs every matcher group for an event).
 - Re-running install never duplicates Kimetsu groups (replace-in-place).
 - The `already defines hooks; pass --force` errors are removed. Hook merge no
   longer consults `force`.
 
-A Kimetsu-owned group is detected by scanning its `hooks[].command` strings for
-the substring `kimetsu brain`.
+Kimetsu always contributes its own matcher group rather than splicing commands
+into a user's group, so user groups stay byte-for-byte untouched even when they
+share Kimetsu's matcher (`""` for `UserPromptSubmit`/`Stop`, `"Bash"` for the
+proactive tool hooks). A Kimetsu-owned group is detected by scanning its
+`hooks[].command` strings for the substring `kimetsu brain`; only a group that
+matches is ever replaced.
 
 ### 2. MCP config writers become idempotent
 
@@ -139,10 +148,14 @@ Notes:
 
 Unit tests in `bridge.rs`:
 
-1. **Preserve user hooks (Claude):** seed `settings.json` with a non-Kimetsu
-   `UserPromptSubmit` hook and a non-Kimetsu `PreToolUse` hook; after install
-   both survive and Kimetsu's groups are present alongside.
-2. **Preserve user hooks (Codex):** same for `hooks.json`.
+1. **Preserve user hooks on a shared event (Claude):** seed `settings.json`
+   with a non-Kimetsu `UserPromptSubmit` group (the same event Kimetsu uses) and
+   a non-Kimetsu group on an unrelated event (e.g. `SubagentStop`); after
+   install, assert the user's `UserPromptSubmit` group is still present with its
+   original command intact **and** Kimetsu's `UserPromptSubmit` group is appended
+   alongside it (array length 2), and the unrelated event is untouched.
+2. **Preserve user hooks on a shared event (Codex):** same for `hooks.json`,
+   including a user-defined `UserPromptSubmit` group plus Kimetsu's.
 3. **Idempotent re-run:** run install twice; assert exactly one Kimetsu group per
    event (no duplicates) for both targets.
 4. **No --force needed:** install succeeds on a workspace that already has hooks,
