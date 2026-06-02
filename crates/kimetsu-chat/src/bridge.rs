@@ -385,6 +385,8 @@ pub fn plugin_install(
             fs::create_dir_all(&commands)
                 .map_err(|err| format!("create {}: {err}", commands.display()))?;
             let bridge = commands.join("bridge.md");
+            // Generated docs are Kimetsu-owned boilerplate (not user-editable),
+            // so always overwrite them on install — unlike CLAUDE.md.
             write_text_file(
                 &bridge,
                 match mode {
@@ -1213,7 +1215,11 @@ mod tests {
             root.join(".codex/skills/kimetsu-bridge/SKILL.md"),
         )
         .unwrap();
-        assert!(!skill.is_empty());
+        // Prove the file was overwritten with the Required variant, not left as Optional.
+        assert!(
+            skill.contains("Treat missing Kimetsu MCP access as a setup blocker"),
+            "SKILL.md should contain Required-mode wording after second install"
+        );
 
         fs::remove_dir_all(root).ok();
     }
