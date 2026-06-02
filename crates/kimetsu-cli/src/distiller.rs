@@ -47,17 +47,51 @@ fn default_confidence() -> f32 {
     0.7
 }
 
+/// Extract the first complete top-level JSON array from `text`, ignoring
+/// brackets that appear inside JSON strings and any prose after the array.
+/// Byte-scan is safe: the structural bytes (`"` `[` `]` `\`) are all ASCII,
+/// and UTF-8 continuation bytes are >= 0x80 so they never match.
+fn find_json_array(text: &str) -> Option<&str> {
+    let start = text.find('[')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// Extract the first JSON array from `text` and parse it into lessons.
 /// Tolerant: returns empty on any parse failure; drops empty lessons;
 /// caps at 3.
 pub fn parse_lessons(text: &str) -> Vec<Lesson> {
-    let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) else {
+    let Some(array) = find_json_array(text) else {
         return Vec::new();
     };
-    if end < start {
-        return Vec::new();
-    }
-    serde_json::from_str::<Vec<Lesson>>(&text[start..=end])
+    serde_json::from_str::<Vec<Lesson>>(array)
         .unwrap_or_default()
         .into_iter()
         .filter(|l| !l.lesson.trim().is_empty())
@@ -108,7 +142,7 @@ pub fn build_transcript_view(path: &str, max_chars: usize) -> String {
         if let Some(snippet) = extract_snippet(&value) {
             out.push_str(&snippet);
             out.push('\n');
-            if out.chars().count() > max_chars * 2 {
+            if out.chars().count() > max_chars.saturating_mul(2) {
                 out = tail_chars(&out, max_chars);
             }
         }
@@ -162,6 +196,7 @@ fn tail_chars(s: &str, n: usize) -> String {
 pub fn distill_and_record(start: &Path, view: &str, provider: &mut dyn ModelProvider) -> usize {
     let mut recorded = 0;
     for lesson in distill_lessons(view, provider) {
+        // Mirror kimetsu_brain_record's MCP kind mapping; semantic_operator + default store as Fact.
         let kind = match lesson.kind.as_str() {
             "anti_pattern" => MemoryKind::FailurePattern,
             "convention" => MemoryKind::Convention,
@@ -269,6 +304,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_lessons_ignores_trailing_prose_and_brackets() {
+        let lessons = parse_lessons(
+            "[{\"lesson\":\"Pin the linker\",\"confidence\":0.9}], also see [1] and [2].",
+        );
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].lesson, "Pin the linker");
+    }
+
+    #[test]
+    fn parse_lessons_handles_brackets_inside_strings() {
+        let lessons = parse_lessons("[{\"lesson\":\"use arr[0] not arr.first\"}]");
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].lesson, "use arr[0] not arr.first");
+    }
+
+    #[test]
     fn distill_lessons_uses_model_text() {
         let mut provider = MockProvider::new([text_response(
             "[{\"lesson\":\"Pin the linker\",\"tags\":[\"rust\",\"windows\"],\"kind\":\"convention\",\"confidence\":0.9}]",
@@ -328,26 +379,22 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        // git_init_boundary makes this dir its own git toplevel so
-        // ProjectPaths::discover() resolves to `root` itself instead of
-        // climbing to the enclosing Kimetsu dev repo.
+        std::fs::create_dir_all(&root).unwrap();
         kimetsu_core::paths::git_init_boundary(&root);
-        // SAFETY: single-threaded test setup; isolate from any user brain.
-        unsafe {
-            std::env::set_var("KIMETSU_USER_BRAIN", "0");
-        }
-        kimetsu_brain::project::init_project(&root, true).expect("init brain");
 
-        let mut provider = MockProvider::new([text_response(
-            "[{\"lesson\":\"Set USERPROFILE for global installs\",\"tags\":[\"cargo\",\"windows\"],\"confidence\":0.9}]",
-        )]);
-        let n = distill_and_record(&root, "user: a\nuser: b", &mut provider);
-        assert_eq!(n, 1);
-        let memories = kimetsu_brain::project::list_memories(&root).expect("list");
-        assert!(
-            memories.iter().any(|m| m.text.contains("USERPROFILE")),
-            "distilled lesson was recorded"
-        );
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            kimetsu_brain::project::init_project(&root, true).expect("init brain");
+            let mut provider = MockProvider::new([text_response(
+                "[{\"lesson\":\"Set USERPROFILE for global installs\",\"tags\":[\"cargo\",\"windows\"],\"confidence\":0.9}]",
+            )]);
+            let n = distill_and_record(&root, "user: a\nuser: b", &mut provider);
+            assert_eq!(n, 1);
+            let memories = kimetsu_brain::project::list_memories(&root).expect("list");
+            assert!(
+                memories.iter().any(|m| m.text.contains("USERPROFILE")),
+                "distilled lesson was recorded"
+            );
+        });
 
         std::fs::remove_dir_all(root).ok();
     }
