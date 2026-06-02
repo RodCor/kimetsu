@@ -191,9 +191,16 @@ fn tail_chars(s: &str, n: usize) -> String {
     }
 }
 
-/// Distill lessons from `view` and record each via the confidence-gated
-/// brain API. Returns the count recorded.
-pub fn distill_and_record(start: &Path, view: &str, provider: &mut dyn ModelProvider) -> usize {
+/// Distill lessons from `view` and record each. `Project` scope uses the
+/// confidence-gated `propose_or_merge_memory` (workspace brain); `GlobalUser`
+/// uses `add_memory`, which routes to `~/.kimetsu/brain.db` (the user brain
+/// has no proposal queue, so this is add-or-dedup). Returns the count recorded.
+pub fn distill_and_record(
+    start: &Path,
+    view: &str,
+    provider: &mut dyn ModelProvider,
+    scope: MemoryScope,
+) -> usize {
     let mut recorded = 0;
     for lesson in distill_lessons(view, provider) {
         // Mirror kimetsu_brain_record's MCP kind mapping; semantic_operator + default store as Fact.
@@ -202,17 +209,22 @@ pub fn distill_and_record(start: &Path, view: &str, provider: &mut dyn ModelProv
             "convention" => MemoryKind::Convention,
             _ => MemoryKind::Fact,
         };
-        let confidence = lesson.confidence.clamp(0.0, 1.0);
-        if project::propose_or_merge_memory(
-            start,
-            MemoryScope::Project,
-            kind,
-            lesson.lesson.trim(),
-            confidence,
-            "auto-harvested at session end",
-        )
-        .is_ok()
-        {
+        let text = lesson.lesson.trim();
+        let ok = match scope {
+            MemoryScope::GlobalUser => {
+                project::add_memory(start, MemoryScope::GlobalUser, kind, text).is_ok()
+            }
+            _ => project::propose_or_merge_memory(
+                start,
+                scope,
+                kind,
+                text,
+                lesson.confidence.clamp(0.0, 1.0),
+                "auto-harvested at session end",
+            )
+            .is_ok(),
+        };
+        if ok {
             recorded += 1;
         }
     }
@@ -265,7 +277,7 @@ pub fn run_session_end_hook(workspace: &Path) {
     ) else {
         return;
     };
-    let recorded = distill_and_record(&paths.repo_root, &view, &mut provider);
+    let recorded = distill_and_record(&paths.repo_root, &view, &mut provider, MemoryScope::Project);
     if recorded > 0 {
         println!(
             "[Kimetsu] distilled {recorded} lesson{} at session end.",
@@ -391,7 +403,7 @@ mod tests {
             let mut provider = MockProvider::new([text_response(
                 "[{\"lesson\":\"Set USERPROFILE for global installs\",\"tags\":[\"cargo\",\"windows\"],\"confidence\":0.9}]",
             )]);
-            let n = distill_and_record(&root, "user: a\nuser: b", &mut provider);
+            let n = distill_and_record(&root, "user: a\nuser: b", &mut provider, MemoryScope::Project);
             assert_eq!(n, 1);
             let memories = kimetsu_brain::project::list_memories(&root).expect("list");
             assert!(
@@ -401,5 +413,58 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Run `f` with the user brain pointed at a temp dir (enabled), under
+    /// the process-wide env lock, restoring the previous env afterward.
+    fn with_user_brain_dir<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let _g = kimetsu_brain::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        let prev_en = std::env::var("KIMETSU_USER_BRAIN").ok();
+        // SAFETY: scoped by the shared lock.
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
+            std::env::remove_var("KIMETSU_USER_BRAIN");
+        }
+        let out = f();
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_en {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn distill_and_record_global_writes_to_user_brain() {
+        let dir = std::env::temp_dir().join(format!(
+            "kimetsu_userbrain_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        with_user_brain_dir(&dir, || {
+            let mut provider = MockProvider::new([text_response(
+                "[{\"lesson\":\"Global lesson kept everywhere\",\"tags\":[\"x\"],\"confidence\":0.9}]",
+            )]);
+            // `start` is ignored on the GlobalUser path; pass the temp dir.
+            let n = distill_and_record(&dir, "user: a", &mut provider, MemoryScope::GlobalUser);
+            assert_eq!(n, 1);
+            let conn = kimetsu_brain::user_brain::open_user_brain_readonly()
+                .unwrap()
+                .expect("user brain exists");
+            let mems = kimetsu_brain::user_brain::list_user_memories(&conn).unwrap();
+            assert!(mems.iter().any(|m| m.text.contains("Global lesson kept everywhere")));
+        });
+        std::fs::remove_dir_all(dir).ok();
     }
 }
