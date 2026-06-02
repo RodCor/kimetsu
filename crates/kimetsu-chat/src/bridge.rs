@@ -428,7 +428,7 @@ pub fn plugin_install(
                 force,
             )?;
             files.push(normalize_path(&skill));
-            write_codex_hooks(&workspace, force, proactive, &mut files)?;
+            write_codex_hooks(&workspace.join(".codex"), proactive, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
             let dir = workspace.join(".kimetsu").join("extensions");
@@ -487,12 +487,11 @@ fn upsert_kimetsu_hook(
 }
 
 fn write_codex_hooks(
-    workspace: &Path,
-    force: bool,
+    codex_dir: &Path,
     proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    let hooks = workspace.join(".codex").join("hooks.json");
+    let hooks = codex_dir.join("hooks.json");
     let mut root = if hooks.is_file() {
         let text =
             fs::read_to_string(&hooks).map_err(|err| format!("read {}: {err}", hooks.display()))?;
@@ -510,15 +509,11 @@ fn write_codex_hooks(
     let hooks_obj = hooks_value
         .as_object_mut()
         .ok_or_else(|| format!("{} `hooks` must be a JSON object", hooks.display()))?;
-    if hooks_obj.contains_key("UserPromptSubmit") && !force {
-        return Err(format!(
-            "{} already defines UserPromptSubmit hooks; pass --force",
-            hooks.display()
-        ));
-    }
-    hooks_obj.insert(
-        "UserPromptSubmit".to_string(),
-        serde_json::json!([{
+
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        serde_json::json!({
             "matcher": "",
             "hooks": [{
                 "type": "command",
@@ -526,15 +521,13 @@ fn write_codex_hooks(
                 "statusMessage": "Loading Kimetsu brain context",
                 "timeout": 30
             }]
-        }]),
+        }),
     );
     if proactive {
-        // v0.8: Codex supports PreToolUse/PostToolUse with a regex
-        // matcher on tool name (Bash). Both surface a relevant memory
-        // via hookSpecificOutput.additionalContext without blocking.
-        hooks_obj.insert(
-            "PreToolUse".to_string(),
-            serde_json::json!([{
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PreToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
@@ -542,11 +535,12 @@ fn write_codex_hooks(
                     "statusMessage": "Kimetsu proactive check",
                     "timeout": 15
                 }]
-            }]),
+            }),
         );
-        hooks_obj.insert(
-            "PostToolUse".to_string(),
-            serde_json::json!([{
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PostToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
@@ -554,9 +548,10 @@ fn write_codex_hooks(
                     "statusMessage": "Kimetsu proactive check",
                     "timeout": 15
                 }]
-            }]),
+            }),
         );
     }
+
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Codex hooks: {err}"))?;
     write_text_file(&hooks, &text, true)?;
@@ -1139,6 +1134,45 @@ mod tests {
         // Kimetsu's own events present.
         assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["command"], "kimetsu brain stop-hook");
         assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "kimetsu brain pretool-hook");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn codex_hooks_merge_preserves_user_hooks() {
+        let root = temp_root("codex_hooks_merge");
+        let codex = root.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("hooks.json"),
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-codex-hook" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        write_codex_hooks(&codex, true, &mut files).unwrap();
+        write_codex_hooks(&codex, true, &mut files).unwrap(); // idempotent
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex.join("hooks.json")).unwrap()).unwrap();
+        let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "user group kept + one kimetsu group");
+        assert_eq!(ups[0]["hooks"][0]["command"], "user-codex-hook");
+        assert_eq!(
+            ups[1]["hooks"][0]["command"],
+            "kimetsu brain context-hook --workspace ."
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "kimetsu brain pretool-hook --workspace ."
+        );
 
         fs::remove_dir_all(root).ok();
     }
