@@ -6,7 +6,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
-## Unreleased
+## v0.9.0 — auto-harvested memories + SessionEnd distiller
 
 ADDED
   * **Credentialed SessionEnd distiller (opt-in).** A second, deterministic
@@ -23,8 +23,6 @@ ADDED
     end-of-session cue is suppressed (the distiller owns end-of-session; the
     mid-session PostToolUse resolved-failure cue stays). `AnthropicProvider`
     gained an optional base URL for the LiteLLM case.
-
-ADDED
   * **Auto-harvested memories (in-agent).** The hooks now drive memory
     *generation*, not just retrieval. When a command that failed earlier in the
     session succeeds (PostToolUse), or a non-trivial session ends with nothing
