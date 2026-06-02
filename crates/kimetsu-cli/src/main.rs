@@ -1882,7 +1882,10 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .map(|c| c.learning.auto_harvest)
         .unwrap_or(true);
 
-    if auto_harvest && !stop_active && let Some(paths) = paths.as_ref() {
+    if auto_harvest
+        && !stop_active
+        && let Some(paths) = paths.as_ref()
+    {
         let sid = session.get("session_id").and_then(|v| v.as_str());
         let state_path = proactive_state::session_path(&paths.kimetsu_dir, sid);
         let mut state = proactive_state::load(&state_path);
