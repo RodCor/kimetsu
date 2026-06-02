@@ -778,7 +778,9 @@ fn write_claude_settings(
     fs::create_dir_all(claude_dir)
         .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
 
-    // CLAUDE.md: seed only when missing, unless forced — never clobber edits.
+    // CLAUDE.md: seed when missing. If it already exists we leave it alone
+    // unless `force` is set — overwriting an existing CLAUDE.md is the one
+    // thing `--force` still does. Without force, user edits are never clobbered.
     let claude_md = claude_dir.join("CLAUDE.md");
     if !claude_md.is_file() || force {
         write_text_file(&claude_md, CLAUDE_MD_CONTENT, true)?;
@@ -1292,6 +1294,7 @@ mod tests {
         .unwrap();
 
         assert!(home.join(".claude/settings.json").is_file());
+        assert!(home.join(".claude/CLAUDE.md").is_file());
         assert!(home.join(".claude/commands/kimetsu/bridge.md").is_file());
         assert!(home.join(".claude.json").is_file());
         let value: serde_json::Value =
