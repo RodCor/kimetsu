@@ -1806,13 +1806,16 @@ fn user_prompt_submit_context_output(additional_context: &str) -> serde_json::Va
     })
 }
 
-/// v0.7: Claude Code Stop hook. Reads session JSON from stdin, counts
-/// kimetsu_brain_record calls in the transcript, and prints a summary
-/// banner. Silent exit when the session was short or nothing to report.
+/// v0.7: Claude Code Stop hook. Reads the session JSON from stdin,
+/// counts `kimetsu_brain_record` calls in the transcript, and prints a
+/// summary banner. v0.8.5: reads the real `transcript_path` (a JSONL
+/// file Claude Code writes) instead of a non-existent inline array, and
+/// — when nothing was recorded in a non-trivial session — points at the
+/// memory-harvester subagent. Silent exit for short sessions.
 fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     use std::io::Read;
 
-    let _workspace = args
+    let workspace = args
         .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
 
@@ -1823,30 +1826,32 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     let session: serde_json::Value =
         serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
 
-    // Count kimetsu_brain_record tool calls in the transcript.
-    let transcript = session
-        .get("transcript")
-        .and_then(|v| v.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
+    // Gather transcript messages. Claude Code's Stop hook sends a
+    // `transcript_path` to a JSONL file (one message per line), NOT an
+    // inline array — read that. Fall back to an inline `transcript`
+    // array for other harnesses / tests.
+    let messages: Vec<serde_json::Value> = match session
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+    {
+        Some(path) => std::fs::read_to_string(path)
+            .ok()
+            .map(|text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str(line.trim()).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => session
+            .get("transcript")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    };
 
-    let turn_count = transcript.len();
-    let recorded: usize = transcript
-        .iter()
-        .flat_map(|msg| {
-            msg.get("content")
-                .and_then(|c| c.as_array())
-                .into_iter()
-                .flatten()
-        })
-        .filter(|block| {
-            block
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| n == "kimetsu_brain_record")
-                .unwrap_or(false)
-        })
-        .count();
+    let turn_count = messages.len();
+    let recorded = count_brain_record_calls(&messages);
 
     if recorded > 0 {
         println!(
@@ -1854,13 +1859,74 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
             recorded,
             if recorded == 1 { "" } else { "s" }
         );
-    } else if turn_count > 4 {
-        println!(
-            "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
-        );
+        return Ok(());
     }
     // Short sessions (≤4 turns) exit silently — no nagging for quick lookups.
+    if turn_count <= 4 {
+        return Ok(());
+    }
+
+    // Non-trivial session, nothing recorded. When auto-harvest is on and
+    // we haven't already cued a harvest this session (e.g. via the
+    // PostToolUse resolution cue), point at the harvester subagent.
+    // `stop_hook_active` means we're already in a stop continuation —
+    // don't re-cue.
+    let stop_active = session
+        .get("stop_hook_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace).ok();
+    let auto_harvest = paths
+        .as_ref()
+        .and_then(|p| project::load_config(p).ok())
+        .map(|c| c.learning.auto_harvest)
+        .unwrap_or(true);
+
+    if auto_harvest && !stop_active && let Some(paths) = paths.as_ref() {
+        let sid = session.get("session_id").and_then(|v| v.as_str());
+        let state_path = proactive_state::session_path(&paths.kimetsu_dir, sid);
+        let mut state = proactive_state::load(&state_path);
+        if !state.harvest_cued() {
+            println!(
+                "[kimetsu-harvest] No lessons recorded this non-trivial session. If anything \
+                 durable was learned, dispatch the kimetsu-memory-harvester subagent \
+                 (run_in_background: true) to capture it — otherwise call kimetsu_brain_record."
+            );
+            state.note_harvest_cue(proactive_state::now_unix());
+            proactive_state::save(&state_path, &state);
+            return Ok(());
+        }
+    }
+
+    println!(
+        "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
+    );
     Ok(())
+}
+
+/// Count `kimetsu_brain_record` tool-use blocks across transcript
+/// messages. Tolerates both the inline message shape (`content` array)
+/// and Claude Code's JSONL shape (`message.content` array).
+fn count_brain_record_calls(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            let content = m
+                .get("content")
+                .or_else(|| m.get("message").and_then(|msg| msg.get("content")))
+                .and_then(|c| c.as_array());
+            content
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| {
+                            b.get("name").and_then(|n| n.as_str()) == Some("kimetsu_brain_record")
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1935,10 +2001,15 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
         return Ok(());
     };
     // Honor the configured embedder id for consistency (proactive
-    // retrieval is lexical-only, but this keeps labels coherent).
-    if let Ok(config) = project::load_config(&paths) {
-        kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
-    }
+    // retrieval is lexical-only, but this keeps labels coherent). Also
+    // capture the auto-harvest toggle for the resolution cue below.
+    let auto_harvest = match project::load_config(&paths) {
+        Ok(config) => {
+            kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
+            config.learning.auto_harvest
+        }
+        Err(_) => true,
+    };
 
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap_or(0);
@@ -1957,6 +2028,37 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
 
     let now = proactive_state::now_unix();
     proactive_state::gc(&paths.kimetsu_dir, now);
+
+    let state_path = proactive_state::session_path(&paths.kimetsu_dir, hook.session_id.as_deref());
+    let mut state = proactive_state::load(&state_path);
+
+    // v0.8.5: PostToolUse success — if this command failed earlier this
+    // session and just succeeded, that's a resolved failure (a learnable
+    // moment). Cue the agent (throttled) to harvest the lesson, then exit.
+    if matches!(event, ProactiveEvent::PostTool) {
+        let resp = hook.tool_response.as_deref().unwrap_or("");
+        if !proactive_state::looks_like_failure(resp) {
+            let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(""));
+            if auto_harvest
+                && !norm.is_empty()
+                && state.had_prior_failure(&norm)
+                && !state.harvest_in_refractory(now, proactive_state::HARVEST_REFRACTORY_SECS)
+            {
+                let cmd = hook.command.as_deref().unwrap_or("the command");
+                let cue = format!(
+                    "[kimetsu-harvest] You just resolved a previously failing command (`{cmd}`). \
+                     If this revealed a durable, generalizable lesson, dispatch the \
+                     kimetsu-memory-harvester subagent in the background (run_in_background: true) \
+                     to record it via kimetsu_brain_record."
+                );
+                print_tool_use_context(event, &cue)?;
+                state.note_harvest_cue(now);
+                state.clear_failure(&norm);
+            }
+            proactive_state::save(&state_path, &state);
+            return Ok(());
+        }
+    }
 
     // Build the retrieval query + actionable kinds per event.
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
@@ -1980,9 +2082,7 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
         }
     };
 
-    // Load session state, record this command, decide loop mode.
-    let state_path = proactive_state::session_path(&paths.kimetsu_dir, hook.session_id.as_deref());
-    let mut state = proactive_state::load(&state_path);
+    // Record this command, decide loop mode (state loaded above).
     let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(&query));
     let seen_count = state.note_command(&norm, error_sig.as_deref(), now);
     let loop_mode = seen_count >= proactive_state::LOOP_THRESHOLD;
@@ -2867,6 +2967,38 @@ mod tests {
     use kimetsu_core::ids::RunId;
     use std::fs;
     use std::io::Cursor;
+
+    #[test]
+    fn count_brain_record_calls_handles_both_shapes() {
+        // Inline message shape: `content` array directly on the message.
+        let inline = vec![
+            serde_json::json!({
+                "content": [
+                    { "type": "tool_use", "name": "kimetsu_brain_record" },
+                    { "type": "tool_use", "name": "Bash" }
+                ]
+            }),
+            serde_json::json!({ "content": [] }),
+        ];
+        assert_eq!(count_brain_record_calls(&inline), 1);
+
+        // Claude Code JSONL shape: `message.content` array.
+        let jsonl = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "tool_use", "name": "kimetsu_brain_record" }] }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "tool_use", "name": "kimetsu_brain_record" }] }
+            }),
+        ];
+        assert_eq!(count_brain_record_calls(&jsonl), 2);
+
+        // No record calls.
+        let none = vec![serde_json::json!({ "message": { "content": [{ "name": "Bash" }] } })];
+        assert_eq!(count_brain_record_calls(&none), 0);
+    }
 
     #[test]
     fn context_hook_output_is_user_prompt_submit_json() {
