@@ -64,6 +64,39 @@ impl Default for PluginMode {
     }
 }
 
+/// Where the plugin surface is installed: the current workspace
+/// (`.claude/`, `.codex/`, `.mcp.json`) or the user's home directory
+/// (`~/.claude/`, `~/.claude.json`, `~/.codex/`) for all sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallScope {
+    Workspace,
+    Global,
+}
+
+impl InstallScope {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "workspace" | "ws" | "local" | "project" => Ok(Self::Workspace),
+            "global" | "g" | "user" | "home" => Ok(Self::Global),
+            other => Err(format!("unknown install scope `{other}`")),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Global => "global",
+        }
+    }
+}
+
+impl Default for InstallScope {
+    fn default() -> Self {
+        Self::Workspace
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeExtensionManifest {
     pub id: String,
@@ -104,6 +137,7 @@ pub struct BridgeScan {
 #[derive(Debug, Clone)]
 pub struct PluginInstallReport {
     pub target: BridgeTarget,
+    pub scope: InstallScope,
     pub mode: PluginMode,
     pub files: Vec<PathBuf>,
 }
@@ -331,26 +365,74 @@ pub fn bridge_sync(workspace: &Path, config: &SkillConfig, force: bool) -> Resul
     Ok(imported)
 }
 
+fn resolve_home() -> Result<PathBuf, String> {
+    std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "cannot resolve home directory for a global install (set HOME or USERPROFILE)"
+                .to_string()
+        })
+}
+
 pub fn plugin_install(
     workspace: &Path,
     target: BridgeTarget,
+    scope: InstallScope,
     mode: PluginMode,
     force: bool,
     proactive: bool,
+) -> Result<PluginInstallReport, String> {
+    let home = match scope {
+        InstallScope::Global => Some(resolve_home()?),
+        InstallScope::Workspace => None,
+    };
+    plugin_install_inner(
+        workspace,
+        target,
+        scope,
+        mode,
+        force,
+        proactive,
+        home.as_deref(),
+    )
+}
+
+/// `home` is `Some` for a global install (the directory that stands in for
+/// `~`), `None` for a workspace install. Kept separate from `plugin_install`
+/// so tests can inject a deterministic home without touching process env.
+fn plugin_install_inner(
+    workspace: &Path,
+    target: BridgeTarget,
+    scope: InstallScope,
+    mode: PluginMode,
+    force: bool,
+    proactive: bool,
+    home: Option<&Path>,
 ) -> Result<PluginInstallReport, String> {
     let workspace = normalize_path(workspace);
     let mut files = Vec::new();
     match target {
         BridgeTarget::ClaudeCode => {
-            // Claude Code reads project-scoped MCP servers from `.mcp.json` at
-            // the workspace root, NOT `.claude/mcp.json`.
-            let mcp = workspace.join(".mcp.json");
-            write_mcp_config(&mcp, force)?;
+            // MCP: workspace -> ./.mcp.json (servers + mcpServers);
+            // global -> ~/.claude.json (mcpServers only).
+            let (mcp, only_mcp_servers) = match home {
+                Some(home) => (home.join(".claude.json"), true),
+                None => (workspace.join(".mcp.json"), false),
+            };
+            write_mcp_config(&mcp, only_mcp_servers)?;
             files.push(normalize_path(&mcp));
 
-            let commands = workspace.join(".claude").join("commands").join("kimetsu");
+            let claude_dir = match home {
+                Some(home) => home.join(".claude"),
+                None => workspace.join(".claude"),
+            };
+            let commands = claude_dir.join("commands").join("kimetsu");
             fs::create_dir_all(&commands)
                 .map_err(|err| format!("create {}: {err}", commands.display()))?;
+            // Generated docs are Kimetsu-owned boilerplate (not user-editable),
+            // so always overwrite them on install — unlike CLAUDE.md.
             let bridge = commands.join("bridge.md");
             write_text_file(
                 &bridge,
@@ -358,7 +440,7 @@ pub fn plugin_install(
                     PluginMode::Optional => CLAUDE_BRIDGE_COMMAND_OPTIONAL,
                     PluginMode::Required => CLAUDE_BRIDGE_COMMAND_REQUIRED,
                 },
-                force,
+                true,
             )?;
             files.push(normalize_path(&bridge));
             let delegate = commands.join("delegate.md");
@@ -368,21 +450,21 @@ pub fn plugin_install(
                     PluginMode::Optional => CLAUDE_DELEGATE_COMMAND_OPTIONAL,
                     PluginMode::Required => CLAUDE_DELEGATE_COMMAND_REQUIRED,
                 },
-                force,
+                true,
             )?;
             files.push(normalize_path(&delegate));
-            // Claude Code hooks live in `.claude/settings.json` under the
-            // `hooks` key (keyed by real events, fed via stdin JSON) — not
-            // standalone `.ps1`/`.sh` files driven by env vars.
-            write_claude_settings(&workspace, force, proactive, &mut files)?;
+            write_claude_settings(&claude_dir, force, proactive, &mut files)?;
         }
         BridgeTarget::Codex => {
-            let config = workspace.join(".codex").join("config.toml");
-            write_codex_config(&config, force)?;
+            let codex_dir = match home {
+                Some(home) => home.join(".codex"),
+                None => workspace.join(".codex"),
+            };
+            let config = codex_dir.join("config.toml");
+            write_codex_config(&config)?;
             files.push(normalize_path(&config));
 
-            let skill = workspace
-                .join(".codex")
+            let skill = codex_dir
                 .join("skills")
                 .join("kimetsu-bridge")
                 .join("SKILL.md");
@@ -392,12 +474,13 @@ pub fn plugin_install(
                     PluginMode::Optional => CODEX_KIMETSU_SKILL_OPTIONAL,
                     PluginMode::Required => CODEX_KIMETSU_SKILL_REQUIRED,
                 },
-                force,
+                true,
             )?;
             files.push(normalize_path(&skill));
-            write_codex_hooks(&workspace, force, proactive, &mut files)?;
+            write_codex_hooks(&codex_dir, proactive, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
+            // Kimetsu extensions are workspace-only; scope is ignored.
             let dir = workspace.join(".kimetsu").join("extensions");
             fs::create_dir_all(&dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
             files.push(normalize_path(&dir));
@@ -405,6 +488,7 @@ pub fn plugin_install(
     }
     Ok(PluginInstallReport {
         target,
+        scope,
         mode,
         files,
     })
@@ -414,13 +498,64 @@ pub fn extensions_root(workspace: &Path) -> PathBuf {
     workspace.join(".kimetsu").join("extensions")
 }
 
+/// True when a hook matcher-group is one Kimetsu installed (any inner
+/// command invokes `kimetsu brain …`).
+fn is_kimetsu_hook_group(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(|hooks| hooks.as_array())
+        .map(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| command.contains("kimetsu brain"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Merge Kimetsu's matcher `group` into the event array at `hooks[event]`,
+/// preserving every other group. Idempotent: replaces an existing
+/// Kimetsu-owned group instead of appending a duplicate. Never reads or
+/// mutates the user's own groups, even when they share Kimetsu's matcher.
+fn upsert_kimetsu_hook(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    group: serde_json::Value,
+) {
+    let entry = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    // If somehow not an array, replace with a fresh single-group array.
+    let Some(list) = entry.as_array_mut() else {
+        *entry = serde_json::Value::Array(vec![group]);
+        return;
+    };
+    match list
+        .iter_mut()
+        .find(|existing| is_kimetsu_hook_group(existing))
+    {
+        Some(slot) => *slot = group,
+        None => list.push(group),
+    }
+}
+
+/// Merge Kimetsu's `UserPromptSubmit` hook (plus the v0.8 proactive
+/// `PreToolUse`/`PostToolUse` Bash hooks when `proactive`) into
+/// `.codex/hooks.json`, preserving any other hooks the user has — even on
+/// the same events. Idempotent: re-running never duplicates.
+///
+/// Codex discovers hooks only from the config-layer `hooks.json` file, using
+/// real lifecycle events like `UserPromptSubmit`. The proactive
+/// `PreToolUse`/`PostToolUse` hooks use a `Bash` matcher so they fire only
+/// around shell invocations; they surface a memory check without blocking the
+/// tool call.
 fn write_codex_hooks(
-    workspace: &Path,
-    force: bool,
+    codex_dir: &Path,
     proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    let hooks = workspace.join(".codex").join("hooks.json");
+    let hooks = codex_dir.join("hooks.json");
     let mut root = if hooks.is_file() {
         let text =
             fs::read_to_string(&hooks).map_err(|err| format!("read {}: {err}", hooks.display()))?;
@@ -438,15 +573,11 @@ fn write_codex_hooks(
     let hooks_obj = hooks_value
         .as_object_mut()
         .ok_or_else(|| format!("{} `hooks` must be a JSON object", hooks.display()))?;
-    if hooks_obj.contains_key("UserPromptSubmit") && !force {
-        return Err(format!(
-            "{} already defines UserPromptSubmit hooks; pass --force",
-            hooks.display()
-        ));
-    }
-    hooks_obj.insert(
-        "UserPromptSubmit".to_string(),
-        serde_json::json!([{
+
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        serde_json::json!({
             "matcher": "",
             "hooks": [{
                 "type": "command",
@@ -454,15 +585,13 @@ fn write_codex_hooks(
                 "statusMessage": "Loading Kimetsu brain context",
                 "timeout": 30
             }]
-        }]),
+        }),
     );
     if proactive {
-        // v0.8: Codex supports PreToolUse/PostToolUse with a regex
-        // matcher on tool name (Bash). Both surface a relevant memory
-        // via hookSpecificOutput.additionalContext without blocking.
-        hooks_obj.insert(
-            "PreToolUse".to_string(),
-            serde_json::json!([{
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PreToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
@@ -470,11 +599,12 @@ fn write_codex_hooks(
                     "statusMessage": "Kimetsu proactive check",
                     "timeout": 15
                 }]
-            }]),
+            }),
         );
-        hooks_obj.insert(
-            "PostToolUse".to_string(),
-            serde_json::json!([{
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PostToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
@@ -482,9 +612,10 @@ fn write_codex_hooks(
                     "statusMessage": "Kimetsu proactive check",
                     "timeout": 15
                 }]
-            }]),
+            }),
         );
     }
+
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Codex hooks: {err}"))?;
     write_text_file(&hooks, &text, true)?;
@@ -555,7 +686,11 @@ fn resolve_bridge_skill_source(
     Ok(registry.resolve_or_manifest_contained(selection)?.root)
 }
 
-fn write_mcp_config(path: &Path, force: bool) -> Result<(), String> {
+/// Upsert the `kimetsu` MCP server into a Claude config file. Idempotent —
+/// re-running just rewrites the same entry, preserving all other keys.
+/// `only_mcp_servers` is true for `~/.claude.json` (global), which uses
+/// only the `mcpServers` key; workspace `.mcp.json` also gets `servers`.
+fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -567,34 +702,20 @@ fn write_mcp_config(path: &Path, force: bool) -> Result<(), String> {
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
-    let has_kimetsu = root_obj
-        .get("servers")
-        .and_then(|value| value.as_object())
-        .map(|map| map.contains_key("kimetsu"))
-        .unwrap_or(false)
-        || root_obj
-            .get("mcpServers")
-            .and_then(|value| value.as_object())
-            .map(|map| map.contains_key("kimetsu"))
-            .unwrap_or(false);
-    if has_kimetsu && !force {
-        return Err(format!(
-            "{} already has a kimetsu MCP server; pass --force",
-            path.display()
-        ));
-    }
     let server = serde_json::json!({
-            "command": "kimetsu",
-            "args": ["mcp", "serve", "--workspace", "."]
+        "command": "kimetsu",
+        "args": ["mcp", "serve", "--workspace", "."]
     });
-    insert_mcp_server(root_obj, "servers", server.clone(), path)?;
+    if !only_mcp_servers {
+        insert_mcp_server(root_obj, "servers", server.clone(), path)?;
+    }
     insert_mcp_server(root_obj, "mcpServers", server, path)?;
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize MCP config: {err}"))?;
     write_text_file(path, &text, true)
 }
 
-fn write_codex_config(path: &Path, force: bool) -> Result<(), String> {
+fn write_codex_config(path: &Path) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -612,12 +733,6 @@ fn write_codex_config(path: &Path, force: bool) -> Result<(), String> {
     let servers = servers_value
         .as_table_mut()
         .ok_or_else(|| format!("{} `mcp_servers` must be a TOML table", path.display()))?;
-    if servers.contains_key("kimetsu") && !force {
-        return Err(format!(
-            "{} already has a kimetsu MCP server; pass --force",
-            path.display()
-        ));
-    }
 
     let mut kimetsu = toml::map::Map::new();
     kimetsu.insert(
@@ -658,32 +773,34 @@ effort or that you would want to remember next session.
 /// Write the Claude Code surface that lives under `.claude/`: the brain
 /// `CLAUDE.md` guidance and the `settings.json` hook registration.
 fn write_claude_settings(
-    workspace: &Path,
+    claude_dir: &Path,
     force: bool,
     proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    let claude_dir = workspace.join(".claude");
-    fs::create_dir_all(&claude_dir)
+    fs::create_dir_all(claude_dir)
         .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
 
-    // CLAUDE.md: only seed when missing so we never clobber user edits.
+    // CLAUDE.md: seed when missing. If it already exists we leave it alone
+    // unless `force` is set — overwriting an existing CLAUDE.md is the one
+    // thing `--force` still does. Without force, user edits are never clobbered.
     let claude_md = claude_dir.join("CLAUDE.md");
-    if !claude_md.is_file() {
-        write_text_file(&claude_md, CLAUDE_MD_CONTENT, force)?;
+    if !claude_md.is_file() || force {
+        write_text_file(&claude_md, CLAUDE_MD_CONTENT, true)?;
     }
     files.push(normalize_path(&claude_md));
 
     let settings = claude_dir.join("settings.json");
-    write_claude_hooks(&settings, force, proactive)?;
+    write_claude_hooks(&settings, proactive)?;
     files.push(normalize_path(&settings));
     Ok(())
 }
 
 /// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks (plus the v0.8
 /// proactive `PreToolUse`/`PostToolUse` Bash hooks when `proactive`)
-/// into `.claude/settings.json`, preserving any other settings.
-fn write_claude_hooks(path: &Path, force: bool, proactive: bool) -> Result<(), String> {
+/// into `settings.json`, preserving any other hooks the user has — even
+/// on the same events. Idempotent: re-running never duplicates.
+fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -695,39 +812,48 @@ fn write_claude_hooks(path: &Path, force: bool, proactive: bool) -> Result<(), S
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
-    if root_obj.contains_key("hooks") && !force {
-        return Err(format!(
-            "{} already defines hooks; pass --force",
-            path.display()
-        ));
-    }
-    let mut hooks = serde_json::json!({
-        "UserPromptSubmit": [{
+    let hooks_value = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} `hooks` must be a JSON object", path.display()))?;
+
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        serde_json::json!({
             "matcher": "",
             "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
-        }],
-        "Stop": [{
+        }),
+    );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "Stop",
+        serde_json::json!({
             "matcher": "",
             "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
-        }]
-    });
-    if proactive && let Some(map) = hooks.as_object_mut() {
-        map.insert(
-            "PreToolUse".to_string(),
-            serde_json::json!([{
+        }),
+    );
+    if proactive {
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PreToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{ "type": "command", "command": "kimetsu brain pretool-hook" }]
-            }]),
+            }),
         );
-        map.insert(
-            "PostToolUse".to_string(),
-            serde_json::json!([{
+        upsert_kimetsu_hook(
+            hooks_obj,
+            "PostToolUse",
+            serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{ "type": "command", "command": "kimetsu brain posttool-hook" }]
-            }]),
+            }),
         );
     }
-    root_obj.insert("hooks".to_string(), hooks);
+
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Claude settings: {err}"))?;
     write_text_file(path, &text, true)
@@ -856,6 +982,63 @@ fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn upsert_kimetsu_hook_preserves_user_groups_and_is_idempotent() {
+        // A user already has their own UserPromptSubmit hook.
+        let mut hooks: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "UserPromptSubmit": [
+                { "matcher": "", "hooks": [{ "type": "command", "command": "my-own-hook" }] }
+            ]
+        }))
+        .unwrap();
+
+        let km = json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
+        });
+
+        // First upsert: append alongside the user's group.
+        upsert_kimetsu_hook(&mut hooks, "UserPromptSubmit", km.clone());
+        let arr = hooks["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "kimetsu group appended, user group kept");
+        assert_eq!(arr[0]["hooks"][0]["command"], "my-own-hook");
+        assert_eq!(arr[1]["hooks"][0]["command"], "kimetsu brain context-hook");
+
+        // Second upsert (re-run): replace in place, no duplicate.
+        upsert_kimetsu_hook(&mut hooks, "UserPromptSubmit", km);
+        let arr = hooks["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "re-run is idempotent, no duplicate kimetsu group"
+        );
+        assert_eq!(arr[0]["hooks"][0]["command"], "my-own-hook");
+
+        // New event with no prior array: creates it.
+        let km_stop = json!({ "matcher": "", "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }] });
+        upsert_kimetsu_hook(&mut hooks, "Stop", km_stop);
+        assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_scope_parses_aliases() {
+        assert_eq!(InstallScope::parse("").unwrap(), InstallScope::Workspace);
+        assert_eq!(
+            InstallScope::parse("workspace").unwrap(),
+            InstallScope::Workspace
+        );
+        assert_eq!(
+            InstallScope::parse("Local").unwrap(),
+            InstallScope::Workspace
+        );
+        assert_eq!(InstallScope::parse("global").unwrap(), InstallScope::Global);
+        assert_eq!(InstallScope::parse("USER").unwrap(), InstallScope::Global);
+        assert_eq!(InstallScope::Workspace.as_str(), "workspace");
+        assert_eq!(InstallScope::Global.as_str(), "global");
+        assert!(InstallScope::parse("nope").is_err());
+    }
 
     #[test]
     fn imports_and_exports_skill_bundle() {
@@ -890,6 +1073,7 @@ mod tests {
         let optional = plugin_install(
             &root,
             BridgeTarget::Codex,
+            InstallScope::Workspace,
             PluginMode::Optional,
             false,
             true,
@@ -928,8 +1112,15 @@ mod tests {
         assert!(!root.join(".codex/mcp.json").exists());
         assert!(!root.join(".codex/hooks/pre-turn.ps1").exists());
 
-        let required = plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, true, true)
-            .expect("required install");
+        let required = plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Required,
+            true,
+            true,
+        )
+        .expect("required install");
         assert_eq!(required.mode, PluginMode::Required);
         let required_text = fs::read_to_string(&skill_path).expect("required skill");
         assert!(required_text.contains("Required mode"));
@@ -953,6 +1144,7 @@ mod tests {
         plugin_install(
             &root,
             BridgeTarget::Codex,
+            InstallScope::Workspace,
             PluginMode::Optional,
             false,
             false,
@@ -967,6 +1159,218 @@ mod tests {
         );
         assert!(hooks_json["hooks"]["PostToolUse"].is_null());
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_hooks_merge_preserves_user_hooks() {
+        let root = temp_root("claude_hooks_merge");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        // User already has their own UserPromptSubmit hook and an unrelated event.
+        fs::write(
+            claude.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-prompt-thing" }] }
+                    ],
+                    "SubagentStop": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-subagent-thing" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settings = claude.join("settings.json");
+        write_claude_hooks(&settings, true).unwrap();
+        // Re-run to prove idempotency.
+        write_claude_hooks(&settings, true).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(
+            ups.len(),
+            2,
+            "user group kept + one kimetsu group, no dupes"
+        );
+        assert_eq!(ups[0]["hooks"][0]["command"], "user-prompt-thing");
+        assert_eq!(ups[1]["hooks"][0]["command"], "kimetsu brain context-hook");
+        // Unrelated user event untouched.
+        assert_eq!(
+            value["hooks"]["SubagentStop"][0]["hooks"][0]["command"],
+            "user-subagent-thing"
+        );
+        // Kimetsu's own events present.
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "kimetsu brain stop-hook"
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "kimetsu brain pretool-hook"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn codex_hooks_merge_preserves_user_hooks() {
+        let root = temp_root("codex_hooks_merge");
+        let codex = root.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("hooks.json"),
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-codex-hook" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        write_codex_hooks(&codex, true, &mut files).unwrap();
+        write_codex_hooks(&codex, true, &mut files).unwrap(); // idempotent
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex.join("hooks.json")).unwrap()).unwrap();
+        let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "user group kept + one kimetsu group");
+        assert_eq!(ups[0]["hooks"][0]["command"], "user-codex-hook");
+        assert_eq!(
+            ups[1]["hooks"][0]["command"],
+            "kimetsu brain context-hook --workspace ."
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "kimetsu brain pretool-hook --workspace ."
+        );
+        assert_eq!(
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "kimetsu brain posttool-hook --workspace ."
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mcp_config_is_idempotent_and_scopes_keys() {
+        let root = temp_root("mcp_idempotent");
+        let mcp = root.join(".mcp.json");
+
+        // Workspace style: write both `servers` and `mcpServers`, twice, no error.
+        write_mcp_config(&mcp, false).unwrap();
+        write_mcp_config(&mcp, false).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(value["servers"]["kimetsu"]["command"], "kimetsu");
+        assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
+
+        // Global style: only `mcpServers`, preserving unrelated keys.
+        let claude_json = root.join(".claude.json");
+        fs::write(
+            &claude_json,
+            serde_json::to_string(&json!({ "keepme": 1 })).unwrap(),
+        )
+        .unwrap();
+        write_mcp_config(&claude_json, true).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(value["keepme"], 1);
+        assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        assert!(
+            value.get("servers").is_none(),
+            "global writes mcpServers only"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plugin_install_refreshes_generated_files_without_force() {
+        let root = temp_root("plugin_install_refresh");
+        // First install (Codex) writes SKILL.md.
+        plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+        )
+        .unwrap();
+        // Second install with force=false must succeed (refresh, not error).
+        plugin_install(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Required,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let skill = fs::read_to_string(root.join(".codex/skills/kimetsu-bridge/SKILL.md")).unwrap();
+        // Prove the file was overwritten with the Required variant, not left as Optional.
+        assert!(
+            skill.contains("Treat missing Kimetsu MCP access as a setup blocker"),
+            "SKILL.md should contain Required-mode wording after second install"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plugin_install_global_writes_to_home_not_workspace() {
+        let ws = temp_root("plugin_install_global_ws");
+        let home = temp_root("plugin_install_global_home");
+
+        // Claude global install into the injected home.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            true,
+            Some(home.as_path()),
+        )
+        .unwrap();
+
+        assert!(home.join(".claude/settings.json").is_file());
+        assert!(home.join(".claude/CLAUDE.md").is_file());
+        assert!(home.join(".claude/commands/kimetsu/bridge.md").is_file());
+        assert!(home.join(".claude.json").is_file());
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        assert!(value.get("servers").is_none());
+        assert!(!ws.join(".claude").exists());
+        assert!(!ws.join(".mcp.json").exists());
+
+        // Codex global install.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::Codex,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            true,
+            Some(home.as_path()),
+        )
+        .unwrap();
+        assert!(home.join(".codex/config.toml").is_file());
+        assert!(home.join(".codex/hooks.json").is_file());
+        assert!(!ws.join(".codex").exists());
+
+        fs::remove_dir_all(ws).ok();
+        fs::remove_dir_all(home).ok();
     }
 
     fn temp_root(label: &str) -> PathBuf {

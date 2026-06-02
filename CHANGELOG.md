@@ -6,6 +6,25 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
 caveat that pre-1.0 minor bumps may include breaking changes
 (documented in the release notes).
 
+## v0.8.4 — non-destructive plugin install + global scope
+
+ADDED
+  * **Global plugin install.** `kimetsu plugin install <target> --scope global`
+    installs the Kimetsu surface into the user's home for every session —
+    `~/.claude/` + `~/.claude.json` (`mcpServers`) for Claude Code, and
+    `~/.codex/` for Codex — instead of the workspace. `--scope` defaults to
+    `workspace` (the prior behavior). Also exposed as the `scope` argument on
+    the `kimetsu_plugin_install` MCP tool.
+
+FIXED
+  * **Hook install no longer clobbers existing hooks.** `kimetsu plugin install`
+    now *merges* its hooks into existing Claude `settings.json` / Codex
+    `hooks.json` instead of replacing them. Hooks you already have — even on the
+    same events Kimetsu uses (`UserPromptSubmit`, `PreToolUse`, …) — are
+    preserved, with Kimetsu's group added alongside. Re-running install is
+    idempotent (no duplicate groups) and the MCP config + generated docs refresh
+    without requiring `--force`.
+
 ## v0.8.3 — npm distribution
 
 ADDED
