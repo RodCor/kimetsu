@@ -391,7 +391,7 @@ pub fn plugin_install(
                     PluginMode::Optional => CLAUDE_BRIDGE_COMMAND_OPTIONAL,
                     PluginMode::Required => CLAUDE_BRIDGE_COMMAND_REQUIRED,
                 },
-                force,
+                true,
             )?;
             files.push(normalize_path(&bridge));
             let delegate = commands.join("delegate.md");
@@ -401,7 +401,7 @@ pub fn plugin_install(
                     PluginMode::Optional => CLAUDE_DELEGATE_COMMAND_OPTIONAL,
                     PluginMode::Required => CLAUDE_DELEGATE_COMMAND_REQUIRED,
                 },
-                force,
+                true,
             )?;
             files.push(normalize_path(&delegate));
             // Claude Code hooks live in `.claude/settings.json` under the
@@ -425,7 +425,7 @@ pub fn plugin_install(
                     PluginMode::Optional => CODEX_KIMETSU_SKILL_OPTIONAL,
                     PluginMode::Required => CODEX_KIMETSU_SKILL_REQUIRED,
                 },
-                force,
+                true,
             )?;
             files.push(normalize_path(&skill));
             write_codex_hooks(&workspace.join(".codex"), proactive, &mut files)?;
@@ -1197,6 +1197,23 @@ mod tests {
         assert_eq!(value["keepme"], 1);
         assert_eq!(value["mcpServers"]["kimetsu"]["command"], "kimetsu");
         assert!(value.get("servers").is_none(), "global writes mcpServers only");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plugin_install_refreshes_generated_files_without_force() {
+        let root = temp_root("plugin_install_refresh");
+        // First install (Codex) writes SKILL.md.
+        plugin_install(&root, BridgeTarget::Codex, PluginMode::Optional, false, true).unwrap();
+        // Second install with force=false must succeed (refresh, not error).
+        plugin_install(&root, BridgeTarget::Codex, PluginMode::Required, false, true).unwrap();
+
+        let skill = fs::read_to_string(
+            root.join(".codex/skills/kimetsu-bridge/SKILL.md"),
+        )
+        .unwrap();
+        assert!(!skill.is_empty());
 
         fs::remove_dir_all(root).ok();
     }
