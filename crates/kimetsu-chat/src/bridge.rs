@@ -447,6 +447,45 @@ pub fn extensions_root(workspace: &Path) -> PathBuf {
     workspace.join(".kimetsu").join("extensions")
 }
 
+/// True when a hook matcher-group is one Kimetsu installed (any inner
+/// command invokes `kimetsu brain …`).
+fn is_kimetsu_hook_group(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(|hooks| hooks.as_array())
+        .map(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| command.contains("kimetsu brain"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Merge Kimetsu's matcher `group` into the event array at `hooks[event]`,
+/// preserving every other group. Idempotent: replaces an existing
+/// Kimetsu-owned group instead of appending a duplicate. Never reads or
+/// mutates the user's own groups, even when they share Kimetsu's matcher.
+fn upsert_kimetsu_hook(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    group: serde_json::Value,
+) {
+    let entry = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    // If somehow not an array, replace with a fresh single-group array.
+    let Some(list) = entry.as_array_mut() else {
+        *entry = serde_json::Value::Array(vec![group]);
+        return;
+    };
+    match list.iter_mut().find(|existing| is_kimetsu_hook_group(existing)) {
+        Some(slot) => *slot = group,
+        None => list.push(group),
+    }
+}
+
 fn write_codex_hooks(
     workspace: &Path,
     force: bool,
@@ -889,6 +928,41 @@ fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn upsert_kimetsu_hook_preserves_user_groups_and_is_idempotent() {
+        // A user already has their own UserPromptSubmit hook.
+        let mut hooks: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "UserPromptSubmit": [
+                { "matcher": "", "hooks": [{ "type": "command", "command": "my-own-hook" }] }
+            ]
+        }))
+        .unwrap();
+
+        let km = json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain context-hook" }]
+        });
+
+        // First upsert: append alongside the user's group.
+        upsert_kimetsu_hook(&mut hooks, "UserPromptSubmit", km.clone());
+        let arr = hooks["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "kimetsu group appended, user group kept");
+        assert_eq!(arr[0]["hooks"][0]["command"], "my-own-hook");
+        assert_eq!(arr[1]["hooks"][0]["command"], "kimetsu brain context-hook");
+
+        // Second upsert (re-run): replace in place, no duplicate.
+        upsert_kimetsu_hook(&mut hooks, "UserPromptSubmit", km);
+        let arr = hooks["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "re-run is idempotent, no duplicate kimetsu group");
+        assert_eq!(arr[0]["hooks"][0]["command"], "my-own-hook");
+
+        // New event with no prior array: creates it.
+        let km_stop = json!({ "matcher": "", "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }] });
+        upsert_kimetsu_hook(&mut hooks, "Stop", km_stop);
+        assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn install_scope_parses_aliases() {
