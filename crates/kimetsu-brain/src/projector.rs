@@ -1,9 +1,23 @@
+use std::borrow::Cow;
+
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::event::Event;
 use rusqlite::{Connection, params};
 use time::format_description::well_known::Rfc3339;
 
 use crate::schema;
+
+/// Event-schema durability seam. Normalizes an event written under an older
+/// `EVENT_SCHEMA_VERSION` to the current payload shape *before projection*,
+/// so a future version bump is a localized addition here rather than a
+/// projector rewrite. Identity today (`EVENT_SCHEMA_VERSION == 1`: every
+/// stored event is already current). When the event schema first changes,
+/// add `(kind, schema_version)`-keyed transforms that return `Cow::Owned`
+/// with the upgraded payload.
+fn upcast_event(event: &Event) -> Cow<'_, Event> {
+    // No historical versions to upcast yet.
+    Cow::Borrowed(event)
+}
 
 pub fn rebuild(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
     reset_projection(conn)?;
@@ -34,7 +48,13 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
 }
 
 fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    // Persist the event exactly as written (raw, original schema_version).
     insert_event(conn, event)?;
+
+    // Project through the durability seam so older-schema events normalize
+    // to the current shape before dispatch.
+    let event = upcast_event(event);
+    let event = event.as_ref();
 
     match event.kind.as_str() {
         "run.started" => apply_run_started(conn, event),
@@ -508,4 +528,154 @@ pub fn ensure_schema(conn: &Connection) -> KimetsuResult<()> {
 
 fn ts_text(event: &Event) -> KimetsuResult<String> {
     Ok(event.ts.format(&Rfc3339)?)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use kimetsu_core::event::Event;
+    use kimetsu_core::ids::RunId;
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    use super::{apply_events, upcast_event};
+    use crate::schema;
+
+    fn make_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        schema::initialize(&conn).expect("schema::initialize");
+        conn
+    }
+
+    fn make_event(run_id: RunId, kind: &str, payload: serde_json::Value) -> Event {
+        Event::new(run_id, kind, payload)
+    }
+
+    // ------------------------------------------------------------------
+    // A6-1. upcast_event is identity (Cow::Borrowed) at schema_version 1
+    // ------------------------------------------------------------------
+    #[test]
+    fn upcast_is_identity_at_v1() {
+        let run_id = RunId::new();
+        let event = make_event(
+            run_id,
+            "run.started",
+            json!({"project_id": "p1", "task": "t"}),
+        );
+        assert_eq!(
+            event.schema_version, 1,
+            "Event::new must stamp schema_version=1"
+        );
+
+        let cow = upcast_event(&event);
+        // Must be a Borrowed reference, not an owned clone.
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "upcast_event must return Cow::Borrowed for current schema_version"
+        );
+        // The payload fields must be unchanged.
+        let out = cow.as_ref();
+        assert_eq!(out.kind, event.kind);
+        assert_eq!(out.schema_version, event.schema_version);
+        assert_eq!(out.payload, event.payload);
+    }
+
+    // ------------------------------------------------------------------
+    // A6-2. Per-kind missing-field durability: every dispatched kind with
+    // an empty payload replays without panic/error.
+    // ------------------------------------------------------------------
+
+    fn assert_empty_payload_ok(kind: &str) {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let event = make_event(run_id, kind, json!({}));
+        let result = apply_events(&conn, &[event]);
+        assert!(
+            result.is_ok(),
+            "apply_events with empty payload for kind={kind:?} must return Ok(()), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_payload_run_started() {
+        assert_empty_payload_ok("run.started");
+    }
+
+    #[test]
+    fn empty_payload_run_finished() {
+        assert_empty_payload_ok("run.finished");
+    }
+
+    #[test]
+    fn empty_payload_run_failed() {
+        assert_empty_payload_ok("run.failed");
+    }
+
+    #[test]
+    fn empty_payload_run_aborted() {
+        assert_empty_payload_ok("run.aborted");
+    }
+
+    #[test]
+    fn empty_payload_memory_accepted() {
+        assert_empty_payload_ok("memory.accepted");
+    }
+
+    #[test]
+    fn empty_payload_memory_proposed() {
+        assert_empty_payload_ok("memory.proposed");
+    }
+
+    #[test]
+    fn empty_payload_memory_rejected() {
+        assert_empty_payload_ok("memory.rejected");
+    }
+
+    #[test]
+    fn empty_payload_memory_invalidated() {
+        assert_empty_payload_ok("memory.invalidated");
+    }
+
+    #[test]
+    fn empty_payload_memory_cited() {
+        assert_empty_payload_ok("memory.cited");
+    }
+
+    // ------------------------------------------------------------------
+    // A6-3. A well-formed run.started event still projects correctly
+    // after routing through the upcast seam.
+    // ------------------------------------------------------------------
+    #[test]
+    fn well_formed_run_started_projects_correctly() {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let event = make_event(
+            run_id,
+            "run.started",
+            json!({
+                "project_id": "proj-abc",
+                "task": "fix the bug",
+                "model": "claude-sonnet-4-6"
+            }),
+        );
+        apply_events(&conn, &[event])
+            .expect("apply_events must succeed for well-formed run.started");
+
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT run_id, project_id, task FROM runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("runs row must exist after apply_events");
+
+        assert_eq!(row.0, run_id.to_string());
+        assert_eq!(row.1, "proj-abc");
+        assert_eq!(row.2, "fix the bug");
+    }
 }
