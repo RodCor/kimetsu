@@ -868,8 +868,21 @@ fn merge_claude_md(path: &Path) -> Result<(), String> {
     let merged = match (existing.find(CLAUDE_MD_BEGIN), existing.find(CLAUDE_MD_END)) {
         (Some(start), Some(end_start)) if end_start >= start => {
             let end = end_start + CLAUDE_MD_END.len();
-            let after = existing[end..].strip_prefix('\n').unwrap_or(&existing[end..]);
+            let after = existing[end..]
+                .strip_prefix('\n')
+                .unwrap_or(&existing[end..]);
             format!("{}{block}{after}", &existing[..start])
+        }
+        (Some(start), _) => {
+            // BEGIN present but END missing/malformed: the marked region is corrupt.
+            // Replace everything from BEGIN onward with a single fresh block rather
+            // than appending a duplicate.
+            let before = existing[..start].trim_end_matches('\n');
+            if before.is_empty() {
+                block
+            } else {
+                format!("{before}\n\n{block}")
+            }
         }
         _ => {
             let mut out = existing.to_string();
@@ -1645,7 +1658,11 @@ mod tests {
         merge_claude_md(&p).unwrap();
         merge_claude_md(&p).unwrap();
         let text = fs::read_to_string(&p).unwrap();
-        assert_eq!(text.matches(CLAUDE_MD_BEGIN).count(), 1, "no duplicate block");
+        assert_eq!(
+            text.matches(CLAUDE_MD_BEGIN).count(),
+            1,
+            "no duplicate block"
+        );
         assert_eq!(text.matches(CLAUDE_MD_END).count(), 1);
         assert!(text.contains("# Mine"));
         fs::remove_dir_all(root).ok();
@@ -1679,6 +1696,35 @@ mod tests {
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("# My rules"));
         assert!(text.contains("# Kimetsu brain"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_repairs_begin_without_end() {
+        let root = temp_root("claude-md-repair");
+        let path = root.join("CLAUDE.md");
+        // user content + a corrupt half-block: BEGIN but no END
+        let corrupt =
+            format!("# My rules\n\nKeep it tidy.\n\n{CLAUDE_MD_BEGIN}\nstale half-block\n");
+        write_text_file(&path, &corrupt, true).unwrap();
+
+        merge_claude_md(&path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        // user content preserved
+        assert!(out.contains("# My rules"));
+        assert!(out.contains("Keep it tidy."));
+        // exactly one BEGIN and one END now (the corrupt region was replaced, not duplicated)
+        assert_eq!(out.matches(CLAUDE_MD_BEGIN).count(), 1);
+        assert_eq!(out.matches(CLAUDE_MD_END).count(), 1);
+        // the stale text is gone and our real guidance is present
+        assert!(!out.contains("stale half-block"));
+        assert!(out.contains("Kimetsu brain"));
+        // idempotent: a second merge keeps exactly one block
+        merge_claude_md(&path).unwrap();
+        let out2 = fs::read_to_string(&path).unwrap();
+        assert_eq!(out2.matches(CLAUDE_MD_BEGIN).count(), 1);
+        assert_eq!(out2.matches(CLAUDE_MD_END).count(), 1);
         fs::remove_dir_all(root).ok();
     }
 
