@@ -526,7 +526,11 @@ pub fn retrieve_context_with_embedder(
                     .partial_cmp(&a.capsule.freshness)
                     .unwrap_or(Ordering::Equal)
             })
-            .then_with(|| a.capsule.id.cmp(&b.capsule.id))
+            // Deterministic tiebreak on the STABLE handle (memory:<id> /
+            // file:<path>) — capsule.id is a fresh random ULID per retrieval,
+            // so tiebreaking on it would make retrieval non-reproducible on
+            // score+freshness ties.
+            .then_with(|| a.capsule.expansion_handle.cmp(&b.capsule.expansion_handle))
     });
 
     // Run embedding-MMR on embeddings builds; lean builds skip directly
@@ -557,7 +561,8 @@ pub fn retrieve_context_with_embedder(
                         .partial_cmp(&left.freshness)
                         .unwrap_or(Ordering::Equal)
                 })
-                .then_with(|| left.id.cmp(&right.id))
+                // Stable handle tiebreak (capsule.id is random per retrieval).
+                .then_with(|| left.expansion_handle.cmp(&right.expansion_handle))
         });
     }
 
