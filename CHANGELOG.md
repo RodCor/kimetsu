@@ -2,9 +2,72 @@
 
 All notable changes to kimetsu land here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
-follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
-caveat that pre-1.0 minor bumps may include breaking changes
-(documented in the release notes).
+follow [SemVer](https://semver.org/spec/v2.0.0.html). From v1.0.0
+onward the project follows SemVer normally: patch releases are
+bug-fix-only, minor releases are backward-compatible additions, and
+breaking changes require a major bump.
+
+## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
+
+ADDED
+  * **Durable schema migrations.** brain.db now migrates forward
+    automatically on open via a versioned, forward-only runner (each
+    migration applied in one transaction). The DB is backed up to a
+    `brain.db.bak-*` sidecar before any version-advancing migration
+    (skipped for empty brains; the three newest backups are kept).
+    Read-only opens of an un-migrated brain degrade gracefully; an
+    event-upcast seam keeps old traces replayable. The project.toml
+    config version is decoupled from the DB schema version so the
+    schema can evolve without breaking existing projects.
+  * **Proof-of-value analytics.** New `kimetsu brain insights` command
+    and `kimetsu_brain_insights` MCP tool: retrieval hit-rate &
+    skip-rate, citation rate, proposal acceptance rate, usefulness
+    trend, harvest yield, corpus health, and token economy — computed
+    over a configurable recent-runs window. A new `context.served`
+    event records every retrieval (hit or miss); `context.injected`
+    now carries injected-token counts.
+  * **Semantic retrieval (sqlite-vec ANN).** On the embeddings build, an
+    approximate-nearest-neighbour index (sqlite-vec, statically linked)
+    finds memories whose *meaning* matches the query even with no shared
+    words. Retrieval is sharpened with embedding-MMR (collapses true
+    paraphrase duplicates) and an absolute semantic-relevance floor
+    (genuinely off-topic queries return nothing). Capsule caps are
+    config-driven (default 8) and injected tokens drop while the
+    relevant capsule is preserved. The lean (FTS-only) build is
+    unchanged.
+  * **Proactive & cost-shrinking recall (the agent brain).** Before the
+    first implementation attempt, a tight retrieval surfaces a "Known
+    pitfalls" block (failure patterns / conventions) — proactive, not
+    just post-failure. Tasks are classified (Debug / Feature / Refactor /
+    Docs / Investigation) to route recall by kind. A per-run recall
+    ledger deduplicates capsules across stages (rendered once,
+    back-referenced after), and the long tail is injected as one-line
+    headlines the agent expands on demand via a new `expand_capsule`
+    tool — so brain overhead shrinks in relative terms as tasks grow
+    (an adaptive sublinear, per-run-capped budget).
+  * **`kimetsu config edit` and `kimetsu run abort`** are now fully
+    implemented: `config edit` opens `$EDITOR` on project.toml and
+    re-validates on save; `run abort` cleanly finalizes a dangling run.
+    No stub subcommands ship.
+  * **`kimetsu doctor --selftest`** proves the brain pipeline works
+    end-to-end (ingest → retrieve → record) without needing a live
+    model or network.
+  * A 5-minute quickstart was added to the README.
+
+CHANGED
+  * **Install/upgrade hardening.** Golden tests lock the
+    non-destructive config-merge for Claude/Codex hooks, MCP config,
+    and CLAUDE.md (user content always preserved; re-installs are
+    byte-idempotent). Windows now runs the full test suite in PR CI.
+  * **Clippy is a hard CI gate** (`-D warnings`) on both the lean and
+    embeddings builds.
+  * **Retrieval ordering is fully deterministic** — a stable tiebreak
+    eliminates non-reproducible ranking across runs.
+
+FIXED
+  * **MSRV portability.** A 1.87-only API that violated the declared
+    `rust-version = "1.85"` MSRV was replaced with the compatible
+    1.85 equivalent.
 
 ## v0.9.0 — auto-harvested memories + SessionEnd distiller
 
