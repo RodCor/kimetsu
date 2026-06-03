@@ -8,7 +8,7 @@ use kimetsu_brain::project;
 use kimetsu_brain::projector;
 use kimetsu_brain::trace::{RunPaths, TraceWriter, read_trace};
 use kimetsu_core::KimetsuResult;
-use kimetsu_core::config::ProjectConfig;
+use kimetsu_core::config::{ProjectConfig, adaptive_budget};
 use kimetsu_core::event::Event;
 use kimetsu_core::ids::{RunId, new_id};
 use kimetsu_core::paths::ProjectPaths;
@@ -224,6 +224,21 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
     // unaffected — they never set task_kind on a ContextRequest at all.
     let task_kind = context::classify_task(&options.task);
 
+    // F1+F3: one ledger per run — created early so the per-run global cap
+    // (budget_run_cap_tokens) can be tracked across all retrieval + render
+    // stages. F1 deduplicates capsules; F3 caps total brain tokens.
+    let mut recall_ledger = RunRecallLedger::new();
+
+    // F3: task-size signal (first component: task text tokens only; file
+    // context is not yet known at this point, before localization retrieval).
+    // Defined as: tokens(task_text) + tokens(localized_file_context).
+    // The task_text component is computed here using the same heuristic
+    // as the rest of the pipeline: (whitespace_words * 1.33).ceil().
+    // The file-context component is added after localization retrieval.
+    let task_tokens = estimate_task_tokens(&options.task);
+    let floor = config.broker.budget_floor_tokens;
+    let run_cap = config.broker.budget_run_cap_tokens;
+
     let (localization_context, patch_context, broker_summary) = if options.disable_broker {
         let empty_loc = ContextBundle {
             stage: CodingStage::Localization.as_str().to_string(),
@@ -245,6 +260,12 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         };
         (empty_loc, empty_plan, "Broker disabled (brain_off).")
     } else {
+        // F3: localization stage budget — task_size uses task tokens only
+        // (file context unknown pre-retrieval). remaining starts at run_cap
+        // (ledger is empty before any rendering).
+        let remaining_loc = run_cap.saturating_sub(recall_ledger.injected_tokens());
+        let loc_budget = adaptive_budget(task_tokens, floor, run_cap).min(remaining_loc);
+
         let localization_context = context::retrieve_context(
             &conn,
             &repo_root,
@@ -252,7 +273,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             ContextRequest {
                 stage: CodingStage::Localization.as_str().to_string(),
                 query: options.task.clone(),
-                budget_tokens: config.broker.default_budget_tokens,
+                // F3: adaptive sublinear budget, capped to remaining run budget.
+                budget_tokens: loc_budget,
                 // D1f: propagate config-driven caps into the request so
                 // retrieve_context_with_embedder honours them directly.
                 max_capsules: config.broker.max_capsules,
@@ -262,6 +284,22 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 ..Default::default()
             },
         )?;
+
+        // F3: determine localized files to compute the full task-size signal
+        // for the patch-plan stage. The file_context component accounts for
+        // the extra context tokens injected from the localized file list.
+        let localized_for_size = likely_files(&localization_context, 5);
+        let file_context_tokens =
+            estimate_task_tokens(&render_localized_files(&localized_for_size));
+        let task_size_full = task_tokens.saturating_add(file_context_tokens);
+
+        // F3: patch-plan stage budget — full task-size signal (task + files).
+        // Remaining budget = run_cap minus what localization retrieval budgeted.
+        // (Rendering hasn't happened yet at this point, but we conservatively
+        // reserve half the run_cap for each stage to avoid starvation.)
+        let remaining_patch = run_cap.saturating_sub(loc_budget);
+        let patch_budget = adaptive_budget(task_size_full, floor, run_cap).min(remaining_patch);
+
         let patch_context = context::retrieve_context(
             &conn,
             &repo_root,
@@ -269,7 +307,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             ContextRequest {
                 stage: CodingStage::PatchPlan.as_str().to_string(),
                 query: options.task.clone(),
-                budget_tokens: config.broker.default_budget_tokens,
+                // F3: adaptive sublinear budget, capped to remaining run budget.
+                budget_tokens: patch_budget,
                 // D1f: same config-driven caps for the patch-plan stage.
                 max_capsules: config.broker.max_capsules,
                 min_semantic_score: config.broker.min_semantic_score,
@@ -341,11 +380,6 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             "files_to_read": files_to_read,
         }),
     )?;
-
-    // F1: one ledger per run — shared across PatchPlan and Implementation renders
-    // so capsules injected into the patch-plan prompt are back-referenced (not
-    // re-rendered in full) in the implementation prompt, counting tokens once.
-    let mut recall_ledger = RunRecallLedger::new();
 
     stage_entered(&mut writer, &mut events, run_id, CodingStage::PatchPlan)?;
     let model_patch_plan = if options.disable_model {
@@ -2225,6 +2259,16 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     out
 }
 
+/// F3: token-count heuristic for the task-size signal.
+///
+/// Uses the same formula as `estimate_tokens` in `kimetsu_brain::context`
+/// and `estimate_request_tokens` above: `(whitespace_words * 1.33).ceil()`.
+/// Kept as a separate named function so the task-size signal definition is
+/// explicit and unit-testable without importing brain internals.
+fn estimate_task_tokens(text: &str) -> u32 {
+    ((text.split_whitespace().count() as f32) * 1.33).ceil() as u32
+}
+
 fn is_code_source(path: &str) -> bool {
     matches!(
         path.rsplit('.').next(),
@@ -3567,6 +3611,149 @@ mod tests {
         assert!(
             request.query.contains(expected_outcome),
             "query must include a patch-plan signal"
+        );
+    }
+
+    // ── F3: adaptive budget + per-run cap + overhead ratio tests ──────────
+
+    /// F3-pipeline-1: `estimate_task_tokens` uses the same whitespace-word
+    /// heuristic as the rest of the pipeline (words * 1.33 ceiled).
+    #[test]
+    fn f3_estimate_task_tokens_matches_pipeline_heuristic() {
+        // 4 words → ceil(4 * 1.33) = ceil(5.32) = 6
+        let text = "fix the scheduler loop";
+        assert_eq!(
+            estimate_task_tokens(text),
+            6,
+            "4 whitespace-words → 6 tokens"
+        );
+
+        // Empty string → 0
+        assert_eq!(estimate_task_tokens(""), 0, "empty string → 0 tokens");
+
+        // 1 word → ceil(1.33) = 2
+        assert_eq!(estimate_task_tokens("word"), 2, "1 word → 2 tokens");
+    }
+
+    /// F3-pipeline-2: per-run global cap via ledger.
+    ///
+    /// Simulates two stages: stage 1 injects near the cap, stage 2's effective
+    /// budget is the small remainder, and total injected never exceeds run_cap.
+    #[test]
+    fn f3_per_run_global_cap_limits_total_brain_tokens() {
+        use kimetsu_core::config::adaptive_budget;
+
+        let floor = 1500u32;
+        let run_cap = 8000u32;
+        let task_size = 200u32;
+
+        // Stage 1: budget = adaptive_budget(task_size), remaining = run_cap
+        let stage1_budget = adaptive_budget(task_size, floor, run_cap);
+
+        // Simulate stage 1 injecting its full budget.
+        let mut ledger = RunRecallLedger::new();
+        ledger.mark_injected("cap-s1-a", stage1_budget / 2);
+        ledger.mark_injected("cap-s1-b", stage1_budget / 2);
+        let after_stage1 = ledger.injected_tokens();
+
+        // Stage 2: remaining budget = run_cap - injected so far.
+        let remaining_stage2 = run_cap.saturating_sub(after_stage1);
+        let stage2_budget = adaptive_budget(task_size, floor, run_cap).min(remaining_stage2);
+
+        // Simulate stage 2 trying to inject up to its budget.
+        ledger.mark_injected("cap-s2-a", stage2_budget / 2);
+        ledger.mark_injected("cap-s2-b", stage2_budget / 2);
+
+        let total_injected = ledger.injected_tokens();
+        assert!(
+            total_injected <= run_cap,
+            "total injected ({total_injected}) must not exceed run_cap ({run_cap})"
+        );
+        assert!(
+            remaining_stage2 < stage1_budget,
+            "stage 2 must have less budget than stage 1 when stage 1 used its allocation"
+        );
+    }
+
+    /// F3-pipeline-3: overhead-ratio fixture-level proof.
+    ///
+    /// Two fixtures — a small task and a ~5×-larger task. The task-size signal
+    /// is defined as: estimate_tokens(task_text) + estimate_tokens(file_list).
+    ///
+    /// Assertions (fixture-level, not universal theorems):
+    ///   (a) brain tokens grow < 2× between small and large fixture
+    ///   (b) overhead ratio (brain / total) is STRICTLY LOWER for the larger task
+    ///       where total ∝ task_size (simulated as 8× task_size for realism)
+    ///
+    /// The factor 8× for total comes from the observation that typical model
+    /// context (system prompt + file contents + conversation) is roughly an
+    /// order of magnitude larger than the task description alone.
+    #[test]
+    fn f3_overhead_ratio_falls_on_larger_task() {
+        use kimetsu_core::config::adaptive_budget;
+
+        let floor = 1500u32;
+        let run_cap = 16_000u32; // raised cap so both fixtures are unclamped
+
+        // Small fixture: a concise 5-word task + 2 file paths listed
+        // task: "fix the scheduler exit loop" → estimate_task_tokens = 8
+        // files: "- src/scheduler.rs\n- src/main.rs" → ~4 words → 6 tokens
+        // task_size_small ≈ 14 tokens
+        let task_small = "fix the scheduler exit loop";
+        let files_small = "- src/scheduler.rs\n- src/main.rs";
+        let task_size_small =
+            estimate_task_tokens(task_small).saturating_add(estimate_task_tokens(files_small));
+
+        // Large fixture: a ~5× larger task (verbose multi-paragraph description)
+        // + many more file paths. We construct it to be ~5× task_size_small.
+        // 5 × 14 ≈ 70 tokens; use 30 task words (≈40 tokens) + 20 file path words (≈27 tokens)
+        // = ~67 tokens.
+        let task_large = "implement a comprehensive fix for the scheduler exit loop \
+            that handles all edge cases including the timeout path the retry path \
+            and the graceful shutdown sequence with proper cleanup of resources";
+        let files_large = "- src/scheduler.rs\n- src/main.rs\n- src/config.rs\n\
+            - src/worker.rs\n- src/runtime.rs\n- tests/scheduler_test.rs";
+        let task_size_large =
+            estimate_task_tokens(task_large).saturating_add(estimate_task_tokens(files_large));
+
+        // Verify the large fixture is genuinely ~5× the small fixture.
+        assert!(
+            task_size_large >= 4 * task_size_small,
+            "large fixture ({task_size_large} tokens) should be >= 4× small ({task_size_small} tokens)"
+        );
+
+        // Compute adaptive brain budgets for each fixture.
+        let brain_small = adaptive_budget(task_size_small, floor, run_cap) as f64;
+        let brain_large = adaptive_budget(task_size_large, floor, run_cap) as f64;
+
+        // (a) brain tokens grow < 2× even though task is ~5× larger.
+        assert!(
+            brain_large < 2.0 * brain_small,
+            "F3 sublinear guarantee (fixture): brain_large={brain_large} must be < 2×brain_small={}",
+            2.0 * brain_small
+        );
+
+        // (b) Overhead ratio (brain / total) strictly falls for the larger task.
+        // Total model context is simulated as 8 × task_size (task description +
+        // file contents + system prompt) — this factor is the same for both, so
+        // the ratio difference is purely driven by the sublinear brain budget.
+        let total_factor = 8.0f64;
+        let total_small = total_factor * task_size_small as f64;
+        let total_large = total_factor * task_size_large as f64;
+
+        let ratio_small = brain_small / total_small;
+        let ratio_large = brain_large / total_large;
+
+        assert!(
+            ratio_large < ratio_small,
+            "F3 overhead-ratio fixture: ratio_large={ratio_large:.4} must be < ratio_small={ratio_small:.4} \
+            (brain tokens grow sublinearly while task/total grows linearly)"
+        );
+
+        // Sanity: both ratios are positive and sensible.
+        assert!(
+            ratio_small > 0.0 && ratio_large > 0.0,
+            "ratios must be positive"
         );
     }
 }

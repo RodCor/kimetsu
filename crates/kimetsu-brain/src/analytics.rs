@@ -151,6 +151,17 @@ pub struct TokenEconomy {
     pub avg_capsules: Option<f64>,
     /// Skip-rate (skipped / served); `None` until C7 adds `context.served`.
     pub skip_rate: Option<f64>,
+    /// F3 — overhead ratio: brain-injected tokens ÷ total run tokens, averaged
+    /// over runs in the window that carry both `context.injected` `used_tokens`
+    /// AND `run.finished` `total_prompt_tokens` (or equivalent).
+    ///
+    /// Currently `None` because the pipeline does not yet record
+    /// `total_prompt_tokens` in `run.finished` events. When that field is
+    /// added, this metric will be computed from it. The fixture-level
+    /// guarantee (brain overhead ratio falls on larger tasks) is proven in
+    /// the `f3_overhead_ratio_falls_on_larger_task` unit test in
+    /// `kimetsu_agent::pipeline` using `adaptive_budget` + simulated totals.
+    pub overhead_ratio: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +723,9 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             avg_injected_tokens,
             avg_capsules,
             skip_rate,
+            // F3: overhead_ratio requires total_prompt_tokens from run.finished
+            // events, which the pipeline does not yet record. See field doc.
+            overhead_ratio: None,
         }
     };
 

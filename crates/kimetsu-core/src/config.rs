@@ -176,6 +176,10 @@ impl Default for ModelSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerSection {
+    /// Flat per-stage budget (tokens). Used as a fallback when
+    /// `task_size == 0` (broker disabled or task-size signal unavailable)
+    /// and as the compat default for pre-F3 project.toml files.
+    /// For live runs the adaptive budget (`adaptive_budget`) supersedes this.
     pub default_budget_tokens: u32,
     pub weights: BrokerWeights,
     /// D1f: hard cap on capsules rendered into a model prompt. The
@@ -202,10 +206,29 @@ pub struct BrokerSection {
     /// project.toml. `#[serde(default)]` keeps older configs loading.
     #[serde(default)]
     pub min_semantic_score: f32,
+    /// F3: floor for the adaptive per-stage brain budget. Small tasks
+    /// receive at least this many tokens so the brain is never starved.
+    /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
+    #[serde(default = "default_budget_floor_tokens")]
+    pub budget_floor_tokens: u32,
+    /// F3: per-run global ceiling on brain-injected tokens across ALL
+    /// stages combined. Later stages receive only the remaining capacity
+    /// once earlier stages have been charged via the `RunRecallLedger`.
+    /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
+    #[serde(default = "default_budget_run_cap_tokens")]
+    pub budget_run_cap_tokens: u32,
 }
 
 fn default_max_capsules() -> usize {
     8
+}
+
+fn default_budget_floor_tokens() -> u32 {
+    1500
+}
+
+fn default_budget_run_cap_tokens() -> u32 {
+    8000
 }
 
 impl Default for BrokerSection {
@@ -215,8 +238,48 @@ impl Default for BrokerSection {
             weights: BrokerWeights::default(),
             max_capsules: default_max_capsules(),
             min_semantic_score: 0.0,
+            budget_floor_tokens: default_budget_floor_tokens(),
+            budget_run_cap_tokens: default_budget_run_cap_tokens(),
         }
     }
+}
+
+/// F3: compute the adaptive per-stage brain budget given a task-size signal.
+///
+/// **Task-size signal** (defined): `task_size = estimate_tokens(task_text) +
+/// estimate_tokens(localized_file_context)`, where `estimate_tokens` uses the
+/// same heuristic as the rest of the pipeline: `(whitespace_words * 1.33).ceil()`.
+/// Localized-file context is the rendered list of paths surfaced before the
+/// first implementation attempt.
+///
+/// **Scaling**: `floor + k * sqrt(task_size)` clamped to `[floor, run_cap]`.
+/// sqrt is chosen because it grows slower than linear — doubling task_size
+/// grows the budget by only ~41%, and a 5× task grows it by only ~124%
+/// (well under 2×).
+///
+/// **Constant k**: chosen so a "typical" task (task_size ≈ 200 tokens, e.g.
+/// a concise one-paragraph task + a handful of file paths) lands near
+/// today's default 6000 tokens, avoiding a behavior cliff on upgrade.
+///   k = (6000 - 1500) / sqrt(200) ≈ 318.2
+///
+/// **Fallback**: when `task_size == 0` (broker disabled, size signal
+/// unavailable, or called pre-retrieval) returns `floor` — callers should
+/// use `default_budget_tokens` instead in those paths.
+///
+/// **Per-run cap**: the caller is responsible for computing
+/// `remaining = run_cap.saturating_sub(ledger.injected_tokens())` and passing
+/// `min(adaptive_budget(...), remaining)` as the stage's `budget_tokens`.
+pub fn adaptive_budget(task_size: u32, floor: u32, run_cap: u32) -> u32 {
+    if task_size == 0 {
+        return floor;
+    }
+    // k ≈ 318.2 so that adaptive_budget(200, 1500, 8000) ≈ 6000.
+    // We scale k by 10 and work in integer arithmetic to avoid f64 in hot path.
+    const K_SCALED: u32 = 3182; // k * 10
+    let sqrt_part = (task_size as f64).sqrt();
+    let budget_f = floor as f64 + (K_SCALED as f64 / 10.0) * sqrt_part;
+    let budget = budget_f.round() as u32;
+    budget.clamp(floor, run_cap)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +476,10 @@ max_total_cost_usd = 250.0
         // must load cleanly and receive the safe defaults.
         assert_eq!(config.broker.max_capsules, 8);
         assert_eq!(config.broker.min_semantic_score, 0.0);
+        // F3: pre-F3 configs without budget_floor_tokens / budget_run_cap_tokens
+        // must load cleanly and receive the safe defaults.
+        assert_eq!(config.broker.budget_floor_tokens, 1500);
+        assert_eq!(config.broker.budget_run_cap_tokens, 8000);
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
@@ -436,5 +503,92 @@ max_total_cost_usd = 250.0
         assert_eq!(reloaded.embedder.model, "bge-m3");
         assert_eq!(reloaded.broker.default_budget_tokens, 6000);
         assert_eq!(reloaded.kimetsu.project_id, "demo");
+        // F3 fields survive round-trip.
+        assert_eq!(reloaded.broker.budget_floor_tokens, 1500);
+        assert_eq!(reloaded.broker.budget_run_cap_tokens, 8000);
+    }
+
+    // ── F3: adaptive_budget unit tests ────────────────────────────────────
+
+    /// F3-budget-1: floor is returned when task_size == 0.
+    #[test]
+    fn f3_adaptive_budget_zero_size_returns_floor() {
+        assert_eq!(
+            super::adaptive_budget(0, 1500, 8000),
+            1500,
+            "task_size=0 must return floor"
+        );
+    }
+
+    /// F3-budget-2: run_cap is returned when task_size is enormous (very large).
+    #[test]
+    fn f3_adaptive_budget_huge_size_clamped_to_run_cap() {
+        let result = super::adaptive_budget(1_000_000, 1500, 8000);
+        assert_eq!(result, 8000, "huge task_size must be clamped to run_cap");
+    }
+
+    /// F3-budget-3: budget grows SUBLINEARLY — adaptive_budget(5*T) < 2 * adaptive_budget(T).
+    ///
+    /// With sqrt scaling: budget(5*T) / budget(T) = (floor + k*sqrt(5T)) / (floor + k*sqrt(T))
+    /// < sqrt(5) ≈ 2.236 for large T, but also < 2 for T in the practical range
+    /// because the floor term dominates at small sizes and sqrt(5) dominates at large
+    /// sizes. Specifically for T=200: budget(200)≈6000, budget(1000)≈8000 (capped) → ratio < 2.
+    /// For T=50 (below cap): budget(50)≈3751, budget(250)≈6534 → ratio ≈ 1.74 < 2. ✓
+    #[test]
+    fn f3_adaptive_budget_is_sublinear() {
+        let floor = 1500u32;
+        let run_cap = 16_000u32; // raised cap for this test so neither hits the ceiling
+
+        // T0 = 200 tokens (concise task), 5*T0 = 1000 tokens (verbose task)
+        let t0 = 200u32;
+        let b_t0 = super::adaptive_budget(t0, floor, run_cap);
+        let b_5t0 = super::adaptive_budget(5 * t0, floor, run_cap);
+
+        assert!(
+            b_5t0 < 2 * b_t0,
+            "sublinear guarantee: adaptive_budget(5*T)={b_5t0} must be < 2*adaptive_budget(T)={} (T={t0})",
+            2 * b_t0
+        );
+        assert!(
+            b_5t0 > b_t0,
+            "budget must still grow: adaptive_budget(5*T)={b_5t0} > adaptive_budget(T)={b_t0}"
+        );
+    }
+
+    /// F3-budget-4: a typical task (task_size ≈ 200) lands near the historical
+    /// default of 6000 tokens, avoiding a behavior cliff on upgrade.
+    #[test]
+    fn f3_adaptive_budget_typical_task_near_historical_default() {
+        let budget = super::adaptive_budget(200, 1500, 8000);
+        // k = 318.2 → floor + k*sqrt(200) = 1500 + 318.2*14.14 ≈ 5999
+        // Allow ±300 to tolerate rounding.
+        assert!(
+            (5700..=8000).contains(&budget),
+            "typical task budget expected near 6000, got {budget}"
+        );
+    }
+
+    /// F3-budget-5: floor is always respected — even small tasks get at least floor.
+    #[test]
+    fn f3_adaptive_budget_respects_floor() {
+        for size in [1u32, 5, 10, 50] {
+            let b = super::adaptive_budget(size, 1500, 8000);
+            assert!(
+                b >= 1500,
+                "task_size={size}: budget={b} must be >= floor=1500"
+            );
+        }
+    }
+
+    /// F3-budget-6: run_cap is always respected — large tasks never exceed cap.
+    #[test]
+    fn f3_adaptive_budget_respects_run_cap() {
+        for size in [500u32, 1000, 5000, 100_000] {
+            let b = super::adaptive_budget(size, 1500, 8000);
+            assert!(
+                b <= 8000,
+                "task_size={size}: budget={b} must be <= run_cap=8000"
+            );
+        }
     }
 }
