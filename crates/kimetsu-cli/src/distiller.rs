@@ -10,6 +10,7 @@ use kimetsu_agent::anthropic::AnthropicProvider;
 use kimetsu_agent::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ToolChoice,
 };
+use kimetsu_agent::openai::OpenAiProvider;
 use kimetsu_brain::project;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
@@ -236,6 +237,7 @@ pub fn distill_and_record(
 /// The distiller selected for this session: which model/key/endpoint to use,
 /// and how to record (project vs the global user brain).
 pub struct ResolvedDistiller {
+    pub provider: String,
     pub model: String,
     pub key: String,
     pub base_url: Option<String>,
@@ -267,10 +269,11 @@ fn resolve_distiller_with(
     {
         let d = &config.learning.distiller;
         if d.enabled
-            && d.provider == "anthropic"
+            && let Some(provider) = normalize_distiller_provider(&d.provider)
             && let Some(key) = resolve_env_value(&paths.repo_root, &d.api_key_env)
         {
             return Some(ResolvedDistiller {
+                provider: provider.to_string(),
                 model: d.model.clone(),
                 key,
                 base_url: resolve_env_value(&paths.repo_root, &d.base_url_env),
@@ -287,10 +290,11 @@ fn resolve_distiller_with(
     {
         let d = &config.learning.distiller;
         if d.enabled
-            && d.provider == "anthropic"
+            && let Some(provider) = normalize_distiller_provider(&d.provider)
             && let Some(key) = resolve_env_value(&dir, &d.api_key_env)
         {
             return Some(ResolvedDistiller {
+                provider: provider.to_string(),
                 model: d.model.clone(),
                 key,
                 base_url: resolve_env_value(&dir, &d.base_url_env),
@@ -301,6 +305,14 @@ fn resolve_distiller_with(
         }
     }
     None
+}
+
+fn normalize_distiller_provider(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => Some("anthropic"),
+        "openai" | "oai" | "gpt" => Some("openai"),
+        _ => None,
+    }
 }
 
 /// `kimetsu brain session-end-hook` entry. Reads the SessionEnd payload
@@ -319,28 +331,52 @@ pub fn run_session_end_hook(workspace: &Path) {
     else {
         return;
     };
-    let Some(resolved) = resolve_distiller(workspace) else {
-        return;
-    };
+    run_distiller_for_transcript(workspace, transcript_path);
+}
+
+/// Run the configured distiller against a known transcript path. Used by
+/// SessionEnd hooks where available, and by Codex Stop hooks because current
+/// Codex releases expose Stop but not SessionEnd.
+pub fn run_distiller_for_transcript(workspace: &Path, transcript_path: &str) -> Option<usize> {
+    let resolved = resolve_distiller(workspace)?;
     let view = build_transcript_view(transcript_path, MAX_VIEW_CHARS);
     if view.trim().is_empty() {
-        return;
+        return Some(0);
     }
-    let Ok(mut provider) = AnthropicProvider::for_distiller(
-        &resolved.model,
-        resolved.key,
-        resolved.base_url,
-        resolved.timeout_secs,
-    ) else {
-        return;
+    let mut provider: Box<dyn ModelProvider> = match resolved.provider.as_str() {
+        "anthropic" => match AnthropicProvider::for_distiller(
+            &resolved.model,
+            resolved.key,
+            resolved.base_url,
+            resolved.timeout_secs,
+        ) {
+            Ok(provider) => Box::new(provider),
+            Err(_) => return None,
+        },
+        "openai" => match OpenAiProvider::for_distiller(
+            &resolved.model,
+            resolved.key,
+            resolved.base_url,
+            resolved.timeout_secs,
+        ) {
+            Ok(provider) => Box::new(provider),
+            Err(_) => return None,
+        },
+        _ => return None,
     };
-    let recorded = distill_and_record(&resolved.record_start, &view, &mut provider, resolved.scope);
+    let recorded = distill_and_record(
+        &resolved.record_start,
+        &view,
+        provider.as_mut(),
+        resolved.scope,
+    );
     if recorded > 0 {
         println!(
             "[Kimetsu] distilled {recorded} lesson{} at session end.",
             if recorded == 1 { "" } else { "s" }
         );
     }
+    Some(recorded)
 }
 
 #[cfg(test)]
@@ -510,13 +546,31 @@ mod tests {
     /// `model` sections are required by serde (no `#[serde(default)]` on those
     /// `ProjectConfig` fields).
     fn write_distiller_toml(dir: &std::path::Path, enabled: bool, model: &str) {
+        write_distiller_toml_with_provider(
+            dir,
+            enabled,
+            "anthropic",
+            model,
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+        );
+    }
+
+    fn write_distiller_toml_with_provider(
+        dir: &std::path::Path,
+        enabled: bool,
+        provider: &str,
+        model: &str,
+        api_key_env: &str,
+        base_url_env: &str,
+    ) {
         std::fs::create_dir_all(dir).unwrap();
         let mut config = ProjectConfig::default_for_project("test");
         config.learning.distiller.enabled = enabled;
-        config.learning.distiller.provider = "anthropic".to_string();
+        config.learning.distiller.provider = provider.to_string();
         config.learning.distiller.model = model.to_string();
-        config.learning.distiller.api_key_env = "ANTHROPIC_API_KEY".to_string();
-        config.learning.distiller.base_url_env = "ANTHROPIC_BASE_URL".to_string();
+        config.learning.distiller.api_key_env = api_key_env.to_string();
+        config.learning.distiller.base_url_env = base_url_env.to_string();
         let toml = config.to_toml().unwrap();
         std::fs::write(dir.join("project.toml"), toml).unwrap();
     }
@@ -545,6 +599,7 @@ mod tests {
 
         let r = resolve_distiller_with(&ws, Some(gdir.clone())).expect("global resolved");
         assert_eq!(r.scope, MemoryScope::GlobalUser);
+        assert_eq!(r.provider, "anthropic");
         assert_eq!(r.model, "claude-haiku-4-5");
         assert_eq!(r.key, "sk-global");
 
@@ -596,11 +651,52 @@ mod tests {
 
         let r = resolve_distiller_with(&ws, Some(gdir.clone())).expect("workspace resolved");
         assert_eq!(r.scope, MemoryScope::Project);
+        assert_eq!(r.provider, "anthropic");
         assert_eq!(r.model, "ws-model");
         assert_eq!(r.key, "sk-ws");
 
         std::fs::remove_dir_all(ws).ok();
         std::fs::remove_dir_all(gdir).ok();
+    }
+
+    #[test]
+    fn resolve_distiller_openai_workspace() {
+        let ws = std::env::temp_dir().join(format!(
+            "km_rd_oai_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(ws.join(".kimetsu")).unwrap();
+        assert!(
+            kimetsu_core::paths::git_init_boundary(&ws),
+            "git_init_boundary failed - git needed for workspace isolation"
+        );
+        {
+            let mut config = ProjectConfig::default_for_project("ws");
+            config.learning.distiller.enabled = true;
+            config.learning.distiller.provider = "openai".to_string();
+            config.learning.distiller.model = "gpt-5.4-mini".to_string();
+            config.learning.distiller.api_key_env = "OPENAI_API_KEY".to_string();
+            config.learning.distiller.base_url_env = "OPENAI_BASE_URL".to_string();
+            let toml = config.to_toml().unwrap();
+            std::fs::write(ws.join(".kimetsu").join("project.toml"), toml).unwrap();
+        }
+        std::fs::write(
+            ws.join(".env"),
+            "OPENAI_API_KEY=sk-openai\nOPENAI_BASE_URL=http://localhost:4000/v1\n",
+        )
+        .unwrap();
+
+        let r = resolve_distiller_with(&ws, None).expect("workspace resolved");
+        assert_eq!(r.scope, MemoryScope::Project);
+        assert_eq!(r.provider, "openai");
+        assert_eq!(r.model, "gpt-5.4-mini");
+        assert_eq!(r.key, "sk-openai");
+        assert_eq!(r.base_url.as_deref(), Some("http://localhost:4000/v1"));
+
+        std::fs::remove_dir_all(ws).ok();
     }
 
     #[test]

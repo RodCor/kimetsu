@@ -326,12 +326,17 @@ The core hook pattern is the same across hosts:
   calls, and prints a one-line post-turn banner — either confirming how
   many lessons were captured or nudging the model to record one after a
   non-trivial, un-captured session.
+- **`SessionEnd` → `kimetsu brain session-end-hook`** runs the optional
+  credentialed distiller when the host exposes SessionEnd. Claude Code uses
+  this event; Codex uses its supported `Stop` event with `--distill-on-stop`
+  for the same deterministic harvest path.
 
 These are plain CLI subcommands, so the same pattern works under any
-harness that can run a command on a prompt, stop, or tool event. The
-Codex installer wires prompt-time context and proactive tool hooks; the
-Claude Code installer wires prompt-time context, stop summaries, and
-proactive tool hooks.
+harness that can run a command on a prompt, stop, session-end, or tool
+event. The Codex installer wires prompt-time context, stop summaries,
+Stop-time distilling, proactive tool hooks, and a
+`kimetsu-memory-harvester` custom agent; the Claude Code installer wires
+the same flow through `.claude/settings.json` and its subagent file.
 
 ### Proactive recall (mid-work)
 
@@ -451,13 +456,23 @@ max_total_files = 50_000
 max_total_tool_calls = 60
 max_total_model_turns = 30
 max_total_cost_usd = 250.0    # advisory under subscription providers
+
+[learning]
+auto_harvest = true
+
+[learning.distiller]
+enabled = false
+provider = "anthropic"        # or "openai"
+model = "claude-haiku-4-5"    # OpenAI default: "gpt-5.4-mini"
+api_key_env = "ANTHROPIC_API_KEY"   # or "OPENAI_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL" # or "OPENAI_BASE_URL"
 ```
 
 Environment variables that override at runtime:
 
 | Variable | Effect |
 |----------|--------|
-| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_TOKEN` | Provider credentials |
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY` | Provider credentials |
 | `KIMETSU_USER_BRAIN=0` | Disable the user brain (project-only memories) |
 | `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick the embedder (or disable) |
 

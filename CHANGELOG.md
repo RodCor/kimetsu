@@ -11,18 +11,22 @@ caveat that pre-1.0 minor bumps may include breaking changes
 ADDED
   * **Credentialed SessionEnd distiller (opt-in).** A second, deterministic
     memory-harvest path alongside the v0.9.0 in-agent harvester. `kimetsu plugin
-    install claude-code` now runs an interactive wizard (on a TTY; skip with
-    `--no-setup`, force with `--setup-harvest`) that configures a cheap distiller
-    model — Anthropic (recommended `claude-haiku-4-5`) or any Anthropic-compatible
-    endpoint incl. **LiteLLM** via `ANTHROPIC_BASE_URL`. The key + base URL are
-    written to a gitignored `.env`; the selection lands in `[learning.distiller]`
-    in `project.toml`. A new `SessionEnd` hook then runs `kimetsu brain
-    session-end-hook`, which (when enabled + credentialed) distills the
+    install claude-code` and `kimetsu plugin install codex` now run an
+    interactive wizard (on a TTY; skip with `--no-setup`, force with
+    `--setup-harvest`) that configures a cheap distiller
+    model: Anthropic (recommended `claude-haiku-4-5`), OpenAI (recommended
+    `gpt-5.4-mini`), or compatible endpoints via `ANTHROPIC_BASE_URL` /
+    `OPENAI_BASE_URL`. The key + base URL are written to a gitignored `.env`;
+    the selection lands in `[learning.distiller]`
+    in `project.toml`. A new `SessionEnd` hook for Claude Code runs
+    `kimetsu brain session-end-hook`; Codex uses its supported `Stop` hook with
+    `--distill-on-stop`. When enabled + credentialed, the distiller reads the
     transcript with that model and records lessons through the confidence-gated
     `propose_or_merge_memory`. When the distiller is enabled, the Stop hook's
     end-of-session cue is suppressed (the distiller owns end-of-session; the
     mid-session PostToolUse resolved-failure cue stays). `AnthropicProvider`
-    gained an optional base URL for the LiteLLM case. With `--scope global` the
+    gained an optional base URL for the LiteLLM case, and the distiller gained
+    an OpenAI Responses API provider. With `--scope global` the
     wizard configures the distiller once in `~/.kimetsu/` (config + `.env`); that
     global distiller then runs in every project and records into the user brain
     (`~/.kimetsu/brain.db`, available everywhere), with a per-project distiller
@@ -32,7 +36,8 @@ ADDED
     session succeeds (PostToolUse), or a non-trivial session ends with nothing
     recorded (Stop), Kimetsu emits a `[kimetsu-harvest]` cue telling the agent to
     dispatch a new background **`kimetsu-memory-harvester`** subagent (installed
-    at `.claude/agents/`, pinned to a cheap model). The subagent distills 0–3
+    at `.claude/agents/` for Claude Code and `.codex/agents/` for Codex, pinned
+    to a cheap model). The subagent distills 0–3
     generalizable lessons and records them through the confidence-gated
     `kimetsu_brain_record` path — no separate API key or kimetsu-side model
     credentials, billed in-agent at the cheap model's rate, non-blocking. Cues
