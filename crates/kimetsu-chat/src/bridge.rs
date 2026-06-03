@@ -438,7 +438,7 @@ fn plugin_install_inner(
     target: BridgeTarget,
     scope: InstallScope,
     mode: PluginMode,
-    force: bool,
+    _force: bool,
     proactive: bool,
     home: Option<&Path>,
 ) -> Result<PluginInstallReport, String> {
@@ -492,7 +492,7 @@ fn plugin_install_inner(
             let harvester = agents.join("kimetsu-memory-harvester.md");
             write_text_file(&harvester, CLAUDE_MEMORY_HARVESTER_AGENT, true)?;
             files.push(normalize_path(&harvester));
-            write_claude_settings(&claude_dir, force, proactive, &mut files)?;
+            write_claude_settings(&claude_dir, proactive, &mut files)?;
         }
         BridgeTarget::Codex => {
             let codex_dir = match home {
@@ -942,20 +942,16 @@ calling the brain tools. Be terse. One brain call per distinct lesson.
 /// `CLAUDE.md` guidance and the `settings.json` hook registration.
 fn write_claude_settings(
     claude_dir: &Path,
-    force: bool,
     proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     fs::create_dir_all(claude_dir)
         .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
 
-    // CLAUDE.md: seed when missing. If it already exists we leave it alone
-    // unless `force` is set — overwriting an existing CLAUDE.md is the one
-    // thing `--force` still does. Without force, user edits are never clobbered.
+    // CLAUDE.md: merge our guidance into whatever is there (or create it),
+    // never overwriting the user's content. See `merge_claude_md`.
     let claude_md = claude_dir.join("CLAUDE.md");
-    if !claude_md.is_file() || force {
-        write_text_file(&claude_md, CLAUDE_MD_CONTENT, true)?;
-    }
+    merge_claude_md(&claude_md)?;
     files.push(normalize_path(&claude_md));
 
     let settings = claude_dir.join("settings.json");
@@ -1725,6 +1721,31 @@ mod tests {
         let out2 = fs::read_to_string(&path).unwrap();
         assert_eq!(out2.matches(CLAUDE_MD_BEGIN).count(), 1);
         assert_eq!(out2.matches(CLAUDE_MD_END).count(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn install_preserves_existing_user_claude_md() {
+        let root = temp_root("install_claude_md");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("CLAUDE.md"),
+            "# Personal global instructions\nDo X.\n",
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        write_claude_settings(&claude, false, &mut files).unwrap();
+
+        let text = fs::read_to_string(claude.join("CLAUDE.md")).unwrap();
+        assert!(
+            text.contains("# Personal global instructions"),
+            "user content kept"
+        );
+        assert!(text.contains("Do X."));
+        assert!(text.contains("# Kimetsu brain"), "kimetsu block appended");
+        assert!(text.contains(CLAUDE_MD_BEGIN));
         fs::remove_dir_all(root).ok();
     }
 
