@@ -846,6 +846,46 @@ and records any durable lesson without blocking your work. It runs on a small,
 cheap model and records nothing when there's nothing worth saving.
 "#;
 
+const CLAUDE_MD_BEGIN: &str = "<!-- kimetsu:begin -->";
+const CLAUDE_MD_END: &str = "<!-- kimetsu:end -->";
+
+/// Merge Kimetsu's guidance block into a `CLAUDE.md` without ever clobbering
+/// the user's content. The guidance is wrapped in HTML-comment markers so it
+/// can be found and updated idempotently:
+///   * missing file   -> write the block
+///   * markers absent  -> append the block after the user's content
+///   * markers present -> replace just the marked region (upgrade in place)
+/// Used for both the workspace `.claude/CLAUDE.md` and the global
+/// `~/.claude/CLAUDE.md`.
+fn merge_claude_md(path: &Path) -> Result<(), String> {
+    let block = format!("{CLAUDE_MD_BEGIN}\n{CLAUDE_MD_CONTENT}{CLAUDE_MD_END}\n");
+    let raw = if path.is_file() {
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?
+    } else {
+        String::new()
+    };
+    let existing = strip_bom(&raw);
+    let merged = match (existing.find(CLAUDE_MD_BEGIN), existing.find(CLAUDE_MD_END)) {
+        (Some(start), Some(end_start)) if end_start >= start => {
+            let end = end_start + CLAUDE_MD_END.len();
+            let after = existing[end..].strip_prefix('\n').unwrap_or(&existing[end..]);
+            format!("{}{block}{after}", &existing[..start])
+        }
+        _ => {
+            let mut out = existing.to_string();
+            if !out.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n'); // blank line separating user content from our block
+            }
+            out.push_str(&block);
+            out
+        }
+    };
+    write_text_file(path, &merged, true)
+}
+
 /// v0.8.5: the memory-harvester subagent installed at
 /// `.claude/agents/kimetsu-memory-harvester.md`. A cheap, background
 /// Haiku distiller the hooks cue the main agent to dispatch — it reads
@@ -1565,6 +1605,80 @@ mod tests {
             value["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
             "kimetsu brain session-end-hook"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_fresh_file() {
+        let root = temp_root("claude_md_fresh");
+        let p = root.join("CLAUDE.md");
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains(CLAUDE_MD_BEGIN));
+        assert!(text.contains("# Kimetsu brain"));
+        assert!(text.contains(CLAUDE_MD_END));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_preserves_user_content() {
+        let root = temp_root("claude_md_preserve");
+        let p = root.join("CLAUDE.md");
+        fs::write(&p, "# My rules\nAlways use tabs.\n").unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# My rules"));
+        assert!(text.contains("Always use tabs."));
+        assert!(text.contains("# Kimetsu brain"));
+        assert!(
+            text.find("My rules").unwrap() < text.find(CLAUDE_MD_BEGIN).unwrap(),
+            "user content precedes the kimetsu block"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_idempotent() {
+        let root = temp_root("claude_md_idem");
+        let p = root.join("CLAUDE.md");
+        fs::write(&p, "# Mine\n").unwrap();
+        merge_claude_md(&p).unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches(CLAUDE_MD_BEGIN).count(), 1, "no duplicate block");
+        assert_eq!(text.matches(CLAUDE_MD_END).count(), 1);
+        assert!(text.contains("# Mine"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_upgrades_in_place() {
+        let root = temp_root("claude_md_upgrade");
+        let p = root.join("CLAUDE.md");
+        fs::write(
+            &p,
+            format!("# Top\n\n{CLAUDE_MD_BEGIN}\nOLD STALE\n{CLAUDE_MD_END}\n\n# Bottom\n"),
+        )
+        .unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("OLD STALE"), "stale block replaced");
+        assert!(text.contains("# Kimetsu brain"));
+        assert!(text.contains("# Top"));
+        assert!(text.contains("# Bottom"));
+        assert_eq!(text.matches(CLAUDE_MD_BEGIN).count(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_tolerates_bom() {
+        let root = temp_root("claude_md_bom");
+        let p = root.join("CLAUDE.md");
+        fs::write(&p, format!("\u{feff}# My rules\n")).unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# My rules"));
+        assert!(text.contains("# Kimetsu brain"));
         fs::remove_dir_all(root).ok();
     }
 
