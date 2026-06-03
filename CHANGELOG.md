@@ -64,11 +64,15 @@ FIXED
     `config.toml` / `.mcp.json`, so a config saved by a BOM-emitting editor
     (e.g. older Windows Notepad) no longer fails with "expected value at line 1
     column 1".
-  * **Install polish.** `--force` help now states it overwrites an existing
-    `CLAUDE.md` (including the global `~/.claude/CLAUDE.md`); a `--scope global`
-    on the workspace-only `kimetsu` target warns instead of silently doing
-    nothing; `--workspace` is canonicalized leniently so a global install
-    doesn't fail on a missing workspace path.
+  * **Install polish.** The installer now **merges** Kimetsu's guidance into an
+    existing `CLAUDE.md` — workspace `.claude/CLAUDE.md` or the global
+    `~/.claude/CLAUDE.md` — inside `<!-- kimetsu:begin -->`/`<!-- kimetsu:end -->`
+    markers, appending and upgrading in place, never overwriting the user's
+    content. `--force` no longer overwrites `CLAUDE.md` (the whole install is
+    idempotent and non-destructive; the flag is retained only for compatibility).
+    A `--scope global` on the workspace-only `kimetsu` target warns instead of
+    silently doing nothing; `--workspace` is canonicalized leniently so a global
+    install doesn't fail on a missing workspace path.
 
 ## v0.8.4 — non-destructive plugin install + global scope
 

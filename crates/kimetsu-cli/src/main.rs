@@ -284,9 +284,9 @@ struct PluginInstallArgs {
     /// sessions.
     #[arg(long, default_value = "workspace")]
     scope: String,
-    /// Overwrite an existing CLAUDE.md (with `--scope global` this replaces
-    /// your global ~/.claude/CLAUDE.md). MCP config, hooks, and generated docs
-    /// always refresh idempotently and never need this.
+    /// Retained for compatibility; has no effect. The installer is fully
+    /// idempotent and non-destructive — CLAUDE.md guidance is merged (never
+    /// overwritten), and hooks / MCP config / generated docs refresh in place.
     #[arg(long)]
     force: bool,
     /// Skip wiring the proactive PreToolUse/PostToolUse Bash
