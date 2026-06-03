@@ -269,19 +269,24 @@ pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
 
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     use kimetsu_core::KIMETSU_SCHEMA_VERSION;
-    let schema_version: i64 = conn.query_row(
+    let current: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
         [],
         |row| row.get(0),
     )?;
-
-    if schema_version != KIMETSU_SCHEMA_VERSION {
+    let target = KIMETSU_SCHEMA_VERSION;
+    if current > target {
         return Err(format!(
-            "brain.db schema version {schema_version} does not match expected {KIMETSU_SCHEMA_VERSION}; run `kimetsu brain rebuild`"
+            "brain.db schema version {current} was written by a newer Kimetsu (this binary expects {target}); upgrade Kimetsu"
         )
         .into());
     }
-
+    if current < target {
+        return Err(Box::new(crate::migrate::SchemaNeedsMigration {
+            from: current,
+            to: target,
+        }));
+    }
     Ok(())
 }
 
@@ -484,6 +489,67 @@ mod tests {
             migrate::current_version(&conn).expect("current_version"),
             2,
             "version must still be 2 after double initialize"
+        );
+    }
+
+    // Helper: seed an in-memory conn with only schema_info at the given version.
+    fn seed_schema_info(version: i64) -> Connection {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO schema_info VALUES ('kimetsu_schema_version', {version});"
+        ))
+        .expect("seed schema_info");
+        conn
+    }
+
+    // ------------------------------------------------------------------
+    // A5-1. validate Ok at target version
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_ok_at_target() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
+        let conn = seed_schema_info(KIMETSU_SCHEMA_VERSION);
+        validate(&conn).expect("validate at target must return Ok(())");
+    }
+
+    // ------------------------------------------------------------------
+    // A5-2. validate returns SchemaNeedsMigration for an older DB
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_returns_needs_migration_for_older_db() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
+        let conn = seed_schema_info(1);
+        let err = validate(&conn).expect_err("validate on v1 DB must return Err");
+        let snm = err
+            .downcast_ref::<migrate::SchemaNeedsMigration>()
+            .expect("error must downcast to SchemaNeedsMigration");
+        assert_eq!(
+            snm,
+            &migrate::SchemaNeedsMigration {
+                from: 1,
+                to: KIMETSU_SCHEMA_VERSION,
+            },
+            "SchemaNeedsMigration must carry the correct from/to versions"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A5-3. validate hard-errors (non-SchemaNeedsMigration) for a newer DB
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_hard_errors_for_newer_db() {
+        let conn = seed_schema_info(999);
+        let err = validate(&conn).expect_err("validate on v999 DB must return Err");
+        assert!(
+            err.downcast_ref::<migrate::SchemaNeedsMigration>()
+                .is_none(),
+            "error for a newer DB must NOT downcast to SchemaNeedsMigration"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer"),
+            "error message must contain 'newer', got: {msg}"
         );
     }
 }

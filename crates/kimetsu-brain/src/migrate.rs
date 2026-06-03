@@ -5,6 +5,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
 use rusqlite::Connection;
 
+/// Returned by `schema::validate` when a read-only connection observes a DB
+/// older than the binary's target version. Read-only connections cannot run
+/// DDL, so the caller must decide: the user brain treats it as "unavailable
+/// this call" (`Ok(None)`) and the next read-write open migrates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaNeedsMigration {
+    pub from: i64,
+    pub to: i64,
+}
+
+impl std::fmt::Display for SchemaNeedsMigration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "brain.db schema version {} is older than this binary's {}; open it read-write once to migrate",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for SchemaNeedsMigration {}
+
 /// One forward-only schema migration. `version` is the value the DB is
 /// stamped with AFTER `up` succeeds (i.e. `migrations()[i].version` is the
 /// post-migration version). `up` MUST be idempotent (it may be re-run after

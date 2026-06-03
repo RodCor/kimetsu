@@ -78,7 +78,18 @@ pub fn open_user_brain_readonly() -> KimetsuResult<Option<Connection>> {
         return Ok(None);
     }
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    schema::validate(&conn)?;
+    match schema::validate(&conn) {
+        Ok(()) => {}
+        // A stale user brain must not break an unrelated read-only project op;
+        // skip it this call. The next read-write open migrates it.
+        Err(e)
+            if e.downcast_ref::<crate::migrate::SchemaNeedsMigration>()
+                .is_some() =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    }
     Ok(Some(conn))
 }
 
@@ -408,6 +419,36 @@ mod tests {
             let path = user_brain_path().expect("path");
             assert!(path.starts_with(&tmp));
             assert!(path.ends_with("brain.db"));
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // A5-4. open_user_brain_readonly degrades to Ok(None) on a stale user brain
+    // ------------------------------------------------------------------
+    #[test]
+    fn readonly_degrades_to_none_on_stale_schema() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-stale");
+        with_user_brain_at(&tmp, || {
+            // Write a v1 stub directly — only schema_info, no full schema.
+            // schema::validate reads only schema_info, so this is sufficient
+            // to trigger SchemaNeedsMigration without any other tables.
+            let db_path = tmp.join("brain.db");
+            {
+                let conn = rusqlite::Connection::open(&db_path).expect("open stub db");
+                conn.execute_batch(
+                    "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                     INSERT INTO schema_info VALUES ('kimetsu_schema_version', 1);",
+                )
+                .expect("seed v1 stub");
+            }
+            // The file exists but is at v1; open_user_brain_readonly must degrade
+            // to Ok(None) instead of propagating the SchemaNeedsMigration error.
+            let result = open_user_brain_readonly()
+                .expect("open_user_brain_readonly must not error on stale user brain");
+            assert!(
+                result.is_none(),
+                "stale user brain (v1 < target) must yield Ok(None), not an error"
+            );
         });
     }
 
