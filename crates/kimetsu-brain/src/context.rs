@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use kimetsu_core::config::{BrokerWeights, StageWeights};
 use kimetsu_core::memory::MemoryScope;
 use kimetsu_core::{KimetsuResult, ids::new_id};
-#[cfg(feature = "embeddings")]
-use rusqlite::OptionalExtension;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------
@@ -1942,6 +1940,105 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+// -----------------------------------------------------------------------
+// F2: capsule resolver — expand a headline handle to its full text.
+// -----------------------------------------------------------------------
+
+/// Maximum bytes returned when resolving a `file:` handle. Keeps large
+/// source files from flooding the context window on a single expand call.
+const FILE_EXPAND_CAP_BYTES: usize = 2048;
+
+/// F2: resolve an expansion handle to its full text content.
+///
+/// Handles:
+/// - `memory:<id>` → `SELECT text FROM memories WHERE memory_id = ?`
+/// - `file:<path>` → read `repo_root/<path>`, capped at [`FILE_EXPAND_CAP_BYTES`]
+/// - `run:<id>`    → deferred; returns a descriptive error
+/// - anything else → returns a descriptive error
+///
+/// This is the resolver that the `expand_capsule` agent tool delegates to.
+/// All errors are user-visible (returned to the agent as a tool-result
+/// error string) and never crash the dispatch loop.
+pub fn resolve_capsule(
+    conn: &Connection,
+    repo_root: &std::path::Path,
+    handle: &str,
+) -> kimetsu_core::KimetsuResult<String> {
+    if let Some(memory_id) = handle.strip_prefix("memory:") {
+        // SELECT the raw text from the memories table.
+        let mut stmt = conn.prepare_cached(
+            "SELECT text FROM memories WHERE memory_id = ? AND invalidated_at IS NULL",
+        )?;
+        let text: Option<String> = stmt
+            .query_row(rusqlite::params![memory_id], |row| row.get(0))
+            .optional()?;
+        match text {
+            Some(t) => Ok(t),
+            None => {
+                Err(format!("expand_capsule: no active memory found for handle `{handle}`").into())
+            }
+        }
+    } else if let Some(rel_path) = handle.strip_prefix("file:") {
+        // Sanitize: reject absolute paths (drive-letter or Unix-root) and
+        // `..` traversal. On Windows, POSIX-style `/foo` paths are not
+        // considered absolute by `is_absolute()` (no drive prefix), so we
+        // also reject paths with a RootDir component.
+        let path = std::path::Path::new(rel_path);
+        if path.is_absolute() {
+            return Err(format!(
+                "expand_capsule: `{handle}` is an absolute path — only repo-relative paths are supported"
+            )
+            .into());
+        }
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    return Err(format!(
+                        "expand_capsule: `{handle}` contains `..` traversal — rejected"
+                    )
+                    .into());
+                }
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Err(format!(
+                        "expand_capsule: `{handle}` is an absolute path — only repo-relative paths are supported"
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+        }
+        let full_path = repo_root.join(path);
+        let bytes = std::fs::read(&full_path)
+            .map_err(|e| format!("expand_capsule: could not read `{rel_path}`: {e}"))?;
+        // Bound the returned slice so huge files don't blow the context window.
+        let bounded = if bytes.len() > FILE_EXPAND_CAP_BYTES {
+            let mut end = FILE_EXPAND_CAP_BYTES;
+            // Snap back to a UTF-8 boundary so we don't slice mid-codepoint.
+            while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            let s = String::from_utf8_lossy(&bytes[..end]);
+            format!(
+                "{s}\n[... truncated at {FILE_EXPAND_CAP_BYTES} bytes; call expand_capsule again with a line range if needed]"
+            )
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        Ok(bounded)
+    } else if handle.starts_with("run:") {
+        Err(format!(
+            "expand_capsule: `run:` handle expansion is not yet supported (handle: `{handle}`)"
+        )
+        .into())
+    } else {
+        Err(format!(
+            "expand_capsule: unrecognised handle format `{handle}`; \
+             expected `memory:<id>`, `file:<path>`, or `run:<id>`"
+        )
+        .into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,6 +2057,19 @@ mod tests {
             scope_weight: 1.0,
             score: 1.0,
         }
+    }
+
+    /// Create a unique temp directory under the system temp path.
+    /// Named by `tag` so test failures are diagnosable.
+    fn make_test_dir(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("kbrain_test_{tag}_{ts}"));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
     }
 
     #[test]
@@ -3838,5 +3948,131 @@ mod tests {
                 .map(|c| format!("{}:{}", c.kind, &c.summary[..c.summary.len().min(60)]))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    // ── F2: resolve_capsule unit tests ────────────────────────────────────
+
+    fn init_db_with_memory(memory_id: &str, text: &str) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let normalized = kimetsu_core::memory::normalize_memory_text(text);
+        conn.execute(
+            "INSERT INTO memories (
+                 memory_id, scope, kind, text, normalized_text, confidence,
+                 source_event_id, provenance_snapshot_json, created_at,
+                 use_count, usefulness_score
+             )
+             VALUES (?1, 'project', 'fact', ?2, ?3, 1.0, NULL, '{}',
+                     '2026-01-01T00:00:00Z', 0, 0.0)",
+            rusqlite::params![memory_id, text, normalized],
+        )
+        .expect("insert memory");
+        conn
+    }
+
+    /// F2-1: memory:<id> resolves to the full memory text.
+    #[test]
+    fn resolve_capsule_memory_returns_full_text() {
+        let conn = init_db_with_memory("test-mem-id", "Use rg over grep for speed");
+        let repo_root = std::path::Path::new("/fake-repo");
+        let result =
+            resolve_capsule(&conn, repo_root, "memory:test-mem-id").expect("should resolve");
+        assert_eq!(result, "Use rg over grep for speed");
+    }
+
+    /// F2-2: memory:<id> for a non-existent id returns Err.
+    #[test]
+    fn resolve_capsule_memory_missing_id_returns_err() {
+        let conn = init_db_with_memory("real-id", "some text");
+        let repo_root = std::path::Path::new("/fake-repo");
+        let err = resolve_capsule(&conn, repo_root, "memory:nonexistent-id")
+            .expect_err("should error for missing memory");
+        assert!(
+            err.to_string().contains("no active memory"),
+            "error message should mention missing: {err}"
+        );
+    }
+
+    /// F2-3: file:<path> returns a bounded slice of the file content.
+    #[test]
+    fn resolve_capsule_file_returns_bounded_content() {
+        let dir = make_test_dir("f2_file_resolve");
+        let content = "hello from the file\n";
+        std::fs::write(dir.join("notes.txt"), content).expect("write");
+        let result = resolve_capsule(
+            // conn is unused for file: handles; pass an in-memory DB
+            &rusqlite::Connection::open_in_memory().expect("open"),
+            &dir,
+            "file:notes.txt",
+        )
+        .expect("should resolve file");
+        assert!(result.contains("hello from the file"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F2-4: file:<path> for a large file is capped at FILE_EXPAND_CAP_BYTES.
+    #[test]
+    fn resolve_capsule_file_caps_large_file() {
+        let dir = make_test_dir("f2_file_cap");
+        let big = "A".repeat(FILE_EXPAND_CAP_BYTES * 3);
+        std::fs::write(dir.join("big.txt"), &big).expect("write");
+        let result = resolve_capsule(
+            &rusqlite::Connection::open_in_memory().expect("open"),
+            &dir,
+            "file:big.txt",
+        )
+        .expect("should resolve large file");
+        assert!(
+            result.len() <= FILE_EXPAND_CAP_BYTES + 200,
+            "result should be bounded: got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("truncated"),
+            "truncation marker should be present"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F2-5: unknown handle format returns Err.
+    #[test]
+    fn resolve_capsule_unknown_handle_returns_err() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        let err = resolve_capsule(&conn, std::path::Path::new("/r"), "blob:abc123")
+            .expect_err("should error");
+        assert!(
+            err.to_string().contains("unrecognised handle"),
+            "got: {err}"
+        );
+    }
+
+    /// F2-6: malformed handle (no colon) returns Err.
+    #[test]
+    fn resolve_capsule_malformed_handle_returns_err() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        let err = resolve_capsule(&conn, std::path::Path::new("/r"), "justnocolon")
+            .expect_err("should error");
+        assert!(
+            err.to_string().contains("unrecognised handle"),
+            "got: {err}"
+        );
+    }
+
+    /// F2-7: run:<id> returns the deferred-error message.
+    #[test]
+    fn resolve_capsule_run_handle_returns_deferred_err() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        let err = resolve_capsule(&conn, std::path::Path::new("/r"), "run:some-run-id")
+            .expect_err("run: should be deferred err");
+        assert!(err.to_string().contains("not yet supported"), "got: {err}");
+    }
+
+    /// F2-8: file:<path> with absolute path is rejected.
+    #[test]
+    fn resolve_capsule_file_rejects_absolute_path() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        let err = resolve_capsule(&conn, std::path::Path::new("/r"), "file:/etc/passwd")
+            .expect_err("should reject absolute path");
+        assert!(err.to_string().contains("absolute path"), "got: {err}");
     }
 }

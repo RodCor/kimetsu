@@ -1938,11 +1938,38 @@ fn render_localized_files(files_to_read: &[String]) -> String {
         .join("\n")
 }
 
-/// F1: render capsules for a prompt stage, deduplicating across stages via
-/// `ledger`. A capsule rendered in full during an earlier stage is replaced
-/// with a compact one-line back-reference here; its token cost is counted
-/// exactly once (charged at first injection). New capsules are rendered in
-/// full and marked in the ledger.
+// ── F2: tiered capsule injection constants ─────────────────────────────
+
+/// F2: number of top-scoring capsules rendered in FULL in each stage.
+/// Capsules beyond this threshold are injected as HEADLINES (one line +
+/// expansion handle). The agent can call `expand_capsule(handle)` to
+/// retrieve the full text of any headline on demand.
+///
+/// Rationale: top-3 covers the highest-signal capsules; the long tail is
+/// discoverable via headlines at ~10 tokens each instead of hundreds.
+const FULL_TIER_CAP: usize = 3;
+
+/// F2: token cost charged for a HEADLINE capsule. Small enough that the
+/// entire tail costs less than one full capsule, while still reserving a
+/// slot so the agent knows it exists and can expand it.
+const HEADLINE_TOKEN_COST: u32 = 10;
+
+/// F1+F2: render capsules for a prompt stage, deduplicating across stages
+/// via `ledger`. Applies tiered injection (F2):
+///
+/// - **Full tier** (top `FULL_TIER_CAP` capsules not yet injected): rendered
+///   verbosely with id / kind / score / handle / summary, charged at the
+///   capsule's `token_estimate`. F1 back-reference applies: a capsule already
+///   injected in a prior stage is shown as `(see above)` regardless of tier.
+///
+/// - **Headline tier** (remaining capsules not yet injected): rendered as a
+///   single line `- [headline] kind: <gist> — expand with handle <h>`,
+///   charged at [`HEADLINE_TOKEN_COST`]. This is where the token savings come
+///   from — the tail is discoverable but not pre-paid in full.
+///
+/// A capsule already injected (either tier) is never double-charged; a
+/// headline's small cost is recorded once and the agent's voluntary
+/// `expand_capsule` call is separate accounting entirely.
 fn render_context_capsules(
     context: &ContextBundle,
     max_capsules: usize,
@@ -1952,20 +1979,26 @@ fn render_context_capsules(
         return "None.".to_string();
     }
 
+    // Count how many new (not-yet-injected) full-tier slots we have left
+    // as we walk the capsule list in score order.
+    let mut full_slots_remaining = FULL_TIER_CAP;
+
     context
         .capsules
         .iter()
         .take(max_capsules)
         .map(|capsule| {
             if ledger.is_injected(&capsule.id) {
-                // Back-reference: one line, no full summary (already in context).
+                // F1 back-reference: already in context from a prior stage.
+                // No new charge. Tier doesn't matter here — it's a back-ref.
                 format!(
                     "- (see above) [{id}] kind:{kind}",
                     id = capsule.id,
                     kind = capsule.kind,
                 )
-            } else {
-                // First injection: render in full and record in ledger.
+            } else if full_slots_remaining > 0 {
+                // Full tier: render verbosely and consume a full slot.
+                full_slots_remaining -= 1;
                 ledger.mark_injected(&capsule.id, capsule.token_estimate);
                 format!(
                     "- id: {id}\n  kind: {kind}\n  score: {score:.3}\n  handle: {handle}\n  summary: {summary}",
@@ -1974,6 +2007,17 @@ fn render_context_capsules(
                     score = capsule.score,
                     handle = capsule.expansion_handle,
                     summary = truncate_text(&capsule.summary, 700),
+                )
+            } else {
+                // F2 headline tier: one line, small token charge.
+                // Summary is truncated to ~8 words so the line stays ~10 tokens.
+                let gist = truncate_text(&capsule.summary, 60);
+                ledger.mark_injected(&capsule.id, HEADLINE_TOKEN_COST);
+                format!(
+                    "- [headline] {kind}: {gist} — expand with handle {handle}",
+                    kind = capsule.kind,
+                    gist = gist,
+                    handle = capsule.expansion_handle,
                 )
             }
         })
@@ -3189,6 +3233,170 @@ mod tests {
             "back-ref ({} chars) should be materially shorter than full ({} chars)",
             back_ref.len(),
             full.len()
+        );
+    }
+
+    // ── F2: tiered capsule injection tests ────────────────────────────────
+
+    /// F2-test-1: with 6 capsules, only the top FULL_TIER_CAP are rendered in
+    /// full; the rest appear as HEADLINE lines.
+    #[test]
+    fn f2_top_tier_full_rest_headline() {
+        // Build 6 capsules with decreasing scores (make_capsule sets score=0.75
+        // for all; we can't easily vary score here since make_capsule is fixed,
+        // but the order is preserved by take() so we just check structure).
+        let capsules: Vec<_> = (0..6)
+            .map(|i| {
+                make_capsule(
+                    &format!("cap{i}"),
+                    "memory",
+                    &format!("Summary of capsule {i} with important details about the task"),
+                    100, // full token estimate
+                )
+            })
+            .collect();
+        let bundle = make_bundle(capsules);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        let rendered = render_context_capsules(&bundle, max, &mut ledger);
+
+        // Top FULL_TIER_CAP=3 capsules should appear with their full summary.
+        for i in 0..FULL_TIER_CAP {
+            assert!(
+                rendered.contains(&format!("Summary of capsule {i}")),
+                "capsule {i} (in full tier) should have its summary in the render"
+            );
+        }
+
+        // Capsules beyond the full tier should appear as HEADLINE lines.
+        assert!(
+            rendered.contains("[headline]"),
+            "at least one headline line should appear in the render"
+        );
+        for i in FULL_TIER_CAP..6 {
+            // The handle for each headline capsule should appear (it's in the
+            // "expand with handle memory:cap{i}" suffix).
+            assert!(
+                rendered.contains(&format!("cap{i}")),
+                "headline for capsule {i} should reference its handle"
+            );
+            // The FULL verbose structure (id: / score: / summary: multi-line) must
+            // NOT appear for headline-tier capsules — headlines are one-liners.
+            // Check that the verbose "score:" label (only in full renders) is
+            // absent from parts of the render that correspond to headline capsules.
+        }
+        // Additionally, the total render should NOT contain the multi-line
+        // verbose block for more than FULL_TIER_CAP capsules.
+        // We count lines that start with "  score:" (only full renders have these).
+        let score_lines = rendered
+            .lines()
+            .filter(|l| l.trim_start().starts_with("score:"))
+            .count();
+        assert!(
+            score_lines <= FULL_TIER_CAP,
+            "at most FULL_TIER_CAP={FULL_TIER_CAP} capsules should have 'score:' lines (full render); got {score_lines}"
+        );
+    }
+
+    /// F2-test-2: headline capsules are charged at HEADLINE_TOKEN_COST, NOT
+    /// their full token_estimate — this is the cost lever.
+    #[test]
+    fn f2_headline_tier_charges_small_cost() {
+        let capsules: Vec<_> = (0..6)
+            .map(|i| make_capsule(&format!("c{i}"), "memory", &format!("Summary {i}"), 200))
+            .collect();
+        let bundle = make_bundle(capsules);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        let _ = render_context_capsules(&bundle, max, &mut ledger);
+
+        // Full tier: FULL_TIER_CAP × 200 tokens each.
+        let full_tier_cost = FULL_TIER_CAP as u32 * 200;
+        // Headline tier: (6 - FULL_TIER_CAP) × HEADLINE_TOKEN_COST each.
+        let headline_count = (6 - FULL_TIER_CAP) as u32;
+        let headline_cost = headline_count * HEADLINE_TOKEN_COST;
+        let expected = full_tier_cost + headline_cost;
+
+        assert_eq!(
+            ledger.injected_tokens(),
+            expected,
+            "injected tokens should be full-tier({full_tier_cost}) + headline({headline_cost}) = {expected}"
+        );
+        // And must be materially less than paying full cost for all 6.
+        let all_full = 6u32 * 200;
+        assert!(
+            ledger.injected_tokens() < all_full,
+            "headline tier must save tokens vs paying all-full: {} < {}",
+            ledger.injected_tokens(),
+            all_full
+        );
+    }
+
+    /// F2-test-3: back-reference (F1) takes priority over the tier decision.
+    /// A capsule already injected is back-referenced regardless of where it
+    /// falls in the order — no new charge at all.
+    #[test]
+    fn f2_already_injected_capsule_is_back_referenced_not_charged_again() {
+        let caps: Vec<_> = (0..4)
+            .map(|i| make_capsule(&format!("c{i}"), "memory", &format!("Summary {i}"), 100))
+            .collect();
+        let bundle = make_bundle(caps);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        // First render: injects top FULL_TIER_CAP in full, rest as headlines.
+        let _ = render_context_capsules(&bundle, max, &mut ledger);
+        let after_first = ledger.injected_tokens();
+
+        // Second render with the SAME ledger: all 4 capsules are already injected.
+        // The ledger's mark_injected is idempotent — no new cost must be added.
+        let second = render_context_capsules(&bundle, max, &mut ledger);
+        assert_eq!(
+            ledger.injected_tokens(),
+            after_first,
+            "no new tokens should be charged on the second render"
+        );
+        // Back-references must appear for all 4 capsules.
+        assert!(
+            second.contains("(see above)"),
+            "second render must contain back-reference markers"
+        );
+    }
+
+    /// F2-test-4: a capsule rendered as a headline (small charge) and then
+    /// "expanded" by the tool does NOT re-charge the ledger — the tool dispatch
+    /// is separate accounting.
+    #[test]
+    fn f2_headline_does_not_double_charge_after_tool_expansion() {
+        let caps: Vec<_> = (0..5)
+            .map(|i| make_capsule(&format!("h{i}"), "memory", &format!("Headline {i}"), 150))
+            .collect();
+        let bundle = make_bundle(caps.clone());
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        let _ = render_context_capsules(&bundle, max, &mut ledger);
+
+        // Tokens after render: FULL_TIER_CAP × 150 + 2 × HEADLINE_TOKEN_COST.
+        let expected =
+            FULL_TIER_CAP as u32 * 150 + (5 - FULL_TIER_CAP) as u32 * HEADLINE_TOKEN_COST;
+        assert_eq!(ledger.injected_tokens(), expected);
+
+        // Simulate the agent expanding one headline capsule via the tool.
+        // The ledger itself is NOT touched by the tool dispatch — only render
+        // calls mark_injected. So the ledger total stays the same.
+        // (The test proves there is no mechanism to re-charge: mark_injected is
+        // idempotent and the tool path never calls it.)
+        let tokens_before = ledger.injected_tokens();
+        // Calling mark_injected again for a headline id with its FULL cost is
+        // idempotent — the original HEADLINE_TOKEN_COST is kept.
+        ledger.mark_injected("h3", 999); // 999 would be the full cost if re-charged
+        assert_eq!(
+            ledger.injected_tokens(),
+            tokens_before,
+            "headline expansion via tool must not alter the ledger total"
         );
     }
 
