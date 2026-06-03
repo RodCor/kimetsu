@@ -92,8 +92,17 @@ fn db_file_path(conn: &Connection) -> Option<PathBuf> {
     }
 }
 
+/// Return the number of rows in the `memories` table, or 0 if the table does
+/// not yet exist (e.g. a synthetic / partially-initialized DB).  Defensive:
+/// never panics; query errors silently map to 0.
+fn durable_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+}
+
 /// Snapshot the live DB before a version-advancing migration.  Returns the
-/// sidecar path, or `None` for an in-memory DB (nothing to back up).
+/// sidecar path, or `None` for an in-memory DB (nothing to back up) or when
+/// the DB contains zero memories (fresh install — nothing worth protecting).
 ///
 /// Uses SQLite's online backup API for a consistent copy that respects WAL.
 /// The sidecar is placed next to the source DB and named:
@@ -103,6 +112,12 @@ fn backup_before_migrate(conn: &Connection, from: i64, to: i64) -> KimetsuResult
         Some(p) => p,
         None => return Ok(None), // in-memory or anonymous temp DB — nothing to back up
     };
+
+    // Skip the backup when the DB is empty — a fresh/empty brain has nothing
+    // to lose; an upgraded brain with real memories gets protected.
+    if durable_row_count(conn) == 0 {
+        return Ok(None);
+    }
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -267,6 +282,17 @@ pub(crate) fn run_with(
         }
     }
 
+    // Emit a structured trace event so operators using RUST_LOG can see
+    // when a migration ran without spamming every fresh-install stdout.
+    if !applied.is_empty() {
+        tracing::info!(
+            from = current,
+            to = target,
+            backup = ?backup_path,
+            "migrated brain.db schema"
+        );
+    }
+
     Ok(MigrationOutcome {
         from: current,
         to: target,
@@ -305,6 +331,24 @@ mod tests {
              INSERT INTO schema_info VALUES ('kimetsu_schema_version', {version});"
         ))
         .expect("seed schema_info");
+        conn
+    }
+
+    /// Seed a file-based DB with schema_info at `version` AND one row in a
+    /// minimal `memories` table, so `durable_row_count` returns 1 and the
+    /// backup guard fires.
+    fn make_file_db_with_memory(path: &Path, version: i64) -> Connection {
+        let conn = make_file_db(path, version);
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                 memory_id TEXT PRIMARY KEY,
+                 scope TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 text TEXT NOT NULL
+             );
+             INSERT INTO memories VALUES ('test-mem-id', 'repo', 'preference', 'test memory');",
+        )
+        .expect("seed memories table");
         conn
     }
 
@@ -499,7 +543,8 @@ mod tests {
 
         let db_path = tmp_dir.join("brain.db");
         {
-            let conn = make_file_db(&db_path, 1);
+            // Seed a memories row so durable_row_count > 0 and the backup fires.
+            let conn = make_file_db_with_memory(&db_path, 1);
 
             let migs = [Migration {
                 version: 2,

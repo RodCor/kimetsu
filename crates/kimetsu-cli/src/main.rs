@@ -328,6 +328,9 @@ enum BrainCommand {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Rebuild the in-DB memory projection by replaying the event trace.
+    /// (Schema upgrades are automatic on open; this does not change the
+    /// schema version.)
     Rebuild,
     Stats,
     /// Brain health summary — memory counts, domain groups,
@@ -1731,6 +1734,7 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 /// v0.6: `kimetsu brain status` — brain health at a glance.
 fn brain_status(json: bool) -> KimetsuResult<()> {
     let cwd = env::current_dir()?;
+    let schema_ver = project::schema_version(&cwd)?;
     let memories = project::list_memories(&cwd)?;
     let proposals = project::list_proposals(
         &cwd,
@@ -1783,6 +1787,7 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": schema_ver,
                 "memories": memories.len(),
                 "pending_proposals": proposals.len(),
                 "open_conflicts": conflicts.len(),
@@ -1799,6 +1804,7 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
             proposals.len(),
             conflicts.len()
         );
+        println!("schema version: {schema_ver}");
         if !top_domains.is_empty() {
             println!("domains: {}", top_domains.join(", "));
         }

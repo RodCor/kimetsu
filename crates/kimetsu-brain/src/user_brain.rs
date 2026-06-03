@@ -452,6 +452,84 @@ mod tests {
         });
     }
 
+    // ------------------------------------------------------------------
+    // A7: user-brain v1→v2 migration — backup sidecar + data preserved
+    // ------------------------------------------------------------------
+    #[test]
+    fn migration_upgrades_user_brain_creates_backup_and_preserves_data() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-migrate");
+        with_user_brain_at(&tmp, || {
+            // (a) Create the user brain and seed a GlobalUser memory.
+            //     open_user_brain() calls schema::initialize() which runs
+            //     run_migrations, leaving the DB at v2.
+            let mem_id = {
+                let conn = open_user_brain().expect("open ok").expect("enabled");
+                add_user_memory(
+                    &conn,
+                    MemoryKind::Preference,
+                    "A7 user-brain migration test",
+                    1.0,
+                )
+                .expect("add_user_memory")
+            };
+
+            // (b) Stamp the schema_info version back to 1 to simulate a
+            //     pre-upgrade DB.  The DDL is already v2-shaped; the
+            //     migration is idempotent, so re-running is safe.
+            let db_path = tmp.join("brain.db");
+            {
+                let conn = rusqlite::Connection::open(&db_path).expect("open for stamp-down");
+                conn.execute(
+                    "UPDATE schema_info SET value = 1 WHERE key = 'kimetsu_schema_version'",
+                    [],
+                )
+                .expect("stamp version back to 1");
+                let stamped: i64 = conn
+                    .query_row(
+                        "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("read stamped version");
+                assert_eq!(stamped, 1, "version should be 1 after stamp-down");
+            }
+
+            // (c) Re-open through open_user_brain() — calls schema::initialize
+            //     → run_migrations → migrates v1→v2 with a backup.
+            let conn = open_user_brain().expect("re-open ok").expect("enabled");
+
+            // Assert 1: version is back at 2.
+            let ver =
+                crate::migrate::current_version(&conn).expect("current_version after re-open");
+            assert_eq!(ver, 2, "user brain must be at v2 after re-open");
+
+            // Assert 2: backup sidecar brain.db.bak-1-2-* exists next to brain.db.
+            let bak_files: Vec<_> = std::fs::read_dir(&tmp)
+                .expect("read tmp dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("brain.db.bak-1-2-"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert_eq!(
+                bak_files.len(),
+                1,
+                "exactly one user-brain backup sidecar brain.db.bak-1-2-* must exist; found: {:?}",
+                bak_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+            );
+
+            // Assert 3: the seeded memory survives the migration.
+            let rows = list_user_memories(&conn).expect("list_user_memories");
+            assert!(
+                rows.iter().any(|r| r.memory_id == mem_id),
+                "seeded memory must survive v1→v2 migration; mem_id={mem_id}"
+            );
+        });
+    }
+
     fn tempdir_in_test(prefix: &str) -> std::path::PathBuf {
         // Don't pull in `tempfile` — the workspace doesn't use it
         // elsewhere in this crate. Roll a small helper.

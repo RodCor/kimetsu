@@ -201,6 +201,15 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
     Ok((paths, config, conn))
 }
 
+/// Return the brain.db schema version for the project rooted at `start`.
+///
+/// Opens via `load_project` (which migrates on the way through), so by the
+/// time this returns the DB is at the current target version.
+pub fn schema_version(start: &Path) -> KimetsuResult<i64> {
+    let (_, _, conn) = load_project(start)?;
+    crate::migrate::current_version(&conn)
+}
+
 pub fn load_project_readonly(
     start: &Path,
 ) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {

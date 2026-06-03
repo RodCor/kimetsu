@@ -1510,6 +1510,7 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tracing",
  "ulid",
 ]
 
