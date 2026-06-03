@@ -36,7 +36,7 @@ kimetsu-core = { path = "../kimetsu-core", version = "0.9.0" }
 # `kimetsu_brain::redact`. The crate is already a workspace pin
 # elsewhere; we just opt this crate into it now.
 regex.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["backup"] }
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

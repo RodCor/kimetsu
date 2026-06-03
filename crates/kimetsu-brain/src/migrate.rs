@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::cmp::Reverse;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
 use rusqlite::Connection;
@@ -18,7 +20,8 @@ pub struct MigrationOutcome {
     pub from: i64,
     pub to: i64,
     pub applied: Vec<i64>,
-    /// Populated by A4 (backup-before-migrate). Always `None` until then.
+    /// Path of the pre-migration sidecar backup, when one was created.
+    /// `None` for in-memory DBs, no-op opens, and the `current > target` error path.
     pub backup_path: Option<PathBuf>,
 }
 
@@ -53,6 +56,112 @@ pub fn current_version(conn: &Connection) -> KimetsuResult<i64> {
 pub fn run_migrations(conn: &Connection) -> KimetsuResult<MigrationOutcome> {
     run_with(conn, migrations(), target_version())
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the filesystem path of `conn`'s main database file, if any.
+/// Returns `None` for in-memory (`:memory:`) and anonymous temp DBs.
+fn db_file_path(conn: &Connection) -> Option<PathBuf> {
+    match conn.path() {
+        Some(p) if !p.is_empty() && p != ":memory:" => Some(PathBuf::from(p)),
+        _ => None,
+    }
+}
+
+/// Snapshot the live DB before a version-advancing migration.  Returns the
+/// sidecar path, or `None` for an in-memory DB (nothing to back up).
+///
+/// Uses SQLite's online backup API for a consistent copy that respects WAL.
+/// The sidecar is placed next to the source DB and named:
+///   `<db-filename>.bak-<from>-<to>-<unix_secs>`
+fn backup_before_migrate(conn: &Connection, from: i64, to: i64) -> KimetsuResult<Option<PathBuf>> {
+    let db_path = match db_file_path(conn) {
+        Some(p) => p,
+        None => return Ok(None), // in-memory or anonymous temp DB — nothing to back up
+    };
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Sidecar next to the DB: brain.db.bak-<from>-<to>-<ts>
+    let file_name = format!(
+        "{}.bak-{from}-{to}-{ts}",
+        db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("brain.db")
+    );
+    let dest_path = db_path.with_file_name(file_name);
+
+    // Online backup: open dest, copy main DB into it to completion.
+    let mut dest = Connection::open(&dest_path)?;
+    let backup = rusqlite::backup::Backup::new(conn, &mut dest)?;
+    // pages_per_step must be > 0 (asserted by rusqlite); use 64.
+    // pause_between_pages = 0ms since we want a fast single-shot backup.
+    backup.run_to_completion(64, std::time::Duration::from_millis(0), None)?;
+    drop(backup);
+
+    Ok(Some(dest_path))
+}
+
+/// Keep the newest `keep` `<stem>.bak-*` sidecars next to `db_path`; delete
+/// older ones.  Sorts candidates by the trailing `<ts>` integer parsed from
+/// the filename (not mtime), which is both deterministic in tests and
+/// monotonic in production since `<ts>` is the creation unix time.
+///
+/// Best-effort: filesystem errors while pruning are swallowed (we never fail
+/// a migration over cleanup).
+fn prune_backups(db_path: &Path, keep: usize) {
+    let (Some(dir), Some(stem)) = (
+        db_path.parent(),
+        db_path.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+
+    let prefix = format!("{stem}.bak-");
+
+    let mut backups: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => return,
+    };
+
+    if backups.len() <= keep {
+        return;
+    }
+
+    // Sort newest-first by the trailing numeric `<ts>` parsed from the
+    // filename.  This is deterministic in tests and monotonic in production.
+    backups.sort_by_key(|p| {
+        Reverse(
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit('-').next())
+                .and_then(|ts| ts.parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    });
+
+    for old in backups.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core runner
+// ---------------------------------------------------------------------------
 
 /// Injectable core (test seam): apply `migs` to advance `conn` to `target`.
 ///
@@ -94,8 +203,8 @@ pub(crate) fn run_with(
         .into());
     }
 
-    // current < target
-    // A4 will insert backup_before_migrate(...) here.
+    // current < target — snapshot before we touch anything.
+    let backup_path = backup_before_migrate(conn, current, target)?;
 
     let mut applied = Vec::new();
 
@@ -128,11 +237,19 @@ pub(crate) fn run_with(
         }
     }
 
+    // Prune old backups (best-effort; swallows errors).
+    if let Some(ref bp) = backup_path {
+        if let Some(parent) = bp.parent() {
+            let db_ref = db_file_path(conn).unwrap_or_else(|| parent.join("brain.db"));
+            prune_backups(&db_ref, 3);
+        }
+    }
+
     Ok(MigrationOutcome {
         from: current,
         to: target,
         applied,
-        backup_path: None,
+        backup_path,
     })
 }
 
@@ -150,6 +267,17 @@ mod tests {
     /// against just the `schema_info` table.
     fn make_db(version: i64) -> Connection {
         let conn = Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO schema_info VALUES ('kimetsu_schema_version', {version});"
+        ))
+        .expect("seed schema_info");
+        conn
+    }
+
+    /// Seed a file-based DB at `path` with `schema_info` at `version`.
+    fn make_file_db(path: &Path, version: i64) -> Connection {
+        let conn = Connection::open(path).expect("open file db");
         conn.execute_batch(&format!(
             "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
              INSERT INTO schema_info VALUES ('kimetsu_schema_version', {version});"
@@ -190,6 +318,11 @@ mod tests {
         // rolled back together with the version bump.
         conn.execute_batch("CREATE TABLE IF NOT EXISTS partial_table (x INTEGER);")?;
         Err("intentional migration failure".into())
+    }
+
+    fn up_create_t(conn: &Connection) -> KimetsuResult<()> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS t (x INTEGER);")?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -243,6 +376,7 @@ mod tests {
         assert_eq!(outcome.from, 1);
         assert_eq!(outcome.to, 2);
         assert_eq!(outcome.applied, vec![2]);
+        // in-memory — no backup
         assert!(outcome.backup_path.is_none());
         // Version bumped in DB.
         assert_eq!(current_version(&conn).unwrap(), 2);
@@ -327,5 +461,202 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 3);
         assert!(table_exists(&conn, "m2"), "m2 should exist");
         assert!(table_exists(&conn, "m3"), "m3 should exist");
+    }
+
+    // ------------------------------------------------------------------
+    // A4-1. Backup created + stamped at pre-migration version (file DB)
+    // ------------------------------------------------------------------
+    #[test]
+    fn backup_created_for_file_db() {
+        let tmp_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("kimetsu-test-backup-{tmp_id}"));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+
+        let db_path = tmp_dir.join("brain.db");
+        {
+            let conn = make_file_db(&db_path, 1);
+
+            let migs = [Migration {
+                version: 2,
+                description: "create t",
+                up: up_create_t,
+            }];
+
+            let outcome = run_with(&conn, &migs, 2).expect("run_with");
+
+            // Backup must be Some and the file must exist on disk.
+            let bak_path = outcome
+                .backup_path
+                .expect("backup_path should be Some for file DB");
+            assert!(
+                bak_path.exists(),
+                "backup file should exist at {bak_path:?}"
+            );
+
+            // Filename must match pattern brain.db.bak-1-2-*
+            let bak_name = bak_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("backup has a filename");
+            assert!(
+                bak_name.starts_with("brain.db.bak-1-2-"),
+                "backup name should be brain.db.bak-1-2-<ts>, got: {bak_name}"
+            );
+
+            // The backup must reflect PRE-migration state (version = 1).
+            let bak_conn = Connection::open(&bak_path).expect("open backup db");
+            let bak_version: i64 = bak_conn
+                .query_row(
+                    "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("read backup version");
+            assert_eq!(
+                bak_version, 1,
+                "backup should capture pre-migration version 1"
+            );
+
+            // Live DB must now be at version 2.
+            assert_eq!(current_version(&conn).unwrap(), 2);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // A4-2. In-memory DB → no backup
+    // ------------------------------------------------------------------
+    #[test]
+    fn no_backup_for_in_memory_db() {
+        let conn = make_db(1);
+        let migs = [Migration {
+            version: 2,
+            description: "create t",
+            up: up_create_t,
+        }];
+        let outcome = run_with(&conn, &migs, 2).expect("run_with");
+        assert!(
+            outcome.backup_path.is_none(),
+            "in-memory DB must not produce a backup"
+        );
+        // Migration must still have been applied.
+        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert!(table_exists(&conn, "t"), "table t should exist");
+    }
+
+    // ------------------------------------------------------------------
+    // A4-3. No-op at target → no backup created
+    // ------------------------------------------------------------------
+    #[test]
+    fn no_backup_for_noop() {
+        let tmp_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("kimetsu-test-noop-{tmp_id}"));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+
+        let db_path = tmp_dir.join("brain.db");
+        {
+            let conn = make_file_db(&db_path, 2);
+            let outcome = run_with(&conn, &[], 2).expect("run_with");
+
+            assert!(
+                outcome.backup_path.is_none(),
+                "no-op run must not produce a backup"
+            );
+
+            // No .bak-* files should exist in the directory.
+            let bak_files: Vec<_> = std::fs::read_dir(&tmp_dir)
+                .expect("read_dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.contains(".bak-"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                bak_files.is_empty(),
+                "no backup files should exist after no-op, found: {bak_files:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // A4-4. Retention keep-3: prune_backups removes oldest, keeps 3 newest
+    // ------------------------------------------------------------------
+    #[test]
+    fn retention_keep_3() {
+        let tmp_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("kimetsu-test-retention-{tmp_id}"));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+
+        // Create 4 fake sidecar files with distinct trailing timestamps.
+        // prune_backups sorts by the trailing <ts> integer, so the timestamps
+        // in the filenames drive the ordering — mtime is irrelevant.
+        let sidecar_names = [
+            "brain.db.bak-1-2-1000",
+            "brain.db.bak-1-2-2000",
+            "brain.db.bak-1-2-3000",
+            "brain.db.bak-1-2-4000",
+        ];
+        for name in &sidecar_names {
+            let p = tmp_dir.join(name);
+            std::fs::write(&p, b"fake backup").expect("write fake sidecar");
+        }
+
+        let db_path = tmp_dir.join("brain.db");
+        prune_backups(&db_path, 3);
+
+        // Count surviving .bak-* files.
+        let remaining: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("brain.db.bak-"))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.file_name().to_str().unwrap_or("").to_owned())
+            .collect();
+
+        assert_eq!(
+            remaining.len(),
+            3,
+            "exactly 3 backups should remain after pruning, found: {remaining:?}"
+        );
+
+        // The oldest one (ts=1000) must have been deleted.
+        assert!(
+            !tmp_dir.join("brain.db.bak-1-2-1000").exists(),
+            "oldest backup (ts=1000) should have been pruned"
+        );
+        // The 3 newest must survive.
+        assert!(
+            tmp_dir.join("brain.db.bak-1-2-2000").exists(),
+            "backup ts=2000 should survive"
+        );
+        assert!(
+            tmp_dir.join("brain.db.bak-1-2-3000").exists(),
+            "backup ts=3000 should survive"
+        );
+        assert!(
+            tmp_dir.join("brain.db.bak-1-2-4000").exists(),
+            "backup ts=4000 should survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
