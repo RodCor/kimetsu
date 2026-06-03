@@ -256,25 +256,6 @@ pub fn resolve_distiller(workspace: &Path) -> Option<ResolvedDistiller> {
     resolve_distiller_with(workspace, global_dir)
 }
 
-/// True when a global distiller (`~/.kimetsu/project.toml`) is enabled. Used by
-/// the Stop hook to suppress its end-of-session cue (the distiller owns it).
-pub fn global_distiller_enabled() -> bool {
-    let dir = if user_brain_enabled() {
-        user_kimetsu_dir()
-    } else {
-        None
-    };
-    global_distiller_enabled_in(dir)
-}
-
-fn global_distiller_enabled_in(global_dir: Option<std::path::PathBuf>) -> bool {
-    global_dir
-        .and_then(|dir| std::fs::read_to_string(dir.join("project.toml")).ok())
-        .and_then(|text| ProjectConfig::from_toml(&text).ok())
-        .map(|c| c.learning.distiller.enabled)
-        .unwrap_or(false)
-}
-
 /// Testable core: `global_dir` is injected (the `~/.kimetsu` dir, or `None`).
 fn resolve_distiller_with(
     workspace: &Path,
@@ -534,22 +515,6 @@ mod tests {
         config.learning.distiller.base_url_env = "ANTHROPIC_BASE_URL".to_string();
         let toml = config.to_toml().unwrap();
         std::fs::write(dir.join("project.toml"), toml).unwrap();
-    }
-
-    #[test]
-    fn global_distiller_enabled_reads_global_toml() {
-        let gdir = std::env::temp_dir().join(format!(
-            "km_gde_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        write_distiller_toml(&gdir, true, "claude-haiku-4-5");
-        assert!(global_distiller_enabled_in(Some(gdir.clone())));
-
-        write_distiller_toml(&gdir, false, "claude-haiku-4-5");
-        assert!(!global_distiller_enabled_in(Some(gdir.clone())));
-
-        assert!(!global_distiller_enabled_in(None));
-        std::fs::remove_dir_all(gdir).ok();
     }
 
     #[test]
