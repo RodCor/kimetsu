@@ -17,6 +17,11 @@ pub struct ProjectConfig {
     /// default; see `kimetsu_brain::embeddings::resolve_embedder_id`.
     #[serde(default)]
     pub embedder: EmbedderSection,
+    /// v0.8.5: automatic memory harvesting. `#[serde(default)]` keeps
+    /// pre-v0.8.5 project.toml files loading cleanly (they get
+    /// auto-harvest on).
+    #[serde(default)]
+    pub learning: LearningSection,
 }
 
 impl ProjectConfig {
@@ -32,6 +37,7 @@ impl ProjectConfig {
             ingestion: IngestionSection::default(),
             run: RunSection::default(),
             embedder: EmbedderSection::default(),
+            learning: LearningSection::default(),
         }
     }
 
@@ -69,6 +75,78 @@ impl Default for EmbedderSection {
     fn default() -> Self {
         Self {
             model: default_embedder_id(),
+        }
+    }
+}
+
+/// v0.8.5: automatic memory harvesting. When `auto_harvest` is on, the
+/// proactive PostToolUse hook and the Stop hook emit a `[kimetsu-harvest]`
+/// cue at high-signal moments (a failed-then-fixed command, or a
+/// non-trivial session that recorded nothing) telling the agent to
+/// dispatch the `kimetsu-memory-harvester` subagent. Set it false to
+/// silence those cues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningSection {
+    #[serde(default = "default_auto_harvest")]
+    pub auto_harvest: bool,
+    /// Opt-in credentialed SessionEnd distiller (configured by the install
+    /// wizard). Disabled by default; `#[serde(default)]` keeps older
+    /// project.toml files loading.
+    #[serde(default)]
+    pub distiller: DistillerSection,
+}
+
+fn default_auto_harvest() -> bool {
+    true
+}
+
+impl Default for LearningSection {
+    fn default() -> Self {
+        Self {
+            auto_harvest: default_auto_harvest(),
+            distiller: DistillerSection::default(),
+        }
+    }
+}
+
+/// Credentialed SessionEnd distiller config. Secret values (the API key,
+/// optional base URL) live in `.env` under the env-var names below; only
+/// non-secret selection lives here. `provider` is `anthropic` or `openai`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillerSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_distiller_provider")]
+    pub provider: String,
+    #[serde(default = "default_distiller_model")]
+    pub model: String,
+    #[serde(default = "default_distiller_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_distiller_base_url_env")]
+    pub base_url_env: String,
+}
+
+fn default_distiller_provider() -> String {
+    "anthropic".to_string()
+}
+fn default_distiller_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+fn default_distiller_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+fn default_distiller_base_url_env() -> String {
+    "ANTHROPIC_BASE_URL".to_string()
+}
+
+impl Default for DistillerSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_distiller_provider(),
+            model: default_distiller_model(),
+            api_key_env: default_distiller_api_key_env(),
+            base_url_env: default_distiller_base_url_env(),
         }
     }
 }
@@ -291,6 +369,16 @@ max_total_cost_usd = 250.0
 "#;
         let config = ProjectConfig::from_toml(toml).expect("pre-v0.8 toml must load");
         assert_eq!(config.embedder.model, "bge-small-en-v1.5");
+        // A pre-v0.8.5 toml has no [learning] section — auto-harvest
+        // defaults on so existing installs gain the behavior on upgrade.
+        assert!(config.learning.auto_harvest);
+        // A pre-distiller toml has no [learning.distiller] — defaults to off,
+        // anthropic, claude-haiku-4-5.
+        assert!(!config.learning.distiller.enabled);
+        assert_eq!(config.learning.distiller.provider, "anthropic");
+        assert_eq!(config.learning.distiller.model, "claude-haiku-4-5");
+        assert_eq!(config.learning.distiller.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(config.learning.distiller.base_url_env, "ANTHROPIC_BASE_URL");
     }
 
     /// `model set` writes the whole config back via `to_toml`; a

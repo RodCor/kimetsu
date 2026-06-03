@@ -207,7 +207,8 @@ Optional mode:
 - Kimetsu brain is the preferred first step for non-trivial work.
 - If native MCP tools are unavailable and the task is small, note that Kimetsu brain context was unavailable and continue.
 - For broad work, fix the plugin/MCP setup first so `kimetsu_brain_context` is available.
-- Installed Codex hooks use `.codex/hooks.json` and the `UserPromptSubmit` event to run `kimetsu brain context-hook --workspace .`. Optional mode does not block when Kimetsu returns no relevant context.
+- Installed Codex hooks use `.codex/hooks.json`: `UserPromptSubmit` runs `kimetsu brain context-hook --workspace .`, `Stop` runs `kimetsu brain stop-hook --workspace . --distill-on-stop`, and proactive hooks wrap Bash tool calls. Optional mode does not block when Kimetsu returns no relevant context.
+- The installer also writes `.codex/agents/kimetsu-memory-harvester.toml`. When a `[kimetsu-harvest]` cue appears and no credentialed distiller is configured, spawn that custom agent in the background to record any durable lesson.
 
 Kimetsu brain tools retrieve and manage durable context. Kimetsu bridge tools discover and install reusable capabilities. Continue the actual task with the host harness's normal file, shell, edit, and verification tools.
 "#;
@@ -232,9 +233,39 @@ Required mode:
 - Treat missing Kimetsu MCP access as a setup blocker for non-trivial tasks.
 - Continue without Kimetsu only when the user explicitly waives it or the task is trivial.
 - State whether `kimetsu_benchmark_context` or `kimetsu_brain_context` was called and how many capsules were returned when reporting benchmark or audit results.
-- Installed Codex hooks use `.codex/hooks.json` and the `UserPromptSubmit` event to run `kimetsu brain context-hook --workspace .`; benchmark wrappers should inspect MCP transcripts for required Kimetsu usage.
+- Installed Codex hooks use `.codex/hooks.json`: `UserPromptSubmit` runs `kimetsu brain context-hook --workspace .`, `Stop` runs `kimetsu brain stop-hook --workspace . --distill-on-stop`, and proactive hooks wrap Bash tool calls; benchmark wrappers should inspect MCP transcripts for required Kimetsu usage.
+- The installer also writes `.codex/agents/kimetsu-memory-harvester.toml`. When a `[kimetsu-harvest]` cue appears and no credentialed distiller is configured, spawn that custom agent in the background to record any durable lesson.
 
 Kimetsu brain tools retrieve and manage durable context. Kimetsu bridge tools discover and install reusable capabilities. Continue the actual task with the host harness's normal file, shell, edit, and verification tools after loading Kimetsu context.
+"#;
+
+/// Codex custom agent installed at `.codex/agents/kimetsu-memory-harvester.toml`.
+/// It mirrors the Claude Code harvester agent but uses Codex's standalone TOML
+/// custom-agent schema.
+const CODEX_MEMORY_HARVESTER_AGENT: &str = r#"name = "kimetsu-memory-harvester"
+description = "Distills durable, generalizable lessons from the recent session and records them to the Kimetsu brain. Spawn in the background when a [kimetsu-harvest] hook cue appears, or after solving a non-obvious problem."
+model = "gpt-5.3-codex-spark"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+developer_instructions = """
+You are Kimetsu's memory harvester. Given the recent conversation/session context, extract durable lessons worth remembering across future sessions and record them.
+
+What qualifies:
+- A non-obvious fix for a command/tool that failed and was then resolved; capture the root cause and fix, generalized beyond one repo path.
+- A convention, gotcha, or environment quirk that cost real effort to discover.
+- A reusable approach or anti-pattern confirmed by the outcome.
+
+What does not qualify:
+- Trivial or well-known facts, one-liners, restatements of docs.
+- Anything specific to a single throwaway value with no general lesson.
+
+How to record:
+- For each qualifying lesson, at most 3, call kimetsu_brain_record with a concrete actionable lesson, 2-5 domain tags, an optional one-line context, and confidence in [0,1].
+- Use kind = "anti_pattern" for things to avoid, "convention" for project norms, otherwise the default.
+- If nothing qualifies, do nothing and finish.
+
+Constraints: do not modify files, run shell commands, or take any action other than calling Kimetsu brain MCP tools. Quality over quantity.
+"""
 "#;
 
 pub fn bridge_scan(workspace: &Path, config: &SkillConfig) -> Result<BridgeScan, String> {
@@ -407,7 +438,7 @@ fn plugin_install_inner(
     target: BridgeTarget,
     scope: InstallScope,
     mode: PluginMode,
-    force: bool,
+    _force: bool,
     proactive: bool,
     home: Option<&Path>,
 ) -> Result<PluginInstallReport, String> {
@@ -453,7 +484,15 @@ fn plugin_install_inner(
                 true,
             )?;
             files.push(normalize_path(&delegate));
-            write_claude_settings(&claude_dir, force, proactive, &mut files)?;
+            // v0.8.5: the memory-harvester subagent the hooks cue the
+            // agent to dispatch (a cheap background Haiku distiller).
+            let agents = claude_dir.join("agents");
+            fs::create_dir_all(&agents)
+                .map_err(|err| format!("create {}: {err}", agents.display()))?;
+            let harvester = agents.join("kimetsu-memory-harvester.md");
+            write_text_file(&harvester, CLAUDE_MEMORY_HARVESTER_AGENT, true)?;
+            files.push(normalize_path(&harvester));
+            write_claude_settings(&claude_dir, proactive, &mut files)?;
         }
         BridgeTarget::Codex => {
             let codex_dir = match home {
@@ -477,6 +516,12 @@ fn plugin_install_inner(
                 true,
             )?;
             files.push(normalize_path(&skill));
+            let agents = codex_dir.join("agents");
+            fs::create_dir_all(&agents)
+                .map_err(|err| format!("create {}: {err}", agents.display()))?;
+            let harvester = agents.join("kimetsu-memory-harvester.toml");
+            write_text_file(&harvester, CODEX_MEMORY_HARVESTER_AGENT, true)?;
+            files.push(normalize_path(&harvester));
             write_codex_hooks(&codex_dir, proactive, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
@@ -540,7 +585,7 @@ fn upsert_kimetsu_hook(
     }
 }
 
-/// Merge Kimetsu's `UserPromptSubmit` hook (plus the v0.8 proactive
+/// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks (plus the v0.8 proactive
 /// `PreToolUse`/`PostToolUse` Bash hooks when `proactive`) into
 /// `.codex/hooks.json`, preserving any other hooks the user has — even on
 /// the same events. Idempotent: re-running never duplicates.
@@ -550,6 +595,15 @@ fn upsert_kimetsu_hook(
 /// `PreToolUse`/`PostToolUse` hooks use a `Bash` matcher so they fire only
 /// around shell invocations; they surface a memory check without blocking the
 /// tool call.
+///
+/// Strip a leading UTF-8 BOM so `serde_json`/`toml` (which reject it) can parse
+/// config files written by BOM-emitting editors (e.g. older Windows Notepad) —
+/// otherwise an existing `settings.json` saved with a BOM fails install with
+/// "expected value at line 1 column 1".
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 fn write_codex_hooks(
     codex_dir: &Path,
     proactive: bool,
@@ -559,7 +613,7 @@ fn write_codex_hooks(
     let mut root = if hooks.is_file() {
         let text =
             fs::read_to_string(&hooks).map_err(|err| format!("read {}: {err}", hooks.display()))?;
-        serde_json::from_str::<serde_json::Value>(&text)
+        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", hooks.display()))?
     } else {
         serde_json::json!({})
@@ -584,6 +638,19 @@ fn write_codex_hooks(
                 "command": "kimetsu brain context-hook --workspace .",
                 "statusMessage": "Loading Kimetsu brain context",
                 "timeout": 30
+            }]
+        }),
+    );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "Stop",
+        serde_json::json!({
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "kimetsu brain stop-hook --workspace . --distill-on-stop",
+                "statusMessage": "Checking Kimetsu memory capture",
+                "timeout": 180
             }]
         }),
     );
@@ -694,7 +761,7 @@ fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        serde_json::from_str::<serde_json::Value>(&text)
+        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", path.display()))?
     } else {
         serde_json::json!({})
@@ -719,7 +786,7 @@ fn write_codex_config(path: &Path) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        toml::from_str::<toml::Value>(&text)
+        toml::from_str::<toml::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", path.display()))?
     } else {
         toml::Value::Table(toml::map::Map::new())
@@ -768,26 +835,123 @@ You have a persistent memory brain attached via MCP (tools prefixed `mcp__kimets
 
 Do not call either tool on simple/one-liner tasks. The brain is for things that required real
 effort or that you would want to remember next session.
+
+## Auto-harvesting memories
+
+A Kimetsu hook may emit a `[kimetsu-harvest]` cue (after you fix a previously
+failing command, or at the end of a non-trivial session that recorded nothing).
+When you see one, dispatch the `kimetsu-memory-harvester` subagent **in the
+background** (the Task/Agent tool with `run_in_background: true`) so it distills
+and records any durable lesson without blocking your work. It runs on a small,
+cheap model and records nothing when there's nothing worth saving.
+"#;
+
+const CLAUDE_MD_BEGIN: &str = "<!-- kimetsu:begin -->";
+const CLAUDE_MD_END: &str = "<!-- kimetsu:end -->";
+
+/// Merge Kimetsu's guidance block into a `CLAUDE.md` without ever clobbering
+/// the user's content. The guidance is wrapped in HTML-comment markers so it
+/// can be found and updated idempotently:
+///   * missing file   -> write the block
+///   * markers absent  -> append the block after the user's content
+///   * markers present -> replace just the marked region (upgrade in place)
+/// Used for both the workspace `.claude/CLAUDE.md` and the global
+/// `~/.claude/CLAUDE.md`.
+fn merge_claude_md(path: &Path) -> Result<(), String> {
+    let block = format!("{CLAUDE_MD_BEGIN}\n{CLAUDE_MD_CONTENT}{CLAUDE_MD_END}\n");
+    let raw = if path.is_file() {
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?
+    } else {
+        String::new()
+    };
+    let existing = strip_bom(&raw);
+    let merged = match (existing.find(CLAUDE_MD_BEGIN), existing.find(CLAUDE_MD_END)) {
+        (Some(start), Some(end_start)) if end_start >= start => {
+            let end = end_start + CLAUDE_MD_END.len();
+            let after = existing[end..]
+                .strip_prefix('\n')
+                .unwrap_or(&existing[end..]);
+            format!("{}{block}{after}", &existing[..start])
+        }
+        (Some(start), _) => {
+            // BEGIN present but END missing/malformed: the marked region is corrupt.
+            // Replace everything from BEGIN onward with a single fresh block rather
+            // than appending a duplicate.
+            let before = existing[..start].trim_end_matches('\n');
+            if before.is_empty() {
+                block
+            } else {
+                format!("{before}\n\n{block}")
+            }
+        }
+        _ => {
+            let mut out = existing.to_string();
+            if !out.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n'); // blank line separating user content from our block
+            }
+            out.push_str(&block);
+            out
+        }
+    };
+    write_text_file(path, &merged, true)
+}
+
+/// v0.8.5: the memory-harvester subagent installed at
+/// `.claude/agents/kimetsu-memory-harvester.md`. A cheap, background
+/// Haiku distiller the hooks cue the main agent to dispatch — it reads
+/// the recent context, distills 0-3 generalizable lessons (favoring
+/// hard-won fixes / resolved tool failures), and records each through
+/// the confidence-gated `kimetsu_brain_record` MCP tool.
+const CLAUDE_MEMORY_HARVESTER_AGENT: &str = r#"---
+name: kimetsu-memory-harvester
+description: Distills durable, generalizable lessons from the recent session and records them to the Kimetsu brain. Dispatch in the background when a [kimetsu-harvest] hook cue appears, or after solving a non-obvious problem.
+model: haiku
+tools: mcp__kimetsu__kimetsu_brain_record, mcp__kimetsu__kimetsu_brain_context
+---
+
+You are Kimetsu's memory harvester. Given the recent conversation/session context,
+extract durable lessons worth remembering across future sessions and record them.
+
+What qualifies (record these):
+- A non-obvious fix for a command/tool that failed and was then resolved — capture
+  the root cause and the fix, generalized beyond this one repo path.
+- A convention, gotcha, or environment quirk that cost real effort to discover.
+- A reusable approach or anti-pattern confirmed by the outcome.
+
+What does NOT qualify (record nothing):
+- Trivial or well-known facts, one-liners, restatements of docs.
+- Anything specific to a single throwaway value with no general lesson.
+
+How to record:
+- For each qualifying lesson (at most 3), call `kimetsu_brain_record` with a
+  concrete, actionable `lesson`, 2-5 domain `tags`, an optional one-line
+  `context`, and a `confidence` in [0,1] (0.8 when you're sure it generalizes,
+  lower when unsure — low-confidence lessons become proposals for review).
+- Use `kind: "anti_pattern"` for things to avoid, `"convention"` for project
+  norms, otherwise the default.
+- If nothing qualifies, do nothing and finish. Quality over quantity.
+
+Constraints: do NOT modify files, run commands, or take any action other than
+calling the brain tools. Be terse. One brain call per distinct lesson.
 "#;
 
 /// Write the Claude Code surface that lives under `.claude/`: the brain
 /// `CLAUDE.md` guidance and the `settings.json` hook registration.
 fn write_claude_settings(
     claude_dir: &Path,
-    force: bool,
     proactive: bool,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     fs::create_dir_all(claude_dir)
         .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
 
-    // CLAUDE.md: seed when missing. If it already exists we leave it alone
-    // unless `force` is set — overwriting an existing CLAUDE.md is the one
-    // thing `--force` still does. Without force, user edits are never clobbered.
+    // CLAUDE.md: merge our guidance into whatever is there (or create it),
+    // never overwriting the user's content. See `merge_claude_md`.
     let claude_md = claude_dir.join("CLAUDE.md");
-    if !claude_md.is_file() || force {
-        write_text_file(&claude_md, CLAUDE_MD_CONTENT, true)?;
-    }
+    merge_claude_md(&claude_md)?;
     files.push(normalize_path(&claude_md));
 
     let settings = claude_dir.join("settings.json");
@@ -804,7 +968,7 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        serde_json::from_str::<serde_json::Value>(&text)
+        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
             .map_err(|err| format!("parse {}: {err}", path.display()))?
     } else {
         serde_json::json!({})
@@ -833,6 +997,14 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
         serde_json::json!({
             "matcher": "",
             "hooks": [{ "type": "command", "command": "kimetsu brain stop-hook" }]
+        }),
+    );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "SessionEnd",
+        serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain session-end-hook" }]
         }),
     );
     if proactive {
@@ -1087,6 +1259,11 @@ mod tests {
         assert!(optional_text.contains("kimetsu_benchmark_context"));
         assert!(optional_text.contains("kimetsu_benchmark_record_outcome"));
         assert!(!optional_text.contains("kimetsu_harbor"));
+        let codex_harvester = root.join(".codex/agents/kimetsu-memory-harvester.toml");
+        let harvester_text = fs::read_to_string(&codex_harvester).expect("codex harvester");
+        let _: toml::Value = toml::from_str(&harvester_text).expect("harvester toml");
+        assert!(harvester_text.contains("name = \"kimetsu-memory-harvester\""));
+        assert!(harvester_text.contains("kimetsu_brain_record"));
         let codex_config = root.join(".codex/config.toml");
         let config_text = fs::read_to_string(&codex_config).expect("codex config");
         assert!(config_text.contains("[mcp_servers.kimetsu]"));
@@ -1099,6 +1276,10 @@ mod tests {
         assert_eq!(
             hooks_json["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
             Some("kimetsu brain context-hook --workspace .")
+        );
+        assert_eq!(
+            hooks_json["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("kimetsu brain stop-hook --workspace . --distill-on-stop")
         );
         // v0.8: proactive on by default wires the Bash PreToolUse/PostToolUse hooks.
         assert_eq!(
@@ -1153,11 +1334,45 @@ mod tests {
         let hooks_text = fs::read_to_string(root.join(".codex/hooks.json")).expect("codex hooks");
         let hooks_json: serde_json::Value = serde_json::from_str(&hooks_text).expect("hooks json");
         assert!(hooks_json["hooks"]["UserPromptSubmit"].is_array());
+        assert_eq!(
+            hooks_json["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("kimetsu brain stop-hook --workspace . --distill-on-stop")
+        );
         assert!(
             hooks_json["hooks"]["PreToolUse"].is_null(),
             "proactive disabled must not write PreToolUse"
         );
         assert!(hooks_json["hooks"]["PostToolUse"].is_null());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_hooks_merge_tolerates_utf8_bom() {
+        // A settings.json saved by a BOM-emitting editor (older Notepad)
+        // must still parse + merge, not fail with "expected value at line 1".
+        let root = temp_root("claude_hooks_bom");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let body = serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "matcher": "", "hooks": [{ "type": "command", "command": "user-hook" }] }
+                ]
+            }
+        }))
+        .unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, format!("\u{feff}{body}")).unwrap(); // leading BOM
+
+        write_claude_hooks(&settings, true).expect("BOM settings.json must merge");
+
+        let value: serde_json::Value =
+            serde_json::from_str(strip_bom(&fs::read_to_string(&settings).unwrap()))
+                .expect("output parses");
+        let ups = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "user hook kept + kimetsu appended");
+        assert_eq!(ups[0]["hooks"][0]["command"], "user-hook");
+
         fs::remove_dir_all(root).ok();
     }
 
@@ -1246,6 +1461,10 @@ mod tests {
         assert_eq!(
             ups[1]["hooks"][0]["command"],
             "kimetsu brain context-hook --workspace ."
+        );
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "kimetsu brain stop-hook --workspace . --distill-on-stop"
         );
         assert_eq!(
             value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -1346,6 +1565,10 @@ mod tests {
         assert!(home.join(".claude/settings.json").is_file());
         assert!(home.join(".claude/CLAUDE.md").is_file());
         assert!(home.join(".claude/commands/kimetsu/bridge.md").is_file());
+        assert!(
+            home.join(".claude/agents/kimetsu-memory-harvester.md")
+                .is_file()
+        );
         assert!(home.join(".claude.json").is_file());
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
@@ -1367,10 +1590,163 @@ mod tests {
         .unwrap();
         assert!(home.join(".codex/config.toml").is_file());
         assert!(home.join(".codex/hooks.json").is_file());
+        assert!(
+            home.join(".codex/agents/kimetsu-memory-harvester.toml")
+                .is_file()
+        );
         assert!(!ws.join(".codex").exists());
 
         fs::remove_dir_all(ws).ok();
         fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn claude_hooks_install_session_end() {
+        let root = temp_root("claude_session_end");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        write_claude_hooks(&settings, true).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(strip_bom(&fs::read_to_string(&settings).unwrap())).unwrap();
+        assert_eq!(
+            value["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "kimetsu brain session-end-hook"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_fresh_file() {
+        let root = temp_root("claude_md_fresh");
+        let p = root.join("CLAUDE.md");
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains(CLAUDE_MD_BEGIN));
+        assert!(text.contains("# Kimetsu brain"));
+        assert!(text.contains(CLAUDE_MD_END));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_preserves_user_content() {
+        let root = temp_root("claude_md_preserve");
+        let p = root.join("CLAUDE.md");
+        fs::write(&p, "# My rules\nAlways use tabs.\n").unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# My rules"));
+        assert!(text.contains("Always use tabs."));
+        assert!(text.contains("# Kimetsu brain"));
+        assert!(
+            text.find("My rules").unwrap() < text.find(CLAUDE_MD_BEGIN).unwrap(),
+            "user content precedes the kimetsu block"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_idempotent() {
+        let root = temp_root("claude_md_idem");
+        let p = root.join("CLAUDE.md");
+        fs::write(&p, "# Mine\n").unwrap();
+        merge_claude_md(&p).unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            text.matches(CLAUDE_MD_BEGIN).count(),
+            1,
+            "no duplicate block"
+        );
+        assert_eq!(text.matches(CLAUDE_MD_END).count(), 1);
+        assert!(text.contains("# Mine"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_upgrades_in_place() {
+        let root = temp_root("claude_md_upgrade");
+        let p = root.join("CLAUDE.md");
+        fs::write(
+            &p,
+            format!("# Top\n\n{CLAUDE_MD_BEGIN}\nOLD STALE\n{CLAUDE_MD_END}\n\n# Bottom\n"),
+        )
+        .unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("OLD STALE"), "stale block replaced");
+        assert!(text.contains("# Kimetsu brain"));
+        assert!(text.contains("# Top"));
+        assert!(text.contains("# Bottom"));
+        assert_eq!(text.matches(CLAUDE_MD_BEGIN).count(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_tolerates_bom() {
+        let root = temp_root("claude_md_bom");
+        let p = root.join("CLAUDE.md");
+        fs::write(&p, format!("\u{feff}# My rules\n")).unwrap();
+        merge_claude_md(&p).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# My rules"));
+        assert!(text.contains("# Kimetsu brain"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn merge_claude_md_repairs_begin_without_end() {
+        let root = temp_root("claude-md-repair");
+        let path = root.join("CLAUDE.md");
+        // user content + a corrupt half-block: BEGIN but no END
+        let corrupt =
+            format!("# My rules\n\nKeep it tidy.\n\n{CLAUDE_MD_BEGIN}\nstale half-block\n");
+        write_text_file(&path, &corrupt, true).unwrap();
+
+        merge_claude_md(&path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        // user content preserved
+        assert!(out.contains("# My rules"));
+        assert!(out.contains("Keep it tidy."));
+        // exactly one BEGIN and one END now (the corrupt region was replaced, not duplicated)
+        assert_eq!(out.matches(CLAUDE_MD_BEGIN).count(), 1);
+        assert_eq!(out.matches(CLAUDE_MD_END).count(), 1);
+        // the stale text is gone and our real guidance is present
+        assert!(!out.contains("stale half-block"));
+        assert!(out.contains("Kimetsu brain"));
+        // idempotent: a second merge keeps exactly one block
+        merge_claude_md(&path).unwrap();
+        let out2 = fs::read_to_string(&path).unwrap();
+        assert_eq!(out2.matches(CLAUDE_MD_BEGIN).count(), 1);
+        assert_eq!(out2.matches(CLAUDE_MD_END).count(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn install_preserves_existing_user_claude_md() {
+        let root = temp_root("install_claude_md");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("CLAUDE.md"),
+            "# Personal global instructions\nDo X.\n",
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        write_claude_settings(&claude, false, &mut files).unwrap();
+
+        let text = fs::read_to_string(claude.join("CLAUDE.md")).unwrap();
+        assert!(
+            text.contains("# Personal global instructions"),
+            "user content kept"
+        );
+        assert!(text.contains("Do X."));
+        assert!(text.contains("# Kimetsu brain"), "kimetsu block appended");
+        assert!(text.contains(CLAUDE_MD_BEGIN));
+        fs::remove_dir_all(root).ok();
     }
 
     fn temp_root(label: &str) -> PathBuf {

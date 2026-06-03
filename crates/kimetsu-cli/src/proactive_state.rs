@@ -31,6 +31,11 @@ use serde::{Deserialize, Serialize};
 /// Repeated (command, error) observations before loop mode kicks in.
 pub const LOOP_THRESHOLD: u32 = 3;
 
+/// v0.8.5: minimum gap between `[kimetsu-harvest]` cues in one session.
+/// A single fix shouldn't fire repeatedly, and the end-of-session cue
+/// shares this throttle so the agent is nudged at most a couple of times.
+pub const HARVEST_REFRACTORY_SECS: u64 = 600;
+
 const MAX_RECENT_COMMANDS: usize = 12;
 const SESSION_GC_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -42,6 +47,12 @@ pub struct SessionState {
     pub last_injection_unix: u64,
     #[serde(default)]
     pub recent_commands: Vec<CmdSeen>,
+    /// v0.8.5: unix time of the last `[kimetsu-harvest]` cue this
+    /// session. Throttles how often we nudge the agent to dispatch the
+    /// memory-harvester subagent (a failed-then-fixed command, or a
+    /// non-trivial session that recorded nothing). `0` = never cued.
+    #[serde(default)]
+    pub harvest_cued_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +213,39 @@ impl SessionState {
         self.last_injection_unix = now;
     }
 
+    /// v0.8.5: True when `norm` was seen failing earlier this session
+    /// (any tracked observation of it carries an error signature). Used
+    /// by the PostToolUse hook to detect "a previously-failing command
+    /// just succeeded" — a high-signal learnable moment.
+    pub fn had_prior_failure(&self, norm: &str) -> bool {
+        self.recent_commands
+            .iter()
+            .any(|c| c.norm == norm && c.error_sig.is_some())
+    }
+
+    /// v0.8.5: Drop the failure observations for `norm` (call after a
+    /// resolution cue so the same fix isn't re-harvested if the command
+    /// is run again).
+    pub fn clear_failure(&mut self, norm: &str) {
+        self.recent_commands
+            .retain(|c| !(c.norm == norm && c.error_sig.is_some()));
+    }
+
+    /// v0.8.5: True when a harvest cue fired within `secs` of `now`.
+    pub fn harvest_in_refractory(&self, now: u64, secs: u64) -> bool {
+        self.harvest_cued_unix > 0 && now.saturating_sub(self.harvest_cued_unix) < secs
+    }
+
+    /// v0.8.5: True when a harvest cue has fired at all this session.
+    /// The end-of-session (Stop) cue uses this to fire at most once.
+    pub fn harvest_cued(&self) -> bool {
+        self.harvest_cued_unix > 0
+    }
+
+    pub fn note_harvest_cue(&mut self, now: u64) {
+        self.harvest_cued_unix = now;
+    }
+
     /// Record an observation of `norm`/`error_sig` and return the new
     /// running count for that pair. Keeps a bounded ring buffer so the
     /// state file stays tiny.
@@ -289,6 +333,34 @@ mod tests {
         assert!(!p.to_string_lossy().contains(".."));
         let none = session_path(dir, None);
         assert!(none.to_string_lossy().contains("_no_session"));
+    }
+
+    #[test]
+    fn failure_then_resolution_is_detectable() {
+        let mut s = SessionState::default();
+        let norm = normalize_command("cargo build");
+        assert!(!s.had_prior_failure(&norm));
+        // A failing observation carries an error signature.
+        s.note_command(&norm, Some("error: linker"), 1);
+        assert!(s.had_prior_failure(&norm));
+        // After we cue a harvest for the resolution, clearing the
+        // failure stops it from re-firing on a later success.
+        s.clear_failure(&norm);
+        assert!(!s.had_prior_failure(&norm));
+        // A clean (no-error) observation never marks a failure.
+        s.note_command(&norm, None, 2);
+        assert!(!s.had_prior_failure(&norm));
+    }
+
+    #[test]
+    fn harvest_cue_throttle() {
+        let mut s = SessionState::default();
+        assert!(!s.harvest_cued());
+        assert!(!s.harvest_in_refractory(100, HARVEST_REFRACTORY_SECS));
+        s.note_harvest_cue(100);
+        assert!(s.harvest_cued());
+        assert!(s.harvest_in_refractory(150, HARVEST_REFRACTORY_SECS));
+        assert!(!s.harvest_in_refractory(100 + HARVEST_REFRACTORY_SECS, HARVEST_REFRACTORY_SECS));
     }
 
     #[test]

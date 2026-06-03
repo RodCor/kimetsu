@@ -4,6 +4,7 @@ pub mod bench;
 pub mod claude_code;
 pub mod harness;
 pub mod model;
+pub mod openai;
 pub mod pipeline;
 pub mod swe_bench;
 pub mod tools;

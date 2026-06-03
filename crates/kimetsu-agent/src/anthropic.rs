@@ -26,6 +26,10 @@ pub struct AnthropicProvider {
     // injection below.
     api_key: SecretString,
     model: String,
+    /// When set, requests POST to `<base_url>/v1/messages` (Anthropic-
+    /// compatible endpoints such as a LiteLLM proxy). When `None`, the
+    /// default Anthropic API URL is used.
+    base_url: Option<String>,
 }
 
 impl AnthropicProvider {
@@ -58,20 +62,52 @@ impl AnthropicProvider {
             client,
             api_key: SecretString::new(api_key),
             model: config.model.model.clone(),
+            base_url: None,
         }))
     }
 
     pub fn model_name(&self) -> &str {
         &self.model
     }
+
+    /// Build a provider directly from resolved values — used by the
+    /// SessionEnd distiller, which controls model/key/base independent of
+    /// the project's `[model]` section. `base_url` is normalized: empty/
+    /// whitespace becomes `None`.
+    pub fn for_distiller(
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        timeout_secs: u64,
+    ) -> KimetsuResult<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()?;
+        Ok(Self {
+            client,
+            api_key: SecretString::new(api_key.into()),
+            model: model.into(),
+            base_url: base_url.filter(|value| !value.trim().is_empty()),
+        })
+    }
+}
+
+/// Resolve the messages endpoint: `<base>/v1/messages` when a base URL is
+/// configured, else the default Anthropic API URL.
+fn messages_url(base_url: &Option<String>) -> String {
+    match base_url {
+        Some(base) => format!("{}/v1/messages", base.trim_end_matches('/')),
+        None => MESSAGES_URL.to_string(),
+    }
 }
 
 impl ModelProvider for AnthropicProvider {
     fn complete(&mut self, request: ModelRequest) -> KimetsuResult<ModelResponse> {
         let body = build_request_body(&self.model, &request);
+        let url = messages_url(&self.base_url);
         let response = self
             .client
-            .post(MESSAGES_URL)
+            .post(&url)
             // v0.4.9: explicit cleartext leak point for the HTTP
             // header. The reqwest client never logs header values
             // by default; if a future caller adds request logging
@@ -313,6 +349,7 @@ mod tests {
             client: Client::new(),
             api_key: SecretString::new(token),
             model: "claude-opus-4-7".into(),
+            base_url: None,
         };
         let dbg = format!("{:?}", provider);
         assert!(
@@ -321,6 +358,32 @@ mod tests {
         );
         assert!(dbg.contains("REDACTED"));
         assert!(dbg.contains("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn messages_url_uses_base_when_set() {
+        assert_eq!(messages_url(&None), MESSAGES_URL);
+        assert_eq!(
+            messages_url(&Some("http://localhost:4000".to_string())),
+            "http://localhost:4000/v1/messages"
+        );
+        assert_eq!(
+            messages_url(&Some("http://localhost:4000/".to_string())),
+            "http://localhost:4000/v1/messages"
+        );
+    }
+
+    #[test]
+    fn for_distiller_builds_provider_with_base_url() {
+        let p = AnthropicProvider::for_distiller(
+            "claude-haiku-4-5",
+            "sk-test",
+            Some("http://localhost:4000".to_string()),
+            60,
+        )
+        .expect("build");
+        assert_eq!(p.model_name(), "claude-haiku-4-5");
+        assert_eq!(p.base_url.as_deref(), Some("http://localhost:4000"));
     }
 
     #[test]

@@ -3,7 +3,9 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod distiller;
 mod doctor;
+mod harvest_setup;
 mod proactive_state;
 mod update;
 
@@ -64,12 +66,12 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
-    /// v0.3: interactive REPL chat - kimetsu as a user-facing coding
+    /// Interactive REPL chat — kimetsu as a user-facing coding
     /// assistant. Reuses the full agent runtime (tools, prompts, brain,
     /// MP-18 verify) with a stdin/stdout transport. No dependency on
     /// Terminal-Bench.
     Chat(ChatArgs),
-    /// v0.4.6: kimetsu doctor — automated wire-health check.
+    /// Kimetsu doctor — automated wire-health check.
     ///
     /// Validates that every kimetsu subsystem the chat REPL + MCP
     /// sidecar rely on actually works against the current workspace
@@ -282,19 +284,28 @@ struct PluginInstallArgs {
     /// sessions.
     #[arg(long, default_value = "workspace")]
     scope: String,
+    /// Retained for compatibility; has no effect. The installer is fully
+    /// idempotent and non-destructive — CLAUDE.md guidance is merged (never
+    /// overwritten), and hooks / MCP config / generated docs refresh in place.
     #[arg(long)]
     force: bool,
-    /// v0.8: skip wiring the proactive PreToolUse/PostToolUse Bash
+    /// Skip wiring the proactive PreToolUse/PostToolUse Bash
     /// hooks (mid-work recall). UserPromptSubmit + Stop still install.
     #[arg(long)]
     no_proactive: bool,
+    /// Skip the interactive auto-harvest distiller setup prompt.
+    #[arg(long)]
+    no_setup: bool,
+    /// Force the auto-harvest distiller setup prompt even off a TTY.
+    #[arg(long)]
+    setup_harvest: bool,
 }
 
 #[derive(Debug, Args)]
 struct InitArgs {
     #[arg(long)]
     force: bool,
-    /// v0.6: skip writing .claude/CLAUDE.md and .claude/settings.json.
+    /// Skip writing .claude/CLAUDE.md and .claude/settings.json.
     /// Use when you manage Claude Code configuration manually.
     #[arg(long)]
     no_hooks: bool,
@@ -319,47 +330,49 @@ enum BrainCommand {
     },
     Rebuild,
     Stats,
-    /// v0.6: brain health summary — memory counts, domain groups,
+    /// Brain health summary — memory counts, domain groups,
     /// pending proposals, unresolved conflicts, and usefulness bands.
     Status {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
-    /// v0.6: Claude Code UserPromptSubmit hook. Reads JSON from stdin
+    /// Claude Code UserPromptSubmit hook. Reads JSON from stdin
     /// (`{"prompt":"...","..."}`), retrieves relevant brain context, and
     /// prints it to stdout for injection into the conversation.
     /// Exits 0 silently when the brain has nothing above threshold.
     ContextHook(ContextHookArgs),
-    /// v0.7: Claude Code Stop hook. Reads session JSON from stdin,
+    /// Claude Code Stop hook. Reads session JSON from stdin,
     /// counts kimetsu_brain_record calls made this session, and
     /// prints a summary banner. Exits 0 silently for short sessions
     /// with nothing to report.
     StopHook(StopHookArgs),
-    /// v0.4.3: backfill missing or stale embeddings on memory rows.
-    /// Run after upgrading kimetsu (so pre-v0.4.2 rows pick up
-    /// vectors) or after changing the embedder model via
+    /// Backfill missing or stale embeddings on memory rows.
+    /// Run after upgrading kimetsu or after changing the embedder model via
     /// `KIMETSU_BRAIN_EMBEDDER=<id>`.
     Reindex(ReindexArgs),
-    /// v0.8: inspect or change which built-in embedding model the
+    /// Inspect or change which built-in embedding model the
     /// brain uses. `list` shows the curated set and the active id;
     /// `set <id>` writes it to project.toml and re-embeds the corpus.
     Model {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// v0.8: proactive PreToolUse hook. Reads tool-call JSON from
+    /// Proactive PreToolUse hook. Reads tool-call JSON from
     /// stdin and, only for a high-confidence match against a stored
     /// failure_pattern/convention, prints a one-line warning BEFORE a
     /// risky Bash command runs. Exits 0 silently otherwise.
     #[command(name = "pretool-hook")]
     PreToolHook(ProactiveHookArgs),
-    /// v0.8: proactive PostToolUse hook. Reads tool-call JSON from
+    /// Proactive PostToolUse hook. Reads tool-call JSON from
     /// stdin and, when a Bash command failed and matches a stored
     /// failure_pattern/command, surfaces the known fix. Exits 0
     /// silently otherwise.
     #[command(name = "posttool-hook")]
     PostToolHook(ProactiveHookArgs),
+    /// Host SessionEnd hook — runs the credentialed distiller.
+    #[command(name = "session-end-hook")]
+    SessionEndHook(SessionEndHookArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -428,6 +441,17 @@ struct StopHookArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Codex compatibility: run the credentialed distiller from Stop because
+    /// current Codex hooks expose Stop but not SessionEnd.
+    #[arg(long)]
+    distill_on_stop: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionEndHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -466,7 +490,7 @@ struct ContextArgs {
     /// Print machine-readable JSON for hooks and harness wrappers.
     #[arg(long)]
     json: bool,
-    /// v0.4.4: skip the ambient workspace fingerprint (git branch,
+    /// Skip the ambient workspace fingerprint (git branch,
     /// dirty files, recent edits). Default behavior augments the
     /// query with that suffix so hooks calling with terse queries
     /// like "continue" or "fix it" still surface useful capsules.
@@ -482,21 +506,20 @@ enum MemoryCommand {
     Accept(AcceptArgs),
     Reject(RejectArgs),
     Invalidate(InvalidateArgs),
-    /// MP-5a: batch review pending memory proposals. The v0.2 default is
-    /// "human curates"; this subcommand is the non-interactive batch mode
-    /// (interactive TTY review lands in MP-5b).
+    /// Batch review pending memory proposals in non-interactive mode
+    /// (interactive TTY review available separately).
     Review(ReviewArgs),
-    /// MP-6: ranked memories by usefulness ratio so the user can see what
+    /// Ranked memories by usefulness ratio so the user can see what
     /// is pulling weight after curation.
     Top(TopArgs),
-    /// MP-6: bulk-invalidate memories whose outcome attribution says they
+    /// Bulk-invalidate memories whose outcome attribution says they
     /// hurt more than they help. Safe-by-default: dry-run unless --apply.
     Prune(PruneArgs),
-    /// v0.5.1: per-run memory attribution. Walks `memory_citations` +
+    /// Per-run memory attribution. Walks `memory_citations` +
     /// `context.injected` events to surface which memories the model
     /// actually leveraged vs which were silent passengers.
     Blame(BlameArgs),
-    /// v0.5.2: list and resolve conflict-detection hits surfaced at
+    /// List and resolve conflict-detection hits surfaced at
     /// ingest. With `--list` (the default) renders open conflicts;
     /// `--resolve <id> <kept_new|kept_existing|kept_both>` settles one.
     Conflicts(ConflictsArgs),
@@ -686,7 +709,7 @@ struct SweArgs {
     #[arg(long)]
     tasks: PathBuf,
     /// Caller-prepared repo path. Kimetsu does NOT clone or apply test_patch
-    /// in v0.1 â€” see docs/SWEBENCH.md for the full integration plan.
+    /// automatically — see docs/SWEBENCH.md for the full integration plan.
     #[arg(long)]
     repo: PathBuf,
     /// Run a single instance by id (default: every task).
@@ -943,13 +966,26 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
 
     match command {
         PluginCommand::Install(args) => {
-            let workspace = args.workspace.canonicalize()?;
+            // Canonicalize leniently: a global install doesn't use the
+            // workspace, so a missing `--workspace` path shouldn't fail it.
+            let workspace = args
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| args.workspace.clone());
             let target = BridgeTarget::parse(&args.target)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let scope = InstallScope::parse(&args.scope)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let mode = PluginMode::parse(&args.mode)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            // The kimetsu extensions target is workspace-only; warn rather
+            // than silently ignore a `--scope global` for it.
+            if matches!(scope, InstallScope::Global) && matches!(target, BridgeTarget::Kimetsu) {
+                eprintln!(
+                    "kimetsu plugin install: --scope global has no effect for the `kimetsu` target; \
+                     installing to the workspace .kimetsu/extensions."
+                );
+            }
             let report = plugin_install(
                 &workspace,
                 target,
@@ -967,6 +1003,56 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
             );
             for file in report.files {
                 println!("  {}", file.display());
+            }
+            // Offer interactive distiller setup for host targets on a TTY.
+            let interactive = args.setup_harvest
+                || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+            if matches!(target, BridgeTarget::ClaudeCode | BridgeTarget::Codex)
+                && !args.no_setup
+                && interactive
+            {
+                let target_for_scope = match scope {
+                    InstallScope::Global => match kimetsu_core::paths::user_kimetsu_dir() {
+                        Some(dir) => Some((
+                            harvest_setup::SetupTarget {
+                                project_toml: dir.join("project.toml"),
+                                env_path: dir.join(".env"),
+                                gitignore_dir: dir,
+                            },
+                            "globally (all projects, ~/.kimetsu)",
+                        )),
+                        None => {
+                            eprintln!(
+                                "kimetsu plugin install: cannot resolve ~/.kimetsu; skipping distiller setup."
+                            );
+                            None
+                        }
+                    },
+                    InstallScope::Workspace => {
+                        let p = kimetsu_core::paths::ProjectPaths::at_root(&workspace);
+                        Some((
+                            harvest_setup::SetupTarget {
+                                project_toml: p.project_toml.clone(),
+                                env_path: p.repo_root.join(".env"),
+                                gitignore_dir: p.repo_root.clone(),
+                            },
+                            "this workspace",
+                        ))
+                    }
+                };
+                if let Some((setup_target, label)) = target_for_scope {
+                    let stdin = std::io::stdin();
+                    let mut reader = stdin.lock();
+                    let mut stdout = std::io::stdout();
+                    if let Err(err) = harvest_setup::run_harvest_setup(
+                        &mut reader,
+                        &mut stdout,
+                        &setup_target,
+                        label,
+                    ) {
+                        eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
+                    }
+                }
             }
         }
     }
@@ -1366,6 +1452,13 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Model { command } => brain_model(command),
         BrainCommand::PreToolHook(args) => proactive_hook(ProactiveEvent::PreTool, args),
         BrainCommand::PostToolHook(args) => proactive_hook(ProactiveEvent::PostTool, args),
+        BrainCommand::SessionEndHook(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            distiller::run_session_end_hook(&workspace);
+            Ok(())
+        }
     }
 }
 
@@ -1806,13 +1899,16 @@ fn user_prompt_submit_context_output(additional_context: &str) -> serde_json::Va
     })
 }
 
-/// v0.7: Claude Code Stop hook. Reads session JSON from stdin, counts
-/// kimetsu_brain_record calls in the transcript, and prints a summary
-/// banner. Silent exit when the session was short or nothing to report.
+/// v0.7: Claude Code Stop hook. Reads the session JSON from stdin,
+/// counts `kimetsu_brain_record` calls in the transcript, and prints a
+/// summary banner. v0.8.5: reads the real `transcript_path` (a JSONL
+/// file Claude Code writes) instead of a non-existent inline array, and
+/// — when nothing was recorded in a non-trivial session — points at the
+/// memory-harvester subagent. Silent exit for short sessions.
 fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     use std::io::Read;
 
-    let _workspace = args
+    let workspace = args
         .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
 
@@ -1823,30 +1919,27 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     let session: serde_json::Value =
         serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
 
-    // Count kimetsu_brain_record tool calls in the transcript.
-    let transcript = session
-        .get("transcript")
-        .and_then(|v| v.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
-
-    let turn_count = transcript.len();
-    let recorded: usize = transcript
-        .iter()
-        .flat_map(|msg| {
-            msg.get("content")
-                .and_then(|c| c.as_array())
-                .into_iter()
-                .flatten()
-        })
-        .filter(|block| {
-            block
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| n == "kimetsu_brain_record")
-                .unwrap_or(false)
-        })
-        .count();
+    // Count transcript messages + recorded lessons. Claude Code's Stop
+    // hook sends a `transcript_path` to a JSONL file (one message per
+    // line), NOT an inline array — stream it line-by-line so a long
+    // session's transcript (tens of MB) never lands in memory at once.
+    // Fall back to an inline `transcript` array for other harnesses/tests.
+    let transcript_path = session
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+        .map(str::to_string);
+    let (turn_count, recorded) = match transcript_path.as_deref() {
+        Some(path) => count_transcript_jsonl(path),
+        None => {
+            let messages: Vec<serde_json::Value> = session
+                .get("transcript")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            (messages.len(), count_brain_record_calls(&messages))
+        }
+    };
 
     if recorded > 0 {
         println!(
@@ -1854,13 +1947,146 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
             recorded,
             if recorded == 1 { "" } else { "s" }
         );
-    } else if turn_count > 4 {
-        println!(
-            "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
-        );
+        return Ok(());
     }
-    // Short sessions (≤4 turns) exit silently — no nagging for quick lookups.
+    // Short sessions exit silently — no nagging for quick lookups. The
+    // count is transcript *lines* (user/assistant/tool messages), so the
+    // bar is set above a trivial lookup exchange.
+    const MIN_TRANSCRIPT_LINES: usize = 12;
+    if turn_count < MIN_TRANSCRIPT_LINES {
+        return Ok(());
+    }
+
+    // Non-trivial session, nothing recorded. When auto-harvest is on and
+    // we haven't already cued a harvest this session (e.g. via the
+    // PostToolUse resolution cue), point at the harvester subagent.
+    // `stop_hook_active` means we're already in a stop continuation —
+    // don't re-cue.
+    let stop_active = session
+        .get("stop_hook_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace).ok();
+    let auto_harvest = paths
+        .as_ref()
+        .and_then(|p| project::load_config(p).ok())
+        .map(|c| c.learning.auto_harvest)
+        .unwrap_or(true);
+    let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
+    let sid = session.get("session_id").and_then(|v| v.as_str());
+    let state_path = paths
+        .as_ref()
+        .map(|p| proactive_state::session_path(&p.kimetsu_dir, sid));
+
+    if args.distill_on_stop
+        && distiller_enabled
+        && !stop_active
+        && let Some(path) = transcript_path.as_deref()
+    {
+        let mut state = state_path
+            .as_ref()
+            .map(|path| proactive_state::load(path))
+            .unwrap_or_default();
+        if !state.harvest_cued() {
+            let _ = distiller::run_distiller_for_transcript(&workspace, path);
+            if let Some(state_path) = state_path.as_ref() {
+                state.note_harvest_cue(proactive_state::now_unix());
+                proactive_state::save(state_path, &state);
+            }
+            return Ok(());
+        }
+    }
+
+    if should_emit_stop_harvest_cue(auto_harvest, distiller_enabled)
+        && !stop_active
+        && let Some(paths) = paths.as_ref()
+    {
+        let state_path =
+            state_path.unwrap_or_else(|| proactive_state::session_path(&paths.kimetsu_dir, sid));
+        let mut state = proactive_state::load(&state_path);
+        if !state.harvest_cued() {
+            println!(
+                "[kimetsu-harvest] No lessons recorded this non-trivial session. If anything \
+                 durable was learned, run the kimetsu-memory-harvester agent in the background \
+                 to capture it — otherwise call kimetsu_brain_record."
+            );
+            state.note_harvest_cue(proactive_state::now_unix());
+            proactive_state::save(&state_path, &state);
+            return Ok(());
+        }
+    }
+
+    println!(
+        "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
+    );
     Ok(())
+}
+
+/// The end-of-session harvest cue fires only when auto-harvest is on AND
+/// the credentialed distiller is not handling end-of-session itself.
+fn should_emit_stop_harvest_cue(auto_harvest: bool, distiller_enabled: bool) -> bool {
+    auto_harvest && !distiller_enabled
+}
+
+/// Count `kimetsu_brain_record` tool-use blocks across transcript
+/// messages. Tolerates both the inline message shape (`content` array)
+/// and Claude Code's JSONL shape (`message.content` array). The tool
+/// name is matched against both the bare `kimetsu_brain_record` and the
+/// MCP-namespaced `mcp__kimetsu__kimetsu_brain_record` form that real
+/// Claude Code transcripts actually carry.
+fn count_brain_record_calls(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            let content = m
+                .get("content")
+                .or_else(|| m.get("message").and_then(|msg| msg.get("content")))
+                .and_then(|c| c.as_array());
+            content
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| {
+                            b.get("name")
+                                .and_then(|n| n.as_str())
+                                .is_some_and(is_brain_record_tool)
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// True for the `kimetsu_brain_record` tool under either the bare name
+/// or any MCP namespace prefix (`mcp__<server>__kimetsu_brain_record`).
+fn is_brain_record_tool(name: &str) -> bool {
+    name == "kimetsu_brain_record" || name.ends_with("__kimetsu_brain_record")
+}
+
+/// Stream a transcript JSONL file, returning `(message_count,
+/// brain_record_count)` without loading the whole file into memory.
+/// Best-effort: an unreadable file or malformed line is skipped, never
+/// fatal (a hook must not break the agent's turn). A leading UTF-8 BOM on
+/// the first line is tolerated.
+fn count_transcript_jsonl(path: &str) -> (usize, usize) {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return (0, 0);
+    };
+    let mut turns = 0usize;
+    let mut records = 0usize;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() {
+            continue;
+        }
+        turns += 1;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            records += count_brain_record_calls(std::slice::from_ref(&value));
+        }
+    }
+    (turns, records)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1935,10 +2161,15 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
         return Ok(());
     };
     // Honor the configured embedder id for consistency (proactive
-    // retrieval is lexical-only, but this keeps labels coherent).
-    if let Ok(config) = project::load_config(&paths) {
-        kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
-    }
+    // retrieval is lexical-only, but this keeps labels coherent). Also
+    // capture the auto-harvest toggle for the resolution cue below.
+    let auto_harvest = match project::load_config(&paths) {
+        Ok(config) => {
+            kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
+            config.learning.auto_harvest
+        }
+        Err(_) => true,
+    };
 
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap_or(0);
@@ -1957,6 +2188,37 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
 
     let now = proactive_state::now_unix();
     proactive_state::gc(&paths.kimetsu_dir, now);
+
+    let state_path = proactive_state::session_path(&paths.kimetsu_dir, hook.session_id.as_deref());
+    let mut state = proactive_state::load(&state_path);
+
+    // v0.8.5: PostToolUse success — if this command failed earlier this
+    // session and just succeeded, that's a resolved failure (a learnable
+    // moment). Cue the agent (throttled) to harvest the lesson, then exit.
+    if matches!(event, ProactiveEvent::PostTool) {
+        let resp = hook.tool_response.as_deref().unwrap_or("");
+        if !proactive_state::looks_like_failure(resp) {
+            let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(""));
+            if auto_harvest
+                && !norm.is_empty()
+                && state.had_prior_failure(&norm)
+                && !state.harvest_in_refractory(now, proactive_state::HARVEST_REFRACTORY_SECS)
+            {
+                let cmd = hook.command.as_deref().unwrap_or("the command");
+                let cue = format!(
+                    "[kimetsu-harvest] You just resolved a previously failing command (`{cmd}`). \
+                     If this revealed a durable, generalizable lesson, run the \
+                     kimetsu-memory-harvester agent in the background \
+                     to record it via kimetsu_brain_record."
+                );
+                print_tool_use_context(event, &cue)?;
+                state.note_harvest_cue(now);
+                state.clear_failure(&norm);
+            }
+            proactive_state::save(&state_path, &state);
+            return Ok(());
+        }
+    }
 
     // Build the retrieval query + actionable kinds per event.
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
@@ -1980,9 +2242,7 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
         }
     };
 
-    // Load session state, record this command, decide loop mode.
-    let state_path = proactive_state::session_path(&paths.kimetsu_dir, hook.session_id.as_deref());
-    let mut state = proactive_state::load(&state_path);
+    // Record this command, decide loop mode (state loaded above).
     let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(&query));
     let seen_count = state.note_command(&norm, error_sig.as_deref(), now);
     let loop_mode = seen_count >= proactive_state::LOOP_THRESHOLD;
@@ -2869,6 +3129,75 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn count_brain_record_calls_handles_both_shapes() {
+        // Inline message shape: `content` array directly on the message.
+        let inline = vec![
+            serde_json::json!({
+                "content": [
+                    { "type": "tool_use", "name": "kimetsu_brain_record" },
+                    { "type": "tool_use", "name": "Bash" }
+                ]
+            }),
+            serde_json::json!({ "content": [] }),
+        ];
+        assert_eq!(count_brain_record_calls(&inline), 1);
+
+        // Claude Code JSONL shape: `message.content` array, with the
+        // MCP-namespaced tool name real transcripts actually carry.
+        let jsonl = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "tool_use", "name": "mcp__kimetsu__kimetsu_brain_record" }] }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "tool_use", "name": "mcp__kimetsu__kimetsu_brain_record" }] }
+            }),
+        ];
+        assert_eq!(count_brain_record_calls(&jsonl), 2);
+
+        // A differently-namespaced server prefix still matches.
+        let other_ns = vec![serde_json::json!({
+            "message": { "content": [{ "name": "mcp__brain__kimetsu_brain_record" }] }
+        })];
+        assert_eq!(count_brain_record_calls(&other_ns), 1);
+
+        // No record calls.
+        let none = vec![serde_json::json!({ "message": { "content": [{ "name": "Bash" }] } })];
+        assert_eq!(count_brain_record_calls(&none), 0);
+    }
+
+    #[test]
+    fn count_transcript_jsonl_streams_counts() {
+        let dir = std::env::temp_dir().join(format!(
+            "kimetsu_transcript_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // Leading BOM on line 1, a namespaced record call, a blank line,
+        // and a malformed line (all tolerated).
+        let body = "\u{feff}{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n\
+             {\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"mcp__kimetsu__kimetsu_brain_record\"}]}}\n\
+             \n\
+             not json\n\
+             {\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"bye\"}]}}\n";
+        fs::write(&path, body).unwrap();
+
+        let (turns, records) = count_transcript_jsonl(path.to_str().unwrap());
+        assert_eq!(turns, 4, "4 non-empty lines counted");
+        assert_eq!(records, 1, "one namespaced brain_record counted");
+
+        // Missing file is best-effort (0, 0).
+        assert_eq!(count_transcript_jsonl("/no/such/file.jsonl"), (0, 0));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn context_hook_output_is_user_prompt_submit_json() {
         let value = user_prompt_submit_context_output("Kimetsu context");
         assert_eq!(value["continue"], true);
@@ -3119,5 +3448,12 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn stop_cue_suppressed_when_distiller_enabled() {
+        assert!(should_emit_stop_harvest_cue(true, false));
+        assert!(!should_emit_stop_harvest_cue(true, true));
+        assert!(!should_emit_stop_harvest_cue(false, false));
     }
 }
