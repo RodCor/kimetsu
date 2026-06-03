@@ -340,6 +340,22 @@ enum BrainCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Effectiveness analytics — is the brain helping? Hit-rate, citations,
+    /// acceptance, usefulness trend, token economy.
+    Insights {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Number of most-recent runs to include in the rolling window.
+        #[arg(long, default_value_t = 50)]
+        last_n_runs: u32,
+        /// ISO-8601 lower bound on run timestamps (overrides --last-n-runs).
+        #[arg(long)]
+        since: Option<String>,
+        /// How many items to include in ranked lists (top-useful, prune-candidates).
+        #[arg(long, default_value_t = 10)]
+        top: u32,
+    },
     /// Claude Code UserPromptSubmit hook. Reads JSON from stdin
     /// (`{"prompt":"...","..."}`), retrieves relevant brain context, and
     /// prints it to stdout for injection into the conversation.
@@ -1449,6 +1465,12 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         }
         BrainCommand::Stats => stats(),
         BrainCommand::Status { json } => brain_status(json),
+        BrainCommand::Insights {
+            json,
+            last_n_runs,
+            since,
+            top,
+        } => brain_insights(json, last_n_runs, since, top),
         BrainCommand::ContextHook(args) => brain_context_hook(args),
         BrainCommand::StopHook(args) => brain_stop_hook(args),
         BrainCommand::Reindex(args) => reindex_brain(args),
@@ -1817,6 +1839,177 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
         if stale.len() > 3 {
             println!("hint: run `kimetsu brain memory prune` to clean stale entries");
         }
+    }
+    Ok(())
+}
+
+/// v1.0 (C5): `kimetsu brain insights` — effectiveness analytics.
+fn brain_insights(
+    json: bool,
+    last_n_runs: u32,
+    since: Option<String>,
+    top: u32,
+) -> KimetsuResult<()> {
+    use kimetsu_brain::analytics::{self, InsightsOptions};
+
+    let cwd = env::current_dir()?;
+    let opts = InsightsOptions {
+        last_n_runs,
+        since,
+        top_n: top,
+    };
+    let report = analytics::compute_insights(&cwd, opts)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        // --- Retrieval ---
+        let hit_rate = report
+            .retrieval
+            .hit_rate
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "n/a".to_string());
+        let avg_score = report
+            .retrieval
+            .avg_top_score
+            .map(|v| format!("{:.3}", v))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("── Retrieval ──────────────────────────────────");
+        println!("  served:       {}", report.retrieval.served);
+        println!("  hit-rate:     {hit_rate}  (n/a until C7)");
+        println!("  avg-top-score:{avg_score}  (n/a until C7)");
+
+        // --- Citation ---
+        let citation_rate = report
+            .citation
+            .citation_rate
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("── Citation ───────────────────────────────────");
+        println!("  runs-considered: {}", report.citation.runs_considered);
+        println!("  retrieved:       {}", report.citation.retrieved_total);
+        println!("  cited:           {}", report.citation.cited_total);
+        println!("  citation-rate:   {citation_rate}");
+
+        // --- Proposals ---
+        let acceptance_rate = report
+            .proposals
+            .acceptance_rate
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("── Proposals ──────────────────────────────────");
+        println!("  accepted:        {}", report.proposals.accepted);
+        println!("  rejected:        {}", report.proposals.rejected);
+        println!("  pending:         {}", report.proposals.pending);
+        println!("  acceptance-rate: {acceptance_rate}");
+
+        // --- Usefulness ---
+        let avg_ratio = report
+            .usefulness
+            .avg_ratio
+            .map(|v| format!("{:.3}", v))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("── Usefulness Trend ───────────────────────────");
+        println!(
+            "  sum-usefulness:      {:.3}",
+            report.usefulness.sum_usefulness
+        );
+        println!("  avg-ratio:           {avg_ratio}");
+        println!(
+            "  window-finished:     {}",
+            report.usefulness.window_finished
+        );
+        println!(
+            "  window-failed(non-gate): {}",
+            report.usefulness.window_failed_nongate
+        );
+        println!("  window-net:          {}", report.usefulness.window_net);
+
+        // --- Harvest ---
+        let yield_per_run = report
+            .harvest
+            .yield_per_run
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("── Harvest ────────────────────────────────────");
+        println!("  created-in-window: {}", report.harvest.created_in_window);
+        println!("  yield-per-run:     {yield_per_run}");
+        if !report.harvest.by_source.is_empty() {
+            let sources: Vec<String> = report
+                .harvest
+                .by_source
+                .iter()
+                .map(|(src, n)| format!("{src}={n}"))
+                .collect();
+            println!("  by-source:         {}", sources.join(", "));
+        }
+
+        // --- Corpus ---
+        println!("── Corpus Health ──────────────────────────────");
+        println!("  active:           {}", report.corpus.active);
+        println!("  invalidated:      {}", report.corpus.invalidated);
+        println!("  open-conflicts:   {}", report.corpus.open_conflicts);
+        println!("  pending-proposals:{}", report.corpus.pending_proposals);
+        if !report.corpus.by_scope.is_empty() {
+            let scopes: Vec<String> = report
+                .corpus
+                .by_scope
+                .iter()
+                .map(|(s, n)| format!("{s}={n}"))
+                .collect();
+            println!("  by-scope:         {}", scopes.join(", "));
+        }
+        if !report.corpus.by_kind.is_empty() {
+            let kinds: Vec<String> = report
+                .corpus
+                .by_kind
+                .iter()
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect();
+            println!("  by-kind:          {}", kinds.join(", "));
+        }
+        if !report.corpus.top_useful.is_empty() {
+            println!("  top-useful:");
+            for m in &report.corpus.top_useful {
+                println!(
+                    "    [{:.2}] {} — {}",
+                    m.usefulness_score, m.memory_id, m.text_preview
+                );
+            }
+        }
+        if !report.corpus.prune_candidates.is_empty() {
+            println!(
+                "  prune-candidates ({}):",
+                report.corpus.prune_candidates.len()
+            );
+            for m in &report.corpus.prune_candidates {
+                println!(
+                    "    [{:.2}] {} — {}",
+                    m.usefulness_score, m.memory_id, m.text_preview
+                );
+            }
+        }
+
+        // --- Token Economy ---
+        let avg_tokens = report
+            .token_economy
+            .avg_injected_tokens
+            .map(|v| format!("{:.0}", v))
+            .unwrap_or_else(|| "n/a".to_string());
+        let avg_capsules = report
+            .token_economy
+            .avg_capsules
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "n/a".to_string());
+        let skip_rate = report
+            .token_economy
+            .skip_rate
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("── Token Economy ──────────────────────────────");
+        println!("  avg-injected-tokens: {avg_tokens}");
+        println!("  avg-capsules:        {avg_capsules}");
+        println!("  skip-rate:           {skip_rate}  (n/a until C7)");
     }
     Ok(())
 }

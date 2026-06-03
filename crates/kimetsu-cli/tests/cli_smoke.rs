@@ -137,6 +137,27 @@ fn kimetsu_brain_memory_help_lists_v05_subcommands() {
 }
 
 #[test]
+fn kimetsu_brain_insights_help_lists_args() {
+    let output = Command::new(kimetsu_bin())
+        .args(["brain", "insights", "--help"])
+        .output()
+        .expect("spawn kimetsu brain insights --help");
+    assert!(
+        output.status.success(),
+        "brain insights --help should exit 0; got {:?}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in ["--json", "--last-n-runs", "--since", "--top"] {
+        assert!(
+            stdout.contains(expected),
+            "brain insights --help should mention `{expected}`; got: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn kimetsu_unknown_subcommand_exits_nonzero_with_helpful_message() {
     let output = Command::new(kimetsu_bin())
         .arg("not-a-real-subcommand")

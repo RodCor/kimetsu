@@ -228,6 +228,7 @@ fn call_tool(
 ) -> Result<Value, String> {
     match name {
         "kimetsu_brain_status" => Ok(kimetsu_brain_status(workspace)),
+        "kimetsu_brain_insights" => Ok(kimetsu_brain_insights(workspace, &arguments)),
         "kimetsu_brain_context" => Ok(kimetsu_brain_context(workspace, &arguments)),
         "kimetsu_brain_record" => Ok(kimetsu_brain_record(workspace, &arguments)),
         "kimetsu_benchmark_context" => Ok(kimetsu_benchmark_context(workspace, &arguments)),
@@ -445,6 +446,61 @@ fn kimetsu_brain_status(workspace: &Path) -> Value {
         },
         "top_memories": top_memories.iter().map(json_memory_row).collect::<Vec<_>>(),
         "pending_proposals": pending.iter().map(json_proposal_row).collect::<Vec<_>>(),
+    })
+}
+
+/// v1.0 (C6): `kimetsu_brain_insights` — effectiveness analytics MCP tool.
+fn kimetsu_brain_insights(workspace: &Path, arguments: &Value) -> Value {
+    use kimetsu_brain::analytics::{self, InsightsOptions};
+
+    let last_n_runs = u32_arg(arguments, "last_n_runs", 50, 1, u32::MAX);
+    let since = optional_string_arg(arguments, "since");
+    let top = u32_arg(arguments, "top", 10, 1, u32::MAX);
+
+    let opts = InsightsOptions {
+        last_n_runs,
+        since,
+        top_n: top,
+    };
+
+    let report = match analytics::compute_insights(workspace, opts) {
+        Ok(r) => r,
+        Err(err) => {
+            return brain_unavailable_json(workspace, &format!("kimetsu_brain_insights: {err}"));
+        }
+    };
+
+    // Build a short interpretation string from headline numbers.
+    let citation_rate = report
+        .citation
+        .citation_rate
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    let acceptance_rate = report
+        .proposals
+        .acceptance_rate
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    let avg_tokens = report
+        .token_economy
+        .avg_injected_tokens
+        .map(|v| format!("{:.0} tokens/injection", v))
+        .unwrap_or_else(|| "n/a tokens/injection".to_string());
+    let interpretation = format!(
+        "Citation rate {citation_rate} ({cited}/{retrieved} memories cited), \
+         proposal acceptance {acceptance_rate} ({accepted}/{total} decided), \
+         token economy {avg_tokens}. Retrieval hit-rate n/a until C7.",
+        cited = report.citation.cited_total,
+        retrieved = report.citation.retrieved_total,
+        accepted = report.proposals.accepted,
+        total = report.proposals.accepted + report.proposals.rejected,
+    );
+
+    let report_json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    json!({
+        "ok": true,
+        "report": report_json,
+        "interpretation": interpretation,
     })
 }
 
@@ -1861,6 +1917,18 @@ fn tool_definitions() -> Value {
             "name": "kimetsu_brain_config_show",
             "description": "Read the project.toml config (raw + parsed), including the active embedder, broker weights, and run limits.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "kimetsu_brain_insights",
+            "description": "Brain effectiveness analytics: retrieval hit-rate, citation rate, proposal acceptance, usefulness trend, harvest yield, token economy. Use to see whether the brain is helping and to tune it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "last_n_runs": { "type": "integer", "minimum": 1, "description": "Number of most-recent runs to include in the rolling window. Default 50." },
+                    "since": { "type": "string", "description": "ISO-8601 lower bound on run timestamps. When set, overrides last_n_runs." },
+                    "top": { "type": "integer", "minimum": 1, "description": "How many items to include in ranked lists (top-useful, prune-candidates). Default 10." }
+                }
+            }
         }
     ])
 }
@@ -1958,6 +2026,110 @@ mod tests {
         .expect("brain status");
         assert_eq!(result["initialized"].as_bool(), Some(false));
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn brain_insights_appears_in_tool_definitions() {
+        let result = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("tools/list");
+        let tools = result["tools"].as_array().unwrap();
+        let insights_tool = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("kimetsu_brain_insights"))
+            .expect("kimetsu_brain_insights must be in tool_definitions");
+        // Description must mention analytics.
+        assert!(
+            insights_tool["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("analytics"),
+            "kimetsu_brain_insights description should contain 'analytics'"
+        );
+        // Schema must accept optional last_n_runs, since, top.
+        let props = &insights_tool["inputSchema"]["properties"];
+        assert!(
+            props.get("last_n_runs").is_some(),
+            "schema must have last_n_runs"
+        );
+        assert!(props.get("since").is_some(), "schema must have since");
+        assert!(props.get("top").is_some(), "schema must have top");
+    }
+
+    #[test]
+    fn brain_insights_reports_missing_project_without_error() {
+        let root = temp_root("kimetsu-mcp-insights-no-brain");
+        fs::create_dir_all(&root).expect("create temp root");
+        let result = call_tool(
+            "kimetsu_brain_insights",
+            json!({}),
+            &root,
+            &SkillConfig::default(),
+        )
+        .expect("brain insights call");
+        // No brain — must return initialized:false, not panic.
+        assert_eq!(result["initialized"].as_bool(), Some(false));
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn brain_insights_returns_well_formed_report() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-insights-brain");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "insights mcp test fixture memory",
+            )
+            .expect("add memory");
+
+            let result = call_tool(
+                "kimetsu_brain_insights",
+                json!({ "last_n_runs": 50, "top": 5 }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("brain insights call");
+
+            assert_eq!(result["ok"].as_bool(), Some(true), "ok must be true");
+            // The report must have the top-level sections.
+            let report = &result["report"];
+            assert!(
+                report.get("retrieval").is_some(),
+                "report.retrieval missing"
+            );
+            assert!(report.get("citation").is_some(), "report.citation missing");
+            assert!(
+                report.get("proposals").is_some(),
+                "report.proposals missing"
+            );
+            assert!(
+                report.get("usefulness").is_some(),
+                "report.usefulness missing"
+            );
+            assert!(report.get("harvest").is_some(), "report.harvest missing");
+            assert!(report.get("corpus").is_some(), "report.corpus missing");
+            assert!(
+                report.get("token_economy").is_some(),
+                "report.token_economy missing"
+            );
+            // interpretation string must be present and non-empty.
+            let interp = result["interpretation"].as_str().unwrap_or("");
+            assert!(!interp.is_empty(), "interpretation must be non-empty");
+            // hit_rate is None (C7 not landed) — JSON null in the report.
+            assert!(
+                report["retrieval"]["hit_rate"].is_null(),
+                "hit_rate must be null (C7 not yet landed)"
+            );
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
     }
 
     #[test]
