@@ -111,7 +111,7 @@ impl Default for LearningSection {
 
 /// Credentialed SessionEnd distiller config. Secret values (the API key,
 /// optional base URL) live in `.env` under the env-var names below; only
-/// non-secret selection lives here.
+/// non-secret selection lives here. `provider` is `anthropic` or `openai`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistillerSection {
     #[serde(default)]

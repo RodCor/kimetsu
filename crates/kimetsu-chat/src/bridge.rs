@@ -207,7 +207,8 @@ Optional mode:
 - Kimetsu brain is the preferred first step for non-trivial work.
 - If native MCP tools are unavailable and the task is small, note that Kimetsu brain context was unavailable and continue.
 - For broad work, fix the plugin/MCP setup first so `kimetsu_brain_context` is available.
-- Installed Codex hooks use `.codex/hooks.json` and the `UserPromptSubmit` event to run `kimetsu brain context-hook --workspace .`. Optional mode does not block when Kimetsu returns no relevant context.
+- Installed Codex hooks use `.codex/hooks.json`: `UserPromptSubmit` runs `kimetsu brain context-hook --workspace .`, `Stop` runs `kimetsu brain stop-hook --workspace . --distill-on-stop`, and proactive hooks wrap Bash tool calls. Optional mode does not block when Kimetsu returns no relevant context.
+- The installer also writes `.codex/agents/kimetsu-memory-harvester.toml`. When a `[kimetsu-harvest]` cue appears and no credentialed distiller is configured, spawn that custom agent in the background to record any durable lesson.
 
 Kimetsu brain tools retrieve and manage durable context. Kimetsu bridge tools discover and install reusable capabilities. Continue the actual task with the host harness's normal file, shell, edit, and verification tools.
 "#;
@@ -232,9 +233,39 @@ Required mode:
 - Treat missing Kimetsu MCP access as a setup blocker for non-trivial tasks.
 - Continue without Kimetsu only when the user explicitly waives it or the task is trivial.
 - State whether `kimetsu_benchmark_context` or `kimetsu_brain_context` was called and how many capsules were returned when reporting benchmark or audit results.
-- Installed Codex hooks use `.codex/hooks.json` and the `UserPromptSubmit` event to run `kimetsu brain context-hook --workspace .`; benchmark wrappers should inspect MCP transcripts for required Kimetsu usage.
+- Installed Codex hooks use `.codex/hooks.json`: `UserPromptSubmit` runs `kimetsu brain context-hook --workspace .`, `Stop` runs `kimetsu brain stop-hook --workspace . --distill-on-stop`, and proactive hooks wrap Bash tool calls; benchmark wrappers should inspect MCP transcripts for required Kimetsu usage.
+- The installer also writes `.codex/agents/kimetsu-memory-harvester.toml`. When a `[kimetsu-harvest]` cue appears and no credentialed distiller is configured, spawn that custom agent in the background to record any durable lesson.
 
 Kimetsu brain tools retrieve and manage durable context. Kimetsu bridge tools discover and install reusable capabilities. Continue the actual task with the host harness's normal file, shell, edit, and verification tools after loading Kimetsu context.
+"#;
+
+/// Codex custom agent installed at `.codex/agents/kimetsu-memory-harvester.toml`.
+/// It mirrors the Claude Code harvester agent but uses Codex's standalone TOML
+/// custom-agent schema.
+const CODEX_MEMORY_HARVESTER_AGENT: &str = r#"name = "kimetsu-memory-harvester"
+description = "Distills durable, generalizable lessons from the recent session and records them to the Kimetsu brain. Spawn in the background when a [kimetsu-harvest] hook cue appears, or after solving a non-obvious problem."
+model = "gpt-5.3-codex-spark"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+developer_instructions = """
+You are Kimetsu's memory harvester. Given the recent conversation/session context, extract durable lessons worth remembering across future sessions and record them.
+
+What qualifies:
+- A non-obvious fix for a command/tool that failed and was then resolved; capture the root cause and fix, generalized beyond one repo path.
+- A convention, gotcha, or environment quirk that cost real effort to discover.
+- A reusable approach or anti-pattern confirmed by the outcome.
+
+What does not qualify:
+- Trivial or well-known facts, one-liners, restatements of docs.
+- Anything specific to a single throwaway value with no general lesson.
+
+How to record:
+- For each qualifying lesson, at most 3, call kimetsu_brain_record with a concrete actionable lesson, 2-5 domain tags, an optional one-line context, and confidence in [0,1].
+- Use kind = "anti_pattern" for things to avoid, "convention" for project norms, otherwise the default.
+- If nothing qualifies, do nothing and finish.
+
+Constraints: do not modify files, run shell commands, or take any action other than calling Kimetsu brain MCP tools. Quality over quantity.
+"""
 "#;
 
 pub fn bridge_scan(workspace: &Path, config: &SkillConfig) -> Result<BridgeScan, String> {
@@ -485,6 +516,12 @@ fn plugin_install_inner(
                 true,
             )?;
             files.push(normalize_path(&skill));
+            let agents = codex_dir.join("agents");
+            fs::create_dir_all(&agents)
+                .map_err(|err| format!("create {}: {err}", agents.display()))?;
+            let harvester = agents.join("kimetsu-memory-harvester.toml");
+            write_text_file(&harvester, CODEX_MEMORY_HARVESTER_AGENT, true)?;
+            files.push(normalize_path(&harvester));
             write_codex_hooks(&codex_dir, proactive, &mut files)?;
         }
         BridgeTarget::Kimetsu => {
@@ -548,7 +585,7 @@ fn upsert_kimetsu_hook(
     }
 }
 
-/// Merge Kimetsu's `UserPromptSubmit` hook (plus the v0.8 proactive
+/// Merge Kimetsu's `UserPromptSubmit`/`Stop` hooks (plus the v0.8 proactive
 /// `PreToolUse`/`PostToolUse` Bash hooks when `proactive`) into
 /// `.codex/hooks.json`, preserving any other hooks the user has — even on
 /// the same events. Idempotent: re-running never duplicates.
@@ -601,6 +638,19 @@ fn write_codex_hooks(
                 "command": "kimetsu brain context-hook --workspace .",
                 "statusMessage": "Loading Kimetsu brain context",
                 "timeout": 30
+            }]
+        }),
+    );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "Stop",
+        serde_json::json!({
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "kimetsu brain stop-hook --workspace . --distill-on-stop",
+                "statusMessage": "Checking Kimetsu memory capture",
+                "timeout": 180
             }]
         }),
     );
@@ -1160,6 +1210,11 @@ mod tests {
         assert!(optional_text.contains("kimetsu_benchmark_context"));
         assert!(optional_text.contains("kimetsu_benchmark_record_outcome"));
         assert!(!optional_text.contains("kimetsu_harbor"));
+        let codex_harvester = root.join(".codex/agents/kimetsu-memory-harvester.toml");
+        let harvester_text = fs::read_to_string(&codex_harvester).expect("codex harvester");
+        let _: toml::Value = toml::from_str(&harvester_text).expect("harvester toml");
+        assert!(harvester_text.contains("name = \"kimetsu-memory-harvester\""));
+        assert!(harvester_text.contains("kimetsu_brain_record"));
         let codex_config = root.join(".codex/config.toml");
         let config_text = fs::read_to_string(&codex_config).expect("codex config");
         assert!(config_text.contains("[mcp_servers.kimetsu]"));
@@ -1172,6 +1227,10 @@ mod tests {
         assert_eq!(
             hooks_json["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
             Some("kimetsu brain context-hook --workspace .")
+        );
+        assert_eq!(
+            hooks_json["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("kimetsu brain stop-hook --workspace . --distill-on-stop")
         );
         // v0.8: proactive on by default wires the Bash PreToolUse/PostToolUse hooks.
         assert_eq!(
@@ -1226,6 +1285,10 @@ mod tests {
         let hooks_text = fs::read_to_string(root.join(".codex/hooks.json")).expect("codex hooks");
         let hooks_json: serde_json::Value = serde_json::from_str(&hooks_text).expect("hooks json");
         assert!(hooks_json["hooks"]["UserPromptSubmit"].is_array());
+        assert_eq!(
+            hooks_json["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("kimetsu brain stop-hook --workspace . --distill-on-stop")
+        );
         assert!(
             hooks_json["hooks"]["PreToolUse"].is_null(),
             "proactive disabled must not write PreToolUse"
@@ -1351,6 +1414,10 @@ mod tests {
             "kimetsu brain context-hook --workspace ."
         );
         assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "kimetsu brain stop-hook --workspace . --distill-on-stop"
+        );
+        assert_eq!(
             value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "kimetsu brain pretool-hook --workspace ."
         );
@@ -1474,6 +1541,10 @@ mod tests {
         .unwrap();
         assert!(home.join(".codex/config.toml").is_file());
         assert!(home.join(".codex/hooks.json").is_file());
+        assert!(
+            home.join(".codex/agents/kimetsu-memory-harvester.toml")
+                .is_file()
+        );
         assert!(!ws.join(".codex").exists());
 
         fs::remove_dir_all(ws).ok();

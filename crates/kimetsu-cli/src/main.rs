@@ -370,9 +370,9 @@ enum BrainCommand {
     /// silently otherwise.
     #[command(name = "posttool-hook")]
     PostToolHook(ProactiveHookArgs),
-    /// Claude Code SessionEnd hook — runs the credentialed distiller.
+    /// Host SessionEnd hook — runs the credentialed distiller.
     #[command(name = "session-end-hook")]
-    SessionEndHook(StopHookArgs),
+    SessionEndHook(SessionEndHookArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -438,6 +438,17 @@ struct ContextHookArgs {
 
 #[derive(Debug, Args)]
 struct StopHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Codex compatibility: run the credentialed distiller from Stop because
+    /// current Codex hooks expose Stop but not SessionEnd.
+    #[arg(long)]
+    distill_on_stop: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionEndHookArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -993,20 +1004,54 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
             for file in report.files {
                 println!("  {}", file.display());
             }
-            // Offer interactive distiller setup for Claude Code on a TTY.
+            // Offer interactive distiller setup for host targets on a TTY.
             let interactive = args.setup_harvest
                 || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
-            if matches!(target, BridgeTarget::ClaudeCode) && !args.no_setup && interactive {
-                // Anchor strictly at the install workspace (NOT `discover`,
-                // which climbs to an enclosing git repo and could write the
-                // distiller config + secret .env into a parent repository).
-                let paths = kimetsu_core::paths::ProjectPaths::at_root(&workspace);
-                let stdin = std::io::stdin();
-                let mut reader = stdin.lock();
-                let mut stdout = std::io::stdout();
-                if let Err(err) = harvest_setup::run_harvest_setup(&mut reader, &mut stdout, &paths)
-                {
-                    eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
+            if matches!(target, BridgeTarget::ClaudeCode | BridgeTarget::Codex)
+                && !args.no_setup
+                && interactive
+            {
+                let target_for_scope = match scope {
+                    InstallScope::Global => match kimetsu_core::paths::user_kimetsu_dir() {
+                        Some(dir) => Some((
+                            harvest_setup::SetupTarget {
+                                project_toml: dir.join("project.toml"),
+                                env_path: dir.join(".env"),
+                                gitignore_dir: dir,
+                            },
+                            "globally (all projects, ~/.kimetsu)",
+                        )),
+                        None => {
+                            eprintln!(
+                                "kimetsu plugin install: cannot resolve ~/.kimetsu; skipping distiller setup."
+                            );
+                            None
+                        }
+                    },
+                    InstallScope::Workspace => {
+                        let p = kimetsu_core::paths::ProjectPaths::at_root(&workspace);
+                        Some((
+                            harvest_setup::SetupTarget {
+                                project_toml: p.project_toml.clone(),
+                                env_path: p.repo_root.join(".env"),
+                                gitignore_dir: p.repo_root.clone(),
+                            },
+                            "this workspace",
+                        ))
+                    }
+                };
+                if let Some((setup_target, label)) = target_for_scope {
+                    let stdin = std::io::stdin();
+                    let mut reader = stdin.lock();
+                    let mut stdout = std::io::stdout();
+                    if let Err(err) = harvest_setup::run_harvest_setup(
+                        &mut reader,
+                        &mut stdout,
+                        &setup_target,
+                        label,
+                    ) {
+                        eprintln!("kimetsu plugin install: distiller setup skipped: {err}");
+                    }
                 }
             }
         }
@@ -1879,11 +1924,12 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     // line), NOT an inline array — stream it line-by-line so a long
     // session's transcript (tens of MB) never lands in memory at once.
     // Fall back to an inline `transcript` array for other harnesses/tests.
-    let (turn_count, recorded) = match session
+    let transcript_path = session
         .get("transcript_path")
         .and_then(|v| v.as_str())
         .filter(|p| !p.trim().is_empty())
-    {
+        .map(str::to_string);
+    let (turn_count, recorded) = match transcript_path.as_deref() {
         Some(path) => count_transcript_jsonl(path),
         None => {
             let messages: Vec<serde_json::Value> = session
@@ -1921,24 +1967,48 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace).ok();
-    let (auto_harvest, distiller_enabled) = paths
+    let auto_harvest = paths
         .as_ref()
         .and_then(|p| project::load_config(p).ok())
-        .map(|c| (c.learning.auto_harvest, c.learning.distiller.enabled))
-        .unwrap_or((true, false));
+        .map(|c| c.learning.auto_harvest)
+        .unwrap_or(true);
+    let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
+    let sid = session.get("session_id").and_then(|v| v.as_str());
+    let state_path = paths
+        .as_ref()
+        .map(|p| proactive_state::session_path(&p.kimetsu_dir, sid));
+
+    if args.distill_on_stop
+        && distiller_enabled
+        && !stop_active
+        && let Some(path) = transcript_path.as_deref()
+    {
+        let mut state = state_path
+            .as_ref()
+            .map(|path| proactive_state::load(path))
+            .unwrap_or_default();
+        if !state.harvest_cued() {
+            let _ = distiller::run_distiller_for_transcript(&workspace, path);
+            if let Some(state_path) = state_path.as_ref() {
+                state.note_harvest_cue(proactive_state::now_unix());
+                proactive_state::save(state_path, &state);
+            }
+            return Ok(());
+        }
+    }
 
     if should_emit_stop_harvest_cue(auto_harvest, distiller_enabled)
         && !stop_active
         && let Some(paths) = paths.as_ref()
     {
-        let sid = session.get("session_id").and_then(|v| v.as_str());
-        let state_path = proactive_state::session_path(&paths.kimetsu_dir, sid);
+        let state_path =
+            state_path.unwrap_or_else(|| proactive_state::session_path(&paths.kimetsu_dir, sid));
         let mut state = proactive_state::load(&state_path);
         if !state.harvest_cued() {
             println!(
                 "[kimetsu-harvest] No lessons recorded this non-trivial session. If anything \
-                 durable was learned, dispatch the kimetsu-memory-harvester subagent \
-                 (run_in_background: true) to capture it — otherwise call kimetsu_brain_record."
+                 durable was learned, run the kimetsu-memory-harvester agent in the background \
+                 to capture it — otherwise call kimetsu_brain_record."
             );
             state.note_harvest_cue(proactive_state::now_unix());
             proactive_state::save(&state_path, &state);
@@ -2137,8 +2207,8 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
                 let cmd = hook.command.as_deref().unwrap_or("the command");
                 let cue = format!(
                     "[kimetsu-harvest] You just resolved a previously failing command (`{cmd}`). \
-                     If this revealed a durable, generalizable lesson, dispatch the \
-                     kimetsu-memory-harvester subagent in the background (run_in_background: true) \
+                     If this revealed a durable, generalizable lesson, run the \
+                     kimetsu-memory-harvester agent in the background \
                      to record it via kimetsu_brain_record."
                 );
                 print_tool_use_context(event, &cue)?;

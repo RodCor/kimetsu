@@ -9,8 +9,8 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 rust-version.workspace = true
-description = "Transport-neutral agent runtime for kimetsu: tools, prompts, verify-loop, providers (claude_code, anthropic)."
-keywords = ["kimetsu", "agent", "llm", "anthropic", "claude"]
+description = "Transport-neutral agent runtime for kimetsu: tools, prompts, verify-loop, providers (claude_code, anthropic, openai)."
+keywords = ["kimetsu", "agent", "llm", "anthropic", "openai"]
 categories = ["development-tools"]
 
 [features]

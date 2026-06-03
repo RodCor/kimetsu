@@ -8,7 +8,7 @@
 //!   1. Zero dependence on Terminal-Bench / Harbor — chat is its own
 //!      product, not a benchmark subset.
 //!   2. Reuse the entire 20-tool surface, prompts, brain integration,
-//!      providers (`claude_code` today; `anthropic` natively next), and
+//!      providers (`claude_code`, `anthropic`, and distiller-specific OpenAI), and
 //!      MP-18's iterative goal verify with no per-feature porting.
 //!   3. Tool runtime swaps to host-side `LocalShellExecutor` — commands
 //!      execute against the user's actual filesystem.

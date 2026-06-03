@@ -182,7 +182,7 @@ cover Claude Code and Codex:
 
 ```bash
 kimetsu plugin install claude --workspace .    # writes .mcp.json + .claude/settings.json
-kimetsu plugin install codex  --workspace .    # writes .codex/config.toml + .codex/hooks.json + skill
+kimetsu plugin install codex  --workspace .    # writes .codex/config.toml + .codex/hooks.json + skill + agent
 
 # Install globally for every project (writes to ~/.claude, ~/.claude.json, ~/.codex):
 kimetsu plugin install claude --scope global
@@ -205,11 +205,16 @@ in-agent distiller) that records the lesson for next time — no extra API key.
 Turn it off with `[learning] auto_harvest = false` in `.kimetsu/project.toml`.
 
 For a deterministic harvest that doesn't depend on the agent, `kimetsu plugin
-install claude-code` offers to set up a **SessionEnd distiller**: a cheap
-configured model (Anthropic `claude-haiku-4-5`, or a LiteLLM endpoint via
-`ANTHROPIC_BASE_URL`) that distills each session itself at the end and records
-the lessons. The wizard stores the key in a gitignored `.env`; skip it with
-`--no-setup`.
+install claude-code` and `kimetsu plugin install codex` offer to set up a
+**SessionEnd distiller**: a cheap configured model (Anthropic
+`claude-haiku-4-5`, OpenAI `gpt-5.4-mini`, or a compatible endpoint via
+`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) that distills each session itself at
+the end and records the lessons. Claude Code runs it from `SessionEnd`; Codex
+runs it from the supported `Stop` hook with `--distill-on-stop`. The wizard
+stores the key in a gitignored `.env`; skip it with `--no-setup`. Run it with
+`--scope global` to configure the distiller once in
+`~/.kimetsu/` — it then distills every project's sessions into your user brain
+(available everywhere), unless that project has its own distiller.
 
 ```bash
 kimetsu brain search "build failures"
