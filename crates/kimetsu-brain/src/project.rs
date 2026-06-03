@@ -1867,6 +1867,37 @@ fn config_hash(path: &Path) -> KimetsuResult<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// C7: best-effort telemetry write from a hook context (no active run).
+///
+/// Appends a single event (e.g. `context.served`) directly to the project
+/// brain's `events` table with a sentinel run_id (`"hook"` encoded as a
+/// ULID-zero string). Swallows all errors — telemetry must never break
+/// a hook. Opens the DB read-write so the hook can record misses without
+/// holding a write lock (the DB is opened and closed immediately).
+///
+/// The sentinel run_id is a valid ULID-shaped string (`00000000000000000000000000`
+/// padded to 26 chars). Crucially there is **no** corresponding row in the
+/// `runs` table; analytics windows over `context.served` filter by `ts`, not
+/// `run_id`, so this is correct.
+pub fn log_telemetry_event(
+    start: &Path,
+    kind: &str,
+    payload: serde_json::Value,
+) -> KimetsuResult<()> {
+    // We need a read-write connection to insert. Use a fresh Connection
+    // (not load_project which also validates config) so a misconfigured
+    // project.toml never prevents telemetry from writing.
+    let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+
+    // Sentinel run_id: all-zero ULID (26 '0' chars), never in `runs`.
+    let sentinel_run_id = RunId(ulid::Ulid::nil());
+    let event = Event::new(sentinel_run_id, kind, payload);
+    projector::insert_event(&conn, &event)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

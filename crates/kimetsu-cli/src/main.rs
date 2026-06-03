@@ -1876,8 +1876,8 @@ fn brain_insights(
             .unwrap_or_else(|| "n/a".to_string());
         println!("── Retrieval ──────────────────────────────────");
         println!("  served:       {}", report.retrieval.served);
-        println!("  hit-rate:     {hit_rate}  (n/a until C7)");
-        println!("  avg-top-score:{avg_score}  (n/a until C7)");
+        println!("  hit-rate:     {hit_rate}");
+        println!("  avg-top-score:{avg_score}");
 
         // --- Citation ---
         let citation_rate = report
@@ -2009,7 +2009,7 @@ fn brain_insights(
         println!("── Token Economy ──────────────────────────────");
         println!("  avg-injected-tokens: {avg_tokens}");
         println!("  avg-capsules:        {avg_capsules}");
-        println!("  skip-rate:           {skip_rate}  (n/a until C7)");
+        println!("  skip-rate:           {skip_rate}");
     }
     Ok(())
 }
@@ -2057,10 +2057,36 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         ..Default::default()
     };
 
-    let bundle = match project::retrieve_context_readonly_with_request(&workspace, request) {
+    let bundle = match project::retrieve_context_readonly_with_request(&workspace, request.clone())
+    {
         Ok(b) => b,
         Err(_) => return Ok(()), // Brain not initialized — silent fail
     };
+
+    // C7: emit a context.served event BEFORE the early-return so misses are
+    // logged. Best-effort (let _ =) — telemetry must never break the hook.
+    // Gate behind KIMETSU_BRAIN_LOG_RETRIEVAL=0 opt-out (default ON).
+    if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() != Ok("0") {
+        let top_score = bundle.top_score;
+        let query_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            request.query.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        let _ = project::log_telemetry_event(
+            &workspace,
+            "context.served",
+            serde_json::json!({
+                "query_hash": query_hash,
+                "capsule_count": bundle.capsules.len(),
+                "top_score": top_score,
+                "skipped": bundle.skipped,
+                "stage": &request.stage,
+            }),
+        );
+    }
 
     if bundle.skipped || bundle.capsules.is_empty() {
         return Ok(()); // Nothing relevant — zero output

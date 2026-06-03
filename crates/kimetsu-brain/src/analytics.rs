@@ -181,14 +181,92 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
     };
 
     // -----------------------------------------------------------------------
-    // C1 — RetrievalStats (stub; C7 populates from context.served)
+    // C1/C7 — RetrievalStats from context.served events.
+    //
+    // Hook-emitted events have run_id = all-zero ULID (sentinel "hook"),
+    // so we do NOT filter by run_id-in-window. Instead we filter by the
+    // event's ts column, which is always the real wall-clock time of the
+    // hook call. Pipeline events are also included (their ts falls in the
+    // same window). The window_since bound applies uniformly.
     // -----------------------------------------------------------------------
-    // C7: populate from context.served events
-    let retrieval = RetrievalStats {
-        served: 0,
-        with_hit: 0,
-        hit_rate: None,
-        avg_top_score: None,
+    let retrieval = {
+        // Total context.served events in the window.
+        let served: u64 = match &window_since {
+            Some(ts) => conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE kind = 'context.served' AND ts >= ?1",
+                params![ts],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'context.served'",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+
+        // with_hit: capsule_count >= 1 AND skipped = false (JSON values).
+        // Treat missing/null fields defensively (old-style events fall through
+        // to 0/null → excluded from with_hit, which is correct).
+        let with_hit: u64 = match &window_since {
+            Some(ts) => conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE kind = 'context.served' AND ts >= ?1 \
+                   AND CAST(COALESCE(json_extract(payload_json,'$.capsule_count'),0) AS INTEGER) >= 1 \
+                   AND COALESCE(json_extract(payload_json,'$.skipped'),'false') != 'true' \
+                   AND COALESCE(json_extract(payload_json,'$.skipped'),0) != 1",
+                params![ts],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE kind = 'context.served' \
+                   AND CAST(COALESCE(json_extract(payload_json,'$.capsule_count'),0) AS INTEGER) >= 1 \
+                   AND COALESCE(json_extract(payload_json,'$.skipped'),'false') != 'true' \
+                   AND COALESCE(json_extract(payload_json,'$.skipped'),0) != 1",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+
+        let hit_rate = if served > 0 {
+            Some(with_hit as f64 / served as f64)
+        } else {
+            None
+        };
+
+        // avg_top_score over events where capsule_count >= 1 (hits only).
+        let avg_top_score: Option<f64> = match &window_since {
+            Some(ts) => conn
+                .query_row(
+                    "SELECT AVG(CAST(json_extract(payload_json,'$.top_score') AS REAL)) \
+                     FROM events \
+                     WHERE kind = 'context.served' AND ts >= ?1 \
+                       AND CAST(COALESCE(json_extract(payload_json,'$.capsule_count'),0) AS INTEGER) >= 1",
+                    params![ts],
+                    |row| row.get::<_, Option<f64>>(0),
+                )
+                .optional()?
+                .flatten(),
+            None => conn
+                .query_row(
+                    "SELECT AVG(CAST(json_extract(payload_json,'$.top_score') AS REAL)) \
+                     FROM events \
+                     WHERE kind = 'context.served' \
+                       AND CAST(COALESCE(json_extract(payload_json,'$.capsule_count'),0) AS INTEGER) >= 1",
+                    [],
+                    |row| row.get::<_, Option<f64>>(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+
+        RetrievalStats {
+            served,
+            with_hit,
+            hit_rate,
+            avg_top_score,
+        }
     };
 
     // -----------------------------------------------------------------------
@@ -604,11 +682,36 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             None
         };
 
+        // C7: skip_rate = count(context.served where skipped=true) / served.
+        // Reuse the `served` count already computed above.
+        let skipped_count: u64 = match &window_since {
+            Some(ts) => conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE kind = 'context.served' AND ts >= ?1 \
+                   AND (json_extract(payload_json,'$.skipped') = 1 \
+                     OR json_extract(payload_json,'$.skipped') = 'true')",
+                params![ts],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE kind = 'context.served' \
+                   AND (json_extract(payload_json,'$.skipped') = 1 \
+                     OR json_extract(payload_json,'$.skipped') = 'true')",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        let skip_rate = if retrieval.served > 0 {
+            Some(skipped_count as f64 / retrieval.served as f64)
+        } else {
+            None
+        };
+
         TokenEconomy {
             avg_injected_tokens,
             avg_capsules,
-            // C7: populate from context.served events
-            skip_rate: None,
+            skip_rate,
         }
     };
 
@@ -1014,10 +1117,10 @@ mod tests {
                 (avg_cap - 3.0).abs() < 1e-6,
                 "avg_capsules expected 3.0, got {avg_cap}"
             );
-            // skip_rate stays None until C7
+            // No context.served events seeded → served==0 → skip_rate is None.
             assert!(
                 te.skip_rate.is_none(),
-                "skip_rate must be None (C7 not yet landed)"
+                "skip_rate must be None when no context.served events exist"
             );
         });
     }
@@ -1051,6 +1154,180 @@ mod tests {
             assert!(
                 te.avg_capsules.is_none(),
                 "must be None when no event has capsule_count"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. C7 — RetrievalStats from context.served events
+    // -----------------------------------------------------------------------
+
+    /// Helper: seed a `context.served` event directly into the DB.
+    fn seed_context_served(
+        conn: &rusqlite::Connection,
+        capsule_count: u64,
+        top_score: f32,
+        skipped: bool,
+    ) {
+        let run_id = RunId::new();
+        let event = Event::new(
+            run_id,
+            "context.served",
+            serde_json::json!({
+                "query_hash": "testhash",
+                "capsule_count": capsule_count,
+                "top_score": top_score,
+                "skipped": skipped,
+                "stage": "localization",
+            }),
+        );
+        projector::apply_events(conn, &[event]).expect("seed context.served");
+    }
+
+    #[test]
+    fn retrieval_stats_counts_hits_and_misses() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let (_paths, _config, conn) = crate::project::load_project(&root).expect("load");
+
+            // 2 hits (capsule_count >= 1, skipped=false)
+            seed_context_served(&conn, 3, 0.85, false);
+            seed_context_served(&conn, 1, 0.60, false);
+            // 1 miss (capsule_count == 0, skipped=true)
+            seed_context_served(&conn, 0, 0.0, true);
+            // 1 explicit skip (skipped=true but some top_score)
+            seed_context_served(&conn, 0, 0.10, true);
+
+            let report = compute_insights(&root, InsightsOptions::default()).expect("insights");
+            let rs = &report.retrieval;
+
+            assert_eq!(
+                rs.served, 4,
+                "served should count all context.served events"
+            );
+            assert_eq!(
+                rs.with_hit, 2,
+                "with_hit should count events with capsule_count>=1 and skipped=false"
+            );
+            let hr = rs.hit_rate.expect("hit_rate must be Some when served>0");
+            assert!(
+                (hr - 0.5).abs() < 1e-9,
+                "hit_rate should be 2/4 = 0.5; got {hr}"
+            );
+
+            // avg_top_score over hits only (0.85 + 0.60) / 2 = 0.725
+            let avg = rs
+                .avg_top_score
+                .expect("avg_top_score must be Some when hits exist");
+            assert!(
+                (avg - 0.725).abs() < 0.001,
+                "avg_top_score expected ~0.725; got {avg}"
+            );
+
+            // skip_rate: 2 skipped / 4 served = 0.5
+            let sr = report
+                .token_economy
+                .skip_rate
+                .expect("skip_rate must be Some when served>0");
+            assert!(
+                (sr - 0.5).abs() < 1e-9,
+                "skip_rate should be 2/4 = 0.5; got {sr}"
+            );
+        });
+    }
+
+    #[test]
+    fn retrieval_stats_no_context_served_events_returns_none() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // No context.served events — old-DB case.
+            let report = compute_insights(&root, InsightsOptions::default()).expect("insights");
+            let rs = &report.retrieval;
+
+            assert_eq!(rs.served, 0, "served must be 0 with no events");
+            assert_eq!(rs.with_hit, 0, "with_hit must be 0 with no events");
+            assert!(
+                rs.hit_rate.is_none(),
+                "hit_rate must be None when served==0"
+            );
+            assert!(
+                rs.avg_top_score.is_none(),
+                "avg_top_score must be None when no hits"
+            );
+            assert!(
+                report.token_economy.skip_rate.is_none(),
+                "skip_rate must be None when served==0"
+            );
+        });
+    }
+
+    #[test]
+    fn retrieval_stats_all_hits_skip_rate_zero() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let (_paths, _config, conn) = crate::project::load_project(&root).expect("load");
+
+            // 3 hits, no skips
+            seed_context_served(&conn, 2, 0.90, false);
+            seed_context_served(&conn, 5, 0.75, false);
+            seed_context_served(&conn, 1, 0.55, false);
+
+            let report = compute_insights(&root, InsightsOptions::default()).expect("insights");
+            let rs = &report.retrieval;
+
+            assert_eq!(rs.served, 3);
+            assert_eq!(rs.with_hit, 3);
+            let hr = rs.hit_rate.expect("hit_rate");
+            assert!(
+                (hr - 1.0).abs() < 1e-9,
+                "all hits → hit_rate = 1.0; got {hr}"
+            );
+
+            let sr = report
+                .token_economy
+                .skip_rate
+                .expect("skip_rate must be Some");
+            assert!(
+                (sr - 0.0).abs() < 1e-9,
+                "no skips → skip_rate = 0.0; got {sr}"
+            );
+        });
+    }
+
+    #[test]
+    fn log_telemetry_event_writes_context_served_to_db() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Write via log_telemetry_event (the helper used by the hook).
+            crate::project::log_telemetry_event(
+                &root,
+                "context.served",
+                serde_json::json!({
+                    "query_hash": "abc123",
+                    "capsule_count": 0,
+                    "top_score": 0.0,
+                    "skipped": true,
+                    "stage": "localization",
+                }),
+            )
+            .expect("log_telemetry_event must succeed");
+
+            let report = compute_insights(&root, InsightsOptions::default()).expect("insights");
+            let rs = &report.retrieval;
+            assert_eq!(rs.served, 1, "log_telemetry_event event must be counted");
+            assert_eq!(rs.with_hit, 0, "skipped event is not a hit");
+            assert!(rs.hit_rate.is_some());
+            assert!(
+                (rs.hit_rate.unwrap() - 0.0).abs() < 1e-9,
+                "0 hits / 1 served = 0.0"
             );
         });
     }

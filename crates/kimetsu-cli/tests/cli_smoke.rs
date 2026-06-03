@@ -10,7 +10,15 @@
 //! sets when running integration tests for a crate that defines a
 //! `[[bin]]`. No PATH hacks required.
 
-use std::process::Command;
+use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+// C7 hook tests use kimetsu_brain and kimetsu_core directly for project setup.
+// Both are direct [dependencies] of kimetsu-cli so they're available in
+// integration tests.
+use kimetsu_brain::project as brain_project;
+use kimetsu_core::ids::RunId;
 
 /// Path to the freshly-built `kimetsu` binary. Cargo injects
 /// `CARGO_BIN_EXE_<name>` for each `[[bin]]` declared in the crate
@@ -155,6 +163,112 @@ fn kimetsu_brain_insights_help_lists_args() {
             "brain insights --help should mention `{expected}`; got: {stdout}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// C7: context-hook miss-logging and env-var suppression
+// ---------------------------------------------------------------------------
+
+/// Helper: initialise a temp project dir and return its path.
+fn temp_project_dir(label: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("kimetsu-smoke-hook-{label}-{}", RunId::new()));
+    fs::create_dir_all(&root).expect("create temp dir");
+    kimetsu_core::paths::git_init_boundary(&root);
+    brain_project::init_project(&root, false).expect("init_project");
+    root
+}
+
+/// Count `context.served` events by running `kimetsu brain insights --json`
+/// and parsing the `retrieval.served` field.
+fn count_context_served_via_insights(bin: &str, root: &std::path::Path) -> u64 {
+    let out = Command::new(bin)
+        .args(["brain", "insights", "--json"])
+        .current_dir(root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn insights");
+    if !out.status.success() {
+        return 0;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    v.get("retrieval")
+        .and_then(|r| r.get("served"))
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0)
+}
+
+#[test]
+fn context_hook_miss_logs_context_served_event() {
+    // The hook should log a context.served event even when the brain
+    // returns zero capsules (the "miss" path). Use a prompt long enough
+    // to pass the 10-char guard.
+    let root = temp_project_dir("hook_miss");
+    let bin = kimetsu_bin();
+
+    let before = count_context_served_via_insights(bin, &root);
+
+    let mut child = Command::new(bin)
+        .args(["brain", "context-hook", "--workspace"])
+        .arg(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("KIMETSU_BRAIN_LOG_RETRIEVAL", "1") // explicitly ON
+        .env("KIMETSU_USER_BRAIN", "0") // disable user brain for isolation
+        .spawn()
+        .expect("spawn context-hook");
+
+    // Write a prompt long enough to pass the 10-char guard.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ =
+            stdin.write_all(br#"{"prompt": "investigate this failing test in the CI pipeline"}"#);
+    }
+    let _ = child.wait().expect("wait context-hook");
+
+    let after = count_context_served_via_insights(bin, &root);
+    assert!(
+        after > before,
+        "context-hook should log at least one context.served event on a miss; \
+         before={before}, after={after} in {:?}",
+        root
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_suppressed_when_env_var_zero() {
+    let root = temp_project_dir("hook_suppress");
+    let bin = kimetsu_bin();
+
+    let before = count_context_served_via_insights(bin, &root);
+
+    let mut child = Command::new(bin)
+        .args(["brain", "context-hook", "--workspace"])
+        .arg(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("KIMETSU_BRAIN_LOG_RETRIEVAL", "0") // SUPPRESSED
+        .env("KIMETSU_USER_BRAIN", "0")
+        .spawn()
+        .expect("spawn context-hook suppressed");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ =
+            stdin.write_all(br#"{"prompt": "investigate this failing test in the CI pipeline"}"#);
+    }
+    let _ = child.wait().expect("wait context-hook suppressed");
+
+    let after = count_context_served_via_insights(bin, &root);
+    assert_eq!(
+        after, before,
+        "KIMETSU_BRAIN_LOG_RETRIEVAL=0 should suppress context.served logging; \
+         before={before}, after={after} in {:?}",
+        root
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

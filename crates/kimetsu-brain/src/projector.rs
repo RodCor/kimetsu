@@ -111,7 +111,7 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     Ok(())
 }
 
-fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+pub(crate) fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let payload = serde_json::to_string(&event.payload)?;
     conn.execute(
         "

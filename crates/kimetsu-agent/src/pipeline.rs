@@ -278,7 +278,21 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         CodingStage::Localization,
         &localization_context,
     )?;
+    emit_context_served(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::Localization,
+        &localization_context,
+    )?;
     emit_context_injected(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::PatchPlan,
+        &patch_context,
+    )?;
+    emit_context_served(
         &mut writer,
         &mut events,
         run_id,
@@ -1729,6 +1743,44 @@ fn emit_context_injected(
                 "file_paths": file_paths,
                 "used_tokens": bundle.used_tokens,
                 "capsule_count": bundle.capsules.len(),
+            }),
+        ),
+    )
+}
+
+/// C7: emit a `context.served` event so the analytics module can compute
+/// retrieval hit-rate, avg top score, and skip-rate over pipeline runs.
+/// Called alongside `emit_context_injected` for each retrieved bundle.
+fn emit_context_served(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_id: RunId,
+    stage: CodingStage,
+    bundle: &ContextBundle,
+) -> KimetsuResult<()> {
+    // Hash the capsule_handles as a proxy for the "query" — the pipeline
+    // doesn't expose the raw query text here, but a deterministic hash of
+    // the bundle handles gives a correlatable fingerprint without storing
+    // raw task text.
+    let handle_concat: String = bundle
+        .capsules
+        .iter()
+        .map(|c| c.expansion_handle.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    let query_hash = blake3::hash(handle_concat.as_bytes()).to_hex().to_string();
+    emit(
+        writer,
+        events,
+        Event::new(
+            run_id,
+            "context.served",
+            serde_json::json!({
+                "query_hash": query_hash,
+                "capsule_count": bundle.capsules.len(),
+                "top_score": bundle.top_score,
+                "skipped": bundle.skipped,
+                "stage": stage.as_str(),
             }),
         ),
     )
