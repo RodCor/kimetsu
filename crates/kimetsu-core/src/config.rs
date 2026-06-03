@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
+use crate::{KIMETSU_CONFIG_VERSION, KimetsuResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -29,7 +29,7 @@ impl ProjectConfig {
         Self {
             kimetsu: KimetsuSection {
                 project_id: project_id.into(),
-                schema_version: KIMETSU_SCHEMA_VERSION,
+                schema_version: KIMETSU_CONFIG_VERSION,
             },
             model: ModelSection::default(),
             broker: BrokerSection::default(),
@@ -379,6 +379,16 @@ max_total_cost_usd = 250.0
         assert_eq!(config.learning.distiller.model, "claude-haiku-4-5");
         assert_eq!(config.learning.distiller.api_key_env, "ANTHROPIC_API_KEY");
         assert_eq!(config.learning.distiller.base_url_env, "ANTHROPIC_BASE_URL");
+    }
+
+    /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
+    /// project.toml format version), NOT KIMETSU_SCHEMA_VERSION (the brain.db
+    /// schema). The two constants are intentionally decoupled so a DB-schema
+    /// bump does not force every project.toml to be rewritten.
+    #[test]
+    fn default_config_uses_config_version_not_schema_version() {
+        let cfg = ProjectConfig::default_for_project("p1");
+        assert_eq!(cfg.kimetsu.schema_version, crate::KIMETSU_CONFIG_VERSION);
     }
 
     /// `model set` writes the whole config back via `to_toml`; a

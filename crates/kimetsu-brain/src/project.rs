@@ -7,7 +7,7 @@ use kimetsu_core::event::Event;
 use kimetsu_core::ids::RunId;
 use kimetsu_core::memory::{MemoryKind, MemoryScope, normalize_memory_text};
 use kimetsu_core::paths::{ProjectPaths, default_project_id};
-use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
+use kimetsu_core::{KIMETSU_CONFIG_VERSION, KimetsuResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use ulid::Ulid;
 
@@ -188,10 +188,10 @@ pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
 pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
     let paths = ProjectPaths::discover(start)?;
     let config = load_config(&paths)?;
-    if config.kimetsu.schema_version != KIMETSU_SCHEMA_VERSION {
+    if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
         return Err(format!(
             "project.toml schema version {} does not match expected {}",
-            config.kimetsu.schema_version, KIMETSU_SCHEMA_VERSION
+            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
         )
         .into());
     }
@@ -206,10 +206,10 @@ pub fn load_project_readonly(
 ) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
     let paths = ProjectPaths::discover(start)?;
     let config = load_config(&paths)?;
-    if config.kimetsu.schema_version != KIMETSU_SCHEMA_VERSION {
+    if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
         return Err(format!(
             "project.toml schema version {} does not match expected {}",
-            config.kimetsu.schema_version, KIMETSU_SCHEMA_VERSION
+            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
         )
         .into());
     }
@@ -3239,6 +3239,78 @@ mod tests {
                 .expect_err("invalid resolution should error");
             assert!(format!("{err}").contains("invalid conflict resolution"));
 
+            fs::remove_dir_all(root).expect("remove temp project");
+        });
+    }
+
+    /// A1: project.toml load gate is keyed to KIMETSU_CONFIG_VERSION, not
+    /// KIMETSU_SCHEMA_VERSION. A config with schema_version =
+    /// KIMETSU_CONFIG_VERSION + 1 must be REJECTED by load_project, proving
+    /// the gate is active and uses the config constant (not the DB constant).
+    /// When both constants are 1 this also demonstrates that the value of 1
+    /// is the correct expected value.
+    #[test]
+    fn load_project_rejects_future_config_version() {
+        with_user_brain_disabled(|| {
+            use kimetsu_core::KIMETSU_CONFIG_VERSION;
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            // Write a project.toml with an unsupported (future) config version.
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root)
+                .expect("discover paths after git_init_boundary");
+            fs::create_dir_all(&paths.kimetsu_dir).expect("create .kimetsu dir");
+            let bad_version = KIMETSU_CONFIG_VERSION + 1;
+            let toml_str = format!(
+                r#"
+[kimetsu]
+project_id = "test-config-gate"
+schema_version = {bad_version}
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#
+            );
+            fs::write(&paths.project_toml, &toml_str).expect("write bad project.toml");
+            let err = load_project(&root).expect_err("future config version must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&bad_version.to_string()),
+                "error message should mention the bad version; got: {msg}"
+            );
+            assert!(
+                msg.contains(&KIMETSU_CONFIG_VERSION.to_string()),
+                "error message should mention the expected version; got: {msg}"
+            );
             fs::remove_dir_all(root).expect("remove temp project");
         });
     }
