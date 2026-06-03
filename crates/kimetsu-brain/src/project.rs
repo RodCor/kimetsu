@@ -196,6 +196,7 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
         .into());
     }
 
+    schema::ensure_vec_extension_registered();
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
     Ok((paths, config, conn))
@@ -223,6 +224,7 @@ pub fn load_project_readonly(
         .into());
     }
 
+    schema::ensure_vec_extension_registered();
     let conn = Connection::open_with_flags(&paths.brain_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     schema::validate(&conn)?;
     Ok((paths, config, conn))

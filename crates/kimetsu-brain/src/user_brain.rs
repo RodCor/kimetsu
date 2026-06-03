@@ -58,6 +58,7 @@ pub fn open_user_brain() -> KimetsuResult<Option<Connection>> {
     };
     fs::create_dir_all(&dir)?;
     let db_path = dir.join("brain.db");
+    schema::ensure_vec_extension_registered();
     let conn = Connection::open(&db_path)?;
     schema::initialize(&conn)?;
     Ok(Some(conn))
@@ -77,6 +78,7 @@ pub fn open_user_brain_readonly() -> KimetsuResult<Option<Connection>> {
     if !db_path.exists() {
         return Ok(None);
     }
+    schema::ensure_vec_extension_registered();
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     match schema::validate(&conn) {
         Ok(()) => {}
