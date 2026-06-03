@@ -1,8 +1,18 @@
 use rusqlite::Connection;
 
-use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
+use kimetsu_core::KimetsuResult;
 
 pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
+    create_baseline(conn)?;
+    crate::migrate::run_migrations(conn)?;
+    Ok(())
+}
+
+/// Create the baseline v1 schema (pragmas + all tables/indexes/FTS as of the
+/// original v1 shape). Seeds `schema_info` with version **1** so the migration
+/// runner knows where to start. On an existing DB every CREATE is a no-op
+/// (`IF NOT EXISTS`).
+fn create_baseline(conn: &Connection) -> KimetsuResult<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
 
@@ -118,7 +128,17 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             USING fts5(memory_id UNINDEXED, text, kind, scope);
         ",
     )?;
+    Ok(())
+}
 
+/// The v1→v2 migration: folds every historical in-place patch
+/// (additive columns, citations/conflicts tables, FTS reshapes) into one
+/// idempotent step. Real-world DBs were all stamped v1, so this brings
+/// them — and freshly-created baselines — to the v2 shape.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner. Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
     // In-place column additions for v0.1 brain.db files predating each
     // column. Each ALTER is idempotent: we ignore the duplicate-column error
     // so an upgraded binary opens an older brain.db without forcing a
@@ -244,24 +264,11 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     )?;
     ensure_memories_fts_shape(conn)?;
     ensure_repo_manifests_fts_shape(conn)?;
-
-    let schema_version: i64 = conn.query_row(
-        "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    if schema_version != KIMETSU_SCHEMA_VERSION {
-        return Err(format!(
-            "brain.db schema version {schema_version} does not match expected {KIMETSU_SCHEMA_VERSION}; run `kimetsu brain rebuild`"
-        )
-        .into());
-    }
-
     Ok(())
 }
 
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
+    use kimetsu_core::KIMETSU_SCHEMA_VERSION;
     let schema_version: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
         [],
@@ -345,4 +352,138 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> KimetsuResu
         }
     }
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate;
+    use rusqlite::Connection;
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("query_map")
+            .map(|r| r.expect("row"))
+            .collect()
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    // ------------------------------------------------------------------
+    // 1. Fresh init reaches v2 with full shape
+    // ------------------------------------------------------------------
+    #[test]
+    fn fresh_init_reaches_v2_with_full_shape() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("initialize");
+
+        // Version must be 2.
+        assert_eq!(
+            migrate::current_version(&conn).expect("current_version"),
+            2,
+            "fresh DB must be at schema version 2 after initialize"
+        );
+
+        // Post-migration columns exist on `memories`.
+        let mem_cols = column_names(&conn, "memories");
+        assert!(
+            mem_cols.contains(&"embedding".to_string()),
+            "memories must have `embedding` column"
+        );
+        assert!(
+            mem_cols.contains(&"embedding_model".to_string()),
+            "memories must have `embedding_model` column"
+        );
+        assert!(
+            mem_cols.contains(&"last_useful_at".to_string()),
+            "memories must have `last_useful_at` column"
+        );
+
+        // Tables added by the migration exist.
+        assert!(
+            table_exists(&conn, "memory_citations"),
+            "memory_citations table must exist"
+        );
+        assert!(
+            table_exists(&conn, "memory_conflicts"),
+            "memory_conflicts table must exist"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Idempotent re-run: run_migrations again after initialize is a no-op
+    // ------------------------------------------------------------------
+    #[test]
+    fn idempotent_rerun_preserves_data() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("initialize");
+
+        // Insert a memories row.
+        conn.execute_batch(
+            "INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text,
+                confidence, provenance_snapshot_json, created_at,
+                use_count, usefulness_score
+             ) VALUES (
+                'mem-1', 'test', 'fact', 'hello world', 'hello world',
+                0.9, '{}', '2024-01-01T00:00:00Z',
+                0, 0.0
+             );",
+        )
+        .expect("insert row");
+
+        // Re-run migrations — must be a no-op at target.
+        let outcome = migrate::run_migrations(&conn).expect("second run_migrations");
+        assert_eq!(
+            outcome.applied,
+            Vec::<i64>::new(),
+            "second run_migrations must apply nothing"
+        );
+        assert_eq!(
+            migrate::current_version(&conn).expect("current_version"),
+            2,
+            "version must still be 2"
+        );
+
+        // Data must be intact.
+        let text: String = conn
+            .query_row(
+                "SELECT text FROM memories WHERE memory_id = 'mem-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row must survive");
+        assert_eq!(text, "hello world");
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Idempotent initialize: calling initialize twice succeeds, version stays 2
+    // ------------------------------------------------------------------
+    #[test]
+    fn idempotent_initialize_twice() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("first initialize");
+        initialize(&conn).expect("second initialize must not error");
+        assert_eq!(
+            migrate::current_version(&conn).expect("current_version"),
+            2,
+            "version must still be 2 after double initialize"
+        );
+    }
 }

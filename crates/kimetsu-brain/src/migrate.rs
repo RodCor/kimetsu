@@ -22,13 +22,17 @@ pub struct MigrationOutcome {
     pub backup_path: Option<PathBuf>,
 }
 
-/// The ordered migration set. EMPTY until A3 adds the v1→v2 migration.
+/// The ordered migration set.
 ///
 /// Invariant (debug-asserted in `run_with`): versions strictly ascending and
 /// contiguous starting at 2 (version 1 is the baseline `CREATE`, not a
 /// migration step).
 fn migrations() -> &'static [Migration] {
-    &[]
+    &[Migration {
+        version: 2,
+        description: "fold additive columns, citations/conflicts tables, and FTS reshapes",
+        up: crate::schema::migrate_v1_to_v2,
+    }]
 }
 
 /// Return the code's compile-time target schema version.
