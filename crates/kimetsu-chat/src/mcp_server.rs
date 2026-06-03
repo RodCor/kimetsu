@@ -948,11 +948,10 @@ fn kimetsu_brain_memory_top(workspace: &Path, arguments: &Value) -> Result<Value
 fn kimetsu_brain_memory_add(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let scope = MemoryScope::from_str(&string_arg(arguments, "scope")?)?;
     let kind = MemoryKind::from_str(
-        &arguments
+        arguments
             .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or("fact")
-            .to_string(),
+            .unwrap_or("fact"),
     )?;
     let text = string_arg(arguments, "text")?;
     let memory_id = project::add_memory(workspace, scope, kind, &text)

@@ -1854,7 +1854,7 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
         *domain_counts.entry(domain).or_insert(0) += 1;
     }
     let mut domain_list: Vec<(String, usize)> = domain_counts.into_iter().collect();
-    domain_list.sort_by(|a, b| b.1.cmp(&a.1));
+    domain_list.sort_by_key(|b| std::cmp::Reverse(b.1));
     let top_domains: Vec<String> = domain_list
         .iter()
         .take(6)
@@ -2153,7 +2153,7 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         // Strip the "scope:kind - " prefix from the summary for readability
         let text = capsule
             .summary
-            .splitn(3, " - ")
+            .split(" - ")
             .nth(1)
             .unwrap_or(&capsule.summary);
         additional_context.push('\n');
@@ -2573,7 +2573,7 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
 
     let body = capsule
         .summary
-        .splitn(3, " - ")
+        .split(" - ")
         .nth(1)
         .unwrap_or(&capsule.summary);
     let header = proactive_header(event, loop_mode);

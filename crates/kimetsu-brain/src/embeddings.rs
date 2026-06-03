@@ -23,8 +23,8 @@
 //! Wire compatibility:
 //!   * Embeddings are nullable. Pre-v0.4.2 rows have NULL embedding
 //!     + NULL embedding_model. The retrieval blender treats them as
-//!     "lexical-only" — they still score via FTS, they just don't
-//!     contribute to the cosine term.
+//!       "lexical-only" — they still score via FTS, they just don't
+//!       contribute to the cosine term.
 //!   * The `embedding_model` column carries an opaque string id
 //!     ("bge-small-en-v1.5", "stub-d8", etc.). Queries blend only
 //!     when the query's embedder id matches the row's stored id,
@@ -610,7 +610,7 @@ pub fn encode_embedding(vec: &[f32]) -> Vec<u8> {
 /// Decode a BLOB back into a float vector. Optionally validates the
 /// expected dimension; pass `None` to accept any length.
 pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuResult<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
         return Err(format!("embedding blob length {} not a multiple of 4", bytes.len()).into());
     }
     let dim = bytes.len() / 4;

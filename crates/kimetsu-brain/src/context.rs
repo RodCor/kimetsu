@@ -2189,7 +2189,7 @@ mod tests {
         let mem_order: Vec<&str> = bundle
             .capsules
             .iter()
-            .filter_map(|c| c.expansion_handle.strip_prefix("memory:").map(|s| s))
+            .filter_map(|c| c.expansion_handle.strip_prefix("memory:"))
             .collect();
         assert_eq!(
             mem_order.first().copied(),
@@ -2241,8 +2241,10 @@ mod tests {
         }
 
         // Disable decay via broker config.
-        let mut weights = kimetsu_core::config::BrokerWeights::default();
-        weights.decay_half_life_days = 0.0;
+        let weights = kimetsu_core::config::BrokerWeights {
+            decay_half_life_days: 0.0,
+            ..Default::default()
+        };
 
         let bundle = retrieve_context_with_embedder(
             &conn,

@@ -25,6 +25,7 @@ pub(crate) fn ensure_vec_extension_registered() {
             // three-argument xEntryPoint signature expected by
             // sqlite3_auto_extension — this is the pattern from the
             // sqlite-vec crate's own tests and is safe on all supported targets.
+            #[allow(clippy::missing_transmute_annotations)]
             unsafe {
                 rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
                     sqlite_vec::sqlite3_vec_init as *const (),

@@ -273,7 +273,7 @@ fn collect_recent_files(workspace: &Path, limit: usize, budget: Duration) -> Vec
         }
         candidates.push((mtime, rel));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
     candidates
         .into_iter()
         .take(limit)

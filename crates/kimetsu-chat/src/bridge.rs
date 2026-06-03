@@ -34,9 +34,10 @@ impl BridgeTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PluginMode {
+    #[default]
     Optional,
     Required,
 }
@@ -58,18 +59,13 @@ impl PluginMode {
     }
 }
 
-impl Default for PluginMode {
-    fn default() -> Self {
-        Self::Optional
-    }
-}
-
 /// Where the plugin surface is installed: the current workspace
 /// (`.claude/`, `.codex/`, `.mcp.json`) or the user's home directory
 /// (`~/.claude/`, `~/.claude.json`, `~/.codex/`) for all sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstallScope {
+    #[default]
     Workspace,
     Global,
 }
@@ -88,12 +84,6 @@ impl InstallScope {
             Self::Workspace => "workspace",
             Self::Global => "global",
         }
-    }
-}
-
-impl Default for InstallScope {
-    fn default() -> Self {
-        Self::Workspace
     }
 }
 
@@ -855,6 +845,7 @@ const CLAUDE_MD_END: &str = "<!-- kimetsu:end -->";
 ///   * missing file   -> write the block
 ///   * markers absent  -> append the block after the user's content
 ///   * markers present -> replace just the marked region (upgrade in place)
+///
 /// Used for both the workspace `.claude/CLAUDE.md` and the global
 /// `~/.claude/CLAUDE.md`.
 fn merge_claude_md(path: &Path) -> Result<(), String> {
@@ -1687,7 +1678,7 @@ mod tests {
     fn merge_claude_md_tolerates_bom() {
         let root = temp_root("claude_md_bom");
         let p = root.join("CLAUDE.md");
-        fs::write(&p, format!("\u{feff}# My rules\n")).unwrap();
+        fs::write(&p, "\u{feff}# My rules\n").unwrap();
         merge_claude_md(&p).unwrap();
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("# My rules"));
