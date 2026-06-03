@@ -224,6 +224,65 @@ kimetsu brain memory top          # most useful memories so far
 
 ---
 
+## 5-minute quickstart — prove it works
+
+**Step 1: Install**
+
+```bash
+cargo install kimetsu-cli           # lean build (FTS retrieval)
+# or with semantic search:
+cargo install kimetsu-cli --features embeddings
+```
+
+**Step 2: Wire it into your host agent**
+
+```bash
+cd /your/project
+kimetsu init                                 # creates .kimetsu/project.toml + brain.db
+kimetsu plugin install claude --workspace .  # Claude Code: writes .mcp.json + hooks
+# or:
+kimetsu plugin install codex --workspace .   # Codex: writes .codex/ config + hooks
+```
+
+**Step 3: Verify the brain is working**
+
+```bash
+kimetsu doctor --selftest
+# prints: ✓ recorded a memory and retrieved it — the brain works
+```
+
+**Step 4: Record your first memory**
+
+From the command line:
+
+```bash
+kimetsu brain memory add --scope project --kind convention "Use cargo nextest for all test runs"
+```
+
+Or let the agent record it — inside Claude Code or Codex, the agent calls
+`kimetsu_brain_record` after any non-trivial solve. The Stop hook prints a
+summary at the end of each session.
+
+**Step 5: Retrieve it**
+
+```bash
+kimetsu brain search "test runs"          # lexical FTS search
+kimetsu brain context "how do I run tests?"  # broker-ranked context bundle
+kimetsu brain memory top                  # most-useful memories by score
+kimetsu brain insights                    # effectiveness analytics
+```
+
+From this point your agent automatically retrieves the top context capsules
+before each task. Cite a memory to give it a +1 usefulness signal;
+memories the agent never reaches for decay slowly and can be pruned
+with `kimetsu brain memory prune`.
+
+**Troubleshoot:** `kimetsu doctor` checks paths, brain.db schema, embedder,
+MCP wiring, and installed hooks. `kimetsu doctor --selftest` is the one-shot
+"confirm it works end-to-end" check.
+
+---
+
 ## What's in the box
 
 | Surface | What it is |

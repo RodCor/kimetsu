@@ -100,6 +100,12 @@ struct DoctorArgs {
     /// sandbox where spawning is disallowed.
     #[arg(long)]
     skip_mcp: bool,
+    /// Run a hermetic end-to-end self-test: record a sample memory in a
+    /// throwaway temp project, retrieve it by FTS query, and report
+    /// PASS/FAIL. Works on both lean and embeddings builds. Does not
+    /// touch the real workspace brain.
+    #[arg(long)]
+    selftest: bool,
 }
 
 #[derive(Debug, Args)]
@@ -864,6 +870,10 @@ fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
 ///   1 — at least one Fail.
 ///   2 — internal doctor error (couldn't even run the checks).
 fn doctor_cmd(args: DoctorArgs) -> KimetsuResult<()> {
+    // D4: --selftest runs a hermetic round-trip and exits early.
+    if args.selftest {
+        return doctor::run_selftest();
+    }
     let opts = doctor::DoctorOptions {
         json: args.json,
         skip_mcp: args.skip_mcp,
@@ -1359,8 +1369,54 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
             print!("{}", project::config_text(&env::current_dir()?)?);
             Ok(())
         }
-        ConfigCommand::Edit => not_implemented("config edit"),
+        ConfigCommand::Edit => {
+            let cwd = env::current_dir()?;
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&cwd)?;
+            config_edit_with(&paths.project_toml, |path| {
+                // Resolve the editor: $EDITOR, then $VISUAL, then platform default.
+                let editor = env::var("EDITOR")
+                    .or_else(|_| env::var("VISUAL"))
+                    .unwrap_or_else(|_| {
+                        if cfg!(windows) {
+                            "notepad".to_string()
+                        } else {
+                            "vi".to_string()
+                        }
+                    });
+                let status = std::process::Command::new(&editor).arg(path).status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "editor `{editor}` exited with non-zero status: {status}"
+                    )))
+                }
+            })
+        }
     }
+}
+
+/// Testable seam for `config edit`. Opens the config file at `toml_path`
+/// via the `edit` closure (which is either the real editor launch or a
+/// test-injected closure that mutates the file), then re-parses the
+/// result to catch syntax errors before returning.
+///
+/// Returns `Err` with a clear message if the editor fails or if the
+/// resulting TOML is invalid. Prints a confirmation on success.
+fn config_edit_with(
+    toml_path: &std::path::Path,
+    edit: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> KimetsuResult<()> {
+    edit(toml_path).map_err(|err| format!("config edit: editor failed: {err}"))?;
+
+    // Re-parse to catch syntax errors.
+    let content = std::fs::read_to_string(toml_path)
+        .map_err(|err| format!("config edit: could not read {}: {err}", toml_path.display()))?;
+    project::load_config_from_text(&content)
+        .map_err(|err| format!("config edit: saved file has invalid TOML — {err}"))?;
+
+    println!("config saved: {}", toml_path.display());
+    Ok(())
 }
 
 fn brain(command: BrainCommand) -> KimetsuResult<()> {
@@ -3221,7 +3277,11 @@ fn run_command(command: RunCommand) -> KimetsuResult<()> {
             println!("trace: {}", result.trace_path.display());
             Ok(())
         }
-        RunCommand::Abort { run_id: _ } => not_implemented("run abort"),
+        RunCommand::Abort { run_id } => {
+            project::abort_run(&env::current_dir()?, &run_id)?;
+            println!("run aborted: {run_id}");
+            Ok(())
+        }
     }
 }
 
@@ -3337,11 +3397,6 @@ fn lock(command: LockCommand) -> KimetsuResult<()> {
             Ok(())
         }
     }
-}
-
-fn not_implemented(feature: &str) -> KimetsuResult<()> {
-    println!("{feature} is planned but not implemented in phase 0");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3680,5 +3735,112 @@ mod tests {
         assert!(should_emit_stop_harvest_cue(true, false));
         assert!(!should_emit_stop_harvest_cue(true, true));
         assert!(!should_emit_stop_harvest_cue(false, false));
+    }
+
+    // ── D2a: config_edit_with ─────────────────────────────────────────────────
+
+    fn test_project_root(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("kimetsu-cli-d2-{label}-{nanos}"));
+        kimetsu_core::paths::git_init_boundary(&root);
+        root
+    }
+
+    #[test]
+    fn config_edit_with_valid_edit_is_accepted() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = test_project_root("config-edit-ok");
+            fs::create_dir_all(&root).expect("mkdir");
+            project::init_project(&root, false).expect("init");
+
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+            let toml_path = paths.project_toml.clone();
+
+            // Edit: append a TOML comment (valid, no semantic change).
+            let result = config_edit_with(&toml_path, |path| {
+                let mut existing = std::fs::read_to_string(path)?;
+                existing.push_str("\n# kimetsu-cli test comment\n");
+                std::fs::write(path, existing)
+            });
+            assert!(result.is_ok(), "valid edit should succeed: {result:?}");
+
+            // Confirm the comment is present.
+            let content = fs::read_to_string(&toml_path).expect("read");
+            assert!(
+                content.contains("kimetsu-cli test comment"),
+                "comment should be persisted"
+            );
+
+            fs::remove_dir_all(root).ok();
+        });
+    }
+
+    #[test]
+    fn config_edit_with_broken_toml_returns_err() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = test_project_root("config-edit-bad");
+            fs::create_dir_all(&root).expect("mkdir");
+            project::init_project(&root, false).expect("init");
+
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+            let toml_path = paths.project_toml.clone();
+
+            // Edit: write invalid TOML.
+            let result = config_edit_with(&toml_path, |path| {
+                std::fs::write(path, "this = [[[not valid toml}}}}")
+            });
+            assert!(result.is_err(), "invalid TOML should return Err");
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("invalid TOML") || msg.contains("TOML"),
+                "error should mention TOML, got: {msg}"
+            );
+
+            fs::remove_dir_all(root).ok();
+        });
+    }
+
+    // ── D2b: run abort via CLI ────────────────────────────────────────────────
+
+    #[test]
+    fn run_abort_cli_stamps_terminal_kind() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            use kimetsu_brain::projector;
+            use kimetsu_core::event::Event;
+
+            let root = test_project_root("run-abort");
+            fs::create_dir_all(&root).expect("mkdir");
+            project::init_project(&root, false).expect("init");
+
+            // Create a dangling run.
+            let run_id = {
+                let (paths, _config, conn) = project::load_project(&root).expect("load");
+                let run_id = RunId::new();
+                let (mut writer, _) =
+                    kimetsu_brain::trace::TraceWriter::create(&paths, run_id).expect("trace");
+                let started = Event::new(
+                    run_id,
+                    "run.started",
+                    serde_json::json!({"project_id": "test", "task": "dangling"}),
+                );
+                writer.append(&started, true).expect("append");
+                projector::apply_events(&conn, &[started]).expect("project");
+                run_id
+            };
+
+            // Abort via the project helper (the CLI dispatches here).
+            project::abort_run(&root, &run_id.to_string()).expect("abort_run");
+
+            // Confirm terminal_kind.
+            let run = project::show_run(&root, &run_id.to_string())
+                .expect("show_run")
+                .expect("run exists");
+            assert_eq!(run.terminal_kind.as_deref(), Some("run.aborted"));
+
+            fs::remove_dir_all(root).ok();
+        });
     }
 }

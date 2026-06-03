@@ -356,6 +356,12 @@ pub fn load_config(paths: &ProjectPaths) -> KimetsuResult<ProjectConfig> {
     ProjectConfig::from_toml(&content)
 }
 
+/// D2: Parse a project config from raw TOML text. Used by `config edit`
+/// to validate the file the user just saved before confirming success.
+pub fn load_config_from_text(toml: &str) -> KimetsuResult<ProjectConfig> {
+    ProjectConfig::from_toml(toml)
+}
+
 pub fn config_text(start: &Path) -> KimetsuResult<String> {
     let paths = ProjectPaths::discover(start)?;
     Ok(fs::read_to_string(paths.project_toml)?)
@@ -1869,6 +1875,74 @@ fn config_hash(path: &Path) -> KimetsuResult<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// D2: Abort a dangling run — cleanly finalize a run that has no terminal
+/// event (e.g. the process was killed mid-way). Steps:
+///
+/// 1. Validate the run_id exists in `runs`.
+/// 2. Error if the run already has a `terminal_kind` (already finished/failed/aborted).
+/// 3. Append a `run.aborted` event to the run's trace.
+/// 4. Project it (updates `runs.ended_at` + `terminal_kind`).
+/// 5. Clear any stale writer lock so subsequent commands can proceed.
+///
+/// Returns the trace path on success. Errors if the run is unknown or already terminal.
+pub fn abort_run(start: &Path, run_id_str: &str) -> KimetsuResult<()> {
+    // 1. Validate the run_id exists + check terminal state (read-only query).
+    {
+        let (_paths, _config, ro_conn) = load_project_readonly(start)?;
+        let row: Option<Option<String>> = ro_conn
+            .query_row(
+                "SELECT terminal_kind FROM runs WHERE run_id = ?1",
+                rusqlite::params![run_id_str],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        match row {
+            None => {
+                return Err(format!("run abort: unknown run_id `{run_id_str}`").into());
+            }
+            Some(Some(terminal_kind)) => {
+                return Err(format!(
+                    "run abort: run `{run_id_str}` is already terminal ({})",
+                    terminal_kind
+                )
+                .into());
+            }
+            Some(None) => {} // dangling — proceed
+        }
+    }
+
+    // 2. Parse the run_id as a RunId.
+    let run_id: RunId = run_id_str
+        .parse::<ulid::Ulid>()
+        .map(RunId)
+        .map_err(|_| format!("run abort: `{run_id_str}` is not a valid ULID run id"))?;
+
+    // 3. Open rw, append run.aborted, project it.
+    let (paths, _config, conn) = load_project(start)?;
+    let lock = ProjectLock::acquire(&paths, "run abort", Some(run_id))?;
+
+    // Open the trace in append mode (create_dirs is idempotent).
+    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
+
+    let aborted_event = Event::new(
+        run_id,
+        "run.aborted",
+        serde_json::json!({
+            "reason": "manual_abort_via_cli",
+        }),
+    );
+    writer.append(&aborted_event, true)?;
+    projector::apply_events(&conn, &[aborted_event])?;
+
+    // 4. Release the write lock acquired above, then force-clear any
+    //    additional stale lock file that may have been left by a
+    //    previously killed process (clear_force is idempotent).
+    lock.release()?;
+    crate::lock::clear_force(&paths)?;
+
+    Ok(())
+}
+
 /// C7: best-effort telemetry write from a hook context (no active run).
 ///
 /// Appends a single event (e.g. `context.served`) directly to the project
@@ -3354,6 +3428,105 @@ max_total_cost_usd = 250.0
                 "error message should mention the expected version; got: {msg}"
             );
             fs::remove_dir_all(root).expect("remove temp project");
+        });
+    }
+
+    // ── D2: abort_run ──────────────────────────────────────────────────────────
+
+    /// Helper: create a dangling run (run.started only, no terminal event).
+    fn make_dangling_run(root: &std::path::Path) -> RunId {
+        let (paths, _config, conn) = load_project(root).expect("load project");
+        let run_id = RunId::new();
+        let (mut writer, _) = TraceWriter::create(&paths, run_id).expect("create trace");
+        let started = Event::new(
+            run_id,
+            "run.started",
+            serde_json::json!({"project_id": "test", "task": "dangling task"}),
+        );
+        writer.append(&started, true).expect("append started");
+        projector::apply_events(&conn, &[started]).expect("project started");
+        run_id
+    }
+
+    #[test]
+    fn abort_run_stamps_aborted_and_frees_lock() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("mkdir");
+            init_project(&root, false).expect("init");
+
+            let run_id = make_dangling_run(&root);
+
+            // Abort it.
+            abort_run(&root, &run_id.to_string()).expect("abort_run");
+
+            // The run should now have terminal_kind = "run.aborted".
+            let run = show_run(&root, &run_id.to_string())
+                .expect("show_run")
+                .expect("run exists");
+            assert_eq!(
+                run.terminal_kind.as_deref(),
+                Some("run.aborted"),
+                "terminal_kind should be run.aborted"
+            );
+
+            // Lock should be absent (clear_force ran).
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+            assert!(
+                !paths.lock_file.exists(),
+                "lock file should not exist after abort"
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    #[test]
+    fn abort_run_already_finished_returns_err() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("mkdir");
+            init_project(&root, false).expect("init");
+
+            // Use add_memory which creates a run.started + run.finished.
+            add_memory(&root, MemoryScope::Project, MemoryKind::Fact, "some fact")
+                .expect("add memory");
+
+            let runs = list_runs(&root).expect("list runs");
+            assert!(!runs.is_empty(), "should have at least one run");
+            let finished_run = runs
+                .iter()
+                .find(|r| r.terminal_kind.is_some())
+                .expect("should have a finished run");
+
+            let err = abort_run(&root, &finished_run.run_id)
+                .expect_err("aborting a finished run should error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("already terminal"),
+                "error should mention 'already terminal', got: {msg}"
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    #[test]
+    fn abort_run_unknown_id_returns_err() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("mkdir");
+            init_project(&root, false).expect("init");
+
+            let fake_id = RunId::new().to_string();
+            let err = abort_run(&root, &fake_id).expect_err("aborting an unknown run should error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("unknown run_id"),
+                "error should mention 'unknown run_id', got: {msg}"
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
         });
     }
 }

@@ -465,6 +465,76 @@ fn check_hooks_installed(workspace: &Path) -> CheckReport {
     }
 }
 
+/// D4: `kimetsu doctor --selftest` — hermetic end-to-end round-trip.
+///
+/// Exercises the full record → retrieve path in a throw-away temp project:
+///
+/// 1. Create an isolated temp dir with its own `git init` boundary.
+/// 2. Init a kimetsu project there.
+/// 3. Record a sample memory with a distinctive text.
+/// 4. Query the brain for that text via FTS retrieval.
+/// 5. Confirm the memory comes back (matched by substring).
+/// 6. Print "✓ recorded a memory and retrieved it — the brain works".
+/// 7. Delete the temp dir.
+///
+/// Works on both lean (FTS-only) and `--features embeddings` builds.
+/// Does NOT touch the real workspace brain or user brain.
+/// Exits non-zero (returns `Err`) on any failure.
+pub fn run_selftest() -> KimetsuResult<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir().join(format!("kimetsu-selftest-{nanos}"));
+    std::fs::create_dir_all(&tmp)?;
+    kimetsu_core::paths::git_init_boundary(&tmp);
+
+    let result = run_selftest_in(&tmp);
+
+    // Always clean up, even on failure.
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    match result {
+        Ok(()) => {
+            println!("✓ recorded a memory and retrieved it — the brain works");
+            Ok(())
+        }
+        Err(err) => Err(format!("kimetsu doctor --selftest FAILED: {err}").into()),
+    }
+}
+
+fn run_selftest_in(root: &Path) -> KimetsuResult<()> {
+    // Disable user-brain so the selftest never touches ~/.kimetsu.
+    kimetsu_brain::user_brain::with_user_brain_disabled(|| run_selftest_isolated(root))
+}
+
+fn run_selftest_isolated(root: &Path) -> KimetsuResult<()> {
+    use kimetsu_brain::project as bp;
+    use kimetsu_core::memory::{MemoryKind, MemoryScope};
+
+    // 1. Init project.
+    bp::init_project(root, false).map_err(|e| format!("selftest: init_project failed: {e}"))?;
+
+    // 2. Record a distinctive memory.
+    let probe = "kimetsu-selftest-probe-xq7w9";
+    bp::add_memory(root, MemoryScope::Project, MemoryKind::Fact, probe)
+        .map_err(|e| format!("selftest: add_memory failed: {e}"))?;
+
+    // 3. Retrieve via FTS — must find the probe text.
+    let hits = bp::search_memories(root, probe, 5, 0, None, None)
+        .map_err(|e| format!("selftest: search_memories failed: {e}"))?;
+
+    if hits.iter().any(|h| h.text.contains(probe)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "selftest: recorded memory `{probe}` not found in retrieval results ({} hits)",
+            hits.len()
+        )
+        .into())
+    }
+}
+
 fn file_contains_all(path: &Path, needles: &[&str]) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
@@ -636,5 +706,22 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
         std::fs::create_dir_all(&tmp).expect("mkdir");
         tmp
+    }
+
+    /// D4: `--selftest` must exit 0 on a healthy setup and print
+    /// the success line. Runs hermetically in a throw-away temp dir.
+    #[test]
+    fn selftest_passes_on_healthy_setup() {
+        // run_selftest_in exercises record → retrieve without touching
+        // the real workspace brain (user brain disabled inside the
+        // helper via with_user_brain_disabled).
+        let tmp = tempdir_in_test("kimetsu-doctor-selftest");
+        kimetsu_core::paths::git_init_boundary(&tmp);
+        let result = run_selftest_in(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            result.is_ok(),
+            "selftest should pass on a clean temp project: {result:?}"
+        );
     }
 }
