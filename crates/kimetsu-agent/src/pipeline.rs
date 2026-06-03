@@ -21,6 +21,7 @@ use crate::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
     TokenUsage, ToolChoice, default_tool_definitions,
 };
+use crate::recall_ledger::RunRecallLedger;
 use crate::tools::{CommandSpec, ToolPatchPlan, ToolRuntime, ToolRuntimeConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +333,11 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         }),
     )?;
 
+    // F1: one ledger per run — shared across PatchPlan and Implementation renders
+    // so capsules injected into the patch-plan prompt are back-referenced (not
+    // re-rendered in full) in the implementation prompt, counting tokens once.
+    let mut recall_ledger = RunRecallLedger::new();
+
     stage_entered(&mut writer, &mut events, run_id, CodingStage::PatchPlan)?;
     let model_patch_plan = if options.disable_model {
         emit(
@@ -362,6 +368,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             &options.task,
             &files_to_read,
             &patch_context,
+            &mut recall_ledger,
         )
     };
     let (patch_plan, patch_plan_usage) = match model_patch_plan {
@@ -649,6 +656,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 &patch_plan,
                 &patch_context,
                 last_failure_context.as_deref(),
+                &mut recall_ledger,
             )?);
             let runtime = loop_runner.into_runtime();
             let Some((restored_writer, _)) = runtime.into_trace() else {
@@ -1074,6 +1082,7 @@ fn try_model_patch_plan(
     task: &str,
     files_to_read: &[String],
     patch_context: &ContextBundle,
+    ledger: &mut RunRecallLedger,
 ) -> KimetsuResult<Option<(PatchPlan, TokenUsage)>> {
     if cfg!(test) {
         return Ok(None);
@@ -1099,7 +1108,7 @@ fn try_model_patch_plan(
         return Ok(None);
     };
 
-    let request = build_patch_plan_request(config, task, files_to_read, patch_context);
+    let request = build_patch_plan_request(config, task, files_to_read, patch_context, ledger);
     record_model_requested(
         writer,
         events,
@@ -1140,6 +1149,7 @@ fn build_patch_plan_request(
     task: &str,
     files_to_read: &[String],
     patch_context: &ContextBundle,
+    ledger: &mut RunRecallLedger,
 ) -> ModelRequest {
     let system = ModelMessage {
         role: MessageRole::System,
@@ -1174,9 +1184,12 @@ fn build_patch_plan_request(
         // retrieve_context via config.broker.max_capsules). Fall back to
         // config.broker.max_capsules so the render cap stays in sync if
         // a caller bypasses the broker's own max_capsules gate.
+        // F1: pass the run ledger so capsules already injected here are
+        // back-referenced (not duplicated) in the later implementation stage.
         capsules = render_context_capsules(
             patch_context,
-            config.broker.max_capsules.max(patch_context.capsules.len())
+            config.broker.max_capsules.max(patch_context.capsules.len()),
+            ledger,
         ),
     ));
 
@@ -1638,6 +1651,7 @@ fn build_implementation_messages(
     patch_plan: &PatchPlan,
     patch_context: &ContextBundle,
     retry_context: Option<&str>,
+    ledger: &mut RunRecallLedger,
 ) -> KimetsuResult<Vec<ModelMessage>> {
     let system = ModelMessage {
         role: MessageRole::System,
@@ -1667,7 +1681,11 @@ fn build_implementation_messages(
         // retrieve_context). The broker's max_capsules gate ensures a
         // tight, high-precision set; re-capping here would silently
         // discard capsules the broker decided were worth including.
-        capsules = render_context_capsules(patch_context, patch_context.capsules.len().max(1)),
+        // F1: pass the run ledger — capsules already injected in the
+        // patch-plan stage appear as compact back-references here instead
+        // of being repeated in full, shrinking the implementation prompt.
+        capsules =
+            render_context_capsules(patch_context, patch_context.capsules.len().max(1), ledger,),
     ));
     Ok(vec![system, user])
 }
@@ -1847,7 +1865,16 @@ fn render_localized_files(files_to_read: &[String]) -> String {
         .join("\n")
 }
 
-fn render_context_capsules(context: &ContextBundle, max_capsules: usize) -> String {
+/// F1: render capsules for a prompt stage, deduplicating across stages via
+/// `ledger`. A capsule rendered in full during an earlier stage is replaced
+/// with a compact one-line back-reference here; its token cost is counted
+/// exactly once (charged at first injection). New capsules are rendered in
+/// full and marked in the ledger.
+fn render_context_capsules(
+    context: &ContextBundle,
+    max_capsules: usize,
+    ledger: &mut RunRecallLedger,
+) -> String {
     if context.capsules.is_empty() {
         return "None.".to_string();
     }
@@ -1857,14 +1884,25 @@ fn render_context_capsules(context: &ContextBundle, max_capsules: usize) -> Stri
         .iter()
         .take(max_capsules)
         .map(|capsule| {
-            format!(
-                "- id: {id}\n  kind: {kind}\n  score: {score:.3}\n  handle: {handle}\n  summary: {summary}",
-                id = capsule.id,
-                kind = capsule.kind,
-                score = capsule.score,
-                handle = capsule.expansion_handle,
-                summary = truncate_text(&capsule.summary, 700),
-            )
+            if ledger.is_injected(&capsule.id) {
+                // Back-reference: one line, no full summary (already in context).
+                format!(
+                    "- (see above) [{id}] kind:{kind}",
+                    id = capsule.id,
+                    kind = capsule.kind,
+                )
+            } else {
+                // First injection: render in full and record in ledger.
+                ledger.mark_injected(&capsule.id, capsule.token_estimate);
+                format!(
+                    "- id: {id}\n  kind: {kind}\n  score: {score:.3}\n  handle: {handle}\n  summary: {summary}",
+                    id = capsule.id,
+                    kind = capsule.kind,
+                    score = capsule.score,
+                    handle = capsule.expansion_handle,
+                    summary = truncate_text(&capsule.summary, 700),
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2904,5 +2942,180 @@ mod tests {
             expected_outcome: "n/a".to_string(),
             risk_level: RiskLevel::Low,
         }
+    }
+
+    // ── F1: cross-stage capsule dedup tests ────────────────────────────────
+
+    fn make_capsule(id: &str, kind: &str, summary: &str, token_estimate: u32) -> ContextCapsule {
+        ContextCapsule {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            summary: summary.to_string(),
+            token_estimate,
+            expansion_handle: format!("memory:{id}"),
+            provenance: Vec::new(),
+            confidence: 0.9,
+            freshness: 1.0,
+            relevance: 0.8,
+            scope_weight: 1.0,
+            score: 0.75,
+        }
+    }
+
+    fn make_bundle(capsules: Vec<ContextCapsule>) -> ContextBundle {
+        ContextBundle {
+            stage: "patch_plan".to_string(),
+            budget_tokens: 4096,
+            used_tokens: capsules.iter().map(|c| c.token_estimate).sum(),
+            capsules,
+            excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.75,
+        }
+    }
+
+    /// F1-test-1: two renders of the same bundle with a shared ledger — first
+    /// render injects both capsules in full; second render back-references
+    /// both. Token count stays at 100 (counted once).
+    #[test]
+    fn f1_dedup_across_two_renders_same_bundle() {
+        let bundle = make_bundle(vec![
+            make_capsule(
+                "a",
+                "semantic_operator",
+                "Summary of A — quite long content here",
+                50,
+            ),
+            make_capsule(
+                "b",
+                "convention",
+                "Summary of B — different important stuff",
+                50,
+            ),
+        ]);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+
+        // First render (patch-plan stage): both capsules injected in full.
+        let first = render_context_capsules(&bundle, max, &mut ledger);
+        assert!(
+            first.contains("Summary of A"),
+            "first render must contain full summary for 'a'"
+        );
+        assert!(
+            first.contains("Summary of B"),
+            "first render must contain full summary for 'b'"
+        );
+        assert_eq!(ledger.injected_count(), 2);
+        assert_eq!(ledger.injected_tokens(), 100);
+
+        // Second render (implementation stage): both capsules back-referenced.
+        let second = render_context_capsules(&bundle, max, &mut ledger);
+        assert!(
+            !second.contains("Summary of A"),
+            "second render must NOT repeat full summary for 'a'"
+        );
+        assert!(
+            !second.contains("Summary of B"),
+            "second render must NOT repeat full summary for 'b'"
+        );
+        assert!(
+            second.contains("(see above)"),
+            "second render must contain back-reference marker"
+        );
+        assert!(
+            second.contains("[a]"),
+            "second render must reference capsule id 'a'"
+        );
+        assert!(
+            second.contains("[b]"),
+            "second render must reference capsule id 'b'"
+        );
+        // Token cost still counted once.
+        assert_eq!(
+            ledger.injected_count(),
+            2,
+            "count must not change on re-render"
+        );
+        assert_eq!(
+            ledger.injected_tokens(),
+            100,
+            "tokens must not be double-counted"
+        );
+    }
+
+    /// F1-test-2: partial overlap — first bundle injects {a, b}; second
+    /// bundle {b, c} with same ledger → 'b' is back-referenced, 'c' is full.
+    #[test]
+    fn f1_partial_overlap_second_bundle() {
+        let bundle_ab = make_bundle(vec![
+            make_capsule("a", "semantic_operator", "A is here for the first time", 50),
+            make_capsule("b", "convention", "B appears in both stages", 50),
+        ]);
+        let bundle_bc = make_bundle(vec![
+            make_capsule("b", "convention", "B appears in both stages", 50),
+            make_capsule("c", "anti_pattern", "C is new in the second stage", 60),
+        ]);
+
+        let mut ledger = RunRecallLedger::new();
+
+        // First render: inject a and b.
+        let _ = render_context_capsules(&bundle_ab, bundle_ab.capsules.len(), &mut ledger);
+        assert_eq!(ledger.injected_count(), 2);
+        assert_eq!(ledger.injected_tokens(), 100); // a=50, b=50
+
+        // Second render: b is back-ref, c is new.
+        let second = render_context_capsules(&bundle_bc, bundle_bc.capsules.len(), &mut ledger);
+        assert!(
+            !second.contains("B appears in both stages"),
+            "'b' summary must not re-appear"
+        );
+        assert!(
+            second.contains("C is new"),
+            "'c' summary must be rendered in full"
+        );
+        assert_eq!(
+            ledger.injected_count(),
+            3,
+            "a + b + c = 3 distinct capsules"
+        );
+        assert_eq!(
+            ledger.injected_tokens(),
+            160,
+            "a(50) + b(50) + c(60) = 160, each counted once"
+        );
+    }
+
+    /// F1-test-3: back-reference is materially shorter than a full render.
+    #[test]
+    fn f1_back_ref_is_cheaper_than_full_render() {
+        let long_summary = "A".repeat(300); // deliberately long
+        let bundle = make_bundle(vec![make_capsule(
+            "x",
+            "semantic_operator",
+            &long_summary,
+            200,
+        )]);
+
+        let mut ledger = RunRecallLedger::new();
+
+        let full = render_context_capsules(&bundle, 1, &mut ledger);
+        let back_ref = render_context_capsules(&bundle, 1, &mut ledger);
+
+        assert!(
+            full.contains(&long_summary),
+            "full render must include the long summary"
+        );
+        assert!(
+            !back_ref.contains(&long_summary),
+            "back-ref must not include the long summary"
+        );
+        assert!(
+            back_ref.len() < full.len() / 2,
+            "back-ref ({} chars) should be materially shorter than full ({} chars)",
+            back_ref.len(),
+            full.len()
+        );
     }
 }
