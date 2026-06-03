@@ -178,6 +178,34 @@ impl Default for ModelSection {
 pub struct BrokerSection {
     pub default_budget_tokens: u32,
     pub weights: BrokerWeights,
+    /// D1f: hard cap on capsules rendered into a model prompt. The
+    /// broker may surface more capsules than this (up to the token
+    /// budget), but the pipeline render step truncates to this cap so
+    /// a tighter, higher-precision capsule set isn't silently padded
+    /// back to a larger number. 0 = disabled (budget-only limit).
+    ///
+    /// Default 8: lower than the old hard-coded 12 so precision from
+    /// D1e wins; operators can raise it per-project in project.toml.
+    /// `#[serde(default)]` keeps pre-D1f project.toml files loading.
+    #[serde(default = "default_max_capsules")]
+    pub max_capsules: usize,
+    /// D1e: absolute minimum cosine similarity between the query
+    /// embedding and a candidate embedding required for the candidate
+    /// to survive budgeting. When > 0.0, candidates whose cosine is
+    /// strictly below this threshold are dropped BEFORE the MMR pass
+    /// so a genuinely-irrelevant corpus hits the zero-capsule skipped
+    /// path more often. Inert on lean (NoopEmbedder) builds because
+    /// there is no query embedding to compare against.
+    ///
+    /// Default 0.0 (disabled) — the threshold does NOT change
+    /// existing test outcomes; operators opt in by raising it in
+    /// project.toml. `#[serde(default)]` keeps older configs loading.
+    #[serde(default)]
+    pub min_semantic_score: f32,
+}
+
+fn default_max_capsules() -> usize {
+    8
 }
 
 impl Default for BrokerSection {
@@ -185,6 +213,8 @@ impl Default for BrokerSection {
         Self {
             default_budget_tokens: 6000,
             weights: BrokerWeights::default(),
+            max_capsules: default_max_capsules(),
+            min_semantic_score: 0.0,
         }
     }
 }
@@ -379,6 +409,10 @@ max_total_cost_usd = 250.0
         assert_eq!(config.learning.distiller.model, "claude-haiku-4-5");
         assert_eq!(config.learning.distiller.api_key_env, "ANTHROPIC_API_KEY");
         assert_eq!(config.learning.distiller.base_url_env, "ANTHROPIC_BASE_URL");
+        // D1e/D1f: pre-D1 configs without max_capsules / min_semantic_score
+        // must load cleanly and receive the safe defaults.
+        assert_eq!(config.broker.max_capsules, 8);
+        assert_eq!(config.broker.min_semantic_score, 0.0);
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the

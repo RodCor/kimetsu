@@ -247,6 +247,10 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 stage: CodingStage::Localization.as_str().to_string(),
                 query: options.task.clone(),
                 budget_tokens: config.broker.default_budget_tokens,
+                // D1f: propagate config-driven caps into the request so
+                // retrieve_context_with_embedder honours them directly.
+                max_capsules: config.broker.max_capsules,
+                min_semantic_score: config.broker.min_semantic_score,
                 ..Default::default()
             },
         )?;
@@ -258,6 +262,9 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 stage: CodingStage::PatchPlan.as_str().to_string(),
                 query: options.task.clone(),
                 budget_tokens: config.broker.default_budget_tokens,
+                // D1f: same config-driven caps for the patch-plan stage.
+                max_capsules: config.broker.max_capsules,
+                min_semantic_score: config.broker.min_semantic_score,
                 ..Default::default()
             },
         )?;
@@ -1163,7 +1170,14 @@ fn build_patch_plan_request(
          - risk_level must be one of: low, medium, high.\n\
          - Return JSON only, without Markdown fences.",
         localized_files = render_localized_files(files_to_read),
-        capsules = render_context_capsules(patch_context, 12),
+        // D1f: render all broker-selected capsules (already capped by
+        // retrieve_context via config.broker.max_capsules). Fall back to
+        // config.broker.max_capsules so the render cap stays in sync if
+        // a caller bypasses the broker's own max_capsules gate.
+        capsules = render_context_capsules(
+            patch_context,
+            config.broker.max_capsules.max(patch_context.capsules.len())
+        ),
     ));
 
     ModelRequest {
@@ -1649,7 +1663,11 @@ fn build_implementation_messages(
          - Only files declared in files_to_modify, files_to_create, or files_to_delete may be changed.\n\
          - Keep edits minimal and directly tied to expected_outcome.\n\
          - Finish with a concise summary of changed files and remaining verification work.",
-        capsules = render_context_capsules(patch_context, 12),
+        // D1f: render all broker-selected capsules (already capped by
+        // retrieve_context). The broker's max_capsules gate ensures a
+        // tight, high-precision set; re-capping here would silently
+        // discard capsules the broker decided were worth including.
+        capsules = render_context_capsules(patch_context, patch_context.capsules.len().max(1)),
     ));
     Ok(vec![system, user])
 }

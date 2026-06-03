@@ -94,6 +94,14 @@ pub struct ContextRequest {
     /// restrict recall to actionable kinds (failure_pattern, command,
     /// convention). Empty (default) keeps all kinds, prior behaviour.
     pub kinds: Vec<String>,
+    /// D1e: absolute cosine-similarity floor. On embeddings builds,
+    /// memory candidates whose cosine to the query is below this
+    /// threshold are dropped before budgeting. 0.0 (default) disables
+    /// the floor — matches pre-D1e behaviour. Repo-file and manifest
+    /// candidates are unaffected (they have no cosine score). Populated
+    /// from `BrokerSection.min_semantic_score` by the pipeline; callers
+    /// that don't set it get the prior behaviour automatically.
+    pub min_semantic_score: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +123,16 @@ pub struct ContextBundle {
 struct Candidate {
     capsule: ContextCapsule,
     raw_relevance: f32,
+    /// D1e: the row's embedding vector, present when the row's
+    /// `embedding_model` matches the active query embedder's id.
+    /// `None` for repo-file/manifest candidates and for memory rows
+    /// whose model differs from the active embedder (cross-model
+    /// rows). Used by the candidate-stage embedding-MMR pass.
+    embedding: Option<Vec<f32>>,
+    /// D1e: raw cosine similarity between this candidate and the
+    /// query embedding. Present when `embedding` is `Some`. Used for
+    /// the absolute semantic relevance floor (min_semantic_score).
+    cosine: Option<f32>,
 }
 
 pub fn retrieve_context(
@@ -236,24 +254,89 @@ pub fn retrieve_context_with_embedder(
         }
     }
 
+    // D1e-2: absolute semantic relevance floor. On embeddings builds
+    // (query_embedding is Some), drop candidates whose cosine to the
+    // query is strictly below min_semantic_score. This ensures a
+    // genuinely-irrelevant corpus hits the zero-capsule skipped path
+    // rather than surfacing its "best of a bad lot". Inert on lean
+    // builds (query_embedding is None) or when floor is 0.0.
+    //
+    // Applied BEFORE the candidate→capsule conversion so irrelevant
+    // rows don't consume budget or affect normalization.
+    //
+    // Only applied to memory candidates (those with cosine populated);
+    // repo_file and manifest candidates have cosine=None and are
+    // always passed through — they're matched by FTS which is already
+    // a signal of relevance.
+    if query_embedding.is_some() && request.min_semantic_score > 0.0 {
+        candidates.retain(|c| {
+            // Keep non-memory candidates (no cosine) and memory
+            // candidates that cleared the floor.
+            match c.cosine {
+                Some(cos) => cos >= request.min_semantic_score,
+                None => true,
+            }
+        });
+    }
+
+    // D1e-1: candidate-stage embedding-MMR. On embeddings builds,
+    // apply MMR over the ranked Vec<Candidate> using cosine similarity
+    // between candidate embeddings as the redundancy measure. This
+    // collapses true semantic near-duplicates ("prefer rg over grep"
+    // and "use ripgrep") that Jaccard-of-tokens would miss.
+    //
+    // When EITHER candidate lacks an embedding (repo-file, manifest,
+    // or a cross-model memory row), falls back to Jaccard similarity
+    // of summary tokens — the same measure the existing capsule-stage
+    // MMR uses. This preserves lean parity exactly.
+    //
+    // Sort by score descending first so the greedy MMR seeds on the
+    // top-scoring candidate (same as the capsule-stage MMR).
+    candidates.sort_by(|a, b| {
+        b.capsule
+            .score
+            .partial_cmp(&a.capsule.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                b.capsule
+                    .freshness
+                    .partial_cmp(&a.capsule.freshness)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| a.capsule.id.cmp(&b.capsule.id))
+    });
+
+    // Run embedding-MMR on embeddings builds; lean builds skip directly
+    // to the capsule-stage Jaccard MMR below.
+    let embedding_mmr_ran = query_embedding.is_some() && !candidates.is_empty();
+    let candidates = if embedding_mmr_ran {
+        apply_candidate_mmr_diversity(candidates, 0.7)
+    } else {
+        candidates
+    };
+
     let mut capsules = candidates
         .into_iter()
         .map(|candidate| candidate.capsule)
         .collect::<Vec<_>>();
 
-    capsules.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                right
-                    .freshness
-                    .partial_cmp(&left.freshness)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    // After embedding-MMR the candidate list is already in MMR order.
+    // On lean builds (no embedding-MMR) we still need to sort by score.
+    if !embedding_mmr_ran {
+        capsules.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .freshness
+                        .partial_cmp(&left.freshness)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
 
     // v0.6: confidence-aware skip — if the top score is below the caller's
     // threshold, return an empty bundle immediately. Zero tokens injected.
@@ -270,11 +353,13 @@ pub fn retrieve_context_with_embedder(
         });
     }
 
-    // MP-17 #13: Maximal-Marginal-Relevance (MMR) re-ranking — when two
-    // capsules look very similar (same tokens in the summary), keep the
-    // higher-scoring one but push the redundant ones down so the budget
-    // covers more distinct ground. Lambda=0.7 keeps the original ordering
-    // strongly while penalizing >0.5-Jaccard overlaps.
+    // MP-17 #13: capsule-stage Jaccard MMR — safety net / lean path.
+    // On embeddings builds the candidate-stage embedding-MMR already
+    // collapsed semantic near-duplicates; this pass is largely a no-op
+    // (same-kind Jaccard score will be low for already-deduped summaries)
+    // but provides a final guard against any remaining token-level
+    // duplicates (e.g. repo files with heavily overlapping snippets).
+    // On lean builds this is the sole diversity mechanism (unchanged).
     let capsules = apply_mmr_diversity(capsules, 0.7);
 
     let capsule_budget = request.budget_tokens / 2;
@@ -560,7 +645,8 @@ fn memory_ann_candidates(
             embedding_model,
             last_useful_at,
         ) = row?;
-        let cosine = compute_cosine(Some(qe), embedding.as_deref(), embedding_model.as_deref());
+        let (cosine, row_vec) =
+            compute_cosine_and_vec(Some(qe), embedding.as_deref(), embedding_model.as_deref());
         if let Some(candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
@@ -575,6 +661,7 @@ fn memory_ann_candidates(
             half_life_days,
             None, // no raw FTS relevance override — cosine drives ranking
             cosine,
+            row_vec,
         ) {
             candidates.push(candidate);
         }
@@ -720,7 +807,7 @@ fn latest_memory_candidates(
             embedding_model,
             last_useful_at,
         ) = row?;
-        let cosine = compute_cosine(
+        let (cosine, row_vec) = compute_cosine_and_vec(
             query_embedding,
             embedding.as_deref(),
             embedding_model.as_deref(),
@@ -739,6 +826,7 @@ fn latest_memory_candidates(
             half_life_days,
             None,
             cosine,
+            row_vec,
         ) {
             candidates.push(candidate);
         }
@@ -803,7 +891,7 @@ fn memory_fts_candidates(
             last_useful_at,
         ) = row?;
         let fts_relevance = (-rank as f32).max(0.0);
-        let cosine = compute_cosine(
+        let (cosine, row_vec) = compute_cosine_and_vec(
             query_embedding,
             embedding.as_deref(),
             embedding_model.as_deref(),
@@ -822,6 +910,7 @@ fn memory_fts_candidates(
             half_life_days,
             Some(fts_relevance),
             cosine,
+            row_vec,
         ) {
             candidates.push(candidate);
         }
@@ -829,33 +918,55 @@ fn memory_fts_candidates(
     Ok(candidates)
 }
 
-/// v0.4.2: cosine helper used by both the FTS and latest-memory
-/// retrieval branches. Returns `Some(score in [-1, 1])` when a
-/// non-null embedding is present AND its `embedding_model` matches
-/// the active `query_embedding`'s model id. Otherwise None — the
-/// caller treats None as "lexical only".
+/// v0.4.2 / D1e: cosine helper — returns both the cosine score and the
+/// decoded row embedding vector for a memory row. Used by all three
+/// memory-candidate retrieval paths (FTS, ANN, latest-recency) to
+/// populate `Candidate.cosine` and `Candidate.embedding` for the
+/// candidate-stage embedding-MMR pass.
+///
+/// Returns `(None, None)` when:
+///   * `query_embedding` is None (NoopEmbedder / lean build)
+///   * The row has no embedding bytes
+///   * The row's `embedding_model` doesn't match the active query's
+///     model id (cross-model mismatch — vectors are incomparable)
 ///
 /// Cross-model rows are intentionally NOT blended: a row embedded
 /// with `stub-d8` and a query embedded with `bge-small-en-v1.5`
 /// produce meaningless dot products. Falling back to FTS for those
 /// rows keeps hybrid retrieval safe across schema upgrades and
 /// `kimetsu brain reindex` migrations (v0.4.3).
-fn compute_cosine(
+///
+/// D1e: variant that returns both the cosine score and the decoded row
+/// embedding vector. Used by callsites that need to store the vector
+/// on the `Candidate` for the candidate-stage embedding-MMR pass.
+/// When the row is cross-model or has no embedding, both fields are
+/// `None` — identical semantics to [`compute_cosine`].
+fn compute_cosine_and_vec(
     query_embedding: Option<&QueryEmbedding>,
     row_bytes: Option<&[u8]>,
     row_model: Option<&str>,
-) -> Option<f32> {
-    let q = query_embedding?;
-    let bytes = row_bytes?;
-    let model = row_model?;
+) -> (Option<f32>, Option<Vec<f32>>) {
+    let q = match query_embedding {
+        Some(q) => q,
+        None => return (None, None),
+    };
+    let bytes = match row_bytes {
+        Some(b) => b,
+        None => return (None, None),
+    };
+    let model = match row_model {
+        Some(m) => m,
+        None => return (None, None),
+    };
     if model != q.model_id {
-        return None;
+        return (None, None);
     }
     let row_vec = match decode_embedding(bytes, Some(q.vector.len())) {
         Ok(v) => v,
-        Err(_) => return None,
+        Err(_) => return (None, None),
     };
-    Some(cosine_similarity(&q.vector, &row_vec))
+    let score = cosine_similarity(&q.vector, &row_vec);
+    (Some(score), Some(row_vec))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -873,6 +984,11 @@ fn memory_row_to_candidate(
     half_life_days: f32,
     raw_relevance_override: Option<f32>,
     cosine_score: Option<f32>,
+    // D1e: decoded embedding vector for this row (same model as the
+    // active query embedder). None for cross-model rows, rows without
+    // embeddings, or lean builds. Stored on Candidate for the
+    // candidate-stage embedding-MMR pass.
+    row_embedding: Option<Vec<f32>>,
 ) -> Option<Candidate> {
     let lexical = lexical_relevance(query_tokens, &format!("{kind} {text}"));
     let lexical_term = raw_relevance_override.unwrap_or(lexical).max(lexical);
@@ -918,6 +1034,8 @@ fn memory_row_to_candidate(
     let biased_relevance = raw_relevance * multiplier;
     Some(Candidate {
         raw_relevance: biased_relevance,
+        embedding: row_embedding,
+        cosine: cosine_score,
         capsule: ContextCapsule {
             id: new_id().to_string(),
             kind: "memory".to_string(),
@@ -1043,6 +1161,8 @@ fn repo_file_candidates(
         let token_estimate = estimate_tokens(&summary) + 8;
         candidates.push(Candidate {
             raw_relevance,
+            embedding: None,
+            cosine: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_file".to_string(),
@@ -1107,6 +1227,8 @@ fn manifest_candidates(
         let token_estimate = estimate_tokens(&summary) + 8;
         candidates.push(Candidate {
             raw_relevance,
+            embedding: None,
+            cosine: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_manifest".to_string(),
@@ -1163,6 +1285,8 @@ fn manifest_fts_candidates(
         let token_estimate = estimate_tokens(&summary) + 8;
         candidates.push(Candidate {
             raw_relevance,
+            embedding: None,
+            cosine: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_manifest".to_string(),
@@ -1383,6 +1507,109 @@ pub(crate) fn fts_query(query: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" OR "),
     )
+}
+
+/// D1e: candidate-stage MMR using embedding cosine similarity as the
+/// redundancy measure, with Jaccard-of-summary-tokens as the fallback
+/// when either candidate lacks an embedding vector.
+///
+/// Called BEFORE the candidate→capsule conversion so the `Candidate`
+/// embedding fields are still accessible. Input must already be sorted
+/// by descending score (the pipeline sorts before calling this).
+///
+/// Redundancy measure:
+///   * Both candidates have embeddings of the same model → cosine(a, b).
+///     cosine ∈ [-1, 1]; we use it directly as the overlap penalty.
+///     Two paraphrases ("prefer rg" / "use ripgrep") will typically
+///     share high cosine (≥0.85) and collapse to one slot.
+///   * Either candidate lacks an embedding → Jaccard of summary-token
+///     sets, scaled by 0.5 for cross-kind pairs (mirrors the existing
+///     capsule-stage logic).
+///
+/// Cross-kind pairs are penalized at half the same-kind rate for both
+/// measures (consistent with the capsule-stage Jaccard MMR).
+fn apply_candidate_mmr_diversity(mut sorted: Vec<Candidate>, lambda: f32) -> Vec<Candidate> {
+    if sorted.len() <= 1 {
+        return sorted;
+    }
+    // Pre-tokenize summaries for the Jaccard fallback.
+    let summaries: Vec<std::collections::HashSet<String>> = sorted
+        .iter()
+        .map(|c| summary_token_set(&c.capsule.summary))
+        .collect();
+
+    let mut picked_indices: Vec<usize> = Vec::with_capacity(sorted.len());
+    let mut remaining: Vec<usize> = (0..sorted.len()).collect();
+
+    // Seed with the highest-scoring candidate.
+    picked_indices.push(remaining.remove(0));
+
+    while !remaining.is_empty() {
+        let mut best_idx_in_remaining = 0;
+        let mut best_score = f32::MIN;
+
+        for (i, &cand) in remaining.iter().enumerate() {
+            let mut max_overlap = 0.0f32;
+            for &p in &picked_indices {
+                // Compute redundancy between candidate `cand` and
+                // already-picked `p`.
+                let same_kind = sorted[cand].capsule.kind == sorted[p].capsule.kind;
+                let raw_overlap = candidate_pair_overlap(
+                    &sorted[cand],
+                    &sorted[p],
+                    &summaries[cand],
+                    &summaries[p],
+                );
+                let overlap = if same_kind {
+                    raw_overlap
+                } else {
+                    raw_overlap * 0.5
+                };
+                if overlap > max_overlap {
+                    max_overlap = overlap;
+                }
+            }
+            let mmr = lambda * sorted[cand].capsule.score - (1.0 - lambda) * max_overlap;
+            if mmr > best_score {
+                best_score = mmr;
+                best_idx_in_remaining = i;
+            }
+        }
+        picked_indices.push(remaining.remove(best_idx_in_remaining));
+    }
+
+    // Reconstruct in picked order.
+    let mut taken: Vec<Option<Candidate>> = sorted.drain(..).map(Some).collect();
+    let mut out = Vec::with_capacity(taken.len());
+    for idx in picked_indices {
+        if let Some(c) = taken[idx].take() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// D1e: overlap between two candidates for MMR.
+///
+/// * Both have embeddings → cosine similarity (clamped to [0,1] to
+///   treat anti-correlated vectors as non-redundant, not negatively
+///   redundant).
+/// * Either lacks an embedding → Jaccard of summary-token sets.
+fn candidate_pair_overlap(
+    a: &Candidate,
+    b: &Candidate,
+    tokens_a: &std::collections::HashSet<String>,
+    tokens_b: &std::collections::HashSet<String>,
+) -> f32 {
+    if let (Some(va), Some(vb)) = (a.embedding.as_deref(), b.embedding.as_deref()) {
+        // Cosine in [-1,1]; clamp to [0,1] so negative correlation
+        // (very different content) contributes 0 overlap rather than
+        // a negative penalty (which would spuriously boost unrelated
+        // content over moderately-related content).
+        cosine_similarity(va, vb).max(0.0)
+    } else {
+        jaccard(tokens_a, tokens_b)
+    }
 }
 
 /// MP-17 #13: greedy MMR (Maximal Marginal Relevance) re-ranking.
@@ -2345,6 +2572,524 @@ mod tests {
                 .iter()
                 .map(|c| &c.expansion_handle)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // D1e tests: embedding-MMR deduplication + semantic relevance floor
+    // ---------------------------------------------------------------
+
+    /// D1e-a (embeddings-gated): two paraphrased memories that share an
+    /// almost-identical embedding vector (cosine = 1.0, so embedding-MMR
+    /// sees them as maximally redundant) but have LOW Jaccard overlap on
+    /// their summary tokens (different words, so the Jaccard-only capsule-
+    /// stage MMR would NOT penalize the second one and both survive the
+    /// budget with max_capsules=2).
+    ///
+    /// Key mechanic: embedding-MMR assigns the second near-duplicate a very
+    /// negative MMR score (lambda * score - (1-lambda) * 1.0 < 0 when score
+    /// is small). It therefore ends up LAST in the reordered candidate list.
+    /// When max_capsules=1 it is excluded. With Jaccard-only (NoopEmbedder),
+    /// the second paraphrase has low Jaccard overlap → survives when
+    /// max_capsules=2.
+    ///
+    /// Expected result:
+    ///   * OracleEmbedder + max_capsules=1: ONE paraphrase (embedding-MMR
+    ///     collapsed the redundant one).
+    ///   * NoopEmbedder + max_capsules=2: BOTH paraphrases survive (Jaccard
+    ///     does not see them as redundant — different tokens).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_mmr_collapses_paraphrases_but_jaccard_does_not() {
+        crate::schema::ensure_vec_extension_registered();
+
+        // OracleEmbedder: always returns [1,0,0,…] (dim=8).
+        // cosine(any two texts) = 1.0 → maximal redundancy in embedding space.
+        struct OracleEmbedder;
+        impl embeddings::Embedder for OracleEmbedder {
+            fn embed(&self, _text: &str) -> Result<Vec<f32>, embeddings::EmbedderError> {
+                let mut v = vec![0.0f32; 8];
+                v[0] = 1.0;
+                Ok(v)
+            }
+            fn model_id(&self) -> &str {
+                "oracle-d8"
+            }
+            fn dim(&self) -> usize {
+                8
+            }
+        }
+
+        // Setup: two memories with DIFFERENT words (low Jaccard) but
+        // SAME oracle embedding (cosine = 1.0).
+        let oracle = OracleEmbedder;
+        let weights = kimetsu_core::config::BrokerWeights::default();
+
+        // "prefer ripgrep" vs "rg is the fastest" — entirely different tokens.
+        // Summary token-set overlap ≈ 0 ⟹ Jaccard ≈ 0.
+        let m_rg1_text = "prefer ripgrep for searching source code";
+        let m_rg2_text = "rg is the fastest way to locate patterns";
+
+        // --- Embedding-MMR path (OracleEmbedder), max_capsules=1 ---
+        // Under embedding-MMR: second paraphrase gets MMR score
+        //   0.7 * score - 0.3 * 1.0  (overlap = cosine = 1.0)
+        // For any small normalised score, this is negative → it is assigned
+        // last in the MMR reordering. max_capsules=1 → only 1 included.
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        insert_memory_with_embedding(&conn, "m_rg1", m_rg1_text, &oracle);
+        insert_memory_with_embedding(&conn, "m_rg2", m_rg2_text, &oracle);
+
+        let bundle_embedding = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                // Query that matches both via FTS so they survive pre-MMR scoring.
+                query: "search source patterns".to_string(),
+                budget_tokens: 20_000,
+                max_capsules: 1, // tight cap: only 1 slot available
+                ..Default::default()
+            },
+            &[],
+            &oracle,
+        )
+        .expect("retrieve with oracle embedder");
+
+        // Under embedding-MMR, the second paraphrase (cosine=1.0 with first)
+        // is reranked last and excluded by max_capsules=1.
+        let emb_in_capsules = bundle_embedding
+            .capsules
+            .iter()
+            .filter(|c| {
+                c.expansion_handle == "memory:m_rg1" || c.expansion_handle == "memory:m_rg2"
+            })
+            .count();
+        assert_eq!(
+            emb_in_capsules,
+            1,
+            "embedding-MMR must collapse cosine=1.0 paraphrases: with max_capsules=1 \
+             only ONE should be included; capsule handles: {:?}; excluded: {:?}",
+            bundle_embedding
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>(),
+            bundle_embedding
+                .excluded
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+
+        // At least one is in excluded (the redundant near-duplicate).
+        let emb_in_excluded = bundle_embedding
+            .excluded
+            .iter()
+            .filter(|c| {
+                c.expansion_handle == "memory:m_rg1" || c.expansion_handle == "memory:m_rg2"
+            })
+            .count();
+        assert_eq!(
+            emb_in_excluded,
+            1,
+            "the second near-duplicate must be in excluded under embedding-MMR; \
+             excluded handles: {:?}",
+            bundle_embedding
+                .excluded
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+
+        // --- Lean/Jaccard-only path (NoopEmbedder), max_capsules=2 ---
+        // With Jaccard-only: summary tokens of m_rg1 and m_rg2 have ≈0
+        // overlap (different words) → low redundancy penalty → BOTH score
+        // high under MMR → both survive with max_capsules=2.
+        let conn2 = rusqlite::Connection::open_in_memory().expect("in-memory 2");
+        crate::schema::initialize(&conn2).expect("init schema 2");
+        insert_memory_with_embedding(&conn2, "m_rg1", m_rg1_text, &oracle);
+        insert_memory_with_embedding(&conn2, "m_rg2", m_rg2_text, &oracle);
+
+        let bundle_lean = retrieve_context_with_embedder(
+            &conn2,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "search source patterns".to_string(),
+                budget_tokens: 20_000,
+                max_capsules: 2, // room for both
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve with NoopEmbedder");
+
+        let lean_in_capsules = bundle_lean
+            .capsules
+            .iter()
+            .filter(|c| {
+                c.expansion_handle == "memory:m_rg1" || c.expansion_handle == "memory:m_rg2"
+            })
+            .count();
+        assert_eq!(
+            lean_in_capsules,
+            2,
+            "Jaccard-only path must NOT collapse the two paraphrases (different words, \
+             low token overlap → both survive MMR with max_capsules=2); capsule handles: {:?}",
+            bundle_lean
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// D1e-b: absolute semantic relevance floor (min_semantic_score).
+    ///
+    /// * With a positive floor and a query whose embedding is orthogonal
+    ///   to every memory, the result must be `skipped: true` / 0 capsules.
+    /// * With the same floor and a query that IS relevant, the memory
+    ///   still surfaces (signal preserved).
+    /// * With floor = 0.0 (default), the off-topic query still surfaces
+    ///   the "best of a bad lot" (existing pre-D1e behaviour).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn min_semantic_score_floor_drops_off_topic_queries() {
+        crate::schema::ensure_vec_extension_registered();
+
+        // DirectionalEmbedder: returns a specific unit vector based on
+        // which "topic" the text is assigned to. Allows us to place the
+        // query vector and memory vectors in known relative positions.
+        //
+        // dim=8. Topic A = [1,0,0,0,0,0,0,0]. Topic B = [0,1,0,0,0,0,0,0].
+        // cosine(A, B) = 0.0 → perfectly orthogonal (unrelated).
+        // cosine(A, A) = 1.0 → identical topic.
+        //
+        // We embed the query on topic A, the memory on topic B.
+        // Cosine(query, memory) = 0.0 < any positive floor.
+        struct DirectionalEmbedder {
+            // Text containing "TOPIC_A" embeds as [1,0,…]; all others as [0,1,…].
+            marker: &'static str,
+        }
+        impl embeddings::Embedder for DirectionalEmbedder {
+            fn embed(&self, text: &str) -> Result<Vec<f32>, embeddings::EmbedderError> {
+                let mut v = vec![0.0f32; 8];
+                if text.contains(self.marker) {
+                    v[0] = 1.0;
+                } else {
+                    v[1] = 1.0;
+                }
+                Ok(v)
+            }
+            fn model_id(&self) -> &str {
+                "directional-d8"
+            }
+            fn dim(&self) -> usize {
+                8
+            }
+        }
+
+        let emb = DirectionalEmbedder { marker: "TOPIC_A" };
+
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        // Memory is on topic B (does NOT contain "TOPIC_A").
+        insert_memory_with_embedding(&conn, "m_b", "cookie recipe chocolate baking TOPIC_B", &emb);
+
+        let weights = kimetsu_core::config::BrokerWeights::default();
+
+        // 1. Off-topic query (TOPIC_A) with a positive floor: must be skipped.
+        let bundle_off = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                // Query is on TOPIC_A (cosine with memory = 0.0).
+                query: "TOPIC_A unrelated phosphorescent".to_string(),
+                budget_tokens: 4000,
+                min_semantic_score: 0.1, // positive floor
+                ..Default::default()
+            },
+            &[],
+            &emb,
+        )
+        .expect("retrieve off-topic");
+
+        assert!(
+            bundle_off.capsules.is_empty(),
+            "off-topic query (cosine=0 < floor=0.1) must produce zero capsules; \
+             got: {:?}",
+            bundle_off
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+
+        // 2. On-topic query (TOPIC_B): cosine = 1.0 ≥ floor → surfaces.
+        // Insert a memory explicitly on topic B that FTS can also match.
+        let conn2 = rusqlite::Connection::open_in_memory().expect("in-memory 2");
+        crate::schema::initialize(&conn2).expect("init schema 2");
+        insert_memory_with_embedding(
+            &conn2,
+            "m_b2",
+            "cookie recipe chocolate TOPIC_B baking"
+                .to_string()
+                .as_str(),
+            &emb,
+        );
+
+        let bundle_on = retrieve_context_with_embedder(
+            &conn2,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                // Query is on TOPIC_B: cosine with m_b2 = 1.0 ≥ floor.
+                query: "cookie chocolate TOPIC_B".to_string(),
+                budget_tokens: 4000,
+                min_semantic_score: 0.1,
+                ..Default::default()
+            },
+            &[],
+            &emb,
+        )
+        .expect("retrieve on-topic");
+
+        assert!(
+            bundle_on
+                .capsules
+                .iter()
+                .any(|c| c.expansion_handle == "memory:m_b2"),
+            "on-topic query (cosine=1.0 ≥ floor) must surface m_b2; \
+             got capsules: {:?}",
+            bundle_on
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+
+        // 3. Off-topic query with floor=0.0 (disabled): memory still surfaces
+        //    (existing pre-D1e behaviour — floor is a no-op at 0.0).
+        let conn3 = rusqlite::Connection::open_in_memory().expect("in-memory 3");
+        crate::schema::initialize(&conn3).expect("init schema 3");
+        insert_memory_with_embedding(
+            &conn3,
+            "m_b3",
+            "cookie chocolate TOPIC_B recipe".to_string().as_str(),
+            &emb,
+        );
+
+        let bundle_noop_floor = retrieve_context_with_embedder(
+            &conn3,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                // FTS: "cookie chocolate" matches m_b3.
+                query: "cookie chocolate TOPIC_A".to_string(),
+                budget_tokens: 4000,
+                min_semantic_score: 0.0, // disabled
+                ..Default::default()
+            },
+            &[],
+            &emb,
+        )
+        .expect("retrieve noop floor");
+
+        // With floor disabled, FTS match is enough — memory surfaces.
+        assert!(
+            bundle_noop_floor
+                .capsules
+                .iter()
+                .any(|c| c.expansion_handle == "memory:m_b3"),
+            "with floor=0.0 (disabled), off-topic-cosine memory must still surface via FTS; \
+             got: {:?}",
+            bundle_noop_floor
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // D1f test: token-economy reduction proof
+    // ---------------------------------------------------------------
+
+    /// D1f: Prove that embedding-MMR + semantic floor reduces token usage
+    /// while preserving signal.
+    ///
+    /// Setup: a corpus of 6 memories:
+    ///   * 3 near-duplicate paraphrases on topic A (same OracleA vector)
+    ///   * 1 genuinely relevant memory on topic A (same OracleA vector,
+    ///     different words)
+    ///   * 2 completely unrelated memories on topic B (OracleB vector)
+    ///
+    /// Query: topic A.
+    ///
+    /// WITHOUT D1e (NoopEmbedder + floor=0.0): all 6 memories potentially
+    /// surface (no semantic dedup, no floor). With the budget large enough
+    /// all 6 fit → many capsules, many tokens.
+    ///
+    /// WITH D1e (OracleEmbedder + positive floor):
+    ///   * Floor (min_semantic_score > 0) drops the 2 topic-B memories.
+    ///   * Embedding-MMR collapses the 3 near-duplicate topic-A memories
+    ///     to 1 slot.
+    ///   * The genuinely-relevant memory survives (it is the "seed" of MMR
+    ///     or at least one slot per topic-A cluster remains).
+    ///
+    /// Assertion: WITH D1e → strictly fewer capsules AND the genuinely-
+    /// relevant memory is still present (signal preserved, noise cut).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn d1f_token_economy_fewer_capsules_signal_preserved() {
+        crate::schema::ensure_vec_extension_registered();
+
+        // OracleEmbedder: topic-A text gets [1,0,…]; everything else [0,1,…].
+        struct OracleTopicEmbedder;
+        impl embeddings::Embedder for OracleTopicEmbedder {
+            fn embed(&self, text: &str) -> Result<Vec<f32>, embeddings::EmbedderError> {
+                let mut v = vec![0.0f32; 8];
+                if text.contains("TOPIC_A") {
+                    v[0] = 1.0; // topic A
+                } else {
+                    v[1] = 1.0; // topic B
+                }
+                Ok(v)
+            }
+            fn model_id(&self) -> &str {
+                "oracle-topic-d8"
+            }
+            fn dim(&self) -> usize {
+                8
+            }
+        }
+
+        let oracle = OracleTopicEmbedder;
+
+        // Helper: set up the corpus on a fresh connection.
+        let setup = |conn: &rusqlite::Connection| {
+            // 3 near-duplicate paraphrases on topic A (same oracle vector,
+            // different FTS words so they match the query but Jaccard is low).
+            for (mid, text) in [
+                ("m_dup1", "TOPIC_A prefer ripgrep for searching"),
+                ("m_dup2", "TOPIC_A rg is the fastest searcher"),
+                ("m_dup3", "TOPIC_A use rg tool to find patterns"),
+                // 1 genuinely-relevant memory on topic A (the one we must keep).
+                (
+                    "m_relevant",
+                    "TOPIC_A critical lesson about search performance",
+                ),
+                // 2 off-topic memories on topic B.
+                ("m_noise1", "chocolate cookie baking TOPIC_B recipe"),
+                ("m_noise2", "gardening tulip planting TOPIC_B spring"),
+            ] {
+                insert_memory_with_embedding(conn, mid, text, &oracle);
+            }
+        };
+
+        let weights = kimetsu_core::config::BrokerWeights::default();
+
+        // --- WITHOUT D1e: NoopEmbedder, floor=0.0 ---
+        // FTS: "TOPIC_A" appears in m_dup1/2/3 + m_relevant; "search"
+        // appears in m_dup1 and m_relevant. All 4 topic-A memories match
+        // FTS. The 2 topic-B memories also have "recipe" and "spring"
+        // which don't match — they may or may not appear via recency
+        // fallback. Use a large budget so all matching memories fit.
+        let conn_lean = rusqlite::Connection::open_in_memory().expect("in-memory lean");
+        crate::schema::initialize(&conn_lean).expect("init schema lean");
+        setup(&conn_lean);
+
+        let bundle_lean = retrieve_context_with_embedder(
+            &conn_lean,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "TOPIC_A search performance".to_string(),
+                budget_tokens: 20_000,
+                min_semantic_score: 0.0, // floor disabled
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve lean");
+
+        let lean_count = bundle_lean
+            .capsules
+            .iter()
+            .filter(|c| c.expansion_handle.starts_with("memory:"))
+            .count();
+
+        // --- WITH D1e: OracleEmbedder + positive floor ---
+        let conn_emb = rusqlite::Connection::open_in_memory().expect("in-memory emb");
+        crate::schema::initialize(&conn_emb).expect("init schema emb");
+        setup(&conn_emb);
+
+        let bundle_emb = retrieve_context_with_embedder(
+            &conn_emb,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "TOPIC_A search performance".to_string(),
+                budget_tokens: 20_000,
+                min_semantic_score: 0.5, // positive floor: drops topic-B (cosine=0.0)
+                ..Default::default()
+            },
+            &[],
+            &oracle,
+        )
+        .expect("retrieve with embeddings");
+
+        let emb_count = bundle_emb
+            .capsules
+            .iter()
+            .filter(|c| c.expansion_handle.starts_with("memory:"))
+            .count();
+
+        // Token reduction: embedding path must produce strictly fewer capsules.
+        assert!(
+            emb_count < lean_count,
+            "D1e must reduce capsule count: embedding path {emb_count} must be \
+             < lean path {lean_count}. Embedding capsules: {:?}",
+            bundle_emb
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+
+        // Signal preservation: the genuinely-relevant memory must survive.
+        assert!(
+            bundle_emb
+                .capsules
+                .iter()
+                .any(|c| c.expansion_handle == "memory:m_relevant"),
+            "m_relevant must survive D1e selection (signal preserved); \
+             embedding capsules: {:?}",
+            bundle_emb
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+
+        // Token estimate: embedding path must use fewer or equal token budget.
+        let lean_tokens: u32 = bundle_lean.capsules.iter().map(|c| c.token_estimate).sum();
+        let emb_tokens: u32 = bundle_emb.capsules.iter().map(|c| c.token_estimate).sum();
+        assert!(
+            emb_tokens < lean_tokens,
+            "D1e must reduce token usage: emb={emb_tokens} must be < lean={lean_tokens}"
         );
     }
 
