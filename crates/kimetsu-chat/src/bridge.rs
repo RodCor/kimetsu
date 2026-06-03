@@ -1758,4 +1758,775 @@ mod tests {
         fs::create_dir_all(&path).expect("root");
         path
     }
+
+    // -------------------------------------------------------------------------
+    // B1 — Config-merge golden tests
+    // -------------------------------------------------------------------------
+
+    /// Golden test: user has a hook on the shared PreToolUse/Bash event (same
+    /// matcher Kimetsu uses) AND an unrelated non-shared event. After
+    /// write_claude_hooks (run twice), both user groups must survive alongside
+    /// exactly one Kimetsu group on each event, with no duplicates.
+    #[test]
+    fn b1_claude_hooks_golden_shared_pretooluse_event() {
+        let root = temp_root("b1_claude_hooks_golden");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+
+        // Seed: user has their own PreToolUse/Bash hook (same event + matcher
+        // as Kimetsu's proactive hook) and a user hook on PostToolUse.
+        let seed = json!({
+            "someOtherSetting": "keep-me",
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{ "type": "command", "command": "user-pretool-bash-check" }]
+                    }
+                ],
+                "PostToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{ "type": "command", "command": "user-posttool-bash-check" }]
+                    }
+                ]
+            }
+        });
+        let settings = claude.join("settings.json");
+        fs::write(&settings, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        // First run — proactive=true so Kimetsu also writes PreToolUse/PostToolUse.
+        write_claude_hooks(&settings, true).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+
+        // (a) user entry on shared PreToolUse survived
+        let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-pretool-bash-check"),
+            "user PreToolUse/Bash group must survive"
+        );
+        // (b) Kimetsu's PreToolUse group is present alongside
+        assert!(
+            pre.iter()
+                .any(|g| g["hooks"][0]["command"] == "kimetsu brain pretool-hook"),
+            "kimetsu PreToolUse group must be added"
+        );
+        // (a) user entry on shared PostToolUse survived
+        let post = v["hooks"]["PostToolUse"].as_array().unwrap();
+        assert!(
+            post.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-posttool-bash-check"),
+            "user PostToolUse/Bash group must survive"
+        );
+        // (b) Kimetsu's PostToolUse present
+        assert!(
+            post.iter()
+                .any(|g| g["hooks"][0]["command"] == "kimetsu brain posttool-hook"),
+            "kimetsu PostToolUse group must be added"
+        );
+        // unrelated top-level key untouched
+        assert_eq!(v["someOtherSetting"], "keep-me");
+
+        // (c) idempotent: second run must not duplicate Kimetsu's groups
+        write_claude_hooks(&settings, true).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let pre2 = v2["hooks"]["PreToolUse"].as_array().unwrap();
+        let km_pre_count = pre2
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == "kimetsu brain pretool-hook")
+            .count();
+        assert_eq!(
+            km_pre_count, 1,
+            "exactly one Kimetsu PreToolUse group after two runs"
+        );
+        let post2 = v2["hooks"]["PostToolUse"].as_array().unwrap();
+        let km_post_count = post2
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == "kimetsu brain posttool-hook")
+            .count();
+        assert_eq!(
+            km_post_count, 1,
+            "exactly one Kimetsu PostToolUse group after two runs"
+        );
+        // user groups still there after second run
+        assert!(
+            pre2.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-pretool-bash-check"),
+            "user PreToolUse group survives second run"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Golden test: seed a .codex/hooks.json with a user UserPromptSubmit hook
+    /// AND a user hook on a non-Kimetsu event. Run write_codex_hooks twice.
+    /// Assert: user entries survive, Kimetsu's entries are added alongside,
+    /// no duplicate Kimetsu groups.
+    #[test]
+    fn b1_codex_hooks_golden_with_user_content() {
+        let root = temp_root("b1_codex_hooks_golden");
+        let codex = root.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+
+        let seed = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-codex-prompt-hook" }]
+                    }
+                ],
+                "SubagentStop": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-codex-subagent-hook" }]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            codex.join("hooks.json"),
+            serde_json::to_string_pretty(&seed).unwrap(),
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        // First run — proactive=true
+        write_codex_hooks(&codex, true, &mut files).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex.join("hooks.json")).unwrap()).unwrap();
+
+        // (a) user UserPromptSubmit hook survived
+        let ups = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert!(
+            ups.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-codex-prompt-hook"),
+            "user UserPromptSubmit hook must survive"
+        );
+        // (b) Kimetsu's UserPromptSubmit hook is present
+        assert!(
+            ups.iter()
+                .any(|g| g["hooks"][0]["command"] == "kimetsu brain context-hook --workspace ."),
+            "kimetsu UserPromptSubmit hook must be added"
+        );
+        // (a) non-shared event untouched
+        assert_eq!(
+            v["hooks"]["SubagentStop"][0]["hooks"][0]["command"],
+            "user-codex-subagent-hook"
+        );
+        // (b) Kimetsu's own events present
+        assert!(v["hooks"]["Stop"].is_array());
+        assert!(v["hooks"]["PreToolUse"].is_array());
+        assert!(v["hooks"]["PostToolUse"].is_array());
+
+        // (c) idempotent: second run
+        write_codex_hooks(&codex, true, &mut files).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex.join("hooks.json")).unwrap()).unwrap();
+        let ups2 = v2["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        let km_count = ups2
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == "kimetsu brain context-hook --workspace .")
+            .count();
+        assert_eq!(
+            km_count, 1,
+            "exactly one Kimetsu UserPromptSubmit after two runs"
+        );
+        assert!(
+            ups2.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-codex-prompt-hook"),
+            "user hook survives second run"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Golden test: seed .mcp.json with a user-defined non-Kimetsu MCP server.
+    /// Run write_mcp_config (workspace shape, both keys). Assert user server
+    /// survives, kimetsu server is added to both keys, idempotent.
+    #[test]
+    fn b1_mcp_config_golden_preserves_user_server() {
+        let root = temp_root("b1_mcp_golden");
+        let mcp = root.join(".mcp.json");
+
+        // Seed: user's own MCP server in both keys, plus an unrelated root key.
+        let seed = json!({
+            "customKey": "do-not-touch",
+            "servers": {
+                "my-server": { "command": "my-server-cmd", "args": ["--port", "3000"] }
+            },
+            "mcpServers": {
+                "my-server": { "command": "my-server-cmd", "args": ["--port", "3000"] }
+            }
+        });
+        fs::write(&mcp, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        // First run — workspace style (both servers + mcpServers).
+        write_mcp_config(&mcp, false).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+
+        // (a) user server survives in both keys
+        assert_eq!(
+            v["servers"]["my-server"]["command"], "my-server-cmd",
+            "user servers entry must survive"
+        );
+        assert_eq!(
+            v["mcpServers"]["my-server"]["command"], "my-server-cmd",
+            "user mcpServers entry must survive"
+        );
+        // (b) kimetsu server added in both keys
+        assert_eq!(v["servers"]["kimetsu"]["command"], "kimetsu");
+        assert_eq!(v["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        // unrelated root key untouched
+        assert_eq!(v["customKey"], "do-not-touch");
+
+        // (c) idempotent: second run leaves user server and kimetsu in place
+        write_mcp_config(&mcp, false).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(v2["servers"]["my-server"]["command"], "my-server-cmd");
+        assert_eq!(v2["servers"]["kimetsu"]["command"], "kimetsu");
+        assert_eq!(v2["mcpServers"]["my-server"]["command"], "my-server-cmd");
+        assert_eq!(v2["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        assert_eq!(v2["customKey"], "do-not-touch");
+        // Verify no duplicate kimetsu keys (JSON object keys are unique by spec;
+        // the map should have exactly two entries in each block).
+        assert_eq!(
+            v2["servers"].as_object().unwrap().len(),
+            2,
+            "servers must have exactly my-server + kimetsu, no duplicates"
+        );
+        assert_eq!(
+            v2["mcpServers"].as_object().unwrap().len(),
+            2,
+            "mcpServers must have exactly my-server + kimetsu, no duplicates"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // B2 — Full install-path tests: (ClaudeCode, Codex) × (workspace, global)
+    // -------------------------------------------------------------------------
+
+    /// ClaudeCode workspace install: pre-seed CLAUDE.md and settings.json with
+    /// user content, run plugin_install_inner, assert all managed files exist
+    /// AND user content survives in every merged file.
+    #[test]
+    fn b2_install_claudecode_workspace_preserves_user_content() {
+        let ws = temp_root("b2_cc_ws");
+        let home = temp_root("b2_cc_ws_home"); // not used by workspace install
+
+        // Pre-seed .claude/CLAUDE.md with user instructions.
+        let claude_dir = ws.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("CLAUDE.md"),
+            "# My workspace rules\nAlways write tests first.\n",
+        )
+        .unwrap();
+
+        // Pre-seed .claude/settings.json with a user hook on a shared event.
+        let seed_settings = json!({
+            "myTopLevelPref": true,
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-ws-hook" }]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&seed_settings).unwrap(),
+        )
+        .unwrap();
+
+        // Pre-seed .mcp.json with a user server.
+        let seed_mcp = json!({
+            "servers": {
+                "my-ws-server": { "command": "my-ws-server-cmd" }
+            },
+            "mcpServers": {
+                "my-ws-server": { "command": "my-ws-server-cmd" }
+            }
+        });
+        fs::write(
+            ws.join(".mcp.json"),
+            serde_json::to_string_pretty(&seed_mcp).unwrap(),
+        )
+        .unwrap();
+
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None, // workspace install — no home injection needed
+        )
+        .unwrap();
+
+        // All managed files exist.
+        assert!(ws.join(".mcp.json").is_file());
+        assert!(claude_dir.join("CLAUDE.md").is_file());
+        assert!(claude_dir.join("settings.json").is_file());
+        assert!(claude_dir.join("commands/kimetsu/bridge.md").is_file());
+        assert!(claude_dir.join("commands/kimetsu/delegate.md").is_file());
+        assert!(
+            claude_dir
+                .join("agents/kimetsu-memory-harvester.md")
+                .is_file()
+        );
+
+        // User CLAUDE.md content survived.
+        let md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(
+            md.contains("# My workspace rules"),
+            "user CLAUDE.md content kept"
+        );
+        assert!(
+            md.contains("Always write tests first."),
+            "user CLAUDE.md detail kept"
+        );
+        assert!(md.contains("# Kimetsu brain"), "kimetsu block appended");
+        assert!(md.contains(CLAUDE_MD_BEGIN));
+
+        // User settings.json hook survived alongside Kimetsu's.
+        let sv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        let ups = sv["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert!(
+            ups.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-ws-hook"),
+            "user hook must survive in settings.json"
+        );
+        assert!(
+            ups.iter()
+                .any(|g| g["hooks"][0]["command"] == "kimetsu brain context-hook"),
+            "kimetsu hook must be added"
+        );
+        assert_eq!(sv["myTopLevelPref"], true, "top-level pref must survive");
+
+        // User .mcp.json server survived alongside Kimetsu's.
+        let mv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(ws.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(mv["servers"]["my-ws-server"]["command"], "my-ws-server-cmd");
+        assert_eq!(mv["servers"]["kimetsu"]["command"], "kimetsu");
+        assert_eq!(
+            mv["mcpServers"]["my-ws-server"]["command"],
+            "my-ws-server-cmd"
+        );
+        assert_eq!(mv["mcpServers"]["kimetsu"]["command"], "kimetsu");
+
+        fs::remove_dir_all(ws).ok();
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// ClaudeCode global install: pre-seed ~/.claude/CLAUDE.md and
+    /// ~/.claude/settings.json, run plugin_install_inner with injected home,
+    /// assert workspace is untouched and all merged files in home preserve user
+    /// content.
+    #[test]
+    fn b2_install_claudecode_global_preserves_user_content() {
+        let ws = temp_root("b2_cc_global_ws");
+        let home = temp_root("b2_cc_global_home");
+
+        // Pre-seed ~/.claude/ files.
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("CLAUDE.md"),
+            "# Global rules\nUse conventional commits.\n",
+        )
+        .unwrap();
+        let seed_settings = json!({
+            "globalPref": 42,
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-global-stop-hook" }]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&seed_settings).unwrap(),
+        )
+        .unwrap();
+
+        // Pre-seed ~/.claude.json with a non-Kimetsu MCP server.
+        let seed_claude_json = json!({
+            "mcpServers": {
+                "user-global-server": { "command": "user-global-cmd" }
+            }
+        });
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_string_pretty(&seed_claude_json).unwrap(),
+        )
+        .unwrap();
+
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            true,
+            Some(home.as_path()),
+        )
+        .unwrap();
+
+        // Workspace must be untouched.
+        assert!(
+            !ws.join(".claude").exists(),
+            "workspace .claude must not be created"
+        );
+        assert!(
+            !ws.join(".mcp.json").exists(),
+            "workspace .mcp.json must not be created"
+        );
+
+        // All managed files exist in home.
+        assert!(claude_dir.join("CLAUDE.md").is_file());
+        assert!(claude_dir.join("settings.json").is_file());
+        assert!(claude_dir.join("commands/kimetsu/bridge.md").is_file());
+        assert!(
+            claude_dir
+                .join("agents/kimetsu-memory-harvester.md")
+                .is_file()
+        );
+        assert!(home.join(".claude.json").is_file());
+
+        // User CLAUDE.md content survived.
+        let md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(md.contains("# Global rules"), "user global CLAUDE.md kept");
+        assert!(md.contains("Use conventional commits."));
+        assert!(md.contains("# Kimetsu brain"));
+
+        // User settings.json hook survived.
+        let sv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        let stop_hooks = sv["hooks"]["Stop"].as_array().unwrap();
+        assert!(
+            stop_hooks
+                .iter()
+                .any(|g| g["hooks"][0]["command"] == "user-global-stop-hook"),
+            "user global Stop hook must survive"
+        );
+        assert!(
+            stop_hooks
+                .iter()
+                .any(|g| g["hooks"][0]["command"] == "kimetsu brain stop-hook"),
+            "kimetsu Stop hook must be added"
+        );
+        assert_eq!(sv["globalPref"], 42, "top-level pref must survive");
+
+        // User MCP server in ~/.claude.json survived alongside Kimetsu's.
+        let cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            cj["mcpServers"]["user-global-server"]["command"],
+            "user-global-cmd"
+        );
+        assert_eq!(cj["mcpServers"]["kimetsu"]["command"], "kimetsu");
+        // Global installs must not write the `servers` key to ~/.claude.json.
+        assert!(
+            cj.get("servers").is_none(),
+            "global ~/.claude.json must not get a `servers` key"
+        );
+
+        fs::remove_dir_all(ws).ok();
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// Codex workspace install: pre-seed .codex/hooks.json with a user hook,
+    /// run plugin_install_inner, assert all managed files exist AND user hook
+    /// survives.
+    #[test]
+    fn b2_install_codex_workspace_preserves_user_content() {
+        let ws = temp_root("b2_codex_ws");
+
+        // Pre-seed .codex/hooks.json with a user hook.
+        let codex_dir = ws.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let seed_hooks = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-codex-ws-hook" }]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&seed_hooks).unwrap(),
+        )
+        .unwrap();
+
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // All managed files exist.
+        assert!(codex_dir.join("config.toml").is_file());
+        assert!(codex_dir.join("hooks.json").is_file());
+        assert!(codex_dir.join("skills/kimetsu-bridge/SKILL.md").is_file());
+        assert!(
+            codex_dir
+                .join("agents/kimetsu-memory-harvester.toml")
+                .is_file()
+        );
+
+        // User hook survived alongside Kimetsu's.
+        let hv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        let ups = hv["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert!(
+            ups.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-codex-ws-hook"),
+            "user Codex workspace hook must survive"
+        );
+        assert!(
+            ups.iter().any(|g| {
+                g["hooks"][0]["command"] == "kimetsu brain context-hook --workspace ."
+            }),
+            "kimetsu Codex UserPromptSubmit must be added"
+        );
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    /// Codex global install: pre-seed ~/.codex/hooks.json with a user hook,
+    /// run plugin_install_inner with injected home, assert workspace is untouched
+    /// and user hook survives in the home dir.
+    #[test]
+    fn b2_install_codex_global_preserves_user_content() {
+        let ws = temp_root("b2_codex_global_ws");
+        let home = temp_root("b2_codex_global_home");
+
+        // Pre-seed ~/.codex/hooks.json with a user hook on a non-shared event.
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let seed_hooks = json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-global-codex-stop" }]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&seed_hooks).unwrap(),
+        )
+        .unwrap();
+
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::Codex,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            true,
+            Some(home.as_path()),
+        )
+        .unwrap();
+
+        // Workspace must be untouched.
+        assert!(
+            !ws.join(".codex").exists(),
+            "workspace .codex must not be created"
+        );
+
+        // All managed files exist in home.
+        assert!(codex_dir.join("config.toml").is_file());
+        assert!(codex_dir.join("hooks.json").is_file());
+        assert!(codex_dir.join("skills/kimetsu-bridge/SKILL.md").is_file());
+        assert!(
+            codex_dir
+                .join("agents/kimetsu-memory-harvester.toml")
+                .is_file()
+        );
+
+        // User Stop hook survived. Kimetsu's Stop hook also present.
+        let hv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        let stop = hv["hooks"]["Stop"].as_array().unwrap();
+        assert!(
+            stop.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-global-codex-stop"),
+            "user global Codex Stop hook must survive"
+        );
+        assert!(
+            stop.iter().any(|g| {
+                g["hooks"][0]["command"]
+                    == "kimetsu brain stop-hook --workspace . --distill-on-stop"
+            }),
+            "kimetsu Stop hook must be added"
+        );
+
+        fs::remove_dir_all(ws).ok();
+        fs::remove_dir_all(home).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // B3 — Upgrade idempotency: second install can't corrupt managed files
+    // -------------------------------------------------------------------------
+
+    /// Run plugin_install_inner twice over the same workspace (ClaudeCode).
+    /// After the first run, snapshot every managed file. After the second run,
+    /// assert every file is byte-identical to the snapshot: no duplicate hook
+    /// groups, exactly one CLAUDE.md marker block, stable .mcp.json and
+    /// settings.json bytes.
+    #[test]
+    fn b3_upgrade_idempotency_claudecode_workspace() {
+        let ws = temp_root("b3_upgrade_cc_ws");
+
+        // Pre-seed user content so the merged files are non-trivial.
+        let claude_dir = ws.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("CLAUDE.md"),
+            "# User prefs\nDo good work.\n",
+        )
+        .unwrap();
+        let seed_settings = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "user-upgrade-hook" }]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&seed_settings).unwrap(),
+        )
+        .unwrap();
+        let seed_mcp = json!({
+            "servers": { "my-upgrade-server": { "command": "my-upgrade-cmd" } },
+            "mcpServers": { "my-upgrade-server": { "command": "my-upgrade-cmd" } }
+        });
+        fs::write(
+            ws.join(".mcp.json"),
+            serde_json::to_string_pretty(&seed_mcp).unwrap(),
+        )
+        .unwrap();
+
+        // First install.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Snapshot every merged file after the first install.
+        let snapshot_claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        let snapshot_settings = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let snapshot_mcp = fs::read_to_string(ws.join(".mcp.json")).unwrap();
+
+        // Sanity: snapshots contain expected content.
+        assert_eq!(snapshot_claude_md.matches(CLAUDE_MD_BEGIN).count(), 1);
+        assert!(snapshot_claude_md.contains("# User prefs"));
+
+        // Second install — same args.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Every merged file must be byte-identical to the snapshot.
+        let after_claude_md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        let after_settings = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let after_mcp = fs::read_to_string(ws.join(".mcp.json")).unwrap();
+
+        assert_eq!(
+            after_claude_md, snapshot_claude_md,
+            "CLAUDE.md must be byte-identical after second install"
+        );
+        assert_eq!(
+            after_settings, snapshot_settings,
+            "settings.json must be byte-identical after second install"
+        );
+        assert_eq!(
+            after_mcp, snapshot_mcp,
+            ".mcp.json must be byte-identical after second install"
+        );
+
+        // Belt-and-suspenders: confirm invariants on the final state.
+        assert_eq!(
+            after_claude_md.matches(CLAUDE_MD_BEGIN).count(),
+            1,
+            "exactly one CLAUDE.md begin marker"
+        );
+        assert_eq!(
+            after_claude_md.matches(CLAUDE_MD_END).count(),
+            1,
+            "exactly one CLAUDE.md end marker"
+        );
+        let sv: serde_json::Value = serde_json::from_str(&after_settings).unwrap();
+        let ups = sv["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        let km_ups_count = ups
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == "kimetsu brain context-hook")
+            .count();
+        assert_eq!(
+            km_ups_count, 1,
+            "exactly one kimetsu UserPromptSubmit hook group"
+        );
+        assert_eq!(
+            ups.iter()
+                .filter(|g| g["hooks"][0]["command"] == "user-upgrade-hook")
+                .count(),
+            1,
+            "exactly one user hook group"
+        );
+        let mv: serde_json::Value = serde_json::from_str(&after_mcp).unwrap();
+        assert_eq!(mv["servers"].as_object().unwrap().len(), 2);
+        assert_eq!(mv["mcpServers"].as_object().unwrap().len(), 2);
+
+        fs::remove_dir_all(ws).ok();
+    }
 }
