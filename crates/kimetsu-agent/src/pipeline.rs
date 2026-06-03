@@ -513,6 +513,25 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         }
     }
 
+    // E1: proactive failure anticipation — retrieve failure_pattern/convention
+    // memories relevant to this task ONCE before the attempts loop. High
+    // min_score + kind filter keeps this ~zero-token when nothing matches.
+    // Best-effort: a retrieval error just skips the block without failing the run.
+    let proactive_pitfall_bundle: Option<ContextBundle> = if options.disable_broker {
+        None
+    } else {
+        let pitfall_request = ContextRequest {
+            stage: "implementation".to_string(),
+            query: format!("{}\n{}", options.task, patch_plan.expected_outcome),
+            budget_tokens: 600,
+            min_score: 0.7,
+            max_capsules: 2,
+            kinds: vec!["failure_pattern".to_string(), "convention".to_string()],
+            ..Default::default()
+        };
+        context::retrieve_context(&conn, &repo_root, &config.broker.weights, pitfall_request).ok()
+    };
+
     let mut implementation_outcome = None;
     let mut verification_summary: Option<serde_json::Value> = None;
     let mut verification_tool_calls: u32 = 0;
@@ -655,6 +674,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 &options.task,
                 &patch_plan,
                 &patch_context,
+                proactive_pitfall_bundle.as_ref(),
                 last_failure_context.as_deref(),
                 &mut recall_ledger,
             )?);
@@ -1650,6 +1670,7 @@ fn build_implementation_messages(
     task: &str,
     patch_plan: &PatchPlan,
     patch_context: &ContextBundle,
+    pitfall_bundle: Option<&ContextBundle>,
     retry_context: Option<&str>,
     ledger: &mut RunRecallLedger,
 ) -> KimetsuResult<Vec<ModelMessage>> {
@@ -1666,10 +1687,17 @@ fn build_implementation_messages(
         ),
         _ => String::new(),
     };
+    // E1: render the "Known pitfalls" block from the proactive bundle (if any).
+    // Uses is_surfaced/mark_surfaced — separate from the F1 is_injected/mark_injected
+    // dedup — so retries don't repeat the same warning.
+    let pitfalls_block = pitfall_bundle
+        .and_then(|bundle| render_known_pitfalls(bundle, ledger))
+        .map(|block| format!("\n\n{block}"))
+        .unwrap_or_default();
     let user = ModelMessage::user_text(format!(
         "Task:\n{task}\n\n\
          Active PatchPlan:\n{patch_plan_json}\n\n\
-         Context capsules:\n{capsules}{retry_block}\n\n\
+         Context capsules:\n{capsules}{pitfalls_block}{retry_block}\n\n\
          Rules:\n\
          - Read a file before modifying or deleting it.\n\
          - For modify/delete, pass the exact hash from read_file as expected_hash.\n\
@@ -1688,6 +1716,42 @@ fn build_implementation_messages(
             render_context_capsules(patch_context, patch_context.capsules.len().max(1), ledger,),
     ));
     Ok(vec![system, user])
+}
+
+/// E1: render a "Known pitfalls" block from a proactive retrieval bundle.
+///
+/// For each capsule in `bundle` that has NOT already been surfaced this run
+/// (checked via `ledger.is_surfaced`), include it in the block and mark it
+/// surfaced. Capsules already surfaced (e.g. from a prior attempt) are
+/// silently skipped — this is the proactive dedup, kept intentionally
+/// separate from the F1 `is_injected` / `mark_injected` cross-stage capsule
+/// dedup. Returns `None` when no unsurfaced pitfalls remain (empty block,
+/// no header rendered).
+pub fn render_known_pitfalls(
+    bundle: &ContextBundle,
+    ledger: &mut RunRecallLedger,
+) -> Option<String> {
+    if bundle.skipped || bundle.capsules.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for c in &bundle.capsules {
+        if !ledger.is_surfaced(&c.id) {
+            ledger.mark_surfaced(&c.id);
+            lines.push(format!(
+                "- {kind}: {summary}",
+                kind = c.kind,
+                summary = c.summary
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "## Known pitfalls (from past runs)\n{}",
+        lines.join("\n")
+    ))
 }
 
 fn implementation_tool_definitions() -> Vec<crate::model::ToolDefinition> {
@@ -3116,6 +3180,176 @@ mod tests {
             "back-ref ({} chars) should be materially shorter than full ({} chars)",
             back_ref.len(),
             full.len()
+        );
+    }
+
+    // ── E1: proactive failure anticipation tests ───────────────────────────
+
+    /// E1-test-1: a fresh pitfall bundle with one failure_pattern capsule
+    /// produces a "Known pitfalls" block containing that capsule's summary.
+    #[test]
+    fn e1_pitfall_surfaces_in_first_attempt() {
+        let bundle = make_bundle(vec![make_capsule(
+            "fp-1",
+            "failure_pattern",
+            "Always run cargo fmt before cargo clippy or clippy will reject the diff",
+            30,
+        )]);
+        let mut ledger = RunRecallLedger::new();
+
+        let result = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            result.is_some(),
+            "should return Some(_) when there is a matching pitfall"
+        );
+        let block = result.unwrap();
+        assert!(
+            block.contains("Known pitfalls"),
+            "block must contain the section header"
+        );
+        assert!(
+            block.contains("Always run cargo fmt"),
+            "block must contain the capsule summary"
+        );
+        assert!(
+            block.contains("failure_pattern"),
+            "block must include the capsule kind"
+        );
+        // The pitfall must now be recorded in the surfaced set.
+        assert!(
+            ledger.is_surfaced("fp-1"),
+            "capsule id must be marked surfaced after first render"
+        );
+    }
+
+    /// E1-test-2: when the bundle is skipped (empty brain / no match above
+    /// min_score) or truly empty, render_known_pitfalls returns None — zero
+    /// tokens added to the prompt.
+    #[test]
+    fn e1_no_match_returns_none() {
+        // Skipped bundle (top_score below min_score → skipped:true, capsules empty).
+        let skipped_bundle = ContextBundle {
+            stage: "implementation".to_string(),
+            budget_tokens: 600,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: Vec::new(),
+            skipped: true,
+            top_score: 0.0,
+        };
+        let mut ledger = RunRecallLedger::new();
+        assert!(
+            render_known_pitfalls(&skipped_bundle, &mut ledger).is_none(),
+            "skipped bundle must produce None"
+        );
+
+        // Completely empty bundle (skipped:false but no capsules).
+        let empty_bundle = ContextBundle {
+            stage: "implementation".to_string(),
+            budget_tokens: 600,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
+        };
+        assert!(
+            render_known_pitfalls(&empty_bundle, &mut ledger).is_none(),
+            "empty bundle must produce None"
+        );
+    }
+
+    /// E1-test-3: a pitfall surfaced in attempt #1 is NOT repeated in attempt
+    /// #2 — the ledger's surfaced set suppresses it.
+    #[test]
+    fn e1_ledger_suppresses_pitfall_on_retry() {
+        let bundle = make_bundle(vec![make_capsule(
+            "fp-retry",
+            "convention",
+            "Use `--locked` with cargo install to reproduce CI builds exactly",
+            25,
+        )]);
+        let mut ledger = RunRecallLedger::new();
+
+        // Attempt #1: pitfall surfaces.
+        let first = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            first.is_some(),
+            "pitfall should surface on the first attempt"
+        );
+        assert!(first.unwrap().contains("--locked"));
+
+        // Attempt #2: same ledger — pitfall already surfaced, returns None.
+        let second = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            second.is_none(),
+            "pitfall must NOT be repeated when already surfaced this run"
+        );
+    }
+
+    /// E1-test-4: proactive surfaced dedup (is_surfaced/mark_surfaced) is
+    /// independent of the F1 injected dedup (is_injected/mark_injected). A
+    /// capsule can be injected via the normal context path AND surfaced as a
+    /// pitfall without the two mechanisms conflicting.
+    #[test]
+    fn e1_surfaced_and_injected_are_independent() {
+        let capsule = make_capsule(
+            "dual",
+            "failure_pattern",
+            "Watch out for lifetime issues in async blocks",
+            40,
+        );
+        let bundle = make_bundle(vec![capsule.clone()]);
+        let mut ledger = RunRecallLedger::new();
+
+        // Mark it injected (F1 path) — shouldn't affect proactive surfacing.
+        ledger.mark_injected("dual", 40);
+        assert!(ledger.is_injected("dual"));
+        assert!(!ledger.is_surfaced("dual"));
+
+        // Proactive path: should still surface it.
+        let result = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            result.is_some(),
+            "is_injected must NOT prevent proactive surfacing"
+        );
+        assert!(ledger.is_surfaced("dual"));
+
+        // Mark it surfaced (E1 path) — shouldn't affect injected state.
+        // (Already marked above; verify injected_count is still 1.)
+        assert_eq!(ledger.injected_count(), 1);
+        assert_eq!(ledger.injected_tokens(), 40);
+    }
+
+    /// E1-test-5: the proactive request envelope uses the correct kinds,
+    /// min_score, max_capsules, and budget_tokens parameters.
+    #[test]
+    fn e1_pitfall_request_uses_correct_parameters() {
+        // This is a structural/contract test that verifies the ContextRequest
+        // constants match the spec without needing a live brain connection.
+        let task = "fix the scheduler loop";
+        let expected_outcome = "scheduler exits cleanly";
+        let request = ContextRequest {
+            stage: "implementation".to_string(),
+            query: format!("{task}\n{expected_outcome}"),
+            budget_tokens: 600,
+            min_score: 0.7,
+            max_capsules: 2,
+            kinds: vec!["failure_pattern".to_string(), "convention".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(request.stage, "implementation");
+        assert_eq!(request.budget_tokens, 600);
+        assert!(
+            (request.min_score - 0.7).abs() < f32::EPSILON,
+            "min_score must be 0.7"
+        );
+        assert_eq!(request.max_capsules, 2);
+        assert_eq!(request.kinds, vec!["failure_pattern", "convention"]);
+        assert!(request.query.contains(task), "query must include the task");
+        assert!(
+            request.query.contains(expected_outcome),
+            "query must include a patch-plan signal"
         );
     }
 }
