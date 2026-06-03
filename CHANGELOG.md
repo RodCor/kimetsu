@@ -22,7 +22,11 @@ ADDED
     `propose_or_merge_memory`. When the distiller is enabled, the Stop hook's
     end-of-session cue is suppressed (the distiller owns end-of-session; the
     mid-session PostToolUse resolved-failure cue stays). `AnthropicProvider`
-    gained an optional base URL for the LiteLLM case.
+    gained an optional base URL for the LiteLLM case. With `--scope global` the
+    wizard configures the distiller once in `~/.kimetsu/` (config + `.env`); that
+    global distiller then runs in every project and records into the user brain
+    (`~/.kimetsu/brain.db`, available everywhere), with a per-project distiller
+    taking precedence when one is configured.
   * **Auto-harvested memories (in-agent).** The hooks now drive memory
     *generation*, not just retrieval. When a command that failed earlier in the
     session succeeds (PostToolUse), or a non-trivial session ends with nothing

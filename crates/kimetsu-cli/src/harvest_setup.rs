@@ -102,8 +102,7 @@ fn read_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
 /// enclosing git repo and open the brain DB), so the config + secret never
 /// land in a parent repository.
 fn apply_distiller_config(project_toml: &Path, model: &str) -> std::io::Result<()> {
-    let io_err =
-        |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
+    let io_err = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
     let mut config = if project_toml.exists() {
         ProjectConfig::from_toml(&fs::read_to_string(project_toml)?).map_err(io_err)?
     } else {
@@ -186,14 +185,21 @@ mod tests {
     fn wizard_writes_env_and_config() {
         let root = std::env::temp_dir().join(format!(
             "kimetsu_wizard_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(root.join(".kimetsu")).unwrap();
-        let mut input =
-            Cursor::new("y\nclaude\nsk-litellm-123\nhttp://localhost:4000\n\n".as_bytes().to_vec());
+        let mut input = Cursor::new(
+            "y\nclaude\nsk-litellm-123\nhttp://localhost:4000\n\n"
+                .as_bytes()
+                .to_vec(),
+        );
         let mut output = Vec::new();
         let configured =
-            run_harvest_setup(&mut input, &mut output, &target_at(&root), "this workspace").unwrap();
+            run_harvest_setup(&mut input, &mut output, &target_at(&root), "this workspace")
+                .unwrap();
         assert!(configured);
 
         let env = fs::read_to_string(root.join(".env")).unwrap();
@@ -202,7 +208,11 @@ mod tests {
         let toml = fs::read_to_string(root.join(".kimetsu").join("project.toml")).unwrap();
         assert!(toml.contains("enabled = true"));
         assert!(toml.contains("claude-haiku-4-5"));
-        assert!(fs::read_to_string(root.join(".gitignore")).unwrap().contains(".env"));
+        assert!(
+            fs::read_to_string(root.join(".gitignore"))
+                .unwrap()
+                .contains(".env")
+        );
         fs::remove_dir_all(root).ok();
     }
 

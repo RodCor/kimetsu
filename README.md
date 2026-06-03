@@ -209,7 +209,9 @@ install claude-code` offers to set up a **SessionEnd distiller**: a cheap
 configured model (Anthropic `claude-haiku-4-5`, or a LiteLLM endpoint via
 `ANTHROPIC_BASE_URL`) that distills each session itself at the end and records
 the lessons. The wizard stores the key in a gitignored `.env`; skip it with
-`--no-setup`.
+`--no-setup`. Run it with `--scope global` to configure the distiller once in
+`~/.kimetsu/` — it then distills every project's sessions into your user brain
+(available everywhere), unless that project has its own distiller.
 
 ```bash
 kimetsu brain search "build failures"

@@ -14,7 +14,7 @@ use kimetsu_brain::project;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
-use kimetsu_core::paths::{user_brain_enabled, user_kimetsu_dir, ProjectPaths};
+use kimetsu_core::paths::{ProjectPaths, user_brain_enabled, user_kimetsu_dir};
 use serde::Deserialize;
 
 /// Max characters of transcript view fed to the distiller (keeps the
@@ -334,8 +334,7 @@ pub fn run_session_end_hook(workspace: &Path) {
     ) else {
         return;
     };
-    let recorded =
-        distill_and_record(&resolved.record_start, &view, &mut provider, resolved.scope);
+    let recorded = distill_and_record(&resolved.record_start, &view, &mut provider, resolved.scope);
     if recorded > 0 {
         println!(
             "[Kimetsu] distilled {recorded} lesson{} at session end.",
@@ -461,7 +460,12 @@ mod tests {
             let mut provider = MockProvider::new([text_response(
                 "[{\"lesson\":\"Set USERPROFILE for global installs\",\"tags\":[\"cargo\",\"windows\"],\"confidence\":0.9}]",
             )]);
-            let n = distill_and_record(&root, "user: a\nuser: b", &mut provider, MemoryScope::Project);
+            let n = distill_and_record(
+                &root,
+                "user: a\nuser: b",
+                &mut provider,
+                MemoryScope::Project,
+            );
             assert_eq!(n, 1);
             let memories = kimetsu_brain::project::list_memories(&root).expect("list");
             assert!(
@@ -521,14 +525,20 @@ mod tests {
     fn resolve_distiller_global_when_no_workspace() {
         let ws = std::env::temp_dir().join(format!(
             "km_rd_ws_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         // Intentionally NOT a git repo: exercises discover's non-repo fallback
         // so the workspace tier finds no config and we fall through to global.
         std::fs::create_dir_all(&ws).unwrap();
         let gdir = std::env::temp_dir().join(format!(
             "km_rd_g_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         write_distiller_toml(&gdir, true, "claude-haiku-4-5");
         std::fs::write(gdir.join(".env"), "ANTHROPIC_API_KEY=sk-global\n").unwrap();
@@ -549,7 +559,10 @@ mod tests {
     fn resolve_distiller_workspace_wins() {
         let ws = std::env::temp_dir().join(format!(
             "km_rd_wsw_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(ws.join(".kimetsu")).unwrap();
         assert!(
@@ -573,7 +586,10 @@ mod tests {
 
         let gdir = std::env::temp_dir().join(format!(
             "km_rd_gw_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         write_distiller_toml(&gdir, true, "g-model");
         std::fs::write(gdir.join(".env"), "ANTHROPIC_API_KEY=sk-global\n").unwrap();
@@ -608,7 +624,10 @@ mod tests {
                 .unwrap()
                 .expect("user brain exists");
             let mems = kimetsu_brain::user_brain::list_user_memories(&conn).unwrap();
-            assert!(mems.iter().any(|m| m.text.contains("Global lesson kept everywhere")));
+            assert!(
+                mems.iter()
+                    .any(|m| m.text.contains("Global lesson kept everywhere"))
+            );
         });
         std::fs::remove_dir_all(dir).ok();
     }
