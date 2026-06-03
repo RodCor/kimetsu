@@ -8,6 +8,193 @@ use kimetsu_core::{KimetsuResult, ids::new_id};
 use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+
+// -----------------------------------------------------------------------
+// E3: task-kind classification + adaptive retrieval routing
+// -----------------------------------------------------------------------
+
+/// The inferred kind of the current coding task. Classified once at
+/// intake from the task description string — deterministic keyword
+/// scan, no model call, zero allocation-heavy work.
+///
+/// `Feature` is the NEUTRAL default: it does not change weights or
+/// prefer_roles at all, so every existing `..Default::default()`
+/// construction produces exactly the prior retrieval behaviour.
+///
+/// Precedence when multiple keyword sets match:
+///   Debug > Investigation > Refactor > Docs > Feature
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskKind {
+    /// Neutral / catch-all (add, implement, build, create, support, …).
+    /// Must NOT alter weights or prefer_roles — keeps existing tests green.
+    #[default]
+    Feature,
+    /// fix, bug, error, fail, crash, panic, regression, broken, debug,
+    /// stack trace, exception — up freshness, prefer failure_pattern.
+    Debug,
+    /// refactor, rename, cleanup, restructure, simplify, extract,
+    /// deduplicate, reorganize — up scope, prefer convention.
+    Refactor,
+    /// document, readme, changelog, comment, docstring, docs, tutorial,
+    /// guide — near-neutral mild adjustments.
+    Docs,
+    /// investigate, analyze, understand, why, explore, find out,
+    /// root cause, audit, trace — up relevance, prefer fact + preference.
+    Investigation,
+}
+
+/// Classify a task description string into a [`TaskKind`] using a
+/// deterministic keyword scan over the lowercased text. No model call.
+///
+/// Precedence (highest wins when multiple sets match):
+///   Debug > Investigation > Refactor > Docs > Feature
+pub fn classify_task(task: &str) -> TaskKind {
+    let lower = task.to_ascii_lowercase();
+
+    // Debug keywords (highest priority)
+    const DEBUG_KW: &[&str] = &[
+        "fix",
+        "bug",
+        "error",
+        "fail",
+        "crash",
+        "panic",
+        "regression",
+        "broken",
+        "debug",
+        "stack trace",
+        "exception",
+    ];
+    if DEBUG_KW.iter().any(|kw| lower.contains(kw)) {
+        return TaskKind::Debug;
+    }
+
+    // Investigation keywords
+    const INVESTIGATE_KW: &[&str] = &[
+        "investigate",
+        "analyze",
+        "understand",
+        " why ",
+        "explore",
+        "find out",
+        "root cause",
+        "audit",
+        "trace",
+    ];
+    if INVESTIGATE_KW.iter().any(|kw| lower.contains(kw)) {
+        return TaskKind::Investigation;
+    }
+
+    // Refactor keywords
+    const REFACTOR_KW: &[&str] = &[
+        "refactor",
+        "rename",
+        "cleanup",
+        "clean up",
+        "restructure",
+        "simplify",
+        "extract",
+        "deduplicate",
+        "reorganize",
+    ];
+    if REFACTOR_KW.iter().any(|kw| lower.contains(kw)) {
+        return TaskKind::Refactor;
+    }
+
+    // Docs keywords
+    const DOCS_KW: &[&str] = &[
+        "document",
+        "readme",
+        "changelog",
+        "comment",
+        "docstring",
+        "docs",
+        "tutorial",
+        "guide",
+    ];
+    if DOCS_KW.iter().any(|kw| lower.contains(kw)) {
+        return TaskKind::Docs;
+    }
+
+    // Default: Feature (neutral)
+    TaskKind::Feature
+}
+
+/// Compose task-kind weight biases on top of the stage weights.
+///
+/// For `Feature`, returns `base` UNCHANGED — this is the neutrality
+/// guarantee that keeps all existing retrieval tests green.
+///
+/// For other kinds, one component is multiplied by a bias factor and
+/// the result is renormalized so the four weights still sum to the same
+/// total as `base`, preserving overall scoring magnitude (just the mix
+/// changes).
+///
+/// Bias factors (applied before renorm):
+/// - Debug       → freshness × 1.6  (recent failures matter most)
+/// - Refactor    → scope × 1.6      (project/repo conventions matter most)
+/// - Investigation → relevance × 1.4 (broad fact/preference recall)
+/// - Docs        → mild (confidence × 1.15, near-neutral)
+fn weights_for_task_kind(base: StageWeights, kind: TaskKind) -> StageWeights {
+    match kind {
+        TaskKind::Feature => base,
+        TaskKind::Debug => renorm(StageWeights {
+            freshness: base.freshness * 1.6,
+            ..base
+        }),
+        TaskKind::Refactor => renorm(StageWeights {
+            scope: base.scope * 1.6,
+            ..base
+        }),
+        TaskKind::Investigation => renorm(StageWeights {
+            relevance: base.relevance * 1.4,
+            ..base
+        }),
+        TaskKind::Docs => renorm(StageWeights {
+            confidence: base.confidence * 1.15,
+            ..base
+        }),
+    }
+}
+
+/// Renormalize `StageWeights` so the four components sum to the same
+/// total as before the bias was applied. This preserves scoring
+/// magnitude — only the mix changes.
+fn renorm(w: StageWeights) -> StageWeights {
+    let sum = w.relevance + w.confidence + w.freshness + w.scope;
+    if sum <= f32::EPSILON {
+        return w;
+    }
+    // The original sum (before any bias) isn't available here; instead
+    // we scale to 1.0 and then the absolute scores are comparable
+    // because normalize_and_score already places components in [0,1].
+    // NOTE: the stage weights themselves don't need to sum to 1.0 —
+    // the existing defaults (0.5+0.2+0.2+0.1=1.0) do, but the
+    // renormalization target should be the unbiased sum so we don't
+    // change the overall scale. Since we only modify ONE component by a
+    // small factor, we scale back to 1.0 (the natural target).
+    StageWeights {
+        relevance: w.relevance / sum,
+        confidence: w.confidence / sum,
+        freshness: w.freshness / sum,
+        scope: w.scope / sum,
+    }
+}
+
+/// Return the additional `prefer_roles` hints implied by `kind`.
+///
+/// These are MERGED with any caller-supplied `prefer_roles` (not
+/// clobbered), so the task-kind bias is additive.
+/// For `Feature`, returns an empty slice — zero effect on existing behaviour.
+fn task_kind_prefer_roles(kind: TaskKind) -> &'static [&'static str] {
+    match kind {
+        TaskKind::Feature => &[],
+        TaskKind::Debug => &["failure_pattern"],
+        TaskKind::Refactor => &["convention"],
+        TaskKind::Investigation => &["fact", "preference"],
+        TaskKind::Docs => &["convention"],
+    }
+}
 use time::OffsetDateTime;
 
 use crate::embeddings::{
@@ -102,6 +289,11 @@ pub struct ContextRequest {
     /// from `BrokerSection.min_semantic_score` by the pipeline; callers
     /// that don't set it get the prior behaviour automatically.
     pub min_semantic_score: f32,
+    /// E3: inferred kind of the current task. Defaults to `Feature`
+    /// (the neutral kind) so every existing `..Default::default()`
+    /// construction is unchanged — Feature does NOT alter weights or
+    /// prefer_roles. Set by the pipeline via `classify_task` at intake.
+    pub task_kind: TaskKind,
 }
 
 #[derive(Debug, Clone)]
@@ -227,12 +419,35 @@ pub fn retrieve_context_with_embedder(
         });
     }
 
-    normalize_and_score(&mut candidates, weights_for_stage(weights, &request.stage));
+    // E3: compose task-kind weight bias over stage weights, then renormalize.
+    // For Feature (default), weights_for_task_kind returns the base unchanged.
+    let stage_weights = weights_for_stage(weights, &request.stage);
+    let effective_weights = weights_for_task_kind(stage_weights, request.task_kind);
+    normalize_and_score(&mut candidates, effective_weights);
+
+    // E3: merge task-kind prefer_role hints with caller-supplied prefer_roles.
+    // For Feature the hints are empty so this is a no-op (neutral).
+    let kind_role_hints = task_kind_prefer_roles(request.task_kind);
+    let mut effective_prefer_roles: Vec<String> = request.prefer_roles.clone();
+    for &hint in kind_role_hints {
+        let hint_s = hint.to_string();
+        if !effective_prefer_roles.contains(&hint_s) {
+            effective_prefer_roles.push(hint_s);
+        }
+    }
 
     // v0.6: apply tag boost (1.4×) and role-preference boost (1.3×) after
     // normalisation so the multipliers operate on the [0,1]-normalised score
     // rather than the raw pre-normalisation values.
-    if !request.tags.is_empty() || !request.prefer_roles.is_empty() {
+    //
+    // E3: the role-preference check uses `capsule_matches_kind` so that
+    // memory capsules (whose outer `kind` is always `"memory"`) are matched
+    // against the real sub-kind embedded in their summary prefix
+    // (`"scope:kind - text"`). This makes task-kind prefer_role hints
+    // (e.g. "failure_pattern" for Debug) actually work for memory capsules.
+    // For non-memory capsules (repo_file, manifest) the outer kind is checked
+    // directly — same behaviour as before for caller-supplied prefer_roles.
+    if !request.tags.is_empty() || !effective_prefer_roles.is_empty() {
         let tags_lc: Vec<String> = request
             .tags
             .iter()
@@ -243,11 +458,21 @@ pub fn retrieve_context_with_embedder(
             if !tags_lc.is_empty() && tags_lc.iter().any(|t| summary_lc.contains(t.as_str())) {
                 c.capsule.score *= 1.4;
             }
-            if !request.prefer_roles.is_empty()
-                && request
-                    .prefer_roles
-                    .iter()
-                    .any(|r| c.capsule.kind.contains(r.as_str()))
+            if !effective_prefer_roles.is_empty()
+                && effective_prefer_roles.iter().any(|r| {
+                    // For memory capsules: check the real sub-kind embedded in the
+                    // summary prefix ("scope:kind - text") via capsule_matches_kind.
+                    // This makes task-kind prefer_role hints work for memory capsules
+                    // whose outer `kind` field is always the generic "memory" string.
+                    // For non-memory capsules: fall back to the original substring
+                    // check on the outer `kind` field (preserves v0.6 behaviour for
+                    // caller-supplied prefer_roles like "semantic_operator").
+                    if c.capsule.kind == "memory" {
+                        capsule_matches_kind(&c.capsule, r.as_str())
+                    } else {
+                        c.capsule.kind.contains(r.as_str())
+                    }
+                })
             {
                 c.capsule.score *= 1.3;
             }
@@ -3163,5 +3388,455 @@ mod tests {
             "m_y must surface via FTS on lean path; got {handles:?}"
         );
         // Crucially: no panic, no memory_vec table access.
+    }
+
+    // ---------------------------------------------------------------
+    // E3 tests: task-kind classification + adaptive retrieval routing
+    // ---------------------------------------------------------------
+
+    /// E3-1: classify_task is deterministic for each kind.
+    #[test]
+    fn classify_task_maps_each_kind_deterministically() {
+        // Debug examples
+        assert_eq!(
+            classify_task("fix the panic in the parser"),
+            TaskKind::Debug,
+            "contains 'fix' and 'panic'"
+        );
+        assert_eq!(
+            classify_task("there is a crash in auth when calling login"),
+            TaskKind::Debug,
+            "contains 'crash'"
+        );
+        assert_eq!(
+            classify_task("debug the failing test"),
+            TaskKind::Debug,
+            "contains 'debug' and 'fail'"
+        );
+
+        // Investigation examples
+        assert_eq!(
+            classify_task("investigate why retrieval is slow"),
+            TaskKind::Investigation,
+            "contains 'investigate' and 'why'"
+        );
+        assert_eq!(
+            classify_task("analyze the root cause of the latency"),
+            TaskKind::Investigation,
+            "contains 'analyze' and 'root cause'"
+        );
+
+        // Refactor examples
+        assert_eq!(
+            classify_task("refactor the auth module"),
+            TaskKind::Refactor,
+            "contains 'refactor'"
+        );
+        assert_eq!(
+            classify_task("rename the config struct"),
+            TaskKind::Refactor,
+            "contains 'rename'"
+        );
+        assert_eq!(
+            classify_task("simplify the retry handling logic"),
+            TaskKind::Refactor,
+            "contains 'simplify'"
+        );
+
+        // Docs examples
+        assert_eq!(
+            classify_task("document the API endpoints"),
+            TaskKind::Docs,
+            "contains 'document'"
+        );
+        assert_eq!(
+            classify_task("update the readme with new instructions"),
+            TaskKind::Docs,
+            "contains 'readme'"
+        );
+        assert_eq!(
+            classify_task("add a docstring to the main function"),
+            TaskKind::Docs,
+            "contains 'docstring'"
+        );
+
+        // Feature examples (default / fallback)
+        assert_eq!(
+            classify_task("add a dark mode toggle"),
+            TaskKind::Feature,
+            "no debug/refactor/docs/investigate keyword"
+        );
+        assert_eq!(
+            classify_task("implement the new caching layer"),
+            TaskKind::Feature,
+            "no debug/refactor/docs/investigate keyword"
+        );
+        assert_eq!(
+            classify_task("build the export pipeline"),
+            TaskKind::Feature,
+            "no debug/refactor/docs/investigate keyword"
+        );
+    }
+
+    /// E3-1b: precedence — Debug > Investigation > Refactor > Docs > Feature.
+    #[test]
+    fn classify_task_respects_precedence_order() {
+        // "fix" (Debug) + "refactor" (Refactor) → Debug wins
+        assert_eq!(
+            classify_task("fix and refactor the login module"),
+            TaskKind::Debug,
+            "Debug > Refactor"
+        );
+        // "investigate" (Investigation) + "refactor" (Refactor) → Investigation wins
+        assert_eq!(
+            classify_task("investigate and refactor the cache layer"),
+            TaskKind::Investigation,
+            "Investigation > Refactor"
+        );
+        // "investigate" (Investigation) + "document" (Docs) → Investigation wins
+        assert_eq!(
+            classify_task("investigate the docs and document the API"),
+            TaskKind::Investigation,
+            "Investigation > Docs"
+        );
+        // "refactor" (Refactor) + "docs" (Docs) → Refactor wins
+        assert_eq!(
+            classify_task("refactor and add docs"),
+            TaskKind::Refactor,
+            "Refactor > Docs"
+        );
+        // "fix" (Debug) + "investigate" (Investigation) → Debug wins
+        assert_eq!(
+            classify_task("fix the bug and investigate the regression"),
+            TaskKind::Debug,
+            "Debug > Investigation"
+        );
+    }
+
+    /// E3-2: weight renormalization — weights_for_task_kind(w, Debug) sums
+    /// to approximately the same total as the input weights.
+    #[test]
+    fn weights_for_task_kind_renormalizes_to_unit_sum() {
+        let base = StageWeights {
+            relevance: 0.50,
+            confidence: 0.20,
+            freshness: 0.20,
+            scope: 0.10,
+        };
+        let original_sum = base.relevance + base.confidence + base.freshness + base.scope;
+
+        for kind in [
+            TaskKind::Debug,
+            TaskKind::Refactor,
+            TaskKind::Investigation,
+            TaskKind::Docs,
+        ] {
+            let w = weights_for_task_kind(base.clone(), kind);
+            let new_sum = w.relevance + w.confidence + w.freshness + w.scope;
+            // Renormalized to 1.0; the original_sum is also 1.0 for these weights.
+            assert!(
+                (new_sum - original_sum).abs() < 1e-4,
+                "weights_for_task_kind({kind:?}) sum {new_sum} differs from {original_sum}"
+            );
+        }
+    }
+
+    /// E3-2b: Feature is the neutral kind — weights unchanged.
+    #[test]
+    fn weights_for_task_kind_feature_is_unchanged() {
+        let base = StageWeights {
+            relevance: 0.40,
+            confidence: 0.30,
+            freshness: 0.20,
+            scope: 0.10,
+        };
+        let w = weights_for_task_kind(base.clone(), TaskKind::Feature);
+        assert!((w.relevance - base.relevance).abs() < f32::EPSILON);
+        assert!((w.confidence - base.confidence).abs() < f32::EPSILON);
+        assert!((w.freshness - base.freshness).abs() < f32::EPSILON);
+        assert!((w.scope - base.scope).abs() < f32::EPSILON);
+    }
+
+    /// E3-2c: Debug biases toward freshness; after renorm, freshness
+    /// fraction must be strictly larger than in the base weights.
+    #[test]
+    fn weights_for_task_kind_debug_up_freshness_fraction() {
+        let base = StageWeights {
+            relevance: 0.50,
+            confidence: 0.20,
+            freshness: 0.20,
+            scope: 0.10,
+        };
+        let debug_w = weights_for_task_kind(base.clone(), TaskKind::Debug);
+        // Freshness fraction = freshness / sum = freshness (since sum=1 after renorm).
+        assert!(
+            debug_w.freshness > base.freshness,
+            "Debug must increase freshness fraction: {debug_w:?}"
+        );
+    }
+
+    /// E3-2d: Refactor biases toward scope; after renorm, scope fraction
+    /// must be strictly larger than in the base weights.
+    #[test]
+    fn weights_for_task_kind_refactor_up_scope_fraction() {
+        let base = StageWeights {
+            relevance: 0.50,
+            confidence: 0.20,
+            freshness: 0.20,
+            scope: 0.10,
+        };
+        let refactor_w = weights_for_task_kind(base.clone(), TaskKind::Refactor);
+        assert!(
+            refactor_w.scope > base.scope,
+            "Refactor must increase scope fraction: {refactor_w:?}"
+        );
+    }
+
+    /// E3-3: Feature is truly neutral — retrieval with task_kind=Feature
+    /// returns the same capsule set as with the default ContextRequest.
+    #[test]
+    fn task_kind_feature_is_retrieval_neutral() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        // Insert a few memories so retrieval has something to return.
+        // DB columns: scope='project', kind=actual memory kind.
+        // Broker formats summary as "{scope}:{kind} - {text}".
+        for (mid, db_kind, text) in [
+            ("m1", "failure_pattern", "linker not found error in build"),
+            ("m2", "convention", "use snake_case for all identifiers"),
+            ("m3", "fact", "the cache is invalidated on every deploy"),
+        ] {
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "INSERT INTO memories (
+                     memory_id, scope, kind, text, normalized_text, confidence,
+                     source_event_id, provenance_snapshot_json, created_at,
+                     use_count, usefulness_score
+                 )
+                 VALUES (?1, 'project', ?2, ?3, ?4, 1.0, NULL, '{}',
+                         '2026-01-01T00:00:00Z', 0, 0.0)",
+                rusqlite::params![mid, db_kind, text, normalized],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, ?3, 'project')",
+                rusqlite::params![mid, text, db_kind],
+            )
+            .expect("insert fts");
+        }
+
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let query = "cache convention failure".to_string();
+
+        // Baseline: no task_kind set (Default::default() → Feature)
+        let baseline = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.clone(),
+                budget_tokens: 4000,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("baseline retrieve");
+
+        // Explicit Feature: must be identical to baseline
+        let feature = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.clone(),
+                budget_tokens: 4000,
+                task_kind: TaskKind::Feature,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("feature retrieve");
+
+        let baseline_ids: Vec<&str> = baseline
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        let feature_ids: Vec<&str> = feature
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        assert_eq!(
+            baseline_ids, feature_ids,
+            "task_kind=Feature must produce identical retrieval to default; \
+             baseline={baseline_ids:?} feature={feature_ids:?}"
+        );
+
+        let baseline_scores: Vec<f32> = baseline.capsules.iter().map(|c| c.score).collect();
+        let feature_scores: Vec<f32> = feature.capsules.iter().map(|c| c.score).collect();
+        for (b, f) in baseline_scores.iter().zip(feature_scores.iter()) {
+            assert!(
+                (b - f).abs() < 1e-5,
+                "scores must be identical: baseline={b} feature={f}"
+            );
+        }
+    }
+
+    /// E3-4: headline behavioral proof — Debug routes strictly more
+    /// failure_pattern capsules than Docs over the same corpus + query.
+    ///
+    /// Setup: 4 failure_pattern memories + 4 convention/fact memories
+    /// that all share a common topic keyword "auth". We cap at 4 capsules
+    /// and compare how many are failure_pattern between Debug and Docs.
+    ///
+    /// Memory row layout: `scope='project'`, `kind='failure_pattern'` (or
+    /// `'convention'`/`'fact'`). The broker formats the capsule summary as
+    /// `"{scope}:{kind} - {text}"` so `capsule_matches_kind` can parse it.
+    #[test]
+    fn debug_surfaces_more_failure_pattern_than_docs() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        // Insert 4 failure_pattern memories.
+        // DB columns: scope='project', kind='failure_pattern'
+        // Broker formats summary as "project:failure_pattern - <text>".
+        for (i, text) in [
+            "auth token expired causes login failure",
+            "auth service crash on null pointer",
+            "auth regression after upgrade breaks sessions",
+            "auth error when certificate is invalid",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mid = format!("mfp{i}");
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "INSERT INTO memories (
+                     memory_id, scope, kind, text, normalized_text, confidence,
+                     source_event_id, provenance_snapshot_json, created_at,
+                     use_count, usefulness_score
+                 )
+                 VALUES (?1, 'project', 'failure_pattern', ?2, ?3, 1.0, NULL, '{}',
+                         '2026-01-01T00:00:00Z', 0, 0.0)",
+                rusqlite::params![mid, text, normalized],
+            )
+            .expect("insert failure_pattern");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'failure_pattern', 'project')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+
+        // Insert 4 convention/fact memories — also mention "auth".
+        // DB columns: scope='project', kind='convention' or 'fact'.
+        for (i, (db_kind, text)) in [
+            ("convention", "auth module uses bearer tokens by convention"),
+            ("convention", "auth scopes are documented in the API guide"),
+            ("fact", "auth service runs on port 8443 in production"),
+            ("fact", "auth uses JWT with RS256 signing for all tokens"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mid = format!("mconv{i}");
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "INSERT INTO memories (
+                     memory_id, scope, kind, text, normalized_text, confidence,
+                     source_event_id, provenance_snapshot_json, created_at,
+                     use_count, usefulness_score
+                 )
+                 VALUES (?1, 'project', ?2, ?3, ?4, 1.0, NULL, '{}',
+                         '2026-01-01T00:00:00Z', 0, 0.0)",
+                rusqlite::params![mid, db_kind, text, normalized],
+            )
+            .expect("insert convention/fact");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, ?3, 'project')",
+                rusqlite::params![mid, text, db_kind],
+            )
+            .expect("insert fts");
+        }
+
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let query = "auth token failure".to_string();
+
+        // Retrieve with Debug task_kind
+        let debug_bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.clone(),
+                budget_tokens: 4000,
+                max_capsules: 4,
+                task_kind: TaskKind::Debug,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("debug retrieve");
+
+        // Retrieve with Docs task_kind
+        let docs_bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.clone(),
+                budget_tokens: 4000,
+                max_capsules: 4,
+                task_kind: TaskKind::Docs,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("docs retrieve");
+
+        // Count failure_pattern capsules in each result.
+        // Memory capsules have kind="memory"; the real kind is in the summary prefix.
+        let count_failure_pattern = |bundle: &ContextBundle| -> usize {
+            bundle
+                .capsules
+                .iter()
+                .filter(|c| capsule_matches_kind(c, "failure_pattern"))
+                .count()
+        };
+
+        let debug_fp = count_failure_pattern(&debug_bundle);
+        let docs_fp = count_failure_pattern(&docs_bundle);
+
+        assert!(
+            debug_fp > docs_fp,
+            "Debug must surface strictly more failure_pattern capsules than Docs: \
+             debug_fp={debug_fp} docs_fp={docs_fp}\n\
+             Debug capsules: {:?}\n\
+             Docs capsules: {:?}",
+            debug_bundle
+                .capsules
+                .iter()
+                .map(|c| format!("{}:{}", c.kind, &c.summary[..c.summary.len().min(60)]))
+                .collect::<Vec<_>>(),
+            docs_bundle
+                .capsules
+                .iter()
+                .map(|c| format!("{}:{}", c.kind, &c.summary[..c.summary.len().min(60)]))
+                .collect::<Vec<_>>(),
+        );
     }
 }

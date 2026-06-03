@@ -219,6 +219,11 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         .canonicalize()?
         .to_string_lossy()
         .to_string();
+    // E3: classify the task once at intake. Feature is the neutral default
+    // so disable_broker runs and any other path that skips retrieval are
+    // unaffected — they never set task_kind on a ContextRequest at all.
+    let task_kind = context::classify_task(&options.task);
+
     let (localization_context, patch_context, broker_summary) = if options.disable_broker {
         let empty_loc = ContextBundle {
             stage: CodingStage::Localization.as_str().to_string(),
@@ -252,6 +257,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 // retrieve_context_with_embedder honours them directly.
                 max_capsules: config.broker.max_capsules,
                 min_semantic_score: config.broker.min_semantic_score,
+                // E3: task-kind adaptive routing.
+                task_kind,
                 ..Default::default()
             },
         )?;
@@ -266,6 +273,8 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 // D1f: same config-driven caps for the patch-plan stage.
                 max_capsules: config.broker.max_capsules,
                 min_semantic_score: config.broker.min_semantic_score,
+                // E3: task-kind adaptive routing.
+                task_kind,
                 ..Default::default()
             },
         )?;
