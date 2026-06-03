@@ -1727,6 +1727,8 @@ fn emit_context_injected(
                 "memory_ids": memory_ids,
                 "prior_run_ids": prior_run_ids,
                 "file_paths": file_paths,
+                "used_tokens": bundle.used_tokens,
+                "capsule_count": bundle.capsules.len(),
             }),
         ),
     )

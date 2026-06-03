@@ -1,4 +1,5 @@
 pub mod ambient;
+pub mod analytics;
 pub mod benchmark;
 pub mod conflict;
 pub mod context;
