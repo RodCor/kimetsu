@@ -36,17 +36,29 @@ maintenance — described below.
 
 ## 2. The brain
 
-Everything kimetsu remembers lives in **brain.db**, a SQLite
-database. Each project gets one at `<project>/.kimetsu/brain.db`. A
+Everything kimetsu remembers lives in **brain.db**, a single SQLite
+file. Each project gets one at `<project>/.kimetsu/brain.db`. A
 global user brain at `~/.kimetsu/brain.db` holds memories that
-follow you across projects (set `KIMETSU_USER_BRAIN=0` to disable).
+follow you across projects (set `KIMETSU_USER_BRAIN=0`, or
+`[kimetsu] use_user_brain = false` in `project.toml`, to disable).
 
-The brain is event-sourced. Every run writes a trace of `Event` rows
-(JSONL). A **projector** turns those events into materialized tables
-the broker can query fast:
+`.kimetsu/` is deliberately **lean**: a brain-only install holds just
+`brain.db` (plus its `-wal` / `-shm` and any `brain.db.bak-*` migration
+sidecars) and `project.toml`. Memory writes persist straight to brain.db —
+they do **not** create a per-write `runs/<id>/` directory. Only a real agent
+run still writes a `runs/<id>/` dir with its artifacts. The transient
+non-brain working dirs (`proactive/`, `chat/`, `bench/`) live OUT of the repo,
+under `~/.kimetsu/cache/<project-hash>/`, so they never clutter your tree.
+
+The brain is event-sourced, and the **`events` table inside brain.db is the
+durable event log** — not a loose pile of JSONL files. A **projector** replays
+those events into materialized tables the broker can query fast.
+`kimetsu brain rebuild` re-derives every projection from the `events` table
+(pass `--from-traces` to re-import from legacy on-disk `trace.jsonl` files for
+recovery). The materialized tables:
 
 - `runs` — one row per agent run (started_at, terminal_kind, cost).
-- `events` — every event ever written, raw.
+- `events` — every event ever written, raw; the durable source for rebuild.
 - `memories` — the durable knowledge. Each row carries scope
   (`global_user`, `project`, `repo`, `run`), kind (`preference`,
   `convention`, `command`, `failure_pattern`, `fact`), text, confidence,
@@ -61,9 +73,26 @@ the broker can query fast:
   `kimetsu brain ingest repo`.
 - `memories_fts` — FTS5 index of memory text for lexical retrieval.
 
-The schema is forward-additive — every column added since v0.1 uses
-`add_column_if_missing`, so an older brain.db opens cleanly under a
-newer binary without rebuilds.
+### Durable upgrades: schema migrations
+
+brain.db carries a schema version (`KIMETSU_SCHEMA_VERSION`, currently **2**)
+in its `schema_info` table. On every read-write open, a versioned,
+forward-only migration runner brings the DB up to the binary's target. Each
+migration runs inside **one transaction** (the DDL and the version bump commit
+together), so a crash mid-upgrade leaves the DB cleanly stamped at an
+intermediate version rather than half-applied. Before any version-advancing
+migration the runner takes an online-backup snapshot to a
+`brain.db.bak-<from>-<to>-<ts>` sidecar next to the DB (skipped for empty
+brains — a fresh install has nothing to protect; the three newest backups are
+kept). A read-only open of an un-migrated brain degrades gracefully — it reports
+"needs migration" and the next read-write open performs it.
+
+This DB schema version is **decoupled from the `project.toml` config version**
+(`KIMETSU_CONFIG_VERSION`, still `1`). So `[kimetsu] schema_version = 1` in
+`project.toml` is the *config-format* version, not the DB schema — the database
+can evolve (and migrate) without forcing every project.toml to be rewritten.
+The old "forward-additive `add_column_if_missing`, no rebuild" patches from
+v0.1–v0.5 are now folded into the single v1→v2 migration.
 
 ### Memory kinds
 
@@ -93,6 +122,13 @@ the agent loop's pre-stage hook), the **broker** assembles a
 context bundle. It walks both brains, scores candidates, and returns
 the top-N inside a token budget.
 
+**Candidate generation.** Lexical FTS5 always provides candidates. On the
+embeddings build the broker *also* runs an approximate-nearest-neighbour query
+against an in-database **sqlite-vec** index (a `vec0` virtual table, statically
+linked into the bundled SQLite) and **unions** those semantic hits with the FTS
+set — so a memory whose *meaning* matches the query can surface even when it
+shares no words with it. Lean builds use the FTS candidate set alone.
+
 The score is a weighted sum of four signals, plus two multipliers:
 
 ```
@@ -121,10 +157,26 @@ final_score    = weights.relevance   · raw_relevance
 ```
 
 Stages: `localization`, `patch_plan`, `verification`, `review`. Each
-has its own weight profile in `project.toml`. The broker also runs
-**MMR re-ranking** (lambda=0.7) to penalize within-kind redundancy —
-two memories that mention the same words don't both crowd the
-budget.
+has its own weight profile in `project.toml`.
+
+**Selection (sharpened in v1.0).** On the embeddings build the broker runs
+**embedding-MMR** (lambda=0.7): diversity is measured by cosine distance, so it
+collapses true paraphrase near-duplicates that share no surface words (with
+Jaccard token overlap as the lean-build / fallback path). An **absolute
+semantic-relevance floor** (`min_semantic_score`, embeddings-only) then drops
+candidates whose cosine to the query is below the threshold *before* budgeting —
+so a genuinely off-topic query hits the zero-capsule "skipped" path and returns
+nothing rather than padding the prompt with weak hits. Lean (FTS-only)
+selection is unchanged.
+
+Tunable knobs in `[broker]`:
+
+- `max_capsules` (default **8**) — hard cap on capsules rendered into a prompt.
+- `min_semantic_score` (default `0.0` = off) — the embeddings-only relevance
+  floor described above.
+- `budget_floor_tokens` (default `1500`) and `budget_run_cap_tokens`
+  (default `8000`) — bounds for the adaptive per-run budget (see the agent
+  brain section below).
 
 ### Embeddings vs lean builds
 
@@ -152,6 +204,42 @@ budget.
   (`kimetsu-brain`, `kimetsu-chat`) default to lean so downstream
   consumers stay slim; only the `kimetsu-cli` binary opts embeddings
   in by default.
+
+---
+
+## 3a. The agent brain (proactive + cost-shrinking)
+
+The broker above describes *retrieval*. For the autonomous agent pipeline,
+v1.0 layers an adaptive, task-aware recall strategy on top — so the brain is
+proactive, and its token overhead grows far slower than the task does.
+
+- **Task-kind routing.** Each task is classified once by a cheap deterministic
+  keyword classifier into one of `Debug` / `Feature` / `Refactor` / `Docs` /
+  `Investigation` (priority order on a tie: Debug > Investigation > Refactor >
+  Docs > Feature). A task-kind weight layer composes over the per-stage weights
+  (then renormalizes) to bias which *kinds* of memory get recalled: Debug leans
+  on recent `failure_pattern`s, Refactor on `convention`/scope, Investigation
+  on broad `fact`/`preference` recall. `Feature` is the neutral default — it
+  leaves the stage weights untouched.
+- **Proactive "Known pitfalls".** Before the first implementation attempt, a
+  tight `failure_pattern`/`convention` retrieval surfaces known pitfalls —
+  proactively, not only after a failure. It costs ~zero tokens when nothing
+  matches, and a per-run recall ledger stops it re-surfacing the same pitfall
+  on retries.
+- **Cross-stage capsule dedup.** A capsule rendered in an earlier stage is
+  back-referenced (not re-rendered) in later stages and counted once via the
+  run's recall ledger — so brain overhead *shrinks* in relative terms as a
+  task spans more stages.
+- **Lazy capsule expansion.** Top-confidence capsules are injected in full; the
+  long tail is injected as ~1-line headlines that the agent expands on demand
+  via a new **`expand_capsule`** tool (it resolves `memory:` / `file:`
+  handles). The agent only pays for the detail it actually opens.
+- **Adaptive budget.** The flat 6000-tokens-per-stage budget is replaced by one
+  that scales *sublinearly* with task size (`floor + k·√task_size`), floored by
+  `budget_floor_tokens` so small tasks aren't starved and capped per-run by
+  `budget_run_cap_tokens` via the ledger. Doubling task size grows the budget
+  by only ~41%; a 5× task by ~124%. (When the size signal is unavailable the
+  broker falls back to the flat `default_budget_tokens`.)
 
 ---
 
@@ -270,6 +358,34 @@ should have surfaced.
 
 ---
 
+## 6a. Analytics — is the brain actually helping?
+
+A brain you can't measure is a brain you can't trust. `kimetsu brain insights`
+(and the `kimetsu_brain_insights` MCP tool) compute proof-of-value metrics
+over a recent-runs window — default the last 50 runs, override with
+`--last-n-runs N` or an ISO-8601 `--since`, and `--top N` sizes the ranked
+lists. `--json` emits the full report for CI/dashboards. The metrics:
+
+- **Retrieval hit-rate & skip-rate** — of the retrievals served, how many
+  returned at least one capsule vs. hit the zero-capsule skipped path.
+- **Citation rate** — what fraction of retrieved memories the model actually
+  cited.
+- **Proposal acceptance rate** — accepted / (accepted + rejected).
+- **Usefulness trend** — summed usefulness, average usefulness ratio, and the
+  net `run.finished − run.failed(non-Gate)` outcome over the window.
+- **Harvest yield** — memories created in the window, broken down by source,
+  and per-run yield.
+- **Corpus health** — active vs. invalidated counts, breakdowns by scope/kind,
+  top-useful memories, prune candidates, open conflicts, pending proposals.
+- **Token economy** — average injected tokens and capsule count per retrieval.
+
+These are backed by two event additions: a **`context.served`** event logs
+*every* retrieval (hit or miss), and **`context.injected`** now carries the
+injected-token count — so the hit-rate and token-economy numbers are real
+counts, not estimates.
+
+---
+
 ## 7. The MCP surface
 
 Run `kimetsu mcp serve` and the host harness gets ~28
@@ -280,6 +396,7 @@ Run `kimetsu mcp serve` and the host harness gets ~28
 | `kimetsu_brain_context` | Retrieve a context bundle for a query/stage (returns `skipped: true` when nothing relevant — zero overhead) |
 | `kimetsu_brain_record` | Capture a lesson after a non-obvious solve; runs semantic dedup (§6) |
 | `kimetsu_brain_status` | Brain health + memory counts at a glance |
+| `kimetsu_brain_insights` | Effectiveness analytics over a recent-runs window (hit-rate, citation rate, acceptance, token economy — §6a) |
 | `kimetsu_brain_memory_add` | Persist a new memory directly |
 | `kimetsu_brain_memory_list` | List memories in scope, sorted by relevance |
 | `kimetsu_brain_memory_top` | Top memories by usefulness ratio |
@@ -299,6 +416,7 @@ Run `kimetsu mcp serve` and the host harness gets ~28
 | `kimetsu_bridge_status` / `_export` / `_import` / `_sync` | Cross-harness skill registry + install/sync |
 | `kimetsu_skills_search` / `kimetsu_skill` | Find / invoke a portable skill |
 | `cite_memory` | (in-run) Mark a memory as cited |
+| `expand_capsule` | (in-run) Expand a lazily-injected capsule headline to full detail by resolving its `memory:` / `file:` handle (§3a) |
 
 Tool input schemas + descriptions are advertised via the standard
 MCP `tools/list`. Every kimetsu_* tool returns `{"ok": true, "usage":
@@ -361,8 +479,9 @@ stays low), gated by a **high score floor** (0.45; 0.35 once a
 **deduped per session** (a memory surfaces at most once), and
 **throttled** by a refractory window between injections. When nothing
 clears the bar the hook prints nothing — zero tokens. Per-session state
-(surfaced ids, last injection, recent commands) lives in
-`<repo>/.kimetsu/proactive/<session_id>.json` and is GC'd after 7 days.
+(surfaced ids, last injection, recent commands) lives OUT of the repo, under
+`~/.kimetsu/cache/<project-hash>/proactive/<session_id>.json`, and is GC'd
+after 7 days — keeping `.kimetsu/` itself lean (just `brain.db` + `project.toml`).
 
 Proactive hooks install by default with `kimetsu plugin install`; pass
 `--no-proactive` (or `proactive:false` to `kimetsu_plugin_install`) to
@@ -403,6 +522,12 @@ subsystem actually works against the current workspace + user state:
 Hermetic by default — safe in CI. JSON output (`--json`) for
 hooks. Run after upgrading kimetsu or whenever something looks off.
 
+**`kimetsu doctor --selftest`** is the one-shot end-to-end proof: in a
+throw-away temp project (it never touches your real workspace or user brain) it
+records a sample memory and retrieves it back, printing
+`✓ recorded a memory and retrieved it — the brain works` and exiting non-zero
+if any step fails. Use it to confirm a fresh install actually works.
+
 ---
 
 ## 10. Configuration
@@ -412,7 +537,10 @@ Project config lives in `<project>/project.toml`:
 ```toml
 [kimetsu]
 project_id = "my-project"
-schema_version = 1
+schema_version = 1            # project.toml CONFIG-format version, NOT the
+                              # brain.db schema version (that is migrated
+                              # separately; see §2 "Durable upgrades")
+use_user_brain = true         # false → per-project opt-out of the global brain
 
 [model]
 provider = "anthropic"        # or "claude_code"
@@ -422,8 +550,17 @@ max_output_tokens = 8192
 temperature = 0.2
 request_timeout_secs = 120
 
+[embedder]
+enabled = true                # false → FTS-only, no vectors written or queried
+model = "bge-small-en-v1.5"   # or "bge-m3", "jina-v2-base-code"
+
 [broker]
-default_budget_tokens = 6000
+default_budget_tokens = 6000  # flat fallback; the adaptive budget supersedes it
+ambient = true                # false → don't append workspace context to queries
+max_capsules = 8              # hard cap on capsules rendered into a prompt
+min_semantic_score = 0.0      # >0 sets the embeddings-only relevance floor
+budget_floor_tokens = 1500    # adaptive-budget floor (small tasks not starved)
+budget_run_cap_tokens = 8000  # per-run ceiling on brain-injected tokens
 
 [broker.weights]
 relevance = 0.50
@@ -468,13 +605,26 @@ api_key_env = "ANTHROPIC_API_KEY"   # or "OPENAI_API_KEY"
 base_url_env = "ANTHROPIC_BASE_URL" # or "OPENAI_BASE_URL"
 ```
 
-Environment variables that override at runtime:
+**Bidirectional config (off-switches).** Every optional feature is turn-off-able
+in `project.toml` and honored at runtime with precedence
+**env override > config > default**. Every field is `#[serde(default)]`, so a
+partial `project.toml` loads cleanly — older files gain the new defaults on
+upgrade. The toggles: `[embedder] enabled`, `[broker] ambient`,
+`[kimetsu] use_user_brain`, plus the already-bidirectional `[learning]
+auto_harvest`, `[learning.distiller] enabled`, and `[shell] redact_secrets`.
+Flip any of them with **`kimetsu config edit`** (opens `$EDITOR` on
+`project.toml` and re-validates on save); a re-install *merges*, so your toggles
+survive.
+
+Environment variables that override the matching config field at runtime
+(env > config > default). Each now has a persistent `project.toml` equivalent:
 
 | Variable | Effect |
 |----------|--------|
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY` | Provider credentials |
-| `KIMETSU_USER_BRAIN=0` | Disable the user brain (project-only memories) |
-| `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick the embedder (or disable) |
+| `KIMETSU_USER_BRAIN=0` | Disable the user brain (= `[kimetsu] use_user_brain = false`) |
+| `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick the embedder, or disable it (= `[embedder] enabled = false` / `model`) |
+| `KIMETSU_BRAIN_AMBIENT=off` | Disable ambient workspace context (= `[broker] ambient = false`) |
 
 ---
 
@@ -483,8 +633,11 @@ Environment variables that override at runtime:
 - It's not a model. It runs through a host agent or configured model provider
   (for example Anthropic API or Claude Code OAuth).
 - It's not a sandbox. Tools run on the host machine.
-- It's not a vector DB. The brain is SQLite + FTS5 + optional cosine.
-  Single file per project. Backups are `cp brain.db`.
+- It's not an external vector DB. The brain is still a single SQLite file per
+  project (FTS5 + optional cosine). On the embeddings build the semantic index
+  is an *in-database* sqlite-vec ANN (`vec0`) table — no separate vector store,
+  no service to run. Backups are still `cp brain.db` (and the brain also
+  auto-backs-up to a `brain.db.bak-*` sidecar before any schema migration).
 
 ---
 

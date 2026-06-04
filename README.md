@@ -37,8 +37,14 @@ and Codex) or as its own terminal chat, learns which memories the model
 - **It's cheap to be right.** On a recorded 16-task Terminal-Bench slice,
   Kimetsu-enabled runs cost **~13x less per win** than the no-brain host-agent
   baseline: $0.19/win vs $2.47/win.
+- **It gets smarter, not just bigger.** Semantic retrieval finds the right
+  memory even when you used different words; the agent surfaces known pitfalls
+  *before* it repeats them; and brain insights show you the hit-rate,
+  citation rate, and token economy so the value is measurable, not a vibe.
 - **It's yours, on your machine.** The whole brain is one SQLite file per
-  project. No vector DB, no cloud, no telemetry. Back it up with `cp`.
+  project — `.kimetsu/` is just `brain.db` plus a `project.toml`. No external
+  vector DB, no cloud, no telemetry. It auto-migrates forward on upgrade
+  (backing itself up first). Back it up with `cp`.
 
 > *Kimetsu* (鬼滅) — "demon slayer." It slays the demon every agent fights:
 > amnesia.
@@ -82,15 +88,24 @@ and Codex) or as its own terminal chat, learns which memories the model
 1. **Before a task**, the agent asks Kimetsu for context. The **broker**
    walks your project brain *and* your cross-project user brain, scores every
    candidate memory (relevance × usefulness × freshness × scope), de-duplicates,
-   and injects the top few inside a token budget.
-2. **During the task**, the model calls `cite_memory` when a memory actually
-   helps. Those citations are the ground truth.
+   and injects the top few inside an adaptive token budget. On the semantic
+   build it also runs an in-database approximate-nearest-neighbour index
+   (sqlite-vec) so a memory surfaces even when the query shares no words with it.
+2. **While it works**, Kimetsu is proactive: it surfaces "known pitfalls"
+   before the first attempt, classifies the task to bias which kinds of memory
+   it recalls, and the model calls `cite_memory` when a memory actually helps.
+   Those citations are the ground truth.
 3. **After the task**, Kimetsu rewards cited memories, lightly nudges the
    "silent passengers," and lets old advice decay on a half-life curve. The
    brain gets sharper with every run — automatically.
 
-Want the full mechanics — scoring weights, citation deltas, decay, conflict
-detection? See **[docs/HOW-KIMETSU-WORKS.md](docs/HOW-KIMETSU-WORKS.md)**.
+The whole brain is one auto-migrating SQLite file: `brain.db`'s `events` table
+is the durable log, so `.kimetsu/` stays lean (just `brain.db` + `project.toml`)
+and upgrades migrate forward with a backup taken first.
+
+Want the full mechanics — scoring weights, semantic retrieval, the proactive
+agent brain, citation deltas, decay, conflict detection? See
+**[docs/HOW-KIMETSU-WORKS.md](docs/HOW-KIMETSU-WORKS.md)**.
 
 ---
 
@@ -220,7 +235,16 @@ stores the key in a gitignored `.env`; skip it with `--no-setup`. Run it with
 kimetsu brain search "build failures"
 kimetsu brain context "where is auth configured?"
 kimetsu brain memory top          # most useful memories so far
+kimetsu brain insights            # is the brain actually helping?
 ```
+
+Every optional feature is turn-off-able in `.kimetsu/project.toml` —
+embeddings (`[embedder] enabled`), ambient workspace context
+(`[broker] ambient`), the global user brain (`[kimetsu] use_user_brain`),
+auto-harvest, the distiller, secret redaction. The precedence is
+**env override > config > default**, and `kimetsu config edit` opens the file
+in `$EDITOR` and re-validates on save. Re-installing merges, so your toggles
+survive.
 
 ---
 
@@ -288,7 +312,7 @@ MCP wiring, and installed hooks. `kimetsu doctor --selftest` is the one-shot
 | Surface | What it is |
 |---------|------------|
 | **`kimetsu chat`** | A full terminal coding assistant — slash commands, skills, hooks, background tasks, MCP, agents. Runs against your workspace, no Harbor required. |
-| **`kimetsu` brain** | Event-sourced project + user memory in SQLite. Citations, decay, conflict detection, FTS + optional semantic retrieval. |
+| **`kimetsu` brain** | Durable, auto-migrating project + user memory in a single SQLite file. Citations, decay, conflict detection, FTS + optional semantic (sqlite-vec ANN) retrieval, and `kimetsu brain insights` effectiveness analytics. |
 | **`kimetsu bridge`** | Cross-harness skill portability — import/export skills between supported hosts such as Claude Code, Codex, Agents, and Kimetsu. |
 | **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as `kimetsu_*` tools. |
 
