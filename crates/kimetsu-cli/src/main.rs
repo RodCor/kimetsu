@@ -681,6 +681,14 @@ enum MemoryCommand {
     /// ingest. With `--list` (the default) renders open conflicts;
     /// `--resolve <id> <kept_new|kept_existing|kept_both>` settles one.
     Conflicts(ConflictsArgs),
+    /// Edit an existing active memory in-place (text and/or kind).
+    /// Preserves use_count, usefulness_score, confidence, and created_at —
+    /// the memory's learned history is not reset.
+    Edit(MemoryEditArgs),
+    /// Invalidate the most recently recorded active memory in the project
+    /// brain (the "agent saved junk" case). The row is kept for audit;
+    /// it simply stops being retrieved.
+    Undo(MemoryUndoArgs),
 }
 
 #[derive(Debug, Args)]
@@ -847,6 +855,28 @@ struct ReviewArgs {
     /// Print what would happen without writing any events.
     #[arg(long)]
     dry_run: bool,
+}
+
+/// Q6: args for `kimetsu brain memory edit`.
+#[derive(Debug, Args)]
+struct MemoryEditArgs {
+    /// The memory id to edit (a ULID printed by `memory add` / `memory list`).
+    memory_id: String,
+    /// New text to store in place of the existing text. The FTS index and
+    /// embedding are refreshed; usefulness history is preserved.
+    #[arg(long)]
+    text: Option<String>,
+    /// New kind to assign (fact|preference|convention|command|failure_pattern|…).
+    #[arg(long)]
+    kind: Option<String>,
+}
+
+/// Q6: args for `kimetsu brain memory undo`.
+#[derive(Debug, Args)]
+struct MemoryUndoArgs {
+    /// Skip the interactive confirmation and invalidate immediately.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3407,6 +3437,8 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
         MemoryCommand::Prune(args) => memory_prune(args),
         MemoryCommand::Blame(args) => memory_blame(args),
         MemoryCommand::Conflicts(args) => memory_conflicts(args),
+        MemoryCommand::Edit(args) => memory_edit(args),
+        MemoryCommand::Undo(args) => memory_undo(args),
     }
 }
 
@@ -3585,6 +3617,77 @@ fn memory_conflicts(args: ConflictsArgs) -> KimetsuResult<()> {
     println!(
         "\nResolve with: kimetsu brain memory conflicts --resolve <id> <kept_new|kept_existing|kept_both>"
     );
+    Ok(())
+}
+
+/// Q6: `kimetsu brain memory edit <id> [--text …] [--kind …]`
+///
+/// Edits an existing active memory in place — corrects the text and/or
+/// changes the kind while KEEPING the learned history (use_count,
+/// usefulness_score, confidence, created_at). The FTS index and embedding
+/// are refreshed so semantic/keyword retrieval reflects the new text.
+fn memory_edit(args: MemoryEditArgs) -> KimetsuResult<()> {
+    if args.text.is_none() && args.kind.is_none() {
+        return Err("memory edit: at least one of --text or --kind must be provided".into());
+    }
+
+    let cwd = env::current_dir()?;
+    let new_kind = args.kind.as_deref().map(MemoryKind::from_str).transpose()?;
+
+    project::edit_memory(&cwd, &args.memory_id, args.text.as_deref(), new_kind)?;
+    println!("updated memory {}", args.memory_id);
+    Ok(())
+}
+
+/// Q6: `kimetsu brain memory undo [--yes]`
+///
+/// Previews the most-recently-recorded active memory in the project brain,
+/// confirms (unless `--yes`), then invalidates it. The row is retained for
+/// audit purposes — it simply stops being surfaced in retrieval.
+fn memory_undo(args: MemoryUndoArgs) -> KimetsuResult<()> {
+    let cwd = env::current_dir()?;
+
+    // Peek at the most-recent active memory before asking the user.
+    let peek = project::peek_last_memory(&cwd)?;
+    let preview = match peek {
+        None => {
+            println!("no active memories to undo");
+            return Ok(());
+        }
+        Some(m) => m,
+    };
+
+    println!(
+        "most recent memory: {} [{}:{}] {}",
+        preview.memory_id, preview.scope, preview.kind, preview.text
+    );
+
+    // Confirm unless --yes or non-TTY.
+    if !args.yes && io::stdin().is_terminal() {
+        print!("invalidate this memory? [y/N] ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line).ok();
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    match project::undo_last_memory(&cwd)? {
+        Some(undone) => {
+            println!(
+                "invalidated memory {} (row kept for audit; no longer retrieved)",
+                undone.memory_id
+            );
+        }
+        None => {
+            // Edge case: someone invalidated the memory between our peek and
+            // the undo call (concurrent write). Report gracefully.
+            println!("no active memories to undo");
+        }
+    }
+
     Ok(())
 }
 

@@ -1699,6 +1699,209 @@ pub fn invalidate_memory(start: &Path, memory_id: &str, reason: Option<&str>) ->
     Ok(())
 }
 
+/// QoL: returned by [`undo_last_memory`] — the memory that was just invalidated.
+#[derive(Debug, Clone)]
+pub struct UndoneMemory {
+    pub memory_id: String,
+    pub text: String,
+    pub scope: String,
+    pub kind: String,
+}
+
+/// QoL: edit an existing active memory in-place, preserving its usefulness history.
+///
+/// - `new_text`: if given, the text (and normalized_text) are updated, the FTS
+///   index row is refreshed, and a new embedding is stored via the configured
+///   embedder (no-op in lean builds). Secret-redaction is applied at the same
+///   boundary as `add_memory`.
+/// - `new_kind`: if given, the `kind` column is updated.
+///
+/// At least one of `new_text` / `new_kind` must be `Some`; otherwise an error
+/// is returned. `use_count`, `usefulness_score`, `confidence`, and `created_at`
+/// are intentionally left unchanged — the whole point of edit-in-place is to
+/// preserve the memory's learned history.
+///
+/// Errors if the memory id is unknown or already invalidated.
+pub fn edit_memory(
+    start: &Path,
+    memory_id: &str,
+    new_text: Option<&str>,
+    new_kind: Option<MemoryKind>,
+) -> KimetsuResult<()> {
+    if new_text.is_none() && new_kind.is_none() {
+        return Err("edit_memory: at least one of --text or --kind must be provided".into());
+    }
+
+    let (paths, config, conn) = load_project(start)?;
+
+    // Verify memory exists and is active (not invalidated).
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT scope, kind, invalidated_at FROM memories WHERE memory_id = ?1",
+            params![memory_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2).unwrap_or_default(),
+                ))
+            },
+        )
+        .optional()?;
+
+    let (scope, current_kind, invalidated_at) = match row {
+        None => return Err(format!("memory not found: {memory_id}").into()),
+        Some(r) => r,
+    };
+    if !invalidated_at.is_empty() {
+        return Err(format!("memory {memory_id} is already invalidated").into());
+    }
+
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "brain memory edit", Some(run_id))?;
+
+    // Apply text update.
+    if let Some(raw_text) = new_text {
+        let redaction = redact::redact_secrets(raw_text);
+        if redaction.was_redacted() {
+            eprintln!("kimetsu-brain: {}", redaction.summary());
+        }
+        let text = &redaction.text;
+        let normalized = normalize_memory_text(text);
+
+        conn.execute(
+            "UPDATE memories SET text = ?1, normalized_text = ?2 WHERE memory_id = ?3",
+            params![text, normalized, memory_id],
+        )?;
+
+        // Refresh the FTS index row.
+        conn.execute(
+            "DELETE FROM memories_fts WHERE memory_id = ?1",
+            params![memory_id],
+        )?;
+        let kind_for_fts = new_kind
+            .as_ref()
+            .map(|k| k.to_string())
+            .unwrap_or(current_kind.clone());
+        conn.execute(
+            "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
+            params![memory_id, text, kind_for_fts, scope],
+        )?;
+
+        // Re-embed so semantic retrieval reflects the corrected text.
+        let embedder = embeddings::open_embedder_for(config.embedder.enabled);
+        embeddings::embed_and_persist(&conn, memory_id, text, embedder)?;
+    }
+
+    // Apply kind update (FTS row may need refreshing if text wasn't also changed).
+    if let Some(kind) = new_kind {
+        conn.execute(
+            "UPDATE memories SET kind = ?1 WHERE memory_id = ?2",
+            params![kind.to_string(), memory_id],
+        )?;
+
+        // Only refresh FTS kind column if we didn't already rebuild it above.
+        if new_text.is_none() {
+            // Re-read the current text from DB to rebuild the FTS row with
+            // the new kind (text unchanged).
+            let current_text: String = conn.query_row(
+                "SELECT text FROM memories WHERE memory_id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "DELETE FROM memories_fts WHERE memory_id = ?1",
+                params![memory_id],
+            )?;
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
+                params![memory_id, current_text, kind.to_string(), scope],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// QoL: return the most recently created active memory in the project brain
+/// WITHOUT invalidating it — used by the CLI to show a preview before
+/// asking for confirmation. Returns `Ok(None)` if there are no active memories.
+pub fn peek_last_memory(start: &Path) -> KimetsuResult<Option<UndoneMemory>> {
+    let (_paths, _config, conn) = load_project(start)?;
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT memory_id, text, scope, kind FROM memories
+             WHERE invalidated_at IS NULL
+             ORDER BY created_at DESC, memory_id DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    Ok(row.map(|(memory_id, text, scope, kind)| UndoneMemory {
+        memory_id,
+        text,
+        scope,
+        kind,
+    }))
+}
+
+/// QoL: invalidate the most recently created active memory in the project brain.
+///
+/// Finds the newest ACTIVE (non-invalidated) memory, invalidates it with the
+/// reason `"undo: last recorded memory"`, and returns its details. Returns
+/// `Ok(None)` when there are no active memories in the project brain.
+///
+/// Operates on the PROJECT brain only (the "agent just saved junk in this
+/// project" case); the user brain is not touched.
+pub fn undo_last_memory(start: &Path) -> KimetsuResult<Option<UndoneMemory>> {
+    let (paths, _config, conn) = load_project(start)?;
+
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT memory_id, text, scope, kind FROM memories
+             WHERE invalidated_at IS NULL
+             ORDER BY created_at DESC, memory_id DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let (memory_id, text, scope, kind) = match row {
+        None => return Ok(None),
+        Some(r) => r,
+    };
+
+    // Release the read conn before calling invalidate_memory which opens its own.
+    drop(conn);
+    drop(paths);
+
+    invalidate_memory(start, &memory_id, Some("undo: last recorded memory"))?;
+
+    Ok(Some(UndoneMemory {
+        memory_id,
+        text,
+        scope,
+        kind,
+    }))
+}
+
 pub fn reject_proposal(start: &Path, proposal_id: &str, reason: Option<&str>) -> KimetsuResult<()> {
     let (paths, config, conn) = load_project(start)?;
     let _proposal = load_pending_proposal(&conn, proposal_id)?;
@@ -4823,6 +5026,237 @@ max_total_cost_usd = 250.0
             );
 
             fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ── Q6: memory edit / memory undo ──────────────────────────────────────
+
+    /// Q6-1: edit_memory updates text + normalized_text + FTS, preserves history.
+    #[test]
+    fn edit_memory_updates_text_and_preserves_history() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            let mid = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "original text for edit test",
+            )
+            .expect("add");
+
+            // Simulate a "learned" memory by bumping use_count and usefulness_score.
+            {
+                let (_p, _c, conn) = load_project(&root).expect("open conn");
+                conn.execute(
+                    "UPDATE memories SET use_count = 7, usefulness_score = 3.5 WHERE memory_id = ?1",
+                    params![mid],
+                )
+                .expect("bump counters");
+            }
+
+            // Edit the text in place.
+            edit_memory(&root, &mid, Some("corrected text for edit test"), None)
+                .expect("edit_memory");
+
+            // Verify text + normalized_text changed.
+            {
+                let (_p, _c, conn) = load_project(&root).expect("open conn");
+                let (text, normalized, use_count, usefulness_score): (String, String, i64, f64) =
+                    conn.query_row(
+                        "SELECT text, normalized_text, use_count, usefulness_score FROM memories WHERE memory_id = ?1",
+                        params![mid],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .expect("query");
+
+                assert_eq!(text, "corrected text for edit test");
+                assert!(!normalized.is_empty(), "normalized_text must not be empty");
+                // History preserved.
+                assert_eq!(use_count, 7, "use_count must not be reset");
+                assert!(
+                    (usefulness_score - 3.5).abs() < 0.01,
+                    "usefulness_score must not be reset"
+                );
+            }
+
+            // FTS reflects new text — search for a word in the new text.
+            let hits = search_memories(&root, "corrected", 10, 0, None, None).expect("search new");
+            assert!(
+                hits.iter().any(|h| h.memory_id == mid),
+                "edited text must appear in FTS search: {hits:?}"
+            );
+
+            // Old text must no longer match.
+            let old_hits =
+                search_memories(&root, "original", 10, 0, None, None).expect("search old");
+            assert!(
+                !old_hits.iter().any(|h| h.memory_id == mid),
+                "old text must NOT appear after edit: {old_hits:?}"
+            );
+
+            // list_memories should return the new text.
+            let mems = list_memories(&root).expect("list");
+            let m = mems.iter().find(|m| m.memory_id == mid).expect("found");
+            assert_eq!(m.text, "corrected text for edit test");
+        });
+    }
+
+    /// Q6-2: edit_memory can change kind without touching text.
+    #[test]
+    fn edit_memory_changes_kind_only() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            let mid = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "kind-change test memory",
+            )
+            .expect("add");
+
+            edit_memory(&root, &mid, None, Some(MemoryKind::Convention)).expect("edit kind");
+
+            let mems = list_memories(&root).expect("list");
+            let m = mems.iter().find(|m| m.memory_id == mid).expect("found");
+            assert_eq!(m.kind, "convention", "kind must be updated");
+            assert_eq!(m.text, "kind-change test memory", "text must be unchanged");
+        });
+    }
+
+    /// Q6-3: edit_memory errors on unknown id, invalidated id, and neither arg.
+    #[test]
+    fn edit_memory_errors() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Neither text nor kind → error.
+            let err = edit_memory(&root, "does-not-matter", None, None)
+                .expect_err("must err when no fields");
+            assert!(
+                format!("{err}").contains("at least one"),
+                "unexpected err: {err}"
+            );
+
+            // Unknown id.
+            let err = edit_memory(&root, "UNKNOWN_ID", Some("x"), None)
+                .expect_err("must err on unknown id");
+            assert!(
+                format!("{err}").contains("not found"),
+                "unexpected err: {err}"
+            );
+
+            // Invalidated id.
+            let mid = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "will be invalidated",
+            )
+            .expect("add");
+            invalidate_memory(&root, &mid, None).expect("invalidate");
+            let err = edit_memory(&root, &mid, Some("new text"), None)
+                .expect_err("must err on invalidated id");
+            assert!(
+                format!("{err}").contains("invalidated"),
+                "unexpected err: {err}"
+            );
+        });
+    }
+
+    /// Q6-4: undo_last_memory invalidates the most recent memory; second call
+    /// invalidates the one before it.
+    #[test]
+    fn undo_last_memory_invalidates_newest_first() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let mid_a = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "memory A older undo test",
+            )
+            .expect("add A");
+
+            let mid_b = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "memory B newer undo test",
+            )
+            .expect("add B");
+
+            // First undo → B (the newer one per created_at DESC, memory_id DESC).
+            let undone = undo_last_memory(&root)
+                .expect("undo 1")
+                .expect("must return Some");
+            assert_eq!(undone.memory_id, mid_b, "undo must target B (newest)");
+
+            // Check B is now invalidated via DB query.
+            {
+                let (_p, _c, conn) = load_project(&root).expect("open conn");
+                let b_inv: Option<String> = conn
+                    .query_row(
+                        "SELECT invalidated_at FROM memories WHERE memory_id = ?1",
+                        params![mid_b],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .expect("query")
+                    .flatten();
+                assert!(b_inv.is_some(), "B must be invalidated after undo");
+
+                let a_inv: Option<String> = conn
+                    .query_row(
+                        "SELECT invalidated_at FROM memories WHERE memory_id = ?1",
+                        params![mid_a],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .expect("query")
+                    .flatten();
+                assert!(a_inv.is_none(), "A must still be active");
+            }
+
+            // Second undo → A.
+            let undone2 = undo_last_memory(&root)
+                .expect("undo 2")
+                .expect("must return Some");
+            assert_eq!(undone2.memory_id, mid_a, "second undo must target A");
+
+            // Both invalidated.
+            {
+                let (_p, _c, conn) = load_project(&root).expect("open conn");
+                let a_inv: Option<String> = conn
+                    .query_row(
+                        "SELECT invalidated_at FROM memories WHERE memory_id = ?1",
+                        params![mid_a],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .expect("query")
+                    .flatten();
+                assert!(a_inv.is_some(), "A must be invalidated after second undo");
+            }
+
+            // peek_last_memory returns None after both are invalidated.
+            let peek = peek_last_memory(&root).expect("peek after both undone");
+            assert!(peek.is_none(), "peek must return None when all invalidated");
+        });
+    }
+
+    /// Q6-5: undo_last_memory on an empty brain returns Ok(None).
+    #[test]
+    fn undo_last_memory_on_empty_brain_returns_none() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            let result = undo_last_memory(&root).expect("undo on empty");
+            assert!(result.is_none(), "must return None on empty brain");
         });
     }
 }
