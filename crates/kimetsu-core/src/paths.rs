@@ -195,3 +195,131 @@ fn slug(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
 }
+
+/// W2: per-project cache root for transient, non-brain artifacts
+/// (proactive hook state, chat REPL output, benchmark output).
+///
+/// Kept OUT of the project's `.kimetsu/` so a brain-only install's
+/// `.kimetsu/` stays lean. Lives under the user kimetsu home
+/// (`~/.kimetsu/cache/<project-id>/`), honouring
+/// `KIMETSU_USER_BRAIN_DIR`. Falls back to the OS temp dir when no
+/// home resolves, so it NEVER lands back inside `.kimetsu/`.
+///
+/// The `<project-id>` component is the same slug produced by
+/// [`default_project_id`], which is filesystem-safe (ASCII
+/// alphanumeric + hyphens only, non-empty).
+pub fn user_cache_dir_for(repo_root: &Path) -> PathBuf {
+    let hash = default_project_id(repo_root);
+    match user_kimetsu_dir() {
+        Some(home) => home.join("cache").join(&hash),
+        None => std::env::temp_dir().join("kimetsu-cache").join(&hash),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Process-wide mutex for env-mutating path tests.  Any test that
+    /// temporarily modifies `KIMETSU_USER_BRAIN_DIR`, `HOME`, or
+    /// `USERPROFILE` must hold this guard for the duration.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        &LOCK
+    }
+
+    /// Run `f` with `KIMETSU_USER_BRAIN_DIR` set to `dir`, restoring the
+    /// previous value under the shared env lock.
+    fn with_brain_dir<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+        }
+        out
+    }
+
+    /// Run `f` with both `KIMETSU_USER_BRAIN_DIR` and the platform home
+    /// env var cleared, so `user_kimetsu_dir()` returns `None`.
+    fn without_brain_dir<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev_override = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var(home_key).ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_USER_BRAIN_DIR");
+            std::env::remove_var(home_key);
+        }
+        let out = f();
+        unsafe {
+            match prev_override {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var(home_key, v),
+                None => std::env::remove_var(home_key),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn user_cache_dir_for_lands_under_user_home() {
+        let tmp = std::env::temp_dir().join("kimetsu-test-cache-home");
+        let repo = Path::new("/some/project/my-repo");
+        let result = with_brain_dir(&tmp, || user_cache_dir_for(repo));
+        // Must be under <tmp>/cache/<slug>/
+        assert!(
+            result.starts_with(tmp.join("cache")),
+            "expected result under <tmp>/cache, got {result:?}"
+        );
+        // Must not be inside .kimetsu of the repo.
+        assert!(
+            !result.starts_with(repo.join(".kimetsu")),
+            "must not be inside repo .kimetsu, got {result:?}"
+        );
+        // The leaf component is the slug of the repo name.
+        let leaf = result.file_name().unwrap().to_str().unwrap();
+        assert_eq!(leaf, "my-repo");
+    }
+
+    #[test]
+    fn user_cache_dir_for_falls_back_to_temp_when_no_home() {
+        let repo = Path::new("/some/project/fallback-repo");
+        let result = without_brain_dir(|| user_cache_dir_for(repo));
+        // Must be under the OS temp dir, not under ~/.kimetsu.
+        let tmp = std::env::temp_dir();
+        assert!(
+            result.starts_with(&tmp),
+            "expected result under OS temp dir, got {result:?}"
+        );
+        // Must contain "kimetsu-cache".
+        assert!(
+            result
+                .components()
+                .any(|c| c.as_os_str() == "kimetsu-cache"),
+            "expected 'kimetsu-cache' in path, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn slug_is_filesystem_safe() {
+        // No env mutation — no lock needed.
+        let id = default_project_id(Path::new("/tmp/my repo with spaces & stuff!"));
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "slug contains unsafe chars: {id:?}"
+        );
+        assert!(!id.is_empty());
+    }
+}

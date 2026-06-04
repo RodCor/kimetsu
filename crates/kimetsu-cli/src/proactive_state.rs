@@ -284,6 +284,55 @@ impl SessionState {
 mod tests {
     use super::*;
 
+    /// W2: verify that proactive state saved via `session_path` + the
+    /// cache base lands under the cache dir, NOT under any `.kimetsu/`
+    /// inside the repo.
+    #[test]
+    fn proactive_state_lands_in_cache_not_in_kimetsu() {
+        let tmp = std::env::temp_dir();
+        // Simulate a cache dir that looks like ~/.kimetsu/cache/<id>.
+        let cache_dir = tmp.join("kimetsu-w2-test-cache").join("my-repo");
+        // A fake repo root — its .kimetsu must NOT receive any file.
+        let repo_root = tmp.join("kimetsu-w2-test-repo");
+        let kimetsu_dir = repo_root.join(".kimetsu");
+
+        let p = session_path(&cache_dir, Some("test-session"));
+        // State lives under the cache dir, in a `proactive/` subdirectory.
+        assert!(
+            p.starts_with(&cache_dir),
+            "state path {p:?} must be under cache_dir {cache_dir:?}"
+        );
+        assert!(
+            p.to_string_lossy().contains("proactive"),
+            "state path must contain 'proactive', got {p:?}"
+        );
+        // It must NOT be inside the repo's .kimetsu.
+        assert!(
+            !p.starts_with(&kimetsu_dir),
+            "state path must not be inside .kimetsu"
+        );
+
+        // Round-trip: save + load via the cache path.
+        let mut state = SessionState::default();
+        state.mark_surfaced("mem-123");
+        save(&p, &state);
+        let loaded = load(&p);
+        assert!(
+            loaded.is_surfaced("mem-123"),
+            "loaded state must match saved"
+        );
+
+        // .kimetsu/proactive must NOT have been created.
+        assert!(
+            !kimetsu_dir.join("proactive").exists(),
+            ".kimetsu/proactive must not be created"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let _ = std::fs::remove_dir_all(&repo_root);
+    }
+
     #[test]
     fn dedupe_marks_once() {
         let mut s = SessionState::default();

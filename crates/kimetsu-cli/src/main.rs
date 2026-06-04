@@ -2268,9 +2268,10 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .unwrap_or(true);
     let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
     let sid = session.get("session_id").and_then(|v| v.as_str());
-    let state_path = paths
-        .as_ref()
-        .map(|p| proactive_state::session_path(&p.kimetsu_dir, sid));
+    let state_path = paths.as_ref().map(|p| {
+        let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
+        proactive_state::session_path(&cache_dir, sid)
+    });
 
     if args.distill_on_stop
         && distiller_enabled
@@ -2295,8 +2296,10 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         && !stop_active
         && let Some(paths) = paths.as_ref()
     {
-        let state_path =
-            state_path.unwrap_or_else(|| proactive_state::session_path(&paths.kimetsu_dir, sid));
+        let state_path = state_path.unwrap_or_else(|| {
+            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&paths.repo_root);
+            proactive_state::session_path(&cache_dir, sid)
+        });
         let mut state = proactive_state::load(&state_path);
         if !state.harvest_cued() {
             println!(
@@ -2481,9 +2484,11 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     }
 
     let now = proactive_state::now_unix();
-    proactive_state::gc(&paths.kimetsu_dir, now);
+    let proactive_cache_dir = kimetsu_core::paths::user_cache_dir_for(&paths.repo_root);
+    proactive_state::gc(&proactive_cache_dir, now);
 
-    let state_path = proactive_state::session_path(&paths.kimetsu_dir, hook.session_id.as_deref());
+    let state_path =
+        proactive_state::session_path(&proactive_cache_dir, hook.session_id.as_deref());
     let mut state = proactive_state::load(&state_path);
 
     // v0.8.5: PostToolUse success — if this command failed earlier this

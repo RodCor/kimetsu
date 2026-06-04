@@ -48,6 +48,7 @@ use kimetsu_brain::project as brain_project;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::ids::RunId;
+use kimetsu_core::paths::user_cache_dir_for;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
@@ -93,7 +94,7 @@ pub struct ChatConfig {
     /// when stdin/stdout are both terminals; tests and piped input stay
     /// line-buffered.
     pub raw_terminal_input: bool,
-    /// Persist chat transcripts/checkpoints under `.kimetsu/chat/sessions`.
+    /// Persist chat transcripts/checkpoints under `~/.kimetsu/cache/<id>/chat/sessions`.
     /// CLI enables this; library tests default off to avoid workspace writes.
     pub persist_sessions: bool,
 }
@@ -1775,7 +1776,7 @@ fn edit_prompt_in_editor(workspace: &Path, current: &str) -> ChatResult<Option<S
             }
         })
         .unwrap_or_else(|| "vi".to_string());
-    let dir = workspace.join(".kimetsu").join("chat");
+    let dir = user_cache_dir_for(workspace).join("chat");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("prompt-{}.md", now_unix()));
     fs::write(&path, current)?;
@@ -4561,7 +4562,7 @@ struct ChatTask {
 
 impl TaskManager {
     fn new(workspace: PathBuf) -> Self {
-        let task_dir = workspace.join(".kimetsu").join("chat").join("tasks");
+        let task_dir = user_cache_dir_for(&workspace).join("chat").join("tasks");
         Self {
             workspace,
             task_dir,
@@ -4847,7 +4848,7 @@ fn export_transcript(
 }
 
 fn chat_session_dir(workspace: &Path) -> PathBuf {
-    workspace.join(".kimetsu").join("chat").join("sessions")
+    user_cache_dir_for(workspace).join("chat").join("sessions")
 }
 
 fn persist_session(
