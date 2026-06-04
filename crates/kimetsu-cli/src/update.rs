@@ -1603,6 +1603,7 @@ mod tests {
             command_line: Some("kimetsu mcp serve --workspace C:\\proj".to_string()),
             kind: crate::process::ProcKind::McpServe,
             workspace: Some("C:\\proj".to_string()),
+            started_at: None,
         }
     }
 

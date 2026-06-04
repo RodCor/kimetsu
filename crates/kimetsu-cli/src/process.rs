@@ -50,6 +50,10 @@ pub struct KimetsuProc {
     pub kind: ProcKind,
     /// Extracted from `--workspace <path>` in the command line, when present.
     pub workspace: Option<String>,
+    /// Process creation time as seconds since the Unix epoch (UTC), when
+    /// obtainable from the OS.  `None` means the platform query did not
+    /// return a creation timestamp (best-effort).
+    pub started_at: Option<u64>,
 }
 
 /// List running kimetsu processes, excluding the current process.
@@ -161,7 +165,7 @@ fn query_windows(current_pid: u32) -> Vec<KimetsuProc> {
             "Bypass",
             "-Command",
             "Get-CimInstance Win32_Process -Filter \"Name='kimetsu.exe'\" | \
-             Select-Object ProcessId,ExecutablePath,CommandLine | \
+             Select-Object ProcessId,ExecutablePath,CommandLine,CreationDate | \
              ConvertTo-Csv -NoTypeInformation",
         ])
         .output();
@@ -176,15 +180,31 @@ fn query_windows(current_pid: u32) -> Vec<KimetsuProc> {
 }
 
 /// Query running kimetsu processes via `ps` on Unix.
+///
+/// We request `etimes` (elapsed seconds since start) so that the doctor
+/// version-skew check can compare against the binary's mtime.  `etimes` is
+/// supported on macOS and Linux; if it isn't available the parse falls back
+/// gracefully to `started_at: None`.
 #[cfg(not(windows))]
 fn query_unix(current_pid: u32) -> Vec<KimetsuProc> {
+    // Try with etimes first.  Some older/minimal ps binaries may not know
+    // `etimes`, so we fall back to the pid+args-only form on error.
     let output = ProcessCommand::new("ps")
-        .args(["-eo", "pid=,args="])
+        .args(["-eo", "pid=,etimes=,args="])
         .output();
 
     let output = match output {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
+        Ok(o) if o.status.success() => o,
+        _ => {
+            // Fallback: no elapsed-time column.
+            let output = ProcessCommand::new("ps")
+                .args(["-eo", "pid=,args="])
+                .output();
+            match output {
+                Ok(o) => o,
+                Err(_) => return Vec::new(),
+            }
+        }
     };
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -238,10 +258,12 @@ fn kill_pid(pid: u32) -> Result<(), String> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Parse the CSV produced by:
-///   `Get-CimInstance Win32_Process … | Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Csv -NoTypeInformation`
+///   `Get-CimInstance Win32_Process … | Select-Object ProcessId,ExecutablePath,CommandLine,CreationDate | ConvertTo-Csv -NoTypeInformation`
 ///
-/// Expected header:  `"ProcessId","ExecutablePath","CommandLine"`
-/// Expected rows:    `"1234","C:\...\kimetsu.exe","kimetsu mcp serve --workspace C:\proj"`
+/// Expected header:  `"ProcessId","ExecutablePath","CommandLine","CreationDate"`
+/// Expected rows:    `"1234","C:\...\kimetsu.exe","kimetsu mcp serve --workspace C:\proj","20240615120000.000000+000"`
+///
+/// Also accepts the legacy 3-column form (without CreationDate) for backwards compatibility.
 pub fn parse_windows_proc_csv(output: &str, current_pid: u32) -> Vec<KimetsuProc> {
     let mut procs = Vec::new();
     let mut lines = output.lines().peekable();
@@ -271,6 +293,9 @@ pub fn parse_windows_proc_csv(output: &str, current_pid: u32) -> Vec<KimetsuProc
     let col_cmd = header_cols
         .iter()
         .position(|c| c.eq_ignore_ascii_case("CommandLine"));
+    let col_created = header_cols
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case("CreationDate"));
 
     // If we can't find ProcessId, bail — we can't do anything useful.
     let col_pid = match col_pid {
@@ -307,6 +332,11 @@ pub fn parse_windows_proc_csv(output: &str, current_pid: u32) -> Vec<KimetsuProc
             .filter(|s| !s.is_empty())
             .cloned();
 
+        let started_at = col_created
+            .and_then(|i| cols.get(i))
+            .filter(|s| !s.is_empty())
+            .and_then(|s| parse_wmi_datetime(s));
+
         let kind = command_line
             .as_deref()
             .map(classify_kind)
@@ -319,20 +349,32 @@ pub fn parse_windows_proc_csv(output: &str, current_pid: u32) -> Vec<KimetsuProc
             command_line,
             kind,
             workspace,
+            started_at,
         });
     }
 
     procs
 }
 
-/// Parse the output of `ps -eo pid=,args=` (one process per line).
+/// Parse the output of `ps -eo pid=,etimes=,args=` (one process per line).
 ///
-/// Line format: `  <pid>  <full command line with args>`
+/// Line format (with etimes): `  <pid>  <elapsed_secs>  <full command line with args>`
+/// Line format (without etimes fallback): `  <pid>  <full command line with args>`
+///
+/// When `etimes` is present, the second token is an integer number of seconds
+/// the process has been running; `started_at` is derived as `now - etimes`.
+/// If the second token is non-numeric we treat the row as pid+args only.
+///
 /// We filter to rows whose command contains `kimetsu` (binary name).
 // On Windows this function is only called from tests (the live path uses query_windows),
 // so suppress the dead_code lint there while keeping it pub for cross-platform testing.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn parse_unix_ps(output: &str, current_pid: u32) -> Vec<KimetsuProc> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let mut procs = Vec::new();
 
     for line in output.lines() {
@@ -354,7 +396,23 @@ pub fn parse_unix_ps(output: &str, current_pid: u32) -> Vec<KimetsuProc> {
             continue;
         }
 
-        let args = rest.trim();
+        let rest = rest.trim();
+
+        // Attempt to parse an `etimes` field (integer seconds elapsed).
+        // If the first token of `rest` is a pure integer, treat it as etimes
+        // and the remainder as the args.  Otherwise treat all of `rest` as args
+        // (the fallback pid=,args= format).
+        let (started_at, args) = {
+            let mut toks = rest.splitn(2, |c: char| c.is_whitespace());
+            let first = toks.next().unwrap_or("").trim();
+            let remainder = toks.next().unwrap_or("").trim();
+            if let Ok(elapsed) = first.parse::<u64>() {
+                let started = now_secs.saturating_sub(elapsed);
+                (Some(started), remainder)
+            } else {
+                (None, rest)
+            }
+        };
 
         // Filter to rows whose command contains the kimetsu binary.
         // Check the first token of args (the executable path/name).
@@ -379,6 +437,7 @@ pub fn parse_unix_ps(output: &str, current_pid: u32) -> Vec<KimetsuProc> {
             command_line: Some(args.to_string()),
             kind,
             workspace,
+            started_at,
         });
     }
 
@@ -422,6 +481,119 @@ fn parse_csv_row(row: &str) -> Vec<String> {
     }
     fields.push(current);
     fields
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Timestamp helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Parse a WMI DMTF datetime string into seconds since the Unix epoch (UTC).
+///
+/// Format: `YYYYMMDDHHmmss.ffffff±UUU`
+///   - `YYYYMMDD` — date
+///   - `HHmmss`  — time of day
+///   - `.ffffff` — fractional seconds (ignored for our purposes)
+///   - `±UUU`    — UTC offset in minutes (e.g. `+000`, `-300`)
+///
+/// Returns `None` if the string doesn't match the expected format or if
+/// any field is out of range.
+///
+/// This is a no-dep implementation to avoid pulling in a datetime crate.
+/// It deliberately uses simple integer arithmetic and returns `None` on any
+/// malformed input so the caller can fall back gracefully.
+pub fn parse_wmi_datetime(s: &str) -> Option<u64> {
+    // Minimum: "YYYYMMDDHHmmss" = 14 chars; with offset: 21+ chars.
+    let s = s.trim();
+    if s.len() < 14 {
+        return None;
+    }
+
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[4..6].parse().ok()?;
+    let day: i64 = s[6..8].parse().ok()?;
+    let hour: i64 = s[8..10].parse().ok()?;
+    let min: i64 = s[10..12].parse().ok()?;
+    let sec: i64 = s[12..14].parse().ok()?;
+
+    // Basic range checks.
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0..=60).contains(&sec)
+    {
+        return None;
+    }
+
+    // Parse UTC offset in minutes from the `±UUU` suffix after the dot.
+    // The dot is at position 14; offset sign is at position 21 (0-indexed).
+    // Layout: "YYYYMMDDHHmmss.ffffff±UUU"
+    //          0123456789012345678901234
+    //                               ^ 21
+    let offset_mins: i64 = if s.len() >= 22 {
+        // Find the ± character after the fractional part.
+        let sign_pos = s[14..].find(['+', '-']);
+        if let Some(rel) = sign_pos {
+            let abs_pos = 14 + rel;
+            let sign: i64 = if s.as_bytes()[abs_pos] == b'+' { 1 } else { -1 };
+            let offset_str = &s[abs_pos + 1..];
+            // Take up to 3 digits.
+            let digits: String = offset_str.chars().take(3).collect();
+            let offset_val: i64 = digits.parse().unwrap_or(0);
+            sign * offset_val
+        } else {
+            0 // No offset found → assume UTC.
+        }
+    } else {
+        0 // Short string → assume UTC.
+    };
+
+    // Convert calendar date to days since Unix epoch using the proleptic
+    // Gregorian calendar (no external crate needed).
+    let days = days_since_epoch(year, month, day)?;
+    let total_secs = days * 86400 + hour * 3600 + min * 60 + sec - offset_mins * 60;
+
+    if total_secs < 0 {
+        return None;
+    }
+    Some(total_secs as u64)
+}
+
+/// Days since 1970-01-01 for the given (year, month, day).
+/// Returns `None` for obviously invalid dates.
+fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
+    // Days in each month (non-leap year).
+    const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    fn is_leap(y: i64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    }
+
+    let days_this_month = if month == 2 && is_leap(year) {
+        29
+    } else {
+        *DAYS_IN_MONTH.get((month - 1) as usize)?
+    };
+    if day < 1 || day > days_this_month {
+        return None;
+    }
+
+    // Count full years from 1970.
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    // Count full months in the current year.
+    for m in 1..month {
+        days += if m == 2 && is_leap(year) {
+            29
+        } else {
+            DAYS_IN_MONTH[(m - 1) as usize]
+        };
+    }
+    days += day - 1;
+    Some(days)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -729,6 +901,7 @@ mod tests {
             command_line: Some(format!("{exe} mcp serve")),
             kind: ProcKind::McpServe,
             workspace: None,
+            started_at: None,
         }
     }
 
@@ -740,6 +913,7 @@ mod tests {
             command_line: Some("kimetsu mcp serve".to_string()),
             kind: ProcKind::McpServe,
             workspace: None,
+            started_at: None,
         }
     }
 
@@ -826,5 +1000,134 @@ mod tests {
         ];
         let result = filter_locking(procs, target);
         assert!(result.is_empty(), "no proc matches target path");
+    }
+
+    // ── WMI datetime parser ──────────────────────────────────────────────────
+
+    #[test]
+    fn wmi_datetime_utc_zero_offset() {
+        // 2024-06-15 12:00:00 UTC+000
+        let ts = super::parse_wmi_datetime("20240615120000.000000+000").unwrap();
+        // 2024-06-15 12:00:00 UTC
+        // Days from 1970-01-01 to 2024-06-15:
+        //   54 years. We just verify the rough magnitude and one known value.
+        // unix timestamp for 2024-06-15 12:00:00 UTC = 1718452800
+        assert_eq!(ts, 1_718_452_800, "2024-06-15 12:00:00 UTC");
+    }
+
+    #[test]
+    fn wmi_datetime_positive_offset() {
+        // 2024-06-15 14:00:00 UTC+120 → UTC is 12:00:00 → same as above
+        let ts = super::parse_wmi_datetime("20240615140000.000000+120").unwrap();
+        assert_eq!(ts, 1_718_452_800, "UTC+120 offset correctly subtracted");
+    }
+
+    #[test]
+    fn wmi_datetime_negative_offset() {
+        // 2024-06-15 10:00:00 UTC-120 → UTC is 12:00:00 → same as above
+        let ts = super::parse_wmi_datetime("20240615100000.000000-120").unwrap();
+        assert_eq!(ts, 1_718_452_800, "UTC-120 offset correctly added");
+    }
+
+    #[test]
+    fn wmi_datetime_epoch() {
+        // 1970-01-01 00:00:00 UTC+000 → epoch = 0
+        let ts = super::parse_wmi_datetime("19700101000000.000000+000").unwrap();
+        assert_eq!(ts, 0, "epoch must be 0");
+    }
+
+    #[test]
+    fn wmi_datetime_returns_none_for_empty() {
+        assert!(super::parse_wmi_datetime("").is_none());
+        assert!(super::parse_wmi_datetime("   ").is_none());
+    }
+
+    #[test]
+    fn wmi_datetime_returns_none_for_malformed() {
+        assert!(super::parse_wmi_datetime("notadatetime").is_none());
+        assert!(super::parse_wmi_datetime("AAAABBCC").is_none());
+    }
+
+    #[test]
+    fn wmi_datetime_handles_no_offset_suffix() {
+        // Short form without offset — treated as UTC.
+        let ts = super::parse_wmi_datetime("20240615120000").unwrap();
+        assert_eq!(ts, 1_718_452_800);
+    }
+
+    // ── Windows CSV with CreationDate column ─────────────────────────────────
+
+    // "20240615120000.000000+000" = unix 1718452800
+    const WINDOWS_CSV_WITH_DATE: &str = concat!(
+        "\"ProcessId\",\"ExecutablePath\",\"CommandLine\",\"CreationDate\"\n",
+        "\"1001\",\"C:\\Users\\user\\.cargo\\bin\\kimetsu.exe\",\"kimetsu mcp serve --workspace C:\\proj\",\"20240615120000.000000+000\"\n",
+        "\"1002\",\"C:\\Users\\user\\.cargo\\bin\\kimetsu.exe\",\"kimetsu chat --workspace D:\\code\",\"\"\n",
+        "\"9999\",\"C:\\Users\\user\\.cargo\\bin\\kimetsu.exe\",\"kimetsu ps\",\"20240615110000.000000+000\"\n",
+    );
+
+    #[test]
+    fn windows_csv_with_creation_date_parses_timestamp() {
+        let procs = parse_windows_proc_csv(WINDOWS_CSV_WITH_DATE, 9999);
+        assert_eq!(procs.len(), 2, "self (9999) excluded; got {procs:?}");
+
+        let by_pid: std::collections::HashMap<u32, &KimetsuProc> =
+            procs.iter().map(|p| (p.pid, p)).collect();
+
+        // PID 1001 has a valid CreationDate.
+        assert_eq!(
+            by_pid[&1001].started_at,
+            Some(1_718_452_800),
+            "pid 1001 started_at should be parsed"
+        );
+        // PID 1002 has an empty CreationDate → None.
+        assert_eq!(
+            by_pid[&1002].started_at, None,
+            "empty CreationDate → started_at None"
+        );
+    }
+
+    // ── Unix ps with etimes column ───────────────────────────────────────────
+
+    #[test]
+    fn unix_ps_with_etimes_parses_started_at() {
+        // Format: "  <pid>  <etimes>  <args>"
+        // Use a known elapsed time so we can verify the calculation.
+        // We can't know the exact "now" in tests, but we can check relative ordering.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let elapsed_secs: u64 = 3600; // 1 hour
+        let expected_start = now.saturating_sub(elapsed_secs);
+
+        let input = format!(
+            "  1001 {elapsed_secs} /usr/local/bin/kimetsu mcp serve --workspace /proj\n\
+             9999 0 /usr/local/bin/kimetsu ps\n"
+        );
+
+        let procs = parse_unix_ps(&input, 9999);
+        assert_eq!(procs.len(), 1, "self (9999) excluded");
+        let p = &procs[0];
+        assert_eq!(p.pid, 1001);
+        // Allow a 2-second window for test execution time.
+        let started_at = p.started_at.expect("started_at should be Some");
+        assert!(
+            started_at.abs_diff(expected_start) <= 2,
+            "started_at {started_at} should be within 2s of {expected_start}"
+        );
+    }
+
+    #[test]
+    fn unix_ps_without_etimes_falls_back_gracefully() {
+        // Old format: no etimes column. The exe path is not numeric, so
+        // the parser treats all of rest as args → started_at is None.
+        let input = "  1001 /usr/local/bin/kimetsu mcp serve --workspace /proj\n";
+        let procs = parse_unix_ps(input, 9999);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 1001);
+        assert!(
+            procs[0].started_at.is_none(),
+            "no etimes → started_at should be None"
+        );
     }
 }
