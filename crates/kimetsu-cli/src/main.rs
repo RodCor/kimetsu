@@ -955,7 +955,52 @@ struct CodingArgs {
 #[derive(Debug, Subcommand)]
 enum RunsCommand {
     List,
-    Show { run_id: String },
+    Show {
+        run_id: String,
+    },
+    /// Remove old run directories from .kimetsu/runs/.
+    ///
+    /// Run dirs hold trace.jsonl + artifacts. The underlying events are
+    /// durable in brain.db (they can be replayed), so deleting a run
+    /// dir only frees disk — it does NOT remove memories or event history.
+    ///
+    /// Dry-run by default — pass `--apply` to actually delete.
+    ///
+    /// At least one of `--older-than` or `--keep` is required so that
+    /// you cannot accidentally wipe everything in one shot.
+    ///
+    /// Examples:
+    ///   kimetsu runs prune --older-than 30d
+    ///   kimetsu runs prune --keep 10
+    ///   kimetsu runs prune --older-than 7d --keep 5 --apply
+    ///   kimetsu runs prune --older-than 30d --workspace /path/to/repo
+    Prune(PruneRunsArgs),
+}
+
+/// Args for `kimetsu runs prune`.
+#[derive(Debug, Args)]
+struct PruneRunsArgs {
+    /// Remove runs whose start time (from ULID, or filesystem mtime as
+    /// fallback) is older than this duration. Accepted units: d, h, m, s.
+    /// Examples: `30d`, `7d`, `24h`, `90m`, `3600s`.
+    #[arg(long)]
+    older_than: Option<String>,
+
+    /// Always retain the N most-recent runs regardless of age.
+    /// With `--older-than`: a run is pruned only if it is both old
+    /// AND outside the newest-N. Alone: prunes everything except the N newest.
+    #[arg(long)]
+    keep: Option<usize>,
+
+    /// Actually delete the selected run directories. Without this flag
+    /// the command is a dry-run: it prints what would be removed.
+    #[arg(long)]
+    apply: bool,
+
+    /// Workspace root (containing `.kimetsu/`). Defaults to the git
+    /// repository root of the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -4113,6 +4158,182 @@ fn bench(command: BenchCommand) -> KimetsuResult<()> {
     }
 }
 
+// ── runs prune helpers ────────────────────────────────────────────────────
+
+/// Metadata for a single on-disk run directory. Used by the pure selection
+/// logic so tests never touch the filesystem.
+#[derive(Debug, Clone)]
+struct RunDirInfo {
+    /// Directory name (the ULID string, or whatever the dir is named).
+    name: String,
+    /// Full path to the run directory.
+    path: PathBuf,
+    /// Run-start timestamp in Unix milliseconds.
+    /// Derived from the ULID embedded timestamp when the name is a valid
+    /// ULID; falls back to the directory's mtime (converted to ms), or 0
+    /// when neither is available.
+    started_ms: u64,
+    /// Total size of all files in the directory (bytes), best-effort.
+    size_bytes: u64,
+}
+
+/// Parse a human-friendly duration string into a `std::time::Duration`.
+///
+/// Accepted format: `<integer><unit>` where unit is one of:
+///   - `d` → days (86 400 s each)
+///   - `h` → hours
+///   - `m` → minutes
+///   - `s` → seconds
+///
+/// Examples: `"30d"`, `"7d"`, `"24h"`, `"90m"`, `"45s"`.
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+    // Split the trailing unit char from the numeric prefix.
+    let (num_part, unit) = match s.chars().last() {
+        Some(c @ ('d' | 'h' | 'm' | 's')) => (&s[..s.len() - c.len_utf8()], c),
+        Some(c) => return Err(format!("unknown duration unit '{c}'; use d/h/m/s")),
+        None => return Err("empty duration string".to_string()),
+    };
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| format!("invalid duration number '{num_part}' in '{s}'"))?;
+    let secs = match unit {
+        'd' => n * 86_400,
+        'h' => n * 3_600,
+        'm' => n * 60,
+        's' => n,
+        _ => unreachable!(),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// Extract the run-start timestamp (Unix ms) from a ULID string.
+/// Returns `None` when the string is not a valid ULID.
+fn ulid_timestamp_ms(name: &str) -> Option<u64> {
+    name.parse::<ulid::Ulid>().ok().map(|u| u.timestamp_ms())
+}
+
+/// Compute the total size in bytes of all files under `dir`, recursively.
+/// Best-effort: skips entries that cannot be stat-ed.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += dir_size_bytes(&path);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Scan `runs_dir` and return one [`RunDirInfo`] per subdirectory.
+/// Non-directory entries are skipped.
+fn scan_run_dirs(runs_dir: &Path) -> Vec<RunDirInfo> {
+    let Ok(rd) = std::fs::read_dir(runs_dir) else {
+        return Vec::new();
+    };
+    let mut infos: Vec<RunDirInfo> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+
+            // Prefer ULID-embedded time; fall back to mtime.
+            let started_ms = ulid_timestamp_ms(&name).unwrap_or_else(|| {
+                entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            });
+
+            let size_bytes = dir_size_bytes(&path);
+            RunDirInfo {
+                name,
+                path,
+                started_ms,
+                size_bytes,
+            }
+        })
+        .collect();
+
+    // Sort by started_ms descending (newest first) for stable ordering.
+    infos.sort_by_key(|b| std::cmp::Reverse(b.started_ms));
+    infos
+}
+
+/// Pure selection function: given a slice of [`RunDirInfo`] (sorted
+/// newest-first by `started_ms`), return the indices of runs that should
+/// be pruned according to the policy.
+///
+/// # Policy
+///
+/// * **`older_than` alone**: prune runs whose `started_ms` is older than
+///   `now_ms - older_than.as_millis()`. The newest-N guard is absent, so
+///   all qualifying runs are selected.
+///
+/// * **`keep` alone**: prune everything except the `keep` newest runs
+///   (i.e. indices `keep..` in the already-sorted-newest-first slice).
+///
+/// * **both**: prune runs that are *both* older than the cutoff *and*
+///   outside the newest-N. Runs in the newest-N are always protected.
+///
+/// * **neither**: returns an empty `Vec` (the caller must have already
+///   rejected this case with an error).
+fn select_runs_to_prune(
+    runs: &[RunDirInfo],
+    now_ms: u64,
+    older_than: Option<std::time::Duration>,
+    keep: Option<usize>,
+) -> Vec<usize> {
+    let cutoff_ms: Option<u64> = older_than.map(|d| now_ms.saturating_sub(d.as_millis() as u64));
+    let protect_n = keep.unwrap_or(0);
+
+    runs.iter()
+        .enumerate()
+        .filter_map(|(idx, info)| {
+            // The newest-N are always protected.
+            if idx < protect_n {
+                return None;
+            }
+            // Apply older-than cutoff when present.
+            if let Some(cutoff) = cutoff_ms {
+                if info.started_ms >= cutoff {
+                    return None; // not old enough
+                }
+            } else if keep.is_none() {
+                // Neither flag — caller should have blocked this; be safe.
+                return None;
+            }
+            Some(idx)
+        })
+        .collect()
+}
+
+/// Format a byte count as a human-readable string (KB / MB / GB).
+fn fmt_bytes(n: u64) -> String {
+    if n < 1_024 {
+        format!("{n} B")
+    } else if n < 1_024 * 1_024 {
+        format!("{:.1} KB", n as f64 / 1_024.0)
+    } else if n < 1_024 * 1_024 * 1_024 {
+        format!("{:.1} MB", n as f64 / (1_024.0 * 1_024.0))
+    } else {
+        format!("{:.2} GB", n as f64 / (1_024.0 * 1_024.0 * 1_024.0))
+    }
+}
+
 fn runs(command: RunsCommand) -> KimetsuResult<()> {
     match command {
         RunsCommand::List => {
@@ -4147,7 +4368,85 @@ fn runs(command: RunsCommand) -> KimetsuResult<()> {
             }
             Ok(())
         }
+        RunsCommand::Prune(args) => runs_prune(args),
     }
+}
+
+fn runs_prune(args: PruneRunsArgs) -> KimetsuResult<()> {
+    // Require at least one selection criterion.
+    if args.older_than.is_none() && args.keep.is_none() {
+        return Err("specify --older-than and/or --keep".into());
+    }
+
+    // Parse --older-than duration.
+    let older_than_dur: Option<std::time::Duration> = args
+        .older_than
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| format!("--older-than: {e}"))?;
+
+    // Resolve workspace root.
+    let workspace = match args.workspace {
+        Some(p) => p,
+        None => env::current_dir()?,
+    };
+
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+    let runs_dir = &paths.runs_dir;
+
+    if !runs_dir.exists() {
+        println!("no runs to prune");
+        return Ok(());
+    }
+
+    let infos = scan_run_dirs(runs_dir);
+    let total = infos.len();
+
+    // Current time in ms.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let to_prune = select_runs_to_prune(&infos, now_ms, older_than_dur, args.keep);
+    let prune_bytes: u64 = to_prune.iter().map(|&i| infos[i].size_bytes).sum();
+
+    if args.apply {
+        let mut removed = 0usize;
+        let mut freed = 0u64;
+        for &idx in &to_prune {
+            let info = &infos[idx];
+            match std::fs::remove_dir_all(&info.path) {
+                Ok(()) => {
+                    removed += 1;
+                    freed += info.size_bytes;
+                    println!("removed {}", info.name);
+                }
+                Err(e) => {
+                    eprintln!("warning: could not remove {} — {e}", info.name);
+                }
+            }
+        }
+        println!("removed {removed} run(s), freed {}", fmt_bytes(freed));
+    } else {
+        // Dry-run: list what would be removed.
+        for &idx in &to_prune {
+            println!(
+                "would remove {} ({})",
+                infos[idx].name,
+                fmt_bytes(infos[idx].size_bytes)
+            );
+        }
+        println!(
+            "{total} run(s), {} old → would remove {} ({} bytes freed)",
+            to_prune.len(),
+            to_prune.len(),
+            fmt_bytes(prune_bytes)
+        );
+    }
+
+    Ok(())
 }
 
 fn lock(command: LockCommand) -> KimetsuResult<()> {
@@ -4915,5 +5214,289 @@ ambient = false
 
             fs::remove_dir_all(root).ok();
         });
+    }
+
+    // ── Q7: runs prune helpers ────────────────────────────────────────────────
+
+    // ─── parse_duration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_duration_days() {
+        assert_eq!(
+            parse_duration("30d").unwrap(),
+            std::time::Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(
+            parse_duration("7d").unwrap(),
+            std::time::Duration::from_secs(7 * 86_400)
+        );
+        assert_eq!(
+            parse_duration("1d").unwrap(),
+            std::time::Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        assert_eq!(
+            parse_duration("24h").unwrap(),
+            std::time::Duration::from_secs(24 * 3_600)
+        );
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        assert_eq!(
+            parse_duration("90m").unwrap(),
+            std::time::Duration::from_secs(90 * 60)
+        );
+    }
+
+    #[test]
+    fn parse_duration_seconds() {
+        assert_eq!(
+            parse_duration("45s").unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn parse_duration_bad_unit() {
+        assert!(
+            parse_duration("10x").is_err(),
+            "unknown unit x should error"
+        );
+        assert!(
+            parse_duration("10w").is_err(),
+            "unknown unit w should error"
+        );
+    }
+
+    #[test]
+    fn parse_duration_bad_number() {
+        assert!(parse_duration("abcd").is_err());
+        assert!(parse_duration("d").is_err()); // number part is empty
+    }
+
+    #[test]
+    fn parse_duration_empty() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("   ").is_err());
+    }
+
+    // ─── ulid_timestamp_ms ────────────────────────────────────────────────────
+
+    #[test]
+    fn ulid_timestamp_ms_known_ulid() {
+        // ULID "01ARZ3NDEKTSV4RRFFQ69G5FAV" — verify that a valid ULID
+        // parses and that its embedded timestamp matches what the ulid crate
+        // extracts (the canonical value per the ulid-1.2.1 implementation).
+        let ms = ulid_timestamp_ms("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(ms.is_some(), "valid ULID should parse");
+        // The ulid crate reads 1469922850259 ms from this string.
+        assert_eq!(ms.unwrap(), 1_469_922_850_259);
+    }
+
+    #[test]
+    fn ulid_timestamp_ms_non_ulid() {
+        assert!(
+            ulid_timestamp_ms("not-a-ulid").is_none(),
+            "non-ULID should return None"
+        );
+        assert!(
+            ulid_timestamp_ms("").is_none(),
+            "empty string should return None"
+        );
+    }
+
+    #[test]
+    fn ulid_timestamp_ms_roundtrip() {
+        // Create a ULID and verify we can extract its timestamp.
+        let u = ulid::Ulid::new();
+        let s = u.to_string();
+        let ms = ulid_timestamp_ms(&s).expect("fresh ULID should parse");
+        // Allow 2-second slop for test execution time.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            ms <= now_ms && ms >= now_ms.saturating_sub(2_000),
+            "extracted ms {ms} should be close to now_ms {now_ms}"
+        );
+    }
+
+    // ─── select_runs_to_prune ─────────────────────────────────────────────────
+
+    /// Build synthetic RunDirInfo slices from (name, started_ms, size_bytes).
+    fn make_runs(specs: &[(&str, u64, u64)]) -> Vec<RunDirInfo> {
+        let mut v: Vec<RunDirInfo> = specs
+            .iter()
+            .map(|(name, started_ms, size_bytes)| RunDirInfo {
+                name: name.to_string(),
+                path: std::path::PathBuf::from(name),
+                started_ms: *started_ms,
+                size_bytes: *size_bytes,
+            })
+            .collect();
+        // Sort newest-first (mirrors scan_run_dirs).
+        v.sort_by_key(|b| std::cmp::Reverse(b.started_ms));
+        v
+    }
+
+    // Five runs, 1-5 days old at now_ms = 10 * 86_400_000.
+    fn five_runs() -> (Vec<RunDirInfo>, u64) {
+        let day_ms: u64 = 86_400_000;
+        let now_ms: u64 = 10 * day_ms;
+        let runs = make_runs(&[
+            ("run-1d", now_ms - day_ms, 100),     // idx 0 newest
+            ("run-2d", now_ms - 2 * day_ms, 200), // idx 1
+            ("run-3d", now_ms - 3 * day_ms, 300), // idx 2
+            ("run-4d", now_ms - 4 * day_ms, 400), // idx 3
+            ("run-5d", now_ms - 5 * day_ms, 500), // idx 4 oldest
+        ]);
+        (runs, now_ms)
+    }
+
+    #[test]
+    fn select_older_than_only() {
+        let (runs, now_ms) = five_runs();
+        // Prune everything older than 3 days → runs-4d and run-5d (idx 3, 4).
+        let cutoff = parse_duration("3d").unwrap();
+        let selected = select_runs_to_prune(&runs, now_ms, Some(cutoff), None);
+        assert_eq!(selected, vec![3, 4], "should select run-4d and run-5d");
+    }
+
+    #[test]
+    fn select_older_than_exact_boundary() {
+        let (runs, now_ms) = five_runs();
+        // Prune everything strictly older than 3 days.
+        // run-3d is exactly 3 days old → NOT pruned (>= cutoff).
+        let cutoff = parse_duration("3d").unwrap();
+        let selected = select_runs_to_prune(&runs, now_ms, Some(cutoff), None);
+        // run-3d: started_ms = now_ms - 3*day_ms = cutoff → NOT selected.
+        assert!(
+            !selected.contains(&2),
+            "run-3d (exactly at cutoff) should be protected"
+        );
+    }
+
+    #[test]
+    fn select_keep_only() {
+        let (runs, now_ms) = five_runs();
+        // keep=2: protect 2 newest, prune the rest.
+        let selected = select_runs_to_prune(&runs, now_ms, None, Some(2));
+        assert_eq!(selected, vec![2, 3, 4], "should select run-3d..run-5d");
+    }
+
+    #[test]
+    fn select_keep_all_protected() {
+        let (runs, now_ms) = five_runs();
+        // keep=10: all 5 runs protected.
+        let selected = select_runs_to_prune(&runs, now_ms, None, Some(10));
+        assert!(selected.is_empty(), "keep >= total should select nothing");
+    }
+
+    #[test]
+    fn select_both_older_than_and_keep() {
+        let (runs, now_ms) = five_runs();
+        // older_than=2d + keep=2:
+        //   - idx 0 (run-1d, 1d old): protected by keep-2
+        //   - idx 1 (run-2d, 2d old): protected by keep-2
+        //   - idx 2 (run-3d, 3d old): older than 2d, outside keep-2 → PRUNE
+        //   - idx 3 (run-4d, 4d old): older than 2d, outside keep-2 → PRUNE
+        //   - idx 4 (run-5d, 5d old): older than 2d, outside keep-2 → PRUNE
+        let cutoff = parse_duration("2d").unwrap();
+        let selected = select_runs_to_prune(&runs, now_ms, Some(cutoff), Some(2));
+        assert_eq!(selected, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn select_both_keep_protects_even_old_runs() {
+        let (runs, now_ms) = five_runs();
+        // older_than=1d + keep=4:
+        //   The 4 newest are always protected, even if older than 1d.
+        //   Only idx 4 (run-5d) could qualify by age, but so do 2d/3d/4d;
+        //   keep=4 protects idx 0..3, leaving only idx 4 exposed.
+        //   run-5d is 5d old > 1d cutoff → PRUNE.
+        let cutoff = parse_duration("1d").unwrap();
+        let selected = select_runs_to_prune(&runs, now_ms, Some(cutoff), Some(4));
+        // Only idx 4 selected (run-5d).
+        assert_eq!(selected, vec![4]);
+    }
+
+    #[test]
+    fn select_neither_flag_selects_nothing() {
+        let (runs, now_ms) = five_runs();
+        // Both None: selection function returns empty (safety guard).
+        let selected = select_runs_to_prune(&runs, now_ms, None, None);
+        assert!(
+            selected.is_empty(),
+            "no flags should select nothing (caller must error before calling)"
+        );
+    }
+
+    #[test]
+    fn select_empty_runs_list() {
+        let selected =
+            select_runs_to_prune(&[], 1_000_000, Some(parse_duration("1d").unwrap()), Some(2));
+        assert!(selected.is_empty());
+    }
+
+    // ─── fmt_bytes ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_bytes_sub_kb() {
+        assert_eq!(fmt_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn fmt_bytes_kb() {
+        assert_eq!(fmt_bytes(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn fmt_bytes_mb() {
+        assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    // ─── CLI smoke: runs prune --help ─────────────────────────────────────────
+
+    #[test]
+    fn cli_smoke_runs_prune_help() {
+        let result = Cli::try_parse_from(["kimetsu", "runs", "prune", "--help"]);
+        match result {
+            Ok(_) => {}
+            Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {}
+            Err(e) => panic!("unexpected clap error for `runs prune --help`: {e}"),
+        }
+    }
+
+    #[test]
+    fn cli_smoke_runs_prune_parses_flags() {
+        let result = Cli::try_parse_from([
+            "kimetsu",
+            "runs",
+            "prune",
+            "--older-than",
+            "30d",
+            "--keep",
+            "5",
+            "--apply",
+        ]);
+        match result {
+            Ok(Cli {
+                command:
+                    Command::Runs {
+                        command: RunsCommand::Prune(args),
+                    },
+            }) => {
+                assert_eq!(args.older_than.as_deref(), Some("30d"));
+                assert_eq!(args.keep, Some(5));
+                assert!(args.apply);
+            }
+            Ok(other) => panic!("unexpected parse result: {other:?}"),
+            Err(e) => panic!("parse failed: {e}"),
+        }
     }
 }
