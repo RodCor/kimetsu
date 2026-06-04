@@ -40,59 +40,78 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Initialize a Kimetsu project here (writes .kimetsu/project.toml + brain.db).
+    /// Initialize a Kimetsu project
+    ///
+    /// Writes .kimetsu/project.toml + brain.db in the current directory.
     Init(InitArgs),
-    /// Show, edit, get, or set fields in the project config (project.toml).
+    /// Manage project config
+    ///
+    /// Show, edit, get, or set fields in project.toml.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// The memory brain: record, retrieve, search, curate, import/export, and maintain memories.
+    /// Manage the memory brain
+    ///
+    /// Record, retrieve, search, curate, import/export, and maintain memories.
     Brain {
         #[command(subcommand)]
         command: BrainCommand,
     },
-    /// Run a coding task through the autonomous agent pipeline.
+    /// Run a coding task
+    ///
+    /// Drives the autonomous agent pipeline.
     Run {
         #[command(subcommand)]
         command: RunCommand,
     },
-    /// Run benchmark suites (Terminal-Bench / SWE-bench).
+    /// Run benchmark suites
+    ///
+    /// Terminal-Bench / SWE-bench.
     Bench {
         #[command(subcommand)]
         command: BenchCommand,
     },
-    /// Inspect and prune agent run history.
+    /// Inspect and prune run history
     Runs {
         #[command(subcommand)]
         command: RunsCommand,
     },
-    /// Manage the project lock (clear a stale lock).
+    /// Manage the project lock
+    ///
+    /// Clear a stale lock.
     Lock {
         #[command(subcommand)]
         command: LockCommand,
     },
-    /// Cross-harness skill portability: discover, import, and export skills between hosts.
+    /// Port skills between hosts
+    ///
+    /// Discover, import, and export skills across harnesses.
     Bridge {
         #[command(subcommand)]
         command: BridgeCommand,
     },
-    /// Run the MCP server that exposes the brain to host agents.
+    /// Run the MCP server
+    ///
+    /// Exposes the brain to host agents over stdio.
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
     },
-    /// Install Kimetsu's plugin wiring (MCP + hooks) into a host agent (Claude Code / Codex).
+    /// Install plugin wiring into a host
+    ///
+    /// MCP + hooks for Claude Code, Codex, Pi, or OpenClaw. Also: status, uninstall.
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
     },
-    /// Interactive REPL chat — kimetsu as a user-facing coding assistant.
+    /// Interactive REPL chat
     ///
+    /// Kimetsu as a user-facing coding assistant.
     /// Reuses the full agent runtime (tools, prompts, brain, MP-18 verify)
     /// with a stdin/stdout transport. No dependency on Terminal-Bench.
     Chat(ChatArgs),
-    /// Kimetsu doctor — automated wire-health check.
+    /// Check wiring health
     ///
     /// Validates that every kimetsu subsystem the chat REPL + MCP
     /// sidecar rely on actually works against the current workspace
@@ -102,29 +121,34 @@ enum Command {
     /// `KIMETSU_BRAIN_EMBEDDER`, or whenever something looks
     /// off — doctor surfaces the actionable fix.
     Doctor(DoctorArgs),
-    /// Check GitHub Releases for a newer Kimetsu and update discovered
-    /// local installs.
+    /// Update to the latest release
+    ///
+    /// Checks GitHub Releases and updates discovered local installs.
     Update(UpdateArgs),
-    /// Remove discovered Kimetsu executables from this machine.
+    /// Uninstall Kimetsu
+    ///
+    /// Removes discovered Kimetsu executables from this machine.
     Uninstall(UninstallArgs),
-    /// List running kimetsu processes (PID, kind, workspace, exe).
+    /// List running processes
     ///
     /// Useful for diagnosing stale MCP servers or lingering sessions.
     /// On Windows uses CIM (Win32_Process) for the command-line;
     /// on Unix uses `ps -eo pid=,args=`.
     Ps(PsArgs),
-    /// Stop one or more running kimetsu processes.
+    /// Stop running processes
     ///
     /// Note: an MCP server spawned by a host (Claude Code, Codex) will be
     /// respawned automatically on the next tool call — stopping it is safe
     /// and is how you clear a stale server.
     Stop(StopArgs),
-    /// Convenience: stop all kimetsu MCP-server processes.
+    /// Restart MCP servers
     ///
     /// Equivalent to `kimetsu stop --all` targeting McpServe processes.
     /// The host agent (Claude Code / Codex) will respawn the MCP server on
     /// the next tool call, so no manual restart is required.
     Restart(RestartArgs),
+    /// Set up Kimetsu in one command
+    ///
     /// One-command onboarding: init the project, install the plugin into your host, and verify it works.
     ///
     /// Takes a new user from zero to a verified working brain in ONE command,
