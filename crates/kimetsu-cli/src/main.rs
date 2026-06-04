@@ -644,6 +644,21 @@ enum BrainCommand {
     ///   kimetsu brain import mem.json
     ///   kimetsu brain import mem.json --scope-override global_user
     Import(BrainImportArgs),
+    /// Write a consistent full-DB snapshot of brain.db using the SQLite
+    /// online backup API (WAL-safe; no teardown required).
+    ///
+    /// This is a full-DB backup — unlike `brain export` (memories-only JSON)
+    /// this captures every table, index, and event row.  Restore by copying
+    /// the snapshot back over brain.db (stop the MCP server first).
+    ///
+    /// Without <file>, the snapshot is placed next to brain.db and named
+    /// `brain.db.backup-<unix_ts>`.
+    ///
+    /// Examples:
+    ///   kimetsu brain backup
+    ///   kimetsu brain backup /path/to/snapshot.db
+    ///   kimetsu brain backup --workspace /path/to/repo
+    Backup(BrainBackupArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -788,6 +803,16 @@ struct BrainImportArgs {
     /// Override the scope for every imported entry (global_user|project|repo|run).
     #[arg(long)]
     scope_override: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct BrainBackupArgs {
+    /// Destination file for the snapshot. When omitted, placed next to
+    /// brain.db and named `brain.db.backup-<unix_ts>`.
+    file: Option<PathBuf>,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -3068,6 +3093,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Compact(args) => brain_compact(args),
         BrainCommand::Export(args) => brain_export(args),
         BrainCommand::Import(args) => brain_import(args),
+        BrainCommand::Backup(args) => brain_backup(args),
     }
 }
 
@@ -3500,6 +3526,47 @@ fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
     );
 
     Ok(())
+}
+
+/// `kimetsu brain backup [<file>] [--workspace <p>]`
+///
+/// Writes a consistent full-DB snapshot of brain.db via the SQLite online
+/// backup API. Complements `brain export` (memories-only JSON) and the
+/// automatic pre-migrate backup — this is a full-schema snapshot you can
+/// copy back as a restore.
+fn brain_backup(args: BrainBackupArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+
+    if !paths.brain_db.exists() {
+        return Err(format!(
+            "brain.db not found at {} — run `kimetsu init` first",
+            paths.brain_db.display()
+        )
+        .into());
+    }
+
+    let dest = args.file.as_deref();
+    let (dest_path, size) = kimetsu_brain::migrate::backup_brain(&paths.brain_db, dest)?;
+    println!(
+        "backed up brain.db ({}) → {}",
+        fmt_bytes_brain(size),
+        dest_path.display()
+    );
+    Ok(())
+}
+
+/// Format a byte count as a human-readable string for the brain backup output.
+fn fmt_bytes_brain(n: u64) -> String {
+    if n < 1_024 {
+        format!("{n} B")
+    } else if n < 1_024 * 1_024 {
+        format!("{:.1} KB", n as f64 / 1_024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1_024.0 * 1_024.0))
+    }
 }
 
 /// v0.6: `kimetsu brain status` — brain health at a glance.

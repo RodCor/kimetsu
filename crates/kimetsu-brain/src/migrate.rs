@@ -302,6 +302,64 @@ pub(crate) fn run_with(
 }
 
 // ---------------------------------------------------------------------------
+// Public convenience: kimetsu brain backup
+// ---------------------------------------------------------------------------
+
+/// Write a consistent full-DB snapshot of the brain at `brain_db_path` to
+/// `dest`.  When `dest` is `None`, the snapshot is placed next to the source
+/// DB and named `<brain.db>.backup-<unix_ts>`.
+///
+/// Uses the SQLite online backup API (same as `backup_before_migrate`) so the
+/// copy is WAL-aware and consistent even if another writer is active.
+///
+/// Returns the absolute path of the snapshot and its size in bytes.
+///
+/// # Errors
+/// Propagates IO and SQLite errors.  Does **not** swallow errors — callers
+/// should surface them to the user.
+pub fn backup_brain(
+    brain_db_path: &std::path::Path,
+    dest: Option<&std::path::Path>,
+) -> KimetsuResult<(std::path::PathBuf, u64)> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let dest_path = match dest {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let file_name = format!(
+                "{}.backup-{ts}",
+                brain_db_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("brain.db")
+            );
+            brain_db_path.with_file_name(file_name)
+        }
+    };
+
+    // Open the source in read-only mode so we don't disturb a running brain.
+    let src = Connection::open_with_flags(
+        brain_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+
+    // Online backup to the destination (created or overwritten).
+    let mut dst = Connection::open(&dest_path)?;
+    let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
+    backup.run_to_completion(64, std::time::Duration::from_millis(0), None)?;
+    drop(backup);
+    drop(dst);
+    drop(src);
+
+    let size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+
+    Ok((dest_path, size))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -723,6 +781,102 @@ mod tests {
             tmp_dir.join("brain.db.bak-1-2-4000").exists(),
             "backup ts=4000 should survive"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // backup_brain tests
+    // ------------------------------------------------------------------
+
+    /// Seed a minimal fully-initialized brain DB (schema_info + memories table
+    /// with one row) at `path` and return its connection.
+    fn make_full_brain_db(path: &Path) -> Connection {
+        let conn = Connection::open(path).expect("open brain db");
+        // Minimal schema enough for backup_brain to copy.
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO schema_info VALUES ('kimetsu_schema_version', {});
+             CREATE TABLE memories (
+                 memory_id TEXT PRIMARY KEY,
+                 scope TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 text TEXT NOT NULL
+             );
+             INSERT INTO memories VALUES ('bk-mem-1', 'repo', 'fact', 'backup test memory');",
+            target_version(),
+        ))
+        .expect("seed brain db");
+        conn
+    }
+
+    #[test]
+    fn backup_brain_default_path_exists_and_valid() {
+        let tmp_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("kimetsu-test-backup-brain-{tmp_id}"));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+
+        let db_path = tmp_dir.join("brain.db");
+        {
+            let _conn = make_full_brain_db(&db_path);
+        } // close connection before backup_brain opens it read-only
+
+        let (dest, size) = backup_brain(&db_path, None).expect("backup_brain");
+
+        // Path must exist.
+        assert!(dest.exists(), "backup file should exist at {dest:?}");
+        // Must be non-empty.
+        assert!(size > 0, "backup size should be > 0, got {size}");
+        // Name must follow the pattern brain.db.backup-<ts>.
+        let name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("backup has a filename");
+        assert!(
+            name.starts_with("brain.db.backup-"),
+            "backup name should start with 'brain.db.backup-', got: {name}"
+        );
+
+        // Must be a valid SQLite DB with the expected memory count.
+        let bak_conn = Connection::open(&dest).expect("open backup");
+        let count: i64 = bak_conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count memories in backup");
+        assert_eq!(count, 1, "backup should contain 1 memory row");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn backup_brain_custom_path() {
+        let tmp_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("kimetsu-test-backup-brain2-{tmp_id}"));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+
+        let db_path = tmp_dir.join("brain.db");
+        let custom = tmp_dir.join("my-custom-backup.db");
+        {
+            let _conn = make_full_brain_db(&db_path);
+        }
+
+        let (dest, size) = backup_brain(&db_path, Some(&custom)).expect("backup_brain custom");
+
+        assert_eq!(dest, custom, "dest should be the custom path");
+        assert!(custom.exists(), "custom backup file should exist");
+        assert!(size > 0);
+
+        // Valid SQLite with the expected row.
+        let bak_conn = Connection::open(&custom).expect("open custom backup");
+        let count: i64 = bak_conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count memories in custom backup");
+        assert_eq!(count, 1, "custom backup should contain 1 memory row");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
