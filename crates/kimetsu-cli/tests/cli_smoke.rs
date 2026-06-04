@@ -44,6 +44,11 @@ fn kimetsu_version_prints_a_version_string_and_exits_clean() {
         stdout.contains("kimetsu"),
         "kimetsu --version should mention 'kimetsu'; got: {stdout}"
     );
+    // QQ2: --version must also include the build flavor.
+    assert!(
+        stdout.contains("(embeddings)") || stdout.contains("(lean)"),
+        "kimetsu --version should contain build flavor '(embeddings)' or '(lean)'; got: {stdout}"
+    );
 }
 
 #[test]
