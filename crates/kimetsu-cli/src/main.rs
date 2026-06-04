@@ -480,6 +480,30 @@ enum BrainCommand {
     /// Host SessionEnd hook — runs the credentialed distiller.
     #[command(name = "session-end-hook")]
     SessionEndHook(SessionEndHookArgs),
+    /// Export active memories to a portable JSON file (or stdout when <file> is `-`).
+    ///
+    /// The output is a JSON array of `{ text, scope, kind, confidence, created_at }`
+    /// records — all the fields needed to reconstruct the memories in another brain.
+    /// Instance-specific metadata (memory_id, usefulness_score, use_count) is
+    /// intentionally omitted so importing always creates fresh rows with clean stats.
+    ///
+    /// Examples:
+    ///   kimetsu brain export mem.json
+    ///   kimetsu brain export mem.json --scope project
+    ///   kimetsu brain export mem.json --scope project --kind failure_pattern
+    ///   kimetsu brain export - | jq .          # stdout
+    Export(BrainExportArgs),
+    /// Import memories from a portable JSON file produced by `brain export`.
+    ///
+    /// For each entry the importer parses scope + kind and calls the same
+    /// normalized-text dedup path as `memory add`, so re-importing the same
+    /// file is safe. A `--scope-override` reroutes every entry to the given
+    /// scope regardless of what the file says.
+    ///
+    /// Examples:
+    ///   kimetsu brain import mem.json
+    ///   kimetsu brain import mem.json --scope-override global_user
+    Import(BrainImportArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -578,6 +602,33 @@ struct ReindexArgs {
     /// reindex on huge brains over multiple invocations.
     #[arg(long)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct BrainExportArgs {
+    /// Output file path. Use `-` to write to stdout.
+    file: String,
+    /// Filter by scope (global_user|project|repo|run).
+    #[arg(long)]
+    scope: Option<String>,
+    /// Filter by kind (preference|convention|command|failure_pattern|fact).
+    #[arg(long)]
+    kind: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct BrainImportArgs {
+    /// Input file path. Use `-` to read from stdin.
+    file: String,
+    /// Override the scope for every imported entry (global_user|project|repo|run).
+    #[arg(long)]
+    scope_override: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -2050,6 +2101,8 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             distiller::run_session_end_hook(&workspace);
             Ok(())
         }
+        BrainCommand::Export(args) => brain_export(args),
+        BrainCommand::Import(args) => brain_import(args),
     }
 }
 
@@ -2316,6 +2369,101 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
             "updated"
         },
     );
+    Ok(())
+}
+
+// ── Q5: brain export / import ────────────────────────────────────────────────
+
+/// `kimetsu brain export <file> [--scope] [--kind]`
+///
+/// Dumps active memories as pretty-printed JSON. Writes to stdout when
+/// `file` is `-`.  Prints "exported N memories to <file>" on success.
+fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Parse optional scope/kind filters.
+    let scope = args
+        .scope
+        .as_deref()
+        .map(|s| {
+            s.parse::<MemoryScope>().map_err(|_| {
+                format!("unknown scope `{s}`; expected one of: global_user, project, repo, run")
+            })
+        })
+        .transpose()?;
+    let kind = args
+        .kind
+        .as_deref()
+        .map(|k| {
+            k.parse::<MemoryKind>()
+                .map_err(|_| format!("unknown kind `{k}`; expected one of: preference, convention, command, failure_pattern, fact"))
+        })
+        .transpose()?;
+
+    let memories = project::export_memories(&workspace, scope, kind)?;
+    let json = serde_json::to_string_pretty(&memories)
+        .map_err(|e| format!("brain export: failed to serialize: {e}"))?;
+
+    if args.file == "-" {
+        println!("{json}");
+    } else {
+        std::fs::write(&args.file, &json)
+            .map_err(|e| format!("brain export: could not write `{}`: {e}", args.file))?;
+        println!("exported {} memories to {}", memories.len(), args.file);
+    }
+
+    Ok(())
+}
+
+/// `kimetsu brain import <file> [--scope-override]`
+///
+/// Reads a JSON array of `MemoryExport` records (produced by `brain export`)
+/// and imports them into the brain. Prints "imported N (deduped M)".
+/// Reads from stdin when `file` is `-`.
+fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Parse optional scope_override.
+    let scope_override = args
+        .scope_override
+        .as_deref()
+        .map(|s| {
+            s.parse::<MemoryScope>().map_err(|_| {
+                format!("unknown scope `{s}`; expected one of: global_user, project, repo, run")
+            })
+        })
+        .transpose()?;
+
+    // Read JSON.
+    let json = if args.file == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("brain import: failed to read stdin: {e}"))?;
+        buf
+    } else {
+        std::fs::read_to_string(&args.file)
+            .map_err(|e| format!("brain import: could not read `{}`: {e}", args.file))?
+    };
+
+    let entries: Vec<project::MemoryExport> = serde_json::from_str(&json).map_err(|e| {
+        format!(
+            "brain import: `{}` is not valid JSON — expected an array of memory export records: {e}",
+            args.file
+        )
+    })?;
+
+    let summary = project::import_memories(&workspace, &entries, scope_override)?;
+    println!(
+        "imported {} (deduped {})",
+        summary.imported, summary.deduped
+    );
+
     Ok(())
 }
 

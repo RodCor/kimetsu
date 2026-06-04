@@ -2013,6 +2013,199 @@ pub fn log_telemetry_event(
     Ok(())
 }
 
+// ── Q5: portable memory export / import ──────────────────────────────────────
+
+/// A single memory in the portable JSON exchange format.
+///
+/// Carries only the fields needed to reconstruct the memory in another brain —
+/// instance-specific data (`memory_id`, `usefulness_score`, `use_count`) is
+/// intentionally excluded so importing always creates a fresh row with clean
+/// stats.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryExport {
+    pub text: String,
+    pub scope: String,
+    pub kind: String,
+    pub confidence: f32,
+    pub created_at: Option<String>,
+}
+
+/// Summary returned by [`import_memories`].
+#[derive(Debug, Clone, Default)]
+pub struct ImportSummary {
+    /// Memories that were actually written (new rows).
+    pub imported: usize,
+    /// Entries that were skipped because an identical memory already existed
+    /// (detected by `add_memory`'s normalized-text dedup) or because the
+    /// scope/kind was malformed.
+    pub deduped: usize,
+}
+
+/// Export active memories as a vec of portable records.
+///
+/// `scope` and `kind` are optional filters; `None` means "all".
+pub fn export_memories(
+    start: &Path,
+    scope: Option<MemoryScope>,
+    kind: Option<MemoryKind>,
+) -> KimetsuResult<Vec<MemoryExport>> {
+    // Build the SQL dynamically based on the optional filters, including
+    // `created_at` so the JSON record carries the origin timestamp.
+    let (sql, params_vec): (&str, Vec<String>) = match (scope.as_ref(), kind.as_ref()) {
+        (Some(s), Some(k)) => (
+            "SELECT scope, kind, text, confidence, created_at
+             FROM memories
+             WHERE invalidated_at IS NULL
+               AND lower(scope) = lower(?1)
+               AND lower(kind)  = lower(?2)
+             ORDER BY created_at DESC",
+            vec![s.to_string(), k.to_string()],
+        ),
+        (Some(s), None) => (
+            "SELECT scope, kind, text, confidence, created_at
+             FROM memories
+             WHERE invalidated_at IS NULL
+               AND lower(scope) = lower(?1)
+             ORDER BY created_at DESC",
+            vec![s.to_string()],
+        ),
+        (None, Some(k)) => (
+            "SELECT scope, kind, text, confidence, created_at
+             FROM memories
+             WHERE invalidated_at IS NULL
+               AND lower(kind) = lower(?1)
+             ORDER BY created_at DESC",
+            vec![k.to_string()],
+        ),
+        (None, None) => (
+            "SELECT scope, kind, text, confidence, created_at
+             FROM memories
+             WHERE invalidated_at IS NULL
+             ORDER BY created_at DESC",
+            vec![],
+        ),
+    };
+
+    // Project-level memories only (user brain memories live in a separate DB;
+    // callers wanting the user brain should call with scope=GlobalUser on the
+    // user-brain path, or simply use list_memories which merges both).
+    let (_paths, _config, conn) = load_project(start)?;
+
+    let mut stmt = conn.prepare(sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(refs.as_slice(), |row| {
+        Ok(MemoryExport {
+            scope: row.get(0)?,
+            kind: row.get(1)?,
+            text: row.get(2)?,
+            confidence: row.get::<_, f64>(3)? as f32,
+            created_at: row.get(4)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Import a slice of [`MemoryExport`] records into the brain at `start`.
+///
+/// For each entry:
+/// - Parse scope + kind from the string fields (with optional `scope_override`).
+/// - Call `add_memory`, which dedups by normalized text. Dedup is detected by
+///   comparing the set of active memory IDs in the project DB before vs after
+///   each `add_memory` call — if the returned ID was already in the DB at
+///   the start of this import batch, it counts as deduped.
+/// - Malformed entries (bad scope/kind string) are skipped with a warning;
+///   they do NOT abort the whole import.
+///
+/// Returns an [`ImportSummary`] with `imported` (new rows) and `deduped`
+/// (entries that collapsed to an existing row or were skipped).
+pub fn import_memories(
+    start: &Path,
+    entries: &[MemoryExport],
+    scope_override: Option<MemoryScope>,
+) -> KimetsuResult<ImportSummary> {
+    let mut summary = ImportSummary::default();
+
+    // Snapshot all active memory IDs before we start importing.  Any ID
+    // returned by add_memory that is already in this set is a dedup.
+    let pre_existing_ids: std::collections::HashSet<String> = {
+        // Open a read-only connection just for the snapshot; avoid holding it
+        // across the write calls (each add_memory opens its own connection).
+        match load_project_readonly(start) {
+            Ok((_paths, _config, conn)) => {
+                let mut stmt = conn
+                    .prepare("SELECT memory_id FROM memories WHERE invalidated_at IS NULL")
+                    .unwrap_or_else(|_| conn.prepare("SELECT memory_id FROM memories").unwrap());
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+            Err(_) => std::collections::HashSet::new(),
+        }
+    };
+
+    // Also track IDs minted during THIS batch so we can detect within-batch
+    // duplicates (e.g. two identical entries in the import file).
+    let mut this_batch_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for entry in entries {
+        // Resolve scope: prefer override, then parse from the entry.
+        let scope = if let Some(ref ov) = scope_override {
+            *ov
+        } else {
+            match entry.scope.parse::<MemoryScope>() {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!(
+                        "kimetsu-brain import: skipping entry with unknown scope `{}`",
+                        entry.scope
+                    );
+                    summary.deduped += 1;
+                    continue;
+                }
+            }
+        };
+
+        // Resolve kind.
+        let kind = match entry.kind.parse::<MemoryKind>() {
+            Ok(k) => k,
+            Err(_) => {
+                eprintln!(
+                    "kimetsu-brain import: skipping entry with unknown kind `{}`",
+                    entry.kind
+                );
+                summary.deduped += 1;
+                continue;
+            }
+        };
+
+        match add_memory(start, scope, kind, &entry.text) {
+            Ok(id) => {
+                // Dedup if the ID was present before this import started OR
+                // was already seen in this batch (within-batch duplicates).
+                if pre_existing_ids.contains(&id) || !this_batch_ids.insert(id) {
+                    summary.deduped += 1;
+                } else {
+                    summary.imported += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("kimetsu-brain import: failed to add memory: {e}");
+                summary.deduped += 1;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -4336,5 +4529,300 @@ max_total_cost_usd = 250.0
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&user_brain_dir).ok();
+    }
+
+    // ── Q5: export / import tests ─────────────────────────────────────────────
+
+    /// Round-trip: add memories to project A, export, parse JSON, import into
+    /// project B → `list_memories` on B contains all the texts.
+    #[test]
+    fn export_import_round_trip() {
+        with_user_brain_disabled(|| {
+            // --- project A: seed memories --------------------------------
+            let root_a = test_root();
+            init_project(&root_a, false).expect("init A");
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "alpha fact",
+            )
+            .expect("add fact");
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "beta convention",
+            )
+            .expect("add conv");
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::FailurePattern,
+                "gamma failure",
+            )
+            .expect("add fp");
+
+            // Export
+            let exported = export_memories(&root_a, None, None).expect("export");
+            assert_eq!(exported.len(), 3, "must export all 3 active memories");
+
+            // All fields present
+            for e in &exported {
+                assert!(!e.text.is_empty());
+                assert!(!e.scope.is_empty());
+                assert!(!e.kind.is_empty());
+            }
+
+            // Serialize → parse (tests the JSON round-trip)
+            let json = serde_json::to_string_pretty(&exported).expect("serialize");
+            let parsed: Vec<MemoryExport> = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed.len(), 3);
+
+            // --- project B: import and verify ----------------------------
+            let root_b = test_root();
+            init_project(&root_b, false).expect("init B");
+
+            let summary = import_memories(&root_b, &parsed, None).expect("import");
+            assert_eq!(
+                summary.imported, 3,
+                "all 3 must be imported into the empty project B"
+            );
+            assert_eq!(summary.deduped, 0, "no duplicates expected on first import");
+
+            let mems_b = list_memories(&root_b).expect("list B");
+            let texts_b: Vec<&str> = mems_b.iter().map(|m| m.text.as_str()).collect();
+            assert!(
+                texts_b.contains(&"alpha fact"),
+                "alpha fact missing from B: {texts_b:?}"
+            );
+            assert!(
+                texts_b.contains(&"beta convention"),
+                "beta convention missing from B: {texts_b:?}"
+            );
+            assert!(
+                texts_b.contains(&"gamma failure"),
+                "gamma failure missing from B: {texts_b:?}"
+            );
+
+            fs::remove_dir_all(&root_a).ok();
+            fs::remove_dir_all(&root_b).ok();
+        });
+    }
+
+    /// Filter: `export_memories(Some(Project), Some(FailurePattern))` returns
+    /// only memories matching both the scope AND the kind filter.
+    #[test]
+    fn export_scope_kind_filter() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::FailurePattern,
+                "fp1",
+            )
+            .expect("add fp1");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::FailurePattern,
+                "fp2",
+            )
+            .expect("add fp2");
+            add_memory(&root, MemoryScope::Project, MemoryKind::Fact, "fact1").expect("add fact");
+            add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::FailurePattern,
+                "repo-fp",
+            )
+            .expect("add repo-fp");
+
+            // Filter: project scope + failure_pattern kind
+            let filtered = export_memories(
+                &root,
+                Some(MemoryScope::Project),
+                Some(MemoryKind::FailurePattern),
+            )
+            .expect("export filtered");
+            assert_eq!(
+                filtered.len(),
+                2,
+                "must return only the 2 project-scope failure_patterns, got: {filtered:?}"
+            );
+            assert!(filtered.iter().all(|e| e.scope == "project"));
+            assert!(filtered.iter().all(|e| e.kind == "failure_pattern"));
+
+            // Scope-only filter: all project memories
+            let scope_only =
+                export_memories(&root, Some(MemoryScope::Project), None).expect("scope filter");
+            assert_eq!(scope_only.len(), 3, "3 project-scope memories total");
+
+            // Kind-only filter: all failure_patterns (project + repo)
+            let kind_only = export_memories(&root, None, Some(MemoryKind::FailurePattern))
+                .expect("kind filter");
+            assert_eq!(
+                kind_only.len(),
+                3,
+                "3 failure_patterns total (2 project + 1 repo)"
+            );
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    /// Dedup: importing the same set twice into one project → second import
+    /// reports all entries as deduped; `list_memories` count is unchanged.
+    #[test]
+    fn import_dedup_on_second_import() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let entries = vec![
+                MemoryExport {
+                    text: "dedup alpha".to_string(),
+                    scope: "project".to_string(),
+                    kind: "fact".to_string(),
+                    confidence: 1.0,
+                    created_at: None,
+                },
+                MemoryExport {
+                    text: "dedup beta".to_string(),
+                    scope: "project".to_string(),
+                    kind: "convention".to_string(),
+                    confidence: 1.0,
+                    created_at: None,
+                },
+            ];
+
+            // First import — both should be new
+            let s1 = import_memories(&root, &entries, None).expect("import 1");
+            assert_eq!(s1.imported, 2, "first import: 2 new rows");
+            assert_eq!(s1.deduped, 0, "first import: no dups");
+
+            let count_after_first = list_memories(&root).expect("list after 1st").len();
+            assert_eq!(count_after_first, 2);
+
+            // Second import — same entries, all collapsed by normalized-text dedup
+            let s2 = import_memories(&root, &entries, None).expect("import 2");
+            assert_eq!(s2.imported, 0, "second import: no new rows");
+            assert_eq!(s2.deduped, 2, "second import: both entries deduped");
+
+            let count_after_second = list_memories(&root).expect("list after 2nd").len();
+            assert_eq!(
+                count_after_second, 2,
+                "list_memories count must be unchanged after second import"
+            );
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    /// scope_override: importing with `Some(GlobalUser)` with user brain disabled
+    /// routes entries to the project DB under global_user scope.
+    #[test]
+    fn import_scope_override_global_user() {
+        with_user_brain_disabled(|| {
+            // With user brain disabled, GlobalUser writes fall through to project DB.
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let entries = vec![MemoryExport {
+                text: "scope override test memory".to_string(),
+                scope: "project".to_string(), // original scope — will be overridden
+                kind: "fact".to_string(),
+                confidence: 1.0,
+                created_at: None,
+            }];
+
+            let summary =
+                import_memories(&root, &entries, Some(MemoryScope::GlobalUser)).expect("import");
+            assert_eq!(summary.imported, 1);
+            assert_eq!(summary.deduped, 0);
+
+            // The memory must appear with scope = global_user in the project DB
+            // (since user brain is disabled, GlobalUser falls through to project).
+            let mems = list_memories(&root).expect("list");
+            assert_eq!(mems.len(), 1);
+            assert_eq!(
+                mems[0].scope, "global_user",
+                "scope_override must win over entry.scope"
+            );
+            assert_eq!(mems[0].text, "scope override test memory");
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    /// Malformed entries (bad scope or kind string) are skipped gracefully;
+    /// valid entries in the same batch are still imported.
+    #[test]
+    fn import_skips_malformed_entries() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let entries = vec![
+                // valid
+                MemoryExport {
+                    text: "good entry".to_string(),
+                    scope: "project".to_string(),
+                    kind: "fact".to_string(),
+                    confidence: 1.0,
+                    created_at: None,
+                },
+                // bad scope
+                MemoryExport {
+                    text: "bad scope entry".to_string(),
+                    scope: "not_a_real_scope".to_string(),
+                    kind: "fact".to_string(),
+                    confidence: 1.0,
+                    created_at: None,
+                },
+                // bad kind
+                MemoryExport {
+                    text: "bad kind entry".to_string(),
+                    scope: "project".to_string(),
+                    kind: "not_a_real_kind".to_string(),
+                    confidence: 1.0,
+                    created_at: None,
+                },
+                // another valid
+                MemoryExport {
+                    text: "second good entry".to_string(),
+                    scope: "repo".to_string(),
+                    kind: "convention".to_string(),
+                    confidence: 1.0,
+                    created_at: None,
+                },
+            ];
+
+            let summary = import_memories(&root, &entries, None).expect("import with bad entries");
+            assert_eq!(
+                summary.imported, 2,
+                "2 valid entries must be imported; got {summary:?}"
+            );
+            assert_eq!(
+                summary.deduped, 2,
+                "2 malformed entries counted as skipped/deduped; got {summary:?}"
+            );
+
+            let mems = list_memories(&root).expect("list");
+            assert_eq!(mems.len(), 2, "exactly 2 memories in DB; got {mems:?}");
+            let texts: Vec<&str> = mems.iter().map(|m| m.text.as_str()).collect();
+            assert!(
+                texts.contains(&"good entry"),
+                "good entry missing: {texts:?}"
+            );
+            assert!(
+                texts.contains(&"second good entry"),
+                "second good entry missing: {texts:?}"
+            );
+
+            fs::remove_dir_all(&root).ok();
+        });
     }
 }
