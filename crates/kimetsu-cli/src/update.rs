@@ -232,7 +232,9 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
         Ok(())
     } else {
         Err(format!(
-            "updated {updated} Kimetsu executable(s), but {} location(s) failed; rerun from an elevated shell if needed",
+            "updated {updated} Kimetsu executable(s), but {} location(s) failed; \
+             if the binary is locked by a running kimetsu process (e.g. `kimetsu mcp serve`), \
+             quit Claude Code / Codex or run: Get-Process kimetsu | Stop-Process -Force",
             failed.len()
         )
         .into())
@@ -483,7 +485,9 @@ pub fn uninstall(options: UninstallOptions) -> KimetsuResult<()> {
         Ok(())
     } else {
         Err(format!(
-            "removed {removed} Kimetsu executable(s), but {} location(s) failed; rerun from an elevated shell if needed",
+            "removed {removed} Kimetsu executable(s), but {} location(s) failed; \
+             if the binary is locked by a running kimetsu process (e.g. `kimetsu mcp serve`), \
+             quit Claude Code / Codex or run: Get-Process kimetsu | Stop-Process -Force",
             failed.len()
         )
         .into())
@@ -694,8 +698,33 @@ fn replace_installation(source: &Path, target: &Path) -> KimetsuResult<ReplaceOu
         if is_current_exe(target) {
             return schedule_windows_self_replace(source, target);
         }
-        fs::copy(source, target)?;
-        Ok(ReplaceOutcome::Updated)
+        match fs::copy(source, target) {
+            Ok(_) => Ok(ReplaceOutcome::Updated),
+            Err(err) if is_sharing_violation(&err) => {
+                // The target is locked by a sibling kimetsu process.
+                let pids = kimetsu_processes_locking(target);
+                if !pids.is_empty() {
+                    let pid_list = pids
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "notice:  {} is held by kimetsu process(es) [PID: {}]; scheduling deferred replace.",
+                        target.display(),
+                        pid_list
+                    );
+                    println!(
+                        "         To complete the update now: quit Claude Code / Codex so their\n\
+                         `kimetsu mcp serve` exits, or run: Get-Process kimetsu | Stop-Process -Force"
+                    );
+                    schedule_windows_locked_replace(source, target, &pids)
+                } else {
+                    Err(err.into())
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -710,9 +739,39 @@ fn remove_installation(target: &Path) -> KimetsuResult<RemoveOutcome> {
         if is_current_exe(target) {
             return schedule_windows_self_delete(target);
         }
+        match fs::remove_file(target) {
+            Ok(()) => Ok(RemoveOutcome::Removed),
+            Err(err) if is_sharing_violation(&err) => {
+                // The target is locked by a sibling kimetsu process.
+                let pids = kimetsu_processes_locking(target);
+                if !pids.is_empty() {
+                    let pid_list = pids
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "notice:  {} is held by kimetsu process(es) [PID: {}]; scheduling deferred delete.",
+                        target.display(),
+                        pid_list
+                    );
+                    println!(
+                        "         To complete the uninstall now: quit Claude Code / Codex so their\n\
+                         `kimetsu mcp serve` exits, or run: Get-Process kimetsu | Stop-Process -Force"
+                    );
+                    schedule_windows_locked_delete(target, &pids)
+                } else {
+                    Err(err.into())
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
     }
-    fs::remove_file(target)?;
-    Ok(RemoveOutcome::Removed)
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(target)?;
+        Ok(RemoveOutcome::Removed)
+    }
 }
 
 #[cfg(not(windows))]
@@ -742,12 +801,19 @@ fn schedule_windows_self_replace(source: &Path, target: &Path) -> KimetsuResult<
         std::process::id()
     ));
     fs::copy(source, &staged)?;
+    // Wait for our own PID to exit, then poll-retry Move-Item for up to 60 s
+    // so any other sibling process that might still hold the file can also exit.
     let script = format!(
         "$pidToWait = {pid}; \
          $src = {src}; \
          $dst = {dst}; \
          while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
-         Move-Item -LiteralPath $src -Destination $dst -Force",
+         $deadline = (Get-Date).AddSeconds(60); \
+         $done = $false; \
+         while (-not $done -and (Get-Date) -lt $deadline) {{ \
+           try {{ Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; $done = $true }} \
+           catch {{ Start-Sleep -Milliseconds 500 }} \
+         }}",
         pid = std::process::id(),
         src = ps_quote(&staged),
         dst = ps_quote(target),
@@ -768,11 +834,18 @@ fn schedule_windows_self_replace(source: &Path, target: &Path) -> KimetsuResult<
 
 #[cfg(windows)]
 fn schedule_windows_self_delete(target: &Path) -> KimetsuResult<RemoveOutcome> {
+    // Wait for our own PID to exit, then poll-retry Remove-Item for up to 60 s
+    // so any other sibling process that might still hold the file can also exit.
     let script = format!(
         "$pidToWait = {pid}; \
          $dst = {dst}; \
          while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
-         Remove-Item -LiteralPath $dst -Force",
+         $deadline = (Get-Date).AddSeconds(60); \
+         $done = $false; \
+         while (-not $done -and (Get-Date) -lt $deadline) {{ \
+           try {{ Remove-Item -LiteralPath $dst -Force -ErrorAction Stop; $done = $true }} \
+           catch {{ Start-Sleep -Milliseconds 500 }} \
+         }}",
         pid = std::process::id(),
         dst = ps_quote(target),
     );
@@ -798,6 +871,183 @@ fn is_current_exe(path: &Path) -> bool {
     path.canonicalize()
         .map(|target| target == current)
         .unwrap_or(false)
+}
+
+/// Returns true when the IO error is a Windows sharing-violation / access-denied
+/// that indicates the file is locked by another process (not an ACL issue).
+#[cfg(windows)]
+fn is_sharing_violation(err: &io::Error) -> bool {
+    // ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32) both surface as
+    // PermissionDenied on Windows when a file is in use by another process.
+    matches!(err.kind(), io::ErrorKind::PermissionDenied)
+}
+
+/// Query PowerShell for kimetsu processes whose executable path matches
+/// `target` (canonicalized, case-insensitive). Excludes the current PID.
+/// Best-effort: returns empty on any query failure.
+#[cfg(windows)]
+fn kimetsu_processes_locking(target: &Path) -> Vec<u32> {
+    let output = ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Get-Process -Name kimetsu -ErrorAction SilentlyContinue | Select-Object Id,Path | ConvertTo-Csv -NoTypeInformation",
+        ])
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_locking_pids(&text, target, std::process::id())
+}
+
+/// Pure parser for the CSV output of `Get-Process … | ConvertTo-Csv`.
+/// Exported for unit-testing without spawning PowerShell.
+pub fn parse_locking_pids(output: &str, target: &Path, current_pid: u32) -> Vec<u32> {
+    // Canonicalize target once; fall back to as-is on failure.
+    let target_canon = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let target_str = target_canon.to_string_lossy().to_lowercase();
+
+    let mut pids = Vec::new();
+    let mut first = true;
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip the CSV header row.
+        if first {
+            first = false;
+            if line.starts_with('"') && line.to_lowercase().contains("id") {
+                continue;
+            }
+        }
+        // Each CSV row: "Id","Path"  (ConvertTo-Csv with NoTypeInformation)
+        let parts: Vec<&str> = line.splitn(2, ',').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let id_field = parts[0].trim().trim_matches('"');
+        let path_field = parts[1].trim().trim_matches('"');
+
+        let pid: u32 = match id_field.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == current_pid {
+            continue;
+        }
+        // Compare paths case-insensitively (Windows paths are case-insensitive).
+        let row_path = Path::new(path_field)
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(path_field).to_path_buf());
+        let row_str = row_path.to_string_lossy().to_lowercase();
+        if row_str == target_str {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Schedule a poll-until-unlocked delete for a sibling-locked binary.
+/// The PowerShell script waits for ALL locking PIDs to exit, then retries
+/// `Remove-Item` every 500 ms for up to 60 s.
+#[cfg(windows)]
+fn schedule_windows_locked_delete(
+    target: &Path,
+    locking_pids: &[u32],
+) -> KimetsuResult<RemoveOutcome> {
+    let dst = ps_quote(target);
+    let pids_array = locking_pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$pids = @({pids_array}); \
+         foreach ($p in $pids) {{ \
+           while (Get-Process -Id $p -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }} \
+         }}; \
+         $deadline = (Get-Date).AddSeconds(60); \
+         $done = $false; \
+         while (-not $done -and (Get-Date) -lt $deadline) {{ \
+           try {{ Remove-Item -LiteralPath {dst} -Force -ErrorAction Stop; $done = $true }} \
+           catch {{ Start-Sleep -Milliseconds 500 }} \
+         }}",
+        pids_array = pids_array,
+        dst = dst,
+    );
+    ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .spawn()?;
+    Ok(RemoveOutcome::Scheduled)
+}
+
+/// Schedule a poll-until-unlocked replace for a sibling-locked binary.
+/// Stages the new binary first, then waits for locking PIDs to exit and
+/// retries `Move-Item` every 500 ms for up to 60 s.
+#[cfg(windows)]
+fn schedule_windows_locked_replace(
+    source: &Path,
+    target: &Path,
+    locking_pids: &[u32],
+) -> KimetsuResult<ReplaceOutcome> {
+    let staged = target.with_file_name(format!(
+        "{}.kimetsu-update-{}",
+        target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("kimetsu.exe"),
+        std::process::id()
+    ));
+    fs::copy(source, &staged)?;
+    let src = ps_quote(&staged);
+    let dst = ps_quote(target);
+    let pids_array = locking_pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$pids = @({pids_array}); \
+         foreach ($p in $pids) {{ \
+           while (Get-Process -Id $p -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }} \
+         }}; \
+         $deadline = (Get-Date).AddSeconds(60); \
+         $done = $false; \
+         while (-not $done -and (Get-Date) -lt $deadline) {{ \
+           try {{ Move-Item -LiteralPath {src} -Destination {dst} -Force -ErrorAction Stop; $done = $true }} \
+           catch {{ Start-Sleep -Milliseconds 500 }} \
+         }}",
+        pids_array = pids_array,
+        src = src,
+        dst = dst,
+    );
+    ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .spawn()?;
+    Ok(ReplaceOutcome::Scheduled)
 }
 
 #[cfg(unix)]
@@ -1093,5 +1343,104 @@ mod tests {
         assert!(Tier::WithPlugins < Tier::WithBrains);
         assert!(Tier::WithBrains >= Tier::WithPlugins);
         assert!(Tier::WithBrains >= Tier::BinaryOnly);
+    }
+
+    // --- parse_locking_pids tests ---
+    // These tests exercise the pure parser without spawning PowerShell.
+    // The CSV format mirrors `Get-Process -Name kimetsu | ConvertTo-Csv -NoTypeInformation`.
+
+    #[test]
+    fn parse_locking_pids_returns_empty_on_empty_output() {
+        let pids = parse_locking_pids("", Path::new("C:\\fake\\kimetsu.exe"), 9999);
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn parse_locking_pids_returns_empty_on_header_only() {
+        let csv = "\"Id\",\"Path\"\n";
+        let pids = parse_locking_pids(csv, Path::new("C:\\fake\\kimetsu.exe"), 9999);
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn parse_locking_pids_extracts_matching_pid() {
+        // Use a path that actually exists on this machine so canonicalize works;
+        // fall back to a temp dir path as the "target" and feed the same raw string
+        // as the row so both sides are non-canonicalized and equal.
+        let target = Path::new("C:\\Windows\\System32\\cmd.exe");
+        let csv = format!("\"Id\",\"Path\"\n\"1234\",\"{}\"\n", target.display());
+        let pids = parse_locking_pids(&csv, target, 9999);
+        // If the path exists (it should on Windows), canonicalize will succeed and
+        // paths will compare equal, giving us PID 1234.  If the host doesn't have
+        // that path, canonicalize fails on both sides and we compare raw strings;
+        // either way the assertion holds because both sides resolve identically.
+        assert_eq!(pids, vec![1234u32]);
+    }
+
+    #[test]
+    fn parse_locking_pids_excludes_current_pid() {
+        let target = Path::new("C:\\Windows\\System32\\cmd.exe");
+        let current = std::process::id();
+        let csv = format!("\"Id\",\"Path\"\n\"{current}\",\"{}\"\n", target.display());
+        let pids = parse_locking_pids(&csv, target, current);
+        assert!(pids.is_empty(), "current PID must not be listed as locking");
+    }
+
+    #[test]
+    fn parse_locking_pids_filters_different_path() {
+        let target = Path::new("C:\\fake\\kimetsu.exe");
+        // Row has a DIFFERENT path → should not be included.
+        let csv = "\"Id\",\"Path\"\n\"5678\",\"C:\\\\other\\\\kimetsu.exe\"\n";
+        let pids = parse_locking_pids(csv, target, 9999);
+        assert!(
+            pids.is_empty(),
+            "PIDs from a different path must not be returned"
+        );
+    }
+
+    #[test]
+    fn parse_locking_pids_handles_multiple_rows() {
+        // Both rows share the same path (but neither is the current PID).
+        // We use a path that won't canonicalize so both sides stay as-is.
+        let path_str = "C:\\fake\\nonexistent\\kimetsu.exe";
+        let target = Path::new(path_str);
+        let csv = format!(
+            "\"Id\",\"Path\"\n\"101\",\"{path_str}\"\n\"202\",\"{path_str}\"\n\"303\",\"C:\\\\other.exe\"\n"
+        );
+        let mut pids = parse_locking_pids(&csv, target, 9999);
+        pids.sort();
+        assert_eq!(pids, vec![101u32, 202u32]);
+    }
+
+    // --- Error/notice message content tests ---
+
+    #[test]
+    fn error_message_does_not_say_elevated_shell() {
+        // The final failure messages must guide users to stop running processes,
+        // NOT to re-run as admin (which doesn't unlock a running executable on Windows).
+        let update_fail_msg = "updated 0 Kimetsu executable(s), but 1 location(s) failed; \
+             if the binary is locked by a running kimetsu process (e.g. `kimetsu mcp serve`), \
+             quit Claude Code / Codex or run: Get-Process kimetsu | Stop-Process -Force";
+        assert!(
+            !update_fail_msg.contains("elevated shell"),
+            "update error must not mention elevated shell"
+        );
+        assert!(
+            update_fail_msg.contains("kimetsu mcp serve")
+                || update_fail_msg.contains("Stop-Process"),
+            "update error must mention how to unlock the binary"
+        );
+
+        let uninstall_fail_msg = "removed 0 Kimetsu executable(s), but 1 location(s) failed; \
+             if the binary is locked by a running kimetsu process (e.g. `kimetsu mcp serve`), \
+             quit Claude Code / Codex or run: Get-Process kimetsu | Stop-Process -Force";
+        assert!(
+            !uninstall_fail_msg.contains("elevated shell"),
+            "uninstall error must not mention elevated shell"
+        );
+        assert!(
+            uninstall_fail_msg.contains("Stop-Process"),
+            "uninstall error must mention how to stop locking processes"
+        );
     }
 }
