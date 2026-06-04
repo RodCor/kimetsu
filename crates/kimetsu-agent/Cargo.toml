@@ -22,7 +22,11 @@ default = []
 embeddings = ["kimetsu-brain/embeddings"]
 
 [dependencies]
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-runtime-api.workspace = true
 blake3.workspace = true
+http.workspace = true
 kimetsu-brain = { path = "../kimetsu-brain", version = "1.0.0" }
 kimetsu-core = { path = "../kimetsu-core", version = "1.0.0" }
 regex.workspace = true

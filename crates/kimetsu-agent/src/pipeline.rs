@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopOutcome, parse_structured_json};
 use crate::anthropic::AnthropicProvider;
+use crate::bedrock::BedrockProvider;
 use crate::claude_code::ClaudeCodeProvider;
 use crate::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
@@ -640,8 +641,14 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                     options.model_key_override.as_deref(),
                 )
                 .map(|opt| opt.map(|p| Box::new(p) as Box<dyn ModelProvider>)),
+                "bedrock" => BedrockProvider::from_config_with_key(
+                    &paths.repo_root,
+                    &config,
+                    options.model_key_override.as_deref(),
+                )
+                .map(|opt| opt.map(|p| Box::new(p) as Box<dyn ModelProvider>)),
                 other => Err(format!(
-                    "unsupported model provider for implementation: `{other}`; configure `anthropic` or `claude_code`"
+                    "unsupported model provider for implementation: `{other}`; configure `anthropic`, `claude_code`, or `bedrock`"
                 )
                 .into()),
             };
@@ -1129,7 +1136,17 @@ fn load_text_provider(
                     }),
             )
         }
-        other => Err(format!("unsupported model provider: {other}").into()),
+        "bedrock" => {
+            Ok(
+                BedrockProvider::from_config_with_key(repo_root, config, model_key_override)?
+                    .map(|provider| SelectedTextProvider {
+                        provider_name: "bedrock".to_string(),
+                        model_name: provider.model_name().to_string(),
+                        provider: Box::new(provider),
+                    }),
+            )
+        }
+        other => Err(format!("unsupported model provider: {other}; configure `anthropic`, `claude_code`, or `bedrock`").into()),
     }
 }
 

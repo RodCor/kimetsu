@@ -7,6 +7,7 @@ use std::io::{BufRead, Read};
 use std::path::Path;
 
 use kimetsu_agent::anthropic::AnthropicProvider;
+use kimetsu_agent::bedrock::BedrockProvider;
 use kimetsu_agent::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ToolChoice,
 };
@@ -239,11 +240,18 @@ pub fn distill_and_record(
 pub struct ResolvedDistiller {
     pub provider: String,
     pub model: String,
+    /// For Anthropic/OpenAI: the API key. For Bedrock: the AWS access key ID.
     pub key: String,
     pub base_url: Option<String>,
     pub timeout_secs: u64,
     pub scope: MemoryScope,
     pub record_start: std::path::PathBuf,
+    /// Bedrock only: AWS secret access key.
+    pub secret_key: Option<String>,
+    /// Bedrock only: AWS session token (optional for long-term credentials).
+    pub session_token: Option<String>,
+    /// Bedrock only: resolved AWS region.
+    pub region: Option<String>,
 }
 
 /// Resolve the distiller for `workspace`, preferring the workspace distiller
@@ -270,17 +278,44 @@ fn resolve_distiller_with(
         let d = &config.learning.distiller;
         if d.enabled
             && let Some(provider) = normalize_distiller_provider(&d.provider)
-            && let Some(key) = resolve_env_value(&paths.repo_root, &d.api_key_env)
         {
-            return Some(ResolvedDistiller {
-                provider: provider.to_string(),
-                model: d.model.clone(),
-                key,
-                base_url: resolve_env_value(&paths.repo_root, &d.base_url_env),
-                timeout_secs: config.model.request_timeout_secs,
-                scope: MemoryScope::Project,
-                record_start: paths.repo_root.clone(),
-            });
+            if provider == "bedrock" {
+                // Bedrock: needs access key, secret key, and region; no api_key_env.
+                let access_key = resolve_env_value(&paths.repo_root, "AWS_ACCESS_KEY_ID");
+                let secret_key = resolve_env_value(&paths.repo_root, "AWS_SECRET_ACCESS_KEY");
+                let session_token = resolve_env_value(&paths.repo_root, "AWS_SESSION_TOKEN");
+                let region = d.region.clone().or_else(|| {
+                    resolve_env_value(&paths.repo_root, &d.region_env)
+                        .or_else(|| resolve_env_value(&paths.repo_root, "AWS_DEFAULT_REGION"))
+                });
+                if let (Some(ak), Some(sk), Some(rg)) = (access_key, secret_key, region) {
+                    return Some(ResolvedDistiller {
+                        provider: provider.to_string(),
+                        model: d.model.clone(),
+                        key: ak,
+                        base_url: None,
+                        timeout_secs: config.model.request_timeout_secs,
+                        scope: MemoryScope::Project,
+                        record_start: paths.repo_root.clone(),
+                        secret_key: Some(sk),
+                        session_token,
+                        region: Some(rg),
+                    });
+                }
+            } else if let Some(key) = resolve_env_value(&paths.repo_root, &d.api_key_env) {
+                return Some(ResolvedDistiller {
+                    provider: provider.to_string(),
+                    model: d.model.clone(),
+                    key,
+                    base_url: resolve_env_value(&paths.repo_root, &d.base_url_env),
+                    timeout_secs: config.model.request_timeout_secs,
+                    scope: MemoryScope::Project,
+                    record_start: paths.repo_root.clone(),
+                    secret_key: None,
+                    session_token: None,
+                    region: None,
+                });
+            }
         }
     }
     // 2. Global distiller (GlobalUser scope).
@@ -291,17 +326,43 @@ fn resolve_distiller_with(
         let d = &config.learning.distiller;
         if d.enabled
             && let Some(provider) = normalize_distiller_provider(&d.provider)
-            && let Some(key) = resolve_env_value(&dir, &d.api_key_env)
         {
-            return Some(ResolvedDistiller {
-                provider: provider.to_string(),
-                model: d.model.clone(),
-                key,
-                base_url: resolve_env_value(&dir, &d.base_url_env),
-                timeout_secs: config.model.request_timeout_secs,
-                scope: MemoryScope::GlobalUser,
-                record_start: workspace.to_path_buf(),
-            });
+            if provider == "bedrock" {
+                let access_key = resolve_env_value(&dir, "AWS_ACCESS_KEY_ID");
+                let secret_key = resolve_env_value(&dir, "AWS_SECRET_ACCESS_KEY");
+                let session_token = resolve_env_value(&dir, "AWS_SESSION_TOKEN");
+                let region = d.region.clone().or_else(|| {
+                    resolve_env_value(&dir, &d.region_env)
+                        .or_else(|| resolve_env_value(&dir, "AWS_DEFAULT_REGION"))
+                });
+                if let (Some(ak), Some(sk), Some(rg)) = (access_key, secret_key, region) {
+                    return Some(ResolvedDistiller {
+                        provider: provider.to_string(),
+                        model: d.model.clone(),
+                        key: ak,
+                        base_url: None,
+                        timeout_secs: config.model.request_timeout_secs,
+                        scope: MemoryScope::GlobalUser,
+                        record_start: workspace.to_path_buf(),
+                        secret_key: Some(sk),
+                        session_token,
+                        region: Some(rg),
+                    });
+                }
+            } else if let Some(key) = resolve_env_value(&dir, &d.api_key_env) {
+                return Some(ResolvedDistiller {
+                    provider: provider.to_string(),
+                    model: d.model.clone(),
+                    key,
+                    base_url: resolve_env_value(&dir, &d.base_url_env),
+                    timeout_secs: config.model.request_timeout_secs,
+                    scope: MemoryScope::GlobalUser,
+                    record_start: workspace.to_path_buf(),
+                    secret_key: None,
+                    session_token: None,
+                    region: None,
+                });
+            }
         }
     }
     None
@@ -311,6 +372,7 @@ fn normalize_distiller_provider(provider: &str) -> Option<&'static str> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" | "claude" => Some("anthropic"),
         "openai" | "oai" | "gpt" => Some("openai"),
+        "bedrock" | "aws" => Some("bedrock"),
         _ => None,
     }
 }
@@ -362,6 +424,23 @@ pub fn run_distiller_for_transcript(workspace: &Path, transcript_path: &str) -> 
             Ok(provider) => Box::new(provider),
             Err(_) => return None,
         },
+        "bedrock" => {
+            let region = resolved.region?;
+            let secret_key = resolved.secret_key?;
+            match BedrockProvider::for_distiller(
+                &resolved.model,
+                region,
+                resolved.key,
+                secret_key,
+                resolved.session_token,
+                1024,
+                0.2,
+                resolved.timeout_secs,
+            ) {
+                Ok(provider) => Box::new(provider),
+                Err(_) => return None,
+            }
+        }
         _ => return None,
     };
     let recorded = distill_and_record(
@@ -383,6 +462,31 @@ pub fn run_distiller_for_transcript(workspace: &Path, transcript_path: &str) -> 
 mod tests {
     use super::*;
     use kimetsu_agent::model::{MockProvider, ModelResponse, StopReason, TokenUsage};
+
+    // ── A7: normalize_distiller_provider bedrock/aws aliases ─────────────
+
+    #[test]
+    fn normalize_distiller_provider_bedrock_alias() {
+        assert_eq!(normalize_distiller_provider("bedrock"), Some("bedrock"));
+        assert_eq!(normalize_distiller_provider("Bedrock"), Some("bedrock"));
+        assert_eq!(normalize_distiller_provider("BEDROCK"), Some("bedrock"));
+    }
+
+    #[test]
+    fn normalize_distiller_provider_aws_alias() {
+        assert_eq!(normalize_distiller_provider("aws"), Some("bedrock"));
+        assert_eq!(normalize_distiller_provider("AWS"), Some("bedrock"));
+    }
+
+    #[test]
+    fn normalize_distiller_provider_existing_aliases_unchanged() {
+        assert_eq!(normalize_distiller_provider("anthropic"), Some("anthropic"));
+        assert_eq!(normalize_distiller_provider("claude"), Some("anthropic"));
+        assert_eq!(normalize_distiller_provider("openai"), Some("openai"));
+        assert_eq!(normalize_distiller_provider("oai"), Some("openai"));
+        assert_eq!(normalize_distiller_provider("gpt"), Some("openai"));
+        assert_eq!(normalize_distiller_provider("unknown"), None);
+    }
 
     fn text_response(text: &str) -> ModelResponse {
         ModelResponse {

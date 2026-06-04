@@ -1,5 +1,6 @@
 pub mod agent_loop;
 pub mod anthropic;
+pub mod bedrock;
 pub mod bench;
 pub mod claude_code;
 pub mod harness;

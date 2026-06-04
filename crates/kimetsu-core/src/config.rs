@@ -139,7 +139,8 @@ impl Default for LearningSection {
 
 /// Credentialed SessionEnd distiller config. Secret values (the API key,
 /// optional base URL) live in `.env` under the env-var names below; only
-/// non-secret selection lives here. `provider` is `anthropic` or `openai`.
+/// non-secret selection lives here. `provider` is `anthropic`, `openai`, or
+/// `bedrock`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistillerSection {
     #[serde(default)]
@@ -152,6 +153,15 @@ pub struct DistillerSection {
     pub api_key_env: String,
     #[serde(default = "default_distiller_base_url_env")]
     pub base_url_env: String,
+    /// AWS Bedrock distiller: literal region. Takes precedence over
+    /// `region_env`. `#[serde(default)]` keeps existing config loading.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS Bedrock distiller: env-var name that holds the region.
+    /// Defaults to `"AWS_REGION"`. `#[serde(default)]` keeps existing
+    /// config loading cleanly.
+    #[serde(default = "default_distiller_region_env")]
+    pub region_env: String,
 }
 
 fn default_distiller_provider() -> String {
@@ -167,6 +177,10 @@ fn default_distiller_base_url_env() -> String {
     "ANTHROPIC_BASE_URL".to_string()
 }
 
+fn default_distiller_region_env() -> String {
+    "AWS_REGION".to_string()
+}
+
 impl Default for DistillerSection {
     fn default() -> Self {
         Self {
@@ -175,6 +189,8 @@ impl Default for DistillerSection {
             model: default_distiller_model(),
             api_key_env: default_distiller_api_key_env(),
             base_url_env: default_distiller_base_url_env(),
+            region: None,
+            region_env: default_distiller_region_env(),
         }
     }
 }
@@ -187,6 +203,20 @@ pub struct ModelSection {
     pub max_output_tokens: u32,
     pub temperature: f32,
     pub request_timeout_secs: u64,
+    /// AWS Bedrock: literal region (e.g. `us-east-1`). Takes precedence over
+    /// `region_env`. `#[serde(default)]` keeps existing project.toml loading.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS Bedrock: env-var name that holds the region. Defaults to
+    /// `"AWS_REGION"` via `default_region_env()`. Consulted only when
+    /// `region` is `None`. `#[serde(default)]` keeps existing project.toml
+    /// loading cleanly.
+    #[serde(default = "default_region_env")]
+    pub region_env: String,
+}
+
+fn default_region_env() -> String {
+    "AWS_REGION".to_string()
 }
 
 impl Default for ModelSection {
@@ -198,6 +228,8 @@ impl Default for ModelSection {
             max_output_tokens: 8192,
             temperature: 0.2,
             request_timeout_secs: 120,
+            region: None,
+            region_env: default_region_env(),
         }
     }
 }
