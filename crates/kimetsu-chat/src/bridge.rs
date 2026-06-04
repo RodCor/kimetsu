@@ -533,6 +533,327 @@ pub fn extensions_root(workspace: &Path) -> PathBuf {
     workspace.join(".kimetsu").join("extensions")
 }
 
+// ---------------------------------------------------------------------------
+// plugin_uninstall — surgical inverse of plugin_install
+// ---------------------------------------------------------------------------
+
+/// What `plugin_uninstall` deleted or modified during its run.
+#[derive(Debug, Clone, Default)]
+pub struct PluginUninstallReport {
+    /// Files / directories that were deleted entirely.
+    pub removed: Vec<PathBuf>,
+    /// Files whose content was edited (Kimetsu entries stripped).
+    pub modified: Vec<PathBuf>,
+}
+
+pub fn plugin_uninstall(
+    workspace: &Path,
+    target: BridgeTarget,
+    scope: InstallScope,
+) -> Result<PluginUninstallReport, String> {
+    let home = match scope {
+        InstallScope::Global => Some(resolve_home()?),
+        InstallScope::Workspace => None,
+    };
+    plugin_uninstall_inner(workspace, target, scope, home.as_deref())
+}
+
+/// `home` is `Some` for a global uninstall (the directory that stands in for
+/// `~`), `None` for a workspace uninstall. Kept separate so tests can inject
+/// a deterministic home, mirroring `plugin_install_inner`.
+fn plugin_uninstall_inner(
+    workspace: &Path,
+    target: BridgeTarget,
+    _scope: InstallScope,
+    home: Option<&Path>,
+) -> Result<PluginUninstallReport, String> {
+    let workspace = normalize_path(workspace);
+    let mut report = PluginUninstallReport::default();
+
+    match target {
+        BridgeTarget::ClaudeCode => {
+            // MCP config: home → ~/.claude.json (mcpServers only);
+            //             workspace → .mcp.json (servers + mcpServers).
+            let (mcp_path, only_mcp_servers) = match home {
+                Some(h) => (h.join(".claude.json"), true),
+                None => (workspace.join(".mcp.json"), false),
+            };
+            if uninstall_mcp_config(&mcp_path, only_mcp_servers)? {
+                report.modified.push(normalize_path(&mcp_path));
+            }
+
+            let claude_dir = match home {
+                Some(h) => h.join(".claude"),
+                None => workspace.join(".claude"),
+            };
+
+            // settings.json — strip Kimetsu hook groups.
+            let settings = claude_dir.join("settings.json");
+            if uninstall_claude_hooks(&settings)? {
+                report.modified.push(normalize_path(&settings));
+            }
+
+            // CLAUDE.md — remove the <!-- kimetsu:begin/end --> block.
+            let claude_md = claude_dir.join("CLAUDE.md");
+            if uninstall_claude_md(&claude_md)? {
+                report.modified.push(normalize_path(&claude_md));
+            }
+
+            // Delete commands/kimetsu/ directory.
+            let commands_kimetsu = claude_dir.join("commands").join("kimetsu");
+            if remove_path_if_exists(&commands_kimetsu)? {
+                report.removed.push(normalize_path(&commands_kimetsu));
+            }
+
+            // Delete agents/kimetsu-memory-harvester.md.
+            let harvester = claude_dir
+                .join("agents")
+                .join("kimetsu-memory-harvester.md");
+            if remove_path_if_exists(&harvester)? {
+                report.removed.push(normalize_path(&harvester));
+            }
+        }
+
+        BridgeTarget::Codex => {
+            let codex_dir = match home {
+                Some(h) => h.join(".codex"),
+                None => workspace.join(".codex"),
+            };
+
+            // config.toml — remove [mcp_servers.kimetsu].
+            let config = codex_dir.join("config.toml");
+            if uninstall_codex_config(&config)? {
+                report.modified.push(normalize_path(&config));
+            }
+
+            // hooks.json — strip Kimetsu hook groups (same shape as Claude's).
+            let hooks = codex_dir.join("hooks.json");
+            if uninstall_codex_hooks(&hooks)? {
+                report.modified.push(normalize_path(&hooks));
+            }
+
+            // Delete skills/kimetsu-bridge/ directory.
+            let skill_dir = codex_dir.join("skills").join("kimetsu-bridge");
+            if remove_path_if_exists(&skill_dir)? {
+                report.removed.push(normalize_path(&skill_dir));
+            }
+
+            // Delete agents/kimetsu-memory-harvester.toml.
+            let harvester = codex_dir
+                .join("agents")
+                .join("kimetsu-memory-harvester.toml");
+            if remove_path_if_exists(&harvester)? {
+                report.removed.push(normalize_path(&harvester));
+            }
+        }
+
+        BridgeTarget::Kimetsu => {
+            // Extensions are user data; uninstall is a no-op for this target.
+        }
+    }
+
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Uninstall helpers
+// ---------------------------------------------------------------------------
+
+/// Remove `path` if it exists (file or directory). Returns `true` if something
+/// was actually deleted. A missing path is not an error.
+fn remove_path_if_exists(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|err| format!("remove dir {}: {err}", path.display()))?;
+    } else {
+        fs::remove_file(path).map_err(|err| format!("remove file {}: {err}", path.display()))?;
+    }
+    Ok(true)
+}
+
+/// Strip Kimetsu hook groups from `settings.json`. Returns `true` if the file
+/// was changed and written back. Missing file → Ok(false).
+fn uninstall_claude_hooks(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let mut root: serde_json::Value = serde_json::from_str(strip_bom(&text))
+        .map_err(|err| format!("parse {}: {err}", path.display()))?;
+
+    let Some(root_obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let Some(hooks_value) = root_obj.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let Some(hooks_obj) = hooks_value.as_object_mut() else {
+        return Ok(false);
+    };
+
+    // For each event array, retain only non-Kimetsu groups.
+    let mut events_to_remove: Vec<String> = Vec::new();
+    let mut changed = false;
+    for (event, groups_value) in hooks_obj.iter_mut() {
+        let Some(groups) = groups_value.as_array_mut() else {
+            continue;
+        };
+        let before = groups.len();
+        groups.retain(|g| !is_kimetsu_hook_group(g));
+        if groups.len() != before {
+            changed = true;
+        }
+        if groups.is_empty() {
+            events_to_remove.push(event.clone());
+        }
+    }
+    for event in events_to_remove {
+        hooks_obj.remove(&event);
+    }
+
+    // If `hooks` itself became empty, remove it.
+    if hooks_obj.is_empty() {
+        root_obj.remove("hooks");
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    let out = serde_json::to_string_pretty(&root)
+        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    write_text_file(path, &out, true)?;
+    Ok(true)
+}
+
+/// Strip Kimetsu hook groups from `.codex/hooks.json`. The JSON shape used by
+/// Codex is `{ "hooks": { "<Event>": [ <group>, … ] } }` — identical to
+/// Claude's `settings.json`, so we reuse the same removal logic.
+fn uninstall_codex_hooks(path: &Path) -> Result<bool, String> {
+    // Codex hooks.json uses the same `{ "hooks": { … } }` structure as
+    // Claude's settings.json, so the same function applies.
+    uninstall_claude_hooks(path)
+}
+
+/// Remove the `"kimetsu"` key from `mcpServers` (and optionally `servers`) in
+/// the given JSON config file. Returns `true` if the file was changed.
+fn uninstall_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let mut root: serde_json::Value = serde_json::from_str(strip_bom(&text))
+        .map_err(|err| format!("parse {}: {err}", path.display()))?;
+
+    let Some(root_obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+
+    if !only_mcp_servers {
+        if let Some(servers) = root_obj.get_mut("servers").and_then(|v| v.as_object_mut()) {
+            if servers.remove("kimetsu").is_some() {
+                changed = true;
+            }
+        }
+    }
+    if let Some(mcp_servers) = root_obj
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+    {
+        if mcp_servers.remove("kimetsu").is_some() {
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    let out = serde_json::to_string_pretty(&root)
+        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    write_text_file(path, &out, true)?;
+    Ok(true)
+}
+
+/// Remove the `<!-- kimetsu:begin --> … <!-- kimetsu:end -->` block from
+/// `CLAUDE.md`. Returns `true` if the file was changed.
+fn uninstall_claude_md(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let text = strip_bom(&raw);
+
+    let (begin_pos, end_pos) = match (text.find(CLAUDE_MD_BEGIN), text.find(CLAUDE_MD_END)) {
+        (Some(b), Some(e)) if e >= b => (b, e),
+        _ => return Ok(false), // block absent or malformed — nothing to remove
+    };
+
+    let end_of_block = end_pos + CLAUDE_MD_END.len();
+    // Consume one trailing newline if present (the block is written with one).
+    let after_start = if text[end_of_block..].starts_with('\n') {
+        end_of_block + 1
+    } else {
+        end_of_block
+    };
+
+    let before = &text[..begin_pos];
+    let after = &text[after_start..];
+
+    // Trim the trailing separator blank line that merge_claude_md left before
+    // the block (the "\n\n" before CLAUDE_MD_BEGIN), so we don't leave a
+    // doubled blank line where the block used to be.
+    let before_trimmed = before.trim_end_matches('\n');
+    let merged = if before_trimmed.is_empty() {
+        // The Kimetsu block was the entire file (or at the very start).
+        after.to_string()
+    } else if after.is_empty() || after.trim().is_empty() {
+        // Nothing after the block — just the user's content.
+        format!("{before_trimmed}\n")
+    } else {
+        // User content before and after — rejoin with a single blank line.
+        format!("{before_trimmed}\n\n{after}")
+    };
+
+    write_text_file(path, &merged, true)?;
+    Ok(true)
+}
+
+/// Remove the `[mcp_servers.kimetsu]` entry from `.codex/config.toml`.
+/// Returns `true` if the file was changed.
+fn uninstall_codex_config(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let mut root: toml::Value = toml::from_str(strip_bom(&text))
+        .map_err(|err| format!("parse {}: {err}", path.display()))?;
+
+    let Some(root_table) = root.as_table_mut() else {
+        return Ok(false);
+    };
+    let Some(servers_value) = root_table.get_mut("mcp_servers") else {
+        return Ok(false);
+    };
+    let Some(servers) = servers_value.as_table_mut() else {
+        return Ok(false);
+    };
+
+    if servers.remove("kimetsu").is_none() {
+        return Ok(false);
+    }
+
+    let out = toml::to_string_pretty(&root)
+        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    write_text_file(path, &out, true)?;
+    Ok(true)
+}
+
 /// True when a hook matcher-group is one Kimetsu installed (any inner
 /// command invokes `kimetsu brain …`).
 fn is_kimetsu_hook_group(group: &serde_json::Value) -> bool {
@@ -2519,5 +2840,454 @@ mod tests {
         assert_eq!(mv["mcpServers"].as_object().unwrap().len(), 2);
 
         fs::remove_dir_all(ws).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // U1 — plugin_uninstall tests (TDD golden tests)
+    // -------------------------------------------------------------------------
+
+    /// Round-trip: install then uninstall leaves user content untouched and
+    /// removes every Kimetsu artefact (Claude Code, workspace scope).
+    #[test]
+    fn u1_roundtrip_claude_workspace() {
+        let ws = temp_root("u1_roundtrip_cc_ws");
+        let claude_dir = ws.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // Pre-seed user content in every file that install merges into.
+        fs::write(
+            claude_dir.join("CLAUDE.md"),
+            "# My workspace rules\nAlways write tests.\n",
+        )
+        .unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "myPref": true,
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Bash", "hooks": [{ "type": "command", "command": "user-pretool" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            ws.join(".mcp.json"),
+            serde_json::to_string_pretty(&json!({
+                "servers": { "my-server": { "command": "my-cmd" } },
+                "mcpServers": { "my-server": { "command": "my-cmd" } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Install.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Verify install left its artefacts.
+        assert!(claude_dir.join("commands/kimetsu/bridge.md").is_file());
+        assert!(
+            claude_dir
+                .join("agents/kimetsu-memory-harvester.md")
+                .is_file()
+        );
+
+        // Uninstall.
+        let report =
+            plugin_uninstall_inner(&ws, BridgeTarget::ClaudeCode, InstallScope::Workspace, None)
+                .unwrap();
+
+        // Kimetsu artefact files are gone.
+        assert!(
+            !claude_dir.join("commands/kimetsu").exists(),
+            "commands/kimetsu dir must be removed"
+        );
+        assert!(
+            !claude_dir
+                .join("agents/kimetsu-memory-harvester.md")
+                .exists(),
+            "harvester agent must be removed"
+        );
+        assert!(
+            report
+                .removed
+                .iter()
+                .any(|p| p.ends_with("kimetsu") || p.to_string_lossy().contains("kimetsu")),
+            "report.removed must mention kimetsu"
+        );
+
+        // User CLAUDE.md content survived; Kimetsu block is gone.
+        let md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(md.contains("# My workspace rules"), "user CLAUDE.md kept");
+        assert!(md.contains("Always write tests."), "user detail kept");
+        assert!(
+            !md.contains(CLAUDE_MD_BEGIN),
+            "kimetsu begin marker must be removed"
+        );
+        assert!(
+            !md.contains(CLAUDE_MD_END),
+            "kimetsu end marker must be removed"
+        );
+
+        // User hook survived; Kimetsu hooks are gone.
+        let sv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        let pre = sv["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-pretool"),
+            "user PreToolUse hook must survive"
+        );
+        assert!(
+            !pre.iter().any(is_kimetsu_hook_group),
+            "no Kimetsu hook groups must remain"
+        );
+        assert_eq!(sv["myPref"], true, "top-level pref must survive");
+        // Kimetsu-only events should be gone.
+        assert!(
+            sv["hooks"].get("Stop").is_none() || {
+                sv["hooks"]["Stop"]
+                    .as_array()
+                    .map(|a| a.iter().all(|g| !is_kimetsu_hook_group(g)))
+                    .unwrap_or(true)
+            },
+            "no Kimetsu Stop hook groups must remain"
+        );
+
+        // User MCP server survived; Kimetsu key removed.
+        let mv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(ws.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(
+            mv["servers"]["my-server"]["command"], "my-cmd",
+            "user server kept"
+        );
+        assert!(
+            mv["servers"].get("kimetsu").is_none(),
+            "kimetsu servers entry removed"
+        );
+        assert_eq!(mv["mcpServers"]["my-server"]["command"], "my-cmd");
+        assert!(
+            mv["mcpServers"].get("kimetsu").is_none(),
+            "kimetsu mcpServers entry removed"
+        );
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    /// Idempotent on a clean host: uninstall on a workspace with no Kimetsu
+    /// wiring must succeed and remove nothing.
+    #[test]
+    fn u1_idempotent_on_clean_host() {
+        let ws = temp_root("u1_clean_host");
+        // No files at all — completely empty workspace.
+        let report =
+            plugin_uninstall_inner(&ws, BridgeTarget::ClaudeCode, InstallScope::Workspace, None)
+                .unwrap();
+        assert!(
+            report.removed.is_empty(),
+            "nothing removed on a clean host (Claude)"
+        );
+        assert!(
+            report.modified.is_empty(),
+            "nothing modified on a clean host (Claude)"
+        );
+
+        let report2 =
+            plugin_uninstall_inner(&ws, BridgeTarget::Codex, InstallScope::Workspace, None)
+                .unwrap();
+        assert!(
+            report2.removed.is_empty(),
+            "nothing removed on a clean host (Codex)"
+        );
+        assert!(
+            report2.modified.is_empty(),
+            "nothing modified on a clean host (Codex)"
+        );
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    /// Codex round-trip: install then uninstall leaves user codex content intact
+    /// and removes Kimetsu's config.toml entry, hooks.json groups, skill dir, and
+    /// agent file.
+    #[test]
+    fn u1_roundtrip_codex_workspace() {
+        let ws = temp_root("u1_roundtrip_codex_ws");
+        let codex_dir = ws.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+
+        // Pre-seed a user hook on the UserPromptSubmit event.
+        fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-codex-hook" }] }
+                    ],
+                    "SubagentStop": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-subagent-hook" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Pre-seed a user MCP server in config.toml.
+        fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.my-server]\ncommand = \"my-server-cmd\"\nargs = []\n",
+        )
+        .unwrap();
+
+        // Install.
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Verify install wrote its artefacts.
+        assert!(codex_dir.join("skills/kimetsu-bridge/SKILL.md").is_file());
+        assert!(
+            codex_dir
+                .join("agents/kimetsu-memory-harvester.toml")
+                .is_file()
+        );
+
+        // Uninstall.
+        let report =
+            plugin_uninstall_inner(&ws, BridgeTarget::Codex, InstallScope::Workspace, None)
+                .unwrap();
+
+        // Kimetsu artefacts gone.
+        assert!(
+            !codex_dir.join("skills/kimetsu-bridge").exists(),
+            "kimetsu-bridge skill dir must be removed"
+        );
+        assert!(
+            !codex_dir
+                .join("agents/kimetsu-memory-harvester.toml")
+                .exists(),
+            "harvester toml must be removed"
+        );
+        assert!(
+            !report.removed.is_empty(),
+            "report.removed must be non-empty"
+        );
+
+        // config.toml: user server survives, kimetsu entry gone.
+        let config_text = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        let config_val: toml::Value = toml::from_str(&config_text).unwrap();
+        assert!(
+            config_val["mcp_servers"].get("my-server").is_some(),
+            "user mcp server must survive in config.toml"
+        );
+        assert!(
+            config_val["mcp_servers"].get("kimetsu").is_none(),
+            "kimetsu mcp server must be removed from config.toml"
+        );
+
+        // hooks.json: user hooks survive, Kimetsu groups gone.
+        let hooks_val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .unwrap();
+        let ups = hooks_val["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert!(
+            ups.iter()
+                .any(|g| g["hooks"][0]["command"] == "user-codex-hook"),
+            "user UserPromptSubmit hook must survive"
+        );
+        assert!(
+            !ups.iter().any(is_kimetsu_hook_group),
+            "no Kimetsu UserPromptSubmit groups must remain"
+        );
+        // SubagentStop (user-only event) must survive untouched.
+        assert_eq!(
+            hooks_val["hooks"]["SubagentStop"][0]["hooks"][0]["command"],
+            "user-subagent-hook"
+        );
+        // Kimetsu-only Stop event should have no Kimetsu groups.
+        if let Some(stop) = hooks_val["hooks"].get("Stop").and_then(|v| v.as_array()) {
+            assert!(
+                !stop.iter().any(is_kimetsu_hook_group),
+                "no Kimetsu Stop groups must remain"
+            );
+        }
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    /// Preserves a user hook on the SAME event Kimetsu uses (UserPromptSubmit).
+    /// Install adds Kimetsu's group alongside the user's; uninstall removes
+    /// Kimetsu's leaving exactly the user's group.
+    #[test]
+    fn u1_preserves_user_hook_on_shared_event() {
+        let ws = temp_root("u1_shared_event");
+        let claude_dir = ws.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // Seed a user UserPromptSubmit hook.
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "user-ups-hook" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Install (adds Kimetsu's UserPromptSubmit group alongside).
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            false, // proactive=false: skip PreToolUse/PostToolUse
+            None,
+        )
+        .unwrap();
+
+        // Verify both groups exist after install.
+        let sv: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        let ups = sv["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(
+            ups.len(),
+            2,
+            "both user and kimetsu groups present after install"
+        );
+
+        // Uninstall.
+        plugin_uninstall_inner(&ws, BridgeTarget::ClaudeCode, InstallScope::Workspace, None)
+            .unwrap();
+
+        // Exactly one UserPromptSubmit group remains: the user's.
+        let sv2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        let ups2 = sv2["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(
+            ups2.len(),
+            1,
+            "exactly one UserPromptSubmit group survives uninstall"
+        );
+        assert_eq!(
+            ups2[0]["hooks"][0]["command"], "user-ups-hook",
+            "the surviving group is the user's"
+        );
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    /// Global scope round-trip (Claude Code): install into injected home, uninstall
+    /// from the same home — workspace must remain untouched throughout.
+    #[test]
+    fn u1_roundtrip_claude_global() {
+        let ws = temp_root("u1_roundtrip_cc_global_ws");
+        let home = temp_root("u1_roundtrip_cc_global_home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // Pre-seed user content in global home.
+        fs::write(
+            claude_dir.join("CLAUDE.md"),
+            "# Global rules\nUse conventional commits.\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": { "user-global": { "command": "user-global-cmd" } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Install (global).
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Global,
+            PluginMode::Optional,
+            false,
+            false,
+            Some(home.as_path()),
+        )
+        .unwrap();
+
+        assert!(home.join(".claude.json").is_file());
+        assert!(claude_dir.join("commands/kimetsu/bridge.md").is_file());
+
+        // Uninstall (global).
+        plugin_uninstall_inner(
+            &ws,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Global,
+            Some(home.as_path()),
+        )
+        .unwrap();
+
+        // Workspace untouched.
+        assert!(!ws.join(".claude").exists(), "workspace .claude untouched");
+        assert!(
+            !ws.join(".mcp.json").exists(),
+            "workspace .mcp.json untouched"
+        );
+
+        // Kimetsu artefacts in home are gone.
+        assert!(
+            !claude_dir.join("commands/kimetsu").exists(),
+            "commands/kimetsu removed from home"
+        );
+        assert!(
+            !claude_dir
+                .join("agents/kimetsu-memory-harvester.md")
+                .exists(),
+            "harvester removed from home"
+        );
+
+        // User CLAUDE.md content survived; block gone.
+        let md = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(md.contains("# Global rules"), "user global CLAUDE.md kept");
+        assert!(!md.contains(CLAUDE_MD_BEGIN), "kimetsu block removed");
+
+        // User MCP server in ~/.claude.json survived; kimetsu key gone.
+        let cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            cj["mcpServers"]["user-global"]["command"],
+            "user-global-cmd"
+        );
+        assert!(
+            cj["mcpServers"].get("kimetsu").is_none(),
+            "kimetsu mcpServers entry removed"
+        );
+
+        fs::remove_dir_all(ws).ok();
+        fs::remove_dir_all(home).ok();
     }
 }

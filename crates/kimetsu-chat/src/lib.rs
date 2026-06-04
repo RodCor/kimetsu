@@ -31,8 +31,9 @@ pub mod skills;
 pub mod ui;
 
 pub use bridge::{
-    BridgeTarget, InstallScope, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan,
-    bridge_sync, plugin_install,
+    BridgeTarget, InstallScope, PluginInstallReport, PluginMode, PluginUninstallReport,
+    bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync, plugin_install,
+    plugin_uninstall,
 };
 pub use commands::SlashCommand;
 pub use cost::CostMeter;
