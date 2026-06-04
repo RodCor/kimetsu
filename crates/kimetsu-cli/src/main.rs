@@ -375,6 +375,28 @@ struct InitArgs {
 enum ConfigCommand {
     Show,
     Edit,
+    /// Read one field from the EFFECTIVE config (serde defaults included).
+    ///
+    /// Key is a dotted path: `embedder.enabled`, `broker.ambient`, etc.
+    /// Prints the bare value for scalars; pretty-prints tables/arrays.
+    Get {
+        /// Dotted key path (e.g. `embedder.enabled`, `broker.ambient`).
+        key: String,
+    },
+    /// Set one field in the on-disk project.toml.
+    ///
+    /// The value is type-inferred: if the existing key holds a bool, integer,
+    /// or float the input is coerced to that type; otherwise `"true"`/`"false"`
+    /// → bool, all-digit strings → integer, parseable floats → float, else string.
+    ///
+    /// NOTE: `set` re-serialises the entire file, so TOML comments are NOT
+    /// preserved. Use `config edit` to hand-edit with comments.
+    Set {
+        /// Dotted key path (e.g. `embedder.enabled`, `broker.ambient`).
+        key: String,
+        /// New value (type-inferred from the existing field or the literal).
+        value: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1643,6 +1665,101 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
                 }
             })
         }
+        ConfigCommand::Get { key } => {
+            let cwd = env::current_dir()?;
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&cwd)?;
+            // Use the EFFECTIVE config (serde defaults filled in) so fields
+            // like `embedder.enabled` show even when absent from the file.
+            let cfg = project::load_config(&paths)?;
+            let root: toml::Value = toml::Value::try_from(&cfg)
+                .map_err(|e| format!("config get: failed to serialise config: {e}"))?;
+            match get_toml_path(&root, &key) {
+                Some(toml::Value::Table(t)) => {
+                    // Pretty-print tables so the output is readable.
+                    println!(
+                        "{}",
+                        toml::to_string(t)
+                            .map_err(|e| format!("config get: serialise table: {e}"))?
+                            .trim_end()
+                    );
+                }
+                Some(toml::Value::Array(arr)) => {
+                    println!(
+                        "{}",
+                        toml::to_string_pretty(&toml::Value::Array(arr.clone()))
+                            .map_err(|e| format!("config get: serialise array: {e}"))?
+                            .trim_end()
+                    );
+                }
+                Some(leaf) => {
+                    // Bare scalar: strip surrounding quotes for strings.
+                    let rendered = toml::to_string_pretty(&toml::Value::Table({
+                        let mut m = toml::map::Map::new();
+                        m.insert("v".to_string(), leaf.clone());
+                        m
+                    }))
+                    .map_err(|e| format!("config get: serialise scalar: {e}"))?;
+                    // `toml::to_string_pretty` of `{v = <leaf>}` yields "v = <repr>\n".
+                    // Strip the "v = " prefix and trailing newline.
+                    let bare = rendered
+                        .trim_end()
+                        .strip_prefix("v = ")
+                        .unwrap_or(rendered.trim_end());
+                    println!("{bare}");
+                }
+                None => {
+                    // Provide a helpful error listing the closest valid sub-keys.
+                    let hint = closest_keys_hint(&root, &key);
+                    return Err(format!("config get: key `{key}` not found.{hint}").into());
+                }
+            }
+            Ok(())
+        }
+        ConfigCommand::Set { key, value } => {
+            eprintln!(
+                "note: `config set` re-serialises the file — TOML comments are not preserved. \
+                 Use `config edit` to hand-edit with comments."
+            );
+            let cwd = env::current_dir()?;
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&cwd)?;
+
+            // 1. Read the on-disk file into a toml::Value so we preserve all
+            //    existing keys and detect the existing type for coercion.
+            let disk_text = std::fs::read_to_string(&paths.project_toml).map_err(|e| {
+                format!(
+                    "config set: could not read {}: {e}",
+                    paths.project_toml.display()
+                )
+            })?;
+            let mut root: toml::Value = toml::from_str(&disk_text)
+                .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
+
+            // 2. Determine the existing type at this key (for coercion).
+            let existing = get_toml_path(&root, &key).cloned();
+            let typed_value =
+                parse_scalar(&value, existing.as_ref()).map_err(|e| format!("config set: {e}"))?;
+
+            // 3. Navigate/create the path and set the leaf.
+            set_toml_path(&mut root, &key, typed_value).map_err(|e| format!("config set: {e}"))?;
+
+            // 4. Serialise back to text and validate through ProjectConfig.
+            let new_text = toml::to_string_pretty(&root)
+                .map_err(|e| format!("config set: failed to serialise: {e}"))?;
+            project::load_config_from_text(&new_text).map_err(|e| {
+                format!("config set: result is not a valid config — {e}. File NOT written.")
+            })?;
+
+            // 5. Write — only reached when validation passes.
+            std::fs::write(&paths.project_toml, &new_text).map_err(|e| {
+                format!(
+                    "config set: failed to write {}: {e}",
+                    paths.project_toml.display()
+                )
+            })?;
+
+            println!("set {key} = {value}");
+            Ok(())
+        }
     }
 }
 
@@ -1667,6 +1784,142 @@ fn config_edit_with(
 
     println!("config saved: {}", toml_path.display());
     Ok(())
+}
+
+// ── config get/set pure helpers ──────────────────────────────────────────────
+
+/// Navigate a dotted key path (`a.b.c`) through `root` and return a reference
+/// to the leaf value, or `None` if any segment is missing.
+fn get_toml_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    let mut current = root;
+    for segment in key.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Navigate/create a dotted key path (`a.b.c`) in `root` (a `toml::Value::Table`)
+/// and set the leaf to `value`. Intermediate segments are created as empty tables
+/// when absent. Returns `Err` if an intermediate segment exists but is not a table.
+fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<(), String> {
+    let segments: Vec<&str> = key.split('.').collect();
+    let (leaf_key, parents) = segments
+        .split_last()
+        .ok_or_else(|| "key must not be empty".to_string())?;
+
+    let mut current = root;
+    for seg in parents {
+        // Ensure the current node is a table.
+        if !current.is_table() {
+            return Err(format!(
+                "cannot set `{key}`: `{seg}` is `{}`, not a table",
+                current.type_str()
+            ));
+        }
+        // Navigate into the segment, creating an empty table if absent.
+        if current.get(seg).is_none() {
+            current
+                .as_table_mut()
+                .unwrap()
+                .insert(seg.to_string(), toml::Value::Table(toml::map::Map::new()));
+        }
+        current = current.get_mut(seg).unwrap();
+    }
+    if !current.is_table() {
+        return Err(format!(
+            "cannot set `{key}`: parent is `{}`, not a table",
+            current.type_str()
+        ));
+    }
+    current
+        .as_table_mut()
+        .unwrap()
+        .insert(leaf_key.to_string(), value);
+    Ok(())
+}
+
+/// Parse `input` into a typed `toml::Value`.
+///
+/// Type-resolution order:
+/// 1. If `existing` is `Some`, coerce to its type (bool, integer, float, string).
+///    Returns `Err` if coercion to integer or float fails so callers can surface a clear message.
+/// 2. Otherwise infer from the literal:
+///    - `"true"` / `"false"` → `Bool`
+///    - All-digit string (optionally leading `-`) → `Integer`
+///    - Parseable as `f64` → `Float`
+///    - Anything else → `String`
+fn parse_scalar(input: &str, existing: Option<&toml::Value>) -> Result<toml::Value, String> {
+    match existing {
+        Some(toml::Value::Boolean(_)) => {
+            Ok(toml::Value::Boolean(input.eq_ignore_ascii_case("true")))
+        }
+        Some(toml::Value::Integer(_)) => {
+            input.parse::<i64>().map(toml::Value::Integer).map_err(|_| {
+                format!("cannot coerce `{input}` to integer (existing field is an integer)")
+            })
+        }
+        Some(toml::Value::Float(_)) => input
+            .parse::<f64>()
+            .map(toml::Value::Float)
+            .map_err(|_| format!("cannot coerce `{input}` to float (existing field is a float)")),
+        Some(toml::Value::String(_)) => Ok(toml::Value::String(input.to_string())),
+        // Array / table / datetime: fall through to literal inference.
+        _ => Ok(infer_scalar(input)),
+    }
+}
+
+/// Infer a `toml::Value` type from a bare string literal.
+fn infer_scalar(input: &str) -> toml::Value {
+    if input.eq_ignore_ascii_case("true") {
+        return toml::Value::Boolean(true);
+    }
+    if input.eq_ignore_ascii_case("false") {
+        return toml::Value::Boolean(false);
+    }
+    // Integer: optional leading `-`, then all digits.
+    let digit_part = input.strip_prefix('-').unwrap_or(input);
+    if !digit_part.is_empty() && digit_part.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = input.parse::<i64>() {
+            return toml::Value::Integer(n);
+        }
+    }
+    if let Ok(f) = input.parse::<f64>() {
+        // Distinguish "1.0" (float) from "1" (already caught as integer above).
+        if input.contains('.') || input.contains('e') || input.contains('E') {
+            return toml::Value::Float(f);
+        }
+    }
+    toml::Value::String(input.to_string())
+}
+
+/// Build a human-readable hint listing the closest valid keys when `get` fails.
+fn closest_keys_hint(root: &toml::Value, key: &str) -> String {
+    // Walk as far as we can, then show the available keys at the stuck level.
+    let segments: Vec<&str> = key.split('.').collect();
+    let mut current = root;
+    let mut walked = Vec::new();
+    for seg in &segments {
+        match current.get(seg) {
+            Some(next) => {
+                walked.push(*seg);
+                current = next;
+            }
+            None => {
+                // Show available keys at this level.
+                if let Some(table) = current.as_table() {
+                    let keys: Vec<&str> = table.keys().map(|k| k.as_str()).collect();
+                    let prefix = if walked.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Under `{}`:", walked.join("."))
+                    };
+                    return format!("{prefix} available keys: [{}]", keys.join(", "));
+                }
+                return String::new();
+            }
+        }
+    }
+    String::new()
 }
 
 fn brain(command: BrainCommand) -> KimetsuResult<()> {
@@ -4101,6 +4354,313 @@ mod tests {
                 .expect("show_run")
                 .expect("run exists");
             assert_eq!(run.terminal_kind.as_deref(), Some("run.aborted"));
+
+            fs::remove_dir_all(root).ok();
+        });
+    }
+
+    // ── Q4: config get/set pure helpers ──────────────────────────────────────
+
+    // ── parse_scalar ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_scalar_true_infers_bool() {
+        assert_eq!(
+            parse_scalar("true", None).unwrap(),
+            toml::Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parse_scalar_false_infers_bool() {
+        assert_eq!(
+            parse_scalar("false", None).unwrap(),
+            toml::Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn parse_scalar_integer_infers_integer() {
+        assert_eq!(parse_scalar("42", None).unwrap(), toml::Value::Integer(42));
+    }
+
+    #[test]
+    fn parse_scalar_negative_integer() {
+        assert_eq!(parse_scalar("-7", None).unwrap(), toml::Value::Integer(-7));
+    }
+
+    #[test]
+    fn parse_scalar_float_infers_float() {
+        match parse_scalar("1.5", None).unwrap() {
+            toml::Value::Float(f) => assert!((f - 1.5).abs() < 1e-9),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scalar_plain_string() {
+        assert_eq!(
+            parse_scalar("hello", None).unwrap(),
+            toml::Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_scalar_coerces_to_existing_bool() {
+        let existing = toml::Value::Boolean(false);
+        assert_eq!(
+            parse_scalar("true", Some(&existing)).unwrap(),
+            toml::Value::Boolean(true)
+        );
+        assert_eq!(
+            parse_scalar("false", Some(&existing)).unwrap(),
+            toml::Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn parse_scalar_coerces_to_existing_integer() {
+        let existing = toml::Value::Integer(0);
+        assert_eq!(
+            parse_scalar("7", Some(&existing)).unwrap(),
+            toml::Value::Integer(7)
+        );
+    }
+
+    #[test]
+    fn parse_scalar_string_when_existing_is_string() {
+        let existing = toml::Value::String("old".to_string());
+        // Input looks like an integer, but existing type is String → preserve String.
+        assert_eq!(
+            parse_scalar("99", Some(&existing)).unwrap(),
+            toml::Value::String("99".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_scalar_coerce_to_integer_fails_on_non_numeric() {
+        let existing = toml::Value::Integer(0);
+        let result = parse_scalar("notanumber", Some(&existing));
+        assert!(
+            result.is_err(),
+            "should error when coercing non-numeric string to integer"
+        );
+    }
+
+    // ── get_toml_path ────────────────────────────────────────────────────────
+
+    fn sample_root() -> toml::Value {
+        let toml_src = r#"
+[embedder]
+model = "bge-small-en-v1.5"
+enabled = true
+
+[broker]
+default_budget_tokens = 6000
+ambient = false
+"#;
+        toml::from_str(toml_src).expect("parse sample toml")
+    }
+
+    #[test]
+    fn get_toml_path_nested_bool() {
+        let root = sample_root();
+        let v = get_toml_path(&root, "embedder.enabled");
+        assert_eq!(v, Some(&toml::Value::Boolean(true)));
+    }
+
+    #[test]
+    fn get_toml_path_nested_string() {
+        let root = sample_root();
+        let v = get_toml_path(&root, "embedder.model");
+        assert_eq!(
+            v,
+            Some(&toml::Value::String("bge-small-en-v1.5".to_string()))
+        );
+    }
+
+    #[test]
+    fn get_toml_path_returns_table() {
+        let root = sample_root();
+        let v = get_toml_path(&root, "broker");
+        assert!(
+            matches!(v, Some(toml::Value::Table(_))),
+            "expected Table, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn get_toml_path_missing_returns_none() {
+        let root = sample_root();
+        assert_eq!(get_toml_path(&root, "embedder.nonexistent"), None);
+        assert_eq!(get_toml_path(&root, "totally.missing.path"), None);
+    }
+
+    // ── set_toml_path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_toml_path_replaces_existing_bool() {
+        let mut root = sample_root();
+        set_toml_path(&mut root, "embedder.enabled", toml::Value::Boolean(false)).expect("set");
+        assert_eq!(
+            get_toml_path(&root, "embedder.enabled"),
+            Some(&toml::Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn set_toml_path_creates_intermediate_tables() {
+        let mut root: toml::Value = toml::Value::Table(toml::map::Map::new());
+        set_toml_path(&mut root, "a.b.c", toml::Value::Integer(99)).expect("set");
+        assert_eq!(
+            get_toml_path(&root, "a.b.c"),
+            Some(&toml::Value::Integer(99))
+        );
+    }
+
+    #[test]
+    fn set_toml_path_replaces_existing_integer() {
+        let mut root = sample_root();
+        set_toml_path(
+            &mut root,
+            "broker.default_budget_tokens",
+            toml::Value::Integer(9000),
+        )
+        .expect("set");
+        assert_eq!(
+            get_toml_path(&root, "broker.default_budget_tokens"),
+            Some(&toml::Value::Integer(9000))
+        );
+    }
+
+    // ── round-trip validation ─────────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_set_embedder_enabled_false() {
+        use kimetsu_core::config::ProjectConfig;
+        let cfg = ProjectConfig::default_for_project("test-q4");
+        let mut root: toml::Value = toml::Value::try_from(&cfg).expect("serialize cfg");
+        set_toml_path(&mut root, "embedder.enabled", toml::Value::Boolean(false))
+            .expect("set path");
+        let text = toml::to_string_pretty(&root).expect("serialise");
+        let reloaded = ProjectConfig::from_toml(&text).expect("reload");
+        assert!(
+            !reloaded.embedder.enabled,
+            "embedder.enabled should be false after round-trip"
+        );
+    }
+
+    #[test]
+    fn roundtrip_invalid_type_rejected_by_validation() {
+        use kimetsu_core::config::ProjectConfig;
+        let cfg = ProjectConfig::default_for_project("test-q4-invalid");
+        let mut root: toml::Value = toml::Value::try_from(&cfg).expect("serialize cfg");
+        // schema_version is an integer; set it to a string → ProjectConfig::from_toml must Err.
+        set_toml_path(
+            &mut root,
+            "kimetsu.schema_version",
+            toml::Value::String("notanumber".to_string()),
+        )
+        .expect("set path");
+        let text = toml::to_string_pretty(&root).expect("serialise");
+        let result = ProjectConfig::from_toml(&text);
+        assert!(
+            result.is_err(),
+            "from_toml should reject a non-integer schema_version"
+        );
+    }
+
+    // ── CLI smoke: config set/get --help parses without panic ────────────────
+
+    #[test]
+    fn cli_smoke_config_set_help() {
+        // Clap exits with code 0 for --help; we just test that parsing succeeds.
+        let result = Cli::try_parse_from(["kimetsu", "config", "set", "--help"]);
+        // --help triggers an early-exit error in clap (kind == DisplayHelp); that's fine.
+        match result {
+            Ok(_) => {}
+            Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {}
+            Err(e) => panic!("unexpected clap error for `config set --help`: {e}"),
+        }
+    }
+
+    #[test]
+    fn cli_smoke_config_get_help() {
+        let result = Cli::try_parse_from(["kimetsu", "config", "get", "--help"]);
+        match result {
+            Ok(_) => {}
+            Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {}
+            Err(e) => panic!("unexpected clap error for `config get --help`: {e}"),
+        }
+    }
+
+    #[test]
+    fn cli_smoke_config_set_parses_key_value() {
+        let result = Cli::try_parse_from(["kimetsu", "config", "set", "embedder.enabled", "false"]);
+        match result {
+            Ok(Cli {
+                command:
+                    Command::Config {
+                        command: ConfigCommand::Set { key, value },
+                    },
+            }) => {
+                assert_eq!(key, "embedder.enabled");
+                assert_eq!(value, "false");
+            }
+            Ok(other) => panic!("unexpected parse result: {other:?}"),
+            Err(e) => panic!("parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn cli_smoke_config_get_parses_key() {
+        let result = Cli::try_parse_from(["kimetsu", "config", "get", "broker.ambient"]);
+        match result {
+            Ok(Cli {
+                command:
+                    Command::Config {
+                        command: ConfigCommand::Get { key },
+                    },
+            }) => {
+                assert_eq!(key, "broker.ambient");
+            }
+            Ok(other) => panic!("unexpected parse result: {other:?}"),
+            Err(e) => panic!("parse failed: {e}"),
+        }
+    }
+
+    // ── integration: set then get via project files ───────────────────────────
+
+    #[test]
+    fn config_set_and_get_integration() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = test_project_root("config-set-get");
+            fs::create_dir_all(&root).expect("mkdir");
+            project::init_project(&root, false).expect("init");
+
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+
+            // --- set embedder.enabled = false ---
+            let disk_text = std::fs::read_to_string(&paths.project_toml).expect("read toml");
+            let mut root_val: toml::Value = toml::from_str(&disk_text).expect("parse");
+            let existing = get_toml_path(&root_val, "embedder.enabled").cloned();
+            let typed = parse_scalar("false", existing.as_ref()).expect("parse false as bool");
+            set_toml_path(&mut root_val, "embedder.enabled", typed).expect("set");
+            let new_text = toml::to_string_pretty(&root_val).expect("serialise");
+            project::load_config_from_text(&new_text).expect("validate");
+            std::fs::write(&paths.project_toml, &new_text).expect("write");
+
+            // --- verify via load_config ---
+            let cfg = project::load_config(&paths).expect("load");
+            assert!(
+                !cfg.embedder.enabled,
+                "embedder.enabled should be false after set"
+            );
+
+            // --- get_toml_path on effective config ---
+            let root_eff: toml::Value = toml::Value::try_from(&cfg).expect("try_from");
+            let leaf = get_toml_path(&root_eff, "embedder.enabled");
+            assert_eq!(leaf, Some(&toml::Value::Boolean(false)));
 
             fs::remove_dir_all(root).ok();
         });
