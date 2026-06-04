@@ -306,6 +306,35 @@ fn env_disables_embedder() -> bool {
     }
 }
 
+/// W3.1: config-aware enabled check. Resolution precedence:
+///   1. `KIMETSU_BRAIN_EMBEDDER` env is set to a disable value → false.
+///   2. `KIMETSU_BRAIN_EMBEDDER` env is set to a real model id → true
+///      (explicit model override = caller wants embeddings on).
+///   3. Env is unset → `config_enabled` governs.
+///
+/// Keep the env-only `env_disables_embedder()` working for back-compat
+/// callers (the `OnceLock` path).
+pub fn embedder_enabled_for_config(config_enabled: bool) -> bool {
+    // Precedence: env override > config > default.
+    match std::env::var("KIMETSU_BRAIN_EMBEDDER") {
+        Ok(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                // Empty string — treat as unset, fall through to config.
+                config_enabled
+            } else if is_disable_value(&v) {
+                // Explicit disable in env wins.
+                false
+            } else {
+                // A real model id in env = caller wants embeddings on.
+                true
+            }
+        }
+        // Env unset → config governs.
+        Err(_) => config_enabled,
+    }
+}
+
 fn is_disable_value(v: &str) -> bool {
     matches!(v, "noop" | "off" | "none" | "0" | "false" | "no")
 }
@@ -837,6 +866,84 @@ mod tests {
             assert!(!env_disables_embedder(), "value {value:?} must NOT disable");
         }
         // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    // ── W3.1: embedder_enabled_for_config tests ──────────────────────
+
+    /// W3.1: config=false disables embedder when env is unset.
+    #[test]
+    fn w3_embedder_enabled_for_config_false_when_env_unset() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_BRAIN_EMBEDDER");
+        }
+        // config=false + env unset → disabled.
+        assert!(
+            !embedder_enabled_for_config(false),
+            "config=false + env unset must be disabled"
+        );
+        // config=true + env unset → enabled (default).
+        assert!(
+            embedder_enabled_for_config(true),
+            "config=true + env unset must be enabled"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// W3.1: KIMETSU_BRAIN_EMBEDDER=noop overrides config=true.
+    #[test]
+    fn w3_embedder_env_disable_overrides_config_true() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "noop");
+        }
+        assert!(
+            !embedder_enabled_for_config(true),
+            "KIMETSU_BRAIN_EMBEDDER=noop must override config=true"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// W3.1: a real model-id in env overrides config=false (explicit
+    /// model = caller wants embeddings on).
+    #[test]
+    fn w3_embedder_env_model_id_overrides_config_false() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "bge-m3");
+        }
+        assert!(
+            embedder_enabled_for_config(false),
+            "real model id in env must override config=false → enabled"
+        );
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),

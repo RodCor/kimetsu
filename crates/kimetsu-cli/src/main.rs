@@ -1466,14 +1466,21 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             // a short, lexically + semantically retrievable suffix
             // to the query before retrieval — see
             // `kimetsu_brain::ambient::augment_query`.
-            let (effective_query, ambient_payload) =
-                if !args.no_ambient && kimetsu_brain::ambient::ambient_enabled() {
-                    let ctx = kimetsu_brain::ambient::collect(&cwd);
-                    let augmented = kimetsu_brain::ambient::augment_query(&args.query, &ctx);
-                    (augmented, Some(ctx))
-                } else {
-                    (args.query.clone(), None)
-                };
+            // W3.2: load broker.ambient from project config (env still wins).
+            let config_ambient = kimetsu_core::paths::ProjectPaths::discover(&cwd)
+                .ok()
+                .and_then(|paths| project::load_config(&paths).ok())
+                .map(|cfg| cfg.broker.ambient)
+                .unwrap_or(true);
+            let (effective_query, ambient_payload) = if !args.no_ambient
+                && kimetsu_brain::ambient::ambient_enabled_with(config_ambient)
+            {
+                let ctx = kimetsu_brain::ambient::collect(&cwd);
+                let augmented = kimetsu_brain::ambient::augment_query(&args.query, &ctx);
+                (augmented, Some(ctx))
+            } else {
+                (args.query.clone(), None)
+            };
             let bundle =
                 project::retrieve_context(&cwd, &args.stage, &effective_query, args.budget_tokens)?;
             if args.json {

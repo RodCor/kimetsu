@@ -255,7 +255,8 @@ impl BrainSession {
         // Read/write user brain — created on demand so a v0.4 binary
         // running on a v0.3 home dir provisions the file the first
         // time the user actually writes a GlobalUser memory.
-        let user_conn = user_brain::open_user_brain()?;
+        // W3.3: honor config.kimetsu.use_user_brain with env override.
+        let user_conn = user_brain::open_user_brain_for_config(config.kimetsu.use_user_brain)?;
         Self::from_parts(paths, config, conn, user_conn)
     }
 
@@ -264,7 +265,9 @@ impl BrainSession {
         // Read-only path skips file creation — if the user brain
         // doesn't exist yet we just retrieve from the project DB
         // alone, no surprise file under $HOME.
-        let user_conn = user_brain::open_user_brain_readonly()?;
+        // W3.3: honor config.kimetsu.use_user_brain with env override.
+        let user_conn =
+            user_brain::open_user_brain_readonly_for_config(config.kimetsu.use_user_brain)?;
         Self::from_parts(paths, config, conn, user_conn)
     }
 
@@ -450,16 +453,21 @@ pub fn add_memory(
     // intentionally simpler (no run rows, no trace events, no project
     // lock) because there's no project to attribute them to.
     //
-    // If the user brain is disabled (KIMETSU_USER_BRAIN=0) OR
-    // unreachable (no $HOME), fall through to the project DB so
-    // backward compat is preserved — existing scripts that wrote
-    // GlobalUser memories into the project keep working.
+    // If the user brain is disabled (KIMETSU_USER_BRAIN=0 or
+    // config.kimetsu.use_user_brain=false) OR unreachable (no $HOME),
+    // fall through to the project DB so backward compat is preserved —
+    // existing scripts that wrote GlobalUser memories into the project
+    // keep working.
+    //
+    // W3.3: load the config first so we can apply the use_user_brain
+    // flag with env override before opening the user brain.
+    let (paths, config, conn) = load_project(start)?;
     if scope == MemoryScope::GlobalUser
-        && let Some(user_conn) = user_brain::open_user_brain()?
+        && let Some(user_conn) =
+            user_brain::open_user_brain_for_config(config.kimetsu.use_user_brain)?
     {
         return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
     }
-    let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory add", Some(run_id))?;
     let memory_id = Ulid::new().to_string();
@@ -722,10 +730,12 @@ pub fn list_memories(start: &Path) -> KimetsuResult<Vec<MemoryRow>> {
 /// only on the first page (`offset == 0`) so they appear exactly once
 /// during navigation rather than on every page.
 pub fn list_memories_with(start: &Path, opts: ListOptions) -> KimetsuResult<Vec<MemoryRow>> {
-    let (_paths, _config, conn) = load_project(start)?;
+    let (_paths, config, conn) = load_project(start)?;
     let mut memories = list_memories_from_conn(&conn, &opts)?;
+    // W3.3: honor config.kimetsu.use_user_brain with env override.
     if opts.offset == 0
-        && let Some(user_conn) = user_brain::open_user_brain_readonly()?
+        && let Some(user_conn) =
+            user_brain::open_user_brain_readonly_for_config(config.kimetsu.use_user_brain)?
     {
         memories.extend(user_brain::list_user_memories(&user_conn)?);
     }
@@ -742,8 +752,9 @@ pub fn list_memories_with(start: &Path, opts: ListOptions) -> KimetsuResult<Vec<
 /// user-scope memory shows its text even when the run lived in a
 /// project brain.
 pub fn blame_run(start: &Path, run_id: &str) -> KimetsuResult<BlameReport> {
-    let (_paths, _config, conn) = load_project(start)?;
-    let user_conn = user_brain::open_user_brain_readonly()?;
+    let (_paths, config, conn) = load_project(start)?;
+    // W3.3: honor config.kimetsu.use_user_brain with env override.
+    let user_conn = user_brain::open_user_brain_readonly_for_config(config.kimetsu.use_user_brain)?;
 
     // 1. Terminal outcome.
     let (outcome, failure_category) = run_outcome(&conn, run_id)?;
@@ -1344,10 +1355,12 @@ pub fn search_memories(
     let Some(fts) = context::fts_query(query) else {
         return Ok(Vec::new());
     };
-    let (_paths, _config, conn) = load_project(start)?;
+    let (_paths, config, conn) = load_project(start)?;
     let mut hits = search_memories_in_conn(&conn, &fts, limit, offset, kind, scope)?;
+    // W3.3: honor config.kimetsu.use_user_brain with env override.
     if offset == 0
-        && let Some(user_conn) = user_brain::open_user_brain_readonly()?
+        && let Some(user_conn) =
+            user_brain::open_user_brain_readonly_for_config(config.kimetsu.use_user_brain)?
     {
         hits.extend(search_memories_in_conn(
             &user_conn, &fts, limit, 0, kind, scope,
@@ -1753,14 +1766,17 @@ pub struct ScopedConflict {
 /// can re-truncate on display if needed.
 pub fn list_conflicts(start: &Path, limit: u32) -> KimetsuResult<Vec<ScopedConflict>> {
     let mut out = Vec::new();
-    let (_paths, _config, project_conn) = load_project_readonly(start)?;
+    let (_paths, config, project_conn) = load_project_readonly(start)?;
     for report in conflict::list_unresolved_conflicts(&project_conn, limit)? {
         out.push(ScopedConflict {
             source: "project".to_string(),
             report,
         });
     }
-    if let Some(user_conn) = user_brain::open_user_brain_readonly()? {
+    // W3.3: honor config.kimetsu.use_user_brain with env override.
+    if let Some(user_conn) =
+        user_brain::open_user_brain_readonly_for_config(config.kimetsu.use_user_brain)?
+    {
         for report in conflict::list_unresolved_conflicts(&user_conn, limit)? {
             out.push(ScopedConflict {
                 source: "user".to_string(),
@@ -1784,13 +1800,15 @@ pub fn list_conflicts(start: &Path, limit: u32) -> KimetsuResult<Vec<ScopedConfl
 /// duplicate state across two systems. Operators who want the trace-
 /// event-style record can use `kimetsu brain memory invalidate` instead.
 pub fn resolve_conflict(start: &Path, conflict_id: &str, resolution: &str) -> KimetsuResult<bool> {
-    let (paths, _config, project_conn) = load_project(start)?;
+    let (paths, config, project_conn) = load_project(start)?;
     let _lock = ProjectLock::acquire(&paths, "brain memory conflict resolve", None)?;
     if conflict::resolve_conflict(&project_conn, conflict_id, resolution)? {
         return Ok(true);
     }
     drop(project_conn); // release before opening user brain (avoid pseudo-conflict on flock semantics)
-    if let Some(user_conn) = user_brain::open_user_brain()? {
+    // W3.3: honor config.kimetsu.use_user_brain with env override.
+    if let Some(user_conn) = user_brain::open_user_brain_for_config(config.kimetsu.use_user_brain)?
+    {
         return conflict::resolve_conflict(&user_conn, conflict_id, resolution);
     }
     Ok(false)

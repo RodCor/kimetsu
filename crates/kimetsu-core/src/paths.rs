@@ -145,12 +145,29 @@ pub fn user_brain_db_path() -> Option<PathBuf> {
 /// enabled by default — the "brain follows you between projects"
 /// pitch only works if the user opts OUT, not opts IN.
 pub fn user_brain_enabled() -> bool {
-    let value = match std::env::var("KIMETSU_USER_BRAIN") {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    let v = value.trim().to_ascii_lowercase();
-    !matches!(v.as_str(), "0" | "false" | "off" | "no")
+    // Delegate to the config-aware variant with the default (true).
+    user_brain_enabled_with(true)
+}
+
+/// W3.3: config-aware user-brain gate. Resolution precedence:
+///   1. `KIMETSU_USER_BRAIN` env is explicitly set → its value wins.
+///   2. Env is unset → `config_use_user_brain` governs.
+///
+/// Callers with a `ProjectConfig` should pass
+/// `config.kimetsu.use_user_brain`; back-compat callers can use
+/// `user_brain_enabled()`.
+pub fn user_brain_enabled_with(config_use_user_brain: bool) -> bool {
+    // Precedence: env override > config > default.
+    match std::env::var("KIMETSU_USER_BRAIN") {
+        Ok(value) => {
+            let v = value.trim().to_ascii_lowercase();
+            // Env is set — respect it (disable values → false, anything
+            // else including empty → treat as "on").
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
+        }
+        // Env unset → config governs.
+        Err(_) => config_use_user_brain,
+    }
 }
 
 pub fn default_project_id(repo_root: &Path) -> String {

@@ -581,8 +581,16 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
     // `KIMETSU_BRAIN_AMBIENT=off`. The full ambient block is
     // surfaced in the response so the model knows what augmented
     // its retrieval.
-    let (effective_query, ambient_payload) =
-        augment_with_ambient(workspace, query, arguments, "include_ambient");
+    // W3.2: load broker.ambient from the project config (best-effort;
+    // default true keeps existing behavior when config is missing).
+    let config_ambient = load_config_ambient(workspace);
+    let (effective_query, ambient_payload) = augment_with_ambient(
+        workspace,
+        query,
+        arguments,
+        "include_ambient",
+        config_ambient,
+    );
 
     let request = ContextRequest {
         stage: stage.to_string(),
@@ -741,20 +749,36 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
     }
 }
 
+/// W3.2: load `broker.ambient` from the project config, best-effort.
+/// Returns `true` (the default) if the config is missing or unreadable
+/// so existing behavior is preserved when the project hasn't been
+/// initialized or the toml is absent.
+fn load_config_ambient(workspace: &Path) -> bool {
+    kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.ambient)
+        .unwrap_or(true)
+}
+
 /// v0.4.4: shared ambient-augmentation helper for the brain + benchmark
 /// MCP tools.
 ///
 /// Returns `(effective_query, ambient_payload)`. The payload is JSON
 /// (or `null` when ambient is disabled either per-call or globally),
 /// safe to embed directly into the response.
+///
+/// W3.2: `config_ambient` is the project config's `broker.ambient` value
+/// (default true). Resolution: `KIMETSU_BRAIN_AMBIENT` env > `config_ambient`.
 fn augment_with_ambient(
     workspace: &Path,
     query: &str,
     arguments: &Value,
     arg_key: &str,
+    config_ambient: bool,
 ) -> (String, Value) {
     let include = bool_arg(arguments, arg_key, true);
-    if !include || !kimetsu_brain::ambient::ambient_enabled() {
+    if !include || !kimetsu_brain::ambient::ambient_enabled_with(config_ambient) {
         return (query.to_string(), json!(null));
     }
     let ctx = kimetsu_brain::ambient::collect(workspace);
@@ -800,12 +824,15 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     // into the brain so it appends AFTER slug detection (otherwise
     // the suffix would confuse `normalize_task_slug`). The full
     // ambient block is also surfaced in the response payload.
+    // W3.2: honor broker.ambient from project config with env override.
+    let config_ambient = load_config_ambient(workspace);
     let include_ambient = bool_arg(arguments, "include_ambient", true);
-    let ambient_ctx = if include_ambient && kimetsu_brain::ambient::ambient_enabled() {
-        Some(kimetsu_brain::ambient::collect(workspace))
-    } else {
-        None
-    };
+    let ambient_ctx =
+        if include_ambient && kimetsu_brain::ambient::ambient_enabled_with(config_ambient) {
+            Some(kimetsu_brain::ambient::collect(workspace))
+        } else {
+            None
+        };
     let ambient_suffix = ambient_ctx
         .as_ref()
         .map(kimetsu_brain::ambient::render_as_query_suffix)

@@ -30,6 +30,7 @@ impl ProjectConfig {
             kimetsu: KimetsuSection {
                 project_id: project_id.into(),
                 schema_version: KIMETSU_CONFIG_VERSION,
+                use_user_brain: default_true(),
             },
             model: ModelSection::default(),
             broker: BrokerSection::default(),
@@ -54,6 +55,16 @@ impl ProjectConfig {
 pub struct KimetsuSection {
     pub project_id: String,
     pub schema_version: i64,
+    /// W3.3: per-project opt-out of the global cross-project user brain
+    /// (`~/.kimetsu/brain.db`). When false, GlobalUser writes fall back to
+    /// the project DB and retrieval skips the user-brain merge — identical
+    /// to `KIMETSU_USER_BRAIN=0` but durable and scoped to this project.
+    ///
+    /// Precedence: `KIMETSU_USER_BRAIN` env > this field > default (true).
+    /// `#[serde(default)]` keeps all pre-W3 project.toml files loading
+    /// unchanged (they get `use_user_brain = true`).
+    #[serde(default = "default_true")]
+    pub use_user_brain: bool,
 }
 
 /// v0.8: embedding-model selection. `model` is one of the curated
@@ -61,20 +72,37 @@ pub struct KimetsuSection {
 /// (`bge-small-en-v1.5`, `bge-m3`, `jina-v2-base-code`). Switching
 /// changes the vector dimension, so a `kimetsu brain reindex` is
 /// required for cosine retrieval to use the new model.
+///
+/// W3.1: `enabled` is a persistent off-switch for the embedding engine.
+/// When false, the embedder resolves to NoopEmbedder (FTS-only; no
+/// vectors written or queried). Precedence: `KIMETSU_BRAIN_EMBEDDER`
+/// env override > this field > default (true). A disable env value
+/// (`noop`/`off`/`0`/…) always wins; a real model-id env value means
+/// "enabled" regardless of this field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedderSection {
     #[serde(default = "default_embedder_id")]
     pub model: String,
+    /// W3.1: persistent embeddings off-switch. Default true (enabled).
+    /// `#[serde(default = "default_true")]` keeps pre-W3 project.toml
+    /// files loading unchanged.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 fn default_embedder_id() -> String {
     "bge-small-en-v1.5".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for EmbedderSection {
     fn default() -> Self {
         Self {
             model: default_embedder_id(),
+            enabled: default_true(),
         }
     }
 }
@@ -217,6 +245,14 @@ pub struct BrokerSection {
     /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
     #[serde(default = "default_budget_run_cap_tokens")]
     pub budget_run_cap_tokens: u32,
+    /// W3.2: persistent ambient-context off-switch. When false, the
+    /// workspace fingerprint (branch, recent files, dirty status) is not
+    /// collected or appended to the retrieval query. Precedence:
+    /// `KIMETSU_BRAIN_AMBIENT` env override > this field > default (true).
+    /// `#[serde(default = "default_true")]` keeps pre-W3 project.toml
+    /// files loading unchanged.
+    #[serde(default = "default_true")]
+    pub ambient: bool,
 }
 
 fn default_max_capsules() -> usize {
@@ -240,6 +276,7 @@ impl Default for BrokerSection {
             min_semantic_score: 0.0,
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
+            ambient: default_true(),
         }
     }
 }
@@ -480,6 +517,20 @@ max_total_cost_usd = 250.0
         // must load cleanly and receive the safe defaults.
         assert_eq!(config.broker.budget_floor_tokens, 1500);
         assert_eq!(config.broker.budget_run_cap_tokens, 8000);
+        // W3: pre-W3 configs without the new off-switch fields must load
+        // cleanly and default to enabled (true) for all three features.
+        assert!(
+            config.embedder.enabled,
+            "W3.1: embedder.enabled must default to true"
+        );
+        assert!(
+            config.broker.ambient,
+            "W3.2: broker.ambient must default to true"
+        );
+        assert!(
+            config.kimetsu.use_user_brain,
+            "W3.3: kimetsu.use_user_brain must default to true"
+        );
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
@@ -506,6 +557,36 @@ max_total_cost_usd = 250.0
         // F3 fields survive round-trip.
         assert_eq!(reloaded.broker.budget_floor_tokens, 1500);
         assert_eq!(reloaded.broker.budget_run_cap_tokens, 8000);
+        // W3 off-switch fields survive round-trip.
+        assert!(reloaded.embedder.enabled);
+        assert!(reloaded.broker.ambient);
+        assert!(reloaded.kimetsu.use_user_brain);
+    }
+
+    /// W3: the three new off-switch fields can be set to `false` in
+    /// project.toml and round-trip cleanly.
+    #[test]
+    fn w3_off_switch_fields_round_trip_as_false() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.embedder.enabled = false;
+        config.broker.ambient = false;
+        config.kimetsu.use_user_brain = false;
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            !reloaded.embedder.enabled,
+            "embedder.enabled must survive as false"
+        );
+        assert!(
+            !reloaded.broker.ambient,
+            "broker.ambient must survive as false"
+        );
+        assert!(
+            !reloaded.kimetsu.use_user_brain,
+            "kimetsu.use_user_brain must survive as false"
+        );
+        // Unrelated fields unaffected.
+        assert_eq!(reloaded.kimetsu.project_id, "demo");
     }
 
     // ── F3: adaptive_budget unit tests ────────────────────────────────────
