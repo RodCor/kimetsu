@@ -2,9 +2,10 @@
 //!
 //! The proactive PreToolUse/PostToolUse hooks run as fresh CLI
 //! processes per tool call (the "stateless now, daemon later" model),
-//! so cross-call memory lives in a tiny JSON file under
-//! `<repo>/.kimetsu/proactive/<session_id>.json`. It powers three
-//! brain-like behaviours:
+//! so cross-call memory lives in a tiny JSON file under the per-project
+//! user cache, `~/.kimetsu/cache/<project-hash>/proactive/<session_id>.json`
+//! (kept out of the project's `.kimetsu/` so the brain folder stays lean).
+//! It powers three brain-like behaviours:
 //!
 //!   * **Dedupe** — a memory surfaces at most once per session
 //!     (`surfaced_memory_ids`). Once it's "in working memory" it
