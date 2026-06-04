@@ -156,7 +156,11 @@ pub struct SilentMemory {
 
 pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
     let paths = ProjectPaths::discover(start)?;
-    fs::create_dir_all(&paths.runs_dir)?;
+    // Create only the `.kimetsu/` dir itself (needed before writing
+    // project.toml / brain.db). The `runs/` dir is created lazily by the
+    // agent pipeline's TraceWriter — memory writes no longer produce run
+    // dirs (W1.4), so a brain-only install never grows a `runs/` tree.
+    fs::create_dir_all(&paths.kimetsu_dir)?;
 
     let project_id = default_project_id(&paths.repo_root);
     let config = ProjectConfig::default_for_project(project_id);
@@ -1991,6 +1995,27 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
         kimetsu_core::paths::git_init_boundary(&root);
         root
+    }
+
+    #[test]
+    fn w1_5_init_creates_kimetsu_dir_but_no_runs_dir() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            let summary = init_project(&root, false).expect("init");
+            // The .kimetsu/ dir + brain.db + project.toml are created...
+            assert!(summary.kimetsu_dir.exists(), ".kimetsu/ must exist");
+            assert!(summary.brain_db.exists(), "brain.db must be created");
+            assert!(
+                summary.kimetsu_dir.join("project.toml").exists(),
+                "project.toml must be written"
+            );
+            // ...but a fresh init does NOT eagerly create runs/ (it's created
+            // lazily only when an agent run needs it).
+            assert!(
+                !summary.kimetsu_dir.join("runs").exists(),
+                "fresh init must NOT create a runs/ dir"
+            );
+        });
     }
 
     #[test]
