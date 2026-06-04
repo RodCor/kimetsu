@@ -204,7 +204,7 @@ fn process_alive_unix(pid: u32) -> ProcessLiveness {
     // exists and we have permission; ESRCH means no such process (dead).
     // Any other errno (e.g. EPERM) means the process exists but we lack
     // permission — treat as Alive.
-    extern "C" {
+    unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     unsafe {
@@ -229,14 +229,14 @@ unsafe fn libc_errno() -> *mut i32 {
     // On Linux glibc the TLS errno is accessed via __errno_location().
     // On macOS it's __error().  Both are in the C standard library.
     #[cfg(target_os = "macos")]
-    extern "C" {
+    unsafe extern "C" {
         fn __error() -> *mut i32;
     }
     #[cfg(target_os = "macos")]
     return unsafe { __error() };
 
     #[cfg(not(target_os = "macos"))]
-    extern "C" {
+    unsafe extern "C" {
         fn __errno_location() -> *mut i32;
     }
     #[cfg(not(target_os = "macos"))]
