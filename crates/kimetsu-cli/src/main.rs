@@ -395,7 +395,7 @@ struct PluginStatusArgs {
 
 #[derive(Debug, Args)]
 struct PluginUninstallArgs {
-    /// Host to remove from: claude-code | codex | pi.
+    /// Host to remove from: claude-code | codex | openclaw | pi.
     target: String,
     /// Workspace root to operate in. Defaults to current directory.
     #[arg(long, default_value = ".")]
@@ -413,7 +413,7 @@ struct PluginUninstallArgs {
 
 #[derive(Debug, Args)]
 struct PluginInstallArgs {
-    /// Host to install into: claude-code | codex | pi | kimetsu.
+    /// Host to install into: claude-code | codex | openclaw | pi | kimetsu.
     target: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
@@ -460,8 +460,8 @@ struct SetupArgs {
     /// Workspace to set up. Defaults to current directory.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// Host to install into: claude-code | codex | pi | both.
-    /// If omitted, auto-detected from which host config dirs (~/.claude, ~/.codex, ~/.pi) exist.
+    /// Host to install into: claude-code | codex | openclaw | pi | both.
+    /// If omitted, auto-detected from which host config dirs (~/.claude, ~/.codex, ~/.openclaw, ~/.pi) exist.
     #[arg(long)]
     host: Option<String>,
     /// Install scope: workspace (default) | global.
@@ -1504,6 +1504,7 @@ pub fn resolve_setup_hosts(
     arg: Option<&str>,
     present_claude: bool,
     present_codex: bool,
+    present_openclaw: bool,
     present_pi: bool,
     is_tty: bool,
     mut reader: impl io::BufRead,
@@ -1526,6 +1527,9 @@ pub fn resolve_setup_hosts(
     if present_codex {
         detected.push(BridgeTarget::Codex);
     }
+    if present_openclaw {
+        detected.push(BridgeTarget::OpenClaw);
+    }
     if present_pi {
         detected.push(BridgeTarget::Pi);
     }
@@ -1537,12 +1541,12 @@ pub fn resolve_setup_hosts(
     // Nothing detected.
     if !is_tty {
         eprintln!(
-            "note: neither ~/.claude nor ~/.codex nor ~/.pi found; defaulting to claude-code. \
+            "note: neither ~/.claude nor ~/.codex nor ~/.openclaw nor ~/.pi found; defaulting to claude-code. \
              Pass --host to choose explicitly."
         );
         Ok(vec![BridgeTarget::ClaudeCode])
     } else {
-        print!("Which host agent do you use? [claude-code/codex/pi/both]: ");
+        print!("Which host agent do you use? [claude-code/codex/openclaw/pi/both]: ");
         io::stdout().flush().ok();
         let mut line = String::new();
         reader
@@ -1553,6 +1557,8 @@ pub fn resolve_setup_hosts(
             Ok(vec![BridgeTarget::ClaudeCode])
         } else if answer == "codex" {
             Ok(vec![BridgeTarget::Codex])
+        } else if answer == "openclaw" || answer == "claw" {
+            Ok(vec![BridgeTarget::OpenClaw])
         } else if answer == "pi" {
             Ok(vec![BridgeTarget::Pi])
         } else if answer == "both" {
@@ -1563,9 +1569,9 @@ pub fn resolve_setup_hosts(
     }
 }
 
-/// Detect whether the home config directories for Claude Code, Codex, and Pi exist.
-/// Returns `(claude_present, codex_present, pi_present)`.
-fn detect_present_hosts() -> (bool, bool, bool) {
+/// Detect whether the home config directories for Claude Code, Codex, OpenClaw, and Pi exist.
+/// Returns `(claude_present, codex_present, openclaw_present, pi_present)`.
+fn detect_present_hosts() -> (bool, bool, bool, bool) {
     let home = std::env::var_os("USERPROFILE")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
@@ -1573,13 +1579,14 @@ fn detect_present_hosts() -> (bool, bool, bool) {
 
     let home = match home {
         Some(h) => h,
-        None => return (false, false, false),
+        None => return (false, false, false, false),
     };
 
     let claude_present = home.join(".claude").is_dir();
     let codex_present = home.join(".codex").is_dir();
+    let openclaw_present = home.join(".openclaw").is_dir();
     let pi_present = home.join(".pi").is_dir();
-    (claude_present, codex_present, pi_present)
+    (claude_present, codex_present, openclaw_present, pi_present)
 }
 
 /// `kimetsu setup` — one-command onboarding.
@@ -1630,13 +1637,14 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
     // ── Step 2: Choose host(s) ────────────────────────────────────────────────
     println!();
     println!("[2/4] Selecting host(s)...");
-    let (present_claude, present_codex, present_pi) = detect_present_hosts();
+    let (present_claude, present_codex, present_openclaw, present_pi) = detect_present_hosts();
     let is_tty = io::stdin().is_terminal();
     let stdin = io::stdin();
     let hosts = resolve_setup_hosts(
         args.host.as_deref(),
         present_claude,
         present_codex,
+        present_openclaw,
         present_pi,
         is_tty,
         stdin.lock(),
@@ -1667,6 +1675,7 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            BridgeTarget::OpenClaw => "OpenClaw",
             BridgeTarget::Pi => "Pi",
         };
         println!(
@@ -1685,6 +1694,9 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             Ok(report) => {
                 for f in &report.files {
                     println!("    {}", f.display());
+                }
+                for note in &report.notes {
+                    println!("    {note}");
                 }
                 installed_hosts.push(format!("{} ({})", host_label, scope.as_str()));
 
@@ -1814,6 +1826,7 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            BridgeTarget::OpenClaw => "OpenClaw",
             BridgeTarget::Pi => "Pi",
         })
         .collect();
@@ -2100,6 +2113,9 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
             );
             for file in report.files {
                 println!("  {}", file.display());
+            }
+            for note in &report.notes {
+                println!("  {note}");
             }
             // Offer interactive distiller setup for host targets on a TTY.
             let interactive = args.setup_harvest
@@ -6700,6 +6716,7 @@ ambient = false
             false,
             false,
             false,
+            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -6709,8 +6726,16 @@ ambient = false
     #[test]
     fn resolve_setup_hosts_explicit_both() {
         use kimetsu_chat::BridgeTarget;
-        let hosts = resolve_setup_hosts(Some("both"), false, false, false, false, Cursor::new(b""))
-            .unwrap();
+        let hosts = resolve_setup_hosts(
+            Some("both"),
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex]);
     }
 
@@ -6718,21 +6743,24 @@ ambient = false
     fn resolve_setup_hosts_auto_only_claude_present() {
         use kimetsu_chat::BridgeTarget;
         // Only Claude present → Claude.
-        let hosts = resolve_setup_hosts(None, true, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts =
+            resolve_setup_hosts(None, true, false, false, false, false, Cursor::new(b"")).unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_only_codex_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts = resolve_setup_hosts(None, false, true, false, false, Cursor::new(b"")).unwrap();
+        let hosts =
+            resolve_setup_hosts(None, false, true, false, false, false, Cursor::new(b"")).unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Codex]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_both_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts = resolve_setup_hosts(None, true, true, false, false, Cursor::new(b"")).unwrap();
+        let hosts =
+            resolve_setup_hosts(None, true, true, false, false, false, Cursor::new(b"")).unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex]);
     }
 
@@ -6740,7 +6768,7 @@ ambient = false
     fn resolve_setup_hosts_neither_present_non_tty_defaults_claude() {
         use kimetsu_chat::BridgeTarget;
         let hosts =
-            resolve_setup_hosts(None, false, false, false, false, Cursor::new(b"")).unwrap();
+            resolve_setup_hosts(None, false, false, false, false, false, Cursor::new(b"")).unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode]);
     }
 
@@ -6748,8 +6776,16 @@ ambient = false
     fn resolve_setup_hosts_neither_present_tty_scripted_codex() {
         use kimetsu_chat::BridgeTarget;
         // Simulated TTY input "codex\n".
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, true, Cursor::new(b"codex\n")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Cursor::new(b"codex\n"),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Codex]);
     }
 
@@ -6757,6 +6793,7 @@ ambient = false
     fn resolve_setup_hosts_bad_host_arg_returns_error() {
         let result = resolve_setup_hosts(
             Some("not-a-host"),
+            false,
             false,
             false,
             false,
@@ -6769,23 +6806,40 @@ ambient = false
     #[test]
     fn resolve_setup_hosts_neither_present_tty_scripted_both() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, true, Cursor::new(b"both\n")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Cursor::new(b"both\n"),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_only_pi_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts = resolve_setup_hosts(None, false, false, true, false, Cursor::new(b"")).unwrap();
+        let hosts =
+            resolve_setup_hosts(None, false, false, false, true, false, Cursor::new(b"")).unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
     #[test]
     fn resolve_setup_hosts_explicit_pi() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(Some("pi"), false, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            Some("pi"),
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
@@ -6793,8 +6847,66 @@ ambient = false
     fn resolve_setup_hosts_tty_scripted_pi() {
         use kimetsu_chat::BridgeTarget;
         let hosts =
-            resolve_setup_hosts(None, false, false, false, true, Cursor::new(b"pi\n")).unwrap();
+            resolve_setup_hosts(None, false, false, false, false, true, Cursor::new(b"pi\n"))
+                .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
+    }
+
+    #[test]
+    fn resolve_setup_hosts_auto_only_openclaw_present() {
+        use kimetsu_chat::BridgeTarget;
+        // Only OpenClaw present → OpenClaw detected.
+        let hosts =
+            resolve_setup_hosts(None, false, false, true, false, false, Cursor::new(b"")).unwrap();
+        assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
+    }
+
+    #[test]
+    fn resolve_setup_hosts_explicit_openclaw() {
+        use kimetsu_chat::BridgeTarget;
+        let hosts = resolve_setup_hosts(
+            Some("openclaw"),
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
+        assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
+    }
+
+    #[test]
+    fn resolve_setup_hosts_explicit_claw_alias() {
+        use kimetsu_chat::BridgeTarget;
+        let hosts = resolve_setup_hosts(
+            Some("claw"),
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
+        assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
+    }
+
+    #[test]
+    fn resolve_setup_hosts_tty_scripted_openclaw() {
+        use kimetsu_chat::BridgeTarget;
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Cursor::new(b"openclaw\n"),
+        )
+        .unwrap();
+        assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
     }
 
     // ─── QQ3: CLI smoke for setup ─────────────────────────────────────────────
