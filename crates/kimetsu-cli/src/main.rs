@@ -362,6 +362,38 @@ struct McpServeArgs {
 enum PluginCommand {
     /// Wire Kimetsu into a host (.mcp.json/.claude or .codex + hooks).
     Install(PluginInstallArgs),
+    /// Show what Kimetsu wiring is present for each host + scope.
+    Status(PluginStatusArgs),
+    /// Remove Kimetsu's wiring from a host (keeps the CLI binary and brain intact).
+    Uninstall(PluginUninstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct PluginStatusArgs {
+    /// Workspace root to inspect. Defaults to current directory.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PluginUninstallArgs {
+    /// Host to remove from: claude-code | codex.
+    target: String,
+    /// Workspace root to operate in. Defaults to current directory.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Scope to remove from: workspace (default) | global.
+    #[arg(long, default_value = "workspace")]
+    scope: String,
+    /// Remove from both workspace and global scopes.
+    #[arg(long, conflicts_with = "scope")]
+    all_scopes: bool,
+    /// Confirm without prompting (required when stdin is not a TTY).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1518,7 +1550,10 @@ fn mcp(command: McpCommand) -> KimetsuResult<()> {
 }
 
 fn plugin(command: PluginCommand) -> KimetsuResult<()> {
-    use kimetsu_chat::{BridgeTarget, InstallScope, PluginMode, plugin_install};
+    use kimetsu_chat::{
+        BridgeTarget, InstallScope, PluginMode, WiringState, plugin_install, plugin_status,
+        plugin_uninstall,
+    };
 
     match command {
         PluginCommand::Install(args) => {
@@ -1611,8 +1646,258 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 }
             }
         }
+
+        PluginCommand::Status(args) => {
+            let workspace = args
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| args.workspace.clone());
+
+            let statuses = plugin_status(&workspace);
+
+            // Collect running MCP servers.
+            let mcp_procs: Vec<_> = process::list_kimetsu_processes()
+                .into_iter()
+                .filter(|p| p.kind == process::ProcKind::McpServe)
+                .collect();
+
+            // Determine the on-PATH kimetsu version.
+            let path_version = kimetsu_version_on_path();
+            let this_version = env!("CARGO_PKG_VERSION");
+
+            if args.json {
+                #[derive(serde::Serialize)]
+                struct StatusOutput<'a> {
+                    wiring: &'a Vec<kimetsu_chat::PluginScopeStatus>,
+                    this_binary_version: &'a str,
+                    path_version: Option<String>,
+                    mcp_servers: Vec<MiniProc>,
+                }
+                #[derive(serde::Serialize)]
+                struct MiniProc {
+                    pid: u32,
+                    workspace: Option<String>,
+                    exe_path: Option<String>,
+                }
+                let output = StatusOutput {
+                    wiring: &statuses,
+                    this_binary_version: this_version,
+                    path_version,
+                    mcp_servers: mcp_procs
+                        .iter()
+                        .map(|p| MiniProc {
+                            pid: p.pid,
+                            workspace: p.workspace.clone(),
+                            exe_path: p.exe_path.clone(),
+                        })
+                        .collect(),
+                };
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                return Ok(());
+            }
+
+            // Human-readable report.
+            let any_wired = statuses
+                .iter()
+                .any(|s| !matches!(s.state, WiringState::Absent));
+
+            if !any_wired {
+                println!(
+                    "Kimetsu is not installed into any host (workspace or global).\n\
+                     Run `kimetsu plugin install <claude-code|codex>` to wire it in."
+                );
+                return Ok(());
+            }
+
+            println!("Kimetsu plugin wiring status");
+            println!("{}", "─".repeat(60));
+
+            for s in &statuses {
+                let state_label = match s.state {
+                    WiringState::Installed => "INSTALLED",
+                    WiringState::Partial => "PARTIAL  ",
+                    WiringState::Absent => "absent   ",
+                };
+                let present_str = if s.present.is_empty() {
+                    String::new()
+                } else {
+                    format!("  present: [{}]", s.present.join(", "))
+                };
+                let missing_str = if s.missing.is_empty() {
+                    String::new()
+                } else {
+                    format!("  missing: [{}]", s.missing.join(", "))
+                };
+                println!(
+                    "  {:<12}  {:<10}  {}{}{}",
+                    s.host, s.scope, state_label, present_str, missing_str
+                );
+                if !matches!(s.state, WiringState::Absent) {
+                    println!("    config: {}", s.config_path);
+                }
+            }
+
+            println!("{}", "─".repeat(60));
+            println!("This binary:  v{this_version}");
+            match &path_version {
+                Some(pv) if pv != this_version => {
+                    println!("On PATH:      v{pv}  (differs from this binary)");
+                }
+                Some(pv) => println!("On PATH:      v{pv}"),
+                None => println!("On PATH:      (could not determine)"),
+            }
+
+            if mcp_procs.is_empty() {
+                println!("MCP servers:  none running");
+            } else {
+                println!("MCP servers:");
+                for p in &mcp_procs {
+                    println!(
+                        "  PID {}  workspace={}",
+                        p.pid,
+                        p.workspace.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+        }
+
+        PluginCommand::Uninstall(args) => {
+            let workspace = args
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| args.workspace.clone());
+
+            let target = BridgeTarget::parse(&args.target)
+                .map_err(|err| format!("kimetsu plugin uninstall: {err}"))?;
+
+            // Collect scopes to uninstall from.
+            let scopes: Vec<InstallScope> = if args.all_scopes {
+                vec![InstallScope::Workspace, InstallScope::Global]
+            } else {
+                let scope = InstallScope::parse(&args.scope)
+                    .map_err(|err| format!("kimetsu plugin uninstall: {err}"))?;
+                vec![scope]
+            };
+
+            // Show current status for the target+scopes and confirm.
+            let all_statuses = plugin_status(&workspace);
+            let relevant: Vec<_> = all_statuses
+                .iter()
+                .filter(|s| {
+                    s.host == target.as_str()
+                        && scopes.iter().any(|sc| sc.as_str() == s.scope.as_str())
+                })
+                .collect();
+
+            let anything_present = relevant
+                .iter()
+                .any(|s| !matches!(s.state, WiringState::Absent));
+
+            if !anything_present {
+                println!(
+                    "No Kimetsu wiring found for {} ({}) — nothing to remove.",
+                    target.as_str(),
+                    scopes
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                );
+                return Ok(());
+            }
+
+            // Show what will be removed.
+            for s in &relevant {
+                if !matches!(s.state, WiringState::Absent) {
+                    println!(
+                        "Will remove Kimetsu wiring from {} ({}): [{}]",
+                        s.host,
+                        s.scope,
+                        s.present.join(", ")
+                    );
+                }
+            }
+            println!(
+                "\nThis removes ONLY the host wiring — the Kimetsu binary, brain, and your \
+                 other hooks/servers are NOT touched."
+            );
+
+            // Interactive confirm.
+            let scope_label = scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ");
+            if !args.yes && io::stdin().is_terminal() {
+                print!(
+                    "Remove Kimetsu's wiring from {} ({})? [y/N] ",
+                    target.as_str(),
+                    scope_label
+                );
+                io::stdout().flush().ok();
+                let stdin = io::stdin();
+                let line = stdin.lock().lines().next();
+                let answer = match line {
+                    Some(Ok(l)) => l.trim().to_lowercase(),
+                    _ => String::new(),
+                };
+                if answer != "y" && answer != "yes" {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            } else if !args.yes {
+                return Err("stdin is not a TTY; pass --yes to confirm non-interactively".into());
+            }
+
+            // Execute uninstall for each scope.
+            for scope in &scopes {
+                let report = plugin_uninstall(&workspace, target, *scope)
+                    .map_err(|err| format!("kimetsu plugin uninstall: {err}"))?;
+
+                if report.removed.is_empty() && report.modified.is_empty() {
+                    println!(
+                        "  {} scope: nothing to remove (already clean)",
+                        scope.as_str()
+                    );
+                } else {
+                    for path in &report.removed {
+                        println!("  removed  {}", path.display());
+                    }
+                    for path in &report.modified {
+                        println!("  modified {}", path.display());
+                    }
+                }
+            }
+
+            println!(
+                "\nKimetsu plugin wiring removed from {} ({}).",
+                target.as_str(),
+                scope_label
+            );
+            println!(
+                "The Kimetsu binary, brain, and any other hooks/servers are untouched.\n\
+                 To reinstall: `kimetsu plugin install {}`",
+                target.as_str()
+            );
+        }
     }
     Ok(())
+}
+
+/// Try to determine the version of `kimetsu` on the PATH by running `kimetsu --version`.
+/// Returns `None` if not found or if the output is not parseable.
+fn kimetsu_version_on_path() -> Option<String> {
+    let output = std::process::Command::new("kimetsu")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = stdout.trim();
+    // clap emits "kimetsu <version>"
+    text.strip_prefix("kimetsu ").map(|rest| rest.to_string())
 }
 
 fn bridge_skill_config(no_user_skills: bool) -> kimetsu_chat::SkillConfig {

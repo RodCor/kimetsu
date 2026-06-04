@@ -534,6 +534,339 @@ pub fn extensions_root(workspace: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// plugin_status — read-only wiring detector
+// ---------------------------------------------------------------------------
+
+/// Overall wiring state for one host+scope combination.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WiringState {
+    /// All core pieces (hooks + mcp) are present.
+    Installed,
+    /// Some but not all expected pieces are present.
+    Partial,
+    /// No Kimetsu wiring found.
+    Absent,
+}
+
+/// Status of Kimetsu's wiring for a specific host+scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginScopeStatus {
+    /// "claude-code" or "codex"
+    pub host: String,
+    /// "workspace" or "global"
+    pub scope: String,
+    pub state: WiringState,
+    /// Which pieces are present (e.g. "hooks", "mcp", "CLAUDE.md", "commands", "agent").
+    pub present: Vec<String>,
+    /// Expected-but-absent pieces (populated when state is Partial).
+    pub missing: Vec<String>,
+    /// Primary config dir/file for this host+scope.
+    pub config_path: String,
+}
+
+// ── per-piece detection helpers ────────────────────────────────────────────
+
+/// Returns true if `settings.json` exists and has at least one Kimetsu hook group.
+fn detect_claude_hooks(claude_dir: &Path) -> bool {
+    let settings = claude_dir.join("settings.json");
+    if !settings.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&settings) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(strip_bom(&text)) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(|h| h.as_object())
+        .map(|hooks_obj| {
+            hooks_obj.values().any(|event_val| {
+                event_val
+                    .as_array()
+                    .map(|groups| groups.iter().any(is_kimetsu_hook_group))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Returns true if the MCP config file has a `"kimetsu"` key in
+/// `mcpServers` (always checked) or `servers` (only when `check_servers` is true).
+fn detect_claude_mcp(mcp_path: &Path, check_servers: bool) -> bool {
+    if !mcp_path.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(mcp_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(strip_bom(&text)) else {
+        return false;
+    };
+    let in_mcp_servers = root
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .map(|m| m.contains_key("kimetsu"))
+        .unwrap_or(false);
+    let in_servers = if check_servers {
+        root.get("servers")
+            .and_then(|v| v.as_object())
+            .map(|m| m.contains_key("kimetsu"))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    in_mcp_servers || in_servers
+}
+
+/// Returns true if CLAUDE.md contains the Kimetsu begin marker.
+fn detect_claude_md(claude_dir: &Path) -> bool {
+    let md = claude_dir.join("CLAUDE.md");
+    if !md.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&md) else {
+        return false;
+    };
+    text.contains(CLAUDE_MD_BEGIN)
+}
+
+/// Returns true if `commands/kimetsu/` directory exists under `claude_dir`.
+fn detect_claude_commands(claude_dir: &Path) -> bool {
+    claude_dir.join("commands").join("kimetsu").is_dir()
+}
+
+/// Returns true if `agents/kimetsu-memory-harvester.md` exists under `claude_dir`.
+fn detect_claude_agent(claude_dir: &Path) -> bool {
+    claude_dir
+        .join("agents")
+        .join("kimetsu-memory-harvester.md")
+        .is_file()
+}
+
+/// Returns true if `config.toml` has `[mcp_servers.kimetsu]`.
+fn detect_codex_mcp(codex_dir: &Path) -> bool {
+    let config = codex_dir.join("config.toml");
+    if !config.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&config) else {
+        return false;
+    };
+    let Ok(root) = toml::from_str::<toml::Value>(strip_bom(&text)) else {
+        return false;
+    };
+    root.get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .map(|t| t.contains_key("kimetsu"))
+        .unwrap_or(false)
+}
+
+/// Returns true if `hooks.json` has at least one Kimetsu hook group.
+fn detect_codex_hooks(codex_dir: &Path) -> bool {
+    // Codex hooks.json uses the same `{ "hooks": { … } }` structure as
+    // Claude's settings.json. Check codex_dir/hooks.json directly.
+    let hooks = codex_dir.join("hooks.json");
+    if !hooks.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&hooks) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(strip_bom(&text)) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(|h| h.as_object())
+        .map(|hooks_obj| {
+            hooks_obj.values().any(|event_val| {
+                event_val
+                    .as_array()
+                    .map(|groups| groups.iter().any(is_kimetsu_hook_group))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Returns true if `skills/kimetsu-bridge/` exists under `codex_dir`.
+fn detect_codex_skill(codex_dir: &Path) -> bool {
+    codex_dir.join("skills").join("kimetsu-bridge").is_dir()
+}
+
+/// Returns true if `agents/kimetsu-memory-harvester.toml` exists under `codex_dir`.
+fn detect_codex_agent(codex_dir: &Path) -> bool {
+    codex_dir
+        .join("agents")
+        .join("kimetsu-memory-harvester.toml")
+        .is_file()
+}
+
+// ── state aggregation ───────────────────────────────────────────────────────
+
+/// Aggregate present/missing into a `WiringState`.
+/// Core pieces (hooks + mcp) must both be present for `Installed`.
+fn aggregate_state(present: &[&str], missing: &[&str]) -> WiringState {
+    if missing.is_empty() {
+        WiringState::Installed
+    } else if present.is_empty() {
+        WiringState::Absent
+    } else {
+        // If at least one core piece (hooks/mcp) is present but anything is missing
+        // → Partial. If *none* of the core pieces are present → Absent.
+        let has_core = present.iter().any(|p| *p == "hooks" || *p == "mcp");
+        if has_core {
+            WiringState::Partial
+        } else {
+            WiringState::Absent
+        }
+    }
+}
+
+/// Read-only status scan: check each (host, scope) combination and report
+/// which Kimetsu wiring pieces are present, missing, or absent.
+///
+/// For workspace scope the `home` parameter is `None`; for global it is
+/// `Some(&home_dir)` — mirroring `plugin_install_inner`/`plugin_uninstall_inner`.
+fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
+    let workspace = normalize_path(workspace);
+    let mut results = Vec::new();
+
+    let home_opt = resolve_home().ok();
+
+    for &target in &[BridgeTarget::ClaudeCode, BridgeTarget::Codex] {
+        for &scope in &[InstallScope::Workspace, InstallScope::Global] {
+            let home: Option<&Path> = match scope {
+                InstallScope::Global => {
+                    match home_opt.as_deref() {
+                        Some(h) => Some(h),
+                        None => {
+                            // Can't resolve home — report this scope as Absent.
+                            results.push(PluginScopeStatus {
+                                host: target.as_str().to_string(),
+                                scope: scope.as_str().to_string(),
+                                state: WiringState::Absent,
+                                present: vec![],
+                                missing: vec![],
+                                config_path: "(home unavailable)".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                InstallScope::Workspace => None,
+            };
+
+            match target {
+                BridgeTarget::ClaudeCode => {
+                    let claude_dir = match home {
+                        Some(h) => h.join(".claude"),
+                        None => workspace.join(".claude"),
+                    };
+                    let mcp_path = match home {
+                        Some(h) => h.join(".claude.json"),
+                        None => workspace.join(".mcp.json"),
+                    };
+                    // `servers` key is only in workspace .mcp.json, not global ~/.claude.json
+                    let check_servers = home.is_none();
+
+                    let hooks_ok = detect_claude_hooks(&claude_dir);
+                    let mcp_ok = detect_claude_mcp(&mcp_path, check_servers);
+                    let claude_md_ok = detect_claude_md(&claude_dir);
+                    let commands_ok = detect_claude_commands(&claude_dir);
+                    let agent_ok = detect_claude_agent(&claude_dir);
+
+                    let mut present = Vec::new();
+                    let mut missing = Vec::new();
+
+                    for (name, ok) in [
+                        ("hooks", hooks_ok),
+                        ("mcp", mcp_ok),
+                        ("CLAUDE.md", claude_md_ok),
+                        ("commands", commands_ok),
+                        ("agent", agent_ok),
+                    ] {
+                        if ok {
+                            present.push(name.to_string());
+                        } else {
+                            missing.push(name.to_string());
+                        }
+                    }
+
+                    let state = aggregate_state(
+                        &present.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &missing.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    );
+
+                    results.push(PluginScopeStatus {
+                        host: target.as_str().to_string(),
+                        scope: scope.as_str().to_string(),
+                        state,
+                        present,
+                        missing,
+                        config_path: claude_dir.to_string_lossy().to_string(),
+                    });
+                }
+
+                BridgeTarget::Codex => {
+                    let codex_dir = match home {
+                        Some(h) => h.join(".codex"),
+                        None => workspace.join(".codex"),
+                    };
+
+                    let hooks_ok = detect_codex_hooks(&codex_dir);
+                    let mcp_ok = detect_codex_mcp(&codex_dir);
+                    let skill_ok = detect_codex_skill(&codex_dir);
+                    let agent_ok = detect_codex_agent(&codex_dir);
+
+                    let mut present = Vec::new();
+                    let mut missing = Vec::new();
+
+                    for (name, ok) in [
+                        ("hooks", hooks_ok),
+                        ("mcp", mcp_ok),
+                        ("skill", skill_ok),
+                        ("agent", agent_ok),
+                    ] {
+                        if ok {
+                            present.push(name.to_string());
+                        } else {
+                            missing.push(name.to_string());
+                        }
+                    }
+
+                    let state = aggregate_state(
+                        &present.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &missing.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    );
+
+                    results.push(PluginScopeStatus {
+                        host: target.as_str().to_string(),
+                        scope: scope.as_str().to_string(),
+                        state,
+                        present,
+                        missing,
+                        config_path: codex_dir.to_string_lossy().to_string(),
+                    });
+                }
+
+                BridgeTarget::Kimetsu => {
+                    // Not a user-installable host; skip.
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Public entry point: read-only scan of Kimetsu plugin wiring.
+pub fn plugin_status(workspace: &Path) -> Vec<PluginScopeStatus> {
+    plugin_status_inner(workspace)
+}
+
+// ---------------------------------------------------------------------------
 // plugin_uninstall — surgical inverse of plugin_install
 // ---------------------------------------------------------------------------
 
@@ -3289,5 +3622,319 @@ mod tests {
 
         fs::remove_dir_all(ws).ok();
         fs::remove_dir_all(home).ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // QQ1 — plugin_status detection tests
+    // -------------------------------------------------------------------------
+
+    /// Fresh workspace (nothing installed) → all four scopes Absent.
+    #[test]
+    fn qq1_status_fresh_workspace_all_absent() {
+        let root = temp_root("qq1_status_fresh");
+        let statuses = plugin_status_inner(&root);
+        // Should have 4 entries: ClaudeCode/workspace, ClaudeCode/global,
+        // Codex/workspace, Codex/global (global may be absent if HOME works).
+        assert!(!statuses.is_empty(), "should have status entries");
+        for s in &statuses {
+            // A fresh workspace has nothing; workspace-scope entries must be Absent.
+            if s.scope == "workspace" {
+                assert!(
+                    matches!(s.state, WiringState::Absent),
+                    "{}/{} should be Absent in fresh workspace, got present={:?}",
+                    s.host,
+                    s.scope,
+                    s.present
+                );
+            }
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// After install (ClaudeCode, Workspace) → that entry is Installed with
+    /// correct present pieces; others stay Absent for workspace scope.
+    #[test]
+    fn qq1_status_after_claude_code_workspace_install() {
+        let root = temp_root("qq1_status_after_install");
+        let fake_home = temp_root("qq1_status_home");
+
+        // Install with injected home so global detection uses fake_home.
+        plugin_install_inner(
+            &root,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true, // proactive
+            None, // workspace scope → no home needed
+        )
+        .expect("install");
+
+        let statuses = plugin_status_inner(&root);
+
+        let ws_claude = statuses
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("claude-code/workspace entry");
+
+        assert!(
+            matches!(ws_claude.state, WiringState::Installed),
+            "claude-code/workspace should be Installed after install; present={:?} missing={:?}",
+            ws_claude.present,
+            ws_claude.missing
+        );
+        assert!(
+            ws_claude.present.contains(&"hooks".to_string()),
+            "hooks should be present"
+        );
+        assert!(
+            ws_claude.present.contains(&"mcp".to_string()),
+            "mcp should be present"
+        );
+        assert!(
+            ws_claude.present.contains(&"CLAUDE.md".to_string()),
+            "CLAUDE.md should be present"
+        );
+        assert!(
+            ws_claude.present.contains(&"commands".to_string()),
+            "commands should be present"
+        );
+        assert!(
+            ws_claude.present.contains(&"agent".to_string()),
+            "agent should be present"
+        );
+        assert!(ws_claude.missing.is_empty(), "nothing should be missing");
+
+        // Codex workspace should still be Absent.
+        let ws_codex = statuses
+            .iter()
+            .find(|s| s.host == "codex" && s.scope == "workspace")
+            .expect("codex/workspace entry");
+        assert!(
+            matches!(ws_codex.state, WiringState::Absent),
+            "codex/workspace should still be Absent"
+        );
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(fake_home).ok();
+    }
+
+    /// Hand-crafted partial state (MCP key present, no hooks) → Partial with
+    /// correct present/missing.
+    #[test]
+    fn qq1_status_partial_claude_code_workspace() {
+        let root = temp_root("qq1_status_partial");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // Write only the MCP config (no hooks, no CLAUDE.md, no commands, no agent).
+        let mcp = root.join(".mcp.json");
+        fs::write(
+            &mcp,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": { "kimetsu": { "command": "kimetsu", "args": ["mcp", "serve"] } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let statuses = plugin_status_inner(&root);
+        let ws_claude = statuses
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("claude-code/workspace");
+
+        assert!(
+            matches!(ws_claude.state, WiringState::Partial),
+            "should be Partial; present={:?} missing={:?}",
+            ws_claude.present,
+            ws_claude.missing
+        );
+        assert!(
+            ws_claude.present.contains(&"mcp".to_string()),
+            "mcp should be present"
+        );
+        assert!(
+            ws_claude.missing.contains(&"hooks".to_string()),
+            "hooks should be missing"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Codex workspace: after install → Installed; partial (only MCP) → Partial.
+    #[test]
+    fn qq1_status_codex_workspace_install_and_partial() {
+        let root = temp_root("qq1_status_codex");
+
+        // Full install.
+        plugin_install_inner(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .expect("codex install");
+
+        let statuses = plugin_status_inner(&root);
+        let ws_codex = statuses
+            .iter()
+            .find(|s| s.host == "codex" && s.scope == "workspace")
+            .expect("codex/workspace");
+
+        assert!(
+            matches!(ws_codex.state, WiringState::Installed),
+            "codex/workspace should be Installed; present={:?} missing={:?}",
+            ws_codex.present,
+            ws_codex.missing
+        );
+        assert!(ws_codex.present.contains(&"hooks".to_string()));
+        assert!(ws_codex.present.contains(&"mcp".to_string()));
+        assert!(ws_codex.present.contains(&"skill".to_string()));
+        assert!(ws_codex.present.contains(&"agent".to_string()));
+
+        // Now create a fresh workspace with only codex config.toml (no hooks).
+        let root2 = temp_root("qq1_status_codex_partial");
+        let codex_dir = root2.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config = codex_dir.join("config.toml");
+        fs::write(
+            &config,
+            "[mcp_servers.kimetsu]\ncommand = \"kimetsu\"\nargs = [\"mcp\", \"serve\"]\n",
+        )
+        .unwrap();
+
+        let statuses2 = plugin_status_inner(&root2);
+        let partial = statuses2
+            .iter()
+            .find(|s| s.host == "codex" && s.scope == "workspace")
+            .expect("codex/workspace partial");
+
+        assert!(
+            matches!(partial.state, WiringState::Partial),
+            "should be Partial (only mcp); present={:?} missing={:?}",
+            partial.present,
+            partial.missing
+        );
+        assert!(partial.present.contains(&"mcp".to_string()));
+        assert!(partial.missing.contains(&"hooks".to_string()));
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(root2).ok();
+    }
+
+    /// User-only hooks/servers (non-kimetsu) don't make it report Installed.
+    #[test]
+    fn qq1_status_user_content_not_detected_as_kimetsu() {
+        let root = temp_root("qq1_status_user_content");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // Write settings.json with a non-kimetsu hook.
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "my-own-tool" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Write .mcp.json with a non-kimetsu server.
+        fs::write(
+            root.join(".mcp.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": { "my-server": { "command": "my-server" } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let statuses = plugin_status_inner(&root);
+        let ws_claude = statuses
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("claude-code/workspace");
+
+        assert!(
+            matches!(ws_claude.state, WiringState::Absent),
+            "user-only hooks/servers must not register as Kimetsu wiring"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Install (ClaudeCode workspace) → status Installed → uninstall → status Absent.
+    /// Running uninstall again (idempotent) → still Absent, no error.
+    #[test]
+    fn qq1_status_install_then_uninstall_flips_to_absent() {
+        let root = temp_root("qq1_status_uninstall");
+
+        plugin_install_inner(
+            &root,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            true,
+            None,
+        )
+        .expect("install");
+
+        // Confirm Installed.
+        let before = plugin_status_inner(&root);
+        let ws = before
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("ws entry");
+        assert!(
+            matches!(ws.state, WiringState::Installed),
+            "should be Installed before uninstall"
+        );
+
+        // Uninstall.
+        plugin_uninstall_inner(
+            &root,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            None,
+        )
+        .expect("uninstall");
+
+        // Confirm Absent.
+        let after = plugin_status_inner(&root);
+        let ws2 = after
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("ws entry after uninstall");
+        assert!(
+            matches!(ws2.state, WiringState::Absent),
+            "should be Absent after uninstall; present={:?}",
+            ws2.present
+        );
+
+        // Idempotent second uninstall — no error.
+        let result = plugin_uninstall_inner(
+            &root,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            None,
+        );
+        assert!(result.is_ok(), "second uninstall should be a clean no-op");
+        let after2 = plugin_status_inner(&root);
+        let ws3 = after2
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("ws entry after 2nd uninstall");
+        assert!(matches!(ws3.state, WiringState::Absent), "still Absent");
+
+        fs::remove_dir_all(root).ok();
     }
 }
