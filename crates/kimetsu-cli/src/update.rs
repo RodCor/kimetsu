@@ -10,6 +10,8 @@ use kimetsu_core::KimetsuResult;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
+use crate::process::{KimetsuProc, ProcKind};
+
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/RodCor/kimetsu/releases/latest";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -205,7 +207,70 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
 
     let mut updated = 0usize;
     let mut failed = Vec::new();
+    let mut stopped_mcp = 0usize;
     for install in installs {
+        // ── Windows pre-flight: detect locking processes and offer to stop them.
+        #[cfg(windows)]
+        {
+            let locking = crate::process::processes_locking_target(&install.path);
+            if !locking.is_empty() {
+                let is_tty = io::stdin().is_terminal();
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                let mut stdout = io::stdout();
+                let action = decide_preflight_action(
+                    &locking,
+                    is_tty,
+                    options.force,
+                    &mut reader,
+                    &mut stdout,
+                )
+                .unwrap_or(PreflightAction::Defer);
+                match action {
+                    PreflightAction::Stop => {
+                        let pids: Vec<u32> = locking.iter().map(|p| p.pid).collect();
+                        let results = crate::process::stop_processes(&pids);
+                        let mut all_ok = true;
+                        for (pid, result) in &results {
+                            match result {
+                                Ok(()) => println!("  stopped PID {pid}"),
+                                Err(e) => {
+                                    eprintln!("  failed to stop PID {pid}: {e}");
+                                    all_ok = false;
+                                }
+                            }
+                        }
+                        let n_mcp = locking
+                            .iter()
+                            .filter(|p| p.kind == ProcKind::McpServe)
+                            .count();
+                        if all_ok {
+                            stopped_mcp += n_mcp;
+                            // Brief poll: wait up to ~3 s for the OS to release the lock.
+                            let max_wait = Duration::from_secs(3);
+                            let poll = Duration::from_millis(200);
+                            let started = std::time::Instant::now();
+                            loop {
+                                if started.elapsed() >= max_wait {
+                                    break;
+                                }
+                                // Try a non-destructive open to probe lock release.
+                                if fs::File::open(&install.path).is_ok() {
+                                    break;
+                                }
+                                std::thread::sleep(poll);
+                            }
+                        }
+                        // Fall through to replace_installation.
+                    }
+                    PreflightAction::Defer => {
+                        // User declined or non-interactive: skip replace now;
+                        // schedule will happen inside replace_installation if still locked.
+                    }
+                }
+            }
+        }
+
         match replace_installation(&new_binary, &install.path) {
             Ok(ReplaceOutcome::Updated) => {
                 updated += 1;
@@ -223,6 +288,13 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
                 failed.push(install.path);
             }
         }
+    }
+
+    if stopped_mcp > 0 {
+        println!(
+            "hint: stopped {stopped_mcp} kimetsu process(es); your host agent (Claude Code / Codex) \
+             will respawn its MCP server on the next call — restart it to pick up the new version."
+        );
     }
 
     let _ = fs::remove_dir_all(&workdir);
@@ -692,6 +764,90 @@ enum RemoveOutcome {
     Scheduled,
 }
 
+/// Decision outcome for the update pre-flight locking check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightAction {
+    /// Stop the locking processes, then attempt the replace immediately.
+    Stop,
+    /// Skip stopping; fall back to deferred (schedule after process exit).
+    Defer,
+}
+
+/// Pure decision function for the pre-flight locking check.
+///
+/// Given a list of locking processes, TTY state, `--force` flag, and a
+/// reader/writer pair, prints the locking processes and prompts the user
+/// (when interactive) whether to stop them.
+///
+/// Rules:
+/// * Non-interactive (!is_tty) or `force` flag: print the PIDs and return
+///   `Defer` to protect CI from silent process kills.
+///   (If `force` is true the caller passes it as a signal that the user
+///   consented — we still defer because killing processes in CI is risky;
+///   the deferred-replace path is safe.)
+/// * Interactive (TTY, no `force`): print the list, prompt `[Y/n]`.
+///   `Y` / empty → `Stop`; `n` → `Defer`.
+pub fn decide_preflight_action<R: BufRead, W: Write>(
+    locking: &[KimetsuProc],
+    is_tty: bool,
+    force: bool,
+    reader: &mut R,
+    writer: &mut W,
+) -> KimetsuResult<PreflightAction> {
+    if locking.is_empty() {
+        return Ok(PreflightAction::Defer);
+    }
+
+    // Always print which processes are locking the binary.
+    writeln!(
+        writer,
+        "preflight: the following kimetsu process(es) are holding the binary locked:"
+    )?;
+    for p in locking {
+        writeln!(
+            writer,
+            "  PID {}  [{}]  workspace={}",
+            p.pid,
+            p.kind.label(),
+            p.workspace.as_deref().unwrap_or("-")
+        )?;
+    }
+
+    if !is_tty || force {
+        // Non-interactive: print guidance and defer.
+        let pid_list = locking
+            .iter()
+            .map(|p| p.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            writer,
+            "notice:  update will use deferred replace (completes after the process exits).\n\
+             To update immediately, stop those processes or run:\n\
+             Get-Process kimetsu | Stop-Process -Force  [PIDs: {pid_list}]"
+        )?;
+        return Ok(PreflightAction::Defer);
+    }
+
+    // Interactive: prompt.
+    write!(
+        writer,
+        "Stop these kimetsu process(es) so the update can complete now? [Y/n] "
+    )?;
+    writer.flush()?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let answer = line.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        Ok(PreflightAction::Stop)
+    } else {
+        writeln!(writer, "Skipping stop — will use deferred replace instead.")?;
+        Ok(PreflightAction::Defer)
+    }
+}
+
 fn replace_installation(source: &Path, target: &Path) -> KimetsuResult<ReplaceOutcome> {
     #[cfg(windows)]
     {
@@ -882,30 +1038,24 @@ fn is_sharing_violation(err: &io::Error) -> bool {
     matches!(err.kind(), io::ErrorKind::PermissionDenied)
 }
 
-/// Query PowerShell for kimetsu processes whose executable path matches
-/// `target` (canonicalized, case-insensitive). Excludes the current PID.
-/// Best-effort: returns empty on any query failure.
+/// Return PIDs of kimetsu processes locking `target`.
+///
+/// Delegates to `process::processes_locking_target` (the rich Q1 lister) so
+/// there is exactly one process-enumeration path in the codebase.
+/// Used by `replace_installation` / `remove_installation` for the post-failure
+/// deferred-replace scheduling (we need PIDs to wait for).
 #[cfg(windows)]
 fn kimetsu_processes_locking(target: &Path) -> Vec<u32> {
-    let output = ProcessCommand::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "Get-Process -Name kimetsu -ErrorAction SilentlyContinue | Select-Object Id,Path | ConvertTo-Csv -NoTypeInformation",
-        ])
-        .output();
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_locking_pids(&text, target, std::process::id())
+    crate::process::processes_locking_target(target)
+        .into_iter()
+        .map(|p| p.pid)
+        .collect()
 }
 
 /// Pure parser for the CSV output of `Get-Process … | ConvertTo-Csv`.
-/// Exported for unit-testing without spawning PowerShell.
+/// Kept as a pure utility / test helper; live code now routes through
+/// `process::processes_locking_target` so this is only called from tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_locking_pids(output: &str, target: &Path, current_pid: u32) -> Vec<u32> {
     // Canonicalize target once; fall back to as-is on failure.
     let target_canon = target
@@ -1442,5 +1592,134 @@ mod tests {
             uninstall_fail_msg.contains("Stop-Process"),
             "uninstall error must mention how to stop locking processes"
         );
+    }
+
+    // --- decide_preflight_action decision seam tests ---
+
+    fn make_locking_proc(pid: u32) -> KimetsuProc {
+        KimetsuProc {
+            pid,
+            exe_path: Some(r"C:\fake\kimetsu.exe".to_string()),
+            command_line: Some("kimetsu mcp serve --workspace C:\\proj".to_string()),
+            kind: crate::process::ProcKind::McpServe,
+            workspace: Some("C:\\proj".to_string()),
+        }
+    }
+
+    #[test]
+    fn preflight_empty_locking_list_returns_defer() {
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&[], true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Defer);
+        // Output should be empty — no prompt for empty list.
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn preflight_interactive_yes_returns_stop() {
+        let locking = vec![make_locking_proc(1234)];
+        let mut r = Cursor::new(b"y\n");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Stop, "y → Stop");
+        let out = String::from_utf8(w).unwrap();
+        assert!(out.contains("1234"), "output must mention the PID");
+    }
+
+    #[test]
+    fn preflight_interactive_yes_capital_returns_stop() {
+        let locking = vec![make_locking_proc(5678)];
+        let mut r = Cursor::new(b"Y\n");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Stop);
+    }
+
+    #[test]
+    fn preflight_interactive_yes_full_word_returns_stop() {
+        let locking = vec![make_locking_proc(9999)];
+        let mut r = Cursor::new(b"yes\n");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Stop);
+    }
+
+    #[test]
+    fn preflight_interactive_empty_line_returns_stop_default() {
+        // Empty input → default Y.
+        let locking = vec![make_locking_proc(1111)];
+        let mut r = Cursor::new(b"\n");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Stop, "empty input → default Stop");
+    }
+
+    #[test]
+    fn preflight_interactive_n_returns_defer() {
+        let locking = vec![make_locking_proc(2222)];
+        let mut r = Cursor::new(b"n\n");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Defer, "n → Defer");
+        let out = String::from_utf8(w).unwrap();
+        assert!(
+            out.contains("deferred"),
+            "output must mention deferred replace"
+        );
+    }
+
+    #[test]
+    fn preflight_interactive_no_returns_defer() {
+        let locking = vec![make_locking_proc(3333)];
+        let mut r = Cursor::new(b"no\n");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Defer);
+    }
+
+    #[test]
+    fn preflight_non_tty_returns_defer() {
+        // Non-interactive: never Stop silently.
+        let locking = vec![make_locking_proc(4444)];
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, false, false, &mut r, &mut w).unwrap();
+        assert_eq!(action, PreflightAction::Defer, "non-TTY → Defer");
+        let out = String::from_utf8(w).unwrap();
+        // Should print the PIDs and a notice about deferred replace.
+        assert!(
+            out.contains("4444"),
+            "non-TTY output must mention the locking PID"
+        );
+        assert!(
+            out.contains("deferred") || out.contains("Stop-Process"),
+            "non-TTY output must mention the deferred path or manual command"
+        );
+    }
+
+    #[test]
+    fn preflight_force_flag_returns_defer_not_silent_stop() {
+        // `--force` is not a license to kill processes silently in CI.
+        let locking = vec![make_locking_proc(5555)];
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let action = decide_preflight_action(&locking, false, true, &mut r, &mut w).unwrap();
+        assert_eq!(
+            action,
+            PreflightAction::Defer,
+            "--force + non-TTY → Defer (no silent kills)"
+        );
+    }
+
+    #[test]
+    fn preflight_multiple_procs_all_listed() {
+        let locking = vec![make_locking_proc(101), make_locking_proc(202)];
+        let mut r = Cursor::new(b"n\n");
+        let mut w = Vec::<u8>::new();
+        decide_preflight_action(&locking, true, false, &mut r, &mut w).unwrap();
+        let out = String::from_utf8(w).unwrap();
+        assert!(out.contains("101"), "PID 101 should appear in output");
+        assert!(out.contains("202"), "PID 202 should appear in output");
     }
 }

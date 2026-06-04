@@ -4,6 +4,7 @@
 //! `kimetsu stop`    — stop one or all kimetsu processes
 //! `kimetsu restart` — stop all MCP servers (host will respawn them on next use)
 
+use std::path::Path;
 use std::process::Command as ProcessCommand;
 
 use serde::{Deserialize, Serialize};
@@ -424,6 +425,40 @@ fn parse_csv_row(row: &str) -> Vec<String> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Update pre-flight helper
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Return every kimetsu process whose exe path matches `target` (canonicalized,
+/// case-insensitive on Windows).  Excludes the current process (same as
+/// `list_kimetsu_processes`).
+///
+/// Used by `kimetsu update` to detect processes that hold the target binary
+/// locked before attempting the replace, so the user can be offered a chance
+/// to stop them interactively.
+pub fn processes_locking_target(target: &Path) -> Vec<KimetsuProc> {
+    let target_canon = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let target_str = target_canon.to_string_lossy().to_lowercase();
+
+    list_kimetsu_processes()
+        .into_iter()
+        .filter(|p| {
+            p.exe_path
+                .as_deref()
+                .map(|exe| {
+                    let exe_path = Path::new(exe);
+                    let exe_canon = exe_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| exe_path.to_path_buf());
+                    exe_canon.to_string_lossy().to_lowercase() == target_str
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -682,5 +717,114 @@ mod tests {
         let row = r#""123","he said ""hello""","kimetsu""#;
         let cols = super::parse_csv_row(row);
         assert_eq!(cols, vec!["123", r#"he said "hello""#, "kimetsu"]);
+    }
+
+    // ── processes_locking_target path filtering ──────────────────────────────
+
+    /// Build a `KimetsuProc` with a specific exe_path for testing.
+    fn make_proc(pid: u32, exe: &str) -> KimetsuProc {
+        KimetsuProc {
+            pid,
+            exe_path: Some(exe.to_string()),
+            command_line: Some(format!("{exe} mcp serve")),
+            kind: ProcKind::McpServe,
+            workspace: None,
+        }
+    }
+
+    /// Build a `KimetsuProc` with no exe_path.
+    fn make_proc_no_exe(pid: u32) -> KimetsuProc {
+        KimetsuProc {
+            pid,
+            exe_path: None,
+            command_line: Some("kimetsu mcp serve".to_string()),
+            kind: ProcKind::McpServe,
+            workspace: None,
+        }
+    }
+
+    /// Thin version of `processes_locking_target` that accepts a pre-built
+    /// process list instead of calling the live OS query.  This is the pure
+    /// path-filter logic we want to unit-test.
+    fn filter_locking(procs: Vec<KimetsuProc>, target: &Path) -> Vec<KimetsuProc> {
+        let target_canon = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        let target_str = target_canon.to_string_lossy().to_lowercase();
+
+        procs
+            .into_iter()
+            .filter(|p| {
+                p.exe_path
+                    .as_deref()
+                    .map(|exe| {
+                        let exe_path = Path::new(exe);
+                        let exe_canon = exe_path
+                            .canonicalize()
+                            .unwrap_or_else(|_| exe_path.to_path_buf());
+                        exe_canon.to_string_lossy().to_lowercase() == target_str
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn locking_filter_returns_matching_procs() {
+        // Use a path that doesn't exist so canonicalize falls back to as-is on
+        // both sides — comparison is purely lexicographic in that case.
+        let target = Path::new(r"C:\fake\nonexistent\kimetsu.exe");
+        let procs = vec![
+            make_proc(101, r"C:\fake\nonexistent\kimetsu.exe"),
+            make_proc(102, r"C:\other\kimetsu.exe"),
+            make_proc(103, r"C:\fake\nonexistent\kimetsu.exe"),
+        ];
+        let result = filter_locking(procs, target);
+        let pids: Vec<u32> = result.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![101, 103], "only procs whose path matches target");
+    }
+
+    #[test]
+    fn locking_filter_case_insensitive() {
+        // On Windows path comparisons must be case-insensitive.
+        let target = Path::new(r"C:\FAKE\nonexistent\KIMETSU.EXE");
+        let procs = vec![
+            make_proc(201, r"C:\fake\nonexistent\kimetsu.exe"),
+            make_proc(202, r"D:\other\kimetsu.exe"),
+        ];
+        let result = filter_locking(procs, target);
+        // PID 201 matches (different case); PID 202 does not.
+        let pids: Vec<u32> = result.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![201], "case-insensitive path match");
+    }
+
+    #[test]
+    fn locking_filter_excludes_procs_with_no_exe() {
+        let target = Path::new(r"C:\fake\kimetsu.exe");
+        let procs = vec![
+            make_proc_no_exe(301),
+            make_proc(302, r"C:\fake\kimetsu.exe"),
+        ];
+        let result = filter_locking(procs, target);
+        let pids: Vec<u32> = result.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![302], "proc with no exe_path must be excluded");
+    }
+
+    #[test]
+    fn locking_filter_empty_list_returns_empty() {
+        let target = Path::new(r"C:\fake\kimetsu.exe");
+        let result = filter_locking(vec![], target);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn locking_filter_no_match_returns_empty() {
+        let target = Path::new(r"C:\fake\kimetsu.exe");
+        let procs = vec![
+            make_proc(401, r"C:\other\kimetsu.exe"),
+            make_proc(402, r"D:\somewhere\kimetsu.exe"),
+        ];
+        let result = filter_locking(procs, target);
+        assert!(result.is_empty(), "no proc matches target path");
     }
 }
