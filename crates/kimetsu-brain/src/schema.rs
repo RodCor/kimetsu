@@ -47,7 +47,7 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
 /// (`IF NOT EXISTS`).
 fn create_baseline(conn: &Connection) -> KimetsuResult<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    conn.pragma_update(None, "busy_timeout", 15_000)?;
 
     conn.execute_batch(
         "
