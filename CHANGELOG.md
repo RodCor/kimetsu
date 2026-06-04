@@ -52,9 +52,35 @@ ADDED
   * **`kimetsu doctor --selftest`** proves the brain pipeline works
     end-to-end (ingest → retrieve → record) without needing a live
     model or network.
+  * **Process & maintenance commands.** `kimetsu ps` / `stop` /
+    `restart` list and stop running MCP servers (the host respawns one
+    on the next tool call); `doctor` now flags a stale running MCP
+    server after an update. `kimetsu brain export` / `import` move
+    memories between brains as portable JSON; `kimetsu brain memory
+    edit` / `undo` fix a bad recording in place; `kimetsu runs prune`
+    and `kimetsu brain compact` (VACUUM, optional event-trim) keep the
+    install lean.
   * A 5-minute quickstart was added to the README.
 
 CHANGED
+  * **Lean `.kimetsu/`.** The `brain.db` events table is now the
+    durable log — memory writes no longer create per-write `runs/<id>/`
+    directories, so a brain-only `.kimetsu/` holds just `brain.db` +
+    `project.toml`. Transient proactive / chat / bench output moved to
+    `~/.kimetsu/cache/`.
+  * **Bidirectional config — every optional feature is turn-off-able.**
+    `[embedder] enabled`, `[broker] ambient`, `[kimetsu] use_user_brain`
+    (plus the existing `[learning] auto_harvest` / distiller and
+    `[shell] redact_secrets`) are honored at runtime with the precedence
+    env override > config > default. New `kimetsu config set` / `get`
+    read and flip them from the CLI.
+  * **Tiered, non-orphaning uninstall.** `kimetsu uninstall` now removes
+    the host plugin wiring (Claude Code & Codex hooks / MCP / skills /
+    agents, workspace + global) via a 3-tier prompt — binary only /
+    + plugins (default) / + brains (typed confirm) — so it no longer
+    leaves hosts pointing at a missing binary. A binary locked by a
+    running kimetsu process is handled (offer to stop it / deferred
+    delete) instead of a misleading "needs admin".
   * **Install/upgrade hardening.** Golden tests lock the
     non-destructive config-merge for Claude/Codex hooks, MCP config,
     and CLAUDE.md (user content always preserved; re-installs are
@@ -68,6 +94,9 @@ FIXED
   * **MSRV portability.** A 1.87-only API that violated the declared
     `rust-version = "1.85"` MSRV was replaced with the compatible
     1.85 equivalent.
+  * **GlobalUser memory writes work from any directory again** — a
+    regression where recording a global-user memory required a loadable
+    project is fixed.
 
 ## v0.9.0 — auto-harvested memories + SessionEnd distiller
 

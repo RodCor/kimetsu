@@ -246,6 +246,20 @@ auto-harvest, the distiller, secret redaction. The precedence is
 in `$EDITOR` and re-validates on save. Re-installing merges, so your toggles
 survive.
 
+### Maintenance & lifecycle
+
+```bash
+kimetsu config set embedder.enabled false   # flip any toggle (config get reads one)
+kimetsu brain export mem.json                # move memories between brains (import reads them)
+kimetsu brain memory edit <id> --text "…"    # fix a recording in place (undo retires the last one)
+kimetsu runs prune --older-than 30d          # drop old run dirs; brain compact VACUUMs brain.db
+kimetsu ps                                   # see running MCP servers; stop clears a stale one
+kimetsu uninstall                            # tiered: binary / + plugin wiring / + brains
+```
+
+`.kimetsu/` stays lean — just `brain.db` + `project.toml`; transient
+proactive/chat/bench output lives under `~/.kimetsu/cache/`.
+
 ---
 
 ## 5-minute quickstart — prove it works

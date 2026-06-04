@@ -30,39 +30,49 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize a Kimetsu project here (writes .kimetsu/project.toml + brain.db).
     Init(InitArgs),
+    /// Show, edit, get, or set fields in the project config (project.toml).
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// The memory brain: record, retrieve, search, curate, import/export, and maintain memories.
     Brain {
         #[command(subcommand)]
         command: BrainCommand,
     },
+    /// Run a coding task through the autonomous agent pipeline.
     Run {
         #[command(subcommand)]
         command: RunCommand,
     },
+    /// Run benchmark suites (Terminal-Bench / SWE-bench).
     Bench {
         #[command(subcommand)]
         command: BenchCommand,
     },
+    /// Inspect and prune agent run history.
     Runs {
         #[command(subcommand)]
         command: RunsCommand,
     },
+    /// Manage the project lock (clear a stale lock).
     Lock {
         #[command(subcommand)]
         command: LockCommand,
     },
+    /// Cross-harness skill portability: discover, import, and export skills between hosts.
     Bridge {
         #[command(subcommand)]
         command: BridgeCommand,
     },
+    /// Run the MCP server that exposes the brain to host agents.
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Install Kimetsu's plugin wiring (MCP + hooks) into a host agent (Claude Code / Codex).
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
@@ -263,75 +273,100 @@ struct ChatArgs {
 
 #[derive(Debug, Subcommand)]
 enum BridgeCommand {
+    /// Discover skills/extensions across host roots and print what was found.
     Scan(BridgeWorkspaceArgs),
+    /// Alias for `scan` — report discoverable skills + extensions.
     Status(BridgeWorkspaceArgs),
+    /// Import a discovered skill bundle into workspace .kimetsu/extensions.
     Import(BridgeImportArgs),
+    /// Export a skill to another host format (claude-code | codex | kimetsu).
     Export(BridgeExportArgs),
+    /// Mirror all discovered skill bundles into .kimetsu/extensions.
     Sync(BridgeSyncArgs),
+    /// Alias for `scan` — discovery health check across host roots.
     Doctor(BridgeWorkspaceArgs),
 }
 
 #[derive(Debug, Args)]
 struct BridgeWorkspaceArgs {
+    /// Workspace root to scan. Defaults to current directory.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// Do not scan logged-in user tool homes (~/.codex, ~/.claude, etc.).
     #[arg(long)]
     no_user_skills: bool,
 }
 
 #[derive(Debug, Args)]
 struct BridgeImportArgs {
+    /// Name (or path) of the discovered skill bundle to import.
     selection: String,
+    /// Workspace root to import into. Defaults to current directory.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// Overwrite an existing .kimetsu/extensions/<name> import.
     #[arg(long)]
     force: bool,
+    /// Do not scan logged-in user tool homes when resolving the selection.
     #[arg(long)]
     no_user_skills: bool,
 }
 
 #[derive(Debug, Args)]
 struct BridgeExportArgs {
+    /// Name of the skill to export.
     selection: String,
+    /// Destination host format: claude-code | codex | kimetsu.
     target: String,
+    /// Workspace root to export from. Defaults to current directory.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// Overwrite an existing export at the destination.
     #[arg(long)]
     force: bool,
+    /// Do not scan logged-in user tool homes when resolving the selection.
     #[arg(long)]
     no_user_skills: bool,
 }
 
 #[derive(Debug, Args)]
 struct BridgeSyncArgs {
+    /// Workspace root to sync. Defaults to current directory.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// Overwrite existing bundles in .kimetsu/extensions.
     #[arg(long)]
     force: bool,
+    /// Do not scan logged-in user tool homes during discovery.
     #[arg(long)]
     no_user_skills: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum McpCommand {
+    /// Start the MCP server (stdio) for a host agent.
     Serve(McpServeArgs),
 }
 
 #[derive(Debug, Args)]
 struct McpServeArgs {
+    /// Workspace root the brain + skills resolve against. Defaults to current dir.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// Do not expose skills from logged-in user tool homes.
     #[arg(long)]
     no_user_skills: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
+    /// Wire Kimetsu into a host (.mcp.json/.claude or .codex + hooks).
     Install(PluginInstallArgs),
 }
 
 #[derive(Debug, Args)]
 struct PluginInstallArgs {
+    /// Host to install into: claude-code | codex | kimetsu.
     target: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
@@ -363,6 +398,7 @@ struct PluginInstallArgs {
 
 #[derive(Debug, Args)]
 struct InitArgs {
+    /// Overwrite an existing project.toml / brain.db instead of keeping it.
     #[arg(long)]
     force: bool,
     /// Skip writing .claude/CLAUDE.md and .claude/settings.json.
@@ -373,7 +409,9 @@ struct InitArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Print the parsed project config.
     Show,
+    /// Open project.toml in $EDITOR and re-validate on save.
     Edit,
     /// Read one field from the EFFECTIVE config (serde defaults included).
     ///
@@ -401,11 +439,16 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum BrainCommand {
+    /// Index repo files + manifests into the brain.
     IngestRepo {
+        /// Repo root to index.
         path: PathBuf,
     },
+    /// Full-text search over indexed file capsules.
     Search(SearchArgs),
+    /// Retrieve a ranked context bundle for a query/stage.
     Context(ContextArgs),
+    /// Inspect and curate individual memories (add, list, review, prune…).
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
@@ -420,6 +463,7 @@ enum BrainCommand {
         #[arg(long)]
         from_traces: bool,
     },
+    /// Quick memory + run counts.
     Stats,
     /// Brain health summary — memory counts, domain groups,
     /// pending proposals, unresolved conflicts, and usefulness bands.
@@ -677,16 +721,21 @@ struct BrainImportArgs {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
+    /// Search text (matched against indexed file capsules).
     query: String,
+    /// Max results to return.
     #[arg(long, default_value_t = 10)]
     limit: u32,
 }
 
 #[derive(Debug, Args)]
 struct ContextArgs {
+    /// Query the retrieval ranks capsules against.
     query: String,
+    /// Pipeline stage the bundle is shaped for (e.g. localization).
     #[arg(long, default_value = "localization")]
     stage: String,
+    /// Token budget the returned bundle must fit within.
     #[arg(long, default_value_t = 6000)]
     budget_tokens: u32,
     /// Print machine-readable JSON for hooks and harness wrappers.
@@ -702,11 +751,17 @@ struct ContextArgs {
 
 #[derive(Debug, Subcommand)]
 enum MemoryCommand {
+    /// Add a durable memory directly.
     Add(MemoryAddArgs),
+    /// List active memories with usefulness stats.
     List,
+    /// List pending proposals awaiting review.
     Proposals(ProposalsArgs),
+    /// Promote a proposal into an active memory.
     Accept(AcceptArgs),
+    /// Reject a pending proposal.
     Reject(RejectArgs),
+    /// Retire a memory (keeps the row, stops retrieving it).
     Invalidate(InvalidateArgs),
     /// Batch review pending memory proposals in non-interactive mode
     /// (interactive TTY review available separately).
@@ -763,6 +818,7 @@ struct BlameArgs {
 
 #[derive(Debug, Args)]
 struct InvalidateArgs {
+    /// The memory id to retire.
     memory_id: String,
     /// Short note persisted alongside invalidated_at; rendered in
     /// `memory list` so the human reviewer remembers why this memory
@@ -773,10 +829,13 @@ struct InvalidateArgs {
 
 #[derive(Debug, Args)]
 struct MemoryAddArgs {
+    /// Scope to store under: global_user | project | repo | run.
     #[arg(long)]
     scope: String,
+    /// Memory kind: fact | preference | convention | command | failure_pattern.
     #[arg(long, default_value = "fact")]
     kind: String,
+    /// The memory text to store.
     text: String,
 }
 
@@ -804,6 +863,7 @@ struct ProposalsArgs {
 
 #[derive(Debug, Args)]
 struct AcceptArgs {
+    /// The proposal id to promote.
     proposal_id: String,
     /// Override the proposal's scope when promoting it to an accepted memory.
     #[arg(long)]
@@ -815,6 +875,7 @@ struct AcceptArgs {
 
 #[derive(Debug, Args)]
 struct RejectArgs {
+    /// The proposal id to reject.
     proposal_id: String,
     /// Optional short note; persisted on the memory_proposals row for triage.
     #[arg(long)]
@@ -925,13 +986,20 @@ struct MemoryUndoArgs {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
+    /// Run a coding task end-to-end through the agent pipeline.
     Coding(CodingArgs),
-    Abort { run_id: String },
+    /// Abort an in-flight run by id.
+    Abort {
+        /// The run id to abort.
+        run_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum BenchCommand {
+    /// Run the Terminal-Bench suite against a repo.
     Run(BenchRunArgs),
+    /// Run the SWE-bench suite from a tasks JSONL.
     Swe(SweArgs),
 }
 
@@ -960,12 +1028,16 @@ struct SweArgs {
 
 #[derive(Debug, Args)]
 struct BenchRunArgs {
+    /// Repo to benchmark. Defaults to current directory.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Keep generated fixtures on disk after the run (for debugging).
     #[arg(long)]
     keep_fixtures: bool,
+    /// Drive tasks with a live model instead of the offline stub.
     #[arg(long)]
     model_backed: bool,
+    /// Hard cap on tasks executed.
     #[arg(long)]
     limit: Option<usize>,
     /// Soft cost cap; bench stops scheduling new tasks once cumulative model
@@ -979,27 +1051,38 @@ struct BenchRunArgs {
 
 #[derive(Debug, Args)]
 struct CodingArgs {
+    /// Repo the agent operates on. Defaults to current directory.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Plan only; stop before applying the patch.
     #[arg(long)]
     dry_run: bool,
+    /// Permit high-risk shell commands the safety gate would otherwise block.
     #[arg(long)]
     allow_high_risk: bool,
+    /// Run without a model (offline/stub mode).
     #[arg(long)]
     no_model: bool,
+    /// Disable brain retrieval (broker_off) for this run.
     #[arg(long)]
     no_broker: bool,
+    /// Disable secret redaction in shell output.
     #[arg(long)]
     no_redact: bool,
+    /// Verbose debug tracing.
     #[arg(long)]
     debug: bool,
+    /// The task description for the agent to carry out.
     task: String,
 }
 
 #[derive(Debug, Subcommand)]
 enum RunsCommand {
+    /// List recorded agent runs.
     List,
+    /// Show one run's metadata + outcome.
     Show {
+        /// The run id to show.
         run_id: String,
     },
     /// Remove old run directories from .kimetsu/runs/.
@@ -1049,7 +1132,9 @@ struct PruneRunsArgs {
 
 #[derive(Debug, Subcommand)]
 enum LockCommand {
+    /// Clear a stale project lock.
     Clear {
+        /// Remove the lock even if it appears to be held by a live process.
         #[arg(long)]
         force: bool,
     },
