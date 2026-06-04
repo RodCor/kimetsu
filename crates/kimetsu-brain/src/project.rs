@@ -458,7 +458,6 @@ pub fn add_memory(
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory add", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let memory_id = Ulid::new().to_string();
     let normalized = normalize_memory_text(text);
 
@@ -497,8 +496,6 @@ pub fn add_memory(
             "config_hash": config_hash(&paths.project_toml)?,
         }),
     );
-    writer.append(&started, true)?;
-
     let accepted = Event::new(
         run_id,
         "memory.accepted",
@@ -517,7 +514,6 @@ pub fn add_memory(
             }
         }),
     );
-    writer.append(&accepted, true)?;
 
     let finished = Event::new(
         run_id,
@@ -529,7 +525,6 @@ pub fn add_memory(
             "total_tool_calls": 0,
         }),
     );
-    writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, accepted, finished])?;
 
@@ -581,11 +576,9 @@ pub fn propose_memory(
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "memory propose", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let proposal_id = Ulid::new().to_string();
 
     let started = admin_started_event(&paths, &config, run_id, "memory propose")?;
-    writer.append(&started, true)?;
 
     let proposed = Event::new(
         run_id,
@@ -600,10 +593,8 @@ pub fn propose_memory(
             "source_event_ids": [],
         }),
     );
-    writer.append(&proposed, true)?;
 
     let finished = admin_finished_event(run_id);
-    writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, proposed, finished])?;
     Ok(proposal_id)
@@ -1261,10 +1252,8 @@ pub fn ingest_repo(start: &Path) -> KimetsuResult<RepoIngestSummary> {
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain ingest-repo", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
 
     let started = admin_started_event(&paths, &config, run_id, "repo ingest")?;
-    writer.append(&started, true)?;
 
     let summary = ingest::ingest_repo(&conn, &paths, &config)?;
 
@@ -1278,10 +1267,8 @@ pub fn ingest_repo(start: &Path) -> KimetsuResult<RepoIngestSummary> {
             "manifests": summary.manifests,
         }),
     );
-    writer.append(&ingested, true)?;
 
     let finished = admin_finished_event(run_id);
-    writer.append(&finished, true)?;
     projector::apply_events(&conn, &[started, ingested, finished])?;
 
     Ok(summary)
@@ -1516,12 +1503,10 @@ fn propose_benchmark_memory(
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "benchmark memory proposal", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let proposal_id = Ulid::new().to_string();
     // v0.4.5: redact secrets in the proposal text + rationale before
-    // they hit the trace + memory_proposals table. Benchmark outcomes
-    // pull from tool output, which is exactly where a model-leaked
-    // token would surface.
+    // they hit the memory_proposals table. Benchmark outcomes pull from
+    // tool output, which is exactly where a model-leaked token would surface.
     let raw_text = benchmark::proposal_memory_text(outcome, proposal);
     let text_redaction = redact::redact_secrets(&raw_text);
     if text_redaction.was_redacted() {
@@ -1540,7 +1525,6 @@ fn propose_benchmark_memory(
     let rationale = redact::redact_secrets(&rationale_raw).text;
 
     let started = admin_started_event(&paths, &config, run_id, "benchmark memory proposal")?;
-    writer.append(&started, true)?;
 
     let proposed = Event::new(
         run_id,
@@ -1555,10 +1539,8 @@ fn propose_benchmark_memory(
             "source_event_ids": [],
         }),
     );
-    writer.append(&proposed, true)?;
 
     let finished = admin_finished_event(run_id);
-    writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, proposed, finished])?;
     Ok((proposal_id, text))
@@ -1573,7 +1555,6 @@ pub fn accept_proposal(
     let proposal = load_pending_proposal(&conn, proposal_id)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory accept", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
     let memory_id = Ulid::new().to_string();
     let normalized = normalize_memory_text(&proposal.text);
 
@@ -1587,7 +1568,6 @@ pub fn accept_proposal(
         .unwrap_or(proposal.proposed_confidence);
 
     let started = admin_started_event(&paths, &config, run_id, "memory accept")?;
-    writer.append(&started, true)?;
 
     let accepted = Event::new(
         run_id,
@@ -1609,10 +1589,8 @@ pub fn accept_proposal(
             }
         }),
     );
-    writer.append(&accepted, true)?;
 
     let finished = admin_finished_event(run_id);
-    writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, accepted.clone(), finished])?;
     conn.execute(
@@ -1652,7 +1630,6 @@ pub fn invalidate_memory(start: &Path, memory_id: &str, reason: Option<&str>) ->
 
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory invalidate", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
 
     let resolved_reason = reason
         .and_then(|s| {
@@ -1666,7 +1643,6 @@ pub fn invalidate_memory(start: &Path, memory_id: &str, reason: Option<&str>) ->
         .unwrap_or_else(|| "invalidated_by_cli".to_string());
 
     let started = admin_started_event(&paths, &config, run_id, "memory invalidate")?;
-    writer.append(&started, true)?;
 
     let invalidated = Event::new(
         run_id,
@@ -1676,10 +1652,8 @@ pub fn invalidate_memory(start: &Path, memory_id: &str, reason: Option<&str>) ->
             "reason": resolved_reason,
         }),
     );
-    writer.append(&invalidated, true)?;
 
     let finished = admin_finished_event(run_id);
-    writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, invalidated, finished])?;
     Ok(())
@@ -1690,7 +1664,6 @@ pub fn reject_proposal(start: &Path, proposal_id: &str, reason: Option<&str>) ->
     let _proposal = load_pending_proposal(&conn, proposal_id)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory reject", Some(run_id))?;
-    let (mut writer, _run_paths) = TraceWriter::create(&paths, run_id)?;
 
     let resolved_reason = reason
         .and_then(|s| {
@@ -1704,7 +1677,6 @@ pub fn reject_proposal(start: &Path, proposal_id: &str, reason: Option<&str>) ->
         .unwrap_or_else(|| "rejected_by_cli".to_string());
 
     let started = admin_started_event(&paths, &config, run_id, "memory reject")?;
-    writer.append(&started, true)?;
 
     let rejected = Event::new(
         run_id,
@@ -1714,10 +1686,8 @@ pub fn reject_proposal(start: &Path, proposal_id: &str, reason: Option<&str>) ->
             "reason": resolved_reason,
         }),
     );
-    writer.append(&rejected, true)?;
 
     let finished = admin_finished_event(run_id);
-    writer.append(&finished, true)?;
 
     projector::apply_events(&conn, &[started, rejected, finished])?;
     Ok(())
@@ -3615,10 +3585,14 @@ max_total_cost_usd = 250.0
         });
     }
 
-    /// W1.3 --from-traces path: add a memory (writes a trace.jsonl today),
-    /// DELETE FROM events to simulate a blank events table, wipe derived tables,
-    /// then call rebuild_projection(true) — it must re-import from on-disk
-    /// trace files and restore the memory.
+    /// W1.3 --from-traces path: manually write a trace.jsonl on disk (simulating
+    /// a legacy run that pre-dates W1.4, when memory ops did write trace files),
+    /// wipe the events table and derived tables, then call rebuild_projection(true)
+    /// — it must re-import from the on-disk trace file and restore the memory.
+    ///
+    /// W1.4 note: add_memory no longer writes trace files, so this test creates
+    /// the trace file directly via TraceWriter (the same way agent runs still do).
+    /// This keeps the --from-traces code-path exercised for genuine legacy traces.
     #[test]
     fn rebuild_from_traces_flag_reimports_on_disk_traces() {
         with_user_brain_disabled(|| {
@@ -3626,13 +3600,45 @@ max_total_cost_usd = 250.0
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
 
-            let memory_id = add_memory(
-                &root,
-                MemoryScope::Repo,
-                MemoryKind::Fact,
-                "W1.3: from_traces re-imports events from trace.jsonl files",
-            )
-            .expect("add memory");
+            // Build a legacy trace.jsonl directly — simulates what add_memory
+            // wrote before W1.4. This keeps --from-traces coverage alive for
+            // genuine legacy brain directories that still have trace files.
+            let memory_id = Ulid::new().to_string();
+            let run_id = RunId::new();
+            {
+                let (paths, config, conn) = load_project(&root).expect("load");
+                let (mut writer, _run_paths) =
+                    TraceWriter::create(&paths, run_id).expect("trace writer");
+                let text = "W1.3: from_traces re-imports events from trace.jsonl files";
+                let normalized = kimetsu_core::memory::normalize_memory_text(text);
+                let evs: Vec<Event> = vec![
+                    admin_started_event(&paths, &config, run_id, "memory add").expect("started"),
+                    Event::new(
+                        run_id,
+                        "memory.accepted",
+                        serde_json::json!({
+                            "proposal_id": null,
+                            "memory_id": memory_id,
+                            "scope": "repo",
+                            "kind": "fact",
+                            "text": text,
+                            "normalized_text": normalized,
+                            "confidence": 1.0,
+                            "provenance_snapshot": {
+                                "source": "manual_cli",
+                                "run_id": run_id.to_string(),
+                                "text": text,
+                            }
+                        }),
+                    ),
+                    admin_finished_event(run_id),
+                ];
+                for ev in &evs {
+                    writer.append(ev, true).expect("append");
+                }
+                // Also persist to events table so the memory shows up now.
+                projector::apply_events(&conn, &evs).expect("apply");
+            }
 
             // Confirm memory is present.
             let initial = list_memories(&root).expect("list initial");
@@ -3667,10 +3673,13 @@ max_total_cost_usd = 250.0
         });
     }
 
-    /// W1.3 auto-fallback: add a memory (events in DB + trace on disk), then
-    /// DELETE FROM events to simulate a pre-W1.1 wipe, wipe derived tables too,
-    /// and call rebuild_projection(false). The auto-fallback detects an empty
-    /// events table with existing traces and imports them automatically.
+    /// W1.3 auto-fallback: manually write a trace.jsonl (simulating a legacy run),
+    /// wipe the events table and derived tables to simulate a pre-W1.1 state, then
+    /// call rebuild_projection(false). The auto-fallback detects the empty events
+    /// table, finds the on-disk traces, and imports them automatically.
+    ///
+    /// W1.4 note: add_memory no longer writes trace files, so the trace is created
+    /// directly via TraceWriter — the same pattern a real legacy brain would have.
     #[test]
     fn rebuild_auto_fallback_imports_traces_when_events_table_empty() {
         with_user_brain_disabled(|| {
@@ -3678,13 +3687,43 @@ max_total_cost_usd = 250.0
             fs::create_dir_all(&root).expect("create temp project");
             init_project(&root, false).expect("init project");
 
-            let memory_id = add_memory(
-                &root,
-                MemoryScope::Repo,
-                MemoryKind::Convention,
-                "W1.3: auto-fallback recovers from pre-W1.1 events wipe",
-            )
-            .expect("add memory");
+            // Write a legacy trace.jsonl directly to simulate a pre-W1.4 brain.
+            let memory_id = Ulid::new().to_string();
+            let run_id = RunId::new();
+            {
+                let (paths, config, conn) = load_project(&root).expect("load");
+                let (mut writer, _run_paths) =
+                    TraceWriter::create(&paths, run_id).expect("trace writer");
+                let text = "W1.3: auto-fallback recovers from pre-W1.1 events wipe";
+                let normalized = kimetsu_core::memory::normalize_memory_text(text);
+                let evs: Vec<Event> = vec![
+                    admin_started_event(&paths, &config, run_id, "memory add").expect("started"),
+                    Event::new(
+                        run_id,
+                        "memory.accepted",
+                        serde_json::json!({
+                            "proposal_id": null,
+                            "memory_id": memory_id,
+                            "scope": "repo",
+                            "kind": "convention",
+                            "text": text,
+                            "normalized_text": normalized,
+                            "confidence": 1.0,
+                            "provenance_snapshot": {
+                                "source": "manual_cli",
+                                "run_id": run_id.to_string(),
+                                "text": text,
+                            }
+                        }),
+                    ),
+                    admin_finished_event(run_id),
+                ];
+                for ev in &evs {
+                    writer.append(ev, true).expect("append");
+                }
+                // Persist to events table (simulates a post-W1.1 add, pre-W1.4).
+                projector::apply_events(&conn, &evs).expect("apply");
+            }
 
             // Simulate a pre-W1.1 rebuild that wiped the events table.
             // Leave the trace.jsonl files intact.
@@ -3711,6 +3750,238 @@ max_total_cost_usd = 250.0
                 "auto-fallback must restore memory from traces when events table was empty"
             );
             assert_eq!(restored[0].memory_id, memory_id);
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    // ── W1.4 tests ────────────────────────────────────────────────────────────
+
+    /// Helper: count subdirectories of `runs_dir` (each subdir is a run dir).
+    fn run_subdir_count(runs_dir: &std::path::Path) -> usize {
+        if !runs_dir.exists() {
+            return 0;
+        }
+        fs::read_dir(runs_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// W1.4: add_memory creates no on-disk run dir, but the memory is present
+    /// and the runs TABLE row exists (so blame still works).
+    #[test]
+    fn w1_4_add_memory_creates_no_run_dir_but_memory_and_runs_row_exist() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            // Derive runs_dir without holding a connection open across the test.
+            let runs_dir = {
+                let paths =
+                    kimetsu_core::paths::ProjectPaths::discover(&root).expect("discover paths");
+                paths.runs_dir.clone()
+            };
+            let before = run_subdir_count(&runs_dir);
+
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "W1.4: no run dir should be created for memory writes",
+            )
+            .expect("add memory");
+
+            // (a) No new run subdir on disk.
+            let after = run_subdir_count(&runs_dir);
+            assert_eq!(
+                after, before,
+                "add_memory must not create a runs/<id>/ directory (before={before}, after={after})"
+            );
+
+            // (b) Memory is listed.
+            let memories = list_memories(&root).expect("list");
+            assert!(
+                memories.iter().any(|m| m.memory_id == memory_id),
+                "memory must be present after add_memory"
+            );
+
+            // (c) The runs TABLE row exists (projector created it from run.started).
+            let runs_count: i64 = {
+                let (_paths, _config, conn) = load_project(&root).expect("load for runs check");
+                conn.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+                    .expect("count runs")
+            };
+            assert!(
+                runs_count >= 1,
+                "projector must have inserted a runs row from the run.started event (got {runs_count})"
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    /// W1.4: memory survives rebuild_projection(false) without any trace file
+    /// — proving events landed in the durable table.
+    #[test]
+    fn w1_4_memory_survives_rebuild_from_events_table_no_trace() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Convention,
+                "W1.4: events are durable without a trace file",
+            )
+            .expect("add memory");
+
+            // Wipe derived tables (leave events table).
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute_batch("DELETE FROM memories; DELETE FROM memories_fts;")
+                    .expect("wipe derived tables");
+            }
+
+            // rebuild_projection(false) uses the events table — no trace files needed.
+            let count = rebuild_projection(&root, false).expect("rebuild");
+            assert!(count > 0, "should have replayed events; got {count}");
+
+            let restored = list_memories(&root).expect("list after rebuild");
+            assert!(
+                restored.iter().any(|m| m.memory_id == memory_id),
+                "memory must survive rebuild from events table without a trace file"
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    /// W1.4: propose_memory, ingest_repo, invalidate_memory, and reject_proposal
+    /// likewise create no new on-disk run subdirectory.
+    #[test]
+    fn w1_4_memory_ops_create_no_run_dirs() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            // ingest_repo needs a real git repo with at least one file.
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"w14-fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .expect("write Cargo.toml");
+            init_project(&root, false).expect("init project");
+
+            // Derive runs_dir without holding a connection open across the test.
+            let runs_dir = {
+                let paths =
+                    kimetsu_core::paths::ProjectPaths::discover(&root).expect("discover paths");
+                paths.runs_dir.clone()
+            };
+
+            // propose_memory — creates no dir.
+            let before = run_subdir_count(&runs_dir);
+            let proposal_id = propose_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "W1.4 propose: no run dir",
+                0.5,
+                "test rationale",
+            )
+            .expect("propose");
+            assert_eq!(
+                run_subdir_count(&runs_dir),
+                before,
+                "propose_memory must not create a run dir"
+            );
+
+            // ingest_repo — creates no dir.
+            let before = run_subdir_count(&runs_dir);
+            ingest_repo(&root).expect("ingest");
+            assert_eq!(
+                run_subdir_count(&runs_dir),
+                before,
+                "ingest_repo must not create a run dir"
+            );
+
+            // reject_proposal — creates no dir.
+            let before = run_subdir_count(&runs_dir);
+            reject_proposal(&root, &proposal_id, Some("W1.4 test")).expect("reject");
+            assert_eq!(
+                run_subdir_count(&runs_dir),
+                before,
+                "reject_proposal must not create a run dir"
+            );
+
+            // invalidate_memory: add a real memory first, then invalidate it.
+            let mem_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Command,
+                "W1.4 invalidate: no run dir",
+            )
+            .expect("add");
+            let before = run_subdir_count(&runs_dir);
+            invalidate_memory(&root, &mem_id, Some("W1.4 test")).expect("invalidate");
+            assert_eq!(
+                run_subdir_count(&runs_dir),
+                before,
+                "invalidate_memory must not create a run dir"
+            );
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    /// W1.4: dedup hit (second identical add_memory call) creates no orphan run dir.
+    #[test]
+    fn w1_4_dedup_hit_creates_no_orphan_run_dir() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            // Derive runs_dir without holding a connection open across the test.
+            let runs_dir = {
+                let paths =
+                    kimetsu_core::paths::ProjectPaths::discover(&root).expect("discover paths");
+                paths.runs_dir.clone()
+            };
+
+            // First call: accepted.
+            let id1 = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "W1.4 dedup: identical text",
+            )
+            .expect("first add");
+
+            // Both calls produce 0 run dirs total (first also creates none).
+            let after_first = run_subdir_count(&runs_dir);
+            assert_eq!(after_first, 0, "first add must create no run dir");
+
+            // Second call: dedup hit, returns the same id immediately.
+            let id2 = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "W1.4 dedup: identical text",
+            )
+            .expect("second add");
+
+            assert_eq!(id1, id2, "dedup must return the same memory_id");
+            let after_second = run_subdir_count(&runs_dir);
+            assert_eq!(
+                after_second, 0,
+                "dedup hit must not create an orphan run dir"
+            );
 
             fs::remove_dir_all(root).expect("cleanup");
         });
