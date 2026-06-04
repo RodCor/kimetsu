@@ -334,10 +334,16 @@ enum BrainCommand {
         #[command(subcommand)]
         command: MemoryCommand,
     },
-    /// Rebuild the in-DB memory projection by replaying the event trace.
+    /// Rebuild the in-DB memory projection by replaying the event log.
     /// (Schema upgrades are automatic on open; this does not change the
-    /// schema version.)
-    Rebuild,
+    /// schema version.) Use --from-traces to re-import from the on-disk
+    /// trace.jsonl files (legacy recovery).
+    Rebuild {
+        /// Re-import the event log from on-disk run traces instead of the
+        /// brain.db events table (legacy recovery; normally unnecessary).
+        #[arg(long)]
+        from_traces: bool,
+    },
     Stats,
     /// Brain health summary — memory counts, domain groups,
     /// pending proposals, unresolved conflicts, and usefulness bands.
@@ -1514,8 +1520,8 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             Ok(())
         }
         BrainCommand::Memory { command } => memory(command),
-        BrainCommand::Rebuild => {
-            let events = project::rebuild_projection(&env::current_dir()?)?;
+        BrainCommand::Rebuild { from_traces } => {
+            let events = project::rebuild_projection(&env::current_dir()?, from_traces)?;
             println!("brain projection rebuilt from {events} events");
             Ok(())
         }

@@ -1723,12 +1723,36 @@ pub fn reject_proposal(start: &Path, proposal_id: &str, reason: Option<&str>) ->
     Ok(())
 }
 
-pub fn rebuild_projection(start: &Path) -> KimetsuResult<usize> {
+pub fn rebuild_projection(start: &Path, from_traces: bool) -> KimetsuResult<usize> {
     let (paths, _config, conn) = load_project(start)?;
     let _lock = ProjectLock::acquire(&paths, "brain rebuild", None)?;
-    let events = trace::read_all_traces(&paths)?;
-    projector::rebuild(&conn, &events)?;
-    Ok(events.len())
+
+    // Explicit legacy import: rebuild from on-disk trace.jsonl files (inserts
+    // any events missing from the table via OR IGNORE, then projects).
+    if from_traces {
+        let events = trace::read_all_traces(&paths)?;
+        projector::rebuild(&conn, &events)?;
+        return Ok(events.len());
+    }
+
+    // Auto-fallback: a brain whose events table was wiped by a pre-W1.1 rebuild
+    // still has its history only in trace.jsonl. If the table is empty but
+    // traces exist, import them first, then proceed.
+    let event_count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+    if event_count == 0 {
+        let events = trace::read_all_traces(&paths)?;
+        if !events.is_empty() {
+            eprintln!(
+                "[kimetsu] events table empty; importing {} event(s) from legacy traces",
+                events.len()
+            );
+            projector::rebuild(&conn, &events)?;
+            return Ok(events.len());
+        }
+    }
+
+    // Normal path: replay the durable events table in place.
+    projector::rebuild_in_place(&conn)
 }
 
 pub fn clear_lock(start: &Path) -> KimetsuResult<bool> {
@@ -2155,7 +2179,7 @@ mod tests {
             assert_eq!(memories.len(), 1);
             assert_eq!(memories[0].memory_id, memory_id);
 
-            let event_count = rebuild_projection(&root).expect("rebuild projection");
+            let event_count = rebuild_projection(&root, false).expect("rebuild projection");
             assert_eq!(event_count, 3);
 
             let memories = list_memories(&root).expect("list rebuilt memories");
@@ -2270,7 +2294,7 @@ mod tests {
             context.capsules
         );
 
-        rebuild_projection(&root).expect("rebuild projection");
+        rebuild_projection(&root, false).expect("rebuild projection");
         let matches = search_files(&root, "projection rebuild", 5).expect("search after rebuild");
         assert!(
             matches
@@ -2846,8 +2870,8 @@ mod tests {
             assert_eq!(invalidated_reason.as_deref(), Some("hurt 4 runs in a row"));
         }
 
-        // Rebuild from trace and confirm invalidation survives.
-        rebuild_projection(&root).expect("rebuild projection");
+        // Rebuild from table and confirm invalidation survives.
+        rebuild_projection(&root, false).expect("rebuild projection");
         {
             let (_paths, _config, conn) = load_project(&root).expect("load");
             let invalidated_at: Option<String> = conn
@@ -3525,6 +3549,168 @@ max_total_cost_usd = 250.0
                 msg.contains("unknown run_id"),
                 "error should mention 'unknown run_id', got: {msg}"
             );
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    // ── W1.3 tests ────────────────────────────────────────────────────────────
+
+    /// W1.3 normal path: add memories (events land in DB), wipe the derived
+    /// tables, call rebuild_projection(false) — it replays the events table
+    /// in-place and restores the memories without touching the events rows.
+    #[test]
+    fn rebuild_from_events_table_restores_memories() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let id1 = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Convention,
+                "W1.3: prefer explicit error types over anyhow in library crates",
+            )
+            .expect("add memory 1");
+            let id2 = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Command,
+                "W1.3: run cargo fmt --all before committing",
+            )
+            .expect("add memory 2");
+
+            // Wipe the derived tables — events table stays intact.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute_batch("DELETE FROM memories; DELETE FROM memories_fts;")
+                    .expect("wipe derived tables");
+            }
+
+            // Sanity: memories are gone.
+            let gone = list_memories(&root).expect("list after wipe");
+            assert_eq!(gone.len(), 0, "derived tables should be empty after wipe");
+
+            // Rebuild from the events table (normal path, from_traces = false).
+            let count = rebuild_projection(&root, false).expect("rebuild_projection");
+            assert!(
+                count > 0,
+                "should have replayed at least one event; got {count}"
+            );
+
+            // Both memories must be restored.
+            let restored = list_memories(&root).expect("list after rebuild");
+            assert_eq!(
+                restored.len(),
+                2,
+                "both memories should be restored after rebuild; got {:?}",
+                restored.iter().map(|m| &m.memory_id).collect::<Vec<_>>()
+            );
+            let ids: Vec<_> = restored.iter().map(|m| m.memory_id.clone()).collect();
+            assert!(ids.contains(&id1), "id1 must be restored");
+            assert!(ids.contains(&id2), "id2 must be restored");
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    /// W1.3 --from-traces path: add a memory (writes a trace.jsonl today),
+    /// DELETE FROM events to simulate a blank events table, wipe derived tables,
+    /// then call rebuild_projection(true) — it must re-import from on-disk
+    /// trace files and restore the memory.
+    #[test]
+    fn rebuild_from_traces_flag_reimports_on_disk_traces() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Fact,
+                "W1.3: from_traces re-imports events from trace.jsonl files",
+            )
+            .expect("add memory");
+
+            // Confirm memory is present.
+            let initial = list_memories(&root).expect("list initial");
+            assert_eq!(initial.len(), 1);
+
+            // Wipe both events table AND derived tables to simulate a fully
+            // blank DB that still has trace.jsonl files on disk.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute_batch(
+                    "DELETE FROM events; DELETE FROM memories; DELETE FROM memories_fts;",
+                )
+                .expect("wipe events + derived tables");
+            }
+
+            // rebuild_projection with from_traces = true must re-import.
+            let count = rebuild_projection(&root, true).expect("rebuild_projection --from-traces");
+            assert!(
+                count > 0,
+                "should have imported ≥1 event from on-disk traces; got {count}"
+            );
+
+            let restored = list_memories(&root).expect("list after trace import");
+            assert_eq!(
+                restored.len(),
+                1,
+                "memory must be restored from on-disk traces"
+            );
+            assert_eq!(restored[0].memory_id, memory_id);
+
+            fs::remove_dir_all(root).expect("cleanup");
+        });
+    }
+
+    /// W1.3 auto-fallback: add a memory (events in DB + trace on disk), then
+    /// DELETE FROM events to simulate a pre-W1.1 wipe, wipe derived tables too,
+    /// and call rebuild_projection(false). The auto-fallback detects an empty
+    /// events table with existing traces and imports them automatically.
+    #[test]
+    fn rebuild_auto_fallback_imports_traces_when_events_table_empty() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Convention,
+                "W1.3: auto-fallback recovers from pre-W1.1 events wipe",
+            )
+            .expect("add memory");
+
+            // Simulate a pre-W1.1 rebuild that wiped the events table.
+            // Leave the trace.jsonl files intact.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute_batch(
+                    "DELETE FROM events; DELETE FROM memories; DELETE FROM memories_fts;",
+                )
+                .expect("simulate pre-W1.1 wipe");
+            }
+
+            // Call rebuild with from_traces = false; the auto-fallback should
+            // detect the empty events table and import from traces.
+            let count = rebuild_projection(&root, false).expect("rebuild_projection auto-fallback");
+            assert!(
+                count > 0,
+                "auto-fallback should have imported ≥1 event from traces; got {count}"
+            );
+
+            let restored = list_memories(&root).expect("list after auto-fallback");
+            assert_eq!(
+                restored.len(),
+                1,
+                "auto-fallback must restore memory from traces when events table was empty"
+            );
+            assert_eq!(restored[0].memory_id, memory_id);
 
             fs::remove_dir_all(root).expect("cleanup");
         });
