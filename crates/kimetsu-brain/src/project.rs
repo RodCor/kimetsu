@@ -476,9 +476,7 @@ pub fn add_memory(
             .and_then(|paths| load_config(&paths).ok())
             .map(|cfg| cfg.kimetsu.use_user_brain)
             .unwrap_or(true);
-        if let Some(user_conn) =
-            user_brain::open_user_brain_for_config(use_user_brain)?
-        {
+        if let Some(user_conn) = user_brain::open_user_brain_for_config(use_user_brain)? {
             return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
         }
         // User brain disabled/unreachable → fall through to the project DB
@@ -4247,13 +4245,13 @@ max_total_cost_usd = 250.0
     fn p0_global_user_add_memory_works_from_non_project_dir() {
         use crate::user_brain::{list_user_memories, open_user_brain_readonly};
 
-        let user_brain_dir = std::env::temp_dir()
-            .join(format!("kimetsu-p0-ubrain-{}", Ulid::new()));
+        let user_brain_dir =
+            std::env::temp_dir().join(format!("kimetsu-p0-ubrain-{}", Ulid::new()));
         fs::create_dir_all(&user_brain_dir).expect("create user brain dir");
 
         // `start` is a plain temp dir — NOT a kimetsu project.
-        let non_project_dir = std::env::temp_dir()
-            .join(format!("kimetsu-p0-nonproj-{}", Ulid::new()));
+        let non_project_dir =
+            std::env::temp_dir().join(format!("kimetsu-p0-nonproj-{}", Ulid::new()));
         fs::create_dir_all(&non_project_dir).expect("create non-project dir");
 
         with_user_brain_at_p0(&user_brain_dir, || {
@@ -4271,8 +4269,9 @@ max_total_cost_usd = 250.0
                 .expect("user brain must exist after write");
             let mems = list_user_memories(&conn).expect("list");
             assert!(
-                mems.iter()
-                    .any(|m| m.text.contains("P0 regression: GlobalUser write from non-project dir")),
+                mems.iter().any(|m| m
+                    .text
+                    .contains("P0 regression: GlobalUser write from non-project dir")),
                 "P0: the GlobalUser memory must land in the user brain"
             );
         });
@@ -4289,8 +4288,8 @@ max_total_cost_usd = 250.0
         use crate::user_brain::{list_user_memories, open_user_brain_readonly};
 
         // User brain dir: a dedicated temp location so we can assert nothing was written.
-        let user_brain_dir = std::env::temp_dir()
-            .join(format!("kimetsu-p0-w3-ubrain-{}", Ulid::new()));
+        let user_brain_dir =
+            std::env::temp_dir().join(format!("kimetsu-p0-w3-ubrain-{}", Ulid::new()));
         fs::create_dir_all(&user_brain_dir).expect("create user brain dir");
 
         // Create a real kimetsu project.
