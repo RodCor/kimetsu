@@ -7,6 +7,7 @@ mod distiller;
 mod doctor;
 mod harvest_setup;
 mod proactive_state;
+mod process;
 mod update;
 
 use clap::{Args, Parser, Subcommand};
@@ -86,6 +87,24 @@ enum Command {
     Update(UpdateArgs),
     /// Remove discovered Kimetsu executables from this machine.
     Uninstall(UninstallArgs),
+    /// List running kimetsu processes (PID, kind, workspace, exe).
+    ///
+    /// Useful for diagnosing stale MCP servers or lingering sessions.
+    /// On Windows uses CIM (Win32_Process) for the command-line;
+    /// on Unix uses `ps -eo pid=,args=`.
+    Ps(PsArgs),
+    /// Stop one or more running kimetsu processes.
+    ///
+    /// Note: an MCP server spawned by a host (Claude Code, Codex) will be
+    /// respawned automatically on the next tool call — stopping it is safe
+    /// and is how you clear a stale server.
+    Stop(StopArgs),
+    /// Convenience: stop all kimetsu MCP-server processes.
+    ///
+    /// Equivalent to `kimetsu stop --all` targeting McpServe processes.
+    /// The host agent (Claude Code / Codex) will respawn the MCP server on
+    /// the next tool call, so no manual restart is required.
+    Restart(RestartArgs),
 }
 
 #[derive(Debug, Args)]
@@ -144,6 +163,33 @@ struct UninstallArgs {
     /// interactive mode. In non-interactive mode this flag acts as the confirm.
     #[arg(long)]
     delete_user_data: bool,
+}
+
+#[derive(Debug, Args)]
+struct PsArgs {
+    /// Emit machine-readable JSON instead of the human table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StopArgs {
+    /// Stop a specific process by PID. Repeatable; may be combined with --all.
+    #[arg(long = "pid", value_name = "PID")]
+    pids: Vec<u32>,
+    /// Stop ALL running kimetsu processes (excluding self).
+    #[arg(long)]
+    all: bool,
+    /// Confirm without prompting (required when stdin is not a TTY).
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct RestartArgs {
+    /// Confirm without prompting (required when stdin is not a TTY).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -855,6 +901,9 @@ fn run() -> KimetsuResult<()> {
         Command::Doctor(args) => doctor_cmd(args),
         Command::Update(args) => update_cmd(args),
         Command::Uninstall(args) => uninstall_cmd(args),
+        Command::Ps(args) => ps_cmd(args),
+        Command::Stop(args) => stop_cmd(args),
+        Command::Restart(args) => restart_cmd(args),
     }
 }
 
@@ -875,6 +924,192 @@ fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
         keep_plugins: args.keep_plugins,
         delete_user_data: args.delete_user_data,
     })
+}
+
+// ── kimetsu ps ───────────────────────────────────────────────────────────────
+
+fn ps_cmd(args: PsArgs) -> KimetsuResult<()> {
+    let procs = process::list_kimetsu_processes();
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&procs)?);
+        return Ok(());
+    }
+
+    if procs.is_empty() {
+        println!("no running kimetsu processes");
+        return Ok(());
+    }
+
+    // Human table: PID  KIND        WORKSPACE                        EXE
+    println!("{:<8}  {:<12}  {:<40}  EXE", "PID", "KIND", "WORKSPACE");
+    println!("{}", "-".repeat(100));
+    for p in &procs {
+        let kind = p.kind.label();
+        let workspace = p.workspace.as_deref().unwrap_or("-");
+        let exe = p.exe_path.as_deref().unwrap_or("-");
+        println!("{:<8}  {:<12}  {:<40}  {}", p.pid, kind, workspace, exe);
+    }
+    Ok(())
+}
+
+// ── kimetsu stop ─────────────────────────────────────────────────────────────
+
+fn stop_cmd(args: StopArgs) -> KimetsuResult<()> {
+    let all_procs = process::list_kimetsu_processes();
+
+    // Build the target set.
+    let targets: Vec<&process::KimetsuProc> = if !args.pids.is_empty() && !args.all {
+        // Explicit PIDs only.
+        all_procs
+            .iter()
+            .filter(|p| args.pids.contains(&p.pid))
+            .collect()
+    } else {
+        // --all, or no pids given — default to all.
+        all_procs.iter().collect()
+    };
+
+    if targets.is_empty() {
+        println!("no running kimetsu processes to stop");
+        return Ok(());
+    }
+
+    // List what will be stopped.
+    println!("The following kimetsu process(es) will be stopped:");
+    for p in &targets {
+        println!(
+            "  PID {}  [{}]  workspace={}",
+            p.pid,
+            p.kind.label(),
+            p.workspace.as_deref().unwrap_or("-")
+        );
+    }
+
+    // Confirm unless --yes or non-TTY.
+    if !args.yes && io::stdin().is_terminal() {
+        print!("Stop these processes? [y/N] ");
+        io::stdout().flush().ok();
+        let stdin = io::stdin();
+        let line = stdin.lock().lines().next();
+        let answer = match line {
+            Some(Ok(l)) => l.trim().to_lowercase(),
+            _ => String::new(),
+        };
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    } else if !args.yes {
+        // Non-TTY without --yes: refuse (same pattern as uninstall).
+        return Err(
+            "stdin is not a TTY; pass --yes to confirm stopping processes non-interactively".into(),
+        );
+    }
+
+    let pids: Vec<u32> = targets.iter().map(|p| p.pid).collect();
+    let results = process::stop_processes(&pids);
+
+    let mut any_err = false;
+    for (pid, result) in &results {
+        match result {
+            Ok(()) => println!("  stopped PID {pid}"),
+            Err(e) => {
+                eprintln!("  failed to stop PID {pid}: {e}");
+                any_err = true;
+            }
+        }
+    }
+
+    // Hint: host-owned MCP servers are respawned automatically.
+    let has_mcp = targets
+        .iter()
+        .any(|p| p.kind == process::ProcKind::McpServe);
+    if has_mcp {
+        println!(
+            "hint: MCP servers spawned by a host (Claude Code, Codex) are respawned automatically \
+             on the next tool call — no manual restart needed."
+        );
+    }
+
+    if any_err {
+        Err("one or more processes could not be stopped (see errors above)".into())
+    } else {
+        Ok(())
+    }
+}
+
+// ── kimetsu restart ──────────────────────────────────────────────────────────
+
+fn restart_cmd(args: RestartArgs) -> KimetsuResult<()> {
+    // Target: all MCP-serve processes.
+    let all_procs = process::list_kimetsu_processes();
+    let mcp_procs: Vec<&process::KimetsuProc> = all_procs
+        .iter()
+        .filter(|p| p.kind == process::ProcKind::McpServe)
+        .collect();
+
+    if mcp_procs.is_empty() {
+        println!("no running kimetsu MCP server processes found");
+        println!(
+            "hint: MCP servers are spawned by the host (Claude Code, Codex) on first use. \
+             If you expected one, check `kimetsu ps` to see all kimetsu processes."
+        );
+        return Ok(());
+    }
+
+    println!("The following kimetsu MCP server(s) will be stopped:");
+    for p in &mcp_procs {
+        println!(
+            "  PID {}  workspace={}",
+            p.pid,
+            p.workspace.as_deref().unwrap_or("-")
+        );
+    }
+
+    if !args.yes && io::stdin().is_terminal() {
+        print!("Stop and let the host respawn them? [y/N] ");
+        io::stdout().flush().ok();
+        let stdin = io::stdin();
+        let line = stdin.lock().lines().next();
+        let answer = match line {
+            Some(Ok(l)) => l.trim().to_lowercase(),
+            _ => String::new(),
+        };
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    } else if !args.yes {
+        return Err(
+            "stdin is not a TTY; pass --yes to confirm stopping processes non-interactively".into(),
+        );
+    }
+
+    let pids: Vec<u32> = mcp_procs.iter().map(|p| p.pid).collect();
+    let results = process::stop_processes(&pids);
+
+    let mut any_err = false;
+    for (pid, result) in &results {
+        match result {
+            Ok(()) => println!("  stopped PID {pid}"),
+            Err(e) => {
+                eprintln!("  failed to stop PID {pid}: {e}");
+                any_err = true;
+            }
+        }
+    }
+
+    println!(
+        "\nThe host agent (Claude Code / Codex) will automatically respawn the MCP server \
+         on the next kimetsu tool call — no manual restart is needed."
+    );
+
+    if any_err {
+        Err("one or more MCP server processes could not be stopped (see errors above)".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// v0.4.6: `kimetsu doctor` entry point. Runs the full health
