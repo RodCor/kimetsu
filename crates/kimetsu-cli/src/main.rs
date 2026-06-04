@@ -77,10 +77,10 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
-    /// Interactive REPL chat — kimetsu as a user-facing coding
-    /// assistant. Reuses the full agent runtime (tools, prompts, brain,
-    /// MP-18 verify) with a stdin/stdout transport. No dependency on
-    /// Terminal-Bench.
+    /// Interactive REPL chat — kimetsu as a user-facing coding assistant.
+    ///
+    /// Reuses the full agent runtime (tools, prompts, brain, MP-18 verify)
+    /// with a stdin/stdout transport. No dependency on Terminal-Bench.
     Chat(ChatArgs),
     /// Kimetsu doctor — automated wire-health check.
     ///
