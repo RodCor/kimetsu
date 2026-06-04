@@ -83,7 +83,7 @@ fn kimetsu_uninstall_help_lists_confirmation_flags() {
     assert!(output.status.success(), "uninstall --help should exit 0");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in ["--yes", "--dry-run", "--delete-user-data"] {
+    for expected in ["--yes", "--dry-run", "--delete-user-data", "--keep-plugins"] {
         assert!(
             stdout.contains(expected),
             "uninstall --help should mention `{expected}`; got: {stdout}"

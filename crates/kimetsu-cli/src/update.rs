@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -49,10 +49,29 @@ pub struct UpdateOptions {
     pub flavor: UpdateFlavor,
 }
 
+/// Three-tier removal depth for `kimetsu uninstall`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Remove only the kimetsu binary. Plugin wiring and brains are kept.
+    BinaryOnly,
+    /// Remove the binary AND the Kimetsu plugin wiring injected into Claude
+    /// Code & Codex (hooks, MCP entries, skills, CLAUDE.md blocks). Brains
+    /// are kept. This is the **default** because leaving dangling hooks after
+    /// the binary is gone breaks the host agents.
+    WithPlugins,
+    /// Remove binary + plugin wiring + the user brain (`~/.kimetsu`) and the
+    /// current workspace's project brain (`.kimetsu/`). Irreversible; requires
+    /// explicit opt-in (`--delete-user-data` or a typed interactive confirm).
+    WithBrains,
+}
+
 #[derive(Debug, Clone)]
 pub struct UninstallOptions {
     pub dry_run: bool,
     pub yes: bool,
+    /// Skip plugin-wiring removal (select Tier 1 / BinaryOnly).
+    pub keep_plugins: bool,
+    /// Also remove the user brain and workspace brain (select Tier 3 / WithBrains).
     pub delete_user_data: bool,
 }
 
@@ -220,6 +239,91 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
     }
 }
 
+/// Resolve which removal tier to use given the options, TTY state, and user
+/// input. Factored out so unit tests can drive it with a scripted reader
+/// without touching the filesystem.
+///
+/// Rules:
+/// * Non-interactive (`!is_tty` or `yes`): flags decide directly.
+///   - `keep_plugins` → BinaryOnly
+///   - `delete_user_data` → WithBrains  (flag is the brain confirm in non-interactive mode)
+///   - neither flag → WithPlugins (safe default)
+/// * Interactive (TTY, `--yes` not passed): print the menu, read a line.
+///   - "" or "2" → WithPlugins (default)
+///   - "1" → BinaryOnly
+///   - "3" → ask for typed confirm `delete-brains`; anything else → WithPlugins
+///   - `--keep-plugins` flag pre-selects 1; `--delete-user-data` flag pre-selects 3
+///     but the user still confirms.
+pub fn resolve_tier<R: BufRead, W: Write>(
+    options: &UninstallOptions,
+    is_tty: bool,
+    reader: &mut R,
+    writer: &mut W,
+) -> KimetsuResult<Tier> {
+    // Non-interactive path: flags decide, no prompts.
+    if !is_tty || options.yes {
+        if options.keep_plugins {
+            return Ok(Tier::BinaryOnly);
+        }
+        if options.delete_user_data {
+            return Ok(Tier::WithBrains);
+        }
+        return Ok(Tier::WithPlugins);
+    }
+
+    // Interactive path: print the three-option menu.
+    let default_label = if options.keep_plugins {
+        "1"
+    } else if options.delete_user_data {
+        "3"
+    } else {
+        "2"
+    };
+
+    writeln!(
+        writer,
+        "\nWhat should I remove?\n  \
+         1) Kimetsu binary only (leave plugin wiring + memories)\n  \
+         2) Binary + plugin wiring in Claude Code & Codex (recommended — keeps your hosts working) [default]\n  \
+         3) Binary + plugin wiring + ALL memories (deletes your brains — irreversible)"
+    )?;
+    write!(writer, "Choose [1/2/3] (default {default_label}): ")?;
+    writer.flush()?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let choice = line.trim();
+
+    // Empty input → use the preselected default.
+    let effective = if choice.is_empty() {
+        default_label
+    } else {
+        choice
+    };
+
+    match effective {
+        "1" => Ok(Tier::BinaryOnly),
+        "3" => {
+            // Require a typed confirm before deleting brains.
+            write!(writer, "Type \"delete-brains\" to confirm: ")?;
+            writer.flush()?;
+            let mut confirm = String::new();
+            reader.read_line(&mut confirm)?;
+            if confirm.trim() == "delete-brains" {
+                Ok(Tier::WithBrains)
+            } else {
+                writeln!(
+                    writer,
+                    "Confirmation not matched — keeping memories, removing binary + plugin wiring."
+                )?;
+                Ok(Tier::WithPlugins)
+            }
+        }
+        // "2" or anything unrecognised → safe default.
+        _ => Ok(Tier::WithPlugins),
+    }
+}
+
 pub fn uninstall(options: UninstallOptions) -> KimetsuResult<()> {
     let installs = discover_installations();
     if installs.is_empty() {
@@ -236,33 +340,74 @@ pub fn uninstall(options: UninstallOptions) -> KimetsuResult<()> {
         }
     }
 
-    if let Some(user_data) = user_data_dir()
-        && options.delete_user_data
-    {
-        println!("user-data: {}", user_data.display());
+    // Show a one-line note about plugin wiring so users know what tier 2 covers.
+    println!("plugin-wiring: will scan Claude Code & Codex hooks/MCP/skills (workspace + global)");
+
+    // Show brain paths if they exist (so users can make an informed choice).
+    if let Some(user_data) = user_data_dir() {
+        if user_data.exists() {
+            println!("user-brain: {} (exists)", user_data.display());
+        } else {
+            println!("user-brain: {} (not found)", user_data.display());
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_brain = cwd.join(".kimetsu");
+    if project_brain.exists() {
+        println!("project-brain: {} (exists)", project_brain.display());
     }
 
+    // -- Dry-run: resolve the tier from flags and describe what would happen.
     if options.dry_run {
-        for install in installs {
+        // For dry-run, resolve tier from flags only (non-interactive).
+        let tier = if options.keep_plugins {
+            Tier::BinaryOnly
+        } else if options.delete_user_data {
+            Tier::WithBrains
+        } else {
+            Tier::WithPlugins
+        };
+        for install in &installs {
             println!("dry-run: would remove {}", install.path.display());
         }
-        if let Some(user_data) = user_data_dir()
-            && options.delete_user_data
-        {
-            println!("dry-run: would remove user data {}", user_data.display());
+        if tier >= Tier::WithPlugins {
+            println!(
+                "dry-run: would remove Kimetsu wiring from Claude Code & Codex (workspace + global)"
+            );
+        }
+        if tier >= Tier::WithBrains {
+            if let Some(user_data) = user_data_dir() {
+                if user_data.exists() {
+                    println!("dry-run: would remove user brain {}", user_data.display());
+                }
+            }
+            if project_brain.exists() {
+                println!(
+                    "dry-run: would remove project brain {}",
+                    project_brain.display()
+                );
+            }
         }
         return Ok(());
     }
 
-    if !options.yes {
+    // -- Interactive / flag-driven confirmation.
+    let is_tty = io::stdin().is_terminal();
+    if !is_tty && !options.yes {
         return Err(
             "refusing to uninstall without confirmation; rerun with `kimetsu uninstall --yes`"
                 .into(),
         );
     }
 
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut stdout = io::stdout();
+    let tier = resolve_tier(&options, is_tty, &mut reader, &mut stdout)?;
+
+    // -- Binary removal (all tiers).
     let mut removed = 0usize;
-    let mut failed = Vec::new();
+    let mut failed: Vec<PathBuf> = Vec::new();
     for install in installs {
         match remove_installation(&install.path) {
             Ok(RemoveOutcome::Removed) => {
@@ -283,15 +428,52 @@ pub fn uninstall(options: UninstallOptions) -> KimetsuResult<()> {
         }
     }
 
-    if options.delete_user_data
-        && let Some(user_data) = user_data_dir()
-        && user_data.exists()
-    {
-        match fs::remove_dir_all(&user_data) {
-            Ok(()) => println!("removed user data: {}", user_data.display()),
-            Err(err) => {
-                println!("failed user data: {} ({err})", user_data.display());
-                failed.push(user_data);
+    // -- Plugin-wiring removal (tiers 2 and 3).
+    if tier >= Tier::WithPlugins {
+        use kimetsu_chat::bridge::{BridgeTarget, InstallScope, plugin_uninstall};
+        let mut total_removed = 0usize;
+        let mut total_modified = 0usize;
+
+        for target in [BridgeTarget::ClaudeCode, BridgeTarget::Codex] {
+            for scope in [InstallScope::Workspace, InstallScope::Global] {
+                match plugin_uninstall(&cwd, target, scope) {
+                    Ok(report) => {
+                        total_removed += report.removed.len();
+                        total_modified += report.modified.len();
+                    }
+                    Err(err) => {
+                        let label = format!("{} {:?}", target.as_str(), scope);
+                        println!("failed plugin-wiring ({label}): {err}");
+                        failed.push(cwd.join(format!("plugin-wiring/{label}")));
+                    }
+                }
+            }
+        }
+        println!(
+            "removed Kimetsu wiring: {total_modified} file(s) edited, {total_removed} file(s)/dir(s) deleted across Claude Code & Codex"
+        );
+    }
+
+    // -- Brain removal (tier 3 only).
+    if tier >= Tier::WithBrains {
+        if let Some(user_data) = user_data_dir()
+            && user_data.exists()
+        {
+            match fs::remove_dir_all(&user_data) {
+                Ok(()) => println!("removed user brain: {}", user_data.display()),
+                Err(err) => {
+                    println!("failed user brain: {} ({err})", user_data.display());
+                    failed.push(user_data);
+                }
+            }
+        }
+        if project_brain.exists() {
+            match fs::remove_dir_all(&project_brain) {
+                Ok(()) => println!("removed project brain: {}", project_brain.display()),
+                Err(err) => {
+                    println!("failed project brain: {} ({err})", project_brain.display());
+                    failed.push(project_brain);
+                }
             }
         }
     }
@@ -741,6 +923,7 @@ impl Version {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn version_compare_handles_multi_digit_minor() {
@@ -777,5 +960,138 @@ mod tests {
         );
         assert_eq!(default_flavor_for("macos", "aarch64", true), "embeddings");
         assert_eq!(default_flavor_for("linux", "x86_64", false), "lean");
+    }
+
+    // --- Tier resolution tests ---
+
+    fn opts(keep_plugins: bool, delete_user_data: bool, yes: bool) -> UninstallOptions {
+        UninstallOptions {
+            dry_run: false,
+            yes,
+            keep_plugins,
+            delete_user_data,
+        }
+    }
+
+    // Non-interactive (--yes), flags decide tier.
+    #[test]
+    fn tier_non_interactive_default_is_with_plugins() {
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&opts(false, false, true), false, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithPlugins);
+    }
+
+    #[test]
+    fn tier_non_interactive_keep_plugins_is_binary_only() {
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&opts(true, false, true), false, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::BinaryOnly);
+    }
+
+    #[test]
+    fn tier_non_interactive_delete_user_data_is_with_brains() {
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&opts(false, true, true), false, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithBrains);
+    }
+
+    // Non-TTY (CI / piped) without --yes → same flag rules.
+    #[test]
+    fn tier_non_tty_without_yes_uses_flags() {
+        let mut r = Cursor::new(b"");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&opts(true, false, false), false, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::BinaryOnly);
+    }
+
+    // Interactive tests: TTY=true, yes=false.
+    fn interactive_opts(keep_plugins: bool, delete_user_data: bool) -> UninstallOptions {
+        opts(keep_plugins, delete_user_data, false)
+    }
+
+    #[test]
+    fn tier_interactive_empty_line_is_with_plugins() {
+        let mut r = Cursor::new(b"\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithPlugins);
+    }
+
+    #[test]
+    fn tier_interactive_choice_1_is_binary_only() {
+        let mut r = Cursor::new(b"1\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::BinaryOnly);
+    }
+
+    #[test]
+    fn tier_interactive_choice_2_is_with_plugins() {
+        let mut r = Cursor::new(b"2\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithPlugins);
+    }
+
+    #[test]
+    fn tier_interactive_choice_3_with_correct_confirm_is_with_brains() {
+        let mut r = Cursor::new(b"3\ndelete-brains\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithBrains);
+    }
+
+    #[test]
+    fn tier_interactive_choice_3_wrong_confirm_falls_back_to_with_plugins() {
+        let mut r = Cursor::new(b"3\nnope\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithPlugins);
+    }
+
+    #[test]
+    fn tier_interactive_choice_3_empty_confirm_falls_back_to_with_plugins() {
+        let mut r = Cursor::new(b"3\n\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithPlugins);
+    }
+
+    #[test]
+    fn tier_interactive_unknown_choice_defaults_to_with_plugins() {
+        let mut r = Cursor::new(b"banana\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithPlugins);
+    }
+
+    #[test]
+    fn tier_interactive_keep_plugins_flag_preselects_1_on_empty_input() {
+        // keep_plugins flag → default label is "1"; empty input picks the default.
+        let mut r = Cursor::new(b"\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(true, false), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::BinaryOnly);
+    }
+
+    #[test]
+    fn tier_interactive_delete_user_data_flag_preselects_3_and_needs_confirm() {
+        // delete_user_data flag → default label is "3"; empty input picks default (3),
+        // then needs the typed confirm.
+        let mut r = Cursor::new(b"\ndelete-brains\n");
+        let mut w = Vec::<u8>::new();
+        let tier = resolve_tier(&interactive_opts(false, true), true, &mut r, &mut w).unwrap();
+        assert_eq!(tier, Tier::WithBrains);
+    }
+
+    #[test]
+    fn tier_ordering_is_correct() {
+        assert!(Tier::BinaryOnly < Tier::WithPlugins);
+        assert!(Tier::WithPlugins < Tier::WithBrains);
+        assert!(Tier::WithBrains >= Tier::WithPlugins);
+        assert!(Tier::WithBrains >= Tier::BinaryOnly);
     }
 }

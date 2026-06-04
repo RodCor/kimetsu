@@ -129,11 +129,19 @@ struct UninstallArgs {
     /// Print the installs that would be removed without deleting anything.
     #[arg(long)]
     dry_run: bool,
-    /// Confirm removal. Required unless --dry-run is used.
+    /// Confirm removal without prompting. Required when stdin is not a TTY.
+    /// Selects Tier 2 (binary + plugin wiring) unless --keep-plugins or
+    /// --delete-user-data is also passed.
     #[arg(long)]
     yes: bool,
+    /// Remove only the Kimetsu binary; leave Claude Code / Codex plugin
+    /// wiring and all brain data intact (Tier 1).
+    #[arg(long)]
+    keep_plugins: bool,
     /// Also remove the user Kimetsu brain directory (~/.kimetsu or
-    /// KIMETSU_USER_BRAIN_DIR). Project .kimetsu directories are never removed.
+    /// KIMETSU_USER_BRAIN_DIR) and the current workspace's .kimetsu/
+    /// project brain (Tier 3). Irreversible; requires a typed confirm in
+    /// interactive mode. In non-interactive mode this flag acts as the confirm.
     #[arg(long)]
     delete_user_data: bool,
 }
@@ -864,6 +872,7 @@ fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
     update::uninstall(update::UninstallOptions {
         dry_run: args.dry_run,
         yes: args.yes,
+        keep_plugins: args.keep_plugins,
         delete_user_data: args.delete_user_data,
     })
 }
