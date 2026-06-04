@@ -46,8 +46,8 @@ fn kimetsu_version_prints_a_version_string_and_exits_clean() {
     );
     // QQ2: --version must also include the build flavor.
     assert!(
-        stdout.contains("(embeddings)") || stdout.contains("(lean)"),
-        "kimetsu --version should contain build flavor '(embeddings)' or '(lean)'; got: {stdout}"
+        stdout.contains("(embeddings") || stdout.contains("(lean"),
+        "kimetsu --version should contain build flavor '(embeddings' or '(lean'; got: {stdout}"
     );
 }
 

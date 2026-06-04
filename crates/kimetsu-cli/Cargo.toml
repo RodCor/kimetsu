@@ -33,6 +33,8 @@ embeddings = [
     "kimetsu-brain/embeddings",
     "kimetsu-chat/embeddings",
 ]
+pi = ["kimetsu-chat/pi"]
+openclaw = ["kimetsu-chat/openclaw"]
 
 [[bin]]
 name = "kimetsu"

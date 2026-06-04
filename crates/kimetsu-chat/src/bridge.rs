@@ -13,7 +13,9 @@ pub enum BridgeTarget {
     ClaudeCode,
     Codex,
     Kimetsu,
+    #[cfg(feature = "openclaw")]
     OpenClaw,
+    #[cfg(feature = "pi")]
     Pi,
 }
 
@@ -23,8 +25,20 @@ impl BridgeTarget {
             "claude" | "claude-code" | "cc" => Ok(Self::ClaudeCode),
             "codex" => Ok(Self::Codex),
             "kimetsu" => Ok(Self::Kimetsu),
+            #[cfg(feature = "openclaw")]
             "openclaw" | "claw" => Ok(Self::OpenClaw),
+            #[cfg(not(feature = "openclaw"))]
+            "openclaw" | "claw" => {
+                Err("this build was compiled without the OpenClaw integration; \
+                 reinstall with `--features openclaw`"
+                    .to_string())
+            }
+            #[cfg(feature = "pi")]
             "pi" => Ok(Self::Pi),
+            #[cfg(not(feature = "pi"))]
+            "pi" => Err("this build was compiled without the Pi integration; \
+                 reinstall with `--features pi`"
+                .to_string()),
             other => Err(format!("unknown bridge target `{other}`")),
         }
     }
@@ -34,7 +48,9 @@ impl BridgeTarget {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::Kimetsu => "kimetsu",
+            #[cfg(feature = "openclaw")]
             Self::OpenClaw => "openclaw",
+            #[cfg(feature = "pi")]
             Self::Pi => "pi",
         }
     }
@@ -266,6 +282,7 @@ Constraints: do not modify files, run shell commands, or take any action other t
 """
 "#;
 
+#[cfg(feature = "pi")]
 /// TypeScript extension installed at `<pi_dir>/extensions/kimetsu.ts`.
 ///
 /// Pi extensions are auto-discovered from `~/.pi/agent/extensions/` (global)
@@ -315,6 +332,7 @@ export default function (pi: any) {
 }
 "#;
 
+#[cfg(feature = "pi")]
 /// SKILL.md installed at `<pi_dir>/skills/kimetsu-brain/SKILL.md`.
 ///
 /// Pi skills are plain Markdown with optional YAML frontmatter. No MCP is
@@ -341,6 +359,7 @@ Optional mode: Kimetsu brain context is a preferred first step for non-trivial
 work. If the binary is unavailable, note the absence and continue normally.
 "#;
 
+#[cfg(feature = "openclaw")]
 /// TypeScript plugin installed at `<oc_dir>/plugins/kimetsu/index.ts`.
 ///
 /// OpenClaw plugins are discovered from `plugins/<id>/` with an
@@ -399,6 +418,7 @@ export default definePluginEntry({
 });
 "#;
 
+#[cfg(feature = "openclaw")]
 /// Plugin manifest installed at `<oc_dir>/plugins/kimetsu/openclaw.plugin.json`.
 ///
 /// OpenClaw uses this file to discover plugin identity and capabilities.
@@ -415,6 +435,7 @@ const OPENCLAW_PLUGIN_MANIFEST: &str = r#"{
 }
 "#;
 
+#[cfg(feature = "openclaw")]
 /// SKILL.md installed at `<oc_dir>/workspace/skills/kimetsu-context/SKILL.md`.
 ///
 /// OpenClaw workspace skills live in `~/.openclaw/workspace/skills/<skill>/SKILL.md`
@@ -550,11 +571,13 @@ pub fn bridge_export_skill(
         BridgeTarget::ClaudeCode => workspace.join(".claude").join("skills").join(&name),
         BridgeTarget::Codex => workspace.join(".codex").join("skills").join(&name),
         BridgeTarget::Kimetsu => workspace.join(".kimetsu").join("skills").join(&name),
+        #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => workspace
             .join(".openclaw")
             .join("workspace")
             .join("skills")
             .join(&name),
+        #[cfg(feature = "pi")]
         BridgeTarget::Pi => workspace.join(".pi").join("skills").join(&name),
     };
     copy_dir_with_replace(&source_root, &destination_root, force)?;
@@ -624,6 +647,7 @@ fn plugin_install_inner(
 ) -> Result<PluginInstallReport, String> {
     let workspace = normalize_path(workspace);
     let mut files = Vec::new();
+    #[allow(unused_mut)]
     let mut notes: Vec<String> = Vec::new();
     match target {
         BridgeTarget::ClaudeCode => {
@@ -712,6 +736,7 @@ fn plugin_install_inner(
             files.push(normalize_path(&dir));
         }
 
+        #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => {
             // OpenClaw supports MCP natively.
             // Global → ~/.openclaw/; Workspace → <workspace>/.openclaw/.
@@ -748,6 +773,7 @@ fn plugin_install_inner(
             files.push(normalize_path(&skill));
         }
 
+        #[cfg(feature = "pi")]
         BridgeTarget::Pi => {
             // Pi has no MCP. Kimetsu integrates via a TS extension + a SKILL.md.
             // Global → ~/.pi/agent/; Workspace → .pi/ (project-local config).
@@ -955,6 +981,7 @@ fn detect_codex_agent(codex_dir: &Path) -> bool {
         .is_file()
 }
 
+#[cfg(feature = "pi")]
 /// Returns true if Pi's `settings.json` registers the kimetsu extension AND
 /// `extensions/kimetsu.ts` exists in `pi_dir`.
 fn detect_pi_extension(pi_dir: &Path) -> bool {
@@ -981,11 +1008,13 @@ fn detect_pi_extension(pi_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "pi")]
 /// Returns true if `skills/kimetsu-brain/` exists under `pi_dir`.
 fn detect_pi_skill(pi_dir: &Path) -> bool {
     pi_dir.join("skills").join("kimetsu-brain").is_dir()
 }
 
+#[cfg(feature = "openclaw")]
 /// Returns true if `openclaw.json` has `mcp.servers.kimetsu`.
 fn detect_openclaw_mcp(oc_dir: &Path) -> bool {
     let config = oc_dir.join("openclaw.json");
@@ -1005,6 +1034,7 @@ fn detect_openclaw_mcp(oc_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "openclaw")]
 /// Returns true if `plugins/kimetsu/` directory exists (with the manifest) under `oc_dir`.
 fn detect_openclaw_plugin(oc_dir: &Path) -> bool {
     oc_dir
@@ -1014,6 +1044,7 @@ fn detect_openclaw_plugin(oc_dir: &Path) -> bool {
         .is_file()
 }
 
+#[cfg(feature = "openclaw")]
 /// Returns true if `workspace/skills/kimetsu-context/` directory exists under `oc_dir`.
 fn detect_openclaw_skill(oc_dir: &Path) -> bool {
     oc_dir
@@ -1059,12 +1090,14 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
 
     let home_opt = resolve_home().ok();
 
-    for &target in &[
-        BridgeTarget::ClaudeCode,
-        BridgeTarget::Codex,
-        BridgeTarget::OpenClaw,
-        BridgeTarget::Pi,
-    ] {
+    #[allow(unused_mut)]
+    let mut scan_targets = vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex];
+    #[cfg(feature = "openclaw")]
+    scan_targets.push(BridgeTarget::OpenClaw);
+    #[cfg(feature = "pi")]
+    scan_targets.push(BridgeTarget::Pi);
+
+    for &target in &scan_targets {
         for &scope in &[InstallScope::Workspace, InstallScope::Global] {
             let home: Option<&Path> = match scope {
                 InstallScope::Global => {
@@ -1184,6 +1217,7 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
                     // Not a user-installable host; skip.
                 }
 
+                #[cfg(feature = "openclaw")]
                 BridgeTarget::OpenClaw => {
                     // OpenClaw: global → ~/.openclaw/; workspace → .openclaw/
                     let oc_dir = match home {
@@ -1222,6 +1256,7 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
                     });
                 }
 
+                #[cfg(feature = "pi")]
                 BridgeTarget::Pi => {
                     // Pi: global → ~/.pi/agent/; workspace → .pi/
                     let pi_dir = match home {
@@ -1387,6 +1422,7 @@ fn plugin_uninstall_inner(
             // Extensions are user data; uninstall is a no-op for this target.
         }
 
+        #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => {
             let oc_dir = match home {
                 Some(h) => h.join(".openclaw"),
@@ -1415,6 +1451,7 @@ fn plugin_uninstall_inner(
             }
         }
 
+        #[cfg(feature = "pi")]
         BridgeTarget::Pi => {
             let pi_dir = match home {
                 Some(h) => h.join(".pi").join("agent"),
@@ -1643,6 +1680,7 @@ fn uninstall_codex_config(path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(feature = "pi")]
 /// Strip the `"./extensions/kimetsu.ts"` entry from Pi's `settings.json`.
 /// Returns `true` if the file was changed. Missing file or absent entry → Ok(false).
 fn uninstall_pi_settings(path: &Path) -> Result<bool, String> {
@@ -1682,6 +1720,7 @@ fn uninstall_pi_settings(path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(feature = "openclaw")]
 /// Upsert the `kimetsu` MCP server and plugin entry into `openclaw.json`.
 ///
 /// `openclaw.json` is JSON5 (supports comments and trailing commas). We parse
@@ -1768,6 +1807,7 @@ fn write_openclaw_config(path: &Path, notes: &mut Vec<String>) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(feature = "openclaw")]
 /// Strip `mcp.servers.kimetsu` and `plugins.entries.kimetsu` from `openclaw.json`.
 ///
 /// Reads the file as JSON5 (tolerating comments), removes Kimetsu's entries,
@@ -1962,6 +2002,7 @@ fn write_codex_hooks(
     Ok(())
 }
 
+#[cfg(feature = "pi")]
 /// Idempotently register Kimetsu's TS extension in Pi's `settings.json`.
 ///
 /// Pi discovers extensions from the `"extensions"` array of absolute paths.
@@ -4609,6 +4650,7 @@ mod tests {
 
     // ── B-series: Pi host target ───────────────────────────────────────────────
 
+    #[cfg(feature = "pi")]
     #[test]
     fn bridge_target_pi_parse_and_round_trip() {
         assert_eq!(BridgeTarget::parse("pi").unwrap(), BridgeTarget::Pi);
@@ -4616,6 +4658,7 @@ mod tests {
         assert_eq!(BridgeTarget::Pi.as_str(), "pi");
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_install_workspace_writes_expected_files() {
         let ws = temp_root("pi_install_ws");
@@ -4662,6 +4705,7 @@ mod tests {
         fs::remove_dir_all(ws).ok();
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_install_workspace_is_idempotent() {
         let ws = temp_root("pi_install_idem");
@@ -4693,6 +4737,7 @@ mod tests {
         fs::remove_dir_all(ws).ok();
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_install_global_writes_to_home_not_workspace() {
         let ws = temp_root("pi_install_global_ws");
@@ -4729,6 +4774,7 @@ mod tests {
         fs::remove_dir_all(home).ok();
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_detect_helpers_false_before_true_after_install() {
         let ws = temp_root("pi_detect");
@@ -4760,6 +4806,7 @@ mod tests {
         fs::remove_dir_all(ws).ok();
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_status_fully_installed_reports_installed() {
         let ws = temp_root("pi_status_installed");
@@ -4814,6 +4861,7 @@ mod tests {
         assert!(matches!(state4, WiringState::Partial));
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_uninstall_removes_files_and_strips_settings() {
         let ws = temp_root("pi_uninstall");
@@ -4882,6 +4930,7 @@ mod tests {
         fs::remove_dir_all(ws).ok();
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn pi_uninstall_is_idempotent() {
         let ws = temp_root("pi_uninstall_idem");
@@ -4907,6 +4956,7 @@ mod tests {
         fs::remove_dir_all(ws).ok();
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn bridge_export_skill_pi_uses_dot_pi_skills() {
         let ws = temp_root("pi_export_skill");
@@ -4952,6 +5002,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// C2: BridgeTarget parse/as_str round-trip for openclaw/claw aliases.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c2_openclaw_bridge_target_parse_and_as_str() {
         assert_eq!(
@@ -4969,6 +5020,7 @@ mod tests {
     /// C4: workspace install writes openclaw.json with mcp.servers.kimetsu + plugins.entries.kimetsu,
     /// plugins/kimetsu/index.ts, plugins/kimetsu/openclaw.plugin.json, and
     /// workspace/skills/kimetsu-context/SKILL.md. Re-run is idempotent.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c4_install_openclaw_workspace_writes_all_files_and_is_idempotent() {
         let ws = temp_root("c4_openclaw_ws");
@@ -5065,6 +5117,7 @@ mod tests {
     /// C4 (merge): pre-seed openclaw.json with comments and a non-Kimetsu MCP server,
     /// then install. After install, the other server must survive AND comments-lost
     /// note must be in the install report.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c4_install_openclaw_merges_into_preseeded_json5_config() {
         let ws = temp_root("c4_openclaw_merge");
@@ -5130,6 +5183,7 @@ mod tests {
     }
 
     /// C4 (global): install into injected home → writes under <home>/.openclaw/.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c4_install_openclaw_global_writes_under_home() {
         let ws = temp_root("c4_openclaw_global_ws");
@@ -5173,6 +5227,7 @@ mod tests {
     }
 
     /// C5: detect_openclaw_* returns false before install, true after.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c5_detect_openclaw_false_before_true_after_install() {
         let ws = temp_root("c5_detect_openclaw");
@@ -5209,6 +5264,7 @@ mod tests {
     }
 
     /// C6: status returns WiringState::Installed when fully wired.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c6_status_openclaw_fully_installed_is_installed() {
         let ws = temp_root("c6_status_openclaw");
@@ -5245,6 +5301,7 @@ mod tests {
 
     /// C7: uninstall removes kimetsu mcp/plugin/skill, preserves 'other' server,
     /// and second uninstall is a clean no-op.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c7_uninstall_openclaw_removes_kimetsu_preserves_other_and_is_idempotent() {
         let ws = temp_root("c7_uninstall_openclaw");
@@ -5325,6 +5382,7 @@ mod tests {
     }
 
     /// C8: bridge_export_skill for OpenClaw writes to .openclaw/workspace/skills/<name>.
+    #[cfg(feature = "openclaw")]
     #[test]
     fn c8_bridge_export_skill_openclaw_uses_workspace_skills() {
         let ws = temp_root("c8_openclaw_export_skill");

@@ -121,8 +121,13 @@ cargo install kimetsu-cli
 # Semantic build — fastembed + ONNX; first run downloads BGE-small
 cargo install kimetsu-cli --features embeddings
 
+# With Pi + OpenClaw host integrations (opt-in; official prebuilt binaries include them)
+cargo install kimetsu-cli --features pi,openclaw
+# All extras together:
+cargo install kimetsu-cli --features embeddings,pi,openclaw
+
 # From source
-cargo install --path crates/kimetsu-cli   # add --features embeddings for semantic search
+cargo install --path crates/kimetsu-cli   # add --features embeddings,pi,openclaw for full build
 ```
 
 Prefer not to touch the Rust toolchain? Two options.
@@ -203,8 +208,8 @@ Codex, Pi, and OpenClaw:
 ```bash
 kimetsu plugin install claude   --workspace .  # writes .mcp.json + .claude/settings.json
 kimetsu plugin install codex    --workspace .  # writes .codex/config.toml + .codex/hooks.json + skill + agent
-kimetsu plugin install openclaw --workspace .  # MCP server + hooks plugin + skill in .openclaw/
-kimetsu plugin install pi       --workspace .  # TS extension (Pi has no MCP) + skill in .pi/
+kimetsu plugin install openclaw --workspace .  # MCP server + hooks plugin + skill in .openclaw/ (requires --features openclaw on source builds)
+kimetsu plugin install pi       --workspace .  # TS extension (Pi has no MCP) + skill in .pi/ (requires --features pi on source builds)
 
 # Install globally for every project (writes to the host's home config dir):
 kimetsu plugin install claude --scope global

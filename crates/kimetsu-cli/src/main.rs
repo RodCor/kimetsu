@@ -22,12 +22,11 @@ use tracing_subscriber::EnvFilter;
 /// User-facing version string: bare semver + build flavor in parentheses.
 /// Clap prints this for `--version` / `-V`.
 ///
+/// Composed by build.rs from CARGO_FEATURE_* env vars so the flavor string
+/// includes all active optional features (e.g. "1.0.0 (lean, +pi, +openclaw)").
 /// The bare `CARGO_PKG_VERSION` constant in update.rs is intentionally
 /// separate so version-compare logic is never confused by the suffix.
-#[cfg(feature = "embeddings")]
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (embeddings)");
-#[cfg(not(feature = "embeddings"))]
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (lean)");
+const VERSION: &str = env!("KIMETSU_VERSION_DISPLAY");
 
 #[derive(Debug, Parser)]
 #[command(name = "kimetsu")]
@@ -1551,12 +1550,18 @@ pub fn resolve_setup_hosts(
     if present_codex {
         detected.push(BridgeTarget::Codex);
     }
+    #[cfg(feature = "openclaw")]
     if present_openclaw {
         detected.push(BridgeTarget::OpenClaw);
     }
+    #[cfg(not(feature = "openclaw"))]
+    let _ = present_openclaw;
+    #[cfg(feature = "pi")]
     if present_pi {
         detected.push(BridgeTarget::Pi);
     }
+    #[cfg(not(feature = "pi"))]
+    let _ = present_pi;
 
     if !detected.is_empty() {
         return Ok(detected);
@@ -1565,12 +1570,20 @@ pub fn resolve_setup_hosts(
     // Nothing detected.
     if !is_tty {
         eprintln!(
-            "note: neither ~/.claude nor ~/.codex nor ~/.openclaw nor ~/.pi found; defaulting to claude-code. \
+            "note: no recognized host config dirs found; defaulting to claude-code. \
              Pass --host to choose explicitly."
         );
         Ok(vec![BridgeTarget::ClaudeCode])
     } else {
-        print!("Which host agent do you use? [claude-code/codex/openclaw/pi/both]: ");
+        #[cfg(all(feature = "pi", feature = "openclaw"))]
+        let prompt = "Which host agent do you use? [claude-code/codex/openclaw/pi/both]: ";
+        #[cfg(all(feature = "pi", not(feature = "openclaw")))]
+        let prompt = "Which host agent do you use? [claude-code/codex/pi/both]: ";
+        #[cfg(all(not(feature = "pi"), feature = "openclaw"))]
+        let prompt = "Which host agent do you use? [claude-code/codex/openclaw/both]: ";
+        #[cfg(all(not(feature = "pi"), not(feature = "openclaw")))]
+        let prompt = "Which host agent do you use? [claude-code/codex/both]: ";
+        print!("{prompt}");
         io::stdout().flush().ok();
         let mut line = String::new();
         reader
@@ -1581,10 +1594,6 @@ pub fn resolve_setup_hosts(
             Ok(vec![BridgeTarget::ClaudeCode])
         } else if answer == "codex" {
             Ok(vec![BridgeTarget::Codex])
-        } else if answer == "openclaw" || answer == "claw" {
-            Ok(vec![BridgeTarget::OpenClaw])
-        } else if answer == "pi" {
-            Ok(vec![BridgeTarget::Pi])
         } else if answer == "both" {
             Ok(vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex])
         } else {
@@ -1608,8 +1617,14 @@ fn detect_present_hosts() -> (bool, bool, bool, bool) {
 
     let claude_present = home.join(".claude").is_dir();
     let codex_present = home.join(".codex").is_dir();
+    #[cfg(feature = "openclaw")]
     let openclaw_present = home.join(".openclaw").is_dir();
+    #[cfg(not(feature = "openclaw"))]
+    let openclaw_present = false;
+    #[cfg(feature = "pi")]
     let pi_present = home.join(".pi").is_dir();
+    #[cfg(not(feature = "pi"))]
+    let pi_present = false;
     (claude_present, codex_present, openclaw_present, pi_present)
 }
 
@@ -1699,7 +1714,9 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
+            #[cfg(feature = "pi")]
             BridgeTarget::Pi => "Pi",
         };
         println!(
@@ -1850,7 +1867,9 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
+            #[cfg(feature = "pi")]
             BridgeTarget::Pi => "Pi",
         })
         .collect();
@@ -6582,8 +6601,7 @@ ambient = false
     // ─── Part 1: VERSION constant ─────────────────────────────────────────────
 
     /// The user-facing VERSION string must start with the bare semver
-    /// and end with either "(embeddings)" or "(lean)" so users can see the
-    /// build flavor at a glance.
+    /// so users can see the version at a glance.
     #[test]
     fn version_constant_starts_with_cargo_pkg_version() {
         let bare = env!("CARGO_PKG_VERSION");
@@ -6593,11 +6611,13 @@ ambient = false
         );
     }
 
+    /// The flavor suffix must start with "(lean" or "(embeddings" and may
+    /// optionally include ", +pi" and/or ", +openclaw" extras.
     #[test]
-    fn version_constant_ends_with_known_flavor() {
+    fn version_constant_contains_known_flavor() {
         assert!(
-            VERSION.ends_with("(embeddings)") || VERSION.ends_with("(lean)"),
-            "VERSION should end with '(embeddings)' or '(lean)'; got: {VERSION:?}"
+            VERSION.contains("(lean") || VERSION.contains("(embeddings"),
+            "VERSION should contain '(lean' or '(embeddings'; got: {VERSION:?}"
         );
     }
 
@@ -6635,8 +6655,8 @@ ambient = false
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("(embeddings)") || msg.contains("(lean)"),
-            "--version output should contain '(embeddings)' or '(lean)'; got: {msg:?}"
+            msg.contains("(lean") || msg.contains("(embeddings"),
+            "--version output should contain '(lean' or '(embeddings'; got: {msg:?}"
         );
     }
 
@@ -6827,6 +6847,40 @@ ambient = false
         assert!(result.is_err(), "bad --host should return Err");
     }
 
+    /// When Pi feature is off, `BridgeTarget::parse("pi")` must return a clear
+    /// "compiled without" error — not an "unknown bridge target" error.
+    #[cfg(not(feature = "pi"))]
+    #[test]
+    fn parse_pi_without_feature_returns_helpful_error() {
+        use kimetsu_chat::BridgeTarget;
+        let err = BridgeTarget::parse("pi").unwrap_err();
+        assert!(
+            err.contains("compiled without"),
+            "gated-out Pi must give 'compiled without' message, got: {err:?}"
+        );
+        assert!(
+            err.contains("--features pi"),
+            "error must mention --features pi, got: {err:?}"
+        );
+    }
+
+    /// When OpenClaw feature is off, `BridgeTarget::parse("openclaw")` must
+    /// return a clear "compiled without" error.
+    #[cfg(not(feature = "openclaw"))]
+    #[test]
+    fn parse_openclaw_without_feature_returns_helpful_error() {
+        use kimetsu_chat::BridgeTarget;
+        let err = BridgeTarget::parse("openclaw").unwrap_err();
+        assert!(
+            err.contains("compiled without"),
+            "gated-out OpenClaw must give 'compiled without' message, got: {err:?}"
+        );
+        assert!(
+            err.contains("--features openclaw"),
+            "error must mention --features openclaw, got: {err:?}"
+        );
+    }
+
     #[test]
     fn resolve_setup_hosts_neither_present_tty_scripted_both() {
         use kimetsu_chat::BridgeTarget;
@@ -6843,6 +6897,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex]);
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn resolve_setup_hosts_auto_only_pi_present() {
         use kimetsu_chat::BridgeTarget;
@@ -6851,6 +6906,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn resolve_setup_hosts_explicit_pi() {
         use kimetsu_chat::BridgeTarget;
@@ -6867,6 +6923,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
+    #[cfg(feature = "pi")]
     #[test]
     fn resolve_setup_hosts_tty_scripted_pi() {
         use kimetsu_chat::BridgeTarget;
@@ -6876,6 +6933,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
+    #[cfg(feature = "openclaw")]
     #[test]
     fn resolve_setup_hosts_auto_only_openclaw_present() {
         use kimetsu_chat::BridgeTarget;
@@ -6885,6 +6943,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
     }
 
+    #[cfg(feature = "openclaw")]
     #[test]
     fn resolve_setup_hosts_explicit_openclaw() {
         use kimetsu_chat::BridgeTarget;
@@ -6901,6 +6960,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
     }
 
+    #[cfg(feature = "openclaw")]
     #[test]
     fn resolve_setup_hosts_explicit_claw_alias() {
         use kimetsu_chat::BridgeTarget;
@@ -6917,6 +6977,7 @@ ambient = false
         assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
     }
 
+    #[cfg(feature = "openclaw")]
     #[test]
     fn resolve_setup_hosts_tty_scripted_openclaw() {
         use kimetsu_chat::BridgeTarget;
