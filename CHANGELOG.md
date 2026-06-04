@@ -60,6 +60,26 @@ ADDED
     edit` / `undo` fix a bad recording in place; `kimetsu runs prune`
     and `kimetsu brain compact` (VACUUM, optional event-trim) keep the
     install lean.
+  * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
+    on Anthropic models served through Amazon Bedrock (InvokeModel,
+    SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+    (+ optional `AWS_SESSION_TOKEN`) and `AWS_REGION` — no AWS SDK). Set
+    `[model] provider = "bedrock"` and/or `[learning.distiller]`; the two
+    are configured independently, so you can run the agent on Bedrock and
+    harvest on Bedrock or direct Claude/OpenAI.
+  * **Two more host integrations: Pi and OpenClaw.** `kimetsu plugin
+    install pi` wires a TypeScript extension (Pi has no MCP) plus a
+    `kimetsu-brain` skill; `kimetsu plugin install openclaw` registers the
+    MCP server, a hooks plugin, and a `kimetsu-context` skill. Both join
+    Claude Code and Codex across `plugin status`, `plugin uninstall`, and
+    `setup`. Every embedded hook degrades to a silent no-op if the
+    `kimetsu` binary isn't on PATH, so a host is never left broken.
+  * **Full plugin lifecycle.** `kimetsu plugin status` shows what's wired
+    where (host × scope: installed / partial / absent + which pieces);
+    `kimetsu plugin uninstall <host>` removes only the wiring (keeping the
+    binary + brain); `kimetsu setup` runs init + plugin install + a
+    selftest in one command. `kimetsu brain backup` writes a consistent
+    full-DB snapshot via the SQLite online-backup API.
   * A 5-minute quickstart was added to the README.
 
 CHANGED
@@ -89,6 +109,14 @@ CHANGED
     embeddings builds.
   * **Retrieval ordering is fully deterministic** — a stable tiebreak
     eliminates non-reproducible ranking across runs.
+  * **Terser `--help` menu + flavored `--version`.** Top-level commands
+    show short imperative labels (full detail stays in
+    `kimetsu <cmd> --help`), and `kimetsu --version` reports the build
+    flavor — `1.0.0 (embeddings)` vs `(lean)` — so semantic-search
+    availability is obvious at a glance.
+  * **Run dirs self-prune.** New agent runs opportunistically GC run dirs
+    older than 30 days (keeping the newest 20; `KIMETSU_RUNS_GC=0` to
+    disable) — only at run creation, never on the hot brain-open path.
 
 FIXED
   * **MSRV portability.** A 1.87-only API that violated the declared

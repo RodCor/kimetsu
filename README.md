@@ -56,7 +56,8 @@ and Codex) or as its own terminal chat, learns which memories the model
 ```
    +----------------------------+
    | Host agent                 |
-   | Claude Code / Codex / chat |
+   | Claude / Codex / Pi /      |
+   | OpenClaw / chat            |
    +-------------+--------------+
                  |
                  | asks for context
@@ -173,7 +174,11 @@ pass `--delete-user-data`.
 
 **Prerequisites:** Rust 1.85+ (stable) and a model credential for the surface
 you use (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`).
-That's it for chat — Docker, Harbor, and Python are only needed for benchmark runs.
+On AWS Bedrock, set `[model] provider = "bedrock"` and authenticate with
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)
+and `AWS_REGION` — the agent and the auto-harvester both support it, and can be
+pointed at different providers. That's it for chat — Docker, Harbor, and Python
+are only needed for benchmark runs.
 
 ---
 
@@ -192,16 +197,24 @@ whole conversation and injects retrieved context into every turn. Inside chat,
 
 ### 2. Or bolt it onto a host agent
 
-Wire Kimetsu into any supported host as an MCP sidecar. The built-in installers
-cover Claude Code and Codex:
+Wire Kimetsu into any supported host. The built-in installers cover Claude Code,
+Codex, Pi, and OpenClaw:
 
 ```bash
-kimetsu plugin install claude --workspace .    # writes .mcp.json + .claude/settings.json
-kimetsu plugin install codex  --workspace .    # writes .codex/config.toml + .codex/hooks.json + skill + agent
+kimetsu plugin install claude   --workspace .  # writes .mcp.json + .claude/settings.json
+kimetsu plugin install codex    --workspace .  # writes .codex/config.toml + .codex/hooks.json + skill + agent
+kimetsu plugin install openclaw --workspace .  # MCP server + hooks plugin + skill in .openclaw/
+kimetsu plugin install pi       --workspace .  # TS extension (Pi has no MCP) + skill in .pi/
 
-# Install globally for every project (writes to ~/.claude, ~/.claude.json, ~/.codex):
+# Install globally for every project (writes to the host's home config dir):
 kimetsu plugin install claude --scope global
-kimetsu plugin install codex  --scope global
+
+# See what's wired where, or remove just the wiring (keeps the binary + brain):
+kimetsu plugin status
+kimetsu plugin uninstall codex --yes
+
+# Or do init + install + selftest in one shot:
+kimetsu setup --host claude-code
 ```
 
 `--scope` defaults to `workspace`. The installer **merges** into existing
@@ -278,9 +291,11 @@ cargo install kimetsu-cli --features embeddings
 cd /your/project
 kimetsu init                                 # creates .kimetsu/project.toml + brain.db
 kimetsu plugin install claude --workspace .  # Claude Code: writes .mcp.json + hooks
-# or:
+# or: codex | openclaw | pi
 kimetsu plugin install codex --workspace .   # Codex: writes .codex/ config + hooks
 ```
+
+(Or collapse all three steps into one: `kimetsu setup --host claude-code`.)
 
 **Step 3: Verify the brain is working**
 
