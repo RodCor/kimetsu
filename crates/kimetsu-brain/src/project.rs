@@ -2409,6 +2409,112 @@ pub fn import_memories(
     Ok(summary)
 }
 
+// ── Q8: brain compact ────────────────────────────────────────────────────────
+
+/// Report returned by [`compact_brain`] describing what was freed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactReport {
+    /// brain.db file size in bytes before compaction.
+    pub bytes_before: u64,
+    /// brain.db file size in bytes after compaction (WAL checkpointed first).
+    pub bytes_after: u64,
+    /// Number of events deleted by `--trim-events-older-than` (0 when not requested).
+    pub events_trimmed: u64,
+    /// Number of invalidated memory rows purged (0 when not requested).
+    pub invalidated_memories_purged: u64,
+}
+
+/// Reclaim dead space in brain.db.
+///
+/// 1. Acquires the project lock (same as `rebuild_projection`).
+/// 2. Optionally purges invalidated memory rows (`purge_invalidated`).
+/// 3. Optionally trims old events (`trim_events_older_than`).
+/// 4. Runs `VACUUM` (outside any transaction) to rebuild the file in-place.
+/// 5. Checkpoints the WAL before measuring `bytes_after` so the measurement
+///    reflects the on-disk file, not the shadow WAL.
+pub fn compact_brain(
+    start: &Path,
+    trim_events_older_than: Option<std::time::Duration>,
+    purge_invalidated: bool,
+) -> KimetsuResult<CompactReport> {
+    let (paths, _config, conn) = load_project(start)?;
+    let _lock = ProjectLock::acquire(&paths, "brain compact", None)?;
+
+    // Step 2: record bytes_before.
+    let bytes_before = fs::metadata(&paths.brain_db).map(|m| m.len()).unwrap_or(0);
+
+    // Step 3: purge invalidated memories (optional, gated by caller).
+    let invalidated_memories_purged = if purge_invalidated {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute_batch(
+            "DELETE FROM memories_fts WHERE memory_id IN (
+                 SELECT memory_id FROM memories WHERE invalidated_at IS NOT NULL
+             );
+             DELETE FROM memories WHERE invalidated_at IS NOT NULL;",
+        )?;
+        count as u64
+    } else {
+        0
+    };
+
+    // Step 4: trim old events (optional, gated by caller).
+    let events_trimmed = if let Some(dur) = trim_events_older_than {
+        // Compute the cutoff as an RFC 3339 string (UTC) so it compares
+        // correctly against the TEXT `ts` column.
+        let cutoff_secs = dur.as_secs();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cutoff_unix = now_unix.saturating_sub(cutoff_secs);
+        // Format as a naive UTC RFC 3339 string (matches the stored format).
+        let cutoff_rfc3339 = {
+            let secs = cutoff_unix as i64;
+            // Use the `time` crate (already a dependency of projector.rs).
+            use time::OffsetDateTime;
+            use time::format_description::well_known::Rfc3339;
+            OffsetDateTime::from_unix_timestamp(secs)
+                .map_err(|e| format!("compact_brain: invalid cutoff timestamp: {e}"))?
+                .format(&Rfc3339)
+                .map_err(|e| format!("compact_brain: failed to format cutoff: {e}"))?
+        };
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE ts < ?1",
+            rusqlite::params![cutoff_rfc3339],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM events WHERE ts < ?1",
+            rusqlite::params![cutoff_rfc3339],
+        )?;
+        count as u64
+    } else {
+        0
+    };
+
+    // Step 5: VACUUM — must run outside any active transaction.
+    // `rusqlite::Connection` does not hold an implicit transaction here so
+    // execute_batch is safe.
+    conn.execute_batch("VACUUM;")?;
+
+    // Step 6: Checkpoint the WAL so bytes_after reflects the real file size
+    // (on systems without WAL mode this is a no-op).
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    let bytes_after = fs::metadata(&paths.brain_db).map(|m| m.len()).unwrap_or(0);
+
+    Ok(CompactReport {
+        bytes_before,
+        bytes_after,
+        events_trimmed,
+        invalidated_memories_purged,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -5257,6 +5363,244 @@ max_total_cost_usd = 250.0
             init_project(&root, false).expect("init");
             let result = undo_last_memory(&root).expect("undo on empty");
             assert!(result.is_none(), "must return None on empty brain");
+        });
+    }
+
+    // ── Q8: compact_brain tests ───────────────────────────────────────────────
+
+    /// Q8-1: VACUUM reclaims space after purging invalidated memories.
+    ///
+    /// Adds enough memories to grow the file, invalidates most of them,
+    /// then calls compact_brain with purge_invalidated=true. After compaction:
+    ///   - bytes_after <= bytes_before (VACUUM at minimum doesn't grow the file)
+    ///   - invalidated_memories_purged > 0
+    ///   - active memories still survive and are retrievable
+    #[test]
+    fn compact_brain_purge_invalidated_reclaims_space() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Add 20 memories — enough to make the file non-trivially sized.
+            let mut active_id = String::new();
+            for i in 0..20usize {
+                let text = format!(
+                    "compact test memory number {i}: rust sqlite vacuum reclaim disk space \
+                     kimetsu brain compact test payload to increase file size substantially \
+                     so that vacuum has meaningful dead pages to reclaim after deletion"
+                );
+                let mid = add_memory(&root, MemoryScope::Project, MemoryKind::Fact, &text)
+                    .expect("add memory");
+                if i == 0 {
+                    active_id = mid.clone();
+                }
+                // Invalidate all but the first one.
+                if i > 0 {
+                    invalidate_memory(&root, &mid, Some("compact test"))
+                        .expect("invalidate memory");
+                }
+            }
+
+            // Run compact with purge_invalidated = true.
+            let report = compact_brain(&root, None, true).expect("compact_brain");
+
+            // Purge count must match the 19 invalidated memories.
+            assert_eq!(
+                report.invalidated_memories_purged, 19,
+                "should have purged 19 invalidated memories, got {}",
+                report.invalidated_memories_purged
+            );
+            // bytes_after must not exceed bytes_before (VACUUM can only shrink or equal).
+            assert!(
+                report.bytes_after <= report.bytes_before,
+                "bytes_after ({}) should be <= bytes_before ({}) after purge+vacuum",
+                report.bytes_after,
+                report.bytes_before
+            );
+            // events_trimmed must be 0 (we didn't request a trim).
+            assert_eq!(
+                report.events_trimmed, 0,
+                "events_trimmed must be 0 when trim_events_older_than is None"
+            );
+
+            // The one active memory must still be listable.
+            let memories = list_memories(&root).expect("list memories after compact");
+            let active_memories: Vec<_> = memories
+                .iter()
+                .filter(|m| m.memory_id == active_id)
+                .collect();
+            assert_eq!(
+                active_memories.len(),
+                1,
+                "the active memory must survive compaction"
+            );
+        });
+    }
+
+    /// Q8-2: default compact (no flags) preserves everything — a pure VACUUM.
+    ///
+    /// All memories (active AND invalidated) survive, events are untouched,
+    /// and both counters are 0.
+    #[test]
+    fn compact_brain_default_preserves_everything() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let mid = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "preserve me through compact",
+            )
+            .expect("add memory");
+            let mid2 = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "preserve invalidated too",
+            )
+            .expect("add memory 2");
+            invalidate_memory(&root, &mid2, Some("test")).expect("invalidate");
+
+            // Count events before.
+            let event_count_before: i64 = {
+                let (_p, _c, conn) = load_project(&root).expect("load");
+                conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                    .expect("count events")
+            };
+
+            // Default compact: no purge, no trim.
+            let report = compact_brain(&root, None, false).expect("compact_brain");
+            assert_eq!(
+                report.events_trimmed, 0,
+                "events_trimmed must be 0 in default compact"
+            );
+            assert_eq!(
+                report.invalidated_memories_purged, 0,
+                "invalidated_memories_purged must be 0 in default compact"
+            );
+
+            // All memories still present (active + invalidated).
+            let all_mems: Vec<_> = {
+                let (_p, _c, conn) = load_project(&root).expect("load");
+                let mut stmt = conn
+                    .prepare("SELECT memory_id FROM memories")
+                    .expect("prepare");
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .expect("query")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("collect")
+            };
+            assert!(
+                all_mems.contains(&mid),
+                "active memory must survive default compact"
+            );
+            assert!(
+                all_mems.contains(&mid2),
+                "invalidated memory must survive default compact"
+            );
+
+            // Event count unchanged.
+            let event_count_after: i64 = {
+                let (_p, _c, conn) = load_project(&root).expect("load");
+                conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                    .expect("count events")
+            };
+            assert_eq!(
+                event_count_after, event_count_before,
+                "event count must not change in default compact"
+            );
+        });
+    }
+
+    /// Q8-3: event trim removes old events but materialized memories survive.
+    ///
+    /// Uses trim_events_older_than = Duration::ZERO so ALL events are
+    /// classified as "old" relative to `now`. After trim:
+    ///   - events_trimmed > 0
+    ///   - list_memories still returns the seeded memory (projection survives)
+    ///   - memories are NOT deleted by event trimming
+    #[test]
+    fn compact_brain_event_trim_keeps_materialized_memories() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let mid = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "this memory must survive event trim",
+            )
+            .expect("add memory");
+
+            // Trim with a 1-second Duration — but we add a 2-second sleep
+            // alternative: use Duration::from_secs(0) which means cutoff =
+            // now, so events older than "right now" are ALL deleted.
+            // Using 0 ensures even events written 1ms ago are trimmed.
+            let trim_dur = std::time::Duration::from_secs(0);
+
+            // Small sleep to ensure events are definitively in the past
+            // relative to the cutoff computed inside compact_brain.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let report = compact_brain(&root, Some(trim_dur), false).expect("compact_brain");
+
+            assert!(
+                report.events_trimmed > 0,
+                "events_trimmed should be > 0 after trim with duration=0; got {}",
+                report.events_trimmed
+            );
+
+            // The materialized memory (projection row) must survive.
+            let memories = list_memories(&root).expect("list memories after event trim");
+            let found = memories.iter().any(|m| m.memory_id == mid);
+            assert!(
+                found,
+                "memory must still be in the projection after event trim"
+            );
+
+            // purge count must be 0 — we didn't ask for it.
+            assert_eq!(
+                report.invalidated_memories_purged, 0,
+                "invalidated_memories_purged must be 0 when purge_invalidated=false"
+            );
+        });
+    }
+
+    /// Q8-4: rebuild_projection after event trim does not error.
+    ///
+    /// Even with a partially trimmed event log, rebuild_in_place can complete —
+    /// it replays whatever events remain without panicking or returning an error.
+    #[test]
+    fn compact_brain_event_trim_then_rebuild_is_consistent() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "pre-trim memory for rebuild test",
+            )
+            .expect("add memory");
+
+            // Trim all events (cutoff = now).
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let report = compact_brain(&root, Some(std::time::Duration::from_secs(0)), false)
+                .expect("compact_brain");
+            assert!(report.events_trimmed > 0, "events must have been trimmed");
+
+            // rebuild_projection must not error — it replays whatever events remain.
+            let replayed =
+                rebuild_projection(&root, false).expect("rebuild_projection after event trim");
+            // The events are gone so the replay count should be 0 (empty log).
+            assert_eq!(
+                replayed, 0,
+                "replayed should be 0 after all events are trimmed"
+            );
         });
     }
 }

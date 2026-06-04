@@ -480,6 +480,28 @@ enum BrainCommand {
     /// Host SessionEnd hook — runs the credentialed distiller.
     #[command(name = "session-end-hook")]
     SessionEndHook(SessionEndHookArgs),
+    /// Reclaim dead disk space in brain.db.
+    ///
+    /// Without flags this is a safe, read-only-equivalent operation: SQLite
+    /// VACUUM rewrites the file, reclaiming free pages left by past invalidations,
+    /// prunes, and merges. No data is deleted.
+    ///
+    /// --purge-invalidated: also deletes retired (invalidated) memory rows
+    /// before VACUUM. They are excluded from retrieval already; purging them
+    /// makes VACUUM actually shrink the file. Note: they will no longer appear
+    /// in audit/blame output.
+    ///
+    /// --trim-events-older-than <dur>: deletes events older than the given
+    /// duration (e.g. 30d, 7d, 24h). WARNING: this shrinks the rebuild
+    /// history window. Materialized memories (projection rows) are NOT
+    /// affected — only the raw event log is trimmed.
+    ///
+    /// Examples:
+    ///   kimetsu brain compact
+    ///   kimetsu brain compact --purge-invalidated
+    ///   kimetsu brain compact --trim-events-older-than 90d
+    ///   kimetsu brain compact --purge-invalidated --trim-events-older-than 30d --json
+    Compact(CompactArgs),
     /// Export active memories to a portable JSON file (or stdout when <file> is `-`).
     ///
     /// The output is a JSON array of `{ text, scope, kind, confidence, created_at }`
@@ -602,6 +624,28 @@ struct ReindexArgs {
     /// reindex on huge brains over multiple invocations.
     #[arg(long)]
     limit: Option<usize>,
+}
+
+/// Q8: args for `kimetsu brain compact`.
+#[derive(Debug, Args)]
+struct CompactArgs {
+    /// Also delete invalidated (retired) memory rows before VACUUM.
+    /// These rows are already excluded from retrieval; purging them lets
+    /// VACUUM recover more disk space. They will no longer appear in
+    /// audit/blame output after this operation.
+    #[arg(long)]
+    purge_invalidated: bool,
+    /// Trim events older than this duration before VACUUM (e.g. 30d, 7d, 24h).
+    /// WARNING: reduces the rebuild history window. Materialized memories
+    /// (projection rows) are NOT affected — only the raw event log is trimmed.
+    #[arg(long, value_name = "DUR")]
+    trim_events_older_than: Option<String>,
+    /// Emit machine-readable JSON instead of the human summary.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -2176,6 +2220,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             distiller::run_session_end_hook(&workspace);
             Ok(())
         }
+        BrainCommand::Compact(args) => brain_compact(args),
         BrainCommand::Export(args) => brain_export(args),
         BrainCommand::Import(args) => brain_import(args),
     }
@@ -2444,6 +2489,76 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
             "updated"
         },
     );
+    Ok(())
+}
+
+// ── Q8: brain compact ────────────────────────────────────────────────────────
+
+/// `kimetsu brain compact [--purge-invalidated] [--trim-events-older-than <dur>] [--json]`
+///
+/// Reclaims dead space in brain.db via SQLite VACUUM. Optional flags allow
+/// purging invalidated memory rows and trimming the durable event log.
+fn brain_compact(args: CompactArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Parse --trim-events-older-than if provided.
+    let trim_dur = args
+        .trim_events_older_than
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| format!("--trim-events-older-than: {e}"))?;
+
+    // Print warnings before performing any destructive operations.
+    if let Some(ref dur_str) = args.trim_events_older_than {
+        eprintln!(
+            "WARNING: --trim-events-older-than {dur_str} will delete events older than \
+             {dur_str} from the durable event log. Materialized memories are unaffected, \
+             but the rebuild history window will be reduced."
+        );
+    }
+    if args.purge_invalidated {
+        eprintln!(
+            "NOTE: --purge-invalidated will permanently delete retired (invalidated) memory \
+             rows. They will no longer appear in audit/blame output."
+        );
+    }
+
+    let report = project::compact_brain(&workspace, trim_dur, args.purge_invalidated)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human-readable output.
+    let freed = report.bytes_before.saturating_sub(report.bytes_after);
+    println!(
+        "compacted brain.db: {} → {} (freed {})",
+        fmt_bytes(report.bytes_before),
+        fmt_bytes(report.bytes_after),
+        fmt_bytes(freed),
+    );
+    if report.invalidated_memories_purged > 0 {
+        println!(
+            "  purged {} invalidated memor{} (removed from audit trail)",
+            report.invalidated_memories_purged,
+            if report.invalidated_memories_purged == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+    }
+    if report.events_trimmed > 0 {
+        println!(
+            "  trimmed {} old event{} (rebuild history reduced)",
+            report.events_trimmed,
+            if report.events_trimmed == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
