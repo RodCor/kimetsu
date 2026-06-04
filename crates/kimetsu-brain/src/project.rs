@@ -464,15 +464,29 @@ pub fn add_memory(
     // existing scripts that wrote GlobalUser memories into the project
     // keep working.
     //
-    // W3.3: load the config first so we can apply the use_user_brain
-    // flag with env override before opening the user brain.
-    let (paths, config, conn) = load_project(start)?;
-    if scope == MemoryScope::GlobalUser
-        && let Some(user_conn) =
-            user_brain::open_user_brain_for_config(config.kimetsu.use_user_brain)?
-    {
-        return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
+    // P0 fix: this short-circuit MUST run BEFORE `load_project` so
+    // that GlobalUser writes work from ANY `start` directory — including
+    // dirs that are not kimetsu projects (e.g. the global distiller's
+    // temp/user dir). W3.3's `use_user_brain` toggle is still honored
+    // best-effort: if `start` IS a project we read its config; if not
+    // (or if the read fails) we default to enabled (nothing to opt out of).
+    if scope == MemoryScope::GlobalUser {
+        let use_user_brain = ProjectPaths::discover(start)
+            .ok()
+            .and_then(|paths| load_config(&paths).ok())
+            .map(|cfg| cfg.kimetsu.use_user_brain)
+            .unwrap_or(true);
+        if let Some(user_conn) =
+            user_brain::open_user_brain_for_config(use_user_brain)?
+        {
+            return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
+        }
+        // User brain disabled/unreachable → fall through to the project DB
+        // (which DOES require a valid project — same pre-P0 behavior for
+        // the disabled/fallback path).
     }
+
+    let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory add", Some(run_id))?;
     let memory_id = Ulid::new().to_string();
@@ -4196,5 +4210,132 @@ max_total_cost_usd = 250.0
 
             fs::remove_dir_all(root).ok(); // best-effort on Windows
         });
+    }
+
+    // ── P0 regression tests: GlobalUser add_memory must not require a project ─
+
+    /// Helper: run `f` with the user brain pointed at `dir`, under the
+    /// process-wide env lock. Restores env when done and returns `f`'s value.
+    fn with_user_brain_at_p0<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        use crate::user_brain::test_env_lock;
+        let _guard = test_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev_dir = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        let prev_en = std::env::var("KIMETSU_USER_BRAIN").ok();
+        // SAFETY: scoped by the shared mutex.
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
+            std::env::remove_var("KIMETSU_USER_BRAIN");
+        }
+        let out = f();
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_en {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN"),
+            }
+        }
+        out
+    }
+
+    /// P0 regression: `add_memory` with `scope = GlobalUser` from a NON-project
+    /// temp dir (no `.kimetsu/project.toml`) must succeed and land in the user
+    /// brain. This is the exact scenario the global distiller hits.
+    #[test]
+    fn p0_global_user_add_memory_works_from_non_project_dir() {
+        use crate::user_brain::{list_user_memories, open_user_brain_readonly};
+
+        let user_brain_dir = std::env::temp_dir()
+            .join(format!("kimetsu-p0-ubrain-{}", Ulid::new()));
+        fs::create_dir_all(&user_brain_dir).expect("create user brain dir");
+
+        // `start` is a plain temp dir — NOT a kimetsu project.
+        let non_project_dir = std::env::temp_dir()
+            .join(format!("kimetsu-p0-nonproj-{}", Ulid::new()));
+        fs::create_dir_all(&non_project_dir).expect("create non-project dir");
+
+        with_user_brain_at_p0(&user_brain_dir, || {
+            add_memory(
+                &non_project_dir,
+                MemoryScope::GlobalUser,
+                MemoryKind::Fact,
+                "P0 regression: GlobalUser write from non-project dir",
+            )
+            .expect("P0: add_memory(GlobalUser) from a non-project dir must succeed");
+
+            // Verify the memory landed in the user brain.
+            let conn = open_user_brain_readonly()
+                .expect("open ok")
+                .expect("user brain must exist after write");
+            let mems = list_user_memories(&conn).expect("list");
+            assert!(
+                mems.iter()
+                    .any(|m| m.text.contains("P0 regression: GlobalUser write from non-project dir")),
+                "P0: the GlobalUser memory must land in the user brain"
+            );
+        });
+
+        fs::remove_dir_all(&non_project_dir).ok();
+        fs::remove_dir_all(&user_brain_dir).ok();
+    }
+
+    /// W3.3 toggle preserved: when `start` IS a project with
+    /// `[kimetsu] use_user_brain = false`, a GlobalUser `add_memory`
+    /// must NOT write to the user brain (falls through to project DB).
+    #[test]
+    fn p0_global_user_honors_use_user_brain_false_when_start_is_project() {
+        use crate::user_brain::{list_user_memories, open_user_brain_readonly};
+
+        // User brain dir: a dedicated temp location so we can assert nothing was written.
+        let user_brain_dir = std::env::temp_dir()
+            .join(format!("kimetsu-p0-w3-ubrain-{}", Ulid::new()));
+        fs::create_dir_all(&user_brain_dir).expect("create user brain dir");
+
+        // Create a real kimetsu project.
+        let root = test_root();
+        init_project(&root, false).expect("init project");
+
+        // Flip use_user_brain = false.
+        {
+            let (paths, mut config, _) = load_project(&root).expect("load project");
+            config.kimetsu.use_user_brain = false;
+            let toml = config.to_toml().expect("serialize");
+            fs::write(&paths.project_toml, toml).expect("write project.toml");
+        }
+
+        let mem_id = with_user_brain_at_p0(&user_brain_dir, || {
+            // Write GlobalUser memory — user brain disabled by config → falls through
+            // to project DB.
+            let id = add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Fact,
+                "W3.3 toggle: this must stay in the project DB",
+            )
+            .expect("add_memory must succeed (falls through to project DB)");
+
+            // Assert user brain was NOT written to within the same env scope.
+            let user_conn_opt = open_user_brain_readonly().expect("open ok");
+            let user_mems_count = user_conn_opt
+                .map(|c| list_user_memories(&c).unwrap_or_default().len())
+                .unwrap_or(0);
+            assert_eq!(
+                user_mems_count, 0,
+                "W3.3 toggle: user brain must be empty when use_user_brain=false"
+            );
+            id
+        });
+
+        // Assert 1: memory is in the PROJECT db.
+        let project_mems = list_memories(&root).expect("list project memories");
+        assert!(
+            project_mems.iter().any(|m| m.memory_id == mem_id),
+            "W3.3 toggle: memory must be in the project DB when use_user_brain=false"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&user_brain_dir).ok();
     }
 }
