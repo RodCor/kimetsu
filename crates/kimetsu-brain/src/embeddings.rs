@@ -267,6 +267,26 @@ fn build_default_embedder() -> Box<dyn Embedder + Send + Sync> {
     Box::new(NoopEmbedder)
 }
 
+/// W3.1: config-aware embedder resolver.
+///
+/// Returns the shared real embedder when embeddings are enabled, or a
+/// static [`NoopEmbedder`] when they are disabled — so a project with
+/// `[embedder] enabled = false` gets FTS-only retrieval and writes no
+/// vectors, durably, without relying on the `KIMETSU_BRAIN_EMBEDDER`
+/// env var.
+///
+/// Precedence mirrors [`embedder_enabled_for_config`]:
+///   1. `KIMETSU_BRAIN_EMBEDDER` env disable value → Noop.
+///   2. `KIMETSU_BRAIN_EMBEDDER` real model id → real embedder.
+///   3. Env unset → `config_enabled` governs.
+pub fn open_embedder_for(config_enabled: bool) -> &'static dyn Embedder {
+    if embedder_enabled_for_config(config_enabled) {
+        open_default_embedder()
+    } else {
+        &NoopEmbedder
+    }
+}
+
 /// v0.8: open a FRESH (uncached) embedder for an explicit built-in
 /// model id. Unlike [`open_default_embedder`], this bypasses the
 /// process-static cache AND the env/override resolution — the caller
