@@ -131,12 +131,22 @@ pub fn serve_mcp<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn handle_mcp_method(
+/// Transport-agnostic MCP method dispatch.
+///
+/// `allowed_tools = None` → full catalog (identical to the previous
+/// `handle_mcp_method` behaviour; stdio path uses this).
+///
+/// `allowed_tools = Some(set)`:
+///   - `"tools/list"` returns only entries whose `name` ∈ set.
+///   - `"tools/call"` returns an error before dispatching if the
+///     requested tool name is not in the set.
+pub fn dispatch(
     method: &str,
-    params: Value,
-    workspace: &Path,
+    params: serde_json::Value,
+    workspace: &std::path::Path,
     skills: &SkillConfig,
-) -> Result<Value, String> {
+    allowed_tools: Option<&std::collections::BTreeSet<&'static str>>,
+) -> Result<serde_json::Value, String> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
@@ -150,12 +160,39 @@ fn handle_mcp_method(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => {
+            let all = tool_definitions();
+            let tools = match allowed_tools {
+                None => all,
+                Some(set) => {
+                    let filtered: Vec<Value> = all
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|entry| {
+                            entry
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(|n| set.contains(n))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    Value::Array(filtered)
+                }
+            };
+            Ok(json!({ "tools": tools }))
+        }
         "tools/call" => {
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "tools/call missing name".to_string())?;
+            if let Some(set) = allowed_tools {
+                if !set.contains(name) {
+                    return Err(format!("tool `{name}` is not available in remote mode"));
+                }
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -218,6 +255,16 @@ fn handle_mcp_method(
         }
         other => Err(format!("unsupported MCP method `{other}`")),
     }
+}
+
+/// Thin wrapper for the stdio path: full catalog, no allowlist.
+fn handle_mcp_method(
+    method: &str,
+    params: Value,
+    workspace: &Path,
+    skills: &SkillConfig,
+) -> Result<Value, String> {
+    dispatch(method, params, workspace, skills, None)
 }
 
 fn call_tool(
@@ -2373,5 +2420,158 @@ mod tests {
         // so ProjectPaths::discover resolves here, not a shared ancestor.
         kimetsu_core::paths::git_init_boundary(&root);
         root
+    }
+
+    // ── dispatch allowlist tests ──────────────────────────────────────────
+
+    /// (a) dispatch("tools/list", .., None) returns the full catalog.
+    #[test]
+    fn dispatch_no_allowlist_returns_full_catalog() {
+        use std::collections::BTreeSet;
+        let result = dispatch(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+            None,
+        )
+        .expect("dispatch tools/list None");
+        let tools = result["tools"].as_array().expect("tools array");
+        // Full catalog must contain representative tools from every category.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        for expected in &[
+            "kimetsu_brain_status",
+            "kimetsu_brain_context",
+            "kimetsu_brain_record",
+            "kimetsu_benchmark_context",
+            "kimetsu_benchmark_record_outcome",
+            "kimetsu_brain_memory_list",
+            "kimetsu_brain_memory_top",
+            "kimetsu_brain_memory_add",
+            "kimetsu_brain_memory_proposals",
+            "kimetsu_brain_memory_accept",
+            "kimetsu_brain_memory_reject",
+            "kimetsu_brain_memory_invalidate",
+            "kimetsu_brain_memory_blame",
+            "kimetsu_brain_memory_conflicts",
+            "kimetsu_brain_ingest_repo",
+            "kimetsu_bridge_status",
+            "kimetsu_skills_search",
+            "kimetsu_bridge_import",
+            "kimetsu_bridge_export",
+            "kimetsu_bridge_sync",
+            "kimetsu_plugin_install",
+            "kimetsu_brain_model_list",
+            "kimetsu_brain_model_set",
+            "kimetsu_brain_reindex",
+            "kimetsu_brain_memory_search",
+            "kimetsu_brain_conflict_resolve",
+            "kimetsu_brain_prune",
+            "kimetsu_brain_config_show",
+            "kimetsu_brain_insights",
+        ] {
+            assert!(
+                names.contains(expected),
+                "full catalog missing `{expected}`; got: {names:?}"
+            );
+        }
+        // Confirm handle_mcp_method returns the same count (byte-identical path).
+        let via_handle = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("handle_mcp_method tools/list");
+        assert_eq!(
+            result["tools"].as_array().unwrap().len(),
+            via_handle["tools"].as_array().unwrap().len(),
+            "dispatch(None) and handle_mcp_method must return the same number of tools"
+        );
+        let _ = BTreeSet::<&str>::new(); // suppress unused-import if needed
+    }
+
+    /// (b) dispatch("tools/list", .., Some({"kimetsu_brain_record"})) returns ONLY that tool.
+    #[test]
+    fn dispatch_allowlist_filters_tools_list() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_record");
+        let result = dispatch(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect("dispatch filtered tools/list");
+        let tools = result["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools.len(),
+            1,
+            "allowlist of 1 tool should yield exactly 1 entry, got: {tools:?}"
+        );
+        assert_eq!(
+            tools[0]["name"].as_str(),
+            Some("kimetsu_brain_record"),
+            "the returned tool must be kimetsu_brain_record"
+        );
+    }
+
+    /// (c) dispatch("tools/call", {name:"kimetsu_brain_ingest_repo",..}, Some(set_without_it))
+    ///     returns the "not available in remote mode" error without executing.
+    #[test]
+    fn dispatch_allowlist_blocks_unlisted_tool_call() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_record"); // ingest_repo is NOT in this set
+        let err = dispatch(
+            "tools/call",
+            json!({ "name": "kimetsu_brain_ingest_repo", "arguments": {} }),
+            Path::new("."),
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect_err("should be blocked by allowlist");
+        assert!(
+            err.contains("not available in remote mode"),
+            "error must mention 'not available in remote mode', got: {err:?}"
+        );
+        assert!(
+            err.contains("kimetsu_brain_ingest_repo"),
+            "error must name the blocked tool, got: {err:?}"
+        );
+    }
+
+    /// (d) An allowed tools/call dispatches correctly (uses kimetsu_brain_status
+    ///     which returns initialized:false for a missing brain without executing any
+    ///     side-effects, so it's safe in a unit test).
+    #[test]
+    fn dispatch_allowlist_permits_listed_tool_call() {
+        use std::collections::BTreeSet;
+        let root = temp_root("dispatch-allowlist-permitted");
+        fs::create_dir_all(&root).expect("create temp root");
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_status");
+        let result = dispatch(
+            "tools/call",
+            json!({ "name": "kimetsu_brain_status", "arguments": {} }),
+            &root,
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect("allowed tool call should not be blocked");
+        // Result is wrapped in MCP content envelope.
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text");
+        let inner: Value = serde_json::from_str(text).expect("inner JSON");
+        // No brain initialized → initialized:false (not a panic or block error).
+        assert_eq!(
+            inner["initialized"].as_bool(),
+            Some(false),
+            "brain not initialized — expected initialized:false"
+        );
+        fs::remove_dir_all(root).expect("remove temp root");
     }
 }

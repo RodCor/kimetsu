@@ -206,6 +206,83 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
     Ok((paths, config, conn))
 }
 
+/// No-git variant of [`init_project`]: uses [`ProjectPaths::at_root`]
+/// directly so discovery never shells out to git or climbs to a parent repo.
+/// Intended for the remote HTTP MCP server which manages brains at an
+/// explicit root directory per repo-id.
+pub fn init_project_at_root(root: &Path, force: bool) -> KimetsuResult<InitSummary> {
+    let paths = ProjectPaths::at_root(root);
+    fs::create_dir_all(&paths.kimetsu_dir)?;
+
+    let project_id = default_project_id(&paths.repo_root);
+    let config = ProjectConfig::default_for_project(project_id);
+    let wrote_project_toml = if force || !paths.project_toml.exists() {
+        fs::write(&paths.project_toml, config.to_toml()?)?;
+        true
+    } else {
+        false
+    };
+
+    let config = load_config(&paths)?;
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+
+    let api_key_present = resolve_env_value(&paths.repo_root, &config.model.api_key_env).is_some();
+
+    Ok(InitSummary {
+        project_id: config.kimetsu.project_id,
+        repo_root: paths.repo_root,
+        kimetsu_dir: paths.kimetsu_dir,
+        brain_db: paths.brain_db,
+        model: format!("{}/{}", config.model.provider, config.model.model),
+        api_key_env: config.model.api_key_env,
+        api_key_present,
+        wrote_project_toml,
+    })
+}
+
+/// No-git variant of [`load_project`]: uses [`ProjectPaths::at_root`]
+/// directly so discovery never shells out to git or climbs to a parent repo.
+pub fn load_project_at_root(
+    root: &Path,
+) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
+    let paths = ProjectPaths::at_root(root);
+    let config = load_config(&paths)?;
+    if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
+        return Err(format!(
+            "project.toml schema version {} does not match expected {}",
+            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
+        )
+        .into());
+    }
+
+    schema::ensure_vec_extension_registered();
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+    Ok((paths, config, conn))
+}
+
+/// No-git variant of [`load_project_readonly`]: uses [`ProjectPaths::at_root`]
+/// directly so discovery never shells out to git or climbs to a parent repo.
+pub fn load_project_readonly_at_root(
+    root: &Path,
+) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
+    let paths = ProjectPaths::at_root(root);
+    let config = load_config(&paths)?;
+    if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
+        return Err(format!(
+            "project.toml schema version {} does not match expected {}",
+            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
+        )
+        .into());
+    }
+
+    schema::ensure_vec_extension_registered();
+    let conn = Connection::open_with_flags(&paths.brain_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    schema::validate(&conn)?;
+    Ok((paths, config, conn))
+}
+
 /// Return the brain.db schema version for the project rooted at `start`.
 ///
 /// Opens via `load_project` (which migrates on the way through), so by the
@@ -5601,6 +5678,110 @@ max_total_cost_usd = 250.0
                 replayed, 0,
                 "replayed should be 0 after all events are trimmed"
             );
+        });
+    }
+
+    // ── *_at_root no-git seam tests ───────────────────────────────────────
+
+    /// init_project_at_root creates .kimetsu/{project.toml,brain.db} rooted
+    /// at the given directory even when that directory lives INSIDE a git repo
+    /// (no git climb). load_project_at_root opens it, and a round-trip memory
+    /// add + list confirms the brain is functional.
+    #[test]
+    fn at_root_init_and_round_trip_memory() {
+        with_user_brain_disabled(|| {
+            // Use a temp dir with a git boundary so that `add_memory` (which
+            // uses ProjectPaths::discover internally) resolves to this dir
+            // rather than climbing to E:\Kimetsu. The *_at_root functions
+            // themselves never call discover; the boundary is only needed for
+            // the helper calls (add_memory / list_memories) in this test.
+            let root = std::env::temp_dir().join(format!("kimetsu-at-root-{}", Ulid::new()));
+            kimetsu_core::paths::git_init_boundary(&root);
+
+            // Init at explicit root — must not climb to a parent git repo.
+            let summary = init_project_at_root(&root, false).expect("init_project_at_root");
+
+            assert!(
+                summary.kimetsu_dir.exists(),
+                ".kimetsu/ must be created at root"
+            );
+            // The .kimetsu dir must be a child of root, not some git ancestor.
+            assert!(
+                summary.kimetsu_dir.starts_with(&root),
+                ".kimetsu dir {:?} must be inside root {:?}",
+                summary.kimetsu_dir,
+                root
+            );
+            assert!(summary.brain_db.exists(), "brain.db must exist");
+            assert!(
+                root.join(".kimetsu").join("project.toml").exists(),
+                "project.toml must be at root/.kimetsu/"
+            );
+
+            // load_project_at_root must open the same brain.
+            let (paths, _config, _conn) =
+                load_project_at_root(&root).expect("load_project_at_root");
+            assert_eq!(
+                paths
+                    .repo_root
+                    .canonicalize()
+                    .unwrap_or(paths.repo_root.clone()),
+                root.canonicalize().unwrap_or(root.clone()),
+                "repo_root must be our explicit root"
+            );
+
+            // Round-trip: add a memory, then verify it is visible via list_memories.
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "at_root seam test memory",
+            )
+            .expect("add_memory");
+
+            // list_memories opens a fresh connection — confirms the write landed
+            // in the at-root brain.db (not a git-ancestor brain).
+            let memories = list_memories(&root).expect("list_memories");
+            assert!(
+                memories.iter().any(|m| m.memory_id == memory_id),
+                "memory {memory_id} must be present in the at_root brain"
+            );
+
+            // load_project_readonly_at_root must also see it.
+            let (_, _, ro_conn) =
+                load_project_readonly_at_root(&root).expect("load_project_readonly_at_root");
+            let ro_count: i64 = ro_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![memory_id],
+                    |row| row.get(0),
+                )
+                .expect("count memory ro");
+            assert_eq!(ro_count, 1, "readonly view must see the same memory");
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    /// init_project_at_root is idempotent: calling it twice (force=false)
+    /// does not overwrite project.toml.
+    #[test]
+    fn at_root_init_is_idempotent() {
+        with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("kimetsu-at-root-idem-{}", Ulid::new()));
+            std::fs::create_dir_all(&root).expect("create root");
+
+            let s1 = init_project_at_root(&root, false).expect("first init");
+            assert!(s1.wrote_project_toml, "first init must write project.toml");
+
+            let s2 = init_project_at_root(&root, false).expect("second init");
+            assert!(
+                !s2.wrote_project_toml,
+                "second init (force=false) must not overwrite project.toml"
+            );
+            assert_eq!(s1.project_id, s2.project_id, "project_id must be stable");
+
+            std::fs::remove_dir_all(&root).ok();
         });
     }
 }

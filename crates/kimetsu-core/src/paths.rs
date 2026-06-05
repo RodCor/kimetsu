@@ -1,8 +1,23 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::KimetsuResult;
+
+static DISCOVER_AT_ROOT_ONLY: OnceLock<bool> = OnceLock::new();
+
+/// Pin discovery to at_root semantics process-wide (remote server calls once
+/// at startup): every [`ProjectPaths::discover`] call thereafter behaves like
+/// [`ProjectPaths::at_root`] — no git subprocess, never climbs to an
+/// enclosing repo. Idempotent.
+pub fn pin_discover_to_root() {
+    let _ = DISCOVER_AT_ROOT_ONLY.set(true);
+}
+
+fn discover_pins_to_root() -> bool {
+    *DISCOVER_AT_ROOT_ONLY.get().unwrap_or(&false)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProjectPaths {
@@ -17,6 +32,9 @@ pub struct ProjectPaths {
 
 impl ProjectPaths {
     pub fn discover(start: impl AsRef<Path>) -> KimetsuResult<Self> {
+        if discover_pins_to_root() {
+            return Ok(Self::at_root(start.as_ref()));
+        }
         let repo_root = discover_repo_root(start.as_ref())?;
         Ok(Self::at_root(repo_root))
     }
@@ -365,5 +383,41 @@ mod tests {
             "slug contains unsafe chars: {id:?}"
         );
         assert!(!id.is_empty());
+    }
+
+    /// pin_discover_to_root — once set, ProjectPaths::discover(nested_dir)
+    /// must return paths rooted AT that dir, NOT at any git ancestor.
+    ///
+    /// IMPORTANT: OnceLock cannot be reset, so this pin is process-wide and
+    /// permanent once set. This test is intentionally kept minimal and
+    /// self-contained. Primary coverage of the no-git seam lives in the
+    /// kimetsu-brain project.rs `*_at_root` tests which do NOT need the pin.
+    #[test]
+    fn pin_discover_to_root_skips_git_climb() {
+        // Create a temp dir nested inside the current git repo (E:\Kimetsu is
+        // a git repo, so any child dir without its own .git would normally
+        // climb to E:\Kimetsu). We use a deeply nested path to be sure.
+        let nested = std::env::temp_dir()
+            .join("kimetsu-pin-test")
+            .join("nested")
+            .join("deep");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        // Set the pin (process-global, irreversible — that's by design).
+        pin_discover_to_root();
+
+        // discover(nested) must return nested itself, not a git ancestor.
+        let paths = ProjectPaths::discover(&nested).expect("discover with pin should not fail");
+
+        // The repo_root must be exactly `nested` (or its canonical form).
+        let canonical_nested = nested.canonicalize().unwrap_or(nested.clone());
+        let canonical_root = paths
+            .repo_root
+            .canonicalize()
+            .unwrap_or(paths.repo_root.clone());
+        assert_eq!(
+            canonical_root, canonical_nested,
+            "pin_discover_to_root: expected repo_root == nested dir, got {canonical_root:?}"
+        );
     }
 }

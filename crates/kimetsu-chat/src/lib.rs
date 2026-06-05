@@ -37,7 +37,7 @@ pub use bridge::{
 };
 pub use commands::SlashCommand;
 pub use cost::CostMeter;
-pub use mcp_server::{McpServeConfig, serve_mcp};
+pub use mcp_server::{McpServeConfig, dispatch, serve_mcp};
 pub use repl::{ChatConfig, ChatError, ChatResult, run_repl};
 pub use skills::{SkillConfig, SkillRegistry, skill_origin_label};
 pub use ui::{ChatUi, ChatUiMode, rich_ui_enabled_from_env};
