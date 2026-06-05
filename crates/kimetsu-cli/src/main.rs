@@ -471,9 +471,9 @@ struct InitArgs {
     /// Overwrite an existing project.toml / brain.db instead of keeping it.
     #[arg(long)]
     force: bool,
-    /// Skip writing .claude/CLAUDE.md and .claude/settings.json.
-    /// Use when you manage Claude Code configuration manually.
-    #[arg(long)]
+    /// Deprecated — `init` no longer writes host wiring. Use
+    /// `kimetsu plugin install` or `kimetsu setup` to wire hosts.
+    #[arg(long, hide = true)]
     no_hooks: bool,
 }
 
@@ -1272,9 +1272,12 @@ fn main() {
 }
 
 fn install_tracing() {
+    // Default to `warn` so internal INFO noise (schema migration, etc.) stays
+    // hidden on normal CLI runs. Power users can opt in with
+    // `KIMETSU_LOG=info` or `RUST_LOG=info`.
     let filter = EnvFilter::try_from_env("KIMETSU_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -1638,7 +1641,10 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
         .unwrap_or_else(|_| args.workspace.clone());
 
     println!("=== kimetsu setup ===");
-    println!("workspace: {}", workspace.display());
+    println!(
+        "workspace: {}",
+        kimetsu_core::paths::display_path(&workspace)
+    );
     println!();
 
     // ── Step 1: Init ──────────────────────────────────────────────────────────
@@ -1649,12 +1655,12 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             if summary.wrote_project_toml {
                 println!(
                     "  initialized .kimetsu/ at {}",
-                    summary.kimetsu_dir.display()
+                    kimetsu_core::paths::display_path(&summary.kimetsu_dir)
                 );
             } else {
                 println!(
                     "  project already initialized at {}",
-                    summary.kimetsu_dir.display()
+                    kimetsu_core::paths::display_path(&summary.kimetsu_dir)
                 );
             }
             true
@@ -1694,11 +1700,21 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
     let mode = PluginMode::parse(&args.mode).map_err(|e| format!("kimetsu setup: {e}"))?;
 
     let host_labels: Vec<&str> = hosts.iter().map(|h| h.as_str()).collect();
+    let scope_gloss = match scope {
+        InstallScope::Workspace => "this project only",
+        InstallScope::Global => "every project",
+    };
+    let mode_gloss = match mode {
+        PluginMode::Optional => "recommended, non-blocking",
+        PluginMode::Required => "treated as a setup blocker for big tasks",
+    };
     println!(
-        "  hosts: {}  scope: {}  mode: {}",
+        "  hosts: {}   scope: {} ({})   mode: {} ({})",
         host_labels.join(", "),
         scope.as_str(),
-        mode.as_str()
+        scope_gloss,
+        mode.as_str(),
+        mode_gloss,
     );
 
     // ── Step 3: Install ───────────────────────────────────────────────────────
@@ -1734,7 +1750,11 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
         ) {
             Ok(report) => {
                 for f in &report.files {
-                    println!("    {}", f.display());
+                    let rel = f
+                        .strip_prefix(&workspace)
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| kimetsu_core::paths::display_path(f));
+                    println!("    {rel}");
                 }
                 for note in &report.notes {
                     println!("    {note}");
@@ -2148,14 +2168,38 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 !args.no_proactive,
             )
             .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+
+            // Friendly framing: intro line with plain-language scope/mode glosses.
+            let host_label = match target {
+                BridgeTarget::ClaudeCode => "Claude Code",
+                BridgeTarget::Codex => "Codex",
+                BridgeTarget::Kimetsu => "Kimetsu",
+                #[cfg(feature = "openclaw")]
+                BridgeTarget::OpenClaw => "OpenClaw",
+                #[cfg(feature = "pi")]
+                BridgeTarget::Pi => "Pi",
+            };
+            let scope_gloss = match scope {
+                InstallScope::Workspace => "this project only",
+                InstallScope::Global => "every project",
+            };
+            let mode_gloss = match mode {
+                PluginMode::Optional => "recommended, non-blocking",
+                PluginMode::Required => "treated as a setup blocker for big tasks",
+            };
             println!(
-                "installed Kimetsu plugin surface for {} ({} scope) in {} mode",
-                report.target.as_str(),
+                "Wiring Kimetsu into {host_label} ({} scope — {scope_gloss}, {} mode — {mode_gloss})…",
                 report.scope.as_str(),
-                report.mode.as_str()
+                report.mode.as_str(),
             );
-            for file in report.files {
-                println!("  {}", file.display());
+            println!("  wrote/updated:");
+            for file in &report.files {
+                // Show workspace-relative path when possible; fall back to display_path.
+                let rel = file
+                    .strip_prefix(&workspace)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| kimetsu_core::paths::display_path(file));
+                println!("    {rel}");
             }
             for note in &report.notes {
                 println!("  {note}");
@@ -2304,7 +2348,10 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                     s.host, s.scope, state_label, present_str, missing_str
                 );
                 if !matches!(s.state, WiringState::Absent) {
-                    println!("    config: {}", s.config_path);
+                    // Strip \\?\ prefix that canonicalize() can add on Windows.
+                    let cfg_display =
+                        kimetsu_core::paths::display_path(std::path::Path::new(&s.config_path));
+                    println!("    config: {cfg_display}");
                 }
             }
 
@@ -2622,126 +2669,33 @@ fn init(args: InitArgs) -> KimetsuResult<()> {
     let cwd = env::current_dir()?;
     let summary = project::init_project(&cwd, args.force)?;
 
-    println!("project_id: {}", summary.project_id);
-    println!("repo_root: {}", summary.repo_root.display());
-    println!("kimetsu_dir: {}", summary.kimetsu_dir.display());
-    println!("brain_db: {}", summary.brain_db.display());
-    println!("model: {}", summary.model);
-    println!(
-        "project_toml: {}",
-        if summary.wrote_project_toml {
-            "written"
-        } else {
-            "kept existing"
-        }
-    );
-    println!(
-        "api_key: {} ({})",
-        if summary.api_key_present {
-            "present"
-        } else {
-            "missing"
-        },
-        summary.api_key_env
-    );
+    // Friendly summary — use display_path to strip \\?\ on Windows.
+    let pretty_root = kimetsu_core::paths::display_path(&summary.repo_root);
+    println!("✓ Initialized Kimetsu in {pretty_root}");
+
+    // Show inner files workspace-relative.
+    println!("    brain:  .kimetsu/brain.db  ({} memories)", {
+        project::list_memories(&summary.repo_root)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    });
+    println!("    config: .kimetsu/project.toml");
+    println!("    model:  {}", summary.model);
 
     if !summary.api_key_present {
         println!(
-            "hint: set {} before running model-backed commands",
+            "    note: {} isn't set — needed only for model-backed commands \
+             (`kimetsu run`, `kimetsu chat`), not for the brain.",
             summary.api_key_env
         );
     }
 
-    if !args.no_hooks {
-        write_claude_hooks(&summary.repo_root)?;
-    }
-
-    Ok(())
-}
-
-const CLAUDE_MD_CONTENT: &str = r#"# Kimetsu brain
-
-You have a persistent memory brain attached via MCP (tools prefixed `mcp__kimetsu__`).
-
-- **Before non-trivial tasks**: call `kimetsu_brain_context` with a short query. If the brain
-  has relevant prior knowledge it will return it. If not (`skipped: true`), proceed as normal —
-  this is zero overhead.
-- **After solving a non-obvious problem**: call `kimetsu_brain_record` with what you learned
-  and 2-5 domain tags. Keep lessons concrete and actionable, not platitudes.
-
-Do not call either tool on simple/one-liner tasks. The brain is for things that required real
-effort or that you would want to remember next session.
-"#;
-
-const CLAUDE_SETTINGS_CONTENT: &str = r#"{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "kimetsu brain context-hook"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "kimetsu brain pretool-hook"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "kimetsu brain posttool-hook"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "kimetsu brain stop-hook"
-          }
-        ]
-      }
-    ]
-  }
-}
-"#;
-
-fn write_claude_hooks(repo_root: &std::path::Path) -> KimetsuResult<()> {
-    let claude_dir = repo_root.join(".claude");
-    std::fs::create_dir_all(&claude_dir)?;
-
-    let claude_md = claude_dir.join("CLAUDE.md");
-    if !claude_md.exists() {
-        std::fs::write(&claude_md, CLAUDE_MD_CONTENT)?;
-        println!("claude_hooks: wrote {}", claude_md.display());
-    } else {
-        println!("claude_hooks: kept existing {}", claude_md.display());
-    }
-
-    let settings_json = claude_dir.join("settings.json");
-    if !settings_json.exists() {
-        std::fs::write(&settings_json, CLAUDE_SETTINGS_CONTENT)?;
-        println!("claude_hooks: wrote {}", settings_json.display());
-    } else {
-        println!("claude_hooks: kept existing {}", settings_json.display());
-    }
+    println!();
+    println!("Next — wire a host agent so it uses the brain:");
+    println!("    kimetsu plugin install claude-code      (also: codex, pi, openclaw)");
+    println!(
+        "    kimetsu setup                           (init + install + health check, in one step)"
+    );
 
     Ok(())
 }

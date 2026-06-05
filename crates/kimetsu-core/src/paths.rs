@@ -216,6 +216,26 @@ pub fn user_cache_dir_for(repo_root: &Path) -> PathBuf {
     }
 }
 
+/// Strip the Windows `\\?\` extended-path prefix from a path string for
+/// display purposes only. The stored/internal path is never modified.
+///
+/// Conversions:
+///   `\\?\UNC\server\share` → `\\server\share`
+///   `\\?\C:\foo`           → `C:\foo`
+///   anything else          → unchanged
+///
+/// On non-Windows this is a no-op; the prefix never appears there.
+pub fn display_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    s.into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +329,30 @@ mod tests {
                 .components()
                 .any(|c| c.as_os_str() == "kimetsu-cache"),
             "expected 'kimetsu-cache' in path, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn display_path_strips_extended_prefix() {
+        // \\?\C:\foo -> C:\foo
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\foo\.kimetsu\brain.db")),
+            r"C:\Users\foo\.kimetsu\brain.db"
+        );
+        // \\?\UNC\server\share -> \\server\share
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\path")),
+            r"\\server\share\path"
+        );
+        // Already clean — unchanged.
+        assert_eq!(
+            display_path(Path::new(r"C:\Users\foo\.kimetsu")),
+            r"C:\Users\foo\.kimetsu"
+        );
+        // Unix-style — unchanged.
+        assert_eq!(
+            display_path(Path::new("/home/user/.kimetsu")),
+            "/home/user/.kimetsu"
         );
     }
 

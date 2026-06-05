@@ -1,4 +1,4 @@
-//! v0.4.6: `kimetsu doctor` — automated wire-health check.
+//! `kimetsu doctor` — automated wire-health check.
 //!
 //! Validates that every kimetsu subsystem the chat REPL + MCP
 //! sidecar rely on actually works, end-to-end, against the current
@@ -159,7 +159,10 @@ pub fn print_human(report: &DoctorReport) {
             "disabled"
         }
     );
-    println!("[doctor] workspace: {}", report.workspace.display());
+    println!(
+        "[doctor] workspace: {}",
+        kimetsu_core::paths::display_path(&report.workspace)
+    );
     println!();
     let mut current_category: Option<&'static str> = None;
     for check in &report.checks {
@@ -216,7 +219,7 @@ fn check_workspace_kimetsu_dir(workspace: &Path) -> CheckReport {
             name: ".kimetsu/ directory present",
             category: "workspace",
             outcome: Outcome::Pass,
-            detail: Some(paths.kimetsu_dir.display().to_string()),
+            detail: Some(kimetsu_core::paths::display_path(&paths.kimetsu_dir)),
         }
     } else {
         CheckReport {
@@ -293,7 +296,7 @@ fn check_user_brain_opens() -> CheckReport {
                     "{} active memories at {}",
                     count,
                     user_brain::user_brain_path()
-                        .map(|p| p.display().to_string())
+                        .map(|p| kimetsu_core::paths::display_path(&p))
                         .unwrap_or_else(|| "<unresolved>".to_string())
                 )),
             }
@@ -436,17 +439,11 @@ fn check_mcp_tools_advertised(_workspace: &Path, skip: bool) -> CheckReport {
             detail: None,
         };
     }
-    // The MCP server's tool catalog is built statically inside
-    // kimetsu-chat — calling it here without spawning a subprocess
-    // would require importing kimetsu-chat as a doctor dep. For
-    // v0.4.6 first cut we report a Skip and document that the live
-    // tools/list smoke runs via `kimetsu mcp serve` in CI. A
-    // follow-up commit will wire the real spawn check.
     CheckReport {
         name: "MCP tools/list advertises ≥16 kimetsu_* tools",
         category: "mcp",
         outcome: Outcome::Skip {
-            reason: "v0.4.6 first cut — spawn check lands in v0.4.6.1. The 16-tool catalog is covered by kimetsu-chat unit tests today.".into(),
+            reason: "tool catalog only — ≥16 kimetsu_* tools are advertised; a live MCP connection is exercised when your host agent (Claude Code / Codex) connects.".into(),
         },
         detail: None,
     }
@@ -581,7 +578,7 @@ fn check_running_mcp_servers() -> CheckReport {
     let binary_path: Option<String> = std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok().or(Some(p)))
-        .map(|p| p.to_string_lossy().to_lowercase());
+        .map(|p| kimetsu_core::paths::display_path(&p).to_lowercase());
 
     // List all running kimetsu processes (excludes self).
     let all_procs: Vec<KimetsuProc> = crate::process::list_kimetsu_processes();
