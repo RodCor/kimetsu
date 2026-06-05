@@ -1,0 +1,125 @@
+//! End-to-end: drive the real router over HTTP (in-process) and confirm a
+//! recorded memory round-trips, and that two repos stay isolated.
+//!
+//! Runs hermetically: a temp data dir, the user brain disabled, discovery
+//! pinned to the explicit root, and the NoopEmbedder forced so there is no
+//! model download (FTS-only recall still proves the path).
+
+use std::sync::Once;
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use kimetsu_remote::app::build_router;
+use kimetsu_remote::auth::AuthConfig;
+use kimetsu_remote::state::AppState;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+static INIT: Once = Once::new();
+
+fn isolate() {
+    INIT.call_once(|| {
+        // SAFETY: set before any brain/runtime work in this test binary.
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN", "0");
+            std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "noop");
+        }
+        kimetsu_core::paths::pin_discover_to_root();
+    });
+}
+
+fn state(dir: &std::path::Path) -> AppState {
+    let auth = AuthConfig {
+        global: vec!["T".to_string()],
+        per_repo: Default::default(),
+    };
+    AppState::new(dir.to_path_buf(), auth)
+}
+
+fn call(repo: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/mcp/{repo}"))
+        .header("authorization", "Bearer T")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn send(dir: &std::path::Path, repo: &str, body: Value) -> Value {
+    let resp = build_router(state(dir))
+        .oneshot(call(repo, body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "expected 200 for {repo}");
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn record(lesson: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "kimetsu_brain_record",
+                    "arguments": { "lesson": lesson, "tags": ["alpha", "beta"] } }
+    })
+}
+
+fn context(query: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "kimetsu_brain_context",
+                    "arguments": { "query": query, "min_score": 0.0 } }
+    })
+}
+
+/// Unwrap the `tools/call` envelope `{result:{content:[{text:"<json>"}]}}` to the
+/// handler's actual JSON object.
+fn inner(resp: &Value) -> Value {
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no result text in {resp}"));
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test]
+async fn record_then_context_round_trips() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let lesson = "The zephyrqux deployment requires flushing the wobblecache before restart";
+
+    let rec = send(tmp.path(), "repo-a", record(lesson)).await;
+    assert!(
+        inner(&rec)["ok"].as_bool().unwrap_or(false),
+        "record failed: {rec}"
+    );
+
+    // Query with words from the lesson but NOT the asserted token, so the match
+    // can only come from the retrieved capsule (not the echoed query).
+    let ctx = inner(&send(tmp.path(), "repo-a", context("deployment restart flushing")).await);
+    assert_eq!(ctx["skipped"], json!(false), "expected a hit: {ctx}");
+    assert!(
+        ctx["capsules"].to_string().contains("wobblecache"),
+        "retrieved capsules did not contain the recorded memory: {ctx}"
+    );
+}
+
+#[tokio::test]
+async fn two_repos_are_isolated() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let secret = "quibblefrotz only-in-repo-one";
+
+    let rec = send(tmp.path(), "repo-one", record(secret)).await;
+    assert!(
+        inner(&rec)["ok"].as_bool().unwrap_or(false),
+        "record failed: {rec}"
+    );
+
+    // repo-two has its own brain; its retrieved capsules must not include the
+    // secret (assert on capsules, not the whole response — the query is echoed).
+    let ctx = inner(&send(tmp.path(), "repo-two", context("quibblefrotz")).await);
+    assert!(
+        !ctx["capsules"].to_string().contains("quibblefrotz"),
+        "repo isolation breach: repo-two saw repo-one's memory: {ctx}"
+    );
+}

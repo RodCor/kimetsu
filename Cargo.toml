@@ -6,6 +6,7 @@ members = [
     "crates/kimetsu-cli",
     "crates/kimetsu-core",
     "crates/kimetsu-e2e",
+    "crates/kimetsu-remote",
 ]
 resolver = "3"
 

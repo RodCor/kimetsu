@@ -60,6 +60,17 @@ ADDED
     edit` / `undo` fix a bad recording in place; `kimetsu runs prune`
     and `kimetsu brain compact` (VACUUM, optional event-trim) keep the
     install lean.
+  * **Kimetsu Remote (experimental) — the brain over HTTP MCP.** A new
+    standalone `kimetsu-remote` server hosts one brain per repository under a
+    data dir and exposes the memory/retrieval/curation tools over remote MCP
+    (`POST /mcp/{repo}`), so a team — or you across machines — can share one
+    brain with no local checkout. Bearer-token auth (global or per-repo);
+    repo-keyed (the client supplies the id, derivable from the git remote);
+    the agent-facing pure-DB tool subset only (workdir/host-local tools are
+    excluded). Each repo brain is standalone (user-brain merge off). Plain
+    HTTP — terminate TLS at a reverse proxy. `kimetsu-remote serve --addr
+    0.0.0.0:8787 --data <dir> --token <t>` (build with `--features embeddings`
+    for semantic retrieval). Client wiring + packaging land next.
   * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
     on Anthropic models served through Amazon Bedrock (InvokeModel,
     SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
