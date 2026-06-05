@@ -26,9 +26,10 @@ zero — the same wrong turns, the same re-explaining of your conventions,
 the same expensive exploration you already paid for last week.
 
 Kimetsu fixes the forgetting. It's a **sidecar brain**: a single Rust binary
-that runs next to any supported host agent through MCP (including Claude Code
-and Codex) or as its own terminal chat, learns which memories the model
-*actually used to win*, and lets that knowledge compound across runs.
+that runs next to any supported host agent through MCP (Claude Code, Codex, Pi,
+OpenClaw) or as its own terminal chat — or, in beta, server-hosted over HTTP MCP
+and shared across a team. It learns which memories the model *actually used to
+win*, and lets that knowledge compound across runs.
 
 - **It remembers.** Project conventions, failure patterns, the exact command
   that regenerates your schema — captured once, retrieved automatically.
@@ -292,12 +293,15 @@ kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains \
 #   one brain per repo under <data>/<repo-id>/; bearer-auth; plain HTTP — put a
 #   TLS proxy (nginx/Caddy) in front, or build `--features tls` and pass
 #   --tls-cert/--tls-key for in-process HTTPS. `GET /healthz` and `GET /metrics`
-#   (Prometheus text, aggregate-only) are unauthenticated. The embeddings
-#   release archives include the `kimetsu-remote` binary (with TLS support).
+#   (Prometheus text, aggregate-only) are unauthenticated. Prebuilt
+#   kimetsu-remote binaries are built with embeddings + TLS support.
 #
 #   Add --org-brain /srv/kimetsu-org for a shared team brain: memories recorded
 #   at `global_user` scope land there and merge into EVERY repo's retrieval
 #   (project-scoped memories stay per-repo). Must be outside --data.
+#
+#   Add --repos-file repos.toml --checkout-dir /srv/checkouts to let the server
+#   clone registered repos and ingest their files (remote file-capsule retrieval).
 
 # On each client — wire a host at the remote instead of the local stdio command:
 kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
@@ -431,9 +435,10 @@ MCP wiring, and installed hooks. `kimetsu doctor --selftest` is the one-shot
 | **`kimetsu` brain** | Durable, auto-migrating project + user memory in a single SQLite file. Citations, decay, conflict detection, FTS + optional semantic (sqlite-vec ANN) retrieval, and `kimetsu brain insights` effectiveness analytics. |
 | **`kimetsu bridge`** | Cross-harness skill portability — import/export skills between supported hosts such as Claude Code, Codex, Agents, and Kimetsu. |
 | **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as `kimetsu_*` tools. |
+| **Kimetsu Remote** *(beta)* | `kimetsu-remote` — the brain over HTTP MCP, one per repository, shared from a server (separate package). |
 
 Built as a small Rust workspace (`kimetsu-cli`, `-chat`, `-agent`, `-brain`,
-and `-core`). Lint + tests run clean on every change.
+`-core`, and `-remote`). Lint + tests run clean on every change.
 
 ---
 
@@ -441,7 +446,7 @@ and `-core`). Lint + tests run clean on every change.
 
 - **[How Kimetsu Works](docs/HOW-KIMETSU-WORKS.md)** — the conceptual reference:
   the brain, the broker, citations, decay, conflict detection, the MCP surface,
-  the bridge, doctor, and config. Start here for depth.
+  Kimetsu Remote, the bridge, doctor, and config. Start here for depth.
 - **[CHANGELOG](CHANGELOG.md)** — what shipped in each release.
 - Per-crate `src/lib.rs` doc comments for module-level detail.
 

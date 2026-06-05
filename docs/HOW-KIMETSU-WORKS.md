@@ -6,7 +6,7 @@ chat REPL. It watches what the model does, learns which memories actually
 help, and feeds higher-signal context into future runs. This document explains
 the moving parts, in the order you'll encounter them.
 
-## 1. Two ways to use it
+## 1. Ways to use it
 
 **As a sidecar via MCP.** Run `kimetsu mcp serve` directly, or let
 `kimetsu plugin install <target>` write the host config for you. The host
@@ -17,16 +17,22 @@ Memories carry across sessions; learning compounds.
 The intended loop is two calls: **`kimetsu_brain_context`** early on a
 non-trivial task (zero overhead when the brain has nothing — it returns
 `skipped: true`), then **`kimetsu_brain_record`** after solving a
-non-obvious problem worth remembering. Supported host integrations can fire
-the context step automatically: `kimetsu plugin install claude` writes
-`.claude/settings.json`, and `kimetsu plugin install codex` writes
-`.codex/hooks.json`. Both wire `UserPromptSubmit` to
-`kimetsu brain context-hook`; hosts with a supported stop event also wire
-`kimetsu brain stop-hook` to summarize what was captured (see section 7).
+non-obvious problem worth remembering. `kimetsu plugin install <host>` wires the
+context step automatically for **Claude Code**, **Codex**, **Pi**, and
+**OpenClaw** — writing each host's native config (hooks + MCP for Claude/Codex/
+OpenClaw; a TypeScript extension for Pi, which has no MCP). They wire
+`UserPromptSubmit` to `kimetsu brain context-hook`; hosts with a supported stop
+event also wire `kimetsu brain stop-hook` to summarize what was captured (see
+section 7). Pi and OpenClaw are opt-in Cargo features, bundled in the official
+prebuilt/npm binaries.
 
 **As a standalone REPL.** Run `kimetsu chat`. Same brain, same
 tools, just without a host harness. Useful for debugging a brain or
 running short tasks where you don't want a second agent in the loop.
+
+**As a shared server (Kimetsu Remote, beta).** Run the brain on a server and
+connect over HTTP MCP — one brain per *repository*, shared across machines or a
+team, with no local checkout. See §7a.
 
 The CLI also has admin commands (`kimetsu brain ...`,
 `kimetsu doctor`, `kimetsu bridge ...`) that you'll use for
@@ -429,10 +435,13 @@ The MCP tools work whether or not the model decides to call them. To
 make the loop reliable, Kimetsu's plugin installers write host-native
 hook config:
 
-- **Claude Code**: `.claude/settings.json`
-- **Codex**: `.codex/hooks.json`
+- **Claude Code**: `.claude/settings.json` (hooks) + `.mcp.json` (MCP server)
+- **Codex**: `.codex/hooks.json` + `.codex/config.toml`
+- **OpenClaw**: `openclaw.json` (MCP server + a hooks plugin) + a `kimetsu-context` skill
+- **Pi** (no MCP): a TypeScript extension under `~/.pi/agent/extensions/` that
+  shells to `kimetsu brain *-hook`, plus a `kimetsu-brain` skill
 
-The core hook pattern is the same across hosts:
+The core hook pattern is the same across MCP hosts:
 
 - **`UserPromptSubmit` → `kimetsu brain context-hook`** fires before
   each turn. It reads the prompt from stdin, retrieves a context
@@ -490,13 +499,56 @@ supported stop hook.
 
 ---
 
+## 7a. Kimetsu Remote (beta)
+
+Everything above assumes a **local** brain — one `.kimetsu/brain.db` next to your
+checkout, reached over stdio MCP. Kimetsu Remote runs the brain on a **server**
+and exposes it over **HTTP MCP**, so the identity is the **repository**, not a
+local directory: any checkout of the same repo — on any machine, or a teammate's
+— hits the same brain, with no local files required.
+
+> **Beta** — under active testing; the `kimetsu-remote` server is a **separate
+> package** (`npm i -g kimetsu-remote` or `cargo install kimetsu-remote
+> --features embeddings`), not installed with the `kimetsu` CLI.
+
+**The server.** `kimetsu-remote serve --data <dir> --token <secret>` hosts one
+brain per repo under `<dir>/<repo-id>/`, keyed by a sanitized id the client sends
+in the URL (`POST /mcp/<repo-id>`). It reuses the same transport-agnostic tool
+dispatch as the stdio server, filtered to the **pure-DB, agent-facing subset**
+(context, record, search, insights, curation) — the tools that need no checkout.
+Per-repo SQLite + WAL gives concurrent reads; writes serialize through each
+repo's lock; cross-repo is fully parallel.
+
+**Auth + hardening.** Bearer tokens (global or per-repo, constant-time compared);
+optional per-token rate limiting (`--rate-limit <req/min>` → `429`); a structured
+per-request log and an aggregate Prometheus `GET /metrics` (no repo labels — it's
+unauthenticated); plain HTTP by default (terminate TLS at a reverse proxy) or
+in-process HTTPS with `--features tls` + `--tls-cert`/`--tls-key`.
+
+**Client wiring.** `kimetsu plugin install <claude-code|openclaw> --remote <url>`
+writes a remote MCP entry (`url` + `Authorization` header) instead of the local
+stdio command, deriving the repo id from your git remote and referencing
+`${KIMETSU_REMOTE_TOKEN}` so no secret hits disk.
+
+**Optional extras.**
+- **Shared org brain** (`--org-brain <dir>`): `global_user`-scoped memories are
+  stored in one shared brain and merged into *every* repo's retrieval
+  (cross-project team memory); `project`-scoped memories stay per-repo.
+- **Server-side ingest** (`--repos-file` + `--checkout-dir`): the operator
+  pre-registers repo-id → git URL; the server clones/refreshes a managed checkout
+  and `kimetsu_brain_ingest_repo` indexes its files into the brain, so `context`
+  retrieval includes **file capsules** remotely too. Clients can't trigger
+  arbitrary clones; private repos use the server's own git auth.
+
+---
+
 ## 8. The bridge
 
 Kimetsu also runs as a **cross-harness skill bridge**. The
 `kimetsu bridge` subcommand:
 
 - Discovers skills installed in supported hosts such as Claude Code,
-  Codex, and the local kimetsu installation.
+  Codex, Pi, OpenClaw, and the local kimetsu installation.
 - Exports a chosen skill into another harness (e.g., move a skill from
   one host to another).
 - Maintains a unified skill registry so the same skill works in
@@ -543,9 +595,10 @@ schema_version = 1            # project.toml CONFIG-format version, NOT the
 use_user_brain = true         # false → per-project opt-out of the global brain
 
 [model]
-provider = "anthropic"        # or "claude_code"
-model = "claude-opus-4-7"
+provider = "anthropic"        # or "claude_code", "openai", "bedrock"
+model = "claude-opus-4-7"     # bedrock: the full id, e.g. anthropic.claude-3-5-...
 api_key_env = "ANTHROPIC_API_KEY"
+region_env = "AWS_REGION"     # bedrock only (also reads AWS_DEFAULT_REGION)
 max_output_tokens = 8192
 temperature = 0.2
 request_timeout_secs = 120
@@ -599,11 +652,17 @@ auto_harvest = true
 
 [learning.distiller]
 enabled = false
-provider = "anthropic"        # or "openai"
+provider = "anthropic"        # or "openai", "bedrock"
 model = "claude-haiku-4-5"    # OpenAI default: "gpt-5.4-mini"
 api_key_env = "ANTHROPIC_API_KEY"   # or "OPENAI_API_KEY"
 base_url_env = "ANTHROPIC_BASE_URL" # or "OPENAI_BASE_URL"
 ```
+
+The agent model and the distiller are configured **independently**, so the
+provider can differ — e.g. run the agent on **AWS Bedrock** (Anthropic models via
+the InvokeModel API, SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+(+ optional `AWS_SESSION_TOKEN`) and `AWS_REGION`) while the harvester stays on
+direct Claude or OpenAI.
 
 **Bidirectional config (off-switches).** Every optional feature is turn-off-able
 in `project.toml` and honored at runtime with precedence
@@ -621,7 +680,7 @@ Environment variables that override the matching config field at runtime
 
 | Variable | Effect |
 |----------|--------|
-| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY` | Provider credentials |
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY` / `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY`+`AWS_REGION` | Provider credentials (incl. AWS Bedrock) |
 | `KIMETSU_USER_BRAIN=0` | Disable the user brain (= `[kimetsu] use_user_brain = false`) |
 | `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick the embedder, or disable it (= `[embedder] enabled = false` / `model`) |
 | `KIMETSU_BRAIN_AMBIENT=off` | Disable ambient workspace context (= `[broker] ambient = false`) |
@@ -630,8 +689,8 @@ Environment variables that override the matching config field at runtime
 
 ## 11. What kimetsu is NOT
 
-- It's not a model. It runs through a host agent or configured model provider
-  (for example Anthropic API or Claude Code OAuth).
+- It's not a model. It runs through a host agent or a configured model provider
+  (Anthropic API, Claude Code OAuth, OpenAI, or AWS Bedrock).
 - It's not a sandbox. Tools run on the host machine.
 - It's not an external vector DB. The brain is still a single SQLite file per
   project (FTS5 + optional cosine). On the embeddings build the semantic index
