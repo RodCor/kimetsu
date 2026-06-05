@@ -431,7 +431,7 @@ fn check_embedder_default() -> CheckReport {
 fn check_mcp_tools_advertised(_workspace: &Path, skip: bool) -> CheckReport {
     if skip {
         return CheckReport {
-            name: "MCP tools/list advertises ≥16 kimetsu_* tools",
+            name: "MCP tool catalog (≥16 kimetsu_* tools)",
             category: "mcp",
             outcome: Outcome::Skip {
                 reason: "--skip-mcp set".into(),
@@ -440,10 +440,10 @@ fn check_mcp_tools_advertised(_workspace: &Path, skip: bool) -> CheckReport {
         };
     }
     CheckReport {
-        name: "MCP tools/list advertises ≥16 kimetsu_* tools",
+        name: "MCP tool catalog (≥16 kimetsu_* tools)",
         category: "mcp",
         outcome: Outcome::Skip {
-            reason: "tool catalog only — ≥16 kimetsu_* tools are advertised; a live MCP connection is exercised when your host agent (Claude Code / Codex) connects.".into(),
+            reason: "catalog check only — a live MCP connection is exercised when your host agent (Claude Code / Codex) connects.".into(),
         },
         detail: None,
     }
