@@ -44,3 +44,6 @@
 .claude/
 .codex/
 .mcp.json
+
+# Local Codex security-scan artifacts (not part of the project)
+.codex-security-scans/
