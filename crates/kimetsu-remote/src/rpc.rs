@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{self, AuthOutcome};
 use crate::catalog::REMOTE_TOOLS;
+use crate::metrics::Outcome;
 use crate::repo;
 use crate::state::AppState;
 
@@ -69,79 +70,139 @@ fn jsonrpc_err(
     )
 }
 
-/// `POST /mcp/{repo}` — authenticate, resolve the repo's brain, and dispatch the
-/// JSON-RPC method against it (filtered to the remote tool allowlist).
+/// `POST /mcp/{repo}` — outer wrapper: time the request, record the outcome
+/// metric, and emit a structured per-request log line.
 pub async fn handle_mcp(
     State(state): State<AppState>,
     Path(repo): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session = session_header(&headers);
+    let start = std::time::Instant::now();
+    let (outcome, resp) = dispatch_request(&state, &repo, &headers, body).await;
+    state.metrics.record(outcome);
+    tracing::info!(
+        repo = %repo,
+        status = resp.status().as_u16(),
+        outcome = outcome.as_str(),
+        latency_ms = start.elapsed().as_millis() as u64,
+        "mcp request"
+    );
+    resp
+}
+
+/// Authenticate, rate-limit, resolve the repo's brain, and dispatch the
+/// JSON-RPC method (filtered to the remote tool allowlist). Returns the outcome
+/// label alongside the response so the wrapper can record metrics.
+async fn dispatch_request(
+    state: &AppState,
+    repo: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> (Outcome, Response) {
+    let session = session_header(headers);
 
     // 1. Auth (transport-level → real HTTP status).
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match auth::check(&state.auth, &repo, bearer) {
+    match auth::check(&state.auth, repo, bearer) {
         AuthOutcome::Ok => {}
         AuthOutcome::Unauthorized => {
-            return http_error(StatusCode::UNAUTHORIZED, "unauthorized", session);
+            return (
+                Outcome::Unauthorized,
+                http_error(StatusCode::UNAUTHORIZED, "unauthorized", session),
+            );
         }
         AuthOutcome::Forbidden => {
-            return http_error(StatusCode::FORBIDDEN, "forbidden for this repo", session);
+            return (
+                Outcome::Forbidden,
+                http_error(StatusCode::FORBIDDEN, "forbidden for this repo", session),
+            );
         }
     }
 
-    // 2. Resolve the brain root (path-traversal safe).
-    let root = match repo::resolve_brain_root(&state.data_dir, &repo) {
-        Ok(r) => r,
-        Err(e) => return http_error(StatusCode::BAD_REQUEST, &e, session),
-    };
+    // 2. Per-token rate limit.
+    if let Some(tok) = bearer
+        && !state.limiter.allow(tok)
+    {
+        return (
+            Outcome::RateLimited,
+            http_error(StatusCode::TOO_MANY_REQUESTS, "rate limited", session),
+        );
+    }
 
-    // 3. Parse the JSON-RPC envelope.
-    let req: JsonRpcRequest = match serde_json::from_slice(&body) {
+    // 3. Resolve the brain root (path-traversal safe).
+    let root = match repo::resolve_brain_root(&state.data_dir, repo) {
         Ok(r) => r,
         Err(e) => {
-            return jsonrpc_err(
-                StatusCode::BAD_REQUEST,
-                Value::Null,
-                -32700,
-                &format!("parse error: {e}"),
-                session,
+            return (
+                Outcome::BadRequest,
+                http_error(StatusCode::BAD_REQUEST, &e, session),
             );
         }
     };
 
-    // 4. Notifications (no id) get no response body.
-    let Some(id) = req.id.clone() else {
-        return with_session(StatusCode::ACCEPTED.into_response(), session);
+    // 4. Parse the JSON-RPC envelope.
+    let req: JsonRpcRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                Outcome::BadRequest,
+                jsonrpc_err(
+                    StatusCode::BAD_REQUEST,
+                    Value::Null,
+                    -32700,
+                    &format!("parse error: {e}"),
+                    session,
+                ),
+            );
+        }
     };
 
-    // 5. Ensure the brain exists (first-use init).
+    // 5. Notifications (no id) get no response body.
+    let Some(id) = req.id.clone() else {
+        return (
+            Outcome::Ok,
+            with_session(StatusCode::ACCEPTED.into_response(), session),
+        );
+    };
+
+    // 6. Ensure the brain exists (first-use init).
     if let Err(e) = repo::ensure_initialized(&root) {
-        return jsonrpc_err(StatusCode::INTERNAL_SERVER_ERROR, id, -32603, &e, session);
+        return (
+            Outcome::Error,
+            jsonrpc_err(StatusCode::INTERNAL_SERVER_ERROR, id, -32603, &e, session),
+        );
     }
 
-    // 6. Run the (blocking) dispatch off the async pool.
+    // 7. Run the (blocking) dispatch off the async pool.
     let skills = state.skills.clone();
     let method = req.method.clone();
     let params = req.params.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let res = tokio::task::spawn_blocking(move || {
         kimetsu_chat::dispatch(&method, params, &root, skills.as_ref(), Some(&REMOTE_TOOLS))
     })
     .await;
 
-    match outcome {
-        Ok(Ok(value)) => jsonrpc_ok(id, value, session),
-        Ok(Err(msg)) => jsonrpc_err(StatusCode::OK, id, -32000, &msg, session),
-        Err(join) => jsonrpc_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            id,
-            -32603,
-            &format!("internal error: {join}"),
-            session,
+    match res {
+        Ok(Ok(value)) => (Outcome::Ok, jsonrpc_ok(id, value, session)),
+        // App-level tool errors ride the body with HTTP 200 — the request was
+        // served, so it counts as `ok` for metrics.
+        Ok(Err(msg)) => (
+            Outcome::Ok,
+            jsonrpc_err(StatusCode::OK, id, -32000, &msg, session),
+        ),
+        Err(join) => (
+            Outcome::Error,
+            jsonrpc_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                id,
+                -32603,
+                &format!("internal error: {join}"),
+                session,
+            ),
         ),
     }
 }

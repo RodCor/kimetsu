@@ -5,6 +5,8 @@ pub mod app;
 pub mod auth;
 pub mod catalog;
 pub mod config;
+pub mod metrics;
+pub mod ratelimit;
 pub mod repo;
 pub mod rpc;
 pub mod state;
@@ -12,7 +14,6 @@ pub mod state;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use crate::auth::AuthConfig;
 use crate::state::AppState;
 
 /// Parse → isolate → bind → serve. Blocks until shutdown.
@@ -35,6 +36,20 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
 
     let auth = config::build_auth(&args)?;
     let data_dir = prepare_data_dir(&args.data)?;
+    let state = AppState::with_rate_limit(data_dir, auth, args.rate_limit);
+
+    let tls = match (args.tls_cert.clone(), args.tls_key.clone()) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => None,
+    };
+    #[cfg(not(feature = "tls"))]
+    if tls.is_some() {
+        return Err(
+            "this build has no TLS support — rebuild `kimetsu-remote --features tls`, or \
+             terminate TLS at a reverse proxy (nginx/Caddy)"
+                .to_string(),
+        );
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -42,7 +57,7 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         .build()
         .map_err(|e| format!("build runtime: {e}"))?;
 
-    runtime.block_on(serve(args.addr, data_dir, auth))
+    runtime.block_on(serve(args.addr, state, tls))
 }
 
 fn prepare_data_dir(p: &Path) -> Result<PathBuf, String> {
@@ -70,17 +85,56 @@ fn inside_git_repo(start: &Path) -> bool {
     false
 }
 
-async fn serve(addr: SocketAddr, data_dir: PathBuf, auth: AuthConfig) -> Result<(), String> {
-    let state = AppState::new(data_dir, auth);
+async fn serve(
+    addr: SocketAddr,
+    state: AppState,
+    tls: Option<(PathBuf, PathBuf)>,
+) -> Result<(), String> {
     let router = app::build_router(state);
+    match tls {
+        #[cfg(feature = "tls")]
+        Some((cert, key)) => serve_tls(addr, router, cert, key).await,
+        #[cfg(not(feature = "tls"))]
+        Some(_) => Err("TLS requested but this build has no `tls` feature".to_string()),
+        None => serve_plain(addr, router).await,
+    }
+}
+
+async fn serve_plain(addr: SocketAddr, router: axum::Router) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
-    tracing::info!(%addr, "kimetsu-remote listening");
+    tracing::info!(%addr, "kimetsu-remote listening (http)");
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("serve: {e}"))
+}
+
+#[cfg(feature = "tls")]
+async fn serve_tls(
+    addr: SocketAddr,
+    router: axum::Router,
+    cert: PathBuf,
+    key: PathBuf,
+) -> Result<(), String> {
+    // Pin the ring crypto provider (we build rustls without aws-lc-rs).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+        .await
+        .map_err(|e| format!("load TLS cert/key: {e}"))?;
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+    });
+    tracing::info!(%addr, "kimetsu-remote listening (https)");
+    axum_server::bind_rustls(addr, config)
+        .handle(handle)
+        .serve(router.into_make_service())
+        .await
+        .map_err(|e| format!("serve tls: {e}"))
 }
 
 async fn shutdown_signal() {

@@ -33,6 +33,19 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 64)]
     pub max_blocking_threads: usize,
 
+    /// Per-token request rate limit (requests/minute). `0` disables it.
+    #[arg(long, default_value_t = 0)]
+    pub rate_limit: u32,
+
+    /// TLS certificate chain (PEM). Serve HTTPS directly when set with --tls-key
+    /// (otherwise plain HTTP — terminate TLS at a reverse proxy).
+    #[arg(long, requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key (PEM). Pair with --tls-cert.
+    #[arg(long, requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
+
     /// Tracing filter (else `RUST_LOG` / `KIMETSU_LOG`).
     #[arg(long)]
     pub log: Option<String>,

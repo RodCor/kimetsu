@@ -1,6 +1,9 @@
 //! Router assembly (kept separate so tests can build the app in-process).
 
 use axum::Router;
+use axum::extract::State;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use crate::rpc::handle_mcp;
@@ -10,11 +13,22 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Build the axum app: an unauthenticated health probe and the authenticated
-/// per-repo MCP endpoint.
+/// Aggregate request counters in Prometheus text format. Unauthenticated (no
+/// secrets, no repo labels) — keep it on a private network or scrape via proxy.
+async fn metrics(State(state): State<AppState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render_prometheus(),
+    )
+        .into_response()
+}
+
+/// Build the axum app: unauthenticated health + metrics probes and the
+/// authenticated per-repo MCP endpoint.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/mcp/:repo", post(handle_mcp))
         .with_state(state)
 }
@@ -156,6 +170,62 @@ mod tests {
         let v = body_json(resp).await;
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains("not available in remote mode"), "got: {v}");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = AuthConfig {
+            global: vec!["tok_admin".to_string()],
+            per_repo: HashMap::new(),
+        };
+        let app = build_router(AppState::with_rate_limit(tmp.path().to_path_buf(), auth, 1));
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let r1 = app
+            .clone()
+            .oneshot(post("web", Some("tok_admin"), body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app
+            .oneshot(post("web", Some("tok_admin"), body))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_counts_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state_with(tmp.path()));
+        // One unauthenticated request bumps the `unauthorized` counter.
+        let _ = app
+            .clone()
+            .oneshot(post(
+                "web",
+                None,
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("kimetsu_remote_requests_total{outcome=\"unauthorized\"} 1"),
+            "metrics did not count the unauthorized request: {text}"
+        );
     }
 
     #[tokio::test]

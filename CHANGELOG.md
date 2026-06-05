@@ -79,7 +79,12 @@ ADDED
     writes a `url`+`Authorization` MCP entry (no local hooks), deriving the repo
     id from your git remote and referencing `${KIMETSU_REMOTE_TOKEN}` by default
     so the secret isn't written to disk. The embeddings release archives bundle
-    the `kimetsu-remote` binary.
+    the `kimetsu-remote` binary. Hardening: per-token rate limiting
+    (`--rate-limit <req/min>` → 429 when exceeded), a structured per-request log
+    + an unauthenticated `GET /metrics` (Prometheus text, aggregate counts by
+    outcome — no repo labels), and optional in-process HTTPS (build
+    `--features tls`, pass `--tls-cert`/`--tls-key`; rustls/ring, off by default
+    — a reverse proxy is still the recommended terminator).
   * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
     on Anthropic models served through Amazon Bedrock (InvokeModel,
     SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`

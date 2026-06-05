@@ -278,10 +278,13 @@ across machines — shares one brain per repository, with no local checkout:
 
 ```bash
 # On the server (build with --features embeddings for semantic retrieval):
-kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains --token <secret>
+kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains \
+  --token <secret> --rate-limit 120        # 120 req/min per token (0 = off)
 #   one brain per repo under <data>/<repo-id>/; bearer-auth; plain HTTP — put a
-#   TLS proxy (nginx/Caddy) in front. The embeddings release archives include
-#   the `kimetsu-remote` binary.
+#   TLS proxy (nginx/Caddy) in front, or build `--features tls` and pass
+#   --tls-cert/--tls-key for in-process HTTPS. `GET /healthz` and `GET /metrics`
+#   (Prometheus text, aggregate-only) are unauthenticated. The embeddings
+#   release archives include the `kimetsu-remote` binary (with TLS support).
 
 # On each client — wire a host at the remote instead of the local stdio command:
 kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787

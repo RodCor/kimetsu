@@ -72,7 +72,7 @@ jobs:
       - name: build kimetsu-remote (server, embeddings archives only)
         if: matrix.flavor == 'embeddings'
         run: |
-          cargo build --release --locked -p kimetsu-remote --features embeddings --target ${{ matrix.target }}
+          cargo build --release --locked -p kimetsu-remote --features embeddings,tls --target ${{ matrix.target }}
 
       - name: smoke-test built binary (doctor --skip-mcp)
         shell: bash
