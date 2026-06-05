@@ -274,33 +274,33 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
         match replace_installation(&new_binary, &install.path) {
             Ok(ReplaceOutcome::Updated) => {
                 updated += 1;
-                println!("updated: {}", install.path.display());
+                println!(
+                    "updated: {}",
+                    kimetsu_core::paths::display_path(&install.path)
+                );
             }
             Ok(ReplaceOutcome::Scheduled) => {
                 updated += 1;
                 println!(
                     "scheduled: {} (replacement completes after this process exits)",
-                    install.path.display()
+                    kimetsu_core::paths::display_path(&install.path)
                 );
             }
             Err(err) => {
-                println!("failed:  {} ({err})", install.path.display());
+                println!(
+                    "failed:  {} ({err})",
+                    kimetsu_core::paths::display_path(&install.path)
+                );
                 failed.push(install.path);
             }
         }
     }
 
-    if stopped_mcp > 0 {
-        println!(
-            "hint: stopped {stopped_mcp} kimetsu process(es); your host agent (Claude Code / Codex) \
-             will respawn its MCP server on the next call — restart it to pick up the new version."
-        );
-    }
-
     let _ = fs::remove_dir_all(&workdir);
 
     if failed.is_empty() {
-        println!("done:    updated {updated} Kimetsu executable(s)");
+        println!("done:    updated {updated} Kimetsu executable(s) to v{latest}");
+        print_post_update_next_steps(stopped_mcp);
         Ok(())
     } else {
         Err(format!(
@@ -311,6 +311,43 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
         )
         .into())
     }
+}
+
+/// Print the "what now?" guidance after a successful update. Always shown so a
+/// user upgrading from an older version is told to restart their host agent (so
+/// the still-running MCP server respawns on the new binary) and to verify with
+/// `kimetsu doctor` — the most common post-update confusion is a stale MCP
+/// server serving the old image until the host restarts.
+fn print_post_update_next_steps(stopped_mcp: usize) {
+    // Any MCP server still running was spawned from the pre-update binary.
+    let running_mcp = crate::process::list_kimetsu_processes()
+        .into_iter()
+        .filter(|p| matches!(p.kind, ProcKind::McpServe))
+        .count();
+
+    println!();
+    println!("next steps:");
+    if running_mcp > 0 {
+        println!(
+            "  - {running_mcp} kimetsu MCP server(s) are still running the previous version — \
+             restart your host agent (Claude Code / Codex) so it respawns on the new binary."
+        );
+    } else if stopped_mcp > 0 {
+        println!(
+            "  - your host agent (Claude Code / Codex) will respawn its MCP server on the next \
+             call — restart it to load the new version."
+        );
+    } else {
+        println!(
+            "  - if a host agent (Claude Code / Codex) is open, restart it so its kimetsu MCP \
+             server reloads the new binary."
+        );
+    }
+    println!("  - run `kimetsu doctor` to confirm the brain + wiring are healthy.");
+    println!(
+        "  - installed via cargo or npm? update those with `cargo install kimetsu-cli --force` \
+         or `npm update -g kimetsu-ai` instead."
+    );
 }
 
 /// Resolve which removal tier to use given the options, TTY state, and user
