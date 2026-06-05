@@ -84,7 +84,11 @@ ADDED
     + an unauthenticated `GET /metrics` (Prometheus text, aggregate counts by
     outcome — no repo labels), and optional in-process HTTPS (build
     `--features tls`, pass `--tls-cert`/`--tls-key`; rustls/ring, off by default
-    — a reverse proxy is still the recommended terminator).
+    — a reverse proxy is still the recommended terminator). Optional shared
+    **org brain** (`--org-brain <dir>`, outside `--data`): `global_user`-scoped
+    memories are stored there and merged into every repo's retrieval
+    (cross-project team memory), while `project`-scoped memories stay per-repo.
+    Off by default — each repo brain is standalone.
   * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
     on Anthropic models served through Amazon Bedrock (InvokeModel,
     SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`

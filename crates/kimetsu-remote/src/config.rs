@@ -37,6 +37,13 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub rate_limit: u32,
 
+    /// Enable a shared org brain at <dir>: `global_user`-scoped memories are
+    /// stored here and merged into EVERY repo's retrieval (cross-project team
+    /// memory). Off by default (each repo brain is standalone). Must be a path
+    /// OUTSIDE --data.
+    #[arg(long)]
+    pub org_brain: Option<PathBuf>,
+
     /// TLS certificate chain (PEM). Serve HTTPS directly when set with --tls-key
     /// (otherwise plain HTTP — terminate TLS at a reverse proxy).
     #[arg(long, requires = "tls_key")]

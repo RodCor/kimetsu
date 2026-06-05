@@ -26,16 +26,37 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     );
 
     // Server isolation: every brain lives at an explicit root (never climb to an
-    // enclosing repo), and the cross-project user brain is off (each repo brain
-    // is standalone).
+    // enclosing repo).
     kimetsu_core::paths::pin_discover_to_root();
-    // SAFETY: set before the tokio runtime starts any worker threads.
-    unsafe {
-        std::env::set_var("KIMETSU_USER_BRAIN", "0");
-    }
 
     let auth = config::build_auth(&args)?;
     let data_dir = prepare_data_dir(&args.data)?;
+
+    // Cross-project brain: off by default (standalone repos). With --org-brain,
+    // point the user brain at that shared dir and force it on, so global_user
+    // memories are shared + merged into every repo's retrieval.
+    let org_brain = prepare_org_brain(args.org_brain.as_deref(), &data_dir)?;
+    // SAFETY: set before the tokio runtime starts any worker threads.
+    unsafe {
+        match &org_brain {
+            Some(dir) => {
+                std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
+                std::env::set_var("KIMETSU_USER_BRAIN", "1");
+            }
+            None => std::env::set_var("KIMETSU_USER_BRAIN", "0"),
+        }
+    }
+    if let Some(dir) = &org_brain {
+        // Pre-create + init so it exists from the first request (and in doctor).
+        kimetsu_brain::user_brain::open_user_brain_for_config(true)
+            .map_err(|e| format!("init org brain: {e}"))?;
+        tracing::warn!(
+            path = %kimetsu_core::paths::display_path(dir),
+            "shared org brain ENABLED — global_user memories are shared across ALL repos on \
+             this server and merged into every repo's retrieval"
+        );
+    }
+
     let state = AppState::with_rate_limit(data_dir, auth, args.rate_limit);
 
     let tls = match (args.tls_cert.clone(), args.tls_key.clone()) {
@@ -72,6 +93,35 @@ fn prepare_data_dir(p: &Path) -> Result<PathBuf, String> {
         );
     }
     Ok(canon)
+}
+
+/// Validate + create the shared org-brain dir. Must live OUTSIDE the per-repo
+/// data dir (the brains there are keyed by repo id; an org brain inside would
+/// collide). Returns the canonical path when enabled.
+fn prepare_org_brain(dir: Option<&Path>, data_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("create org brain dir {}: {e}", dir.display()))?;
+    let canon = dir
+        .canonicalize()
+        .map_err(|e| format!("canonicalize org brain dir {}: {e}", dir.display()))?;
+    if canon.starts_with(data_dir) || data_dir.starts_with(&canon) {
+        return Err(format!(
+            "--org-brain {} must be OUTSIDE --data {} (repo brains live under --data, keyed by \
+             repo id — an org brain there would collide)",
+            kimetsu_core::paths::display_path(&canon),
+            kimetsu_core::paths::display_path(data_dir)
+        ));
+    }
+    if inside_git_repo(&canon) {
+        tracing::warn!(
+            path = %kimetsu_core::paths::display_path(&canon),
+            "org brain dir is inside a git repository — prefer a dir outside any repo"
+        );
+    }
+    Ok(Some(canon))
 }
 
 fn inside_git_repo(start: &Path) -> bool {

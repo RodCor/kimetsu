@@ -285,6 +285,10 @@ kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains \
 #   --tls-cert/--tls-key for in-process HTTPS. `GET /healthz` and `GET /metrics`
 #   (Prometheus text, aggregate-only) are unauthenticated. The embeddings
 #   release archives include the `kimetsu-remote` binary (with TLS support).
+#
+#   Add --org-brain /srv/kimetsu-org for a shared team brain: memories recorded
+#   at `global_user` scope land there and merge into EVERY repo's retrieval
+#   (project-scoped memories stay per-repo). Must be outside --data.
 
 # On each client — wire a host at the remote instead of the local stdio command:
 kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
