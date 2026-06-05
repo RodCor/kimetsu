@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kimetsu_core::KimetsuResult;
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::process::{KimetsuProc, ProcKind};
 
@@ -141,10 +142,16 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
             env::consts::ARCH
         )
     })?;
-    let asset = select_asset(&release.assets, target, flavor).ok_or_else(|| {
+    let asset = select_asset(&release.assets, latest, target, flavor).ok_or_else(|| {
         format!(
             "latest release {} has no `{target}` `{flavor}` asset; see {}",
             release.tag_name, release.html_url
+        )
+    })?;
+    let checksum_asset = select_checksum_asset(&release.assets).ok_or_else(|| {
+        format!(
+            "latest release {} has no checksums.txt asset; refusing unsigned update",
+            release.tag_name
         )
     })?;
 
@@ -202,7 +209,10 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
 
     let workdir = make_temp_dir("kimetsu-update")?;
     let archive_path = workdir.join(&asset.name);
+    let checksums_path = workdir.join(&checksum_asset.name);
     download_asset(&asset.browser_download_url, &archive_path)?;
+    download_asset(&checksum_asset.browser_download_url, &checksums_path)?;
+    verify_asset_checksum(&archive_path, &asset.name, &checksums_path)?;
     let new_binary = extract_binary(&archive_path, &workdir.join("extract"))?;
 
     let mut updated = 0usize;
@@ -627,6 +637,71 @@ fn download_asset(url: &str, target: &Path) -> KimetsuResult<()> {
     let mut file = fs::File::create(target)?;
     io::copy(&mut response, &mut file)?;
     Ok(())
+}
+
+fn verify_asset_checksum(archive: &Path, asset_name: &str, checksums: &Path) -> KimetsuResult<()> {
+    let manifest = fs::read_to_string(checksums)?;
+    let expected = checksum_for_asset(&manifest, asset_name).ok_or_else(|| {
+        format!("checksums.txt does not contain an entry for release asset `{asset_name}`")
+    })?;
+    let actual = sha256_file_hex(archive)?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(format!(
+            "checksum mismatch for {asset_name}: expected {expected}, got {actual}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
+    for line in manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some((hash, name)) = parse_sha256sum_line(line)
+            && name == asset_name
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+        if let Some((name, hash)) = parse_bsd_checksum_line(line)
+            && name == asset_name
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn parse_sha256sum_line(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.split_whitespace();
+    let hash = parts.next()?;
+    if !is_sha256_hex(hash) {
+        return None;
+    }
+    let name = parts.next()?.trim_start_matches('*');
+    Some((hash, name))
+}
+
+fn parse_bsd_checksum_line(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("SHA256 (")?;
+    let (name, hash) = rest.split_once(") = ")?;
+    if !is_sha256_hex(hash) {
+        return None;
+    }
+    Some((name, hash))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn sha256_file_hex(path: &Path) -> KimetsuResult<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn extract_binary(archive: &Path, dest: &Path) -> KimetsuResult<PathBuf> {
@@ -1279,13 +1354,30 @@ fn make_temp_dir(prefix: &str) -> KimetsuResult<PathBuf> {
 
 fn select_asset<'a>(
     assets: &'a [GitHubAsset],
+    version: &str,
     target: &str,
     flavor: &str,
 ) -> Option<&'a GitHubAsset> {
+    let ext = if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    let expected = format!("kimetsu-{version}-{target}-{flavor}.{ext}");
     assets.iter().find(|asset| {
-        asset.name.contains(target)
-            && asset.name.contains(flavor)
-            && (asset.name.ends_with(".tar.gz") || asset.name.ends_with(".zip"))
+        asset.name == expected
+            && asset
+                .browser_download_url
+                .starts_with("https://github.com/RodCor/kimetsu/releases/download/")
+    })
+}
+
+fn select_checksum_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
+    assets.iter().find(|asset| {
+        asset.name == "checksums.txt"
+            && asset
+                .browser_download_url
+                .starts_with("https://github.com/RodCor/kimetsu/releases/download/")
     })
 }
 
@@ -1373,7 +1465,29 @@ mod tests {
         let assets = vec![
             GitHubAsset {
                 name: "kimetsu-0.7.3-x86_64-pc-windows-msvc-lean.zip".into(),
-                browser_download_url: "https://example.invalid/lean.zip".into(),
+                browser_download_url: "https://github.com/RodCor/kimetsu/releases/download/v0.7.3/kimetsu-0.7.3-x86_64-pc-windows-msvc-lean.zip".into(),
+            },
+            GitHubAsset {
+                name: "kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip".into(),
+                browser_download_url: "https://github.com/RodCor/kimetsu/releases/download/v0.7.3/kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip".into(),
+            },
+        ];
+
+        let asset =
+            select_asset(&assets, "0.7.3", "x86_64-pc-windows-msvc", "embeddings").expect("asset");
+        assert_eq!(
+            asset.name,
+            "kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip"
+        );
+    }
+
+    #[test]
+    fn select_asset_requires_exact_project_release_asset() {
+        let assets = vec![
+            GitHubAsset {
+                name: "evil-kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip".into(),
+                browser_download_url:
+                    "https://github.com/RodCor/kimetsu/releases/download/v0.7.3/evil.zip".into(),
             },
             GitHubAsset {
                 name: "kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip".into(),
@@ -1381,11 +1495,33 @@ mod tests {
             },
         ];
 
-        let asset = select_asset(&assets, "x86_64-pc-windows-msvc", "embeddings").expect("asset");
-        assert_eq!(
-            asset.name,
-            "kimetsu-0.7.3-x86_64-pc-windows-msvc-embeddings.zip"
+        assert!(
+            select_asset(&assets, "0.7.3", "x86_64-pc-windows-msvc", "embeddings").is_none(),
+            "spoofed names or non-project URLs must not match"
         );
+    }
+
+    #[test]
+    fn checksum_manifest_parses_common_formats() {
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let manifest = format!(
+            "{hash}  kimetsu-1.0.0-x86_64-unknown-linux-gnu-lean.tar.gz\n\
+             SHA256 (kimetsu-1.0.0-x86_64-pc-windows-msvc-lean.zip) = {hash}\n"
+        );
+        assert_eq!(
+            checksum_for_asset(
+                &manifest,
+                "kimetsu-1.0.0-x86_64-unknown-linux-gnu-lean.tar.gz"
+            )
+            .as_deref(),
+            Some(hash)
+        );
+        assert_eq!(
+            checksum_for_asset(&manifest, "kimetsu-1.0.0-x86_64-pc-windows-msvc-lean.zip")
+                .as_deref(),
+            Some(hash)
+        );
+        assert!(checksum_for_asset(&manifest, "missing.zip").is_none());
     }
 
     #[test]

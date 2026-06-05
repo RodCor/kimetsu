@@ -23,6 +23,7 @@ fn isolate() {
         unsafe {
             std::env::set_var("KIMETSU_USER_BRAIN", "0");
             std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "noop");
+            std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1");
         }
         kimetsu_core::paths::pin_discover_to_root();
     });

@@ -711,6 +711,11 @@ impl ToolRuntime {
             nearest_existing_parent(parent)?.canonicalize()?
         };
         ensure_inside(&self.repo_root, &canonical_parent)?;
+        if let Ok(metadata) = fs::symlink_metadata(&full)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(format!("refusing_to_write_symlink: {repo_path}").into());
+        }
         Ok(full)
     }
 
@@ -1179,6 +1184,28 @@ fn validate_command_policy(input: &CommandSpec) -> KimetsuResult<()> {
         return Err(format!("policy_violation: network command blocked: {program}").into());
     }
 
+    if matches!(
+        program,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            | "python"
+            | "python3"
+            | "py"
+            | "node"
+            | "deno"
+            | "ruby"
+            | "perl"
+            | "php"
+    ) {
+        return Err(
+            format!("policy_violation: shell/interpreter wrapper blocked: {program}").into(),
+        );
+    }
+
     if program == "git"
         && input
             .args
@@ -1551,6 +1578,18 @@ mod tests {
         });
         assert!(blocked.is_err());
 
+        let wrapper = validate_command_policy(&CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-Command".to_string(),
+                "curl https://example.com".to_string(),
+            ],
+            cwd_relative: None,
+            timeout_secs: Some(5),
+            expected_exit: Some(0),
+        });
+        assert!(wrapper.is_err(), "shell wrappers must not bypass policy");
+
         let output = runtime
             .shell_command(CommandSpec {
                 program: "rustc".to_string(),
@@ -1564,6 +1603,54 @@ mod tests {
         assert!(output.stdout_summary.contains("rustc"));
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn apply_patch_rejects_symlink_targets() {
+        let root = temp_project();
+        init_project(&root, false).expect("init project");
+        let outside = std::env::temp_dir().join(format!("kimetsu-tools-outside-{}", new_id()));
+        fs::write(&outside, "outside\n").expect("outside");
+        let link = root.join("link.txt");
+        if create_file_symlink(&outside, &link).is_err() {
+            fs::remove_dir_all(root).ok();
+            fs::remove_file(outside).ok();
+            return;
+        }
+
+        let run_id = RunId::new();
+        let mut runtime = ToolRuntime::new(&root, run_id).expect("runtime");
+        runtime.set_patch_plan(ToolPatchPlan::allow_modify(["link.txt"]));
+        let outside_hash = blake3::hash(&fs::read(&outside).expect("outside read"))
+            .to_hex()
+            .to_string();
+        let err = runtime
+            .apply_patch(ApplyPatchInput {
+                changes: vec![PatchChange {
+                    path: "link.txt".to_string(),
+                    op: PatchOp::Modify,
+                    content: Some("changed\n".to_string()),
+                    expected_hash: Some(outside_hash),
+                }],
+            })
+            .expect_err("symlink writes must be rejected");
+        assert!(err.to_string().contains("refusing_to_write_symlink"));
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside read"),
+            "outside\n"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_file(outside).ok();
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
     }
 
     fn temp_project() -> PathBuf {

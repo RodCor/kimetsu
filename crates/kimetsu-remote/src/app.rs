@@ -173,6 +173,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_repo_token_cannot_write_shared_user_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state_with(tmp.path()));
+        let resp = app
+            .oneshot(post(
+                "web",
+                Some("tok_web"),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"kimetsu_brain_memory_add","arguments":{
+                    "scope":"global_user",
+                    "text":"shared memory should require admin token"
+                }}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let v = body_json(resp).await;
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("shared org/user memory writes require a global token"));
+    }
+
+    #[tokio::test]
     async fn rate_limit_returns_429() {
         let tmp = tempfile::tempdir().unwrap();
         let auth = AuthConfig {

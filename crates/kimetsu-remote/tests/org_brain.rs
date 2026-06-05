@@ -63,6 +63,7 @@ async fn org_brain_shares_global_user_but_not_project() {
         std::env::set_var("KIMETSU_USER_BRAIN", "1");
         std::env::set_var("KIMETSU_USER_BRAIN_DIR", &org);
         std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "noop");
+        std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1");
     }
     kimetsu_core::paths::pin_discover_to_root();
 

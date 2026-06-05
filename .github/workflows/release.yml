@@ -27,7 +27,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write  # needed to upload release assets
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -150,6 +150,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write  # needed to upload release assets
+      attestations: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -180,6 +184,26 @@ jobs:
             echo "Generated from the kimetsu monorepo. See README.md for installation + usage." >> release-notes.md
           fi
 
+      - name: generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > checksums.txt
+          while IFS= read -r file; do
+            hash="$(sha256sum "$file" | awk '{print $1}')"
+            name="$(basename "$file")"
+            printf '%s  %s\n' "$hash" "$name" >> checksums.txt
+          done < <(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          cat checksums.txt
+
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+            checksums.txt
+
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
@@ -189,6 +213,7 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/**/*.zip
+            checksums.txt
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

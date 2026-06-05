@@ -46,11 +46,17 @@ struct ReposFile {
 /// ```
 pub fn load_repos_file(text: &str) -> Result<HashMap<String, RepoSpec>, String> {
     let parsed: ReposFile = toml::from_str(text).map_err(|e| format!("parse repos file: {e}"))?;
-    Ok(parsed
-        .repos
-        .into_iter()
-        .map(|(k, v)| (k, v.into()))
-        .collect())
+    let mut repos = HashMap::new();
+    for (key, raw) in parsed.repos {
+        let canonical = crate::repo::sanitize_repo_id(&key)
+            .map_err(|e| format!("invalid repo key {key:?}: {e}"))?;
+        if repos.insert(canonical.clone(), raw.into()).is_some() {
+            return Err(format!(
+                "duplicate repo key after canonicalization: {key:?} -> {canonical:?}"
+            ));
+        }
+    }
+    Ok(repos)
 }
 
 pub struct IngestState {
@@ -91,5 +97,26 @@ web = "https://github.com/org/web.git"
     #[test]
     fn empty_file_is_ok() {
         assert!(load_repos_file("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_canonical_repo_keys() {
+        let toml = r#"
+[repos]
+API = "https://github.com/org/api.git"
+api = "https://github.com/org/other.git"
+"#;
+        let err = load_repos_file(toml).expect_err("case-colliding repos must fail");
+        assert!(err.contains("duplicate repo key after canonicalization"));
+    }
+
+    #[test]
+    fn rejects_invalid_repo_keys() {
+        let toml = r#"
+[repos]
+"../escape" = "https://github.com/org/api.git"
+"#;
+        let err = load_repos_file(toml).expect_err("invalid repo key must fail");
+        assert!(err.contains("invalid repo key"));
     }
 }

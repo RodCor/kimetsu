@@ -580,7 +580,10 @@ pub fn bridge_export_skill(
         #[cfg(feature = "pi")]
         BridgeTarget::Pi => workspace.join(".pi").join("skills").join(&name),
     };
-    copy_dir_with_replace(&source_root, &destination_root, force)?;
+    let destination_parent = destination_root
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", destination_root.display()))?;
+    copy_dir_with_replace(&source_root, &destination_root, destination_parent, force)?;
     Ok(normalize_path(&destination_root))
 }
 
@@ -2217,7 +2220,12 @@ fn import_skill_manifest(
 ) -> Result<BridgeExtension, String> {
     let id = slugify(&skill.name);
     let destination = extensions_root(workspace).join(&id);
-    copy_dir_with_replace(&skill.root, &destination, force)?;
+    copy_dir_with_replace(
+        &skill.root,
+        &destination,
+        &extensions_root(workspace),
+        force,
+    )?;
     let manifest = BridgeExtensionManifest {
         id,
         name: skill.name.clone(),
@@ -2591,7 +2599,12 @@ fn write_text_file(path: &Path, text: &str, force: bool) -> Result<(), String> {
     fs::write(path, text).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
-fn copy_dir_with_replace(source: &Path, destination: &Path, force: bool) -> Result<(), String> {
+fn copy_dir_with_replace(
+    source: &Path,
+    destination: &Path,
+    allowed_root: &Path,
+    force: bool,
+) -> Result<(), String> {
     if !source.is_dir() {
         return Err(format!("{} is not a directory", source.display()));
     }
@@ -2602,7 +2615,7 @@ fn copy_dir_with_replace(source: &Path, destination: &Path, force: bool) -> Resu
                 destination.display()
             ));
         }
-        remove_dir_checked(destination)?;
+        remove_dir_checked(destination, allowed_root)?;
     }
     copy_dir(source, destination)
 }
@@ -2631,17 +2644,19 @@ fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_dir_checked(path: &Path) -> Result<(), String> {
+fn remove_dir_checked(path: &Path, allowed_root: &Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| format!("inspect {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("refusing to remove symlink {}", path.display()));
+    }
     let target = path
         .canonicalize()
         .map_err(|err| format!("resolve {}: {err}", path.display()))?;
-    let Some(parent) = target.parent().map(Path::to_path_buf) else {
-        return Err(format!("refusing to remove {}", target.display()));
-    };
-    if !(target.ends_with("extensions")
-        || parent.ends_with("extensions")
-        || parent.ends_with("skills"))
-    {
+    let allowed_root = allowed_root
+        .canonicalize()
+        .map_err(|err| format!("resolve {}: {err}", allowed_root.display()))?;
+    if !target.starts_with(&allowed_root) {
         return Err(format!("refusing to remove {}", target.display()));
     }
     fs::remove_dir_all(&target).map_err(|err| format!("remove {}: {err}", target.display()))
@@ -3394,6 +3409,31 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn copy_dir_with_replace_refuses_symlink_destination() {
+        let root = temp_root("bridge_symlink_dest");
+        let source = root.join("source");
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("SKILL.md"), "safe").expect("skill");
+        fs::create_dir_all(&allowed).expect("allowed");
+        fs::create_dir_all(&outside).expect("outside");
+
+        let destination = allowed.join("skill");
+        if create_dir_symlink(&outside, &destination).is_err() {
+            fs::remove_dir_all(root).ok();
+            return;
+        }
+
+        let err = copy_dir_with_replace(&source, &destination, &allowed, true)
+            .expect_err("symlink destination must be rejected");
+        assert!(err.contains("refusing to remove symlink"), "got: {err}");
+        assert!(outside.exists(), "linked outside directory must survive");
+
+        fs::remove_dir_all(root).ok();
+    }
+
     fn temp_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3402,6 +3442,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kimetsu_{label}_{nanos}"));
         fs::create_dir_all(&path).expect("root");
         path
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
     }
 
     // -------------------------------------------------------------------------

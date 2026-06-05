@@ -101,13 +101,22 @@ async fn dispatch_request(
     body: Bytes,
 ) -> (Outcome, Response) {
     let session = session_header(headers);
+    let repo = match repo::sanitize_repo_id(repo) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                Outcome::BadRequest,
+                http_error(StatusCode::BAD_REQUEST, &e, session),
+            );
+        }
+    };
 
     // 1. Auth (transport-level → real HTTP status).
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match auth::check(&state.auth, repo, bearer) {
+    match auth::check(&state.auth, &repo, bearer) {
         AuthOutcome::Ok => {}
         AuthOutcome::Unauthorized => {
             return (
@@ -134,7 +143,7 @@ async fn dispatch_request(
     }
 
     // 3. Resolve the brain root (path-traversal safe).
-    let root = match repo::resolve_brain_root(&state.data_dir, repo) {
+    let root = match repo::resolve_brain_root(&state.data_dir, &repo) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -169,6 +178,21 @@ async fn dispatch_request(
         );
     };
 
+    if requires_global_memory_grant(&req.method, &req.params)
+        && !auth::is_global_token(&state.auth, bearer)
+    {
+        return (
+            Outcome::Forbidden,
+            jsonrpc_err(
+                StatusCode::FORBIDDEN,
+                id,
+                -32000,
+                "shared org/user memory writes require a global token",
+                session,
+            ),
+        );
+    }
+
     // 6. Ensure the brain exists (first-use init).
     if let Err(e) = repo::ensure_initialized(&root) {
         return (
@@ -184,7 +208,7 @@ async fn dispatch_request(
         && req.method == "tools/call"
         && req.params.get("name").and_then(|n| n.as_str()) == Some("kimetsu_brain_ingest_repo")
     {
-        return handle_server_ingest(ingest, repo, &root, id, session).await;
+        return handle_server_ingest(ingest, &repo, &root, id, session).await;
     }
 
     // 7. Run the (blocking) dispatch off the async pool.
@@ -216,6 +240,35 @@ async fn dispatch_request(
             ),
         ),
     }
+}
+
+fn requires_global_memory_grant(method: &str, params: &Value) -> bool {
+    if method != "tools/call" {
+        return false;
+    }
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    match name {
+        "kimetsu_benchmark_record_outcome" => true,
+        "kimetsu_brain_memory_add" => argument_scope_is_global_user(arguments),
+        "kimetsu_brain_memory_accept" => argument_scope_is_global_user(arguments),
+        _ => false,
+    }
+}
+
+fn argument_scope_is_global_user(arguments: &Value) -> bool {
+    arguments
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(|scope| {
+            matches!(
+                scope.trim().to_ascii_lowercase().as_str(),
+                "global_user" | "user"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Clone/refresh the repo's managed checkout and ingest its files into the

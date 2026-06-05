@@ -1038,7 +1038,6 @@ pub fn run_repl<R: BufRead, W: Write>(
         // and conversation context are external state.)
         let mut runtime = match ToolRuntime::new(&workspace, RunId::new()) {
             Ok(r) => r.with_config(ToolRuntimeConfig {
-                redact_secrets: false,
                 trace_fsync: false,
                 ..ToolRuntimeConfig::default()
             }),
@@ -2967,7 +2966,13 @@ fn expand_file_mentions(line: &str, workspace: &Path) -> Option<String> {
     let mut included = 0usize;
     for mention in mentions {
         let rel = mention.trim_matches(|ch| matches!(ch, ',' | ';' | ':' | ')'));
-        let path = workspace.join(rel);
+        let path = match resolve_mention_path(workspace, rel) {
+            Ok(path) => path,
+            Err(reason) => {
+                out.push_str(&format!("\n--- {rel} ---\n<{reason}>\n"));
+                continue;
+            }
+        };
         if !path.is_file() {
             out.push_str(&format!("\n--- {rel} ---\n<not found or not a file>\n"));
             continue;
@@ -2983,6 +2988,28 @@ fn expand_file_mentions(line: &str, workspace: &Path) -> Option<String> {
         }
     }
     if included == 0 { None } else { Some(out) }
+}
+
+fn resolve_mention_path(workspace: &Path, rel: &str) -> Result<PathBuf, &'static str> {
+    let requested = Path::new(rel);
+    if requested.is_absolute() {
+        return Err("blocked: absolute path outside workspace");
+    }
+    for component in requested.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => return Err("blocked: path must stay inside workspace"),
+        }
+    }
+    let full = workspace.join(requested);
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|_| "blocked: workspace is not readable")?;
+    let canonical = full.canonicalize().map_err(|_| "not found or not a file")?;
+    if !canonical.starts_with(&canonical_workspace) {
+        return Err("blocked: path outside workspace");
+    }
+    Ok(canonical)
 }
 
 struct ReviewCommandContext<'a> {
@@ -3783,6 +3810,9 @@ struct HookReport {
 
 impl HookRegistry {
     fn discover(workspace: &Path) -> Self {
+        if !workspace_hooks_enabled() {
+            return Self::default();
+        }
         let mut hooks = Vec::new();
         for root in [".kimetsu/hooks", ".claude/hooks", ".codex/hooks"] {
             let root = workspace.join(root);
@@ -3833,6 +3863,17 @@ impl HookRegistry {
         }
         Ok(report)
     }
+}
+
+fn workspace_hooks_enabled() -> bool {
+    std::env::var("KIMETSU_ENABLE_WORKSPACE_HOOKS")
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -5785,6 +5826,23 @@ mod tests {
     }
 
     #[test]
+    fn file_mentions_reject_paths_outside_workspace() {
+        let root = temp_root("chat_mentions_block");
+        let outside = temp_root("chat_mentions_outside");
+        fs::write(outside.join("secret.txt"), "do not include").expect("secret");
+        let expanded = expand_file_mentions(
+            &format!(
+                "summarize @../{}",
+                outside.file_name().unwrap().to_string_lossy()
+            ),
+            &root,
+        );
+        assert!(expanded.is_none());
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    #[test]
     fn input_history_moves_backward_and_forward() {
         let mut state = ChatInputState::default();
         state.record("first");
@@ -5821,15 +5879,14 @@ mod tests {
     }
 
     #[test]
-    fn hook_registry_discovers_event_scripts() {
+    fn hook_registry_ignores_workspace_hooks_by_default() {
         let root = temp_root("chat_hooks");
         let dir = root.join(".kimetsu/hooks");
         fs::create_dir_all(&dir).expect("hooks dir");
         fs::write(dir.join("pre-turn.cmd"), "@echo off\necho ok\n").expect("hook");
 
         let hooks = HookRegistry::discover(&root);
-        assert_eq!(hooks.hooks.len(), 1);
-        assert_eq!(hooks.hooks[0].event, HookEvent::PreTurn);
+        assert!(hooks.hooks.is_empty());
         fs::remove_dir_all(root).ok();
     }
 

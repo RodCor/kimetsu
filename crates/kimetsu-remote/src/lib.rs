@@ -75,6 +75,12 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         (Some(cert), Some(key)) => Some((cert, key)),
         _ => None,
     };
+    if tls.is_none() && !args.addr.ip().is_loopback() && !args.allow_public_http {
+        return Err(format!(
+            "refusing plaintext HTTP bind on non-loopback address {}; use --addr 127.0.0.1:8787, configure TLS, or pass --allow-public-http for a trusted network",
+            args.addr
+        ));
+    }
     #[cfg(not(feature = "tls"))]
     if tls.is_some() {
         return Err(

@@ -8,6 +8,7 @@ use rusqlite::{Connection, params};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::redact;
 use crate::schema;
 
 /// Event-schema durability seam. Normalizes an event written under an older
@@ -123,7 +124,10 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
 }
 
 fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
-    // Persist the event exactly as written (raw, original schema_version).
+    let event = redact_memory_event(event);
+    let event = event.as_ref();
+    // Persist the event after memory payload redaction so durable replay tables
+    // never become a second secret store.
     insert_event(conn, event)?;
     // Project the now-stored event into the derived tables.
     project_event(conn, event)
@@ -135,8 +139,9 @@ fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     // Project through the durability seam so older-schema events normalize
     // to the current shape before dispatch.
-    let event = upcast_event(event);
-    let event = event.as_ref();
+    let upcasted = upcast_event(event);
+    let redacted = redact_memory_event(upcasted.as_ref());
+    let event = redacted.as_ref();
 
     match event.kind.as_str() {
         "run.started" => apply_run_started(conn, event),
@@ -151,6 +156,59 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // malformed payload just no-ops.
         "memory.cited" => apply_memory_cited(conn, event),
         _ => Ok(()),
+    }
+}
+
+fn redact_memory_event(event: &Event) -> Cow<'_, Event> {
+    if !matches!(
+        event.kind.as_str(),
+        "memory.accepted" | "memory.proposed" | "memory.cited"
+    ) {
+        return Cow::Borrowed(event);
+    }
+    let (payload, changed) = redact_json_strings(&event.payload);
+    if changed {
+        Cow::Owned(Event {
+            payload,
+            ..event.clone()
+        })
+    } else {
+        Cow::Borrowed(event)
+    }
+}
+
+fn redact_json_strings(value: &serde_json::Value) -> (serde_json::Value, bool) {
+    match value {
+        serde_json::Value::String(text) => {
+            let redaction = redact::redact_secrets(text);
+            let changed = redaction.was_redacted();
+            (serde_json::Value::String(redaction.text), changed)
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            let values = values
+                .iter()
+                .map(|value| {
+                    let (value, did_change) = redact_json_strings(value);
+                    changed |= did_change;
+                    value
+                })
+                .collect();
+            (serde_json::Value::Array(values), changed)
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let map = map
+                .iter()
+                .map(|(key, value)| {
+                    let (value, did_change) = redact_json_strings(value);
+                    changed |= did_change;
+                    (key.clone(), value)
+                })
+                .collect();
+            (serde_json::Value::Object(map), changed)
+        }
+        other => (other.clone(), false),
     }
 }
 
@@ -984,6 +1042,91 @@ mod tests {
     // W1.2c: Event reconstruction fidelity — after rebuild_in_place the
     // projected memory's text/scope/kind match the original.
     // ------------------------------------------------------------------
+    #[test]
+    fn memory_proposed_redacts_event_and_projection_payloads() {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let event = make_event(
+            run_id,
+            "memory.proposed",
+            json!({
+                "proposal_id": "prop-redact",
+                "scope": "project",
+                "kind": "fact",
+                "text": format!("lesson uses {secret}"),
+                "rationale": format!("model repeated {secret}"),
+                "proposed_confidence": 0.5,
+                "source_event_ids": [],
+            }),
+        );
+        apply_events(&conn, &[event]).expect("apply_events");
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE kind = 'memory.proposed'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("event payload");
+        assert!(!payload.contains(secret), "event leaked secret: {payload}");
+        assert!(payload.contains("[REDACTED:anthropic_oauth]"));
+
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT text, rationale FROM memory_proposals WHERE proposal_id = 'prop-redact'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("proposal row");
+        assert!(!row.0.contains(secret), "proposal text leaked: {}", row.0);
+        assert!(
+            !row.1.contains(secret),
+            "proposal rationale leaked: {}",
+            row.1
+        );
+    }
+
+    #[test]
+    fn memory_cited_redacts_event_and_projection_rationale() {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let event = make_event(
+            run_id,
+            "memory.cited",
+            json!({
+                "memory_id": "mem-redact",
+                "turn": 1,
+                "rationale": format!("used because output showed {secret}"),
+            }),
+        );
+        apply_events(&conn, &[event]).expect("apply_events");
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE kind = 'memory.cited'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("event payload");
+        assert!(!payload.contains(secret), "event leaked secret: {payload}");
+        assert!(payload.contains("[REDACTED:anthropic_oauth]"));
+
+        let rationale: String = conn
+            .query_row(
+                "SELECT rationale FROM memory_citations WHERE memory_id = 'mem-redact'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("citation rationale");
+        assert!(
+            !rationale.contains(secret),
+            "citation rationale leaked: {rationale}"
+        );
+        assert!(rationale.contains("[REDACTED:anthropic_oauth]"));
+    }
+
     #[test]
     fn rebuild_in_place_payload_fidelity() {
         use super::rebuild_in_place;

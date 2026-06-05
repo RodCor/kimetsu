@@ -16,6 +16,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const https = require("https");
+const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 
 const REPO = "RodCor/kimetsu";
@@ -104,6 +105,36 @@ function extract(archive, dest) {
   execFileSync("tar", ["-xf", archive, "-C", dest], { stdio: "ignore" });
 }
 
+function sha256File(filePath) {
+  const hash = crypto.createHash("sha256");
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest("hex");
+}
+
+function checksumForAsset(manifest, assetName) {
+  for (const rawLine of manifest.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let match = line.match(/^([a-fA-F0-9]{64})\s+\*?(.+)$/);
+    if (match && match[2] === assetName) return match[1].toLowerCase();
+    match = line.match(/^SHA256 \((.+)\) = ([a-fA-F0-9]{64})$/);
+    if (match && match[1] === assetName) return match[2].toLowerCase();
+  }
+  return null;
+}
+
+function verifyChecksum(archivePath, assetName, checksumsPath) {
+  const manifest = fs.readFileSync(checksumsPath, "utf8");
+  const expected = checksumForAsset(manifest, assetName);
+  if (!expected) {
+    throw new Error(`checksums.txt does not contain ${assetName}`);
+  }
+  const actual = sha256File(archivePath);
+  if (actual !== expected) {
+    throw new Error(`checksum mismatch for ${assetName}: expected ${expected}, got ${actual}`);
+  }
+}
+
 async function ensureEmbeddingsBinary({ version, target, binName }) {
   const cacheDir = path.join(
     cacheRoot(),
@@ -122,8 +153,11 @@ async function ensureEmbeddingsBinary({ version, target, binName }) {
   const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "kimetsu-npm-"));
   try {
     const archivePath = path.join(workdir, assetName);
+    const checksumsPath = path.join(workdir, "checksums.txt");
     process.stderr.write(`kimetsu: fetching embeddings build (${assetName})…\n`);
     await download(downloadUrl(version, assetName), archivePath);
+    await download(downloadUrl(version, "checksums.txt"), checksumsPath);
+    verifyChecksum(archivePath, assetName, checksumsPath);
 
     const extractDir = path.join(workdir, "extract");
     extract(archivePath, extractDir);

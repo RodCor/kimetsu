@@ -56,6 +56,66 @@ impl ProjectPaths {
             kimetsu_dir,
         }
     }
+
+    /// Validate that project state paths remain physically under the project
+    /// root and are not redirected through `.kimetsu` symlinks/junction-style
+    /// final components.
+    pub fn validate_state_dir(&self) -> KimetsuResult<()> {
+        let canonical_root = if self.repo_root.exists() {
+            self.repo_root.canonicalize()?
+        } else {
+            self.repo_root.clone()
+        };
+
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.kimetsu_dir) {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to use symlinked Kimetsu state dir: {}",
+                    self.kimetsu_dir.display()
+                )
+                .into());
+            }
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "Kimetsu state path exists but is not a directory: {}",
+                    self.kimetsu_dir.display()
+                )
+                .into());
+            }
+            let canonical_state = self.kimetsu_dir.canonicalize()?;
+            if !canonical_state.starts_with(&canonical_root) {
+                return Err(format!(
+                    "Kimetsu state dir escaped the project root: {}",
+                    self.kimetsu_dir.display()
+                )
+                .into());
+            }
+        }
+
+        for path in [
+            &self.project_toml,
+            &self.brain_db,
+            &self.project_log,
+            &self.runs_dir,
+            &self.lock_file,
+        ] {
+            reject_symlink(path)?;
+        }
+        Ok(())
+    }
+}
+
+fn reject_symlink(path: &Path) -> KimetsuResult<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to use symlinked Kimetsu state path: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub fn discover_repo_root(start: &Path) -> KimetsuResult<PathBuf> {
@@ -392,6 +452,49 @@ mod tests {
     /// permanent once set. This test is intentionally kept minimal and
     /// self-contained. Primary coverage of the no-git seam lives in the
     /// kimetsu-brain project.rs `*_at_root` tests which do NOT need the pin.
+    #[test]
+    fn validate_state_dir_rejects_symlinked_kimetsu_dir() {
+        let root = temp_root("state_symlink_root");
+        let outside = temp_root("state_symlink_outside");
+        let link = root.join(".kimetsu");
+        if create_dir_symlink(&outside, &link).is_err() {
+            std::fs::remove_dir_all(root).ok();
+            std::fs::remove_dir_all(outside).ok();
+            return;
+        }
+
+        let err = ProjectPaths::at_root(&root)
+            .validate_state_dir()
+            .expect_err("symlinked .kimetsu must be rejected");
+        assert!(
+            format!("{err}").contains("symlinked Kimetsu state dir"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("kimetsu_{label}_{nanos}"));
+        std::fs::create_dir_all(&path).expect("create temp root");
+        path
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
     #[test]
     fn pin_discover_to_root_skips_git_climb() {
         // Create a temp dir nested inside the current git repo (E:\Kimetsu is

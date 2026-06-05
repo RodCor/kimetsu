@@ -79,6 +79,16 @@ pub fn check(auth: &AuthConfig, repo: &str, bearer: Option<&str>) -> AuthOutcome
     }
 }
 
+/// True when the presented bearer token is one of the global/server-admin
+/// tokens. Use this for operations that affect shared org/user memory rather
+/// than a single repo brain.
+pub fn is_global_token(auth: &AuthConfig, bearer: Option<&str>) -> bool {
+    let Some(tok) = bearer.map(str::trim).filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    any_match(&auth.global, tok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +136,12 @@ mod tests {
             check(&cfg(), "acme-api", Some("nope")),
             AuthOutcome::Unauthorized
         );
+    }
+
+    #[test]
+    fn global_token_detection_distinguishes_per_repo_tokens() {
+        assert!(is_global_token(&cfg(), Some("tok_admin")));
+        assert!(!is_global_token(&cfg(), Some("tok_api")));
+        assert!(!is_global_token(&cfg(), Some("nope")));
     }
 }

@@ -11,13 +11,44 @@ fn run_git(args: &[&str]) -> Result<(), String> {
         .output()
         .map_err(|e| format!("spawn git: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let args = args
+            .iter()
+            .map(|arg| redact_url_credentials(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stderr = redact_url_credentials(String::from_utf8_lossy(&out.stderr).trim());
+        return Err(format!("git {} failed: {}", args, stderr));
     }
     Ok(())
+}
+
+fn redact_url_credentials(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    loop {
+        let Some(scheme_pos) = rest.find("://") else {
+            out.push_str(rest);
+            break;
+        };
+        let scheme_end = scheme_pos + 3;
+        out.push_str(&rest[..scheme_end]);
+        let after_scheme = &rest[scheme_end..];
+        let terminator = after_scheme
+            .find(|ch: char| {
+                ch.is_whitespace() || ch == '\'' || ch == '"' || ch == '<' || ch == '>'
+            })
+            .unwrap_or(after_scheme.len());
+        let candidate = &after_scheme[..terminator];
+        if let Some(at_pos) = candidate.find('@') {
+            out.push_str("[redacted]@");
+            out.push_str(&candidate[at_pos + 1..]);
+            rest = &after_scheme[terminator..];
+        } else {
+            out.push_str(candidate);
+            rest = &after_scheme[terminator..];
+        }
+    }
+    out
 }
 
 /// Ensure `<checkout_dir>/<repo_id>` is a fresh shallow checkout of `url`.
@@ -52,4 +83,26 @@ pub fn ensure_checkout(
         run_git(&args)?;
     }
     Ok(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url_credentials;
+
+    #[test]
+    fn redacts_credentials_in_git_urls() {
+        let text = "fatal: Authentication failed for 'https://user:token@example.com/org/repo.git'";
+        let redacted = redact_url_credentials(text);
+        assert_eq!(
+            redacted,
+            "fatal: Authentication failed for 'https://[redacted]@example.com/org/repo.git'"
+        );
+        assert!(!redacted.contains("user:token"));
+    }
+
+    #[test]
+    fn leaves_plain_urls_unchanged() {
+        let text = "https://github.com/org/repo.git";
+        assert_eq!(redact_url_credentials(text), text);
+    }
 }

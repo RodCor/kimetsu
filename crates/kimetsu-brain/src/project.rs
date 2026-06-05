@@ -156,6 +156,7 @@ pub struct SilentMemory {
 
 pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
     let paths = ProjectPaths::discover(start)?;
+    paths.validate_state_dir()?;
     // Create only the `.kimetsu/` dir itself (needed before writing
     // project.toml / brain.db). The `runs/` dir is created lazily by the
     // agent pipeline's TraceWriter — memory writes no longer produce run
@@ -191,6 +192,7 @@ pub fn init_project(start: &Path, force: bool) -> KimetsuResult<InitSummary> {
 
 pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
     let paths = ProjectPaths::discover(start)?;
+    paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
         return Err(format!(
@@ -212,6 +214,7 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
 /// explicit root directory per repo-id.
 pub fn init_project_at_root(root: &Path, force: bool) -> KimetsuResult<InitSummary> {
     let paths = ProjectPaths::at_root(root);
+    paths.validate_state_dir()?;
     fs::create_dir_all(&paths.kimetsu_dir)?;
 
     let project_id = default_project_id(&paths.repo_root);
@@ -247,6 +250,7 @@ pub fn load_project_at_root(
     root: &Path,
 ) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
     let paths = ProjectPaths::at_root(root);
+    paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
         return Err(format!(
@@ -268,6 +272,7 @@ pub fn load_project_readonly_at_root(
     root: &Path,
 ) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
     let paths = ProjectPaths::at_root(root);
+    paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
         return Err(format!(
@@ -296,6 +301,7 @@ pub fn load_project_readonly(
     start: &Path,
 ) -> KimetsuResult<(ProjectPaths, ProjectConfig, Connection)> {
     let paths = ProjectPaths::discover(start)?;
+    paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
         return Err(format!(
@@ -681,6 +687,11 @@ pub fn propose_memory(
         eprintln!("kimetsu-brain: {}", redaction.summary());
     }
     let text = redaction.text.as_str();
+    let rationale_redaction = redact::redact_secrets(rationale);
+    if rationale_redaction.was_redacted() {
+        eprintln!("kimetsu-brain: {}", rationale_redaction.summary());
+    }
+    let rationale = rationale_redaction.text.as_str();
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "memory propose", Some(run_id))?;

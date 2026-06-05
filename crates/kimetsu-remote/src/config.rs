@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use clap::Args;
 use serde::Deserialize;
 
-use crate::auth::AuthConfig;
+use crate::{auth::AuthConfig, repo};
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Address to bind, e.g. 0.0.0.0:8787.
-    #[arg(long, default_value = "0.0.0.0:8787")]
+    /// Address to bind, e.g. 127.0.0.1:8787.
+    #[arg(long, default_value = "127.0.0.1:8787")]
     pub addr: SocketAddr,
 
     /// Directory holding one brain per repo (`<data>/<repo-id>/.kimetsu/`).
@@ -34,8 +34,13 @@ pub struct ServeArgs {
     pub max_blocking_threads: usize,
 
     /// Per-token request rate limit (requests/minute). `0` disables it.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 60)]
     pub rate_limit: u32,
+
+    /// Allow plaintext HTTP on a non-loopback bind address. Prefer TLS or a
+    /// local reverse proxy; this flag exists for explicitly trusted networks.
+    #[arg(long)]
+    pub allow_public_http: bool,
 
     /// Enable a shared org brain at <dir>: `global_user`-scoped memories are
     /// stored here and merged into EVERY repo's retrieval (cross-project team
@@ -102,7 +107,14 @@ pub fn build_auth(args: &ServeArgs) -> Result<AuthConfig, String> {
             toml::from_str(&text).map_err(|e| format!("parse tokens file: {e}"))?;
         auth.global.extend(parsed.global);
         for (repo, toks) in parsed.per_repo {
-            auth.per_repo.entry(repo).or_default().extend(toks);
+            let canonical = repo::sanitize_repo_id(&repo)
+                .map_err(|e| format!("invalid per_repo token key {repo:?}: {e}"))?;
+            if auth.per_repo.contains_key(&canonical) {
+                return Err(format!(
+                    "duplicate per_repo token key after canonicalization: {repo:?} -> {canonical:?}"
+                ));
+            }
+            auth.per_repo.insert(canonical, toks);
         }
     }
 
@@ -119,4 +131,69 @@ pub fn build_auth(args: &ServeArgs) -> Result<AuthConfig, String> {
         );
     }
     Ok(auth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serve_args(tokens_file: PathBuf) -> ServeArgs {
+        ServeArgs {
+            addr: "127.0.0.1:8787".parse().expect("addr"),
+            data: std::env::temp_dir().join("kimetsu-remote-config-test"),
+            tokens: Vec::new(),
+            tokens_file: Some(tokens_file),
+            max_blocking_threads: 64,
+            rate_limit: 60,
+            allow_public_http: false,
+            org_brain: None,
+            repos_file: None,
+            checkout_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+        }
+    }
+
+    #[test]
+    fn per_repo_tokens_are_canonicalized() {
+        let path =
+            std::env::temp_dir().join(format!("kimetsu-remote-tokens-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+[per_repo]
+Acme-API = ["tok"]
+"#,
+        )
+        .expect("write tokens file");
+
+        let auth = build_auth(&serve_args(path.clone())).expect("build auth");
+        assert!(auth.per_repo.contains_key("acme-api"));
+        assert!(!auth.per_repo.contains_key("Acme-API"));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn duplicate_canonical_per_repo_tokens_fail() {
+        let path = std::env::temp_dir().join(format!(
+            "kimetsu-remote-tokens-dup-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[per_repo]
+Acme-API = ["tok1"]
+acme-api = ["tok2"]
+"#,
+        )
+        .expect("write tokens file");
+
+        let err = build_auth(&serve_args(path.clone())).expect_err("duplicate keys must fail");
+        assert!(err.contains("duplicate per_repo token key after canonicalization"));
+
+        std::fs::remove_file(path).ok();
+    }
 }

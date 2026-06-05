@@ -193,6 +193,11 @@ pub fn dispatch(
                     return Err(format!("tool `{name}` is not available in remote mode"));
                 }
             }
+            if is_privileged_write_tool(name) && !mcp_write_tools_enabled() {
+                return Err(format!(
+                    "tool `{name}` requires explicit user approval; set KIMETSU_MCP_ENABLE_WRITE_TOOLS=1 only for trusted sessions"
+                ));
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -390,6 +395,9 @@ fn call_tool(
                 .map(InstallScope::parse)
                 .transpose()?
                 .unwrap_or_default();
+            if matches!(scope, InstallScope::Global) {
+                return Err("global plugin install is not available through MCP; run the explicit CLI command instead".to_string());
+            }
             let mode = arguments
                 .get("mode")
                 .and_then(Value::as_str)
@@ -423,6 +431,38 @@ fn call_tool(
         "kimetsu_brain_config_show" => kimetsu_brain_config_show(workspace),
         other => Err(format!("unknown Kimetsu MCP tool `{other}`")),
     }
+}
+
+fn is_privileged_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "kimetsu_brain_record"
+            | "kimetsu_benchmark_record_outcome"
+            | "kimetsu_brain_memory_add"
+            | "kimetsu_brain_memory_accept"
+            | "kimetsu_brain_memory_reject"
+            | "kimetsu_brain_memory_invalidate"
+            | "kimetsu_brain_ingest_repo"
+            | "kimetsu_bridge_import"
+            | "kimetsu_bridge_export"
+            | "kimetsu_bridge_sync"
+            | "kimetsu_plugin_install"
+            | "kimetsu_brain_model_set"
+            | "kimetsu_brain_reindex"
+            | "kimetsu_brain_conflict_resolve"
+            | "kimetsu_brain_prune"
+    )
+}
+
+fn mcp_write_tools_enabled() -> bool {
+    std::env::var("KIMETSU_MCP_ENABLE_WRITE_TOOLS")
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn kimetsu_brain_status(workspace: &Path) -> Value {
@@ -2541,6 +2581,34 @@ mod tests {
             err.contains("kimetsu_brain_ingest_repo"),
             "error must name the blocked tool, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn dispatch_blocks_privileged_write_tools_by_default() {
+        let err = dispatch(
+            "tools/call",
+            json!({
+                "name": "kimetsu_brain_record",
+                "arguments": { "lesson": "persist this without approval" }
+            }),
+            Path::new("."),
+            &SkillConfig::default(),
+            None,
+        )
+        .expect_err("write tools must require explicit approval");
+        assert!(err.contains("requires explicit user approval"));
+    }
+
+    #[test]
+    fn global_plugin_install_is_not_available_through_mcp_helper() {
+        let err = call_tool(
+            "kimetsu_plugin_install",
+            json!({ "target": "codex", "scope": "global" }),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect_err("global plugin install must be blocked");
+        assert!(err.contains("global plugin install is not available"));
     }
 
     /// (d) An allowed tools/call dispatches correctly (uses kimetsu_brain_status
