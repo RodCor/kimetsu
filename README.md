@@ -112,7 +112,13 @@ agent brain, citation deltas, decay, conflict detection? See
 
 ## Install
 
-Kimetsu is a single Rust binary. Pick your flavor:
+Kimetsu is a single Rust binary. There's really only one choice to make at
+install time — **lean vs semantic (embeddings)** — because that's the only part
+baked into the binary. *Which host agents you use* (Claude Code, Codex, Pi,
+OpenClaw) is a **runtime** choice you change anytime with `kimetsu plugin
+install`/`uninstall` — no reinstall. The official prebuilt + npm binaries
+include all four host integrations; a bare source `cargo install` is minimal and
+adds them with `--features pi,openclaw`.
 
 ```bash
 # Default lean build — fast lexical (FTS) retrieval, no model download
@@ -121,9 +127,9 @@ cargo install kimetsu-cli
 # Semantic build — fastembed + ONNX; first run downloads BGE-small
 cargo install kimetsu-cli --features embeddings
 
-# With Pi + OpenClaw host integrations (opt-in; official prebuilt binaries include them)
+# Add the Pi + OpenClaw host integrations to a source build (prebuilts already have them)
 cargo install kimetsu-cli --features pi,openclaw
-# All extras together:
+# Everything:
 cargo install kimetsu-cli --features embeddings,pi,openclaw
 
 # From source
@@ -135,7 +141,7 @@ Prefer not to touch the Rust toolchain? Two options.
 **npm** — installs the prebuilt binary for your platform, no Rust required:
 
 ```bash
-npm install -g kimetsu-ai                                  # lean build
+npm install -g kimetsu-ai                                  # lean build (all host integrations included)
 KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai    # opt into the semantic build
 ```
 
@@ -148,7 +154,9 @@ Windows x64); elsewhere it falls back to lean. See [`npm/`](npm/) for details.
 **Pre-built archives** — for **Linux / macOS / Windows** on every
 [GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put
 `kimetsu` / `kimetsu.exe` somewhere on `PATH` (`~/.local/bin`, `/usr/local/bin`,
-or `%USERPROFILE%\.cargo\bin`). Lean archives are published for Linux,
+or `%USERPROFILE%\.cargo\bin`). Every prebuilt archive — lean and embeddings —
+bundles all four host integrations, so switching hosts never needs a reinstall.
+Lean archives are published for Linux,
 macOS Intel, macOS Apple Silicon, and Windows. Embeddings archives are
 published where ONNX Runtime prebuilts are available: Linux x86_64,
 macOS Apple Silicon, and Windows x86_64.
@@ -220,6 +228,11 @@ kimetsu plugin uninstall codex --yes
 
 # Or do init + install + selftest in one shot:
 kimetsu setup --host claude-code
+
+# Switched editors? Move your wiring — no reinstall (prebuilt/npm binaries
+# include every host; on a source build add `--features pi`):
+kimetsu plugin uninstall claude-code --yes   # drop the old host's wiring
+kimetsu plugin install pi                     # wire the new one
 ```
 
 `--scope` defaults to `workspace`. The installer **merges** into existing

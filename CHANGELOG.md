@@ -67,15 +67,17 @@ ADDED
     `[model] provider = "bedrock"` and/or `[learning.distiller]`; the two
     are configured independently, so you can run the agent on Bedrock and
     harvest on Bedrock or direct Claude/OpenAI.
-  * **Two more host integrations: Pi and OpenClaw** (opt-in Cargo features;
-    bundled in official prebuilt binaries). `kimetsu plugin install pi`
-    wires a TypeScript extension (Pi has no MCP) plus a `kimetsu-brain`
+  * **Two more host integrations: Pi and OpenClaw.** `kimetsu plugin install
+    pi` wires a TypeScript extension (Pi has no MCP) plus a `kimetsu-brain`
     skill; `kimetsu plugin install openclaw` registers the MCP server, a
     hooks plugin, and a `kimetsu-context` skill. Both join Claude Code and
-    Codex across `plugin status`, `plugin uninstall`, and `setup`. Source
-    builds add them via `--features pi,openclaw`. Every embedded hook
-    degrades to a silent no-op if the `kimetsu` binary isn't on PATH, so
-    a host is never left broken.
+    Codex across `plugin status`, `plugin uninstall`, and `setup` —
+    *which* hosts you wire is a runtime choice you change anytime, no
+    reinstall. **Every official prebuilt + npm binary (lean and embeddings)
+    includes all four host integrations;** they're opt-in Cargo features only
+    for a minimal source build, added with `--features pi,openclaw`. Every
+    embedded hook degrades to a silent no-op if the `kimetsu` binary isn't on
+    PATH, so a host is never left broken.
   * **Full plugin lifecycle.** `kimetsu plugin status` shows what's wired
     where (host × scope: installed / partial / absent + which pieces);
     `kimetsu plugin uninstall <host>` removes only the wiring (keeping the
