@@ -174,6 +174,11 @@ fn is_short_op_too_old(payload: &LockPayload) -> bool {
 enum ProcessLiveness {
     Alive,
     Dead,
+    /// Only constructed on Windows / non-unix-non-windows targets. unix's
+    /// `kill(pid, 0)` collapses to `Alive` (any non-ESRCH errno, e.g. EPERM) or
+    /// `Dead` (ESRCH), so it never yields this on unix — hence the unix-only
+    /// dead-code allow.
+    #[cfg_attr(unix, allow(dead_code))]
     Indeterminate,
 }
 
