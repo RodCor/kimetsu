@@ -6,14 +6,22 @@ users can `npm install -g kimetsu-ai` without a Rust toolchain. npm ships the
 **same prebuilt native binary** as the GitHub Release — it is not a
 reimplementation.
 
+The **server** (`kimetsu-remote`, beta) is published as a *separate* package —
+`npm install -g kimetsu-remote` — so the `kimetsu-ai` CLI never pulls the server
+binary. See `npm/kimetsu-remote/`.
+
 ## Layout
 
 ```
 npm/
-  kimetsu/          main package — committed source (launcher, no binaries)
+  kimetsu/          main CLI package — committed source (launcher, no binaries)
     bin/cli.js      resolves the platform package and execs its binary
     lib/embeddings.js  on-demand embeddings download (KIMETSU_NPM_FLAVOR=embeddings)
     package.json    optionalDependencies -> the 4 @kimetsu-ai/* platform packages
+    README.md
+  kimetsu-remote/   server package (beta) — separate from the CLI
+    bin/cli.js      resolves @kimetsu-ai/remote-<platform> and execs kimetsu-remote
+    package.json    optionalDependencies -> 3 @kimetsu-ai/remote-* packages
     README.md
   README.md         this file
 ```

@@ -61,10 +61,10 @@ ADDED
     and `kimetsu brain compact` (VACUUM, optional event-trim) keep the
     install lean.
   * **Kimetsu Remote (beta) — the brain over HTTP MCP.** Under active testing;
-    the `kimetsu-remote` **server is a separate binary** and is NOT installed by
-    `cargo install kimetsu-cli` / npm — install it on the server with `cargo
-    install kimetsu-remote --features embeddings` (or use the binary bundled in
-    the embeddings release archive). A new
+    the `kimetsu-remote` **server is a separate package** and is NOT installed by
+    `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` — install it on the
+    server with `npm install -g kimetsu-remote` or `cargo install kimetsu-remote
+    --features embeddings` (or its standalone GitHub-Release archive). A new
     standalone `kimetsu-remote` server hosts one brain per repository under a
     data dir and exposes the memory/retrieval/curation tools over remote MCP
     (`POST /mcp/{repo}`), so a team — or you across machines — can share one

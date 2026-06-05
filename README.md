@@ -266,12 +266,17 @@ stores the key in a gitignored `.env`; skip it with `--no-setup`. Run it with
 
 > **Beta.** Kimetsu Remote is under active testing and may have rough edges or
 > breaking changes before the stable release. The `kimetsu-remote` **server is a
-> separate binary** — `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` do
+> separate package** — `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` do
 > **not** install it. Install it on the server when you want it:
-> `cargo install kimetsu-remote --features embeddings`, or use the
-> `kimetsu-remote` binary bundled in the embeddings release archive. (The
+>
+> ```bash
+> npm install -g kimetsu-remote                       # prebuilt server binary
+> cargo install kimetsu-remote --features embeddings  # or from source
+> ```
+>
+> (or grab the standalone `kimetsu-remote` archive from a GitHub Release). The
 > `kimetsu plugin install --remote` *client* wiring is part of the normal
-> `kimetsu` binary — no separate install needed to point a host at a server.)
+> `kimetsu` binary — no separate install needed to point a host at a server.
 
 Run the brain on a server and connect over **HTTP MCP**, so a team — or you
 across machines — shares one brain per repository, with no local checkout:
