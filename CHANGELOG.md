@@ -155,6 +155,11 @@ CHANGED
   * **Run dirs self-prune.** New agent runs opportunistically GC run dirs
     older than 30 days (keeping the newest 20; `KIMETSU_RUNS_GC=0` to
     disable) — only at run creation, never on the hot brain-open path.
+  * **One-command npm semantic build.** `kimetsu npm-flavor embeddings`
+    fetches the semantic build once and persists the choice (in
+    `<cache>/kimetsu/npm/flavor`), so npm users no longer keep
+    `KIMETSU_NPM_FLAVOR` exported across runs; `lean`/`status` round it out
+    (the env var stays a per-run override).
 
 FIXED
   * **MSRV portability.** A 1.87-only API that violated the declared

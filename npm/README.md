@@ -45,8 +45,10 @@ launcher `require.resolve`s its binary and execs it. No postinstall script — i
 works under `npm install --ignore-scripts`.
 
 The embeddings build is larger and only supported on three targets, so it is
-fetched on demand by the launcher when `KIMETSU_NPM_FLAVOR=embeddings` is set,
-rather than shipped as a package.
+fetched on demand rather than shipped as a package. Users opt in once with
+`kimetsu npm-flavor embeddings` (a launcher-only command that fetches the binary
+and records the preference in `<cache>/kimetsu/npm/flavor`, so it persists with
+no env var); `KIMETSU_NPM_FLAVOR=embeddings`/`=lean` remains a per-run override.
 
 ## Versioning
 

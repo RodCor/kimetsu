@@ -87,8 +87,17 @@ async function resolveBinary() {
     fail(unsupportedPlatformMessage(key));
   }
 
-  const wantEmbeddings =
-    (process.env.KIMETSU_NPM_FLAVOR || "").toLowerCase() === "embeddings";
+  // Flavor precedence: an explicit KIMETSU_NPM_FLAVOR env (per-run override) >
+  // the persisted preference set by `kimetsu npm-flavor embeddings` > lean.
+  const env = (process.env.KIMETSU_NPM_FLAVOR || "").toLowerCase();
+  let flavor;
+  if (env === "embeddings" || env === "lean") {
+    flavor = env;
+  } else {
+    const { readFlavorMarker } = require("../lib/embeddings");
+    flavor = readFlavorMarker() || "lean";
+  }
+  const wantEmbeddings = flavor === "embeddings";
 
   if (wantEmbeddings) {
     if (!entry.embeddings) {
@@ -121,7 +130,65 @@ async function resolveBinary() {
   return lean;
 }
 
+// `kimetsu npm-flavor [embeddings|lean|status]` — a launcher-only command
+// (npm installs only) that persistently selects the build, so users never need
+// to keep KIMETSU_NPM_FLAVOR exported. Returns a process exit code.
+async function npmFlavorCommand(argv) {
+  const { readFlavorMarker, writeFlavorMarker } = require("../lib/embeddings");
+  const key = `${process.platform}-${process.arch}`;
+  const entry = PLATFORMS[key];
+  const sub = (argv[1] || "status").toLowerCase();
+
+  if (sub === "status") {
+    process.stdout.write(`kimetsu npm flavor: ${readFlavorMarker() || "lean"}\n`);
+    return 0;
+  }
+  if (sub === "lean") {
+    writeFlavorMarker("lean");
+    process.stdout.write("✓ lean build selected (fast lexical/FTS retrieval).\n");
+    return 0;
+  }
+  if (sub === "embeddings") {
+    if (!entry || !entry.embeddings) {
+      process.stderr.write(
+        `kimetsu: the semantic (embeddings) build isn't available for ${key}.\n` +
+          `Build from source instead: cargo install kimetsu-cli --features embeddings\n`
+      );
+      return 1;
+    }
+    writeFlavorMarker("embeddings");
+    process.stdout.write("Enabling the semantic (embeddings) build…\n");
+    try {
+      const { ensureEmbeddingsBinary } = require("../lib/embeddings");
+      await ensureEmbeddingsBinary({
+        version: VERSION,
+        target: entry.target,
+        binName: entry.bin,
+      });
+      process.stdout.write(
+        "✓ semantic build enabled — kimetsu uses it from now on (no env var needed).\n"
+      );
+      return 0;
+    } catch (err) {
+      process.stderr.write(
+        `kimetsu: could not fetch the embeddings build (${err.message}).\n` +
+          `The preference is saved; it will be retried on the next run.\n`
+      );
+      return 1;
+    }
+  }
+
+  process.stderr.write(
+    `kimetsu npm-flavor: unknown option '${sub}'. Use: embeddings | lean | status\n`
+  );
+  return 1;
+}
+
 async function main() {
+  const argv = process.argv.slice(2);
+  if (argv[0] === "npm-flavor") {
+    process.exit(await npmFlavorCommand(argv));
+  }
   const binary = await resolveBinary();
   const result = spawnSync(binary, process.argv.slice(2), {
     stdio: "inherit",

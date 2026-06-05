@@ -141,15 +141,19 @@ Prefer not to touch the Rust toolchain? Two options.
 **npm** — installs the prebuilt binary for your platform, no Rust required:
 
 ```bash
-npm install -g kimetsu-ai                                  # lean build (all host integrations included)
-KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai    # opt into the semantic build
+npm install -g kimetsu-ai          # lean build (all host integrations included)
+kimetsu npm-flavor embeddings      # one-time: switch to the semantic build — it persists
 ```
 
 npm pulls only the matching per-platform package (`@kimetsu-ai/*`) via
 optionalDependencies — there's no postinstall download, so it works under
-`npm install --ignore-scripts`. The embeddings build is fetched on first run and
-is available where ONNX Runtime prebuilts exist (Linux x64, macOS Apple Silicon,
-Windows x64); elsewhere it falls back to lean. See [`npm/`](npm/) for details.
+`npm install --ignore-scripts`. **`kimetsu npm-flavor embeddings`** fetches the
+semantic build once and remembers the choice (no env var to keep exported);
+`kimetsu npm-flavor lean` switches back, and `kimetsu npm-flavor status` shows
+the current one. (The `KIMETSU_NPM_FLAVOR` env var still works as a per-run
+override.) The embeddings build is available where ONNX Runtime prebuilts exist
+(Linux x64, macOS Apple Silicon, Windows x64); elsewhere it stays lean. See
+[`npm/`](npm/) for details.
 
 **Pre-built archives** — for **Linux / macOS / Windows** on every
 [GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put

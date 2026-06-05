@@ -30,6 +30,28 @@ function cacheRoot() {
   return process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
 }
 
+// Persisted flavor preference, so the choice survives across runs without an
+// env var. `kimetsu npm-flavor embeddings|lean` writes this; the launcher reads
+// it when KIMETSU_NPM_FLAVOR isn't set.
+function flavorMarkerPath() {
+  return path.join(cacheRoot(), "kimetsu", "npm", "flavor");
+}
+
+function readFlavorMarker() {
+  try {
+    const v = fs.readFileSync(flavorMarkerPath(), "utf8").trim().toLowerCase();
+    return v === "embeddings" || v === "lean" ? v : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function writeFlavorMarker(flavor) {
+  const p = flavorMarkerPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, flavor + "\n");
+}
+
 function downloadUrl(version, assetName) {
   return `https://github.com/${REPO}/releases/download/v${version}/${assetName}`;
 }
@@ -129,4 +151,9 @@ async function ensureEmbeddingsBinary({ version, target, binName }) {
   }
 }
 
-module.exports = { ensureEmbeddingsBinary };
+module.exports = {
+  ensureEmbeddingsBinary,
+  readFlavorMarker,
+  writeFlavorMarker,
+  flavorMarkerPath,
+};
