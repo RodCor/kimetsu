@@ -19,6 +19,11 @@ use crate::state::AppState;
 pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     init_tracing(args.log.as_deref());
 
+    tracing::warn!(
+        "Kimetsu Remote is BETA — under active testing; expect rough edges and possible \
+         breaking changes before the stable release. Please report issues."
+    );
+
     // Server isolation: every brain lives at an explicit root (never climb to an
     // enclosing repo), and the cross-project user brain is off (each repo brain
     // is standalone).

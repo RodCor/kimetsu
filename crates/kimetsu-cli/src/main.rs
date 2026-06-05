@@ -2240,6 +2240,11 @@ fn run_plugin_install_remote(
         println!("  {note}");
     }
     println!("  ✓ wired. Restart your host agent so it connects to the remote brain.");
+    println!(
+        "  note: Kimetsu Remote is BETA (under active testing — expect rough edges). The \
+         `kimetsu-remote` server is a SEPARATE binary: `cargo install kimetsu-remote --features \
+         embeddings` (or the embeddings release archive) — it is not installed with `kimetsu`."
+    );
     Ok(())
 }
 

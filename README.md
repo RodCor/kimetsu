@@ -262,7 +262,16 @@ stores the key in a gitignored `.env`; skip it with `--no-setup`. Run it with
 `~/.kimetsu/` — it then distills every project's sessions into your user brain
 (available everywhere), unless that project has its own distiller.
 
-### 3. Or share one brain from a server (Kimetsu Remote, experimental)
+### 3. Or share one brain from a server (Kimetsu Remote — **beta**)
+
+> **Beta.** Kimetsu Remote is under active testing and may have rough edges or
+> breaking changes before the stable release. The `kimetsu-remote` **server is a
+> separate binary** — `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` do
+> **not** install it. Install it on the server when you want it:
+> `cargo install kimetsu-remote --features embeddings`, or use the
+> `kimetsu-remote` binary bundled in the embeddings release archive. (The
+> `kimetsu plugin install --remote` *client* wiring is part of the normal
+> `kimetsu` binary — no separate install needed to point a host at a server.)
 
 Run the brain on a server and connect over **HTTP MCP**, so a team — or you
 across machines — shares one brain per repository, with no local checkout:
