@@ -6,6 +6,7 @@ use std::sync::Arc;
 use kimetsu_chat::SkillConfig;
 
 use crate::auth::AuthConfig;
+use crate::ingest::IngestState;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 
@@ -16,6 +17,8 @@ pub struct AppState {
     pub skills: Arc<SkillConfig>,
     pub limiter: Arc<RateLimiter>,
     pub metrics: Arc<Metrics>,
+    /// Present when `--repos-file` enables server-side ingest.
+    pub ingest: Option<Arc<IngestState>>,
 }
 
 impl AppState {
@@ -36,6 +39,12 @@ impl AppState {
             skills: Arc::new(skills),
             limiter: Arc::new(RateLimiter::new(per_minute)),
             metrics: Arc::new(Metrics::default()),
+            ingest: None,
         }
+    }
+
+    pub fn with_ingest(mut self, ingest: Arc<IngestState>) -> Self {
+        self.ingest = Some(ingest);
+        self
     }
 }

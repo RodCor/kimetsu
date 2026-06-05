@@ -41,3 +41,22 @@ pub static REMOTE_TOOLS: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
     .into_iter()
     .collect()
 });
+
+/// The allowlist plus `kimetsu_brain_ingest_repo`, used when server-side ingest
+/// is enabled (`--repos-file`). The ingest call is intercepted and handled by
+/// the remote server (clone + ingest from the managed checkout), not the normal
+/// dispatch.
+pub static REMOTE_TOOLS_WITH_INGEST: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
+    let mut set = REMOTE_TOOLS.clone();
+    set.insert("kimetsu_brain_ingest_repo");
+    set
+});
+
+/// Pick the active allowlist based on whether ingest is enabled.
+pub fn allowlist(ingest_enabled: bool) -> &'static BTreeSet<&'static str> {
+    if ingest_enabled {
+        &REMOTE_TOOLS_WITH_INGEST
+    } else {
+        &REMOTE_TOOLS
+    }
+}

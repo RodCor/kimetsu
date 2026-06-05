@@ -5,6 +5,8 @@ pub mod app;
 pub mod auth;
 pub mod catalog;
 pub mod config;
+pub mod git;
+pub mod ingest;
 pub mod metrics;
 pub mod ratelimit;
 pub mod repo;
@@ -57,7 +59,17 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         );
     }
 
-    let state = AppState::with_rate_limit(data_dir, auth, args.rate_limit);
+    // Server-side ingest (opt-in via --repos-file + --checkout-dir).
+    let ingest = prepare_ingest(
+        args.repos_file.as_deref(),
+        args.checkout_dir.as_deref(),
+        &data_dir,
+    )?;
+
+    let mut state = AppState::with_rate_limit(data_dir, auth, args.rate_limit);
+    if let Some(ing) = ingest {
+        state = state.with_ingest(std::sync::Arc::new(ing));
+    }
 
     let tls = match (args.tls_cert.clone(), args.tls_key.clone()) {
         (Some(cert), Some(key)) => Some((cert, key)),
@@ -122,6 +134,42 @@ fn prepare_org_brain(dir: Option<&Path>, data_dir: &Path) -> Result<Option<PathB
         );
     }
     Ok(Some(canon))
+}
+
+/// Load the repos registry + validate the checkout dir (outside --data). Returns
+/// the ingest state when `--repos-file` is set.
+fn prepare_ingest(
+    repos_file: Option<&Path>,
+    checkout_dir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<Option<ingest::IngestState>, String> {
+    let Some(repos_file) = repos_file else {
+        return Ok(None);
+    };
+    let checkout_dir =
+        checkout_dir.ok_or_else(|| "--repos-file requires --checkout-dir".to_string())?;
+    let text = std::fs::read_to_string(repos_file)
+        .map_err(|e| format!("read repos file {}: {e}", repos_file.display()))?;
+    let repos = ingest::load_repos_file(&text)?;
+
+    std::fs::create_dir_all(checkout_dir)
+        .map_err(|e| format!("create checkout dir {}: {e}", checkout_dir.display()))?;
+    let canon = checkout_dir
+        .canonicalize()
+        .map_err(|e| format!("canonicalize checkout dir {}: {e}", checkout_dir.display()))?;
+    if canon.starts_with(data_dir) || data_dir.starts_with(&canon) {
+        return Err(format!(
+            "--checkout-dir {} must be OUTSIDE --data {}",
+            kimetsu_core::paths::display_path(&canon),
+            kimetsu_core::paths::display_path(data_dir)
+        ));
+    }
+    tracing::info!(
+        repos = repos.len(),
+        checkout = %kimetsu_core::paths::display_path(&canon),
+        "server-side ingest enabled"
+    );
+    Ok(Some(ingest::IngestState::new(canon, repos)))
 }
 
 fn inside_git_repo(start: &Path) -> bool {

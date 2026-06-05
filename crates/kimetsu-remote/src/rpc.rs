@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{self, AuthOutcome};
-use crate::catalog::REMOTE_TOOLS;
+use crate::ingest::IngestState;
 use crate::metrics::Outcome;
 use crate::repo;
 use crate::state::AppState;
@@ -177,12 +177,23 @@ async fn dispatch_request(
         );
     }
 
+    // 6b. Server-side ingest is intercepted here — it clones/refreshes the
+    // managed checkout and indexes THOSE files into the brain, which the normal
+    // dispatch can't do (it would walk the brain dir, not a checkout).
+    if let Some(ingest) = &state.ingest
+        && req.method == "tools/call"
+        && req.params.get("name").and_then(|n| n.as_str()) == Some("kimetsu_brain_ingest_repo")
+    {
+        return handle_server_ingest(ingest, repo, &root, id, session).await;
+    }
+
     // 7. Run the (blocking) dispatch off the async pool.
+    let allow = crate::catalog::allowlist(state.ingest.is_some());
     let skills = state.skills.clone();
     let method = req.method.clone();
     let params = req.params.clone();
     let res = tokio::task::spawn_blocking(move || {
-        kimetsu_chat::dispatch(&method, params, &root, skills.as_ref(), Some(&REMOTE_TOOLS))
+        kimetsu_chat::dispatch(&method, params, &root, skills.as_ref(), Some(allow))
     })
     .await;
 
@@ -193,6 +204,87 @@ async fn dispatch_request(
         Ok(Err(msg)) => (
             Outcome::Ok,
             jsonrpc_err(StatusCode::OK, id, -32000, &msg, session),
+        ),
+        Err(join) => (
+            Outcome::Error,
+            jsonrpc_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                id,
+                -32603,
+                &format!("internal error: {join}"),
+                session,
+            ),
+        ),
+    }
+}
+
+/// Clone/refresh the repo's managed checkout and ingest its files into the
+/// repo's brain. Only repos registered in `--repos-file` are ingestable.
+async fn handle_server_ingest(
+    ingest: &IngestState,
+    repo: &str,
+    brain_root: &std::path::Path,
+    id: Value,
+    session: Option<HeaderValue>,
+) -> (Outcome, Response) {
+    let Some(spec) = ingest.repos.get(repo) else {
+        return (
+            Outcome::Ok,
+            jsonrpc_err(
+                StatusCode::OK,
+                id,
+                -32000,
+                &format!(
+                    "repo `{repo}` is not registered for server-side ingest (add it to --repos-file)"
+                ),
+                session,
+            ),
+        );
+    };
+
+    // Serialize ingests so concurrent calls don't race on a checkout.
+    let _guard = ingest.lock.lock().await;
+    let checkout_dir = ingest.checkout_dir.clone();
+    let repo_id = repo.to_string();
+    let url = spec.url.clone();
+    let branch = spec.branch.clone();
+    let brain_root = brain_root.to_path_buf();
+
+    let res = tokio::task::spawn_blocking(move || {
+        let files_root =
+            crate::git::ensure_checkout(&checkout_dir, &repo_id, &url, branch.as_deref())?;
+        kimetsu_brain::project::ingest_repo_at_root(&brain_root, &files_root)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    match res {
+        Ok(Ok(summary)) => {
+            let text = serde_json::to_string_pretty(&json!({
+                "ingested": true,
+                "indexed_files": summary.indexed_files,
+                "skipped_files": summary.skipped_files,
+                "manifests": summary.manifests,
+            }))
+            .unwrap_or_default();
+            (
+                Outcome::Ok,
+                jsonrpc_ok(
+                    id,
+                    json!({ "content": [{ "type": "text", "text": text }] }),
+                    session,
+                ),
+            )
+        }
+        Ok(Err(e)) => (
+            Outcome::Error,
+            jsonrpc_err(
+                StatusCode::OK,
+                id,
+                -32000,
+                &format!("ingest failed: {e}"),
+                session,
+            ),
         ),
         Err(join) => (
             Outcome::Error,

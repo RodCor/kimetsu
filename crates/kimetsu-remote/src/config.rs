@@ -44,6 +44,18 @@ pub struct ServeArgs {
     #[arg(long)]
     pub org_brain: Option<PathBuf>,
 
+    /// Enable server-side ingest from a TOML file registering repo-id → git URL
+    /// (`[repos]` table). The server clones/refreshes each registered repo and
+    /// `kimetsu_brain_ingest_repo` indexes its files into that repo's brain.
+    /// Requires --checkout-dir.
+    #[arg(long, requires = "checkout_dir")]
+    pub repos_file: Option<PathBuf>,
+
+    /// Where server-side ingest keeps its managed git checkouts. Must be OUTSIDE
+    /// --data.
+    #[arg(long, requires = "repos_file")]
+    pub checkout_dir: Option<PathBuf>,
+
     /// TLS certificate chain (PEM). Serve HTTPS directly when set with --tls-key
     /// (otherwise plain HTTP — terminate TLS at a reverse proxy).
     #[arg(long, requires = "tls_key")]

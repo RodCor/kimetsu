@@ -299,8 +299,28 @@ The repo id is derived from your git remote (`--repo <id>` to override), so the
 endpoint becomes `https://…/mcp/<repo-id>`. By default the host config
 references `${KIMETSU_REMOTE_TOKEN}` (set that env var where your agent runs)
 rather than writing the token to disk; pass `--token <t>` to embed a literal.
-The remote surfaces the memory/retrieval/curation tools only — repo ingest and
-ambient context need a local checkout and stay local.
+The remote surfaces the memory/retrieval/curation tools by default.
+
+**Server-side ingest (optional).** To make file-capsule retrieval work remotely,
+let the server keep a managed clone of each repo. The operator pre-registers
+repos in a TOML file (so clients can't make the server clone arbitrary URLs):
+
+```toml
+# repos.toml
+[repos]
+github-com-org-api = { url = "https://github.com/org/api.git", branch = "main" }
+github-com-org-web = "https://github.com/org/web.git"
+```
+
+```bash
+kimetsu-remote serve --data /srv/kimetsu-brains --token <secret> \
+  --repos-file /etc/kimetsu/repos.toml --checkout-dir /srv/kimetsu-checkouts
+```
+
+Then `kimetsu_brain_ingest_repo` clones/refreshes the registered repo and indexes
+its files into that repo's brain, so `context` retrieval includes file capsules.
+Private repos use the server's own git auth (credential helper / SSH / a token in
+the URL). The repo-id keys must match the ids clients connect with.
 
 ```bash
 kimetsu brain search "build failures"

@@ -1389,6 +1389,40 @@ pub fn ingest_repo(start: &Path) -> KimetsuResult<RepoIngestSummary> {
     Ok(summary)
 }
 
+/// Ingest files from `files_root` into the brain at `brain_root` (no git
+/// discovery; the two roots differ on a server, where the brain lives under the
+/// data dir and the files live in a managed checkout). Used by kimetsu-remote's
+/// server-side ingest.
+pub fn ingest_repo_at_root(
+    brain_root: &Path,
+    files_root: &Path,
+) -> KimetsuResult<RepoIngestSummary> {
+    let (mut paths, config, conn) = load_project_at_root(brain_root)?;
+    // Walk the checkout, but keep the brain/lock under brain_root.
+    paths.repo_root = files_root
+        .canonicalize()
+        .unwrap_or_else(|_| files_root.to_path_buf());
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "brain ingest-repo (remote)", Some(run_id))?;
+
+    let started = admin_started_event(&paths, &config, run_id, "repo ingest")?;
+    let summary = ingest::ingest_repo(&conn, &paths, &config)?;
+    let ingested = Event::new(
+        run_id,
+        "repo.ingested",
+        serde_json::json!({
+            "repo_root": summary.repo_root.to_string_lossy(),
+            "indexed_files": summary.indexed_files,
+            "skipped_files": summary.skipped_files,
+            "manifests": summary.manifests,
+        }),
+    );
+    let finished = admin_finished_event(run_id);
+    projector::apply_events(&conn, &[started, ingested, finished])?;
+
+    Ok(summary)
+}
+
 pub fn search_files(
     start: &Path,
     query: &str,

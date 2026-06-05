@@ -88,7 +88,12 @@ ADDED
     **org brain** (`--org-brain <dir>`, outside `--data`): `global_user`-scoped
     memories are stored there and merged into every repo's retrieval
     (cross-project team memory), while `project`-scoped memories stay per-repo.
-    Off by default — each repo brain is standalone.
+    Off by default — each repo brain is standalone. Optional **server-side
+    ingest** (`--repos-file` + `--checkout-dir`): the operator pre-registers
+    repo-id → git URL, the server clones/refreshes a managed checkout, and
+    `kimetsu_brain_ingest_repo` indexes its files into the repo's brain so
+    `context` retrieval includes file capsules remotely (clients can't trigger
+    arbitrary clones; private repos use the server's own git auth).
   * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
     on Anthropic models served through Amazon Bedrock (InvokeModel,
     SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
