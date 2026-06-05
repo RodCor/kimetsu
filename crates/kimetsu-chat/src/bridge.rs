@@ -633,6 +633,172 @@ pub fn plugin_install(
     )
 }
 
+/// Remote-server wiring parameters for [`plugin_install_remote`].
+#[derive(Debug, Clone)]
+pub struct RemoteInstall {
+    /// Server base URL, e.g. `https://kimetsu.example.com:8787` (no `/mcp/...`).
+    pub base_url: String,
+    /// Sanitized repo id; the endpoint becomes `<base_url>/mcp/<repo_id>`.
+    pub repo_id: String,
+    /// Literal bearer token; `None` writes a `${KIMETSU_REMOTE_TOKEN}` reference
+    /// so the secret never lands on disk.
+    pub token: Option<String>,
+}
+
+/// Wire a host to a REMOTE Kimetsu server (HTTP MCP) instead of the local stdio
+/// command: writes a `url`+`Authorization` MCP entry plus brain-usage guidance,
+/// and no local hooks (the brain lives on the server). Supported for Claude Code
+/// and OpenClaw — the hosts with remote-MCP support.
+pub fn plugin_install_remote(
+    workspace: &Path,
+    target: BridgeTarget,
+    scope: InstallScope,
+    mode: PluginMode,
+    remote: &RemoteInstall,
+) -> Result<PluginInstallReport, String> {
+    let home = match scope {
+        InstallScope::Global => Some(resolve_home()?),
+        InstallScope::Workspace => None,
+    };
+    plugin_install_remote_inner(workspace, target, scope, mode, remote, home.as_deref())
+}
+
+fn plugin_install_remote_inner(
+    workspace: &Path,
+    target: BridgeTarget,
+    scope: InstallScope,
+    mode: PluginMode,
+    remote: &RemoteInstall,
+    home: Option<&Path>,
+) -> Result<PluginInstallReport, String> {
+    let workspace = normalize_path(workspace);
+    let endpoint = format!(
+        "{}/mcp/{}",
+        remote.base_url.trim_end_matches('/'),
+        remote.repo_id
+    );
+    let auth = format!(
+        "Bearer {}",
+        remote
+            .token
+            .clone()
+            .unwrap_or_else(|| "${KIMETSU_REMOTE_TOKEN}".to_string())
+    );
+    let mut files = Vec::new();
+    let mut notes = Vec::new();
+    match target {
+        BridgeTarget::ClaudeCode => {
+            let server = serde_json::json!({
+                "type": "http",
+                "url": endpoint,
+                "headers": { "Authorization": auth }
+            });
+            let (mcp, only) = match home {
+                Some(h) => (h.join(".claude.json"), true),
+                None => (workspace.join(".mcp.json"), false),
+            };
+            write_mcp_config_server(&mcp, only, server)?;
+            files.push(normalize_path(&mcp));
+
+            let claude_dir = match home {
+                Some(h) => h.join(".claude"),
+                None => workspace.join(".claude"),
+            };
+            fs::create_dir_all(&claude_dir)
+                .map_err(|err| format!("create {}: {err}", claude_dir.display()))?;
+            let claude_md = claude_dir.join("CLAUDE.md");
+            merge_claude_md(&claude_md)?;
+            files.push(normalize_path(&claude_md));
+        }
+        #[cfg(feature = "openclaw")]
+        BridgeTarget::OpenClaw => {
+            let server = serde_json::json!({
+                "url": endpoint,
+                "transport": "streamable-http",
+                "headers": { "Authorization": auth }
+            });
+            let oc_dir = match home {
+                Some(h) => h.join(".openclaw"),
+                None => workspace.join(".openclaw"),
+            };
+            fs::create_dir_all(&oc_dir)
+                .map_err(|err| format!("create {}: {err}", oc_dir.display()))?;
+            let oc_json = oc_dir.join("openclaw.json");
+            write_openclaw_remote_mcp(&oc_json, server, &mut notes)?;
+            files.push(normalize_path(&oc_json));
+            let skill = oc_dir
+                .join("skills")
+                .join("kimetsu-context")
+                .join("SKILL.md");
+            write_text_file(&skill, OPENCLAW_SKILL_MD, true)?;
+            files.push(normalize_path(&skill));
+        }
+        other => {
+            return Err(format!(
+                "remote install is supported for claude-code and openclaw, not `{}`",
+                other.as_str()
+            ));
+        }
+    }
+    notes.push(format!("remote brain endpoint: {endpoint}"));
+    if remote.token.is_none() {
+        notes.push(
+            "auth reads ${KIMETSU_REMOTE_TOKEN} — set that env var where your host agent runs"
+                .to_string(),
+        );
+    }
+    Ok(PluginInstallReport {
+        target,
+        scope,
+        mode,
+        files,
+        notes,
+    })
+}
+
+/// Upsert only `mcp.servers.kimetsu` in an OpenClaw config with a remote server
+/// value (no hooks plugin — the brain is remote).
+#[cfg(feature = "openclaw")]
+fn write_openclaw_remote_mcp(
+    path: &Path,
+    server: serde_json::Value,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let had_file = path.is_file();
+    let mut root = if had_file {
+        let text =
+            fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        json5::from_str::<serde_json::Value>(&text)
+            .map_err(|err| format!("parse {}: {err}", path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
+    let mcp = root_obj
+        .entry("mcp".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let mcp_obj = mcp
+        .as_object_mut()
+        .ok_or_else(|| format!("{} `mcp` must be a JSON object", path.display()))?;
+    let servers = mcp_obj
+        .entry("servers".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let servers_obj = servers
+        .as_object_mut()
+        .ok_or_else(|| format!("{} `mcp.servers` must be a JSON object", path.display()))?;
+    servers_obj.insert("kimetsu".to_string(), server);
+    let text = serde_json::to_string_pretty(&root)
+        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    if had_file {
+        notes.push(
+            "note: openclaw.json was reformatted (JSON5 comments are not preserved)".to_string(),
+        );
+    }
+    write_text_file(path, &text, true)
+}
+
 /// `home` is `Some` for a global install (the directory that stands in for
 /// `~`), `None` for a workspace install. Kept separate from `plugin_install`
 /// so tests can inject a deterministic home without touching process env.
@@ -2112,6 +2278,20 @@ fn resolve_bridge_skill_source(
 /// `only_mcp_servers` is true for `~/.claude.json` (global), which uses
 /// only the `mcpServers` key; workspace `.mcp.json` also gets `servers`.
 fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
+    let server = serde_json::json!({
+        "command": "kimetsu",
+        "args": ["mcp", "serve", "--workspace", "."]
+    });
+    write_mcp_config_server(path, only_mcp_servers, server)
+}
+
+/// Upsert the `kimetsu` MCP server entry with an arbitrary server value (stdio
+/// `command`/`args`, or a remote `type`/`url`/`headers` object).
+fn write_mcp_config_server(
+    path: &Path,
+    only_mcp_servers: bool,
+    server: serde_json::Value,
+) -> Result<(), String> {
     let mut root = if path.is_file() {
         let text =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -2123,10 +2303,6 @@ fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
-    let server = serde_json::json!({
-        "command": "kimetsu",
-        "args": ["mcp", "serve", "--workspace", "."]
-    });
     if !only_mcp_servers {
         insert_mcp_server(root_obj, "servers", server.clone(), path)?;
     }
@@ -2897,6 +3073,120 @@ mod tests {
             "SKILL.md should contain Required-mode wording after second install"
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn remote_install_claude_writes_http_mcp_entry() {
+        let root = temp_root("remote_claude");
+
+        // No token → env-var reference; trailing slash on base trimmed.
+        plugin_install_remote(
+            &root,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            &RemoteInstall {
+                base_url: "https://kimetsu.example.com:8787/".to_string(),
+                repo_id: "demo-repo".to_string(),
+                token: None,
+            },
+        )
+        .expect("remote install");
+
+        let text = fs::read_to_string(root.join(".mcp.json")).expect("read .mcp.json");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let server = &v["mcpServers"]["kimetsu"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(
+            server["url"],
+            "https://kimetsu.example.com:8787/mcp/demo-repo"
+        );
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer ${KIMETSU_REMOTE_TOKEN}"
+        );
+        // No local stdio command must be written for a remote entry.
+        assert!(server.get("command").is_none());
+
+        // status sees the mcp piece.
+        let statuses = plugin_status_inner(&root);
+        let ws = statuses
+            .iter()
+            .find(|s| s.host == "claude-code" && s.scope == "workspace")
+            .expect("claude-code/workspace");
+        assert!(ws.present.contains(&"mcp".to_string()));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn remote_install_literal_token_is_written() {
+        let root = temp_root("remote_token");
+        plugin_install_remote(
+            &root,
+            BridgeTarget::ClaudeCode,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            &RemoteInstall {
+                base_url: "http://localhost:8787".to_string(),
+                repo_id: "r".to_string(),
+                token: Some("tok_secret".to_string()),
+            },
+        )
+        .expect("remote install");
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["kimetsu"]["headers"]["Authorization"],
+            "Bearer tok_secret"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(feature = "openclaw")]
+    #[test]
+    fn remote_install_openclaw_writes_url_transport() {
+        let root = temp_root("remote_openclaw");
+        plugin_install_remote(
+            &root,
+            BridgeTarget::OpenClaw,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            &RemoteInstall {
+                base_url: "https://h:8787".to_string(),
+                repo_id: "demo".to_string(),
+                token: None,
+            },
+        )
+        .expect("remote install");
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".openclaw").join("openclaw.json")).unwrap(),
+        )
+        .unwrap();
+        let server = &v["mcp"]["servers"]["kimetsu"];
+        assert_eq!(server["url"], "https://h:8787/mcp/demo");
+        assert_eq!(server["transport"], "streamable-http");
+        assert!(server.get("command").is_none());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn remote_install_rejects_unsupported_host() {
+        let root = temp_root("remote_codex");
+        let err = plugin_install_remote(
+            &root,
+            BridgeTarget::Codex,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            &RemoteInstall {
+                base_url: "http://h".to_string(),
+                repo_id: "r".to_string(),
+                token: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("remote install is supported"));
         fs::remove_dir_all(root).ok();
     }
 

@@ -70,7 +70,12 @@ ADDED
     excluded). Each repo brain is standalone (user-brain merge off). Plain
     HTTP — terminate TLS at a reverse proxy. `kimetsu-remote serve --addr
     0.0.0.0:8787 --data <dir> --token <t>` (build with `--features embeddings`
-    for semantic retrieval). Client wiring + packaging land next.
+    for semantic retrieval). Wire a host with `kimetsu plugin install
+    <claude-code|openclaw> --remote <url> [--repo <id>] [--token <t>]` — it
+    writes a `url`+`Authorization` MCP entry (no local hooks), deriving the repo
+    id from your git remote and referencing `${KIMETSU_REMOTE_TOKEN}` by default
+    so the secret isn't written to disk. The embeddings release archives bundle
+    the `kimetsu-remote` binary.
   * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
     on Anthropic models served through Amazon Bedrock (InvokeModel,
     SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`

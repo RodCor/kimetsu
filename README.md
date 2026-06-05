@@ -262,6 +262,30 @@ stores the key in a gitignored `.env`; skip it with `--no-setup`. Run it with
 `~/.kimetsu/` — it then distills every project's sessions into your user brain
 (available everywhere), unless that project has its own distiller.
 
+### 3. Or share one brain from a server (Kimetsu Remote, experimental)
+
+Run the brain on a server and connect over **HTTP MCP**, so a team — or you
+across machines — shares one brain per repository, with no local checkout:
+
+```bash
+# On the server (build with --features embeddings for semantic retrieval):
+kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains --token <secret>
+#   one brain per repo under <data>/<repo-id>/; bearer-auth; plain HTTP — put a
+#   TLS proxy (nginx/Caddy) in front. The embeddings release archives include
+#   the `kimetsu-remote` binary.
+
+# On each client — wire a host at the remote instead of the local stdio command:
+kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
+kimetsu plugin install openclaw    --remote https://kimetsu.example.com:8787
+```
+
+The repo id is derived from your git remote (`--repo <id>` to override), so the
+endpoint becomes `https://…/mcp/<repo-id>`. By default the host config
+references `${KIMETSU_REMOTE_TOKEN}` (set that env var where your agent runs)
+rather than writing the token to disk; pass `--token <t>` to embed a literal.
+The remote surfaces the memory/retrieval/curation tools only — repo ingest and
+ambient context need a local checkout and stay local.
+
 ```bash
 kimetsu brain search "build failures"
 kimetsu brain context "where is auth configured?"

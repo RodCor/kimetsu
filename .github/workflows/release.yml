@@ -69,6 +69,11 @@ jobs:
         run: |
           cargo build --release --locked -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
 
+      - name: build kimetsu-remote (server, embeddings archives only)
+        if: matrix.flavor == 'embeddings'
+        run: |
+          cargo build --release --locked -p kimetsu-remote --features embeddings --target ${{ matrix.target }}
+
       - name: smoke-test built binary (doctor --skip-mcp)
         shell: bash
         env:
@@ -92,8 +97,10 @@ jobs:
           mkdir -p "dist/$NAME"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/kimetsu.exe" "dist/$NAME/"
+            [ "${{ matrix.flavor }}" = "embeddings" ] && cp "target/${{ matrix.target }}/release/kimetsu-remote.exe" "dist/$NAME/"
           else
             cp "target/${{ matrix.target }}/release/kimetsu" "dist/$NAME/"
+            [ "${{ matrix.flavor }}" = "embeddings" ] && cp "target/${{ matrix.target }}/release/kimetsu-remote" "dist/$NAME/"
           fi
           MIT_LICENSE="LICENSE-MIT"
           APACHE_LICENSE="LICENSE-APACHE"

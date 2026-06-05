@@ -464,6 +464,20 @@ struct PluginInstallArgs {
     /// Force the auto-harvest distiller setup prompt even off a TTY.
     #[arg(long)]
     setup_harvest: bool,
+    /// Wire a REMOTE kimetsu-remote server (HTTP MCP) instead of the local
+    /// stdio command. Pass the server base URL, e.g.
+    /// https://kimetsu.example.com:8787 (the endpoint becomes <url>/mcp/<repo>).
+    /// Supported for claude-code and openclaw.
+    #[arg(long)]
+    remote: Option<String>,
+    /// Repository id for the remote brain. Defaults to an id derived from this
+    /// repo's git remote URL.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Bearer token for the remote server. If omitted, the host config
+    /// references ${KIMETSU_REMOTE_TOKEN} so the secret isn't written to disk.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -2131,6 +2145,104 @@ pub fn plugin_install_self_check(
     warnings
 }
 
+/// Normalize a git remote URL (or an explicit `--repo`) into a stable,
+/// server-safe id: drop scheme/credentials/`.git`, then slug to
+/// `[a-z0-9-]`. `https://github.com/org/repo.git` and
+/// `git@github.com:org/repo.git` both → `github-com-org-repo`.
+fn normalize_repo_id(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(stripped) = s.strip_suffix(".git") {
+        s = stripped;
+    }
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest;
+    }
+    if let Some((_, rest)) = s.split_once('@') {
+        s = rest;
+    }
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Derive a repo id from `git -C <workspace> remote get-url origin`.
+fn derive_repo_id(workspace: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = normalize_repo_id(String::from_utf8_lossy(&out.stdout).trim());
+    (!id.is_empty()).then_some(id)
+}
+
+/// Wire a host to a remote kimetsu-remote server (HTTP MCP).
+fn run_plugin_install_remote(
+    workspace: &std::path::Path,
+    target: kimetsu_chat::BridgeTarget,
+    scope: kimetsu_chat::InstallScope,
+    mode: kimetsu_chat::PluginMode,
+    args: &PluginInstallArgs,
+    base: &str,
+) -> KimetsuResult<()> {
+    let repo_id = match &args.repo {
+        Some(r) => normalize_repo_id(r),
+        None => derive_repo_id(workspace).ok_or_else(|| {
+            "kimetsu plugin install: could not derive a repo id from this repo's git remote; \
+             pass --repo <id>"
+                .to_string()
+        })?,
+    };
+    if repo_id.is_empty() {
+        return Err("kimetsu plugin install: --repo resolved to an empty id".into());
+    }
+    let remote = kimetsu_chat::RemoteInstall {
+        base_url: base.to_string(),
+        repo_id: repo_id.clone(),
+        token: args.token.clone(),
+    };
+    let report = kimetsu_chat::plugin_install_remote(workspace, target, scope, mode, &remote)
+        .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+
+    let host_label = match target {
+        kimetsu_chat::BridgeTarget::ClaudeCode => "Claude Code",
+        #[cfg(feature = "openclaw")]
+        kimetsu_chat::BridgeTarget::OpenClaw => "OpenClaw",
+        _ => "host",
+    };
+    println!(
+        "Wiring Kimetsu (remote) into {host_label} ({} scope) → repo `{repo_id}`…",
+        report.scope.as_str()
+    );
+    println!("  wrote/updated:");
+    for file in &report.files {
+        let rel = file
+            .strip_prefix(workspace)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| kimetsu_core::paths::display_path(file));
+        println!("    {rel}");
+    }
+    for note in &report.notes {
+        println!("  {note}");
+    }
+    println!("  ✓ wired. Restart your host agent so it connects to the remote brain.");
+    Ok(())
+}
+
 fn plugin(command: PluginCommand) -> KimetsuResult<()> {
     use kimetsu_chat::{
         BridgeTarget, InstallScope, PluginMode, WiringState, plugin_install, plugin_status,
@@ -2151,6 +2263,10 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
             let mode = PluginMode::parse(&args.mode)
                 .map_err(|err| format!("kimetsu plugin install: {err}"))?;
+            // Remote wiring: point the host at a kimetsu-remote HTTP MCP server.
+            if let Some(base) = args.remote.clone() {
+                return run_plugin_install_remote(&workspace, target, scope, mode, &args, &base);
+            }
             // The kimetsu extensions target is workspace-only; warn rather
             // than silently ignore a `--scope global` for it.
             if matches!(scope, InstallScope::Global) && matches!(target, BridgeTarget::Kimetsu) {
@@ -6929,6 +7045,25 @@ ambient = false
         )
         .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
+    }
+
+    #[test]
+    fn normalize_repo_id_handles_url_forms() {
+        assert_eq!(
+            normalize_repo_id("https://github.com/org/repo.git"),
+            "github-com-org-repo"
+        );
+        assert_eq!(
+            normalize_repo_id("git@github.com:org/repo.git"),
+            "github-com-org-repo"
+        );
+        assert_eq!(
+            normalize_repo_id("https://gitlab.com/Group/Sub/Repo"),
+            "gitlab-com-group-sub-repo"
+        );
+        // explicit --repo passthrough is slugged + lowercased
+        assert_eq!(normalize_repo_id("My_Repo"), "my-repo");
+        assert_eq!(normalize_repo_id(""), "");
     }
 
     #[cfg(feature = "openclaw")]
