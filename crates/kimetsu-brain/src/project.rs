@@ -202,7 +202,6 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
         .into());
     }
 
-    schema::ensure_vec_extension_registered();
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
     Ok((paths, config, conn))
@@ -260,7 +259,6 @@ pub fn load_project_at_root(
         .into());
     }
 
-    schema::ensure_vec_extension_registered();
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
     Ok((paths, config, conn))
@@ -282,7 +280,6 @@ pub fn load_project_readonly_at_root(
         .into());
     }
 
-    schema::ensure_vec_extension_registered();
     let conn = Connection::open_with_flags(&paths.brain_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     schema::validate(&conn)?;
     Ok((paths, config, conn))
@@ -311,7 +308,6 @@ pub fn load_project_readonly(
         .into());
     }
 
-    schema::ensure_vec_extension_registered();
     let conn = Connection::open_with_flags(&paths.brain_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     schema::validate(&conn)?;
     Ok((paths, config, conn))
@@ -5921,21 +5917,13 @@ max_total_cost_usd = 250.0
     // Micro-benchmark: Fix 4 — per-add cost must not scale linearly with N
     // ------------------------------------------------------------------
 
-    /// Structural invariant: after seeding N memories with the StubEmbedder
-    /// (so conflict detection runs via vec0 ANN), the memory_vec table has
-    /// exactly as many rows as there are active embeddings in memories.
+    /// Structural invariant: after seeding N memories, the active-memory count
+    /// matches the number of adds.
     ///
-    /// This proves the incremental insert path (Fix 4b) is working: each
-    /// add writes one row to memory_vec immediately, so the table stays
-    /// synchronised without a full backfill scan.
-    ///
-    /// The micro-benchmark also times an early vs late add (with conflict
-    /// detection OFF to isolate the vec-table maintenance cost) and asserts
-    /// the late add is not dramatically slower — proving O(1) per-add cost.
-    ///
-    /// NOTE: StubEmbedder requires the `embeddings` feature for vec0 writes.
-    /// On lean builds (no feature) the test still passes — it simply skips
-    /// the vec0 assertions (vec0 is not linked).
+    /// The micro-benchmark times an early vs late add (with conflict detection
+    /// OFF to isolate per-add maintenance cost) and asserts the late add is not
+    /// dramatically slower — proving O(1) per-add cost (the usearch index is
+    /// maintained incrementally, never full-scanned on add).
     #[test]
     fn perf_tier1_structural_invariant_and_timing() {
         // with_user_brain_disabled already holds test_env_lock — do NOT

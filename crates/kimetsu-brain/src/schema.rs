@@ -32,43 +32,23 @@ pub fn apply_pragmas(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// Register the sqlite-vec extension exactly once, process-wide, so every
-/// subsequently-opened connection can use `vec0` virtual tables.
-///
-/// Must be called BEFORE any `Connection::open` that will use `vec0`.
-/// Idempotent: guarded by a `Once` so calling it from all four DB-open
-/// paths is harmless.
-///
-/// On lean (no `embeddings` feature) builds this is a no-op — the function
-/// body is compiled away and sqlite-vec is not linked.
-pub(crate) fn ensure_vec_extension_registered() {
-    #[cfg(feature = "embeddings")]
-    {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            // SAFETY: sqlite3_auto_extension registers a C init fn pointer with
-            // the rusqlite-bundled SQLite. sqlite_vec::sqlite3_vec_init is the
-            // matching extension entry-point, compiled from sqlite-vec.c with
-            // -DSQLITE_CORE so it links directly into the same SQLite instance.
-            // The transmute converts the zero-argument C fn pointer to the
-            // three-argument xEntryPoint signature expected by
-            // sqlite3_auto_extension — this is the pattern from the
-            // sqlite-vec crate's own tests and is safe on all supported targets.
-            #[allow(clippy::missing_transmute_annotations)]
-            unsafe {
-                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                    sqlite_vec::sqlite3_vec_init as *const (),
-                )));
-            }
-        });
-    }
-}
-
 pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     apply_pragmas(conn)?;
     create_baseline(conn)?;
     crate::migrate::run_migrations(conn)?;
+
+    // T3c: the old brute-force `memory_vec` vec0 virtual table is gone (usearch
+    // supersedes it). Best-effort drop to reclaim space in upgraded brains.
+    //
+    // Best-effort: a vec0 vtable can't be dropped without the (now-removed)
+    // sqlite-vec module loaded, so this DROP raises "no such module: vec0" on
+    // upgraded brains. We deliberately ignore the Result so that error can NEVER
+    // propagate and break connection-open. An orphaned, never-accessed
+    // memory_vec is harmless — SQLite loads a vtable module lazily, only on
+    // access, and nothing in the codebase queries memory_vec anymore. New brains
+    // never create it.
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS memory_vec;");
+
     Ok(())
 }
 
@@ -669,53 +649,6 @@ mod tests {
         assert!(
             msg.contains("newer"),
             "error message must contain 'newer', got: {msg}"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // D1a — sqlite-vec linking + KNN proof (embeddings feature only)
-    // ------------------------------------------------------------------
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn sqlite_vec_extension_links_and_knn_runs() {
-        // Register the extension before opening any connection.
-        ensure_vec_extension_registered();
-
-        let conn = Connection::open_in_memory().unwrap();
-
-        // Prove the extension is loaded: create a vec0 virtual table with a
-        // 4-dimensional float vector column.
-        conn.execute_batch("CREATE VIRTUAL TABLE vt USING vec0(embedding float[4]);")
-            .expect("vec0 virtual table must create — proves the extension linked and loaded");
-
-        // Insert a few vectors. sqlite-vec accepts a JSON array literal.
-        conn.execute(
-            "INSERT INTO vt(rowid, embedding) VALUES (1, '[1.0, 0.0, 0.0, 0.0]')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO vt(rowid, embedding) VALUES (2, '[0.0, 1.0, 0.0, 0.0]')",
-            [],
-        )
-        .unwrap();
-
-        // KNN query: nearest to [0.9, 0.1, 0, 0] should be rowid 1.
-        // vec0 requires `embedding MATCH <query>` + `LIMIT k` for KNN.
-        let nearest: i64 = conn
-            .query_row(
-                "SELECT rowid FROM vt \
-                 WHERE embedding MATCH '[0.9, 0.1, 0.0, 0.0]' \
-                 ORDER BY distance \
-                 LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("vec0 KNN MATCH query must succeed — proves vec0 executes on this MSVC host");
-
-        assert_eq!(
-            nearest, 1,
-            "nearest vector to [0.9,0.1,0,0] must be rowid 1 (the [1,0,0,0] vector)"
         );
     }
 }

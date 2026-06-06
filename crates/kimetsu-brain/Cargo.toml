@@ -20,7 +20,7 @@ categories = ["database", "development-tools"]
 # retrieval that v0.4.2 ships, so `cargo install kimetsu-cli`
 # without --features embeddings never downloads a model.
 default = []
-embeddings = ["dep:fastembed", "dep:sqlite-vec", "dep:usearch"]
+embeddings = ["dep:fastembed", "dep:usearch"]
 
 [dependencies]
 blake3.workspace = true
@@ -30,15 +30,10 @@ blake3.workspace = true
 # required to build kimetsu). Pinned to 5.* — that's the line that
 # supports BGE-M3 + Jina-v2-base-code alongside BGE-small.
 fastembed = { version = "5", optional = true }
-# v1.0 D1a: sqlite-vec provides vec0 virtual tables for ANN (KNN) queries.
-# Compiled from C (bundled) with SQLITE_CORE so it links directly into the
-# rusqlite-bundled SQLite. Only pulled in under the `embeddings` feature —
-# lean builds use NoopEmbedder and have no vectors to index.
-sqlite-vec = { version = "0.1", optional = true }
 # v1.0 Tier-3: usearch provides an HNSW approximate-NN index so retrieval and
-# conflict-detection candidate generation are ~O(log N) instead of the vec0
+# conflict-detection candidate generation are ~O(log N) instead of a
 # brute-force O(N) scan. Native (C++); only pulled under `embeddings`, which is
-# already native (ort, sqlite-vec). The lean build never links it.
+# already native (ort). The lean build never links it.
 usearch = { version = "2", optional = true }
 ignore.workspace = true
 kimetsu-core = { path = "../kimetsu-core", version = "1.0.0" }

@@ -113,20 +113,20 @@ pub struct ConflictReport {
 /// Fix 4c: ANN-based conflict detection.
 ///
 /// Accepts the **precomputed query vector** (already embedded by the add path)
-/// instead of re-embedding — halves embedding cost per add. Uses the vec0 ANN
-/// index to fetch a small candidate pool (≤ max(top_k * 8, 64) rows), then
+/// instead of re-embedding — halves embedding cost per add. Uses the usearch
+/// ANN index to fetch a small candidate pool (≤ max(top_k * 8, 64) rows), then
 /// scores only that pool with exact cosine, never full-scanning the corpus.
 ///
-/// On vec0/non-embeddings builds (lean mode, or ANN query failure) we fall
-/// back to the scope-filtered SQL scan so the function stays correct on lean
-/// builds.
+/// On non-embeddings builds (lean mode, or ANN query failure) we fall back to
+/// the scope-filtered SQL scan so the function stays correct on lean builds.
 ///
 /// `exclude_id`: the memory_id of the newly-added memory, excluded from the
 /// conflict scan (a memory must not conflict with itself).
 ///
-/// Pre-existing memories (upgraded brains) enter vec0 on the next retrieval's
-/// backfill (via `ensure_vec_index`), so conflict detection is best-effort
-/// until then — acceptable per the v0.5.2 policy of "surface > block".
+/// Pre-existing memories (upgraded brains) enter the usearch index on the next
+/// retrieval's reconcile (see `crate::ann`), so conflict detection is
+/// best-effort until then — acceptable per the v0.5.2 policy of "surface >
+/// block".
 pub fn find_potential_conflicts(
     conn: &Connection,
     scope: &MemoryScope,
@@ -186,12 +186,12 @@ pub(crate) fn find_potential_conflicts_with_vec(
     let scope_label = scope.to_string();
     let active_model = embedder.model_id();
     // Pool size for ANN candidate fetch: at least 64, at least top_k * 8.
-    // Only used on embeddings builds (vec0); suppress the lint on lean builds.
+    // Only used on embeddings builds; suppress the lint on lean builds.
     #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))]
     let pool_size = (top_k * 8).max(64) as i64;
 
-    // Fix 4c: ANN path — query vec0 for a small candidate pool.
-    // Only available on embeddings builds (vec0 is not linked on lean).
+    // Fix 4c: ANN path — query the usearch index for a small candidate pool.
+    // Only available on embeddings builds (the ANN index is lean-build absent).
     #[cfg(feature = "embeddings")]
     {
         let handle = crate::ann::handle_for_query(conn, query_vec.len(), active_model)?;
@@ -220,8 +220,10 @@ pub(crate) fn find_potential_conflicts_with_vec(
                    AND  rowid IN ({placeholders})"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let params_vec: Vec<&dyn rusqlite::ToSql> =
-                ann_rowids.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+            let params_vec: Vec<&dyn rusqlite::ToSql> = ann_rowids
+                .iter()
+                .map(|n| n as &dyn rusqlite::ToSql)
+                .collect();
             let rows_iter = stmt.query_map(params_vec.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -270,8 +272,8 @@ pub(crate) fn find_potential_conflicts_with_vec(
     }
 
     // Lean / fallback: full scope-filtered SQL scan (original O(N) path).
-    // Used on lean builds and when vec0 is unavailable or the ANN pool is empty
-    // (e.g. the index hasn't been backfilled yet on a fresh upgraded brain).
+    // Used on lean builds and when the ANN index is unavailable or its pool is
+    // empty (e.g. a fresh upgraded brain not yet reconciled).
     find_potential_conflicts_sql(
         conn,
         &scope_label,
@@ -284,8 +286,9 @@ pub(crate) fn find_potential_conflicts_with_vec(
     )
 }
 
-/// Scope-filtered SQL scan — O(N) fallback used on lean builds and when vec0
-/// is unavailable. This is the original `find_potential_conflicts` body.
+/// Scope-filtered SQL scan — O(N) fallback used on lean builds and when the
+/// ANN index is unavailable. This is the original `find_potential_conflicts`
+/// body.
 #[allow(clippy::too_many_arguments)]
 fn find_potential_conflicts_sql(
     conn: &Connection,

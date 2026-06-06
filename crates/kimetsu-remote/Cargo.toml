@@ -20,7 +20,7 @@ path = "src/main.rs"
 [features]
 # Lean by default (like kimetsu-cli) so a workspace build doesn't unify
 # `kimetsu-brain/embeddings` on for every crate. Build/run the server with
-# `--features embeddings` for semantic (sqlite-vec) retrieval; the release
+# `--features embeddings` for semantic (usearch HNSW) retrieval; the release
 # artifacts and `cargo install kimetsu-remote --features embeddings` do this.
 default = []
 embeddings = ["kimetsu-brain/embeddings"]

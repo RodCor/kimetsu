@@ -646,161 +646,12 @@ pub fn search_repo_files(
 }
 
 // -----------------------------------------------------------------------
-// D1b: derived vec0 index — lazily maintained from the memories table.
-// Only compiled under the `embeddings` feature; lean builds skip entirely.
+// ANN candidate generation via the usearch HNSW index — embeddings only.
+// (The old brute-force `vec0` index code was removed in T3c; usearch now
+// supersedes it entirely. See `crate::ann`.)
 // -----------------------------------------------------------------------
 
-/// D1b / Fix 4a: ensure only the DDL steps (Steps 1-2) for `memory_vec`.
-///
-/// Creates `memory_vec_meta` and `memory_vec` (for `model_id`/`dim`) if they
-/// don't exist yet, or drops-and-recreates `memory_vec` when the active
-/// `(model_id, dim)` differs from what the meta row records.
-///
-/// This is the cheap half of the old `ensure_vec_index` — no backfill scan,
-/// just DDL. Called from `embed_and_persist` so each new row enters the index
-/// immediately (O(1) per add) without ever doing a bulk reconciliation at add
-/// time.
-///
-/// `ensure_vec_index` (the retrieval path) still calls this + does the full
-/// backfill reconciliation once on first retrieve for upgraded brains.
-#[cfg(feature = "embeddings")]
-#[allow(dead_code)] // removed in T3c
-pub(crate) fn ensure_vec_table(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
-    // Step 1: create meta table if needed.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS memory_vec_meta (
-            model_id TEXT NOT NULL,
-            dim      INTEGER NOT NULL
-        )",
-    )?;
-
-    // Step 2: check stored (model_id, dim) and rebuild if stale.
-    let stored: Option<(String, i64)> = {
-        let mut stmt = conn.prepare_cached("SELECT model_id, dim FROM memory_vec_meta LIMIT 1")?;
-        stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?
-    };
-
-    let needs_rebuild = match &stored {
-        None => true,
-        Some((mid, d)) => mid != model_id || *d != dim as i64,
-    };
-
-    if needs_rebuild {
-        conn.execute_batch("DROP TABLE IF EXISTS memory_vec")?;
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE memory_vec
-                 USING vec0(memory_id TEXT PRIMARY KEY, embedding float[{dim}])"
-        ))?;
-        conn.execute_batch("DELETE FROM memory_vec_meta")?;
-        conn.execute(
-            "INSERT INTO memory_vec_meta (model_id, dim) VALUES (?1, ?2)",
-            rusqlite::params![model_id, dim as i64],
-        )?;
-    } else {
-        // Index may not exist yet on first run with an existing meta row.
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec
-                 USING vec0(memory_id TEXT PRIMARY KEY, embedding float[{dim}])"
-        ))?;
-    }
-
-    Ok(())
-}
-
-/// Fix 4b: O(1) single-row upsert into `memory_vec` using the raw f32 BLOB.
-///
-/// Called by `embed_and_persist` immediately after writing the embedding to
-/// `memories`, so `memory_vec` stays current at add time without a full
-/// backfill scan.
-///
-/// `blob` is the little-endian f32 BLOB (from `encode_embedding`). sqlite-vec
-/// accepts raw float32 BLOBs directly for MATCH queries, so no JSON
-/// serialization is needed — 4× smaller representation, no parse overhead.
-#[cfg(feature = "embeddings")]
-#[allow(dead_code)] // removed in T3c
-pub(crate) fn upsert_vec_row(conn: &Connection, memory_id: &str, blob: &[u8]) -> KimetsuResult<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
-        rusqlite::params![memory_id, blob],
-    )?;
-    Ok(())
-}
-
-/// D1b: ensure the `memory_vec` vec0 index and its `memory_vec_meta`
-/// tracking table exist and are up-to-date for the active `(model_id, dim)`.
-///
-/// Split into:
-///   - Steps 1-2: DDL only → delegated to `ensure_vec_table`.
-///   - Step 3: incremental backfill reconciliation (for upgraded brains).
-///
-/// This full version is called by `memory_ann_candidates` (the retrieval path)
-/// so upgraded brains (rows predating the incremental-write change) get
-/// backfilled once on first retrieve. New rows are maintained incrementally
-/// by `embed_and_persist` → `upsert_vec_row`, so the backfill diff is O(delta)
-/// not O(N) after the first retrieval.
-///
-/// # vec0 BLOB encoding (Fix 4a)
-/// The `memories.embedding` column stores little-endian f32 BLOBs.
-/// sqlite-vec accepts the same BLOB format directly for INSERT and MATCH —
-/// no JSON serialization needed. This is 4× smaller than the old JSON path
-/// and avoids a decode+re-encode round-trip in the backfill loop.
-#[cfg(feature = "embeddings")]
-#[allow(dead_code)] // removed in T3c
-fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
-    // Steps 1-2: DDL (create/recreate table if stale).
-    ensure_vec_table(conn, model_id, dim)?;
-
-    // Step 3: incremental reconciliation for upgraded brains.
-
-    // 3a. INSERT rows present in memories but missing from memory_vec.
-    //     Pass the BLOB directly — no decode/re-encode needed (Fix 4a).
-    let new_rows: Vec<(String, Vec<u8>)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT m.memory_id, m.embedding
-             FROM   memories m
-             WHERE  m.invalidated_at IS NULL
-               AND  m.embedding IS NOT NULL
-               AND  m.embedding_model = ?1
-               AND  NOT EXISTS (
-                        SELECT 1 FROM memory_vec v
-                        WHERE  v.memory_id = m.memory_id
-                    )",
-        )?;
-        stmt.query_map(rusqlite::params![model_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    };
-
-    for (memory_id, blob) in new_rows {
-        // Validate the blob length before inserting (skip malformed blobs).
-        if blob.len() != dim * 4 {
-            continue;
-        }
-        // Insert the raw BLOB directly — sqlite-vec accepts f32 BLOBs.
-        upsert_vec_row(conn, &memory_id, &blob)?;
-    }
-
-    // 3b. DELETE memory_vec rows whose memory is now invalidated or gone.
-    conn.execute_batch(
-        "DELETE FROM memory_vec
-         WHERE memory_id NOT IN (
-             SELECT memory_id FROM memories
-             WHERE  invalidated_at IS NULL
-               AND  embedding IS NOT NULL
-         )",
-    )?;
-
-    Ok(())
-}
-
-// -----------------------------------------------------------------------
-// D1c: ANN candidate generation via vec0 KNN — embeddings feature only.
-// -----------------------------------------------------------------------
-
-/// D1c: top-K ANN candidates from the `memory_vec` index.
+/// Top-K ANN candidates from the usearch HNSW index.
 ///
 /// Returns memory rows fetched from `memories` (same columns as
 /// `latest_memory_candidates`) built into `Candidate`s via
@@ -933,7 +784,7 @@ fn memory_candidates(
             Vec::new()
         };
 
-        // ANN candidates — top-80 nearest neighbours from the vec0 index.
+        // ANN candidates — top-80 nearest neighbours from the usearch index.
         let ann_candidates = memory_ann_candidates(conn, qe, 80, &query_tokens, half_life_days)?;
 
         // Union the two sets, deduped by memory_id.  When a memory appears
@@ -2691,7 +2542,7 @@ mod tests {
     /// insertion that stores the SAME vector for the "semantic" memory and a
     /// DIFFERENT vector for the "lexical decoy". The query text and memory
     /// texts deliberately share NO words, so FTS returns nothing. ANN
-    /// surfaces the semantically-near memory via the vec0 index.
+    /// surfaces the semantically-near memory via the usearch index.
     ///
     /// Concretely:
     ///   - query text = "phosphorescent bioluminescent organism" (no overlap
@@ -2709,7 +2560,6 @@ mod tests {
     #[cfg(feature = "embeddings")]
     #[test]
     fn ann_finds_semantic_match_fts_misses() {
-        crate::schema::ensure_vec_extension_registered();
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
         crate::schema::initialize(&conn).expect("init schema");
 
@@ -2822,65 +2672,10 @@ mod tests {
         );
     }
 
-    /// D1d test 2: vec index rebuilds on model-id change.
-    ///
-    /// Seed memory_vec under model A (stub-d8). Call `ensure_vec_index`
-    /// with a different model id and dim. Assert the table is rebuilt:
-    /// rows for model A are gone; the meta row reflects model B.
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn vec_index_rebuilds_on_model_id_change() {
-        crate::schema::ensure_vec_extension_registered();
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
-        crate::schema::initialize(&conn).expect("init schema");
-
-        let stub = embeddings::StubEmbedder::new();
-
-        // Seed one memory row with stub embedder (model "stub-d8", dim 8).
-        insert_memory_with_embedding(&conn, "m_a", "ripgrep search tool", &stub);
-
-        // Build the vec index for model A.
-        ensure_vec_index(&conn, embeddings::StubEmbedder::MODEL_ID, 8)
-            .expect("ensure_vec_index model A");
-
-        // Confirm m_a is in memory_vec.
-        let count_a: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM memory_vec WHERE memory_id = 'm_a'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("count m_a");
-        assert_eq!(count_a, 1, "m_a must be in memory_vec after model-A build");
-
-        // Simulate model switch to "model-b" with dim 4.
-        ensure_vec_index(&conn, "model-b", 4).expect("ensure_vec_index model B");
-
-        // memory_vec must have been rebuilt: m_a (embedded under model-a) is gone.
-        let count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_vec", [], |r| r.get(0))
-            .expect("count after rebuild");
-        assert_eq!(
-            count_after, 0,
-            "memory_vec must be empty after rebuild for model-b \
-             (m_a embedded under stub-d8 has no model-b embedding)"
-        );
-
-        // Meta must reflect model B.
-        let (stored_mid, stored_dim): (String, i64) = conn
-            .query_row("SELECT model_id, dim FROM memory_vec_meta", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .expect("meta row");
-        assert_eq!(stored_mid, "model-b");
-        assert_eq!(stored_dim, 4);
-    }
-
     /// D1d test 3: a memory matched by both FTS and ANN appears exactly once.
     #[cfg(feature = "embeddings")]
     #[test]
     fn dedup_memory_matched_by_fts_and_ann_appears_once() {
-        crate::schema::ensure_vec_extension_registered();
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
         crate::schema::initialize(&conn).expect("init schema");
 
@@ -2951,8 +2746,6 @@ mod tests {
     #[cfg(feature = "embeddings")]
     #[test]
     fn embedding_mmr_collapses_paraphrases_but_jaccard_does_not() {
-        crate::schema::ensure_vec_extension_registered();
-
         // OracleEmbedder: always returns [1,0,0,…] (dim=8).
         // cosine(any two texts) = 1.0 → maximal redundancy in embedding space.
         struct OracleEmbedder;
@@ -3109,8 +2902,6 @@ mod tests {
     #[cfg(feature = "embeddings")]
     #[test]
     fn min_semantic_score_floor_drops_off_topic_queries() {
-        crate::schema::ensure_vec_extension_registered();
-
         // DirectionalEmbedder: returns a specific unit vector based on
         // which "topic" the text is assigned to. Allows us to place the
         // query vector and memory vectors in known relative positions.
@@ -3301,8 +3092,6 @@ mod tests {
     #[cfg(feature = "embeddings")]
     #[test]
     fn d1f_token_economy_fewer_capsules_signal_preserved() {
-        crate::schema::ensure_vec_extension_registered();
-
         // OracleEmbedder: topic-A text gets [1,0,…]; everything else [0,1,…].
         struct OracleTopicEmbedder;
         impl embeddings::Embedder for OracleTopicEmbedder {
@@ -3450,12 +3239,8 @@ mod tests {
     /// table is touched; no panic occurs.
     #[test]
     fn lean_noop_embedder_uses_fts_then_recency_unchanged() {
-        // NOTE: No ensure_vec_extension_registered call here.
-        // This test must work even when the vec extension is not loaded
-        // (i.e. on a lean build or when called before ANN init).
-        // In practice on an embeddings build the extension is already
-        // registered by prior tests, but the logic path (NoopEmbedder)
-        // never touches memory_vec.
+        // The NoopEmbedder logic path never touches the ANN index — it must
+        // work purely via FTS + recency on both lean and embeddings builds.
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
         crate::schema::initialize(&conn).expect("init schema");
 
@@ -3510,7 +3295,7 @@ mod tests {
             handles.contains(&"m_y"),
             "m_y must surface via FTS on lean path; got {handles:?}"
         );
-        // Crucially: no panic, no memory_vec table access.
+        // Crucially: no panic, no ANN index access.
     }
 
     // ---------------------------------------------------------------
