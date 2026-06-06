@@ -365,6 +365,14 @@ fn reindex_one_conn(
         )?;
     }
 
+    // A reindex rewrites `embedding`/`embedding_model` on the updated rows, so
+    // any persisted ANN sidecar (built for the OLD model) is now stale. Drop it
+    // + the cached handle so the next query rebuilds under the new model.
+    #[cfg(feature = "embeddings")]
+    if !opts.dry_run && updated > 0 {
+        crate::ann::invalidate_sidecar(conn);
+    }
+
     Ok(ScopeReport {
         scope,
         opened: true,

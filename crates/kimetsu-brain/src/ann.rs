@@ -117,7 +117,6 @@ pub fn on_invalidate(conn: &Connection, memory_id: &str) {
 
 /// Drop the cached handle AND delete the sidecar for `conn`'s db, forcing a
 /// rebuild on next query. Called after a reindex (model change).
-#[allow(dead_code)] // removed in T3c
 pub fn invalidate_sidecar(conn: &Connection) {
     if let Some(sidecar) = AnnIndex::sidecar_for(conn) {
         registry()
@@ -130,7 +129,6 @@ pub fn invalidate_sidecar(conn: &Connection) {
 }
 
 /// Save every cached on-disk index (called on graceful host shutdown).
-#[allow(dead_code)] // removed in T3c
 pub fn save_all() {
     let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
     for handle in reg.values() {
