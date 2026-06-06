@@ -71,6 +71,17 @@ pub trait Embedder: Send + Sync {
     fn is_noop(&self) -> bool {
         false
     }
+
+    /// Embed many texts in as few backend calls as possible. The
+    /// production fastembed backend runs them through ONNX in batched
+    /// tensors (~10-40x faster than calling `embed` per text). The
+    /// returned Vec is 1:1 with `texts` (same order, same length).
+    /// The default impl loops `embed`, so non-batching embedders work
+    /// unchanged. On any failure the whole batch errors — callers that
+    /// want per-row resilience should fall back to `embed` per text.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
 }
 
 /// Implement `Embedder` for `Box<dyn Embedder>` so callers can hold
@@ -87,6 +98,9 @@ impl Embedder for Box<dyn Embedder> {
     }
     fn is_noop(&self) -> bool {
         (**self).is_noop()
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        (**self).embed_batch(texts)
     }
 }
 
@@ -534,6 +548,35 @@ mod fastembed_backend {
         fn dim(&self) -> usize {
             self.dim
         }
+
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut guard = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let out = guard
+                .embed(texts, None)
+                .map_err(|e| EmbedderError::EmbedFailed(format!("fastembed embed_batch: {e}")))?;
+            if out.len() != texts.len() {
+                return Err(EmbedderError::EmbedFailed(format!(
+                    "fastembed returned {} vectors for {} texts",
+                    out.len(),
+                    texts.len()
+                )));
+            }
+            for v in &out {
+                if v.len() != self.dim {
+                    return Err(EmbedderError::DimMismatch {
+                        expected: self.dim,
+                        got: v.len(),
+                    });
+                }
+            }
+            Ok(out)
+        }
     }
 
     /// Shared handle. `open_default_embedder` boxes this into a
@@ -551,6 +594,9 @@ mod fastembed_backend {
         }
         fn dim(&self) -> usize {
             self.0.dim()
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            self.0.embed_batch(texts)
         }
     }
 
@@ -867,6 +913,53 @@ mod tests {
         let blob = encode_embedding(&vec);
         let err = decode_embedding(&blob, Some(5)).unwrap_err();
         assert!(err.to_string().contains("does not match expected"));
+    }
+
+    // ── embed_batch contract tests (Stub-backed, no model download) ───────────
+
+    /// `embed_batch` returns the same vectors, in the same order, as
+    /// calling `embed` on each text individually.
+    #[test]
+    fn embed_batch_matches_per_row() {
+        let e = StubEmbedder::new();
+        let texts = ["foo bar", "qux", "hello world"];
+        let batch = e.embed_batch(&texts).expect("embed_batch should succeed");
+        assert_eq!(batch.len(), texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let single = e.embed(text).expect("per-row embed should succeed");
+            assert_eq!(
+                batch[i], single,
+                "embed_batch[{i}] must match per-row embed for {text:?}"
+            );
+        }
+    }
+
+    /// `embed_batch(&[])` returns `Ok(vec![])` — empty slice, empty result.
+    #[test]
+    fn embed_batch_empty_is_empty() {
+        let e = StubEmbedder::new();
+        let result = e
+            .embed_batch(&[])
+            .expect("empty embed_batch should succeed");
+        assert!(result.is_empty(), "expected empty Vec, got {result:?}");
+    }
+
+    /// N texts → N vectors, each of length `dim()`.
+    #[test]
+    fn embed_batch_length_matches_input() {
+        let e = StubEmbedder::new();
+        let texts: Vec<&str> = vec!["alpha", "beta", "gamma", "delta", "epsilon"];
+        let batch = e.embed_batch(&texts).expect("embed_batch should succeed");
+        assert_eq!(batch.len(), texts.len(), "output len must equal input len");
+        for (i, v) in batch.iter().enumerate() {
+            assert_eq!(
+                v.len(),
+                e.dim(),
+                "vector[{i}] len {} != dim {}",
+                v.len(),
+                e.dim()
+            );
+        }
     }
 
     /// v0.4.3: under the default Cargo build (no `embeddings` feature)

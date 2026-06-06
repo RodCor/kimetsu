@@ -158,6 +158,95 @@ pub fn reindex_all_with_embedder(
     })
 }
 
+/// Chunk size for batch embedding during reindex. Tuned to keep the
+/// ONNX input tensor at a manageable size while maximising throughput.
+const REINDEX_CHUNK: usize = 256;
+
+/// Flush a pending `(memory_id, text)` chunk through `embed_batch`,
+/// falling back to per-row `embed` on batch error so one malformed
+/// text can't abort the whole reindex. UPDATEs are per-row autocommit
+/// (no transaction — `conn` is already borrowed by the live SELECT).
+///
+/// Returns `true` when the `remaining` cap has been exhausted (caller
+/// should break the outer loop); `false` to continue.
+fn flush_reindex_chunk(
+    conn: &Connection,
+    embedder: &(dyn Embedder + Send + Sync),
+    pending: &mut Vec<(String, String)>,
+    updated: &mut usize,
+    failed: &mut usize,
+    remaining: &mut Option<usize>,
+) -> KimetsuResult<bool> {
+    if pending.is_empty() {
+        return Ok(false);
+    }
+
+    // Attempt one batched ONNX pass over the whole chunk.
+    let texts: Vec<&str> = pending.iter().map(|(_, t)| t.as_str()).collect();
+    let batch_result = embedder.embed_batch(&texts);
+
+    match batch_result {
+        Ok(vecs) => {
+            // Batch succeeded — apply each vector, honoring the cap.
+            for ((memory_id, _), vec) in pending.iter().zip(vecs.iter()) {
+                if remaining.map(|r| r == 0).unwrap_or(false) {
+                    pending.clear();
+                    return Ok(true); // cap exhausted
+                }
+                if vec.len() == embedder.dim() {
+                    conn.execute(
+                        "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
+                        rusqlite::params![encode_embedding(vec), embedder.model_id(), memory_id],
+                    )?;
+                    *updated += 1;
+                    if let Some(r) = remaining {
+                        *r = r.saturating_sub(1);
+                    }
+                } else {
+                    *failed += 1;
+                }
+            }
+        }
+        Err(_) => {
+            // Batch failed — fall back to per-row embed so one bad text
+            // can't fail the whole chunk.
+            for (memory_id, text) in pending.iter() {
+                if remaining.map(|r| r == 0).unwrap_or(false) {
+                    pending.clear();
+                    return Ok(true); // cap exhausted
+                }
+                match embedder.embed(text) {
+                    Ok(vec) if vec.len() == embedder.dim() => {
+                        conn.execute(
+                            "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
+                            rusqlite::params![encode_embedding(&vec), embedder.model_id(), memory_id],
+                        )?;
+                        *updated += 1;
+                        if let Some(r) = remaining {
+                            *r = r.saturating_sub(1);
+                        }
+                    }
+                    Ok(_) => {
+                        *failed += 1;
+                    }
+                    Err(EmbedderError::NotImplemented) => {
+                        // Embedder degraded to noop mid-run (unusual but
+                        // possible if the model unloaded). Record as failed
+                        // so the caller can surface the partial-progress.
+                        *failed += 1;
+                    }
+                    Err(_) => {
+                        *failed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    pending.clear();
+    Ok(false)
+}
+
 fn reindex_one_conn(
     conn: &Connection,
     scope: &'static str,
@@ -225,6 +314,10 @@ fn reindex_one_conn(
     let mut candidates = 0usize;
     let mut updated = 0usize;
     let mut failed = 0usize;
+    // Accumulate rows into chunks; flush when full or at end-of-stream.
+    let mut pending: Vec<(String, String)> = Vec::with_capacity(REINDEX_CHUNK);
+    let mut exhausted = false;
+
     while let Some(row) = rows.next()? {
         if remaining.map(|r| r == 0).unwrap_or(false) {
             break;
@@ -235,30 +328,32 @@ fn reindex_one_conn(
         if opts.dry_run {
             continue;
         }
-        match embedder.embed(&text) {
-            Ok(vec) if vec.len() == embedder.dim() => {
-                conn.execute(
-                    "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
-                    rusqlite::params![encode_embedding(&vec), embedder.model_id(), memory_id],
-                )?;
-                updated += 1;
-                if let Some(r) = remaining {
-                    *r = r.saturating_sub(1);
-                }
-            }
-            Ok(_) => {
-                failed += 1;
-            }
-            Err(EmbedderError::NotImplemented) => {
-                // Embedder degraded to noop mid-run (unusual but
-                // possible if the model unloaded). Record as failed
-                // so the caller can surface the partial-progress.
-                failed += 1;
-            }
-            Err(_) => {
-                failed += 1;
+        pending.push((memory_id, text));
+        if pending.len() >= REINDEX_CHUNK {
+            exhausted = flush_reindex_chunk(
+                conn,
+                embedder,
+                &mut pending,
+                &mut updated,
+                &mut failed,
+                remaining,
+            )?;
+            if exhausted {
+                break;
             }
         }
+    }
+
+    // Flush the final partial chunk (if not already exhausted and not dry-run).
+    if !exhausted && !opts.dry_run {
+        flush_reindex_chunk(
+            conn,
+            embedder,
+            &mut pending,
+            &mut updated,
+            &mut failed,
+            remaining,
+        )?;
     }
 
     Ok(ScopeReport {
@@ -457,6 +552,82 @@ mod tests {
             assert_eq!(report.total, 1);
             assert_eq!(report.candidates, 0, "noop should walk zero candidates");
             assert_eq!(report.updated, 0);
+        });
+    }
+
+    /// Batching exercises multi-chunk flushing: seed MORE than
+    /// REINDEX_CHUNK (300 > 256) rows with NULL embedding, reindex,
+    /// and assert ALL 300 are updated with no failures.
+    #[test]
+    fn reindex_one_conn_batches_more_than_chunk_rows() {
+        with_user_brain_disabled(|| {
+            let conn = rusqlite::Connection::open_in_memory().expect("open");
+            crate::schema::initialize(&conn).expect("init");
+
+            // Insert 300 rows — more than REINDEX_CHUNK (256) — all with
+            // NULL embedding so they are candidates.
+            let count = 300usize;
+            for i in 0..count {
+                conn.execute(
+                    "INSERT INTO memories (
+                         memory_id, scope, kind, text, normalized_text, confidence,
+                         source_event_id, provenance_snapshot_json, created_at,
+                         use_count, usefulness_score
+                     )
+                     VALUES (?1, 'repo', 'fact', ?2, ?3, 1.0,
+                             NULL, '{}', '2026-05-01T00:00:00Z', 0, 0.0)",
+                    rusqlite::params![
+                        format!("batch-test-{i:06}"),
+                        format!("memory text number {i}"),
+                        format!("memory text number {i}"),
+                    ],
+                )
+                .expect("insert row");
+            }
+
+            let stub = StubEmbedder::new();
+            let mut remaining = None;
+            let report = reindex_one_conn(
+                &conn,
+                "project",
+                &stub,
+                &ReindexOptions::default(),
+                &mut remaining,
+            )
+            .expect("batch reindex");
+
+            assert_eq!(
+                report.candidates, count,
+                "all {count} rows should be candidates"
+            );
+            assert_eq!(report.updated, count, "all {count} rows should be updated");
+            assert_eq!(report.failed, 0, "no rows should fail with StubEmbedder");
+
+            // Spot-check: every row has a non-NULL embedding with the stub
+            // model id and the correct blob length.
+            let (check_model, check_blob_len): (String, usize) = conn
+                .query_row(
+                    "SELECT embedding_model, length(embedding) FROM memories
+                     WHERE memory_id = 'batch-test-000000'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("fetch spot-check row");
+            assert_eq!(check_model, stub.model_id());
+            assert_eq!(check_blob_len, stub.dim() * 4, "8 floats * 4 bytes = 32");
+
+            // Confirm zero NULL embeddings remain.
+            let null_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE embedding IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("null count");
+            assert_eq!(
+                null_count, 0,
+                "no rows should have NULL embedding after reindex"
+            );
         });
     }
 
