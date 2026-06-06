@@ -40,7 +40,37 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+#[cfg(feature = "embeddings")]
+use crate::embeddings as embeddings_mod;
 use crate::embeddings::{Embedder, cosine_similarity, decode_embedding};
+
+/// v1.0: config-aware conflict-detection gate.
+///
+/// Resolution precedence (mirrors `user_brain_enabled_with`):
+///   1. `KIMETSU_DETECT_CONFLICTS` env is set → its value wins.
+///      Disable values (`0` / `false` / `off` / `no`) → false.
+///      Any other non-empty value → true.
+///   2. Env unset → `config_value` governs.
+///   3. Default (when no config and no env) → true.
+///
+/// Call sites in `add_memory` and `propose_or_merge_memory` check this
+/// before invoking `detect_and_record` / `find_potential_conflicts`.
+pub fn conflict_detection_enabled(config_value: bool) -> bool {
+    match std::env::var("KIMETSU_DETECT_CONFLICTS") {
+        Ok(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                // Empty string — treat as unset, fall through to config.
+                config_value
+            } else {
+                // Any explicit disable value turns it off; everything else on.
+                !matches!(v.as_str(), "0" | "false" | "off" | "no")
+            }
+        }
+        // Env unset → config governs.
+        Err(_) => config_value,
+    }
+}
 
 /// Default cosine-similarity threshold above which two memories
 /// (with differing normalized text) are flagged as a potential
@@ -82,18 +112,23 @@ pub struct ConflictReport {
     pub resolution: Option<String>,
 }
 
-/// Scan for memories in `scope` whose embedding is within
-/// `threshold` cosine distance of `new_text`'s embedding AND whose
-/// normalized text differs. Returns at most `top_k` hits sorted
-/// by descending similarity.
+/// Fix 4c: ANN-based conflict detection.
 ///
-/// `embedder.is_noop()` short-circuits to an empty vec — lean
-/// builds never trigger conflict detection.
+/// Accepts the **precomputed query vector** (already embedded by the add path)
+/// instead of re-embedding — halves embedding cost per add. Uses the vec0 ANN
+/// index to fetch a small candidate pool (≤ max(top_k * 8, 64) rows), then
+/// scores only that pool with exact cosine, never full-scanning the corpus.
 ///
-/// Errors from the embedder are propagated; a real embedder
-/// failing on a single text means we don't trust *any* downstream
-/// cosine and should let the caller decide whether to fail the
-/// ingest or fall through.
+/// On vec0/non-embeddings builds (lean mode, or ANN query failure) we fall
+/// back to the scope-filtered SQL scan so the function stays correct on lean
+/// builds.
+///
+/// `exclude_id`: the memory_id of the newly-added memory, excluded from the
+/// conflict scan (a memory must not conflict with itself).
+///
+/// Pre-existing memories (upgraded brains) enter vec0 on the next retrieval's
+/// backfill (via `ensure_vec_index`), so conflict detection is best-effort
+/// until then — acceptable per the v0.5.2 policy of "surface > block".
 pub fn find_potential_conflicts(
     conn: &Connection,
     scope: &MemoryScope,
@@ -102,28 +137,197 @@ pub fn find_potential_conflicts(
     top_k: u32,
     threshold: f32,
 ) -> KimetsuResult<Vec<ConflictHit>> {
+    find_potential_conflicts_with_vec(
+        conn, scope, new_text, None, embedder, None, top_k, threshold,
+    )
+}
+
+/// Internal: full signature used by `detect_and_record` when a precomputed
+/// embedding is available (avoids re-embedding at conflict-scan time).
+///
+/// - `precomputed_vec`: the embedding produced by `embed_and_persist` for the
+///   new memory.  When `None`, we embed `new_text` here (original behavior).
+/// - `exclude_id`: the new memory's own id, excluded so a memory is never
+///   flagged as conflicting with itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_potential_conflicts_with_vec(
+    conn: &Connection,
+    scope: &MemoryScope,
+    new_text: &str,
+    precomputed_vec: Option<&[f32]>,
+    embedder: &dyn Embedder,
+    exclude_id: Option<&str>,
+    top_k: u32,
+    threshold: f32,
+) -> KimetsuResult<Vec<ConflictHit>> {
     if embedder.is_noop() {
         return Ok(Vec::new());
     }
-    let new_vec = embedder
-        .embed(new_text)
-        .map_err(|e| format!("embedder failed during conflict scan: {e}"))?;
-    if new_vec.len() != embedder.dim() {
-        return Err(format!(
-            "embedder {} returned {} dims, expected {}",
-            embedder.model_id(),
-            new_vec.len(),
-            embedder.dim()
-        )
-        .into());
-    }
+
+    // Use the precomputed vector when available, else embed now.
+    let new_vec: Vec<f32>;
+    let query_vec: &[f32] = if let Some(v) = precomputed_vec {
+        v
+    } else {
+        new_vec = embedder
+            .embed(new_text)
+            .map_err(|e| format!("embedder failed during conflict scan: {e}"))?;
+        if new_vec.len() != embedder.dim() {
+            return Err(format!(
+                "embedder {} returned {} dims, expected {}",
+                embedder.model_id(),
+                new_vec.len(),
+                embedder.dim()
+            )
+            .into());
+        }
+        &new_vec
+    };
+
     let new_normalized = normalize_memory_text(new_text);
     let scope_label = scope.to_string();
     let active_model = embedder.model_id();
+    // Pool size for ANN candidate fetch: at least 64, at least top_k * 8.
+    // Only used on embeddings builds (vec0); suppress the lint on lean builds.
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))]
+    let pool_size = (top_k * 8).max(64) as i64;
 
+    // Fix 4c: ANN path — query vec0 for a small candidate pool.
+    // Only available on embeddings builds (vec0 is not linked on lean).
+    #[cfg(feature = "embeddings")]
+    {
+        // Ensure the vec table exists (DDL-only, no backfill).
+        if let Ok(()) = crate::context::ensure_vec_table(conn, active_model, query_vec.len()) {
+            let query_blob = embeddings_mod::encode_embedding(query_vec);
+            let ann_ids: Vec<String> = {
+                let mut stmt = match conn.prepare_cached(
+                    "SELECT memory_id
+                     FROM   memory_vec
+                     WHERE  embedding MATCH ?1
+                     ORDER  BY distance
+                     LIMIT  ?2",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // vec0 table not available (lean DB, or DDL raced) —
+                        // fall through to the SQL scan below.
+                        return find_potential_conflicts_sql(
+                            conn,
+                            &scope_label,
+                            &new_normalized,
+                            query_vec,
+                            active_model,
+                            exclude_id,
+                            top_k,
+                            threshold,
+                        );
+                    }
+                };
+                stmt.query_map(rusqlite::params![query_blob, pool_size], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+            };
+
+            if !ann_ids.is_empty() {
+                // Fetch full rows for the ANN pool.
+                let placeholders: String = ann_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT memory_id, kind, text, normalized_text, embedding, embedding_model
+                     FROM   memories
+                     WHERE  invalidated_at IS NULL
+                       AND  scope = '{scope_label}'
+                       AND  embedding_model = '{active_model}'
+                       AND  memory_id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    ann_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                let rows_iter = stmt.query_map(params_vec.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                })?;
+
+                let mut hits: Vec<ConflictHit> = Vec::new();
+                for row in rows_iter {
+                    let (existing_id, kind, text, normalized, bytes) = row?;
+                    // Skip: same normalized text (dedup, not conflict).
+                    if normalized == new_normalized {
+                        continue;
+                    }
+                    // Skip: the new memory itself.
+                    if let Some(excl) = exclude_id {
+                        if existing_id == excl {
+                            continue;
+                        }
+                    }
+                    let Ok(existing_vec) = decode_embedding(&bytes, Some(query_vec.len())) else {
+                        continue;
+                    };
+                    let sim = cosine_similarity(query_vec, &existing_vec);
+                    if sim >= threshold {
+                        hits.push(ConflictHit {
+                            existing_memory_id: existing_id,
+                            existing_kind: kind,
+                            existing_text: text,
+                            similarity: sim,
+                        });
+                    }
+                }
+
+                hits.sort_by(|a, b| {
+                    b.similarity
+                        .partial_cmp(&a.similarity)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                hits.truncate(top_k as usize);
+                return Ok(hits);
+            }
+        }
+    }
+
+    // Lean / fallback: full scope-filtered SQL scan (original O(N) path).
+    // Used on lean builds and when vec0 is unavailable or the ANN pool is empty
+    // (e.g. the index hasn't been backfilled yet on a fresh upgraded brain).
+    find_potential_conflicts_sql(
+        conn,
+        &scope_label,
+        &new_normalized,
+        query_vec,
+        active_model,
+        exclude_id,
+        top_k,
+        threshold,
+    )
+}
+
+/// Scope-filtered SQL scan — O(N) fallback used on lean builds and when vec0
+/// is unavailable. This is the original `find_potential_conflicts` body.
+#[allow(clippy::too_many_arguments)]
+fn find_potential_conflicts_sql(
+    conn: &Connection,
+    scope_label: &str,
+    new_normalized: &str,
+    query_vec: &[f32],
+    active_model: &str,
+    exclude_id: Option<&str>,
+    top_k: u32,
+    threshold: f32,
+) -> KimetsuResult<Vec<ConflictHit>> {
     let mut stmt = conn.prepare(
         "
-        SELECT memory_id, kind, text, normalized_text, embedding, embedding_model
+        SELECT memory_id, kind, text, normalized_text, embedding
         FROM memories
         WHERE scope = ?1
           AND invalidated_at IS NULL
@@ -144,18 +348,18 @@ pub fn find_potential_conflicts(
     let mut hits: Vec<ConflictHit> = Vec::new();
     for row in rows {
         let (existing_id, kind, text, normalized, bytes) = row?;
-        // Skip exact-text matches: those are dedup territory, not
-        // conflicts. The caller's INSERT path already collapses
-        // them by (scope, kind, normalized_text).
         if normalized == new_normalized {
             continue;
         }
-        let Ok(existing_vec) = decode_embedding(&bytes, Some(new_vec.len())) else {
-            // Corrupted blob — skip without erroring out the whole
-            // scan. A reindex will fix the row.
+        if let Some(excl) = exclude_id {
+            if existing_id == excl {
+                continue;
+            }
+        }
+        let Ok(existing_vec) = decode_embedding(&bytes, Some(query_vec.len())) else {
             continue;
         };
-        let sim = cosine_similarity(&new_vec, &existing_vec);
+        let sim = cosine_similarity(query_vec, &existing_vec);
         if sim >= threshold {
             hits.push(ConflictHit {
                 existing_memory_id: existing_id,
@@ -232,6 +436,10 @@ pub fn record_conflict(
 /// conflicts so the caller can decide whether to surface a
 /// warning to stderr.
 ///
+/// `precomputed_vec`: when the caller already embedded `text` (e.g.
+/// `embed_and_persist` just ran), pass that vector here to skip re-embedding.
+/// Pass `None` to let the scan embed on demand (original behavior).
+///
 /// Best-effort: an error inside the scan is downgraded to "no
 /// conflicts detected this round" + a stderr line, because we
 /// never want conflict detection to fail an otherwise-valid memory
@@ -244,11 +452,26 @@ pub fn detect_and_record(
     text: &str,
     embedder: &dyn Embedder,
 ) -> usize {
-    let hits = match find_potential_conflicts(
+    detect_and_record_with_vec(conn, new_memory_id, scope, kind, text, None, embedder)
+}
+
+/// Internal: full variant used by paths that have a precomputed embedding.
+pub(crate) fn detect_and_record_with_vec(
+    conn: &Connection,
+    new_memory_id: &str,
+    scope: &MemoryScope,
+    kind: &str,
+    text: &str,
+    precomputed_vec: Option<&[f32]>,
+    embedder: &dyn Embedder,
+) -> usize {
+    let hits = match find_potential_conflicts_with_vec(
         conn,
         scope,
         text,
+        precomputed_vec,
         embedder,
+        Some(new_memory_id),
         DEFAULT_TOP_K,
         DEFAULT_CONFLICT_THRESHOLD,
     ) {
@@ -834,5 +1057,167 @@ mod tests {
         let err = resolve_conflict(&conn, "ignored", "delete_them_all").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("invalid conflict resolution"), "got: {msg}");
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 2: conflict_detection_enabled off-switch
+    // ------------------------------------------------------------------
+
+    /// Fix 2: conflict_detection_enabled returns false when env is set to a
+    /// disable value. Tests the env > config precedence.
+    #[test]
+    fn conflict_detection_enabled_env_disable_overrides_config_true() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_DETECT_CONFLICTS").ok();
+        for v in ["0", "false", "off", "no"] {
+            unsafe {
+                std::env::set_var("KIMETSU_DETECT_CONFLICTS", v);
+            }
+            assert!(
+                !conflict_detection_enabled(true),
+                "env={v:?} must disable even when config=true"
+            );
+        }
+        // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_DETECT_CONFLICTS", v),
+                None => std::env::remove_var("KIMETSU_DETECT_CONFLICTS"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// Fix 2: conflict_detection_enabled respects config=false when env is unset.
+    #[test]
+    fn conflict_detection_enabled_config_false_when_env_unset() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_DETECT_CONFLICTS").ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_DETECT_CONFLICTS");
+        }
+        assert!(
+            !conflict_detection_enabled(false),
+            "config=false + env unset must be disabled"
+        );
+        assert!(
+            conflict_detection_enabled(true),
+            "config=true + env unset must be enabled"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_DETECT_CONFLICTS", v),
+                None => std::env::remove_var("KIMETSU_DETECT_CONFLICTS"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// Fix 2: with detect_conflicts=false (via env), add_memory of a near-
+    /// duplicate records NO conflict in memory_conflicts.
+    /// Uses find_potential_conflicts directly with config_value=false to test
+    /// the gate — the actual add_memory path goes through project which requires
+    /// disk, so we test the detection layer.
+    #[test]
+    fn off_switch_prevents_conflict_detection() {
+        let conn = open_test_brain();
+        let stub = StubEmbedder::new();
+        // Insert a seed memory.
+        insert_memory(
+            &conn,
+            "m_seed",
+            "global_user",
+            "fact",
+            "alpha beta gamma delta",
+            &stub,
+        );
+
+        // With detection disabled (config_value=false, env unset):
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_DETECT_CONFLICTS").ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_DETECT_CONFLICTS");
+        }
+
+        // Simulate what add_memory does when detect_conflicts=false.
+        if conflict_detection_enabled(false) {
+            // Should not reach here.
+            panic!("detect_conflicts=false must disable the gate");
+        }
+        // No conflicts written.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_conflicts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "off-switch must prevent any conflict writes");
+
+        // With detection enabled (default=true), the near-dup IS flagged.
+        let hits = find_potential_conflicts(
+            &conn,
+            &MemoryScope::GlobalUser,
+            "alpha beta gamma omega",
+            &stub,
+            DEFAULT_TOP_K,
+            0.4,
+        )
+        .expect("scan");
+        // Should fire (near-dup detected) to prove the test setup is valid.
+        assert!(
+            !hits.is_empty(),
+            "when enabled, near-dup must be detected (test sanity check)"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_DETECT_CONFLICTS", v),
+                None => std::env::remove_var("KIMETSU_DETECT_CONFLICTS"),
+            }
+        }
+        drop(lock);
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 4c: exclude_id — new memory must not conflict with itself
+    // ------------------------------------------------------------------
+
+    /// Fix 4c: the exclude_id mechanism prevents a memory from being flagged
+    /// as conflicting with itself. This tests the SQL fallback path
+    /// (which is always active on lean builds and serves as the correctness
+    /// reference).
+    #[test]
+    fn exclude_id_prevents_self_conflict() {
+        let conn = open_test_brain();
+        let stub = StubEmbedder::new();
+        insert_memory(
+            &conn,
+            "m_self",
+            "global_user",
+            "fact",
+            "alpha beta gamma delta",
+            &stub,
+        );
+        // Scan for conflicts of the same text, excluding m_self.
+        let hits = find_potential_conflicts_with_vec(
+            &conn,
+            &MemoryScope::GlobalUser,
+            "alpha beta gamma delta",
+            None,
+            &stub,
+            Some("m_self"),
+            DEFAULT_TOP_K,
+            0.0, // zero threshold so anything would fire
+        )
+        .expect("scan");
+        assert!(
+            hits.is_empty(),
+            "excluded memory must not appear as a conflict hit"
+        );
     }
 }

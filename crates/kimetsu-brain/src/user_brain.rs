@@ -248,7 +248,7 @@ pub fn add_user_memory(
     // behavior on the default build, fastembed-rs BGE-small when
     // the feature is on.
     let embedder = embeddings::open_default_embedder();
-    embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
+    let embedding_vec = embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
 
     // v0.5.2: conflict detection for user-brain writes too. The
     // user brain ships the same `memory_conflicts` schema (shared
@@ -256,12 +256,14 @@ pub fn add_user_memory(
     // memory conflicts` walks the project AND user brains via the
     // existing multi-brain plumbing. Best-effort: NoopEmbedder
     // returns 0 hits; failures are logged, not raised.
-    let conflicts = conflict::detect_and_record(
+    // Fix 4c: pass the precomputed vector to avoid re-embedding.
+    let conflicts = conflict::detect_and_record_with_vec(
         conn,
         &memory_id,
         &MemoryScope::GlobalUser,
         &kind.to_string(),
         text,
+        embedding_vec.as_deref(),
         embedder,
     );
     if conflicts > 0 {

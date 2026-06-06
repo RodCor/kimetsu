@@ -2,6 +2,36 @@ use rusqlite::Connection;
 
 use kimetsu_core::KimetsuResult;
 
+/// Apply performance-tuning SQLite pragmas to `conn`.
+///
+/// Safe on both read-write AND read-only connections: pragmas that cannot
+/// be set on a read-only DB (WAL mode, mmap_size) are skipped when they
+/// error, so the same function is called unconditionally from every open path.
+///
+/// Pragmas set:
+/// - `cache_size = -65536`      → 64 MiB page cache (negative = KiB)
+/// - `mmap_size = 268435456`    → 256 MiB memory-mapped I/O window
+/// - `synchronous = NORMAL`     → safe under WAL; avoids full fsync per commit
+/// - `temp_store = MEMORY`      → keep temp tables / sort buffers in RAM
+///
+/// `journal_mode = WAL` and `busy_timeout` are set by `create_baseline`
+/// (the read-write init path); they are NOT repeated here because
+/// `PRAGMA journal_mode` is a structural change that errors on read-only
+/// connections (the mode is already persisted in the DB file header).
+pub fn apply_pragmas(conn: &Connection) -> KimetsuResult<()> {
+    // cache_size and temp_store are safe on any connection.
+    conn.pragma_update(None, "cache_size", -65536_i64)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+
+    // mmap_size and synchronous may fail on a read-only connection opened
+    // against a DB that's being written by another process in WAL mode.
+    // Best-effort: ignore errors from these two.
+    let _ = conn.pragma_update(None, "mmap_size", 268_435_456_i64);
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+
+    Ok(())
+}
+
 /// Register the sqlite-vec extension exactly once, process-wide, so every
 /// subsequently-opened connection can use `vec0` virtual tables.
 ///
@@ -36,6 +66,7 @@ pub(crate) fn ensure_vec_extension_registered() {
 }
 
 pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
+    apply_pragmas(conn)?;
     create_baseline(conn)?;
     crate::migrate::run_migrations(conn)?;
     Ok(())
@@ -297,10 +328,23 @@ pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
     )?;
     ensure_memories_fts_shape(conn)?;
     ensure_repo_manifests_fts_shape(conn)?;
+
+    // v1.0 (Tier-1 perf): covering index for scope + embedding_model
+    // filtering in conflict detection and ANN pool fetch. Additive — the
+    // IF NOT EXISTS guard makes it idempotent on already-upgraded DBs.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_scope_model_active
+             ON memories (scope, embedding_model, invalidated_at);",
+    )?;
+
     Ok(())
 }
 
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
+    // Apply performance pragmas on read-only connections too. The helper
+    // skips pragmas that error (journal_mode/mmap_size on some read-only
+    // opens), so this is always safe to call here.
+    apply_pragmas(conn)?;
     use kimetsu_core::KIMETSU_SCHEMA_VERSION;
     let current: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
@@ -522,6 +566,48 @@ mod tests {
             migrate::current_version(&conn).expect("current_version"),
             2,
             "version must still be 2 after double initialize"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 1: apply_pragmas sets the tuned cache_size on both RW and RO
+    // ------------------------------------------------------------------
+    #[test]
+    fn apply_pragmas_sets_cache_size_on_rw_connection() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("initialize");
+        // After initialize (which calls apply_pragmas), cache_size must be -65536
+        // (the negative-KiB form we set). SQLite may return it as a page count
+        // (positive) or keep the -KiB form; we just assert it's not the default
+        // -2000 pages, which is what SQLite uses without any pragma_update.
+        let cache_size: i64 = conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .expect("cache_size query");
+        assert_ne!(
+            cache_size, -2000,
+            "cache_size must have been updated from the 2 MiB default, got {cache_size}"
+        );
+        // The tuned value should be a large negative number (KiB) or a large
+        // positive page count — either way not the stock default.
+        assert!(
+            !(-2000..=2000).contains(&cache_size),
+            "cache_size should reflect the 64 MiB tuning (not default -2000), got {cache_size}"
+        );
+    }
+
+    /// Fix 1: validate() (the read-only open path) also calls apply_pragmas.
+    /// We can't open a true read-only connection to an in-memory DB via OpenFlags,
+    /// so we exercise the helper directly and verify it doesn't error.
+    #[test]
+    fn apply_pragmas_does_not_error_on_in_memory_conn() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        apply_pragmas(&conn).expect("apply_pragmas must not error on a fresh in-memory conn");
+        let cache_size: i64 = conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .expect("cache_size");
+        assert!(
+            !(-2000..=2000).contains(&cache_size),
+            "apply_pragmas must update cache_size from the default, got {cache_size}"
         );
     }
 

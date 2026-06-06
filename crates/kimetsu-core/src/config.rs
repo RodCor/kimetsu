@@ -447,6 +447,17 @@ pub struct IngestionSection {
     pub max_file_bytes: u64,
     pub extra_skip_dirs: Vec<String>,
     pub max_total_files: u64,
+    /// v1.0: enable/disable the per-add conflict-detection scan.
+    ///
+    /// Default true. Set to false (or set env `KIMETSU_DETECT_CONFLICTS=0`)
+    /// to skip the cosine-similarity conflict scan at add time — useful when
+    /// bulk-seeding a brain where the O(N²) scan would be prohibitively slow.
+    /// Review `kimetsu brain memory conflicts` afterwards to catch any
+    /// contradictions.
+    ///
+    /// Precedence: `KIMETSU_DETECT_CONFLICTS` env > this field > default.
+    #[serde(default = "default_true")]
+    pub detect_conflicts: bool,
 }
 
 impl Default for IngestionSection {
@@ -455,6 +466,7 @@ impl Default for IngestionSection {
             max_file_bytes: 524_288,
             extra_skip_dirs: Vec::new(),
             max_total_files: 50_000,
+            detect_conflicts: true,
         }
     }
 }

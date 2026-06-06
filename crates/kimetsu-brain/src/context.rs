@@ -650,29 +650,22 @@ pub fn search_repo_files(
 // Only compiled under the `embeddings` feature; lean builds skip entirely.
 // -----------------------------------------------------------------------
 
-/// D1b: ensure the `memory_vec` vec0 index and its `memory_vec_meta`
-/// tracking table exist and are up-to-date for the active `(model_id, dim)`.
+/// D1b / Fix 4a: ensure only the DDL steps (Steps 1-2) for `memory_vec`.
 ///
-/// # Strategy
-/// 1. Create `memory_vec_meta` + `memory_vec` if they don't exist yet.
-/// 2. If the stored `(model_id, dim)` differs from the active one (embedder
-///    was swapped), **DROP + recreate** `memory_vec` (cross-model vectors are
-///    meaningless) and update `memory_vec_meta`.
-/// 3. Incremental reconciliation (O(delta), cheap):
-///    - INSERT rows present in `memories` (not invalidated, embedding not
-///      null, embedding_model == model_id) but absent from `memory_vec`.
-///    - DELETE rows in `memory_vec` for memories that have since been
-///      invalidated or had their embedding removed.
+/// Creates `memory_vec_meta` and `memory_vec` (for `model_id`/`dim`) if they
+/// don't exist yet, or drops-and-recreates `memory_vec` when the active
+/// `(model_id, dim)` differs from what the meta row records.
 ///
-/// # vec0 TEXT PK mapping (confirmed via probe in 0.1.9)
-/// `CREATE VIRTUAL TABLE memory_vec USING vec0(memory_id TEXT PRIMARY KEY, embedding float[D])`
-/// The `memory_id TEXT PRIMARY KEY` partition column lets us map ULID strings
-/// directly as the row identity — no side table required (approach 1).
+/// This is the cheap half of the old `ensure_vec_index` — no backfill scan,
+/// just DDL. Called from `embed_and_persist` so each new row enters the index
+/// immediately (O(1) per add) without ever doing a bulk reconciliation at add
+/// time.
 ///
-/// vec0 vectors are inserted as JSON text (`'[f32, f32, ...]'`).
+/// `ensure_vec_index` (the retrieval path) still calls this + does the full
+/// backfill reconciliation once on first retrieve for upgraded brains.
 #[cfg(feature = "embeddings")]
-fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
-    // --- Step 1: create meta table if needed ---
+pub(crate) fn ensure_vec_table(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
+    // Step 1: create meta table if needed.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_vec_meta (
             model_id TEXT NOT NULL,
@@ -680,7 +673,7 @@ fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuRes
         )",
     )?;
 
-    // --- Step 2: check stored (model_id, dim) ---
+    // Step 2: check stored (model_id, dim) and rebuild if stale.
     let stored: Option<(String, i64)> = {
         let mut stmt = conn.prepare_cached("SELECT model_id, dim FROM memory_vec_meta LIMIT 1")?;
         stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -688,12 +681,11 @@ fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuRes
     };
 
     let needs_rebuild = match &stored {
-        None => true, // meta empty → fresh
+        None => true,
         Some((mid, d)) => mid != model_id || *d != dim as i64,
     };
 
     if needs_rebuild {
-        // Drop the stale index (if any) and recreate for the new model.
         conn.execute_batch("DROP TABLE IF EXISTS memory_vec")?;
         conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE memory_vec
@@ -705,18 +697,61 @@ fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuRes
             rusqlite::params![model_id, dim as i64],
         )?;
     } else {
-        // The index exists but memory_vec might not (e.g. ATTACH case or first
-        // run on an existing meta row). Ensure it exists.
+        // Index may not exist yet on first run with an existing meta row.
         conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec
                  USING vec0(memory_id TEXT PRIMARY KEY, embedding float[{dim}])"
         ))?;
     }
 
-    // --- Step 3: incremental reconciliation ---
+    Ok(())
+}
+
+/// Fix 4b: O(1) single-row upsert into `memory_vec` using the raw f32 BLOB.
+///
+/// Called by `embed_and_persist` immediately after writing the embedding to
+/// `memories`, so `memory_vec` stays current at add time without a full
+/// backfill scan.
+///
+/// `blob` is the little-endian f32 BLOB (from `encode_embedding`). sqlite-vec
+/// accepts raw float32 BLOBs directly for MATCH queries, so no JSON
+/// serialization is needed — 4× smaller representation, no parse overhead.
+#[cfg(feature = "embeddings")]
+pub(crate) fn upsert_vec_row(conn: &Connection, memory_id: &str, blob: &[u8]) -> KimetsuResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![memory_id, blob],
+    )?;
+    Ok(())
+}
+
+/// D1b: ensure the `memory_vec` vec0 index and its `memory_vec_meta`
+/// tracking table exist and are up-to-date for the active `(model_id, dim)`.
+///
+/// Split into:
+///   - Steps 1-2: DDL only → delegated to `ensure_vec_table`.
+///   - Step 3: incremental backfill reconciliation (for upgraded brains).
+///
+/// This full version is called by `memory_ann_candidates` (the retrieval path)
+/// so upgraded brains (rows predating the incremental-write change) get
+/// backfilled once on first retrieve. New rows are maintained incrementally
+/// by `embed_and_persist` → `upsert_vec_row`, so the backfill diff is O(delta)
+/// not O(N) after the first retrieval.
+///
+/// # vec0 BLOB encoding (Fix 4a)
+/// The `memories.embedding` column stores little-endian f32 BLOBs.
+/// sqlite-vec accepts the same BLOB format directly for INSERT and MATCH —
+/// no JSON serialization needed. This is 4× smaller than the old JSON path
+/// and avoids a decode+re-encode round-trip in the backfill loop.
+#[cfg(feature = "embeddings")]
+fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
+    // Steps 1-2: DDL (create/recreate table if stale).
+    ensure_vec_table(conn, model_id, dim)?;
+
+    // Step 3: incremental reconciliation for upgraded brains.
 
     // 3a. INSERT rows present in memories but missing from memory_vec.
-    //     We pull the embedding BLOB here and decode it.
+    //     Pass the BLOB directly — no decode/re-encode needed (Fix 4a).
     let new_rows: Vec<(String, Vec<u8>)> = {
         let mut stmt = conn.prepare_cached(
             "SELECT m.memory_id, m.embedding
@@ -737,17 +772,12 @@ fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuRes
     };
 
     for (memory_id, blob) in new_rows {
-        let vec = match embeddings::decode_embedding(&blob, Some(dim)) {
-            Ok(v) if v.len() == dim => v,
-            _ => continue, // skip malformed blobs
-        };
-        // Serialize to JSON text: "[f1,f2,...,fn]"
-        let json = vec_to_json(&vec);
-        // Use INSERT OR REPLACE to be idempotent (race-safe).
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![memory_id, json],
-        )?;
+        // Validate the blob length before inserting (skip malformed blobs).
+        if blob.len() != dim * 4 {
+            continue;
+        }
+        // Insert the raw BLOB directly — sqlite-vec accepts f32 BLOBs.
+        upsert_vec_row(conn, &memory_id, &blob)?;
     }
 
     // 3b. DELETE memory_vec rows whose memory is now invalidated or gone.
@@ -761,23 +791,6 @@ fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuRes
     )?;
 
     Ok(())
-}
-
-/// Serialize a `Vec<f32>` into the JSON-text format vec0 expects: `"[f,f,...]"`.
-#[cfg(feature = "embeddings")]
-fn vec_to_json(v: &[f32]) -> String {
-    let mut s = String::with_capacity(v.len() * 14 + 2);
-    s.push('[');
-    for (i, x) in v.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        // Use full precision to avoid rounding drift.
-        use std::fmt::Write;
-        write!(s, "{x}").ok();
-    }
-    s.push(']');
-    s
 }
 
 // -----------------------------------------------------------------------
@@ -800,9 +813,10 @@ fn memory_ann_candidates(
     // Ensure the index is consistent for this model+dim before querying.
     ensure_vec_index(conn, &qe.model_id, qe.vector.len())?;
 
-    // KNN query: MATCH on the JSON-serialized query vector, ORDER BY distance
+    // KNN query: MATCH on the raw f32 BLOB query vector (Fix 4a — BLOB is 4×
+    // smaller than JSON and requires no serialization), ORDER BY distance
     // (implicit hidden column), LIMIT k. Returns memory_ids nearest to query.
-    let query_json = vec_to_json(&qe.vector);
+    let query_blob = embeddings::encode_embedding(&qe.vector);
     let knn_ids: Vec<String> = {
         let mut stmt = conn.prepare_cached(
             "SELECT memory_id
@@ -811,7 +825,7 @@ fn memory_ann_candidates(
              ORDER  BY distance
              LIMIT  ?2",
         )?;
-        stmt.query_map(rusqlite::params![query_json, k], |row| {
+        stmt.query_map(rusqlite::params![query_blob, k], |row| {
             row.get::<_, String>(0)
         })?
         .filter_map(|r| r.ok())

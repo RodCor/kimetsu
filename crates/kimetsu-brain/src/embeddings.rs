@@ -607,20 +607,24 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// For other embedder errors we surface them up. The caller
 /// (`add_memory`, `add_user_memory`) can decide whether to fail the
 /// whole insert or log+continue — today they propagate.
+///
+/// Returns the computed embedding vector (so callers can reuse it
+/// for conflict detection without re-embedding). Returns `None` on
+/// Noop or NotImplemented — the same cases where the column stays NULL.
 pub fn embed_and_persist(
     conn: &rusqlite::Connection,
     memory_id: &str,
     text: &str,
     embedder: &dyn Embedder,
-) -> KimetsuResult<()> {
+) -> KimetsuResult<Option<Vec<f32>>> {
     if embedder.is_noop() {
-        return Ok(());
+        return Ok(None);
     }
     let vec = match embedder.embed(text) {
         Ok(v) => v,
         // NotImplemented is the contract for "skip silently". Treat
         // any embedder that signals it the same way as NoopEmbedder.
-        Err(EmbedderError::NotImplemented) => return Ok(()),
+        Err(EmbedderError::NotImplemented) => return Ok(None),
         Err(e) => return Err(format!("embed failed for memory {memory_id}: {e}").into()),
     };
     if vec.len() != embedder.dim() {
@@ -637,7 +641,30 @@ pub fn embed_and_persist(
         "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
         rusqlite::params![blob, embedder.model_id(), memory_id],
     )?;
-    Ok(())
+
+    // Fix 4b: maintain memory_vec incrementally at add time so retrieval
+    // never needs to do the O(N) cold backfill for newly-added rows.
+    // Only compiled on embeddings builds (vec0 is not available on lean).
+    #[cfg(feature = "embeddings")]
+    {
+        // ensure_vec_table is cheap DDL-only (no backfill scan).
+        // upsert_vec_row is a single O(1) INSERT OR REPLACE.
+        // Errors here are best-effort: a vec0 insert failure must not abort
+        // a successful memory write. The next retrieval's ensure_vec_index
+        // backfill will catch any missing rows.
+        if let Err(e) = crate::context::ensure_vec_table(conn, embedder.model_id(), embedder.dim())
+        {
+            eprintln!(
+                "kimetsu-brain: vec table DDL failed for memory {memory_id}: {e} (vec index will backfill on next retrieval)"
+            );
+        } else if let Err(e) = crate::context::upsert_vec_row(conn, memory_id, &blob) {
+            eprintln!(
+                "kimetsu-brain: vec row upsert failed for memory {memory_id}: {e} (vec index will backfill on next retrieval)"
+            );
+        }
+    }
+
+    Ok(Some(vec))
 }
 
 // --------- BLOB codec ---------
