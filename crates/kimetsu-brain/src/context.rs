@@ -664,6 +664,7 @@ pub fn search_repo_files(
 /// `ensure_vec_index` (the retrieval path) still calls this + does the full
 /// backfill reconciliation once on first retrieve for upgraded brains.
 #[cfg(feature = "embeddings")]
+#[allow(dead_code)] // removed in T3c
 pub(crate) fn ensure_vec_table(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
     // Step 1: create meta table if needed.
     conn.execute_batch(
@@ -717,6 +718,7 @@ pub(crate) fn ensure_vec_table(conn: &Connection, model_id: &str, dim: usize) ->
 /// accepts raw float32 BLOBs directly for MATCH queries, so no JSON
 /// serialization is needed — 4× smaller representation, no parse overhead.
 #[cfg(feature = "embeddings")]
+#[allow(dead_code)] // removed in T3c
 pub(crate) fn upsert_vec_row(conn: &Connection, memory_id: &str, blob: &[u8]) -> KimetsuResult<()> {
     conn.execute(
         "INSERT OR REPLACE INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
@@ -744,6 +746,7 @@ pub(crate) fn upsert_vec_row(conn: &Connection, memory_id: &str, blob: &[u8]) ->
 /// no JSON serialization needed. This is 4× smaller than the old JSON path
 /// and avoids a decode+re-encode round-trip in the backfill loop.
 #[cfg(feature = "embeddings")]
+#[allow(dead_code)] // removed in T3c
 fn ensure_vec_index(conn: &Connection, model_id: &str, dim: usize) -> KimetsuResult<()> {
     // Steps 1-2: DDL (create/recreate table if stale).
     ensure_vec_table(conn, model_id, dim)?;
@@ -842,8 +845,10 @@ fn memory_ann_candidates(
         model_param = knn_rowids.len() + 1
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut params_vec: Vec<&dyn rusqlite::ToSql> =
-        knn_rowids.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = knn_rowids
+        .iter()
+        .map(|n| n as &dyn rusqlite::ToSql)
+        .collect();
     params_vec.push(&qe.model_id);
     let rows_iter = stmt.query_map(params_vec.as_slice(), |row| {
         Ok((
