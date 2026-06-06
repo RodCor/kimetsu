@@ -96,7 +96,15 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         .build()
         .map_err(|e| format!("build runtime: {e}"))?;
 
-    runtime.block_on(serve(args.addr, state, tls))
+    let result = runtime.block_on(serve(args.addr, state, tls));
+
+    // Graceful shutdown returned: flush every warm ANN index to its sidecar so
+    // the next start is warm rather than rebuilding from SQLite. Best-effort —
+    // the index stays correct via reconcile-on-open even if this is skipped.
+    #[cfg(feature = "embeddings")]
+    kimetsu_brain::ann::save_all();
+
+    result
 }
 
 fn prepare_data_dir(p: &Path) -> Result<PathBuf, String> {

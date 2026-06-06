@@ -157,7 +157,18 @@ impl From<std::io::Error> for ChatError {
 /// the dependency direction (chat -> kimetsu-agent only, no benchmark adapter). The
 /// model round-trip itself is plumbed in [`run_repl_with_agent`] which
 /// lands in the v0.3.0 commit that wires the provider.
-pub fn run_repl<R: BufRead, W: Write>(
+pub fn run_repl<R: BufRead, W: Write>(reader: R, writer: W, config: ChatConfig) -> ChatResult<()> {
+    let result = run_repl_inner(reader, writer, config);
+    // REPL teardown: flush every warm ANN index to its sidecar so the next
+    // `kimetsu chat` starts warm. Runs on every exit (quit, EOF, or error).
+    // No-op for in-memory/test DBs and lean builds; index stays correct via
+    // reconcile-on-open even when skipped.
+    #[cfg(feature = "embeddings")]
+    kimetsu_brain::ann::save_all();
+    result
+}
+
+fn run_repl_inner<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     mut config: ChatConfig,
