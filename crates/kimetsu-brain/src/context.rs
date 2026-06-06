@@ -810,36 +810,22 @@ fn memory_ann_candidates(
     query_tokens: &[String],
     half_life_days: f32,
 ) -> KimetsuResult<Vec<Candidate>> {
-    // Ensure the index is consistent for this model+dim before querying.
-    ensure_vec_index(conn, &qe.model_id, qe.vector.len())?;
-
-    // KNN query: MATCH on the raw f32 BLOB query vector (Fix 4a — BLOB is 4×
-    // smaller than JSON and requires no serialization), ORDER BY distance
-    // (implicit hidden column), LIMIT k. Returns memory_ids nearest to query.
-    let query_blob = embeddings::encode_embedding(&qe.vector);
-    let knn_ids: Vec<String> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT memory_id
-             FROM   memory_vec
-             WHERE  embedding MATCH ?1
-             ORDER  BY distance
-             LIMIT  ?2",
-        )?;
-        stmt.query_map(rusqlite::params![query_blob, k], |row| {
-            row.get::<_, String>(0)
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    };
-
-    if knn_ids.is_empty() {
+    // Tier-3: ANN candidate generation via the usearch HNSW index.
+    let handle = crate::ann::handle_for_query(conn, qe.vector.len(), &qe.model_id)?;
+    let hits = handle
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .search(&qe.vector, k as usize)?;
+    // Map rowids back to memory_ids (active-only is enforced by the index, but
+    // we still join `memories` below for the full row + the embedding_model
+    // residual filter, so collect rowids here).
+    let knn_rowids: Vec<i64> = hits.into_iter().map(|(rowid, _dist)| rowid).collect();
+    if knn_rowids.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Fetch full memory rows for those ids (same projection as latest_memory_candidates).
-    // We build the IN list manually — rusqlite doesn't have a native binding for
-    // variable-length IN lists, and these are generated ULIDs (safe to interpolate).
-    let placeholders: String = knn_ids
+    // Fetch full memory rows for those rowids (same projection as latest_memory_candidates).
+    let placeholders: String = knn_rowids
         .iter()
         .enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
@@ -851,11 +837,14 @@ fn memory_ann_candidates(
                 last_useful_at
          FROM   memories
          WHERE  invalidated_at IS NULL
-           AND  memory_id IN ({placeholders})"
+           AND  embedding_model = ?{model_param}
+           AND  rowid IN ({placeholders})",
+        model_param = knn_rowids.len() + 1
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params_vec: Vec<&dyn rusqlite::ToSql> =
-        knn_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> =
+        knn_rowids.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+    params_vec.push(&qe.model_id);
     let rows_iter = stmt.query_map(params_vec.as_slice(), |row| {
         Ok((
             row.get::<_, String>(0)?,
