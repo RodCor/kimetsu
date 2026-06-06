@@ -68,7 +68,6 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Handle>> {
 /// On-disk DBs: one cached handle per canonical db path (built + reconciled on
 /// first use). In-memory/pathless DBs: a fresh transient handle rebuilt from the
 /// current SQLite state every call (tiny test DBs — correctness over speed).
-#[allow(dead_code)] // removed in T3b
 pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Handle> {
     match AnnIndex::sidecar_for(conn) {
         Some(sidecar) => {
@@ -91,7 +90,6 @@ pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> Kimets
 
 /// Cached write handle, or `None` for in-memory DBs (their writes are picked up
 /// by the rebuild-on-query path, so write hooks safely skip them).
-#[allow(dead_code)] // removed in T3b
 pub fn cached_handle(conn: &Connection) -> Option<Handle> {
     let sidecar = AnnIndex::sidecar_for(conn)?;
     let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
@@ -100,7 +98,6 @@ pub fn cached_handle(conn: &Connection) -> Option<Handle> {
 
 /// Remove a memory from the cached index by its `memory_id` (no-op for
 /// in-memory DBs / cold indexes — reconcile-on-open will catch it).
-#[allow(dead_code)] // removed in T3b
 pub fn on_invalidate(conn: &Connection, memory_id: &str) {
     let Some(handle) = cached_handle(conn) else {
         return;
