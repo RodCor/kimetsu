@@ -6042,4 +6042,56 @@ max_total_cost_usd = 250.0
             std::fs::remove_dir_all(&root).ok();
         });
     }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn ann_retrieval_round_trips_and_invalidate_drops() {
+        use crate::user_brain::with_user_brain_disabled;
+        with_user_brain_disabled(|| {
+            // Use the StubEmbedder so this is deterministic and offline.
+            let prev_emb = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+            unsafe {
+                std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "stub-d8");
+            }
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "ripgrep is the fast recursive search tool",
+            )
+            .expect("add a");
+            let id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "use fd to find files quickly",
+            )
+            .expect("add b");
+
+            // Retrieval surfaces the relevant memory via the ANN path.
+            let ctx = retrieve_context(&root, "recall", "find files fast", 1024).expect("ctx");
+            assert!(
+                format!("{ctx:?}").contains("fd to find files"),
+                "expected the fd memory in context"
+            );
+
+            // Invalidate it -> it disappears from retrieval.
+            invalidate_memory(&root, &id, Some("test")).expect("invalidate");
+            let ctx2 = retrieve_context(&root, "recall", "find files fast", 1024).expect("ctx2");
+            assert!(
+                !format!("{ctx2:?}").contains("fd to find files"),
+                "invalidated memory must not return"
+            );
+
+            unsafe {
+                match prev_emb {
+                    Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                    None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+                }
+            }
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
 }
