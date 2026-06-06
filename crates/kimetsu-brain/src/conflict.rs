@@ -567,6 +567,8 @@ pub fn resolve_conflict(
             ",
             params![existing_memory_id, now, invalidation_reason],
         )?;
+        #[cfg(feature = "embeddings")]
+        crate::ann::on_invalidate(conn, &existing_memory_id);
     } else if resolution == "kept_existing" {
         conn.execute(
             "
@@ -577,6 +579,8 @@ pub fn resolve_conflict(
             ",
             params![new_memory_id, now, invalidation_reason],
         )?;
+        #[cfg(feature = "embeddings")]
+        crate::ann::on_invalidate(conn, &new_memory_id);
     }
 
     let updated = conn.execute(

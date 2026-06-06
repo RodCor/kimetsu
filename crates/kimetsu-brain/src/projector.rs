@@ -659,6 +659,8 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
         ",
         params![memory_id, ts_text(event)?, reason],
     )?;
+    #[cfg(feature = "embeddings")]
+    crate::ann::on_invalidate(conn, memory_id);
     Ok(())
 }
 
