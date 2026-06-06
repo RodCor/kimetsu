@@ -1,0 +1,731 @@
+//! Tier-3: approximate-nearest-neighbour (HNSW) index via `usearch`.
+//!
+//! Replaces the brute-force `vec0` KNN. The index is a *derived cache*:
+//! `memories.embedding` BLOBs in SQLite are the source of truth. A sidecar
+//! `brain.usearch` (next to `brain.db`) plus a `.json` manifest persist the
+//! graph. Keyed by the SQLite `rowid` (u64); holds ACTIVE rows only
+//! (`remove` on invalidate). Both call sites keep their exact cosine rerank,
+//! so usearch only generates candidates.
+//!
+//! Whole file is `embeddings`-feature-only — the lean build has no vectors.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+
+use kimetsu_core::KimetsuResult;
+
+/// Bump when the on-disk sidecar format or index params change in a way that
+/// makes an old sidecar unsafe to load — forces a rebuild.
+const SCHEMA_VERSION: u32 = 1;
+
+/// HNSW graph degree (M). Higher = better recall, more memory.
+const CONNECTIVITY: usize = 16;
+/// ef_construction: candidate list at build time.
+const EXPANSION_ADD: usize = 128;
+/// ef_search: candidate list at query time.
+const EXPANSION_SEARCH: usize = 64;
+
+/// Sidecar manifest, stored next to `brain.usearch` as `brain.usearch.json`.
+/// Validates that a loaded sidecar matches the active model/dim/schema, and
+/// records how far the index has caught up to SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Manifest {
+    schema_version: u32,
+    dim: usize,
+    model_id: String,
+    /// Highest `memories.rowid` already represented in the index.
+    max_rowid_indexed: i64,
+    /// Number of active vectors in the index (sanity check vs SQLite).
+    count: usize,
+}
+
+fn index_options(dim: usize) -> IndexOptions {
+    IndexOptions {
+        dimensions: dim,
+        metric: MetricKind::Cos,
+        quantization: ScalarKind::F32,
+        connectivity: CONNECTIVITY,
+        expansion_add: EXPANSION_ADD,
+        expansion_search: EXPANSION_SEARCH,
+        multi: false,
+    }
+}
+
+type Handle = Arc<RwLock<AnnIndex>>;
+
+fn registry() -> &'static Mutex<HashMap<PathBuf, Handle>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, Handle>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a shared index handle for read/search.
+///
+/// On-disk DBs: one cached handle per canonical db path (built + reconciled on
+/// first use). In-memory/pathless DBs: a fresh transient handle rebuilt from the
+/// current SQLite state every call (tiny test DBs — correctness over speed).
+#[allow(dead_code)] // removed in T3b
+pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Handle> {
+    match AnnIndex::sidecar_for(conn) {
+        Some(sidecar) => {
+            // canonical-ish key: the sidecar path (stable per db file).
+            let key = sidecar;
+            let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(h) = reg.get(&key) {
+                return Ok(h.clone());
+            }
+            let idx = AnnIndex::open_or_build(conn, dim, model_id)?;
+            let handle: Handle = Arc::new(RwLock::new(idx));
+            reg.insert(key, handle.clone());
+            Ok(handle)
+        }
+        None => Ok(Arc::new(RwLock::new(AnnIndex::build_from_conn(
+            conn, dim, model_id,
+        )?))),
+    }
+}
+
+/// Cached write handle, or `None` for in-memory DBs (their writes are picked up
+/// by the rebuild-on-query path, so write hooks safely skip them).
+#[allow(dead_code)] // removed in T3b
+pub fn cached_handle(conn: &Connection) -> Option<Handle> {
+    let sidecar = AnnIndex::sidecar_for(conn)?;
+    let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    reg.get(&sidecar).cloned()
+}
+
+/// Remove a memory from the cached index by its `memory_id` (no-op for
+/// in-memory DBs / cold indexes — reconcile-on-open will catch it).
+#[allow(dead_code)] // removed in T3b
+pub fn on_invalidate(conn: &Connection, memory_id: &str) {
+    let Some(handle) = cached_handle(conn) else {
+        return;
+    };
+    let rowid: Option<i64> = conn
+        .query_row(
+            "SELECT rowid FROM memories WHERE memory_id = ?1",
+            rusqlite::params![memory_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(rowid) = rowid {
+        let mut guard = handle.write().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.remove(rowid);
+    }
+}
+
+/// Drop the cached handle AND delete the sidecar for `conn`'s db, forcing a
+/// rebuild on next query. Called after a reindex (model change).
+#[allow(dead_code)] // removed in T3c
+pub fn invalidate_sidecar(conn: &Connection) {
+    if let Some(sidecar) = AnnIndex::sidecar_for(conn) {
+        registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&sidecar);
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(AnnIndex::manifest_path(&sidecar));
+    }
+}
+
+/// Save every cached on-disk index (called on graceful host shutdown).
+#[allow(dead_code)] // removed in T3c
+pub fn save_all() {
+    let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    for handle in reg.values() {
+        let guard = handle.read().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = guard.save() {
+            eprintln!("kimetsu-brain: ann save_all failed: {e}");
+        }
+    }
+}
+
+/// The in-process index plus the metadata needed to persist + reconcile it.
+pub struct AnnIndex {
+    index: Index,
+    dim: usize,
+    model_id: String,
+    /// `None` for in-memory / pathless DBs (no sidecar).
+    sidecar: Option<PathBuf>,
+    max_rowid_indexed: i64,
+}
+
+impl AnnIndex {
+    /// Number of vectors currently in the index.
+    pub fn len(&self) -> usize {
+        self.index.size()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Build a fresh index from every active, current-model embedding in SQLite.
+    pub fn build_from_conn(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Self> {
+        let index = Index::new(&index_options(dim)).map_err(|e| format!("usearch new: {e}"))?;
+        let mut me = Self {
+            index,
+            dim,
+            model_id: model_id.to_string(),
+            sidecar: None,
+            max_rowid_indexed: 0,
+        };
+        me.reserve_and_load_active(conn)?;
+        Ok(me)
+    }
+
+    /// Reserve capacity then add every active current-model row to the index,
+    /// tracking the highest rowid seen.
+    fn reserve_and_load_active(&mut self, conn: &Connection) -> KimetsuResult<()> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE invalidated_at IS NULL AND embedding IS NOT NULL AND embedding_model = ?1",
+            rusqlite::params![self.model_id],
+            |r| r.get(0),
+        )?;
+        if count > 0 {
+            self.index
+                .reserve(count as usize)
+                .map_err(|e| format!("usearch reserve: {e}"))?;
+        }
+        let mut stmt = conn.prepare(
+            "SELECT rowid, embedding FROM memories
+             WHERE invalidated_at IS NULL AND embedding IS NOT NULL AND embedding_model = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![self.model_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, blob) = row?;
+            if blob.len() != self.dim * 4 {
+                continue; // skip malformed
+            }
+            let vec = match crate::embeddings::decode_embedding(&blob, Some(self.dim)) {
+                Ok(v) => v,
+                Err(_) => continue, // skip undecodable rows rather than abort the build
+            };
+            self.index
+                .add(rowid as u64, &vec)
+                .map_err(|e| format!("usearch add: {e}"))?;
+            if rowid > self.max_rowid_indexed {
+                self.max_rowid_indexed = rowid;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return up to `k` nearest `(rowid, distance)` pairs for `query`.
+    /// Distance is usearch's metric distance (cosine: smaller = closer).
+    pub fn search(&self, query: &[f32], k: usize) -> KimetsuResult<Vec<(i64, f32)>> {
+        if k == 0 || self.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matches = self
+            .index
+            .search(query, k)
+            .map_err(|e| format!("usearch search: {e}"))?;
+        Ok(matches
+            .keys
+            .into_iter()
+            .zip(matches.distances)
+            .map(|(key, dist)| (key as i64, dist))
+            .collect())
+    }
+
+    /// Insert or replace the vector for `rowid`. usearch would otherwise keep a
+    /// duplicate for an existing key (multi=false still appends a new slot), so
+    /// remove-then-add guarantees a single current entry (in-place re-embed).
+    pub fn add(&mut self, rowid: i64, vector: &[f32]) -> KimetsuResult<()> {
+        if vector.len() != self.dim {
+            return Err(format!("ann add: dim {} != index dim {}", vector.len(), self.dim).into());
+        }
+        if self.index.contains(rowid as u64) {
+            self.index
+                .remove(rowid as u64)
+                .map_err(|e| format!("usearch remove (upsert): {e}"))?;
+        }
+        // Grow capacity if we're at the ceiling.
+        if self.index.size() + 1 > self.index.capacity() {
+            self.index
+                .reserve((self.index.capacity() + 1).max(64) * 2)
+                .map_err(|e| format!("usearch reserve (grow): {e}"))?;
+        }
+        self.index
+            .add(rowid as u64, vector)
+            .map_err(|e| format!("usearch add: {e}"))?;
+        if rowid > self.max_rowid_indexed {
+            self.max_rowid_indexed = rowid;
+        }
+        Ok(())
+    }
+
+    /// Remove `rowid` if present (no-op otherwise).
+    pub fn remove(&mut self, rowid: i64) -> KimetsuResult<()> {
+        if self.index.contains(rowid as u64) {
+            self.index
+                .remove(rowid as u64)
+                .map_err(|e| format!("usearch remove: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Derive the sidecar index path from a brain.db path: sibling
+    /// `<stem>.usearch`. Returns `None` for in-memory / pathless DBs.
+    fn sidecar_for(conn: &Connection) -> Option<PathBuf> {
+        match conn.path() {
+            Some(p) if !p.is_empty() && p != ":memory:" => {
+                // Canonicalize the (existing) db file so two path spellings of the
+                // same brain.db resolve to ONE registry key + sidecar — otherwise
+                // two live indexes could overwrite each other's sidecar.
+                let db = std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+                Some(db.with_extension("usearch"))
+            }
+            _ => None,
+        }
+    }
+
+    fn manifest_path(sidecar: &Path) -> PathBuf {
+        // brain.usearch -> brain.usearch.json
+        let mut s = sidecar.as_os_str().to_owned();
+        s.push(".json");
+        PathBuf::from(s)
+    }
+
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            schema_version: SCHEMA_VERSION,
+            dim: self.dim,
+            model_id: self.model_id.clone(),
+            max_rowid_indexed: self.max_rowid_indexed,
+            count: self.len(),
+        }
+    }
+
+    /// Serialize the index + manifest to the sidecar (no-op for in-memory DBs).
+    pub fn save(&self) -> KimetsuResult<()> {
+        let Some(sidecar) = &self.sidecar else {
+            return Ok(());
+        };
+        self.index
+            .save(sidecar.to_string_lossy().as_ref())
+            .map_err(|e| format!("usearch save: {e}"))?;
+        let manifest =
+            serde_json::to_vec(&self.manifest()).map_err(|e| format!("manifest serialize: {e}"))?;
+        std::fs::write(Self::manifest_path(sidecar), manifest)
+            .map_err(|e| format!("manifest write: {e}"))?;
+        Ok(())
+    }
+
+    /// Load a valid sidecar (manifest matches dim/model/schema) then reconcile
+    /// the SQLite delta; otherwise rebuild from scratch. For in-memory DBs there
+    /// is no sidecar, so this always builds fresh.
+    pub fn open_or_build(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Self> {
+        let sidecar = Self::sidecar_for(conn);
+        if let Some(path) = &sidecar
+            && path.exists()
+            && let Some(loaded) = Self::try_load(path, dim, model_id)?
+        {
+            let mut idx = loaded;
+            idx.reconcile(conn)?;
+            return Ok(idx);
+        }
+        // Rebuild path.
+        let mut idx = Self::build_from_conn(conn, dim, model_id)?;
+        idx.sidecar = sidecar;
+        Ok(idx)
+    }
+
+    /// Attempt to load the sidecar; returns `None` (caller rebuilds) when the
+    /// manifest is missing/unreadable or mismatches dim/model/schema.
+    fn try_load(sidecar: &Path, dim: usize, model_id: &str) -> KimetsuResult<Option<Self>> {
+        let manifest_bytes = match std::fs::read(Self::manifest_path(sidecar)) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let manifest: Manifest = match serde_json::from_slice(&manifest_bytes) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        if manifest.schema_version != SCHEMA_VERSION
+            || manifest.dim != dim
+            || manifest.model_id != model_id
+        {
+            return Ok(None);
+        }
+        let index = Index::new(&index_options(dim)).map_err(|e| format!("usearch new: {e}"))?;
+        if index.load(sidecar.to_string_lossy().as_ref()).is_err() {
+            return Ok(None); // corrupt sidecar → rebuild
+        }
+        Ok(Some(Self {
+            index,
+            dim,
+            model_id: model_id.to_string(),
+            sidecar: Some(sidecar.to_path_buf()),
+            max_rowid_indexed: manifest.max_rowid_indexed,
+        }))
+    }
+
+    /// Apply the SQLite→index delta after a sidecar load:
+    ///   * add active current-model rows with `rowid > max_rowid_indexed`;
+    ///   * remove rows now invalidated (rowid <= max) still in the index.
+    ///
+    /// Cheap: rides the `idx_memories_scope_model_active` covering index.
+    pub fn reconcile(&mut self, conn: &Connection) -> KimetsuResult<()> {
+        // 3a. New active rows since last index.
+        let new_rows: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, embedding FROM memories
+                 WHERE invalidated_at IS NULL AND embedding IS NOT NULL
+                   AND embedding_model = ?1 AND rowid > ?2",
+            )?;
+            stmt.query_map(
+                rusqlite::params![self.model_id, self.max_rowid_indexed],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )?
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+        for (rowid, blob) in new_rows {
+            if blob.len() != self.dim * 4 {
+                continue;
+            }
+            let vec = match crate::embeddings::decode_embedding(&blob, Some(self.dim)) {
+                Ok(v) => v,
+                Err(_) => continue, // skip undecodable rows rather than abort the reconcile
+            };
+            self.add(rowid, &vec)?;
+        }
+
+        // 3b. Remove rows now invalidated (only those <= the watermark; newer
+        //     ones were never added). `remove` is a no-op if absent.
+        let gone: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid FROM memories
+                 WHERE invalidated_at IS NOT NULL AND rowid <= ?1",
+            )?;
+            stmt.query_map(rusqlite::params![self.max_rowid_indexed], |r| {
+                r.get::<_, i64>(0)
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+        for rowid in gone {
+            self.remove(rowid)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embeddings::encode_embedding;
+
+    /// In-memory brain with `n` rows; vector i = a unit-ish vector pointing
+    /// mostly along axis (i % dim). Deterministic, no embedder needed.
+    fn seed_conn(n: usize, dim: usize, model: &str) -> Connection {
+        let conn = Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        for i in 0..n {
+            let mut v = vec![0.01f32; dim];
+            v[i % dim] = 1.0;
+            conn.execute(
+                "INSERT INTO memories
+                   (memory_id, scope, kind, text, normalized_text, confidence,
+                    provenance_snapshot_json, created_at, use_count, usefulness_score,
+                    embedding, embedding_model)
+                 VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,?4)",
+                rusqlite::params![
+                    format!("m-{i:06}"),
+                    format!("text {i}"),
+                    encode_embedding(&v),
+                    model
+                ],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    #[test]
+    fn build_from_conn_indexes_all_active_rows() {
+        let dim = 8;
+        let conn = seed_conn(50, dim, "stub-d8");
+        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+        assert_eq!(idx.len(), 50, "all 50 active rows indexed");
+    }
+
+    #[test]
+    fn search_returns_nearest_rowid_first() {
+        let dim = 8;
+        let conn = seed_conn(dim, dim, "stub-d8"); // one row per axis
+        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+        // Query strongly along axis 3 → row whose rowid maps to memory m-000003.
+        let mut q = vec![0.0f32; dim];
+        q[3] = 1.0;
+        let hits = idx.search(&q, 3).expect("search");
+        assert!(!hits.is_empty(), "got candidates");
+        // The nearest must be the row with embedding peaked on axis 3.
+        let (rowid, _dist) = hits[0];
+        let mid: String = conn
+            .query_row(
+                "SELECT memory_id FROM memories WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| r.get(0),
+            )
+            .expect("map rowid");
+        assert_eq!(mid, "m-000003");
+    }
+
+    #[test]
+    fn add_is_upsert_and_remove_drops() {
+        let dim = 8;
+        let conn = seed_conn(4, dim, "stub-d8");
+        let mut idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+        assert_eq!(idx.len(), 4);
+
+        // Upsert an existing rowid with a new vector — size unchanged.
+        let mut v = vec![0.0f32; dim];
+        v[0] = 1.0;
+        idx.add(1, &v).expect("upsert");
+        assert_eq!(idx.len(), 4, "upsert must not grow the index");
+
+        // Add a brand-new rowid — size grows.
+        idx.add(999, &v).expect("add new");
+        assert_eq!(idx.len(), 5);
+
+        // Remove it — size shrinks and it stops appearing.
+        idx.remove(999).expect("remove");
+        assert_eq!(idx.len(), 4);
+    }
+
+    #[test]
+    fn save_then_open_reuses_sidecar_and_search_matches() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open file db");
+        crate::schema::initialize(&conn).expect("init");
+        for i in 0..20usize {
+            let mut v = vec![0.01f32; dim];
+            v[i % dim] = 1.0;
+            conn.execute(
+                "INSERT INTO memories
+                   (memory_id, scope, kind, text, normalized_text, confidence,
+                    provenance_snapshot_json, created_at, use_count, usefulness_score,
+                    embedding, embedding_model)
+                 VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,'stub-d8')",
+                rusqlite::params![format!("m-{i:06}"), format!("t{i}"), crate::embeddings::encode_embedding(&v)],
+            ).expect("insert");
+        }
+        // First open: no sidecar → build → save.
+        let idx = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("build");
+        idx.save().expect("save");
+        assert!(db.with_extension("usearch").exists(), "sidecar written");
+
+        // Second open: sidecar present + manifest valid → load.
+        let idx2 = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("load");
+        assert_eq!(idx2.len(), 20);
+        let mut q = vec![0.0f32; dim];
+        q[2] = 1.0;
+        assert!(!idx2.search(&q, 5).expect("search").is_empty());
+    }
+
+    #[test]
+    fn manifest_model_mismatch_forces_rebuild() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        // Build + save under model A.
+        AnnIndex::open_or_build(&conn, dim, "model-a")
+            .expect("a")
+            .save()
+            .expect("save");
+        // Open under model B → manifest mismatch → rebuild (empty, no model-b rows).
+        let idx = AnnIndex::open_or_build(&conn, dim, "model-b").expect("b");
+        assert_eq!(idx.len(), 0, "rebuilt for model-b which has no rows");
+    }
+
+    #[test]
+    fn reconcile_adds_new_and_removes_invalidated() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        let insert = |conn: &Connection, i: usize| {
+            let mut v = vec![0.01f32; dim];
+            v[i % dim] = 1.0;
+            conn.execute(
+                "INSERT INTO memories
+                   (memory_id, scope, kind, text, normalized_text, confidence,
+                    provenance_snapshot_json, created_at, use_count, usefulness_score,
+                    embedding, embedding_model)
+                 VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,'stub-d8')",
+                rusqlite::params![format!("m-{i:06}"), format!("t{i}"), crate::embeddings::encode_embedding(&v)],
+            ).expect("insert");
+        };
+        for i in 0..10 {
+            insert(&conn, i);
+        }
+        let idx = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("build");
+        idx.save().expect("save");
+        assert_eq!(idx.len(), 10);
+
+        // Simulate another process: add 5 rows, invalidate 2 existing.
+        for i in 10..15 {
+            insert(&conn, i);
+        }
+        conn.execute("UPDATE memories SET invalidated_at='2026-02-01T00:00:00Z' WHERE memory_id IN ('m-000000','m-000001')", []).expect("invalidate");
+
+        // Reopen → load sidecar (10) → reconcile (+5 new, -2 invalidated) = 13.
+        let idx2 = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("reopen");
+        assert_eq!(idx2.len(), 13);
+    }
+
+    #[test]
+    fn recall_at_10_is_at_least_0_95_vs_brute_force() {
+        use crate::embeddings::{cosine_similarity, decode_embedding};
+        let dim = 16;
+        let n = 5000usize;
+        let conn = Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        // Deterministic pseudo-random unit vectors (LCG; no Math.random/Date).
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            conn.execute(
+                "INSERT INTO memories
+                   (memory_id, scope, kind, text, normalized_text, confidence,
+                    provenance_snapshot_json, created_at, use_count, usefulness_score,
+                    embedding, embedding_model)
+                 VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,'stub')",
+                rusqlite::params![format!("m-{i:06}"), "t", crate::embeddings::encode_embedding(&v)],
+            ).expect("insert");
+        }
+        // Map rowid->vec for brute force.
+        let mut stmt = conn
+            .prepare("SELECT rowid, embedding FROM memories")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .unwrap();
+        for row in rows {
+            let (rowid, blob) = row.unwrap();
+            vectors.push((rowid, decode_embedding(&blob, Some(dim)).unwrap()));
+        }
+
+        let idx = AnnIndex::build_from_conn(&conn, dim, "stub").expect("build");
+        let trials = 50;
+        let k = 10;
+        let mut hit = 0usize;
+        let mut total = 0usize;
+        for t in 0..trials {
+            let q = &vectors[t * 7 % vectors.len()].1;
+            // Exact top-k by cosine.
+            let mut scored: Vec<(i64, f32)> = vectors
+                .iter()
+                .map(|(id, v)| (*id, cosine_similarity(q, v)))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let exact: std::collections::HashSet<i64> =
+                scored.iter().take(k).map(|(id, _)| *id).collect();
+            let ann: std::collections::HashSet<i64> = idx
+                .search(q, k)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            hit += exact.intersection(&ann).count();
+            total += k;
+        }
+        let recall = hit as f32 / total as f32;
+        assert!(recall >= 0.95, "recall@10 = {recall} (want >= 0.95)");
+    }
+
+    #[test]
+    fn registry_caches_per_ondisk_db_and_transient_for_memory() {
+        let dim = 8;
+        // On-disk: two handles for the same db are the same Arc.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let h1 = handle_for_query(&conn, dim, "stub-d8").unwrap();
+        let h2 = handle_for_query(&conn, dim, "stub-d8").unwrap();
+        assert!(Arc::ptr_eq(&h1, &h2), "same db → cached handle");
+
+        // In-memory: returns a usable (transient) handle, no panic.
+        let mem = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&mem).unwrap();
+        let hm = handle_for_query(&mem, dim, "stub-d8").unwrap();
+        assert_eq!(hm.read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn on_invalidate_removes_from_cached_index() {
+        let dim = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let mut v = vec![0.0f32; dim];
+        v[0] = 1.0;
+        conn.execute(
+            "INSERT INTO memories
+               (memory_id, scope, kind, text, normalized_text, confidence,
+                provenance_snapshot_json, created_at, use_count, usefulness_score,
+                embedding, embedding_model)
+             VALUES ('m-x','project','fact','t','t',1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?1,'stub-d8')",
+            rusqlite::params![crate::embeddings::encode_embedding(&v)],
+        ).unwrap();
+        // Warm the cache.
+        let h = handle_for_query(&conn, dim, "stub-d8").unwrap();
+        assert_eq!(h.read().unwrap().len(), 1);
+        // Invalidate in SQLite + notify the index.
+        conn.execute(
+            "UPDATE memories SET invalidated_at='2026-02-01T00:00:00Z' WHERE memory_id='m-x'",
+            [],
+        )
+        .unwrap();
+        on_invalidate(&conn, "m-x");
+        assert_eq!(cached_handle(&conn).unwrap().read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn invalidate_sidecar_removes_file_and_cache() {
+        let dim = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let _ = handle_for_query(&conn, dim, "stub-d8").unwrap();
+        drop(
+            handle_for_query(&conn, dim, "stub-d8")
+                .unwrap()
+                .read()
+                .unwrap(),
+        );
+        cached_handle(&conn)
+            .unwrap()
+            .read()
+            .unwrap()
+            .save()
+            .unwrap();
+        assert!(db.with_extension("usearch").exists());
+        invalidate_sidecar(&conn);
+        assert!(!db.with_extension("usearch").exists());
+        assert!(cached_handle(&conn).is_none());
+    }
+}

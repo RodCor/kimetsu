@@ -20,7 +20,7 @@ categories = ["database", "development-tools"]
 # retrieval that v0.4.2 ships, so `cargo install kimetsu-cli`
 # without --features embeddings never downloads a model.
 default = []
-embeddings = ["dep:fastembed", "dep:sqlite-vec"]
+embeddings = ["dep:fastembed", "dep:sqlite-vec", "dep:usearch"]
 
 [dependencies]
 blake3.workspace = true
@@ -35,6 +35,11 @@ fastembed = { version = "5", optional = true }
 # rusqlite-bundled SQLite. Only pulled in under the `embeddings` feature —
 # lean builds use NoopEmbedder and have no vectors to index.
 sqlite-vec = { version = "0.1", optional = true }
+# v1.0 Tier-3: usearch provides an HNSW approximate-NN index so retrieval and
+# conflict-detection candidate generation are ~O(log N) instead of the vec0
+# brute-force O(N) scan. Native (C++); only pulled under `embeddings`, which is
+# already native (ort, sqlite-vec). The lean build never links it.
+usearch = { version = "2", optional = true }
 ignore.workspace = true
 kimetsu-core = { path = "../kimetsu-core", version = "1.0.0" }
 # v0.4.5: regex backs the secret-redaction patterns in
@@ -47,3 +52,6 @@ serde_json.workspace = true
 time.workspace = true
 tracing.workspace = true
 ulid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
