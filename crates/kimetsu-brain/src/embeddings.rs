@@ -688,25 +688,26 @@ pub fn embed_and_persist(
         rusqlite::params![blob, embedder.model_id(), memory_id],
     )?;
 
-    // Fix 4b: maintain memory_vec incrementally at add time so retrieval
-    // never needs to do the O(N) cold backfill for newly-added rows.
-    // Only compiled on embeddings builds (vec0 is not available on lean).
+    // Tier-3: keep the warm usearch index current at add time. For in-memory
+    // DBs there is no cached handle — the rebuild-on-query path picks the row
+    // up, so we safely skip. Best-effort: an index failure must not abort a
+    // successful memory write.
     #[cfg(feature = "embeddings")]
-    {
-        // ensure_vec_table is cheap DDL-only (no backfill scan).
-        // upsert_vec_row is a single O(1) INSERT OR REPLACE.
-        // Errors here are best-effort: a vec0 insert failure must not abort
-        // a successful memory write. The next retrieval's ensure_vec_index
-        // backfill will catch any missing rows.
-        if let Err(e) = crate::context::ensure_vec_table(conn, embedder.model_id(), embedder.dim())
-        {
-            eprintln!(
-                "kimetsu-brain: vec table DDL failed for memory {memory_id}: {e} (vec index will backfill on next retrieval)"
-            );
-        } else if let Err(e) = crate::context::upsert_vec_row(conn, memory_id, &blob) {
-            eprintln!(
-                "kimetsu-brain: vec row upsert failed for memory {memory_id}: {e} (vec index will backfill on next retrieval)"
-            );
+    if let Some(handle) = crate::ann::cached_handle(conn) {
+        let rowid: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM memories WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(rowid) = rowid {
+            let mut guard = handle.write().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = guard.add(rowid, &vec) {
+                eprintln!(
+                    "kimetsu-brain: ann add failed for memory {memory_id}: {e} (index will reconcile on next open)"
+                );
+            }
         }
     }
 
