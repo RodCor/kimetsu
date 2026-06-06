@@ -40,8 +40,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-#[cfg(feature = "embeddings")]
-use crate::embeddings as embeddings_mod;
 use crate::embeddings::{Embedder, cosine_similarity, decode_embedding};
 
 /// v1.0: config-aware conflict-detection gate.
@@ -196,104 +194,78 @@ pub(crate) fn find_potential_conflicts_with_vec(
     // Only available on embeddings builds (vec0 is not linked on lean).
     #[cfg(feature = "embeddings")]
     {
-        // Ensure the vec table exists (DDL-only, no backfill).
-        if let Ok(()) = crate::context::ensure_vec_table(conn, active_model, query_vec.len()) {
-            let query_blob = embeddings_mod::encode_embedding(query_vec);
-            let ann_ids: Vec<String> = {
-                let mut stmt = match conn.prepare_cached(
-                    "SELECT memory_id
-                     FROM   memory_vec
-                     WHERE  embedding MATCH ?1
-                     ORDER  BY distance
-                     LIMIT  ?2",
-                ) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        // vec0 table not available (lean DB, or DDL raced) —
-                        // fall through to the SQL scan below.
-                        return find_potential_conflicts_sql(
-                            conn,
-                            &scope_label,
-                            &new_normalized,
-                            query_vec,
-                            active_model,
-                            exclude_id,
-                            top_k,
-                            threshold,
-                        );
-                    }
-                };
-                stmt.query_map(rusqlite::params![query_blob, pool_size], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-            };
+        let handle = crate::ann::handle_for_query(conn, query_vec.len(), active_model)?;
+        let ann_rowids: Vec<i64> = handle
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .search(query_vec, pool_size as usize)?
+            .into_iter()
+            .map(|(rowid, _)| rowid)
+            .collect();
 
-            if !ann_ids.is_empty() {
-                // Fetch full rows for the ANN pool.
-                let placeholders: String = ann_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("?{}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT memory_id, kind, text, normalized_text, embedding, embedding_model
-                     FROM   memories
-                     WHERE  invalidated_at IS NULL
-                       AND  scope = '{scope_label}'
-                       AND  embedding_model = '{active_model}'
-                       AND  memory_id IN ({placeholders})"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    ann_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-                let rows_iter = stmt.query_map(params_vec.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                    ))
-                })?;
+        if !ann_rowids.is_empty() {
+            // Fetch full rows for the ANN pool.
+            let placeholders: String = ann_rowids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT memory_id, kind, text, normalized_text, embedding, embedding_model
+                 FROM   memories
+                 WHERE  invalidated_at IS NULL
+                   AND  scope = '{scope_label}'
+                   AND  embedding_model = '{active_model}'
+                   AND  rowid IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                ann_rowids.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+            let rows_iter = stmt.query_map(params_vec.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })?;
 
-                let mut hits: Vec<ConflictHit> = Vec::new();
-                for row in rows_iter {
-                    let (existing_id, kind, text, normalized, bytes) = row?;
-                    // Skip: same normalized text (dedup, not conflict).
-                    if normalized == new_normalized {
+            let mut hits: Vec<ConflictHit> = Vec::new();
+            for row in rows_iter {
+                let (existing_id, kind, text, normalized, bytes) = row?;
+                // Skip: same normalized text (dedup, not conflict).
+                if normalized == new_normalized {
+                    continue;
+                }
+                // Skip: the new memory itself.
+                if let Some(excl) = exclude_id {
+                    if existing_id == excl {
                         continue;
-                    }
-                    // Skip: the new memory itself.
-                    if let Some(excl) = exclude_id {
-                        if existing_id == excl {
-                            continue;
-                        }
-                    }
-                    let Ok(existing_vec) = decode_embedding(&bytes, Some(query_vec.len())) else {
-                        continue;
-                    };
-                    let sim = cosine_similarity(query_vec, &existing_vec);
-                    if sim >= threshold {
-                        hits.push(ConflictHit {
-                            existing_memory_id: existing_id,
-                            existing_kind: kind,
-                            existing_text: text,
-                            similarity: sim,
-                        });
                     }
                 }
-
-                hits.sort_by(|a, b| {
-                    b.similarity
-                        .partial_cmp(&a.similarity)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                hits.truncate(top_k as usize);
-                return Ok(hits);
+                let Ok(existing_vec) = decode_embedding(&bytes, Some(query_vec.len())) else {
+                    continue;
+                };
+                let sim = cosine_similarity(query_vec, &existing_vec);
+                if sim >= threshold {
+                    hits.push(ConflictHit {
+                        existing_memory_id: existing_id,
+                        existing_kind: kind,
+                        existing_text: text,
+                        similarity: sim,
+                    });
+                }
             }
+
+            hits.sort_by(|a, b| {
+                b.similarity
+                    .partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            hits.truncate(top_k as usize);
+            return Ok(hits);
         }
     }
 
