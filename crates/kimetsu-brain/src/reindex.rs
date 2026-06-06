@@ -329,7 +329,16 @@ fn reindex_one_conn(
             continue;
         }
         pending.push((memory_id, text));
-        if pending.len() >= REINDEX_CHUNK {
+        // Never queue (and thus count as a candidate) more rows than the
+        // `remaining` cap allows, so `candidates` stays faithful to the
+        // pre-batch behavior under `--limit`. With no cap we batch the full
+        // chunk. A flush that leaves the cap unmet (e.g. after failures)
+        // returns `false`, so the loop keeps pulling to make up the budget.
+        let chunk_target = match *remaining {
+            Some(r) => REINDEX_CHUNK.min(r),
+            None => REINDEX_CHUNK,
+        };
+        if pending.len() >= chunk_target {
             exhausted = flush_reindex_chunk(
                 conn,
                 embedder,
@@ -628,6 +637,73 @@ mod tests {
                 null_count, 0,
                 "no rows should have NULL embedding after reindex"
             );
+        });
+    }
+
+    /// Under `--limit`, batching must honor the cap EXACTLY and not
+    /// over-count `candidates`: with a limit smaller than REINDEX_CHUNK,
+    /// only `limit` rows are pulled, counted, and updated — the rest are
+    /// left untouched for a later pass.
+    #[test]
+    fn reindex_one_conn_limit_smaller_than_chunk_is_faithful() {
+        with_user_brain_disabled(|| {
+            let conn = rusqlite::Connection::open_in_memory().expect("open");
+            crate::schema::initialize(&conn).expect("init");
+
+            // 300 candidates (NULL embedding), ordered by created_at so the
+            // cap takes a deterministic prefix.
+            let count = 300usize;
+            for i in 0..count {
+                conn.execute(
+                    "INSERT INTO memories (
+                         memory_id, scope, kind, text, normalized_text, confidence,
+                         source_event_id, provenance_snapshot_json, created_at,
+                         use_count, usefulness_score
+                     )
+                     VALUES (?1, 'repo', 'fact', ?2, ?2, 1.0,
+                             NULL, '{}', ?3, 0, 0.0)",
+                    rusqlite::params![
+                        format!("limit-test-{i:06}"),
+                        format!("memory text number {i}"),
+                        format!("2026-05-01T00:00:{:02}Z", i % 60),
+                    ],
+                )
+                .expect("insert row");
+            }
+
+            let stub = StubEmbedder::new();
+            // limit 10 < REINDEX_CHUNK (256): the pre-batch loop would
+            // count exactly 10 candidates; batching must match.
+            let mut remaining = Some(10usize);
+            let report = reindex_one_conn(
+                &conn,
+                "project",
+                &stub,
+                &ReindexOptions {
+                    limit: Some(10),
+                    ..ReindexOptions::default()
+                },
+                &mut remaining,
+            )
+            .expect("limited reindex");
+
+            assert_eq!(
+                report.candidates, 10,
+                "limit must cap candidates at 10, not the full chunk"
+            );
+            assert_eq!(report.updated, 10, "exactly 10 rows updated");
+            assert_eq!(report.failed, 0);
+            assert_eq!(remaining, Some(0), "budget fully consumed");
+
+            // Exactly 290 rows remain un-embedded for a later pass.
+            let null_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE embedding IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("null count");
+            assert_eq!(null_count, (count - 10) as i64);
         });
     }
 
