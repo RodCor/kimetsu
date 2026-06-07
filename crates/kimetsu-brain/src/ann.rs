@@ -56,6 +56,47 @@ fn index_options(dim: usize) -> IndexOptions {
     }
 }
 
+/// Threads for parallel index construction. usearch `add` is thread-safe
+/// (Index: Send+Sync, C++ locks internally), so fanning inserts across cores
+/// turns the single-threaded build (the 1M bottleneck) into ~cores-x faster.
+fn build_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+/// Insert a batch of (rowid, vector) into `index` in parallel. The caller must
+/// have reserved capacity. Returns the first add error if any thread failed.
+fn parallel_add(index: &Index, rows: &[(i64, Vec<f32>)]) -> KimetsuResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let nthreads = build_threads().min(rows.len());
+    let chunk = rows.len().div_ceil(nthreads);
+    let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for part in rows.chunks(chunk) {
+            let err = &err;
+            s.spawn(move || {
+                for (rowid, vec) in part {
+                    if let Err(e) = index.add(*rowid as u64, vec) {
+                        let mut g = err.lock().unwrap_or_else(|p| p.into_inner());
+                        if g.is_none() {
+                            *g = Some(format!("usearch add: {e}"));
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    match err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
 type Handle = Arc<RwLock<AnnIndex>>;
 
 fn registry() -> &'static Mutex<HashMap<PathBuf, Handle>> {
@@ -69,23 +110,38 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Handle>> {
 /// first use). In-memory/pathless DBs: a fresh transient handle rebuilt from the
 /// current SQLite state every call (tiny test DBs — correctness over speed).
 pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Handle> {
-    match AnnIndex::sidecar_for(conn) {
-        Some(sidecar) => {
-            // canonical-ish key: the sidecar path (stable per db file).
-            let key = sidecar;
-            let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(h) = reg.get(&key) {
-                return Ok(h.clone());
-            }
-            let idx = AnnIndex::open_or_build(conn, dim, model_id)?;
-            let handle: Handle = Arc::new(RwLock::new(idx));
-            reg.insert(key, handle.clone());
-            Ok(handle)
-        }
-        None => Ok(Arc::new(RwLock::new(AnnIndex::build_from_conn(
+    // In-memory / pathless DBs: a fresh transient handle, rebuilt every call,
+    // so it can never be stale.
+    let Some(key) = AnnIndex::sidecar_for(conn) else {
+        return Ok(Arc::new(RwLock::new(AnnIndex::build_from_conn(
             conn, dim, model_id,
-        )?))),
+        )?)));
+    };
+    let handle: Handle = {
+        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = reg.get(&key) {
+            h.clone()
+        } else {
+            let idx = AnnIndex::open_or_build(conn, dim, model_id)?;
+            let h: Handle = Arc::new(RwLock::new(idx));
+            reg.insert(key, h.clone());
+            h
+        }
+    };
+    // Reconcile a cached index that has fallen behind SQLite (rows added
+    // out-of-band of the warm add path). Cheap guard: only pay the write lock
+    // + reconcile when MAX(rowid) shows new rows. Double-checked under the lock.
+    let stale = {
+        let idx = handle.read().unwrap_or_else(|p| p.into_inner());
+        idx.is_stale(conn)?
+    };
+    if stale {
+        let mut idx = handle.write().unwrap_or_else(|p| p.into_inner());
+        if idx.is_stale(conn)? {
+            idx.reconcile(conn)?;
+        }
     }
+    Ok(handle)
 }
 
 /// Cached write handle, or `None` for in-memory DBs (their writes are picked up
@@ -159,6 +215,18 @@ impl AnnIndex {
         self.len() == 0
     }
 
+    /// True when SQLite has rows beyond what the index covers (cheap: MAX(rowid)
+    /// is the integer primary key, O(1)-ish). Out-of-band invalidations are NOT
+    /// detected here, but that's harmless — retrieval hydration already filters
+    /// `invalidated_at IS NULL`, so a stale-invalidated candidate is dropped.
+    pub fn is_stale(&self, conn: &Connection) -> KimetsuResult<bool> {
+        let max_rowid: i64 =
+            conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM memories", [], |r| {
+                r.get(0)
+            })?;
+        Ok(max_rowid > self.max_rowid_indexed)
+    }
+
     /// Build a fresh index from every active, current-model embedding in SQLite.
     pub fn build_from_conn(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Self> {
         let index = Index::new(&index_options(dim)).map_err(|e| format!("usearch new: {e}"))?;
@@ -187,29 +255,42 @@ impl AnnIndex {
                 .reserve(count as usize)
                 .map_err(|e| format!("usearch reserve: {e}"))?;
         }
+        // Stream rows in chunks (bounds memory at 1M) and parallel-add each
+        // chunk across cores. usearch `add` is thread-safe (Index: Send+Sync).
+        const BUILD_CHUNK: usize = 16384;
         let mut stmt = conn.prepare(
             "SELECT rowid, embedding FROM memories
-             WHERE invalidated_at IS NULL AND embedding IS NOT NULL AND embedding_model = ?1",
+             WHERE invalidated_at IS NULL AND embedding IS NOT NULL AND embedding_model = ?1
+             ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(rusqlite::params![self.model_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        for row in rows {
-            let (rowid, blob) = row?;
-            if blob.len() != self.dim * 4 {
-                continue; // skip malformed
+        let mut rows_iter = stmt.query(rusqlite::params![self.model_id])?;
+        let mut batch: Vec<(i64, Vec<f32>)> = Vec::with_capacity(BUILD_CHUNK);
+        let mut max_rowid = self.max_rowid_indexed;
+        loop {
+            let row = rows_iter.next()?;
+            let done = row.is_none();
+            if let Some(row) = row {
+                let rowid: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                // Skip malformed blobs and undecodable rows rather than abort.
+                if blob.len() == self.dim * 4
+                    && let Ok(vec) = crate::embeddings::decode_embedding(&blob, Some(self.dim))
+                {
+                    if rowid > max_rowid {
+                        max_rowid = rowid;
+                    }
+                    batch.push((rowid, vec));
+                }
             }
-            let vec = match crate::embeddings::decode_embedding(&blob, Some(self.dim)) {
-                Ok(v) => v,
-                Err(_) => continue, // skip undecodable rows rather than abort the build
-            };
-            self.index
-                .add(rowid as u64, &vec)
-                .map_err(|e| format!("usearch add: {e}"))?;
-            if rowid > self.max_rowid_indexed {
-                self.max_rowid_indexed = rowid;
+            if batch.len() >= BUILD_CHUNK || (done && !batch.is_empty()) {
+                parallel_add(&self.index, &batch)?;
+                batch.clear();
+            }
+            if done {
+                break;
             }
         }
+        self.max_rowid_indexed = max_rowid;
         Ok(())
     }
 
@@ -384,6 +465,10 @@ impl AnnIndex {
             .filter_map(|r| r.ok())
             .collect()
         };
+        // Decode the new rows, tracking the max rowid, then parallel-add the
+        // delta. `parallel_add` does NOT grow capacity, so reserve explicitly.
+        let mut decoded: Vec<(i64, Vec<f32>)> = Vec::with_capacity(new_rows.len());
+        let mut max_rowid = self.max_rowid_indexed;
         for (rowid, blob) in new_rows {
             if blob.len() != self.dim * 4 {
                 continue;
@@ -392,7 +477,17 @@ impl AnnIndex {
                 Ok(v) => v,
                 Err(_) => continue, // skip undecodable rows rather than abort the reconcile
             };
-            self.add(rowid, &vec)?;
+            if rowid > max_rowid {
+                max_rowid = rowid;
+            }
+            decoded.push((rowid, vec));
+        }
+        if !decoded.is_empty() {
+            self.index
+                .reserve(self.index.size() + decoded.len())
+                .map_err(|e| format!("usearch reserve: {e}"))?;
+            parallel_add(&self.index, &decoded)?;
+            self.max_rowid_indexed = max_rowid;
         }
 
         // 3b. Remove rows now invalidated (only those <= the watermark; newer
@@ -647,6 +742,98 @@ mod tests {
         }
         let recall = hit as f32 / total as f32;
         assert!(recall >= 0.95, "recall@10 = {recall} (want >= 0.95)");
+    }
+
+    /// Insert one axis-peaked row directly into SQLite (bypassing the index).
+    fn insert_row(conn: &Connection, i: usize, dim: usize) {
+        let mut v = vec![0.01f32; dim];
+        v[i % dim] = 1.0;
+        conn.execute(
+            "INSERT INTO memories
+               (memory_id, scope, kind, text, normalized_text, confidence,
+                provenance_snapshot_json, created_at, use_count, usefulness_score,
+                embedding, embedding_model)
+             VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,'stub-d8')",
+            rusqlite::params![format!("m-{i:06}"), format!("t{i}"), encode_embedding(&v)],
+        )
+        .expect("insert");
+    }
+
+    #[test]
+    fn parallel_build_indexes_all_rows() {
+        // 2000 rows exercises parallel_add's partitioning across threads; all
+        // rows must be indexed and a peaked query must return the right axis row.
+        let dim = 8;
+        let conn = seed_conn(2000, dim, "stub-d8");
+        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+        assert_eq!(idx.len(), 2000, "all 2000 rows indexed by parallel build");
+        // Row whose embedding peaks on axis 3 is m-000003 (rowid maps via SQL).
+        let mut q = vec![0.0f32; dim];
+        q[3] = 1.0;
+        let hits = idx.search(&q, 5).expect("search");
+        assert!(!hits.is_empty(), "got candidates");
+        // Rows are seeded in insert order (rowid == i+1), so the row whose
+        // embedding peaks on axis 3 has (rowid-1) % dim == 3. Many rows tie on
+        // axis 3 (identical vectors), so the nearest neighbours must all be
+        // axis-3 rows — that proves parallel_add indexed correct vectors.
+        for (rowid, _dist) in &hits {
+            assert_eq!(
+                (*rowid - 1) % dim as i64,
+                3,
+                "every axis-3 query hit must be an axis-3 row, got rowid {rowid}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_stale_detects_new_rows() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        for i in 0..10 {
+            insert_row(&conn, i, dim);
+        }
+        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+        assert!(!idx.is_stale(&conn).expect("stale check"), "fresh index");
+        // Add rows directly to SQLite, bypassing the index.
+        for i in 10..15 {
+            insert_row(&conn, i, dim);
+        }
+        assert!(
+            idx.is_stale(&conn).expect("stale check"),
+            "stale after out-of-band inserts"
+        );
+    }
+
+    #[test]
+    fn handle_for_query_reconciles_cached_index_on_new_rows() {
+        // Regression for the bench staleness bug: a cached handle must reconcile
+        // when SQLite has gained rows out-of-band of the warm add path.
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        let n = 8usize;
+        for i in 0..n {
+            insert_row(&conn, i, dim);
+        }
+        let h1 = handle_for_query(&conn, dim, "stub-d8").expect("build");
+        assert_eq!(h1.read().unwrap().len(), n, "initial build covers all rows");
+        // Bulk-add M more active rows directly via SQL (no warm add path).
+        let m = 5usize;
+        for i in n..n + m {
+            insert_row(&conn, i, dim);
+        }
+        let h2 = handle_for_query(&conn, dim, "stub-d8").expect("requery");
+        assert!(Arc::ptr_eq(&h1, &h2), "same cached handle reused");
+        assert_eq!(
+            h2.read().unwrap().len(),
+            n + m,
+            "cached index reconciled to include bulk-added rows"
+        );
     }
 
     #[test]
