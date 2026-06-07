@@ -104,33 +104,94 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Handle>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Per-key build lock so builds of the SAME brain serialize without blocking
+/// other repos. The global `registry()` mutex is only held briefly (cache check
+/// / insert) — never across a build.
+fn build_lock_for(key: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let m = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+    g.entry(key.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Persist a built/updated index to its sidecar on a background thread so the
+/// triggering query isn't blocked by the (potentially large) write. Best-effort.
+/// usearch `save` takes `&self` and is fine concurrent with searches.
+fn spawn_save(handle: Handle) {
+    std::thread::spawn(move || {
+        let guard = handle.read().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = guard.save() {
+            eprintln!("kimetsu-brain: ann background save failed: {e}");
+        }
+    });
+}
+
 /// Resolve a shared index handle for read/search.
 ///
 /// On-disk DBs: one cached handle per canonical db path (built + reconciled on
 /// first use). In-memory/pathless DBs: a fresh transient handle rebuilt from the
 /// current SQLite state every call (tiny test DBs — correctness over speed).
 pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<Handle> {
-    // In-memory / pathless DBs: a fresh transient handle, rebuilt every call,
-    // so it can never be stale.
     let Some(key) = AnnIndex::sidecar_for(conn) else {
+        // in-memory / pathless: transient, rebuilt each call, never stale.
         return Ok(Arc::new(RwLock::new(AnnIndex::build_from_conn(
             conn, dim, model_id,
         )?)));
     };
-    let handle: Handle = {
-        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(h) = reg.get(&key) {
-            h.clone()
-        } else {
-            let idx = AnnIndex::open_or_build(conn, dim, model_id)?;
-            let h: Handle = Arc::new(RwLock::new(idx));
-            reg.insert(key, h.clone());
-            h
+    let handle = get_or_build_handle(&key, conn, dim, model_id)?;
+    reconcile_if_stale(&handle, conn)?;
+    Ok(handle)
+}
+
+/// Step 1: return the cached handle for `key`, or build it once under the
+/// per-key build lock and cache + background-persist it.
+///
+/// LOCK ORDERING (deadlock-critical): the per-key `build_lock` is the OUTER
+/// lock; the global `registry()` lock is only ever taken alone and briefly
+/// (cache check + insert) — NEVER acquired while holding `build_lock` for a
+/// build. We never acquire `build_lock` while holding `registry()`.
+fn get_or_build_handle(
+    key: &Path,
+    conn: &Connection,
+    dim: usize,
+    model_id: &str,
+) -> KimetsuResult<Handle> {
+    // Fast path: already cached (brief global lock only).
+    {
+        let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = reg.get(key) {
+            return Ok(h.clone());
         }
-    };
-    // Reconcile a cached index that has fallen behind SQLite (rows added
-    // out-of-band of the warm add path). Cheap guard: only pay the write lock
-    // + reconcile when MAX(rowid) shows new rows. Double-checked under the lock.
+    }
+    // Serialize builds of THIS key (other keys proceed concurrently).
+    let bl = build_lock_for(key);
+    let _g = bl.lock().unwrap_or_else(|p| p.into_inner());
+    // Double-check: someone may have built it while we waited.
+    {
+        let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = reg.get(key) {
+            return Ok(h.clone());
+        }
+    }
+    // Build WITHOUT holding the global registry lock.
+    let idx = AnnIndex::open_or_build(conn, dim, model_id)?;
+    let handle: Handle = Arc::new(RwLock::new(idx));
+    // Cache (brief global lock), then persist in the background so a restarted
+    // process LOADS the sidecar instead of rebuilding from scratch.
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_path_buf(), handle.clone());
+    spawn_save(handle.clone());
+    Ok(handle)
+}
+
+/// Step 2: reconcile a cached index that has fallen behind SQLite (rows added
+/// out-of-band of the warm add path). Cheap guard: only pay the write lock +
+/// reconcile when MAX(rowid) shows new rows. Double-checked under the lock.
+fn reconcile_if_stale(handle: &Handle, conn: &Connection) -> KimetsuResult<()> {
     let stale = {
         let idx = handle.read().unwrap_or_else(|p| p.into_inner());
         idx.is_stale(conn)?
@@ -141,7 +202,13 @@ pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> Kimets
             idx.reconcile(conn)?;
         }
     }
-    Ok(handle)
+    Ok(())
+}
+
+/// Build-or-load + cache the index for `conn`'s brain (no query). Lets a host
+/// pre-warm on startup so the first real request doesn't pay the cold build.
+pub fn warm(conn: &Connection, dim: usize, model_id: &str) -> KimetsuResult<()> {
+    handle_for_query(conn, dim, model_id).map(|_| ())
 }
 
 /// Cached write handle, or `None` for in-memory DBs (their writes are picked up
@@ -883,6 +950,94 @@ mod tests {
         .unwrap();
         on_invalidate(&conn, "m-x");
         assert_eq!(cached_handle(&conn).unwrap().read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn concurrent_same_key_builds_once() {
+        // N threads racing `handle_for_query` on the SAME on-disk brain must all
+        // receive ONE shared handle (built once under the per-key build lock).
+        let dim = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let n = 12usize;
+        for i in 0..n {
+            insert_row(&conn, i, dim);
+        }
+        drop(conn); // close our writer; each thread opens its own connection.
+        let db_path = db.clone();
+        let threads = 8usize;
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let p = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let conn = Connection::open(&p).unwrap();
+                handle_for_query(&conn, dim, "stub-d8").unwrap()
+            }));
+        }
+        let results: Vec<Handle> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = results[0].clone();
+        for h in &results[1..] {
+            assert!(
+                Arc::ptr_eq(&first, h),
+                "all concurrent builds must share ONE handle (built once)"
+            );
+        }
+        assert_eq!(
+            first.read().unwrap().len(),
+            n,
+            "shared index covers all rows"
+        );
+    }
+
+    #[test]
+    fn build_persists_sidecar() {
+        // A fresh build is background-saved to its sidecar so a restarted process
+        // LOADS rather than rebuilds. Poll for the sidecar to appear.
+        let dim = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        for i in 0..10 {
+            insert_row(&conn, i, dim);
+        }
+        let _h = handle_for_query(&conn, dim, "stub-d8").unwrap();
+        let sidecar = db.with_extension("usearch");
+        let mut appeared = false;
+        for _ in 0..100 {
+            if sidecar.exists() {
+                appeared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            appeared,
+            "background save must persist the sidecar within ~2s"
+        );
+        // A fresh open loads the persisted sidecar (manifest valid) — same count.
+        let loaded = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("load sidecar");
+        assert_eq!(loaded.len(), 10, "reloaded sidecar covers all rows");
+    }
+
+    #[test]
+    fn warm_caches_handle() {
+        let dim = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        for i in 0..6 {
+            insert_row(&conn, i, dim);
+        }
+        assert!(cached_handle(&conn).is_none(), "cold before warm");
+        warm(&conn, dim, "stub-d8").expect("warm");
+        assert!(
+            cached_handle(&conn).is_some(),
+            "warm must build + cache the handle"
+        );
     }
 
     #[test]

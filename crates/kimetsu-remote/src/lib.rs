@@ -71,6 +71,12 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         state = state.with_ingest(std::sync::Arc::new(ing));
     }
 
+    // Background-warm existing repos so the first real request to each doesn't
+    // pay the cold ANN build. Detached thread — does NOT block startup. Compiles
+    // to nothing on lean (no-embeddings) builds.
+    #[cfg(feature = "embeddings")]
+    spawn_prewarm((*state.data_dir).clone());
+
     let tls = match (args.tls_cert.clone(), args.tls_key.clone()) {
         (Some(cert), Some(key)) => Some((cert, key)),
         _ => None,
@@ -105,6 +111,58 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     kimetsu_brain::ann::save_all();
 
     result
+}
+
+/// Background pre-warm: load-or-build + cache each repo's ANN index on startup
+/// so the first real request doesn't pay the cold build. Runs on ONE detached
+/// OS thread, warming repos SEQUENTIALLY (the build already saturates all cores
+/// via `parallel_add`; warming repos in parallel would oversubscribe). Per-repo
+/// errors are logged and swallowed so one bad repo can't abort warming.
+#[cfg(feature = "embeddings")]
+fn spawn_prewarm(data_dir: PathBuf) {
+    std::thread::spawn(move || {
+        // Resolve the process embedder once. On lean/Noop there are no vectors
+        // to index, so warming is pointless — bail immediately.
+        let embedder = kimetsu_brain::embeddings::open_default_embedder();
+        if embedder.is_noop() {
+            return;
+        }
+        let dim = embedder.dim();
+        let model_id = embedder.model_id();
+
+        let entries = match std::fs::read_dir(&data_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "ann prewarm: cannot read data dir; skipping");
+                return;
+            }
+        };
+        let mut warmed = 0usize;
+        for entry in entries.flatten() {
+            let root = entry.path();
+            // Skip non-dirs and repos that aren't initialized yet.
+            if !root.is_dir() || !root.join(".kimetsu").join("brain.db").exists() {
+                continue;
+            }
+            // Open the brain the SAME way the request path resolves it (no-git,
+            // read-only) and pre-warm its index.
+            match kimetsu_brain::project::load_project_readonly_at_root(&root) {
+                Ok((_, _, conn)) => match kimetsu_brain::ann::warm(&conn, dim, model_id) {
+                    Ok(()) => {
+                        warmed += 1;
+                        tracing::info!(repo = %root.display(), "ann prewarm: warmed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(repo = %root.display(), error = %e, "ann prewarm: warm failed");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(repo = %root.display(), error = %e, "ann prewarm: open failed");
+                }
+            }
+        }
+        tracing::info!(warmed, "ann prewarm: complete");
+    });
 }
 
 fn prepare_data_dir(p: &Path) -> Result<PathBuf, String> {
