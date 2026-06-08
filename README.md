@@ -91,8 +91,9 @@ win*, and lets that knowledge compound across runs.
    walks your project brain *and* your cross-project user brain, scores every
    candidate memory (relevance × usefulness × freshness × scope), de-duplicates,
    and injects the top few inside an adaptive token budget. On the semantic
-   build it also runs an in-database approximate-nearest-neighbour index
-   (sqlite-vec) so a memory surfaces even when the query shares no words with it.
+   build it also runs an approximate-nearest-neighbour index (usearch HNSW) so a
+   memory surfaces even when the query shares no words with it — O(log N) per
+   query, scaling to ~1M memories in ~3 GB RAM with sub-2s retrieval.
 2. **While it works**, Kimetsu is proactive: it surfaces "known pitfalls"
    before the first attempt, classifies the task to bias which kinds of memory
    it recalls, and the model calls `cite_memory` when a memory actually helps.
@@ -432,7 +433,7 @@ MCP wiring, and installed hooks. `kimetsu doctor --selftest` is the one-shot
 | Surface | What it is |
 |---------|------------|
 | **`kimetsu chat`** | A full terminal coding assistant — slash commands, skills, hooks, background tasks, MCP, agents. Runs against your workspace, no Harbor required. |
-| **`kimetsu` brain** | Durable, auto-migrating project + user memory in a single SQLite file. Citations, decay, conflict detection, FTS + optional semantic (sqlite-vec ANN) retrieval, and `kimetsu brain insights` effectiveness analytics. |
+| **`kimetsu` brain** | Durable, auto-migrating project + user memory in a single SQLite file. Citations, decay, conflict detection, FTS + optional semantic (usearch HNSW ANN, scales to ~1M memories) retrieval, and `kimetsu brain insights` effectiveness analytics. |
 | **`kimetsu bridge`** | Cross-harness skill portability — import/export skills between supported hosts such as Claude Code, Codex, Agents, and Kimetsu. |
 | **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as `kimetsu_*` tools. |
 | **Kimetsu Remote** *(beta)* | `kimetsu-remote` — the brain over HTTP MCP, one per repository, shared from a server (separate package). |

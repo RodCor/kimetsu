@@ -26,15 +26,26 @@ ADDED
     over a configurable recent-runs window. A new `context.served`
     event records every retrieval (hit or miss); `context.injected`
     now carries injected-token counts.
-  * **Semantic retrieval (sqlite-vec ANN).** On the embeddings build, an
-    approximate-nearest-neighbour index (sqlite-vec, statically linked)
-    finds memories whose *meaning* matches the query even with no shared
-    words. Retrieval is sharpened with embedding-MMR (collapses true
-    paraphrase duplicates) and an absolute semantic-relevance floor
-    (genuinely off-topic queries return nothing). Capsule caps are
-    config-driven (default 8) and injected tokens drop while the
-    relevant capsule is preserved. The lean (FTS-only) build is
-    unchanged.
+  * **Semantic retrieval (usearch HNSW ANN).** On the embeddings build, an
+    approximate-nearest-neighbour index (usearch HNSW) finds memories whose
+    *meaning* matches the query even with no shared words — **O(log N) per
+    query**, so retrieval stays fast as the corpus grows. The index is
+    candidate generation only; final ranking is an exact cosine rerank over the
+    stored f32 vectors, so the index can be quantized (**f16 by default**,
+    `i8`/`f32` via `KIMETSU_ANN_QUANTIZATION`) for a large RAM saving with
+    negligible quality loss. Retrieval is sharpened with embedding-MMR
+    (collapses true paraphrase duplicates) and an absolute semantic-relevance
+    floor (genuinely off-topic queries return nothing). Capsule caps are
+    config-driven (default 8) and injected tokens drop while the relevant
+    capsule is preserved. The lean (FTS-only) build is unchanged.
+  * **Scales to ~1M memories.** A million-memory corpus runs on modest
+    hardware: **~1.8 s p99 semantic retrieval and ~3 GB RAM at 1M** (f16
+    default; ~2.8 GB with `KIMETSU_ANN_QUANTIZATION=i8`). Both retrieval *and*
+    conflict-detection-on-write are O(log N) via the HNSW index — no
+    brute-force vector scan. Bulk ingest batches embedding; the index builds in
+    parallel across cores, maintains itself incrementally, persists a sidecar
+    so a restarted server loads instead of rebuilding, and Kimetsu Remote
+    pre-warms each repo's index on startup.
   * **Proactive & cost-shrinking recall (the agent brain).** Before the
     first implementation attempt, a tight retrieval surfaces a "Known
     pitfalls" block (failure patterns / conventions) — proactive, not
