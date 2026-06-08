@@ -20,8 +20,10 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 use kimetsu_core::KimetsuResult;
 
 /// Bump when the on-disk sidecar format or index params change in a way that
-/// makes an old sidecar unsafe to load — forces a rebuild.
-const SCHEMA_VERSION: u32 = 1;
+/// makes an old sidecar unsafe to load — forces a rebuild. v2: the manifest
+/// gained a `quant` field AND the default index scalar changed f32→f16, so all
+/// pre-v2 (f32) sidecars must be rebuilt.
+const SCHEMA_VERSION: u32 = 2;
 
 /// HNSW graph degree (M). Higher = better recall, more memory.
 const CONNECTIVITY: usize = 16;
@@ -42,13 +44,45 @@ struct Manifest {
     max_rowid_indexed: i64,
     /// Number of active vectors in the index (sanity check vs SQLite).
     count: usize,
+    /// Scalar quantization the sidecar was built with (`f16`/`i8`/`f32`). A
+    /// sidecar must NOT be loaded under a different quantization (silent
+    /// corruption), so `try_load` rejects a mismatch and forces a rebuild.
+    quant: String,
+}
+
+/// Index scalar quantization. f16 is the default — it ~halves the index's
+/// vector RAM with negligible quality loss (final ranking is an exact f32
+/// cosine rerank from SQLite, so the index only needs to surface the right
+/// candidate pool). `i8` quarters it (for tight containers); `f32` is full
+/// fidelity. Set via `KIMETSU_ANN_QUANTIZATION`.
+fn ann_scalar_kind() -> ScalarKind {
+    match std::env::var("KIMETSU_ANN_QUANTIZATION").ok().as_deref() {
+        Some("f32") => ScalarKind::F32,
+        Some("i8") => ScalarKind::I8,
+        Some("f16") | None => ScalarKind::F16,
+        Some(other) => {
+            eprintln!("kimetsu-brain: unknown KIMETSU_ANN_QUANTIZATION '{other}', using f16");
+            ScalarKind::F16
+        }
+    }
+}
+
+/// Stable string id for a ScalarKind, stored in the manifest so a sidecar built
+/// with one quantization is never loaded by a process configured for another.
+fn scalar_kind_id(k: ScalarKind) -> &'static str {
+    match k {
+        ScalarKind::F32 => "f32",
+        ScalarKind::F16 => "f16",
+        ScalarKind::I8 => "i8",
+        _ => "other",
+    }
 }
 
 fn index_options(dim: usize) -> IndexOptions {
     IndexOptions {
         dimensions: dim,
         metric: MetricKind::Cos,
-        quantization: ScalarKind::F32,
+        quantization: ann_scalar_kind(),
         connectivity: CONNECTIVITY,
         expansion_add: EXPANSION_ADD,
         expansion_search: EXPANSION_SEARCH,
@@ -445,6 +479,7 @@ impl AnnIndex {
             model_id: self.model_id.clone(),
             max_rowid_indexed: self.max_rowid_indexed,
             count: self.len(),
+            quant: scalar_kind_id(ann_scalar_kind()).to_string(),
         }
     }
 
@@ -496,6 +531,9 @@ impl AnnIndex {
         if manifest.schema_version != SCHEMA_VERSION
             || manifest.dim != dim
             || manifest.model_id != model_id
+            // A sidecar built under one quantization must never be loaded under
+            // another (the stored scalar type differs) — force a rebuild.
+            || manifest.quant != scalar_kind_id(ann_scalar_kind())
         {
             return Ok(None);
         }
@@ -518,44 +556,60 @@ impl AnnIndex {
     ///
     /// Cheap: rides the `idx_memories_scope_model_active` covering index.
     pub fn reconcile(&mut self, conn: &Connection) -> KimetsuResult<()> {
-        // 3a. New active rows since last index.
-        let new_rows: Vec<(i64, Vec<u8>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT rowid, embedding FROM memories
-                 WHERE invalidated_at IS NULL AND embedding IS NOT NULL
-                   AND embedding_model = ?1 AND rowid > ?2",
-            )?;
-            stmt.query_map(
-                rusqlite::params![self.model_id, self.max_rowid_indexed],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
-            )?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-        // Decode the new rows, tracking the max rowid, then parallel-add the
-        // delta. `parallel_add` does NOT grow capacity, so reserve explicitly.
-        let mut decoded: Vec<(i64, Vec<f32>)> = Vec::with_capacity(new_rows.len());
-        let mut max_rowid = self.max_rowid_indexed;
-        for (rowid, blob) in new_rows {
-            if blob.len() != self.dim * 4 {
-                continue;
-            }
-            let vec = match crate::embeddings::decode_embedding(&blob, Some(self.dim)) {
-                Ok(v) => v,
-                Err(_) => continue, // skip undecodable rows rather than abort the reconcile
-            };
-            if rowid > max_rowid {
-                max_rowid = rowid;
-            }
-            decoded.push((rowid, vec));
-        }
-        if !decoded.is_empty() {
+        // 3a. New active rows since last index. Stream the delta in chunks so a
+        // bulk load (e.g. 500k rows) never materializes its BLOBs + decoded f32
+        // all at once (~1.5GB transient). COUNT once + reserve the full delta up
+        // front, then decode + parallel-add each chunk and free it before the
+        // next. `parallel_add` does NOT grow capacity, but the upfront reserve
+        // covers the whole delta, so we do NOT re-reserve per chunk.
+        const RECONCILE_CHUNK: usize = 16384;
+        let delta_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE invalidated_at IS NULL AND embedding IS NOT NULL
+               AND embedding_model = ?1 AND rowid > ?2",
+            rusqlite::params![self.model_id, self.max_rowid_indexed],
+            |r| r.get(0),
+        )?;
+        if delta_count > 0 {
             self.index
-                .reserve(self.index.size() + decoded.len())
+                .reserve(self.index.size() + delta_count as usize)
                 .map_err(|e| format!("usearch reserve: {e}"))?;
-            parallel_add(&self.index, &decoded)?;
-            self.max_rowid_indexed = max_rowid;
         }
+        let mut stmt = conn.prepare(
+            "SELECT rowid, embedding FROM memories
+             WHERE invalidated_at IS NULL AND embedding IS NOT NULL
+               AND embedding_model = ?1 AND rowid > ?2 ORDER BY rowid",
+        )?;
+        let mut rows_iter = stmt.query(rusqlite::params![self.model_id, self.max_rowid_indexed])?;
+        let mut batch: Vec<(i64, Vec<f32>)> = Vec::with_capacity(RECONCILE_CHUNK);
+        let mut max_rowid = self.max_rowid_indexed;
+        loop {
+            let row = rows_iter.next()?;
+            let done = row.is_none();
+            if let Some(row) = row {
+                let rowid: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                // Skip malformed blobs and undecodable rows rather than abort.
+                if blob.len() == self.dim * 4
+                    && let Ok(vec) = crate::embeddings::decode_embedding(&blob, Some(self.dim))
+                {
+                    if rowid > max_rowid {
+                        max_rowid = rowid;
+                    }
+                    batch.push((rowid, vec));
+                }
+            }
+            if batch.len() >= RECONCILE_CHUNK || (done && !batch.is_empty()) {
+                parallel_add(&self.index, &batch)?;
+                batch.clear();
+            }
+            if done {
+                break;
+            }
+        }
+        drop(rows_iter);
+        drop(stmt);
+        self.max_rowid_indexed = max_rowid;
 
         // 3b. Remove rows now invalidated (only those <= the watermark; newer
         //     ones were never added). `remove` is a no-op if absent.
@@ -581,6 +635,172 @@ impl AnnIndex {
 mod tests {
     use super::*;
     use crate::embeddings::encode_embedding;
+
+    /// Run `f` with `KIMETSU_ANN_QUANTIZATION` set to `val` (or unset when
+    /// `None`), serialized via the process-wide test env lock and restored
+    /// afterwards. The quantization is process-global (read from env by
+    /// `ann_scalar_kind`), so env-mutating quant tests MUST go through here.
+    fn with_quant<R>(val: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_ANN_QUANTIZATION").ok();
+        // SAFETY: scoped via the shared mutex; no other thread races on env.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("KIMETSU_ANN_QUANTIZATION", v),
+                None => std::env::remove_var("KIMETSU_ANN_QUANTIZATION"),
+            }
+        }
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_ANN_QUANTIZATION", v),
+                None => std::env::remove_var("KIMETSU_ANN_QUANTIZATION"),
+            }
+        }
+        match out {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    /// Seed `n` deterministic pseudo-random unit-ish vectors into an in-memory
+    /// brain and return (conn, rowid->vec map). Shared by the recall tests.
+    fn seed_random(n: usize, dim: usize, model: &str) -> (Connection, Vec<(i64, Vec<f32>)>) {
+        use crate::embeddings::decode_embedding;
+        let conn = Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            conn.execute(
+                "INSERT INTO memories
+                   (memory_id, scope, kind, text, normalized_text, confidence,
+                    provenance_snapshot_json, created_at, use_count, usefulness_score,
+                    embedding, embedding_model)
+                 VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,?4)",
+                rusqlite::params![format!("m-{i:06}"), "t", encode_embedding(&v), model],
+            )
+            .expect("insert");
+        }
+        let mut stmt = conn
+            .prepare("SELECT rowid, embedding FROM memories")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .unwrap();
+        let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+        for row in rows {
+            let (rowid, blob) = row.unwrap();
+            vectors.push((rowid, decode_embedding(&blob, Some(dim)).unwrap()));
+        }
+        drop(stmt);
+        (conn, vectors)
+    }
+
+    /// Mean recall@k of the ANN index vs an exact brute-force cosine top-k.
+    fn measure_recall(idx: &AnnIndex, vectors: &[(i64, Vec<f32>)], k: usize, trials: usize) -> f32 {
+        use crate::embeddings::cosine_similarity;
+        let mut hit = 0usize;
+        let mut total = 0usize;
+        for t in 0..trials {
+            let q = &vectors[t * 7 % vectors.len()].1;
+            let mut scored: Vec<(i64, f32)> = vectors
+                .iter()
+                .map(|(id, v)| (*id, cosine_similarity(q, v)))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let exact: std::collections::HashSet<i64> =
+                scored.iter().take(k).map(|(id, _)| *id).collect();
+            let ann: std::collections::HashSet<i64> = idx
+                .search(q, k)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            hit += exact.intersection(&ann).count();
+            total += k;
+        }
+        hit as f32 / total as f32
+    }
+
+    #[test]
+    fn default_quant_is_f16() {
+        with_quant(None, || {
+            assert!(matches!(ann_scalar_kind(), ScalarKind::F16));
+            assert_eq!(scalar_kind_id(ScalarKind::F16), "f16");
+            assert_eq!(scalar_kind_id(ScalarKind::F32), "f32");
+            assert_eq!(scalar_kind_id(ScalarKind::I8), "i8");
+        });
+    }
+
+    #[test]
+    fn recall_guard_holds_under_f16() {
+        with_quant(Some("f16"), || {
+            let dim = 16;
+            let (conn, vectors) = seed_random(5000, dim, "stub");
+            let idx = AnnIndex::build_from_conn(&conn, dim, "stub").expect("build");
+            let recall = measure_recall(&idx, &vectors, 10, 50);
+            assert!(recall >= 0.95, "f16 recall@10 = {recall} (want >= 0.95)");
+        });
+    }
+
+    #[test]
+    fn i8_quant_builds_and_searches() {
+        with_quant(Some("i8"), || {
+            assert!(matches!(ann_scalar_kind(), ScalarKind::I8));
+            let dim = 16;
+            let (conn, vectors) = seed_random(5000, dim, "stub");
+            let idx = AnnIndex::build_from_conn(&conn, dim, "stub").expect("build");
+            assert_eq!(idx.len(), 5000, "i8 index covers all rows");
+            let hits = idx.search(&vectors[0].1, 10).expect("search");
+            assert_eq!(hits.len(), 10, "i8 search returns k results");
+            let recall = measure_recall(&idx, &vectors, 10, 50);
+            // i8 is lossier than f16; production over-fetches a pool of ~80 and
+            // exact-reranks, so candidate recall is what matters. Floor at 0.85;
+            // if i8 is lower, REPORT the observed number.
+            assert!(recall >= 0.85, "i8 recall@10 = {recall} (want >= 0.85)");
+        });
+    }
+
+    #[test]
+    fn manifest_quant_mismatch_forces_rebuild() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        // Build + save a sidecar under f16.
+        with_quant(Some("f16"), || {
+            let conn = Connection::open(&db).expect("open");
+            crate::schema::initialize(&conn).expect("init");
+            for i in 0..10usize {
+                insert_row(&conn, i, dim);
+            }
+            let idx = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("build");
+            idx.save().expect("save");
+            assert_eq!(idx.manifest().quant, "f16");
+            assert!(db.with_extension("usearch").exists(), "f16 sidecar written");
+        });
+        // Under i8, the f16 sidecar must NOT be reused.
+        with_quant(Some("i8"), || {
+            let conn = Connection::open(&db).expect("open");
+            let sidecar = db.with_extension("usearch");
+            assert!(
+                AnnIndex::try_load(&sidecar, dim, "stub-d8")
+                    .expect("try_load")
+                    .is_none(),
+                "f16 sidecar must be rejected when i8 is active"
+            );
+            // open_or_build rebuilds under i8 (covers the same 10 rows).
+            let idx = AnnIndex::open_or_build(&conn, dim, "stub-d8").expect("rebuild");
+            assert_eq!(idx.manifest().quant, "i8");
+            assert_eq!(idx.len(), 10, "rebuilt i8 index covers all rows");
+        });
+    }
 
     /// In-memory brain with `n` rows; vector i = a unit-ish vector pointing
     /// mostly along axis (i % dim). Deterministic, no embedder needed.
@@ -748,21 +968,22 @@ mod tests {
 
     #[test]
     fn recall_at_10_is_at_least_0_95_vs_brute_force() {
-        use crate::embeddings::{cosine_similarity, decode_embedding};
-        let dim = 16;
-        let n = 5000usize;
-        let conn = Connection::open_in_memory().expect("open");
-        crate::schema::initialize(&conn).expect("init");
-        // Deterministic pseudo-random unit vectors (LCG; no Math.random/Date).
-        let mut state: u64 = 0x9E3779B97F4A7C15;
-        let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
-        };
-        let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
-        for i in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
-            conn.execute(
+        with_quant(Some("f16"), || {
+            use crate::embeddings::{cosine_similarity, decode_embedding};
+            let dim = 16;
+            let n = 5000usize;
+            let conn = Connection::open_in_memory().expect("open");
+            crate::schema::initialize(&conn).expect("init");
+            // Deterministic pseudo-random unit vectors (LCG; no Math.random/Date).
+            let mut state: u64 = 0x9E3779B97F4A7C15;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            };
+            let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+            for i in 0..n {
+                let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+                conn.execute(
                 "INSERT INTO memories
                    (memory_id, scope, kind, text, normalized_text, confidence,
                     provenance_snapshot_json, created_at, use_count, usefulness_score,
@@ -770,45 +991,46 @@ mod tests {
                  VALUES (?1,'project','fact',?2,?2,1.0,'{}','2026-01-01T00:00:00Z',0,0.0,?3,'stub')",
                 rusqlite::params![format!("m-{i:06}"), "t", crate::embeddings::encode_embedding(&v)],
             ).expect("insert");
-        }
-        // Map rowid->vec for brute force.
-        let mut stmt = conn
-            .prepare("SELECT rowid, embedding FROM memories")
-            .unwrap();
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
-            .unwrap();
-        for row in rows {
-            let (rowid, blob) = row.unwrap();
-            vectors.push((rowid, decode_embedding(&blob, Some(dim)).unwrap()));
-        }
+            }
+            // Map rowid->vec for brute force.
+            let mut stmt = conn
+                .prepare("SELECT rowid, embedding FROM memories")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .unwrap();
+            for row in rows {
+                let (rowid, blob) = row.unwrap();
+                vectors.push((rowid, decode_embedding(&blob, Some(dim)).unwrap()));
+            }
 
-        let idx = AnnIndex::build_from_conn(&conn, dim, "stub").expect("build");
-        let trials = 50;
-        let k = 10;
-        let mut hit = 0usize;
-        let mut total = 0usize;
-        for t in 0..trials {
-            let q = &vectors[t * 7 % vectors.len()].1;
-            // Exact top-k by cosine.
-            let mut scored: Vec<(i64, f32)> = vectors
-                .iter()
-                .map(|(id, v)| (*id, cosine_similarity(q, v)))
-                .collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let exact: std::collections::HashSet<i64> =
-                scored.iter().take(k).map(|(id, _)| *id).collect();
-            let ann: std::collections::HashSet<i64> = idx
-                .search(q, k)
-                .unwrap()
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            hit += exact.intersection(&ann).count();
-            total += k;
-        }
-        let recall = hit as f32 / total as f32;
-        assert!(recall >= 0.95, "recall@10 = {recall} (want >= 0.95)");
+            let idx = AnnIndex::build_from_conn(&conn, dim, "stub").expect("build");
+            let trials = 50;
+            let k = 10;
+            let mut hit = 0usize;
+            let mut total = 0usize;
+            for t in 0..trials {
+                let q = &vectors[t * 7 % vectors.len()].1;
+                // Exact top-k by cosine.
+                let mut scored: Vec<(i64, f32)> = vectors
+                    .iter()
+                    .map(|(id, v)| (*id, cosine_similarity(q, v)))
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let exact: std::collections::HashSet<i64> =
+                    scored.iter().take(k).map(|(id, _)| *id).collect();
+                let ann: std::collections::HashSet<i64> = idx
+                    .search(q, k)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                hit += exact.intersection(&ann).count();
+                total += k;
+            }
+            let recall = hit as f32 / total as f32;
+            assert!(recall >= 0.95, "recall@10 = {recall} (want >= 0.95)");
+        });
     }
 
     /// Insert one axis-peaked row directly into SQLite (bypassing the index).
