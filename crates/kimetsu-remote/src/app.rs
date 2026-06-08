@@ -107,6 +107,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state_with(tmp.path()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/web")
+            .header("content-type", "application/json")
+            .header("authorization", "bearer   tok_admin")
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn per_repo_token_wrong_repo_is_403() {
         let tmp = tempfile::tempdir().unwrap();
         let app = build_router(state_with(tmp.path()));

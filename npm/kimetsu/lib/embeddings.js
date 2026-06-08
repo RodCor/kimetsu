@@ -106,9 +106,13 @@ function extract(archive, dest) {
 }
 
 function sha256File(filePath) {
-  const hash = crypto.createHash("sha256");
-  hash.update(fs.readFileSync(filePath));
-  return hash.digest("hex");
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
 }
 
 function checksumForAsset(manifest, assetName) {
@@ -123,13 +127,13 @@ function checksumForAsset(manifest, assetName) {
   return null;
 }
 
-function verifyChecksum(archivePath, assetName, checksumsPath) {
+async function verifyChecksum(archivePath, assetName, checksumsPath) {
   const manifest = fs.readFileSync(checksumsPath, "utf8");
   const expected = checksumForAsset(manifest, assetName);
   if (!expected) {
     throw new Error(`checksums.txt does not contain ${assetName}`);
   }
-  const actual = sha256File(archivePath);
+  const actual = await sha256File(archivePath);
   if (actual !== expected) {
     throw new Error(`checksum mismatch for ${assetName}: expected ${expected}, got ${actual}`);
   }
@@ -157,7 +161,7 @@ async function ensureEmbeddingsBinary({ version, target, binName }) {
     process.stderr.write(`kimetsu: fetching embeddings build (${assetName})…\n`);
     await download(downloadUrl(version, assetName), archivePath);
     await download(downloadUrl(version, "checksums.txt"), checksumsPath);
-    verifyChecksum(archivePath, assetName, checksumsPath);
+    await verifyChecksum(archivePath, assetName, checksumsPath);
 
     const extractDir = path.join(workdir, "extract");
     extract(archivePath, extractDir);

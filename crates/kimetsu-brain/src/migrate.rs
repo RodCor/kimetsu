@@ -100,13 +100,32 @@ fn durable_row_count(conn: &Connection) -> i64 {
         .unwrap_or(0)
 }
 
+fn unique_default_backup_path(candidate: PathBuf) -> PathBuf {
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (Some(parent), Some(file_name)) = (
+        candidate.parent(),
+        candidate.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return candidate;
+    };
+    for suffix in 1..1000 {
+        let next = parent.join(format!("{file_name}-{suffix}"));
+        if !next.exists() {
+            return next;
+        }
+    }
+    candidate
+}
+
 /// Snapshot the live DB before a version-advancing migration.  Returns the
 /// sidecar path, or `None` for an in-memory DB (nothing to back up) or when
 /// the DB contains zero memories (fresh install — nothing worth protecting).
 ///
 /// Uses SQLite's online backup API for a consistent copy that respects WAL.
 /// The sidecar is placed next to the source DB and named:
-///   `<db-filename>.bak-<from>-<to>-<unix_secs>`
+///   `<db-filename>.bak-<from>-<to>-<unix_nanos>`
 fn backup_before_migrate(conn: &Connection, from: i64, to: i64) -> KimetsuResult<Option<PathBuf>> {
     let db_path = match db_file_path(conn) {
         Some(p) => p,
@@ -121,10 +140,10 @@ fn backup_before_migrate(conn: &Connection, from: i64, to: i64) -> KimetsuResult
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    // Sidecar next to the DB: brain.db.bak-<from>-<to>-<ts>
+    // Sidecar next to the DB: brain.db.bak-<from>-<to>-<unix_nanos>
     let file_name = format!(
         "{}.bak-{from}-{to}-{ts}",
         db_path
@@ -132,7 +151,7 @@ fn backup_before_migrate(conn: &Connection, from: i64, to: i64) -> KimetsuResult
             .and_then(|n| n.to_str())
             .unwrap_or("brain.db")
     );
-    let dest_path = db_path.with_file_name(file_name);
+    let dest_path = unique_default_backup_path(db_path.with_file_name(file_name));
 
     // Online backup: open dest, copy main DB into it to completion.
     let mut dest = Connection::open(&dest_path)?;
@@ -307,7 +326,7 @@ pub(crate) fn run_with(
 
 /// Write a consistent full-DB snapshot of the brain at `brain_db_path` to
 /// `dest`.  When `dest` is `None`, the snapshot is placed next to the source
-/// DB and named `<brain.db>.backup-<unix_ts>`.
+/// DB and named `<brain.db>.backup-<unix_nanos>`.
 ///
 /// Uses the SQLite online backup API (same as `backup_before_migrate`) so the
 /// copy is WAL-aware and consistent even if another writer is active.
@@ -323,7 +342,7 @@ pub fn backup_brain(
 ) -> KimetsuResult<(std::path::PathBuf, u64)> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
 
     let dest_path = match dest {
@@ -336,7 +355,7 @@ pub fn backup_brain(
                     .and_then(|n| n.to_str())
                     .unwrap_or("brain.db")
             );
-            brain_db_path.with_file_name(file_name)
+            unique_default_backup_path(brain_db_path.with_file_name(file_name))
         }
     };
 
@@ -846,6 +865,31 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
             .expect("count memories in backup");
         assert_eq!(count, 1, "backup should contain 1 memory row");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn backup_brain_default_path_does_not_overwrite_existing_backup() {
+        let tmp_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir =
+            std::env::temp_dir().join(format!("kimetsu-test-backup-brain-unique-{tmp_id}"));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+
+        let db_path = tmp_dir.join("brain.db");
+        {
+            let _conn = make_full_brain_db(&db_path);
+        }
+
+        let (first, _) = backup_brain(&db_path, None).expect("first backup");
+        let (second, _) = backup_brain(&db_path, None).expect("second backup");
+
+        assert_ne!(first, second, "default backups must not overwrite");
+        assert!(first.exists(), "first backup should still exist");
+        assert!(second.exists(), "second backup should exist");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

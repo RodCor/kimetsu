@@ -29,6 +29,18 @@ fn session_header(headers: &HeaderMap) -> Option<HeaderValue> {
     headers.get("mcp-session-id").cloned()
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next()?;
+    let token = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 fn with_session(mut resp: Response, session: Option<HeaderValue>) -> Response {
     if let Some(sid) = session {
         resp.headers_mut()
@@ -112,10 +124,7 @@ async fn dispatch_request(
     };
 
     // 1. Auth (transport-level → real HTTP status).
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+    let bearer = bearer_token(headers);
     match auth::check(&state.auth, &repo, bearer) {
         AuthOutcome::Ok => {}
         AuthOutcome::Unauthorized => {

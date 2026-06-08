@@ -46,7 +46,7 @@ pub fn resolve_brain_root(data_dir: &Path, repo: &str) -> Result<PathBuf, String
 /// the no-git `init_project_at_root` so discovery never climbs out of the data
 /// dir.
 pub fn ensure_initialized(root: &Path) -> Result<(), String> {
-    if root.join(".kimetsu").exists() {
+    if root.join(".kimetsu").join("brain.db").is_file() {
         return Ok(());
     }
     std::fs::create_dir_all(root).map_err(|e| format!("create brain dir: {e}"))?;
@@ -83,5 +83,16 @@ mod tests {
         let root = resolve_brain_root(data, "acme-api").unwrap();
         assert!(root.starts_with(data));
         assert!(resolve_brain_root(data, "../etc").is_err());
+    }
+
+    #[test]
+    fn ensure_initialized_repairs_partial_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".kimetsu")).expect("partial state dir");
+
+        ensure_initialized(&root).expect("initialize");
+
+        assert!(root.join(".kimetsu").join("brain.db").is_file());
     }
 }

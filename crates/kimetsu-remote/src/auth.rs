@@ -3,15 +3,27 @@
 //! token.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use subtle::ConstantTimeEq;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct AuthConfig {
     /// Tokens valid for ALL repos.
     pub global: Vec<String>,
     /// repo-id → tokens valid only for that repo.
     pub per_repo: HashMap<String, Vec<String>>,
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let per_repo_token_count: usize = self.per_repo.values().map(Vec::len).sum();
+        f.debug_struct("AuthConfig")
+            .field("global_token_count", &self.global.len())
+            .field("per_repo_count", &self.per_repo.len())
+            .field("per_repo_token_count", &per_repo_token_count)
+            .finish()
+    }
 }
 
 impl AuthConfig {
@@ -143,5 +155,14 @@ mod tests {
         assert!(is_global_token(&cfg(), Some("tok_admin")));
         assert!(!is_global_token(&cfg(), Some("tok_api")));
         assert!(!is_global_token(&cfg(), Some("nope")));
+    }
+
+    #[test]
+    fn debug_does_not_expose_tokens() {
+        let text = format!("{:?}", cfg());
+        assert!(text.contains("global_token_count"));
+        assert!(!text.contains("tok_admin"));
+        assert!(!text.contains("tok_api"));
+        assert!(!text.contains("tok_web"));
     }
 }

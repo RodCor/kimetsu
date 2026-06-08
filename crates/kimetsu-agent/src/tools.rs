@@ -1592,15 +1592,15 @@ mod tests {
 
         let output = runtime
             .shell_command(CommandSpec {
-                program: "rustc".to_string(),
+                program: "git".to_string(),
                 args: vec!["--version".to_string()],
                 cwd_relative: None,
                 timeout_secs: Some(10),
                 expected_exit: Some(0),
             })
-            .expect("rustc command");
+            .expect("git command");
         assert_eq!(output.exit_code, 0);
-        assert!(output.stdout_summary.contains("rustc"));
+        assert!(output.stdout_summary.contains("git"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
