@@ -373,13 +373,15 @@ impl AnnIndex {
             if let Some(row) = row {
                 let rowid: i64 = row.get(0)?;
                 let blob: Vec<u8> = row.get(1)?;
+                if rowid > max_rowid {
+                    max_rowid = rowid;
+                }
                 // Skip malformed blobs and undecodable rows rather than abort.
+                // The watermark still advances so a corrupt high-rowid vector
+                // does not force reconciliation on every later query.
                 if blob.len() == self.dim * 4
                     && let Ok(vec) = crate::embeddings::decode_embedding(&blob, Some(self.dim))
                 {
-                    if rowid > max_rowid {
-                        max_rowid = rowid;
-                    }
                     batch.push((rowid, vec));
                 }
             }
@@ -541,6 +543,9 @@ impl AnnIndex {
         if index.load(sidecar.to_string_lossy().as_ref()).is_err() {
             return Ok(None); // corrupt sidecar → rebuild
         }
+        if index.size() != manifest.count {
+            return Ok(None);
+        }
         Ok(Some(Self {
             index,
             dim,
@@ -589,13 +594,15 @@ impl AnnIndex {
             if let Some(row) = row {
                 let rowid: i64 = row.get(0)?;
                 let blob: Vec<u8> = row.get(1)?;
+                if rowid > max_rowid {
+                    max_rowid = rowid;
+                }
                 // Skip malformed blobs and undecodable rows rather than abort.
+                // The watermark still advances so a corrupt high-rowid vector
+                // is skipped once instead of retried on every query forever.
                 if blob.len() == self.dim * 4
                     && let Ok(vec) = crate::embeddings::decode_embedding(&blob, Some(self.dim))
                 {
-                    if rowid > max_rowid {
-                        max_rowid = rowid;
-                    }
                     batch.push((rowid, vec));
                 }
             }
@@ -838,24 +845,28 @@ mod tests {
 
     #[test]
     fn search_returns_nearest_rowid_first() {
-        let dim = 8;
-        let conn = seed_conn(dim, dim, "stub-d8"); // one row per axis
-        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
-        // Query strongly along axis 3 → row whose rowid maps to memory m-000003.
-        let mut q = vec![0.0f32; dim];
-        q[3] = 1.0;
-        let hits = idx.search(&q, 3).expect("search");
-        assert!(!hits.is_empty(), "got candidates");
-        // The nearest must be the row with embedding peaked on axis 3.
-        let (rowid, _dist) = hits[0];
-        let mid: String = conn
-            .query_row(
-                "SELECT memory_id FROM memories WHERE rowid = ?1",
-                rusqlite::params![rowid],
-                |r| r.get(0),
-            )
-            .expect("map rowid");
-        assert_eq!(mid, "m-000003");
+        // Pin f16 (+ serialize via the env lock) so a concurrent quant-mutating
+        // test can't flip this order-sensitive search assertion.
+        with_quant(Some("f16"), || {
+            let dim = 8;
+            let conn = seed_conn(dim, dim, "stub-d8"); // one row per axis
+            let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+            // Query strongly along axis 3 → row whose rowid maps to memory m-000003.
+            let mut q = vec![0.0f32; dim];
+            q[3] = 1.0;
+            let hits = idx.search(&q, 3).expect("search");
+            assert!(!hits.is_empty(), "got candidates");
+            // The nearest must be the row with embedding peaked on axis 3.
+            let (rowid, _dist) = hits[0];
+            let mid: String = conn
+                .query_row(
+                    "SELECT memory_id FROM memories WHERE rowid = ?1",
+                    rusqlite::params![rowid],
+                    |r| r.get(0),
+                )
+                .expect("map rowid");
+            assert_eq!(mid, "m-000003");
+        });
     }
 
     #[test]
@@ -1050,28 +1061,31 @@ mod tests {
 
     #[test]
     fn parallel_build_indexes_all_rows() {
-        // 2000 rows exercises parallel_add's partitioning across threads; all
-        // rows must be indexed and a peaked query must return the right axis row.
-        let dim = 8;
-        let conn = seed_conn(2000, dim, "stub-d8");
-        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
-        assert_eq!(idx.len(), 2000, "all 2000 rows indexed by parallel build");
-        // Row whose embedding peaks on axis 3 is m-000003 (rowid maps via SQL).
-        let mut q = vec![0.0f32; dim];
-        q[3] = 1.0;
-        let hits = idx.search(&q, 5).expect("search");
-        assert!(!hits.is_empty(), "got candidates");
-        // Rows are seeded in insert order (rowid == i+1), so the row whose
-        // embedding peaks on axis 3 has (rowid-1) % dim == 3. Many rows tie on
-        // axis 3 (identical vectors), so the nearest neighbours must all be
-        // axis-3 rows — that proves parallel_add indexed correct vectors.
-        for (rowid, _dist) in &hits {
-            assert_eq!(
-                (*rowid - 1) % dim as i64,
-                3,
-                "every axis-3 query hit must be an axis-3 row, got rowid {rowid}"
+        // 2000 DISTINCT vectors exercise parallel_add's partitioning across
+        // threads. We verify (a) every row is indexed (len) and (b) a sample of
+        // rows self-retrieve — searching a row's own vector returns that row as
+        // the nearest — which proves parallel_add stored the correct vectors.
+        // Distinct (not identical) vectors are used deliberately: many byte-
+        // identical points are a degenerate HNSW input that real embeddings
+        // never produce. Pinned to f16 + serialized via the env lock so a
+        // concurrent quant-mutating test can't perturb the search.
+        with_quant(Some("f16"), || {
+            let dim = 16;
+            let n = 2000;
+            let (conn, vectors) = seed_random(n, dim, "stub-d16");
+            let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d16").expect("build");
+            assert_eq!(idx.len(), n, "all {n} rows indexed by parallel build");
+            // Vector correctness: assert MEAN recall@10, not exact per-row
+            // retrieval. HNSW is APPROXIMATE — even querying an indexed vector
+            // returns it as the #1 hit only ~98-99% of the time — so an exact
+            // top-k assertion would flake. A high mean recall proves parallel_add
+            // stored the right vectors (mirrors `recall_guard_holds_under_f16`).
+            let recall = measure_recall(&idx, &vectors, 10, 100);
+            assert!(
+                recall >= 0.9,
+                "parallel-built index recall@10 = {recall} (want >= 0.9)"
             );
-        }
+        });
     }
 
     #[test]
@@ -1093,6 +1107,62 @@ mod tests {
         assert!(
             idx.is_stale(&conn).expect("stale check"),
             "stale after out-of-band inserts"
+        );
+    }
+
+    #[test]
+    fn malformed_embedding_rows_do_not_keep_index_stale() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        insert_row(&conn, 0, dim);
+        conn.execute(
+            "INSERT INTO memories
+               (memory_id, scope, kind, text, normalized_text, confidence,
+                provenance_snapshot_json, created_at, use_count, usefulness_score,
+                embedding, embedding_model)
+             VALUES ('m-bad','project','fact','bad','bad',1.0,'{}',
+                     '2026-01-01T00:00:00Z',0,0.0,?1,'stub-d8')",
+            rusqlite::params![vec![1_u8, 2, 3]],
+        )
+        .expect("insert malformed embedding");
+
+        let idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+        assert_eq!(idx.len(), 1, "only the valid vector is indexed");
+        assert!(
+            !idx.is_stale(&conn).expect("stale check"),
+            "malformed high-rowid embeddings should not force repeated reconcile"
+        );
+    }
+
+    #[test]
+    fn reconcile_advances_watermark_past_malformed_delta() {
+        let dim = 8;
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).expect("open");
+        crate::schema::initialize(&conn).expect("init");
+        insert_row(&conn, 0, dim);
+        let mut idx = AnnIndex::build_from_conn(&conn, dim, "stub-d8").expect("build");
+
+        conn.execute(
+            "INSERT INTO memories
+               (memory_id, scope, kind, text, normalized_text, confidence,
+                provenance_snapshot_json, created_at, use_count, usefulness_score,
+                embedding, embedding_model)
+             VALUES ('m-bad-delta','project','fact','bad','bad',1.0,'{}',
+                     '2026-01-01T00:00:00Z',0,0.0,?1,'stub-d8')",
+            rusqlite::params![vec![1_u8, 2, 3]],
+        )
+        .expect("insert malformed embedding");
+
+        idx.reconcile(&conn).expect("reconcile");
+        assert_eq!(idx.len(), 1, "malformed delta is skipped");
+        assert!(
+            !idx.is_stale(&conn).expect("stale check"),
+            "malformed delta should be skipped once, not retried forever"
         );
     }
 
