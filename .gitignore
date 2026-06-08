@@ -47,3 +47,4 @@
 
 # Local Codex security-scan artifacts (not part of the project)
 .codex-security-scans/
+/docs/superpowers
