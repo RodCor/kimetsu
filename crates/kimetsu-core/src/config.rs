@@ -288,10 +288,14 @@ pub struct BrokerSection {
     /// path more often. Inert on lean (NoopEmbedder) builds because
     /// there is no query embedding to compare against.
     ///
-    /// Default 0.0 (disabled) — the threshold does NOT change
-    /// existing test outcomes; operators opt in by raising it in
-    /// project.toml. `#[serde(default)]` keeps older configs loading.
-    #[serde(default)]
+    /// Default 0.35 (v1.0.0, was 0.0/disabled): with the warm daemon now
+    /// serving semantic retrieval to every prompt, the floor needs teeth by
+    /// default — bge-family cosines for genuinely related pairs sit well
+    /// above ~0.5 while unrelated pairs cluster below ~0.4, so 0.35 trims
+    /// clear noise without starving recall. Tune against `kimetsu brain
+    /// eval`; set 0.0 to restore the old keep-everything behaviour.
+    /// `#[serde(default = …)]` keeps older configs loading with the floor on.
+    #[serde(default = "default_min_semantic_score")]
     pub min_semantic_score: f32,
     /// v1.0.0: absolute *lexical* relevance floor for memory candidates,
     /// expressed as the fraction of the query's IDF-weighted discriminating
@@ -340,6 +344,10 @@ fn default_max_capsules() -> usize {
     8
 }
 
+fn default_min_semantic_score() -> f32 {
+    0.35
+}
+
 fn default_min_lexical_coverage() -> f32 {
     0.5
 }
@@ -358,7 +366,7 @@ impl Default for BrokerSection {
             default_budget_tokens: 6000,
             weights: BrokerWeights::default(),
             max_capsules: default_max_capsules(),
-            min_semantic_score: 0.0,
+            min_semantic_score: default_min_semantic_score(),
             min_lexical_coverage: default_min_lexical_coverage(),
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
@@ -610,7 +618,9 @@ max_total_cost_usd = 250.0
         // D1e/D1f: pre-D1 configs without max_capsules / min_semantic_score
         // must load cleanly and receive the safe defaults.
         assert_eq!(config.broker.max_capsules, 8);
-        assert_eq!(config.broker.min_semantic_score, 0.0);
+        // v1.0.0: the semantic floor is ON by default (was 0.0/disabled) now
+        // that the warm daemon serves semantic retrieval to every prompt.
+        assert_eq!(config.broker.min_semantic_score, 0.35);
         // v1.0.0: a config without min_lexical_coverage loads with the floor
         // active at its default (0.5), so existing installs gain the relevance
         // gate on upgrade.

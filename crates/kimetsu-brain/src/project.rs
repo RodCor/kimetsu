@@ -395,10 +395,13 @@ impl BrainSession {
         &self,
         mut request: ContextRequest,
     ) -> KimetsuResult<ContextBundle> {
-        // v1.0.0: drive the lexical-relevance floor from config unless the
-        // caller set its own (non-zero) value.
+        // v1.0.0: drive the lexical + semantic relevance floors from config
+        // unless the caller set its own (non-zero) values.
         if request.min_lexical_coverage == 0.0 {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
+        }
+        if request.min_semantic_score == 0.0 {
+            request.min_semantic_score = self.config.broker.min_semantic_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
@@ -471,6 +474,11 @@ impl BrainSession {
     ) -> KimetsuResult<ContextBundle> {
         if request.min_lexical_coverage == 0.0 {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
+        }
+        // v1.0.0: semantic floor from config too — this is the daemon's path,
+        // where a real query embedding makes the cosine floor effective.
+        if request.min_semantic_score == 0.0 {
+            request.min_semantic_score = self.config.broker.min_semantic_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
