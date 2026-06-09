@@ -33,7 +33,13 @@ ADDED
     measures recall@2/4 + MRR across fts / semantic / semantic+rerank modes
     against a committed fixture (`fixtures/eval-retrieval.json`), so ranking
     changes are measurable: baseline shows semantic recall@4 0.90 / MRR 0.91
-    vs FTS 0.72 / 0.81.
+    vs FTS 0.72 / 0.81. `--rerankers <ids>` benchmarks cross-encoders
+    head-to-head (quality + per-query latency); non-curated models load as
+    user-defined ONNX from any HuggingFace repo via hf-hub. Measured result:
+    `jina-reranker-v1-tiny-en` beats the bigger turbo model on both quality
+    (recall@4 0.896 / MRR 0.938 vs 0.833 / 0.875) and speed (~95ms vs ~137ms
+    per query) and is the recommended opt-in; ms-marco TinyBERT-L-2 is ~11×
+    faster still (8.5ms) but its quality (0.715) merely matches FTS.
   * **Warm embedder daemon — semantic recall at hook time.** The
     `UserPromptSubmit` context-hook can now match memories by *meaning*, not
     just lexically. A single per-user daemon (`kimetsu brain embed-daemon`,

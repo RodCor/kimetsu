@@ -101,17 +101,24 @@ pub struct EmbedderSection {
     #[serde(default = "default_true")]
     pub warm_on_start: bool,
     /// v1.0.0: cross-encoder reranker the warm daemon applies as the final
-    /// ranking stage. `"off"` (default) or one of the curated fastembed
-    /// reranker ids (`jina-reranker-v1-turbo-en`, `bge-reranker-base`,
-    /// `bge-reranker-v2-m3`, `jina-reranker-v2-base-multilingual`).
+    /// ranking stage. `"off"` (default), a curated fastembed reranker id
+    /// (`jina-reranker-v1-turbo-en`, `bge-reranker-base`,
+    /// `bge-reranker-v2-m3`, `jina-reranker-v2-base-multilingual`), a
+    /// benchmarked alias (`jina-reranker-v1-tiny-en`,
+    /// `ms-marco-tinybert-l-2-v2`, `ms-marco-minilm-l-4-v2`), or any
+    /// HuggingFace `org/repo` with an ONNX export.
     ///
     /// Off by default because it's a measured quality-over-latency trade:
-    /// a full-fidelity rerank of the 12-capsule pool costs ~0.5–1s on a
-    /// typical CPU — beyond the hook's 300ms budget — while the default
-    /// semantic path (hybrid cosine + the `min_semantic_score` floor)
-    /// already scores recall@4 ≈ 0.90 on the eval fixture at ~100ms.
-    /// Enable it when top-position precision matters more than first-turn
-    /// latency; validate with `kimetsu brain eval`.
+    /// reranking a 12-capsule pool of real (long) memories exceeds the
+    /// hook's 300ms budget on a typical CPU, while the default semantic
+    /// path (hybrid cosine + the `min_semantic_score` floor) already
+    /// scores recall@4 ≈ 0.90 / MRR 0.91 on the eval fixture at ~100ms.
+    /// Benchmarked (`kimetsu brain eval --rerankers …`): the best opt-in is
+    /// `jina-reranker-v1-tiny-en` — recall@4 0.896 / MRR 0.938, ~95ms per
+    /// query on short capsules, noise → 0 — beating the larger turbo model
+    /// on BOTH quality and speed. Enable it when top-position precision
+    /// matters more than first-turn latency; validate on your own corpus
+    /// with `kimetsu brain eval`.
     #[serde(default = "default_reranker_id")]
     pub reranker: String,
 }
