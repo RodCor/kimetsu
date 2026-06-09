@@ -95,6 +95,8 @@ pub fn serve(state: Arc<DaemonState>) -> std::io::Result<()> {
             let Ok(conn) = conn else { break };
             if handle_connection(&state, conn) {
                 shutdown.store(true, Ordering::Relaxed);
+                // Unblock our own accept() so the loop observes the flag and exits.
+                let _ = ipc::connect(&state.model);
                 break;
             }
         }));
@@ -110,7 +112,10 @@ pub fn serve(state: Arc<DaemonState>) -> std::io::Result<()> {
                     break;
                 }
             }
-            Err(_) => continue,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
         }
     }
     Ok(())
@@ -177,8 +182,6 @@ mod tests {
             let mut r = BufReader::new(&conn);
             let _resp: proto::Response = proto::read_line(&mut r).unwrap();
         }
-        // Nudge the accept loop so it observes the shutdown flag and returns.
-        let _ = ipc::connect(&model);
         server.join().unwrap();
     }
 }

@@ -3755,10 +3755,20 @@ fn brain_embed_daemon(args: EmbedDaemonArgs) -> KimetsuResult<()> {
         loaded_ms,
         requests: AtomicU64::new(0),
     });
-    // AddrInUse means another daemon already owns the name — exit 0.
+    // AddrInUse / PermissionDenied / AlreadyExists all mean another daemon
+    // already owns the socket name (Windows race variants) — exit 0.
     match serve(state) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AddrInUse
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -3766,8 +3776,17 @@ fn brain_embed_daemon(args: EmbedDaemonArgs) -> KimetsuResult<()> {
 #[cfg(feature = "embeddings")]
 fn brain_warm() -> KimetsuResult<()> {
     let workspace = env::current_dir().unwrap_or_default();
+    // warm_on_start gate: only PRE-warm at startup when configured to. When
+    // false the daemon still warms lazily on the first prompt (via the hook's
+    // ensure-spawn path) — this only suppresses the SessionStart pre-warm.
+    if let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        && let Ok(config) = project::load_config(&paths)
+        && !config.embedder.warm_on_start
+    {
+        return Ok(());
+    }
     let Some(model) = resolve_daemon_model(&workspace) else {
-        return Ok(()); // disabled by config/env — silent no-op
+        return Ok(());
     };
     embed_daemon::client::ensure_daemon(&model);
     Ok(())
@@ -3841,8 +3860,10 @@ fn try_daemon_retrieve(
             Some(daemon_capsules_to_bundle(request, capsules, skipped, top_score))
         }
         _ => {
-            // Unreachable/errored -> ensure one is coming up for next time.
-            client::ensure_daemon(&model);
+            // Unreachable/errored: we already know it didn't answer, so spawn
+            // directly (no second ping) to keep within the single 750ms budget.
+            // A duplicate spawn loses the OS single-instance race and exits.
+            let _ = client::spawn_daemon(&model);
             None
         }
     }
