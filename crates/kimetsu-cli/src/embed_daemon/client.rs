@@ -8,8 +8,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// Total wall-clock budget for connect+request before we give up and let the
-/// caller fall back to FTS.
-const REQUEST_BUDGET: Duration = Duration::from_millis(750);
+/// caller fall back to FTS. 300ms total: embed ~10ms + ANN + rerank-of-12
+/// ~30–80ms comfortably fits; anything slower falls back to FTS by design.
+const REQUEST_BUDGET: Duration = Duration::from_millis(300);
 
 /// Send one request to the daemon for `model`, returning the response or
 /// `None` on any failure/timeout. Runs the blocking socket I/O on a worker
@@ -35,12 +36,13 @@ fn exchange(model: &str, req: proto::Request) -> std::io::Result<proto::Response
     proto::read_line(&mut reader)
 }
 
-/// Spawn `kimetsu brain embed-daemon --model <model>` detached. Fire-and-
-/// forget: returns immediately; the model load happens inside the child.
-pub fn spawn_daemon(model: &str) -> std::io::Result<()> {
+/// Spawn `kimetsu brain embed-daemon --model <model> --reranker <reranker>`
+/// detached. Fire-and-forget: returns immediately; the model load happens
+/// inside the child.
+pub fn spawn_daemon(model: &str, reranker: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["brain", "embed-daemon", "--model", model])
+    cmd.args(["brain", "embed-daemon", "--model", model, "--reranker", reranker])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -56,11 +58,11 @@ pub fn spawn_daemon(model: &str) -> std::io::Result<()> {
 /// Ensure a daemon is reachable for `model`: a quick ping; if unreachable,
 /// spawn one (detached) and return — the CURRENT call still falls back to FTS,
 /// but the next prompt will find it warm.
-pub fn ensure_daemon(model: &str) {
+pub fn ensure_daemon(model: &str, reranker: &str) {
     if request(model, proto::Request::Ping).is_some() {
         return;
     }
-    let _ = spawn_daemon(model);
+    let _ = spawn_daemon(model, reranker);
 }
 
 #[cfg(test)]

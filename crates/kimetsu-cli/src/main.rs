@@ -737,6 +737,10 @@ struct EmbedDaemonArgs {
     /// Embedder model id to load (resolved from config by the spawner).
     #[arg(long)]
     model: String,
+    /// Cross-encoder reranker id (resolved from config by the spawner).
+    /// `"off"` disables reranking for this daemon process.
+    #[arg(long, default_value = "off")]
+    reranker: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -3747,9 +3751,11 @@ fn brain_embed_daemon(args: EmbedDaemonArgs) -> KimetsuResult<()> {
 
     let t0 = Instant::now();
     let embedder = kimetsu_brain::embeddings::open_embedder_for_model(&args.model);
+    let reranker = kimetsu_brain::embeddings::open_reranker_for_model(&args.reranker);
     let loaded_ms = t0.elapsed().as_millis() as u64;
     let state = Arc::new(DaemonState {
         embedder,
+        reranker,
         model: args.model,
         started: Instant::now(),
         loaded_ms,
@@ -3788,7 +3794,8 @@ fn brain_warm() -> KimetsuResult<()> {
     let Some(model) = resolve_daemon_model(&workspace) else {
         return Ok(());
     };
-    embed_daemon::client::ensure_daemon(&model);
+    let reranker = resolve_daemon_reranker(&workspace);
+    embed_daemon::client::ensure_daemon(&model, &reranker);
     Ok(())
 }
 
@@ -3834,6 +3841,19 @@ fn resolve_daemon_model(workspace: &std::path::Path) -> Option<String> {
     Some(kimetsu_brain::embeddings::resolve_embedder_id(Some(config.embedder.model.as_str())).to_string())
 }
 
+/// Resolve the reranker id from config. Falls back to `"off"` when config is
+/// unreadable so the daemon stays functional without a reranker.
+#[cfg(feature = "embeddings")]
+fn resolve_daemon_reranker(workspace: &std::path::Path) -> String {
+    let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(workspace) else {
+        return "off".to_string();
+    };
+    let Ok(config) = project::load_config(&paths) else {
+        return "off".to_string();
+    };
+    config.embedder.reranker
+}
+
 /// Try semantic retrieval via the warm daemon. Returns `None` (-> FTS fallback)
 /// when embeddings aren't built, the daemon is disabled by config/env, or the
 /// daemon is unreachable within the client budget. On a miss it also kicks off
@@ -3861,9 +3881,10 @@ fn try_daemon_retrieve(
         }
         _ => {
             // Unreachable/errored: we already know it didn't answer, so spawn
-            // directly (no second ping) to keep within the single 750ms budget.
+            // directly (no second ping) to keep within the single 300ms budget.
             // A duplicate spawn loses the OS single-instance race and exits.
-            let _ = client::spawn_daemon(&model);
+            let reranker = resolve_daemon_reranker(workspace);
+            let _ = client::spawn_daemon(&model, &reranker);
             None
         }
     }

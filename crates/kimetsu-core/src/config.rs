@@ -100,10 +100,22 @@ pub struct EmbedderSection {
     /// daemon (if `daemon=true`) warms lazily on the first prompt instead.
     #[serde(default = "default_true")]
     pub warm_on_start: bool,
+    /// v1.0.0: cross-encoder reranker the warm daemon applies as the final
+    /// ranking stage. One of the curated fastembed reranker ids
+    /// (`jina-reranker-v1-turbo-en` default, `bge-reranker-base`,
+    /// `bge-reranker-v2-m3`, `jina-reranker-v2-base-multilingual`) or
+    /// `"off"` to disable reranking. `#[serde(default = …)]` keeps older
+    /// configs loading with the reranker on.
+    #[serde(default = "default_reranker_id")]
+    pub reranker: String,
 }
 
 fn default_embedder_id() -> String {
     "bge-small-en-v1.5".to_string()
+}
+
+fn default_reranker_id() -> String {
+    "jina-reranker-v1-turbo-en".to_string()
 }
 
 fn default_true() -> bool {
@@ -117,6 +129,7 @@ impl Default for EmbedderSection {
             enabled: default_true(),
             daemon: default_true(),
             warm_on_start: default_true(),
+            reranker: default_reranker_id(),
         }
     }
 }
@@ -626,6 +639,13 @@ max_total_cost_usd = 250.0
         assert!(
             config.embedder.warm_on_start,
             "embedder.warm_on_start must default to true"
+        );
+        // v1.0.0: reranker defaults to jina-reranker-v1-turbo-en so existing
+        // installs gain the cross-encoder ranking stage on upgrade.
+        assert_eq!(
+            config.embedder.reranker,
+            "jina-reranker-v1-turbo-en",
+            "embedder.reranker must default to jina-reranker-v1-turbo-en"
         );
     }
 

@@ -11,9 +11,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Candidate pool the reranker judges before truncating to the caller's cap.
+const RERANK_POOL: usize = 12;
+
+/// Sigmoid-score floor — capsules the cross-encoder judges below this are noise.
+const RERANK_FLOOR: f32 = 0.30;
+
 /// Process-global state shared by all worker threads.
 pub struct DaemonState {
     pub embedder: Box<dyn Embedder + Send + Sync>,
+    pub reranker: Option<Box<dyn kimetsu_brain::embeddings::Reranker>>,
     pub model: String,
     pub started: Instant,
     pub loaded_ms: u64,
@@ -43,29 +50,55 @@ impl DaemonState {
             Ok(s) => s,
             Err(e) => return proto::Response::Error { message: format!("open: {e}") },
         };
+        // Clone query before it's moved into the request so we can pass it to
+        // the reranker after retrieval.
+        let query = args.query.clone();
+        let cap = args.max_capsules;
+        // When reranking, over-fetch a larger candidate pool so the
+        // cross-encoder sees enough diversity before truncating to `cap`.
+        let fetch_cap = if self.reranker.is_some() { cap.max(RERANK_POOL) } else { cap };
+        // Bump the token budget so the pool isn't budget-starved before the
+        // reranker sees it.
+        let budget = if self.reranker.is_some() {
+            (if args.budget_tokens == 0 { 2000 } else { args.budget_tokens }).max(6000)
+        } else {
+            if args.budget_tokens == 0 { 2000 } else { args.budget_tokens }
+        };
         let request = ContextRequest {
             stage: if args.stage.is_empty() { "localization".into() } else { args.stage },
             query: args.query,
-            budget_tokens: if args.budget_tokens == 0 { 2000 } else { args.budget_tokens },
+            budget_tokens: budget,
             min_score: args.min_score,
-            max_capsules: args.max_capsules,
+            max_capsules: fetch_cap,
             tags: args.tags,
             ..Default::default()
         };
         match session.retrieve_context_with_injected_embedder(request, self.embedder.as_ref()) {
-            Ok(bundle) => proto::Response::Capsules {
-                capsules: bundle
-                    .capsules
-                    .iter()
-                    .map(|c| proto::Capsule {
-                        summary: c.summary.clone(),
-                        kind: c.kind.clone(),
-                        score: c.score,
-                    })
-                    .collect(),
-                skipped: bundle.skipped,
-                top_score: bundle.top_score,
-            },
+            Ok(mut bundle) => {
+                // Apply cross-encoder reranking when a reranker is present.
+                if let Some(rr) = &self.reranker {
+                    bundle.capsules = kimetsu_brain::context::rerank_capsules(
+                        &query,
+                        bundle.capsules,
+                        rr.as_ref(),
+                        RERANK_FLOOR,
+                        cap,
+                    );
+                }
+                proto::Response::Capsules {
+                    capsules: bundle
+                        .capsules
+                        .iter()
+                        .map(|c| proto::Capsule {
+                            summary: c.summary.clone(),
+                            kind: c.kind.clone(),
+                            score: c.score,
+                        })
+                        .collect(),
+                    skipped: bundle.skipped,
+                    top_score: bundle.top_score,
+                }
+            }
             Err(e) => proto::Response::Error { message: format!("retrieve: {e}") },
         }
     }
@@ -156,6 +189,7 @@ mod tests {
         let model = unique_model();
         let state = Arc::new(DaemonState {
             embedder: Box::new(kimetsu_brain::embeddings::StubEmbedder::default()),
+            reranker: None,
             model: model.clone(),
             started: Instant::now(),
             loaded_ms: 0,
@@ -183,5 +217,97 @@ mod tests {
             let _resp: proto::Response = proto::read_line(&mut r).unwrap();
         }
         server.join().unwrap();
+    }
+
+    /// Direct-retrieve unit test for the rerank plumbing.
+    ///
+    /// Seeds a hermetic temp brain with two memories: one that shares many words
+    /// with the query ("rust async tokio"), one that shares none ("python
+    /// django"). The StubReranker scores by token overlap, so the rust memory
+    /// must win. With `max_capsules: 1` exactly one capsule is returned and it
+    /// must be the rust one. No socket is used — we call `DaemonState::retrieve`
+    /// directly.
+    #[test]
+    fn retrieve_with_stub_reranker_reorders_and_caps() {
+        use kimetsu_brain::project;
+        use kimetsu_core::memory::{MemoryKind, MemoryScope};
+        use kimetsu_core::paths::git_init_boundary;
+
+        // ── 1. Set up a hermetic temp brain ──────────────────────────────────
+        let root = std::env::temp_dir().join(format!(
+            "kimetsu-daemon-rr-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        git_init_boundary(&root);
+
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            project::init_project(&root, true).expect("init brain");
+
+            // Seed two memories with contrasting overlap against the query.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "rust async tokio runtime is the go-to async executor for Rust",
+            )
+            .expect("add rust memory");
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "python django web framework for building applications",
+            )
+            .expect("add python memory");
+
+            // ── 2. Build a DaemonState with NoopEmbedder + StubReranker ──────
+            // Use NoopEmbedder so retrieval stays on FTS (no embeddings were
+            // stored at ingest time). The reranker still gets applied to the
+            // FTS-ranked capsules, which is the plumbing we want to test.
+            let state = DaemonState {
+                embedder: Box::new(kimetsu_brain::embeddings::NoopEmbedder),
+                reranker: Some(Box::new(kimetsu_brain::embeddings::StubReranker)),
+                model: unique_model(),
+                started: Instant::now(),
+                loaded_ms: 0,
+                requests: AtomicU64::new(0),
+            };
+
+            // ── 3. Issue a Retrieve with max_capsules: 1 ─────────────────────
+            let args = proto::RetrieveArgs {
+                v: proto::PROTOCOL_VERSION,
+                brain_root: root.to_string_lossy().into_owned(),
+                query: "rust async tokio".to_string(),
+                stage: "localization".to_string(),
+                budget_tokens: 4000,
+                max_capsules: 1,
+                min_score: 0.0,
+                tags: vec![],
+            };
+            let resp = state.retrieve(args);
+
+            // ── 4. Assertions ─────────────────────────────────────────────────
+            match resp {
+                proto::Response::Capsules { capsules, .. } => {
+                    assert_eq!(
+                        capsules.len(),
+                        1,
+                        "max_capsules=1 must return exactly 1 capsule, got {}",
+                        capsules.len()
+                    );
+                    assert!(
+                        capsules[0].summary.to_lowercase().contains("rust")
+                            || capsules[0].summary.to_lowercase().contains("tokio")
+                            || capsules[0].summary.to_lowercase().contains("async"),
+                        "the returned capsule must be the higher-overlap (rust/tokio) one, got: {:?}",
+                        capsules[0].summary
+                    );
+                }
+                other => panic!("expected Capsules response, got: {other:?}"),
+            }
+        });
     }
 }
