@@ -459,6 +459,30 @@ impl BrainSession {
         )
     }
 
+    /// v1.0.0: read-only retrieval honoring the full [`ContextRequest`] but
+    /// with a caller-supplied embedder. The warm embedder daemon uses this
+    /// to run cosine/ANN retrieval with ONE long-lived model instead of
+    /// opening a fresh embedder per request. The lexical-coverage floor is
+    /// applied here too (driven from config unless the caller overrode it).
+    pub fn retrieve_context_with_injected_embedder(
+        &self,
+        mut request: ContextRequest,
+        embedder: &dyn embeddings::Embedder,
+    ) -> KimetsuResult<ContextBundle> {
+        if request.min_lexical_coverage == 0.0 {
+            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
+        }
+        let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        context::retrieve_context_with_embedder(
+            &self.conn,
+            &self.repo_root,
+            &self.config.broker.weights,
+            request,
+            &extras,
+            embedder,
+        )
+    }
+
     pub fn repo_root(&self) -> &Path {
         &self.paths.repo_root
     }
@@ -4936,6 +4960,56 @@ max_total_cost_usd = 250.0
                         .iter()
                         .any(|c| c.expansion_handle == format!("memory:{memory_id}")),
                     "FTS-only lexical retrieval must surface the seeded memory; \
+                     got handles: {:?}",
+                    bundle
+                        .capsules
+                        .iter()
+                        .map(|c| &c.expansion_handle)
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            fs::remove_dir_all(root).ok(); // best-effort on Windows
+        });
+    }
+
+    /// v1.0.0: `retrieve_context_with_injected_embedder` must honour the
+    /// caller-supplied embedder and still surface FTS matches (NoopEmbedder
+    /// path). This is the API the warm embedder daemon will call so it can
+    /// reuse a long-lived embedding model across requests.
+    #[test]
+    fn retrieve_with_injected_embedder_returns_fts_hits() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "the distiller harvests lessons at session end",
+            )
+            .expect("add");
+
+            {
+                let session = BrainSession::open_readonly(&root).expect("open ro");
+                let bundle = session
+                    .retrieve_context_with_injected_embedder(
+                        crate::context::ContextRequest {
+                            stage: "localization".to_string(),
+                            query: "how does the distiller work".to_string(),
+                            budget_tokens: 2000,
+                            ..Default::default()
+                        },
+                        &crate::embeddings::NoopEmbedder,
+                    )
+                    .expect("retrieve");
+                assert!(
+                    bundle
+                        .capsules
+                        .iter()
+                        .any(|c| c.expansion_handle == format!("memory:{memory_id}")),
+                    "FTS path via injected embedder must surface the memory; \
                      got handles: {:?}",
                     bundle
                         .capsules
