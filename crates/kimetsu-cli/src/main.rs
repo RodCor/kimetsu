@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 mod distiller;
 mod doctor;
+mod embed_daemon;
 mod harvest_setup;
 mod proactive_state;
 mod process;
