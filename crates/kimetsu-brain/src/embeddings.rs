@@ -231,6 +231,83 @@ impl Embedder for StubEmbedder {
     }
 }
 
+// ── Reranker trait + implementations ───────────────────────────────────────
+
+/// v1.0.0: cross-encoder reranker — scores (query, document) pairs jointly.
+/// Returns one sigmoid-normalized score in (0,1) per document, in DOCUMENT
+/// ORDER (not sorted). Implementations must be Send + Sync (the daemon
+/// shares one across worker threads).
+pub trait Reranker: Send + Sync {
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedderError>;
+    fn model_id(&self) -> &str;
+}
+
+/// Deterministic, dependency-free stub reranker for tests.
+///
+/// Scores a (query, document) pair by lowercase-tokenizing both on
+/// non-alphanumeric characters and computing token-overlap:
+///
+///   score = 0.05 + 0.9 * (|intersection| / |query_tokens|)
+///           clamped to (0,1)
+///
+/// This means no doc ever scores exactly 0 or 1, but docs with more query
+/// words in common always score higher. Safe to use in any test that doesn't
+/// need a real model.
+pub struct StubReranker;
+
+impl Reranker for StubReranker {
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedderError> {
+        let query_tokens: std::collections::HashSet<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase())
+            .collect();
+        let q_len = query_tokens.len();
+        let scores = documents
+            .iter()
+            .map(|doc| {
+                if q_len == 0 {
+                    return 0.05_f32;
+                }
+                let doc_tokens: std::collections::HashSet<String> = doc
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.to_lowercase())
+                    .collect();
+                let intersection = query_tokens.intersection(&doc_tokens).count();
+                let overlap = intersection as f32 / q_len as f32;
+                (0.05 + 0.9 * overlap).clamp(0.0, 1.0)
+            })
+            .collect();
+        Ok(scores)
+    }
+
+    fn model_id(&self) -> &str {
+        "stub-reranker"
+    }
+}
+
+/// v1.0.0: open a reranker by curated id. `"off"`/`"none"`/empty → None.
+/// Unknown ids fall back to the default jina turbo model. Lean builds
+/// always return None.
+pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
+    let v = model_id.trim().to_ascii_lowercase();
+    if v.is_empty() || matches!(v.as_str(), "off" | "none" | "noop") {
+        return None;
+    }
+    #[cfg(feature = "embeddings")]
+    {
+        fastembed_backend::FastembedReranker::try_open(model_id)
+            .ok()
+            .map(|r| Box::new(r) as Box<dyn Reranker>)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = v;
+        None
+    }
+}
+
 /// Open the production-default embedder.
 ///
 /// Resolution (v0.4.3):
@@ -483,8 +560,10 @@ pub fn pick_builtin_model_from_env() -> &'static str {
 // ~50-transitive-crate dep tree (ONNX runtime, tokenizers, etc).
 #[cfg(feature = "embeddings")]
 mod fastembed_backend {
-    use super::{Embedder, EmbedderError, pick_builtin_model_from_env};
-    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+    use super::{Embedder, EmbedderError, Reranker, pick_builtin_model_from_env};
+    use fastembed::{
+        EmbeddingModel, InitOptions, RerankerModel, RerankInitOptions, TextEmbedding, TextRerank,
+    };
     use std::sync::{Arc, Mutex, OnceLock};
 
     /// fastembed-backed embedder. Wraps the ONNX runtime in a
@@ -597,6 +676,74 @@ mod fastembed_backend {
         }
         fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
             self.0.embed_batch(texts)
+        }
+    }
+
+    /// fastembed-backed cross-encoder reranker.
+    ///
+    /// Wraps `TextRerank` in a `Mutex` because `rerank` takes `&mut self`.
+    /// The lock window is short (one rerank call per request); the daemon's
+    /// worker threads serialize cleanly through it.
+    pub struct FastembedReranker {
+        pub(super) model_id: &'static str,
+        engine: Mutex<TextRerank>,
+    }
+
+    impl FastembedReranker {
+        /// Map a curated id to the corresponding `RerankerModel` variant and
+        /// initialize a `TextRerank` engine. Unknown ids fall back to the
+        /// jina-reranker-v1-turbo-en default.
+        pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            let (kind, model_id) = match builtin_id {
+                "bge-reranker-base" => (RerankerModel::BGERerankerBase, "bge-reranker-base"),
+                "bge-reranker-v2-m3" => (RerankerModel::BGERerankerV2M3, "bge-reranker-v2-m3"),
+                "jina-reranker-v2-base-multilingual" => (
+                    RerankerModel::JINARerankerV2BaseMultiligual,
+                    "jina-reranker-v2-base-multilingual",
+                ),
+                // jina-reranker-v1-turbo-en is the default + fallback.
+                _ => (
+                    RerankerModel::JINARerankerV1TurboEn,
+                    "jina-reranker-v1-turbo-en",
+                ),
+            };
+            let opts = RerankInitOptions::new(kind).with_show_download_progress(false);
+            let engine = TextRerank::try_new(opts)
+                .map_err(|e| EmbedderError::LoadFailed(format!("fastembed reranker init: {e}")))?;
+            Ok(Self {
+                model_id,
+                engine: Mutex::new(engine),
+            })
+        }
+    }
+
+    impl Reranker for FastembedReranker {
+        fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedderError> {
+            if documents.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut guard = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Pass documents as Vec<&str>; fastembed returns results sorted by
+            // score descending. Use .index to map back to document order.
+            let raw_results = guard
+                .rerank(query, documents, false, None)
+                .map_err(|e| EmbedderError::EmbedFailed(format!("fastembed rerank: {e}")))?;
+            let n = documents.len();
+            let mut scores = vec![0.0f32; n];
+            for result in raw_results {
+                if result.index < n {
+                    // Apply sigmoid to normalize logit → (0,1).
+                    scores[result.index] = 1.0 / (1.0 + (-result.score).exp());
+                }
+            }
+            Ok(scores)
+        }
+
+        fn model_id(&self) -> &str {
+            self.model_id
         }
     }
 
@@ -914,6 +1061,70 @@ mod tests {
         let blob = encode_embedding(&vec);
         let err = decode_embedding(&blob, Some(5)).unwrap_err();
         assert!(err.to_string().contains("does not match expected"));
+    }
+
+    // ── v1.0.0 StubReranker tests ─────────────────────────────────────────────
+
+    /// StubReranker returns one score per document in document order.
+    #[test]
+    fn stub_reranker_returns_doc_order_scores() {
+        let r = StubReranker;
+        let query = "rust async tokio";
+        let docs = &["rust async tokio", "python django", "rust only"];
+        let scores = r.rerank(query, docs).expect("rerank should succeed");
+        assert_eq!(scores.len(), docs.len(), "one score per document");
+        // All scores in (0,1).
+        for (i, &s) in scores.iter().enumerate() {
+            assert!(
+                s > 0.0 && s < 1.0,
+                "score[{i}] must be in (0,1), got {s}"
+            );
+        }
+    }
+
+    /// Higher token overlap ⇒ higher score.
+    #[test]
+    fn stub_reranker_higher_overlap_scores_higher() {
+        let r = StubReranker;
+        let query = "rust async tokio";
+        // doc0: 3/3 tokens shared → highest
+        // doc1: 1/3 tokens shared → middle
+        // doc2: 0/3 tokens shared → lowest (0.05)
+        let docs = &["rust async tokio runtime", "rust only", "python django"];
+        let scores = r.rerank(query, docs).expect("rerank");
+        assert!(
+            scores[0] > scores[1],
+            "3-token overlap must beat 1-token overlap: {} vs {}",
+            scores[0],
+            scores[1]
+        );
+        assert!(
+            scores[1] > scores[2],
+            "1-token overlap must beat 0-token overlap: {} vs {}",
+            scores[1],
+            scores[2]
+        );
+    }
+
+    /// model_id is the stub constant.
+    #[test]
+    fn stub_reranker_model_id() {
+        let r = StubReranker;
+        assert_eq!(r.model_id(), "stub-reranker");
+    }
+
+    /// Empty query → all docs get the floor score 0.05.
+    #[test]
+    fn stub_reranker_empty_query_returns_floor() {
+        let r = StubReranker;
+        let docs = &["anything here", "another doc"];
+        let scores = r.rerank("", docs).expect("rerank");
+        for &s in &scores {
+            assert!(
+                (s - 0.05).abs() < 1e-6,
+                "empty query must yield 0.05, got {s}"
+            );
+        }
     }
 
     // ── embed_batch contract tests (Stub-backed, no model download) ───────────

@@ -2098,6 +2098,62 @@ pub fn resolve_capsule(
     }
 }
 
+// ── v1.0.0: cross-encoder reranking ──────────────────────────────────────
+
+/// v1.0.0: final-stage cross-encoder rerank over already-retrieved capsules.
+/// Reranks by `summary`, overwrites `score` with the sigmoid-normalized
+/// rerank score, sorts descending, drops capsules below `floor`, truncates
+/// to `cap` (0 = no cap). Fail-open: on a rerank error the input ordering
+/// is returned unchanged (truncated to `cap`) — a broken reranker must
+/// never lose retrieval entirely.
+pub fn rerank_capsules(
+    query: &str,
+    capsules: Vec<ContextCapsule>,
+    reranker: &dyn crate::embeddings::Reranker,
+    floor: f32,
+    cap: usize,
+) -> Vec<ContextCapsule> {
+    if capsules.is_empty() {
+        return capsules;
+    }
+
+    let docs: Vec<&str> = capsules.iter().map(|c| c.summary.as_str()).collect();
+    let scores = match reranker.rerank(query, &docs) {
+        Ok(s) => s,
+        Err(_) => {
+            // Fail-open: preserve input order, just apply cap.
+            let mut out = capsules;
+            if cap > 0 && out.len() > cap {
+                out.truncate(cap);
+            }
+            return out;
+        }
+    };
+
+    let mut ranked: Vec<ContextCapsule> = capsules
+        .into_iter()
+        .zip(scores)
+        .map(|(mut c, s)| {
+            c.score = s;
+            c
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    ranked.retain(|c| c.score >= floor);
+
+    if cap > 0 && ranked.len() > cap {
+        ranked.truncate(cap);
+    }
+
+    ranked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4288,5 +4344,147 @@ mod tests {
         let err = resolve_capsule(&conn, std::path::Path::new("/r"), "file:/etc/passwd")
             .expect_err("should reject absolute path");
         assert!(err.to_string().contains("absolute path"), "got: {err}");
+    }
+
+    // ── v1.0.0 rerank_capsules tests ─────────────────────────────────────────
+
+    fn make_capsule(summary: &str, score: f32) -> ContextCapsule {
+        ContextCapsule {
+            id: new_id().to_string(),
+            kind: "memory".to_string(),
+            summary: summary.to_string(),
+            token_estimate: 10,
+            expansion_handle: format!("memory:{}", new_id()),
+            provenance: vec![],
+            confidence: 1.0,
+            freshness: 1.0,
+            relevance: 1.0,
+            scope_weight: 1.0,
+            score,
+        }
+    }
+
+    /// RR-1: capsule whose summary shares more query words ranks first and
+    /// the score field is overwritten by the reranker's sigmoid-normalized score.
+    #[test]
+    fn rerank_capsules_reorders_by_query_overlap() {
+        use crate::embeddings::StubReranker;
+
+        // Two capsules: "rust async tokio" shares 3/3 query tokens;
+        // "python django" shares 0/3.
+        let query = "rust async tokio";
+        let high_overlap = make_capsule("rust async tokio runtime", 0.0);
+        let low_overlap = make_capsule("python django framework", 0.0);
+        // Input order: low-overlap first to verify it gets pushed down.
+        let capsules = vec![low_overlap.clone(), high_overlap.clone()];
+
+        let ranked = rerank_capsules(query, capsules, &StubReranker, 0.0, 0);
+
+        assert_eq!(ranked.len(), 2, "both capsules should survive (floor=0)");
+        // The high-overlap capsule must rank first.
+        assert!(
+            ranked[0].summary.contains("rust"),
+            "rust capsule must be first, got: {:?}",
+            ranked[0].summary
+        );
+        // Score must be overwritten (was 0.0, now > 0.05 for the high-overlap one).
+        assert!(
+            ranked[0].score > 0.05,
+            "score must be overwritten by reranker: {}",
+            ranked[0].score
+        );
+        // High-overlap must score above low-overlap.
+        assert!(
+            ranked[0].score > ranked[1].score,
+            "high overlap must score higher: {} vs {}",
+            ranked[0].score,
+            ranked[1].score
+        );
+    }
+
+    /// RR-2: floor drops a zero-overlap capsule.
+    /// StubReranker scores a zero-overlap doc at 0.05.
+    /// A floor of 0.3 must drop it.
+    #[test]
+    fn rerank_capsules_floor_drops_zero_overlap() {
+        use crate::embeddings::StubReranker;
+
+        let query = "rust async tokio";
+        let high = make_capsule("rust async tokio runtime", 0.0);
+        let zero = make_capsule("completely unrelated document xyz", 0.0); // 0-overlap → 0.05
+
+        let capsules = vec![high, zero];
+        let ranked = rerank_capsules(query, capsules, &StubReranker, 0.3, 0);
+
+        // The zero-overlap capsule (score 0.05) must be dropped by floor=0.3.
+        assert_eq!(ranked.len(), 1, "zero-overlap capsule must be dropped");
+        assert!(
+            ranked[0].summary.contains("rust"),
+            "only rust capsule should survive"
+        );
+    }
+
+    /// RR-3: cap truncates the result.
+    #[test]
+    fn rerank_capsules_cap_truncates() {
+        use crate::embeddings::StubReranker;
+
+        let query = "alpha beta gamma";
+        let capsules = vec![
+            make_capsule("alpha beta gamma delta", 0.0),
+            make_capsule("alpha beta", 0.0),
+            make_capsule("alpha", 0.0),
+            make_capsule("unrelated xyz", 0.0),
+        ];
+
+        let ranked = rerank_capsules(query, capsules, &StubReranker, 0.0, 2);
+        assert_eq!(ranked.len(), 2, "cap=2 must truncate to 2 results");
+        // The top-2 should be the higher-overlap ones.
+        assert!(
+            ranked[0].score >= ranked[1].score,
+            "results must be sorted descending"
+        );
+    }
+
+    /// RR-4: fail-open — a broken reranker returns Err; input order is preserved.
+    #[test]
+    fn rerank_capsules_fail_open_preserves_input_order() {
+        struct FailingReranker;
+        impl crate::embeddings::Reranker for FailingReranker {
+            fn rerank(
+                &self,
+                _query: &str,
+                _docs: &[&str],
+            ) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {
+                Err(crate::embeddings::EmbedderError::EmbedFailed(
+                    "simulated failure".into(),
+                ))
+            }
+            fn model_id(&self) -> &str {
+                "fail-reranker"
+            }
+        }
+
+        let query = "anything";
+        let c1 = make_capsule("first capsule", 0.9);
+        let c2 = make_capsule("second capsule", 0.5);
+        let c3 = make_capsule("third capsule", 0.1);
+        let capsules = vec![c1.clone(), c2.clone(), c3.clone()];
+
+        let out = rerank_capsules(query, capsules, &FailingReranker, 0.0, 0);
+
+        // On error: input order preserved, all 3 capsules returned.
+        assert_eq!(out.len(), 3, "all capsules must be returned on error");
+        assert_eq!(out[0].summary, c1.summary, "order must be preserved");
+        assert_eq!(out[1].summary, c2.summary, "order must be preserved");
+        assert_eq!(out[2].summary, c3.summary, "order must be preserved");
+    }
+
+    /// RR-0: empty input → empty output.
+    #[test]
+    fn rerank_capsules_empty_input_returns_empty() {
+        use crate::embeddings::StubReranker;
+        let out = rerank_capsules("query", vec![], &StubReranker, 0.0, 0);
+        assert!(out.is_empty());
     }
 }
