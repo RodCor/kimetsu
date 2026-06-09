@@ -3815,6 +3815,72 @@ fn resolve_daemon_model(workspace: &std::path::Path) -> Option<String> {
     Some(kimetsu_brain::embeddings::resolve_embedder_id(Some(config.embedder.model.as_str())).to_string())
 }
 
+/// Try semantic retrieval via the warm daemon. Returns `None` (-> FTS fallback)
+/// when embeddings aren't built, the daemon is disabled by config/env, or the
+/// daemon is unreachable within the client budget. On a miss it also kicks off
+/// a detached spawn so the NEXT prompt finds a warm daemon.
+#[cfg(feature = "embeddings")]
+fn try_daemon_retrieve(
+    workspace: &std::path::Path,
+    request: &kimetsu_brain::context::ContextRequest,
+) -> Option<kimetsu_brain::context::ContextBundle> {
+    use embed_daemon::{client, proto};
+    let model = resolve_daemon_model(workspace)?;
+    let args = proto::RetrieveArgs {
+        v: proto::PROTOCOL_VERSION,
+        brain_root: workspace.to_string_lossy().into_owned(),
+        query: request.query.clone(),
+        stage: request.stage.clone(),
+        budget_tokens: request.budget_tokens,
+        max_capsules: request.max_capsules,
+        min_score: request.min_score,
+        tags: request.tags.clone(),
+    };
+    match client::request(&model, proto::Request::Retrieve(args)) {
+        Some(proto::Response::Capsules { capsules, skipped, top_score }) => {
+            Some(daemon_capsules_to_bundle(request, capsules, skipped, top_score))
+        }
+        _ => {
+            // Unreachable/errored -> ensure one is coming up for next time.
+            client::ensure_daemon(&model);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn try_daemon_retrieve(
+    _workspace: &std::path::Path,
+    _request: &kimetsu_brain::context::ContextRequest,
+) -> Option<kimetsu_brain::context::ContextBundle> {
+    None
+}
+
+/// Adapt the wire capsule list back into a `ContextBundle` for the existing
+/// rendering code path.
+#[cfg(feature = "embeddings")]
+fn daemon_capsules_to_bundle(
+    request: &kimetsu_brain::context::ContextRequest,
+    capsules: Vec<embed_daemon::proto::Capsule>,
+    skipped: bool,
+    top_score: f32,
+) -> kimetsu_brain::context::ContextBundle {
+    use kimetsu_brain::context::{ContextBundle, ContextCapsule};
+    let capsules = capsules
+        .into_iter()
+        .map(|c| ContextCapsule::wire_minimal(c.summary, c.kind, c.score))
+        .collect();
+    ContextBundle {
+        stage: request.stage.clone(),
+        budget_tokens: request.budget_tokens,
+        used_tokens: 0,
+        capsules,
+        excluded: Vec::new(),
+        skipped,
+        top_score,
+    }
+}
+
 // ── Lean (no embeddings) stubs ───────────────────────────────────────────────
 #[cfg(not(feature = "embeddings"))]
 fn brain_embed_daemon(_args: EmbedDaemonArgs) -> KimetsuResult<()> {
@@ -4146,15 +4212,14 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         ..Default::default()
     };
 
-    // FTS-only retrieval: the UserPromptSubmit hook runs in a throwaway
-    // per-prompt process that can't reuse the long-lived MCP server's warm
-    // model cache, so loading the semantic embedder here risks a cold ONNX
-    // load that blows the host's 30s hook timeout. Semantic ANN recall stays
-    // with the warm MCP `kimetsu_brain_context` tool. See
-    // project::retrieve_context_lexical_readonly.
-    let bundle = match project::retrieve_context_lexical_readonly(&workspace, request.clone()) {
-        Ok(b) => b,
-        Err(_) => return Ok(()), // Brain not initialized — silent fail
+    // Retrieval: try the warm daemon first (semantic); fall back to
+    // floored-FTS on any miss (daemon disabled / unreachable / cold).
+    let (bundle, retrieval_path) = match try_daemon_retrieve(&workspace, &request) {
+        Some(b) => (b, "daemon"),
+        None => match project::retrieve_context_lexical_readonly(&workspace, request.clone()) {
+            Ok(b) => (b, "fts_fallback"),
+            Err(_) => return Ok(()), // Brain not initialized — silent fail
+        },
     };
 
     // C7: emit a context.served event BEFORE the early-return so misses are
@@ -4178,6 +4243,7 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
                 "top_score": top_score,
                 "skipped": bundle.skipped,
                 "stage": &request.stage,
+                "retrieval_path": retrieval_path,
             }),
         );
     }
@@ -7425,5 +7491,26 @@ ambient = false
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn daemon_capsules_to_bundle_preserves_fields() {
+        let request = kimetsu_brain::context::ContextRequest {
+            stage: "localization".to_string(),
+            budget_tokens: 2000,
+            ..Default::default()
+        };
+        let wire = vec![crate::embed_daemon::proto::Capsule {
+            summary: "repo:fact - x".to_string(),
+            kind: "memory".to_string(),
+            score: 0.9,
+        }];
+        let bundle = daemon_capsules_to_bundle(&request, wire, false, 0.9);
+        assert_eq!(bundle.capsules.len(), 1);
+        assert_eq!(bundle.capsules[0].summary, "repo:fact - x");
+        assert_eq!(bundle.capsules[0].kind, "memory");
+        assert!(!bundle.skipped);
+        assert!((bundle.top_score - 0.9).abs() < 1e-6);
     }
 }

@@ -243,6 +243,27 @@ pub struct ContextCapsule {
     pub score: f32,
 }
 
+impl ContextCapsule {
+    /// v1.0.0: build a render-only capsule from daemon wire data. Only the
+    /// fields the hook renders (`summary`, `kind`, `score`) are meaningful;
+    /// the rest are zeroed — this capsule is never re-scored or expanded.
+    pub fn wire_minimal(summary: String, kind: String, score: f32) -> Self {
+        Self {
+            id: String::new(),
+            kind,
+            summary,
+            token_estimate: 0,
+            expansion_handle: String::new(),
+            provenance: Vec::new(),
+            confidence: 0.0,
+            freshness: 0.0,
+            relevance: 0.0,
+            scope_weight: 0.0,
+            score,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceRef {
     pub source: String,
