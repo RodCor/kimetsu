@@ -13,6 +13,9 @@ pub mod ipc;
 #[cfg(feature = "embeddings")]
 pub mod server;
 
+#[cfg(feature = "embeddings")]
+pub mod client;
+
 /// Bumped only on a wire-incompatible protocol change. Encoded into the
 /// socket name so a new major routes to a fresh daemon.
 pub const PROTOCOL_MAJOR: u32 = 1;
