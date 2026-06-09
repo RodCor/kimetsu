@@ -317,6 +317,7 @@ function kimetsuExec(args: string[]): Promise<void> {
 export default function (pi: any) {
   // session_start fires once when Pi starts up or a new session begins.
   pi.on("session_start", async (_event: any, _ctx: any) => {
+    await kimetsuExec(["brain", "warm"]);
     await kimetsuExec(["brain", "context-hook"]);
   });
 
@@ -400,6 +401,9 @@ function kimetsuExec(args: string[]): Promise<void> {
 
 export default definePluginEntry({
   register(api: any) {
+    // Warm the embedder daemon at plugin registration (startup).
+    kimetsuExec(["brain", "warm"]);
+
     // agent_turn_prepare fires before each turn: load brain context.
     api.on("agent_turn_prepare", async (_ctx: any) => {
       await kimetsuExec(["brain", "context-hook"]);
@@ -2164,6 +2168,8 @@ fn write_codex_hooks(
         );
     }
 
+    // Codex has no session-start event; the daemon warms lazily on the first prompt instead.
+
     let text = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize Codex hooks: {err}"))?;
     write_text_file(&hooks, &text, true)?;
@@ -2544,6 +2550,14 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
         serde_json::json!({
             "matcher": "",
             "hooks": [{ "type": "command", "command": "kimetsu brain session-end-hook" }]
+        }),
+    );
+    upsert_kimetsu_hook(
+        hooks_obj,
+        "SessionStart",
+        serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "kimetsu brain warm" }]
         }),
     );
     if proactive {
@@ -5765,6 +5779,96 @@ mod tests {
         assert!(
             dest.join("SKILL.md").is_file(),
             "SKILL.md must exist in dest"
+        );
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    // ── Warm-daemon startup hook tests ────────────────────────────────────────
+
+    /// Claude Code settings.json must include a SessionStart group that warms
+    /// the embedder daemon. The group must survive idempotent re-runs.
+    #[test]
+    fn claude_hooks_include_sessionstart_warm() {
+        let root = temp_root("claude_sessionstart_warm");
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+
+        write_claude_hooks(&settings, false).expect("write_claude_hooks");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let ss = value["hooks"]["SessionStart"]
+            .as_array()
+            .expect("SessionStart array");
+        assert!(
+            ss.iter()
+                .any(|g| g["hooks"][0]["command"] == "kimetsu brain warm"),
+            "SessionStart must warm the embedder daemon"
+        );
+
+        // Idempotent: second run must not add a second group.
+        write_claude_hooks(&settings, false).expect("second write_claude_hooks");
+        let value2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let ss2 = value2["hooks"]["SessionStart"].as_array().unwrap();
+        let warm_count = ss2
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == "kimetsu brain warm")
+            .count();
+        assert_eq!(warm_count, 1, "exactly one SessionStart warm group after two runs");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Pi extension TS must call kimetsuExec(["brain", "warm"]) inside the
+    /// session_start handler.
+    #[cfg(feature = "pi")]
+    #[test]
+    fn pi_extension_ts_session_start_includes_warm() {
+        let ws = temp_root("pi_warm_sessionstart");
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::Pi,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            false,
+            None,
+        )
+        .expect("Pi workspace install");
+
+        let ts = fs::read_to_string(ws.join(".pi/extensions/kimetsu.ts")).unwrap();
+        assert!(
+            ts.contains("\"brain\", \"warm\""),
+            "Pi session_start handler must warm the embedder daemon"
+        );
+
+        fs::remove_dir_all(ws).ok();
+    }
+
+    /// OpenClaw plugin TS must call kimetsuExec(["brain", "warm"]) at startup
+    /// (inside register(), outside any event handler).
+    #[cfg(feature = "openclaw")]
+    #[test]
+    fn openclaw_plugin_ts_register_includes_warm() {
+        let ws = temp_root("openclaw_warm_startup");
+        plugin_install_inner(
+            &ws,
+            BridgeTarget::OpenClaw,
+            InstallScope::Workspace,
+            PluginMode::Optional,
+            false,
+            false,
+            None,
+        )
+        .expect("OpenClaw workspace install");
+
+        let ts = fs::read_to_string(ws.join(".openclaw/plugins/kimetsu/index.ts")).unwrap();
+        assert!(
+            ts.contains("\"brain\", \"warm\""),
+            "OpenClaw plugin register() must warm the embedder daemon at startup"
         );
 
         fs::remove_dir_all(ws).ok();
