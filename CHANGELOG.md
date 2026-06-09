@@ -10,6 +10,21 @@ breaking changes require a major bump.
 ## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
+  * **Cross-encoder reranking + retrieval eval harness.** The warm daemon now
+    applies a final cross-encoder rerank stage: it over-fetches a 12-capsule
+    pool, scores each (query, memory) pair jointly with a fastembed reranker
+    (`jina-reranker-v1-turbo-en` default; `[embedder] reranker` picks another
+    or `"off"` disables), drops capsules below a 0.30 relevance floor, and
+    truncates to the requested cap. The cosine semantic floor
+    (`broker.min_semantic_score`) is now ON by default (0.35) *and actually
+    wired* — it previously defaulted to 0.0 and was never populated from
+    config in any production path. The hook's daemon budget tightens from
+    750ms to 300ms (warm path fits; misses fall back to floored FTS). New
+    `kimetsu brain eval [--fixture ...]` measures recall@2/4 + MRR across
+    fts / semantic / semantic+rerank modes against a committed fixture
+    (`fixtures/eval-retrieval.json`), so ranking changes are measurable:
+    baseline shows semantic recall@4 0.90 vs FTS 0.72, and reranking drives
+    noise injection on off-domain queries to zero.
   * **Warm embedder daemon — semantic recall at hook time.** The
     `UserPromptSubmit` context-hook can now match memories by *meaning*, not
     just lexically. A single per-user daemon (`kimetsu brain embed-daemon`,
