@@ -266,6 +266,28 @@ pub struct BrokerSection {
     /// project.toml. `#[serde(default)]` keeps older configs loading.
     #[serde(default)]
     pub min_semantic_score: f32,
+    /// v1.0.0: absolute *lexical* relevance floor for memory candidates,
+    /// expressed as the fraction of the query's IDF-weighted discriminating
+    /// power a memory must lexically cover to survive. Unlike
+    /// `min_semantic_score` (which needs a query embedding and is therefore
+    /// inert on the FTS-only `UserPromptSubmit` hook path), this floor works
+    /// on lexical retrieval — closing the gap where a broad conceptual query
+    /// ("what's the idea of the repo") surfaces unrelated memories that only
+    /// share a corpus-ubiquitous token like the project name.
+    ///
+    /// Mechanics: query tokens are stripped of stopwords; each remaining
+    /// token is IDF-weighted over the memory corpus (so the project name,
+    /// present in nearly every memory, contributes ~0). A memory is dropped
+    /// when the IDF-weighted share of the query it covers is below this floor
+    /// AND it has no semantic support. Repo-file/manifest capsules pass
+    /// through untouched (their FTS match on file content is itself the
+    /// relevance signal, and overview queries *want* the README).
+    ///
+    /// Default 0.5 = "must cover the more-discriminating half of the query."
+    /// 0.0 disables the floor. `#[serde(default = …)]` keeps older configs
+    /// loading with the floor active.
+    #[serde(default = "default_min_lexical_coverage")]
+    pub min_lexical_coverage: f32,
     /// F3: floor for the adaptive per-stage brain budget. Small tasks
     /// receive at least this many tokens so the brain is never starved.
     /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
@@ -291,6 +313,10 @@ fn default_max_capsules() -> usize {
     8
 }
 
+fn default_min_lexical_coverage() -> f32 {
+    0.5
+}
+
 fn default_budget_floor_tokens() -> u32 {
     1500
 }
@@ -306,6 +332,7 @@ impl Default for BrokerSection {
             weights: BrokerWeights::default(),
             max_capsules: default_max_capsules(),
             min_semantic_score: 0.0,
+            min_lexical_coverage: default_min_lexical_coverage(),
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
@@ -557,6 +584,10 @@ max_total_cost_usd = 250.0
         // must load cleanly and receive the safe defaults.
         assert_eq!(config.broker.max_capsules, 8);
         assert_eq!(config.broker.min_semantic_score, 0.0);
+        // v1.0.0: a config without min_lexical_coverage loads with the floor
+        // active at its default (0.5), so existing installs gain the relevance
+        // gate on upgrade.
+        assert_eq!(config.broker.min_lexical_coverage, 0.5);
         // F3: pre-F3 configs without budget_floor_tokens / budget_run_cap_tokens
         // must load cleanly and receive the safe defaults.
         assert_eq!(config.broker.budget_floor_tokens, 1500);

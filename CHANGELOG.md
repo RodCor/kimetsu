@@ -175,12 +175,51 @@ CHANGED
     (the env var stays a per-run override).
 
 FIXED
+  * **Lexical retrieval no longer injects off-topic memories that merely
+    share the project name.** A broad conceptual prompt ("tell me about
+    kimetsu, what's the idea of the repo") surfaced narrow debugging
+    war-stories whose only overlap with the query was the corpus-ubiquitous
+    token "kimetsu". Root cause: on the FTS-only `UserPromptSubmit` hook path
+    there was no relevance floor (the cosine-based `min_semantic_score` is
+    inert without an embedding), and `normalize_and_score` divides relevance
+    by the *per-kind* max — so the best memory of each kind became
+    `relevance = 1.0` no matter how weak the actual match, easily clearing
+    the `min_score` gate on freshness + confidence alone. New
+    `broker.min_lexical_coverage` floor (default 0.5): query tokens are
+    stripped of stopwords and IDF-weighted over the memory corpus (so the
+    project name, present in nearly every memory, contributes ~0; a word in
+    *no* memory also contributes 0 since it can't discriminate), and a memory
+    is dropped before scoring when the IDF-weighted share of the query it
+    covers is below the floor and it has no semantic support. Repo-file and
+    manifest capsules pass through untouched. Memories whose only match is the
+    project name are now reliably dropped; the brain stays silent rather than
+    injecting noise. (Keyword-overlap-but-off-topic hits that match a real,
+    non-ubiquitous word still need the semantic path; this is a lexical floor.)
+  * **`Stop` hook no longer trips "invalid stop hook JSON output".**
+    `kimetsu brain stop-hook` printed a bare-text banner on stdout, but
+    Claude Code validates a Stop hook's stdout as the advanced JSON
+    control object — so the banner was rejected. The hook now emits a
+    well-formed JSON object: informational banners via `systemMessage`,
+    and the end-of-session harvest cue via `decision: "block"` so the
+    cue text actually re-enters the model (plain stdout never reached it
+    in a Stop hook, so the cue was previously inert). The one-cue-per-
+    session guards keep blocking from looping.
   * **MSRV portability.** A 1.87-only API that violated the declared
     `rust-version = "1.85"` MSRV was replaced with the compatible
     1.85 equivalent.
   * **GlobalUser memory writes work from any directory again** — a
     regression where recording a global-user memory required a loadable
     project is fixed.
+  * **`UserPromptSubmit` context-hook no longer risks the host's 30s
+    timeout.** The per-prompt hook runs in a throwaway process that
+    can't reuse the long-lived MCP server's warm model cache, so in the
+    embeddings build it was paying a cold fastembed/ONNX model load on
+    every prompt — fast on a warm OS file cache but able to exceed 30s
+    on a cold first prompt (worst under disk contention / AV scanning),
+    which fails the hook. The hook is now FTS-only (lexical retrieval,
+    no embedding model loaded); semantic ANN recall stays with the warm
+    MCP `kimetsu_brain_context` tool the agent calls. Steady-state hook
+    latency drops to ~300 ms regardless of build flavor.
 
 ## v0.9.0 — auto-harvested memories + SessionEnd distiller
 

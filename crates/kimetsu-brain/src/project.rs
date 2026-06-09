@@ -393,8 +393,13 @@ impl BrainSession {
     /// cosine path (FTS-only retrieval) without relying on the env var.
     pub fn retrieve_context_with_request(
         &self,
-        request: ContextRequest,
+        mut request: ContextRequest,
     ) -> KimetsuResult<ContextBundle> {
+        // v1.0.0: drive the lexical-relevance floor from config unless the
+        // caller set its own (non-zero) value.
+        if request.min_lexical_coverage == 0.0 {
+            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
+        }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
             &self.conn,
@@ -413,6 +418,36 @@ impl BrainSession {
     /// caller sets a high `min_score` and `max_capsules: 1` so recall is
     /// rare and confident (the human-brain "it comes to you" model).
     pub fn retrieve_proactive(&self, request: ContextRequest) -> KimetsuResult<ContextBundle> {
+        let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        context::retrieve_context_with_embedder(
+            &self.conn,
+            &self.repo_root,
+            &self.config.broker.weights,
+            request,
+            &extras,
+            &embeddings::NoopEmbedder,
+        )
+    }
+
+    /// v1.0.0: lexical (FTS-only) retrieval honoring the full
+    /// [`ContextRequest`]. Like [`Self::retrieve_context_with_request`]
+    /// but pins [`NoopEmbedder`] so NO embedding model is loaded even in
+    /// `--features embeddings` builds. The `UserPromptSubmit` context-hook
+    /// uses this: it runs in a throwaway per-prompt process that cannot
+    /// reuse the long-lived MCP server's warm model cache, so a cold ONNX
+    /// load there can blow the host's 30s hook timeout. Semantic ANN
+    /// recall stays with the warm MCP `kimetsu_brain_context` tool.
+    pub fn retrieve_context_lexical(
+        &self,
+        mut request: ContextRequest,
+    ) -> KimetsuResult<ContextBundle> {
+        // v1.0.0: the hook path is FTS-only, so this lexical floor (driven
+        // from config unless the caller overrode it) is the *only* relevance
+        // gate protecting it — the cosine-based `min_semantic_score` is inert
+        // here.
+        if request.min_lexical_coverage == 0.0 {
+            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
+        }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
             &self.conn,
@@ -1490,6 +1525,18 @@ pub fn retrieve_context_readonly_with_request(
     request: ContextRequest,
 ) -> KimetsuResult<ContextBundle> {
     BrainSession::open_readonly(start)?.retrieve_context_with_request(request)
+}
+
+/// v1.0.0: lexical (FTS-only) read-only retrieval. Used by the
+/// `UserPromptSubmit` context-hook so its throwaway per-prompt process
+/// never loads the semantic embedding model (a cold ONNX load there can
+/// exceed the host's 30s hook timeout). See
+/// [`BrainSession::retrieve_context_lexical`].
+pub fn retrieve_context_lexical_readonly(
+    start: &Path,
+    request: ContextRequest,
+) -> KimetsuResult<ContextBundle> {
+    BrainSession::open_readonly(start)?.retrieve_context_lexical(request)
 }
 
 /// v0.8: read-only proactive retrieval (lexical-FTS-only, no model
@@ -4846,6 +4893,56 @@ max_total_cost_usd = 250.0
                 // Even if the FTS index is empty (no tokens match), it must not error.
                 // The memory text "fox jumps" overlaps with the query — FTS should hit it.
                 let _ = bundle; // just assert no panic / error
+            }
+
+            fs::remove_dir_all(root).ok(); // best-effort on Windows
+        });
+    }
+
+    /// v1.0.0: the `UserPromptSubmit` context-hook runs in a throwaway
+    /// per-prompt process, so it must NOT load the semantic embedding
+    /// model (cold ONNX load can blow the host's 30s hook timeout).
+    /// `retrieve_context_lexical` pins the NoopEmbedder so the hook stays
+    /// FTS-only and fast regardless of build flavor or `[embedder] enabled`.
+    /// This test proves the lexical path still returns FTS matches.
+    #[test]
+    fn retrieve_context_lexical_returns_fts_hits_without_embedder() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let memory_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Run zylophonecheck before finalizing the deployment pipeline.",
+            )
+            .expect("add memory");
+
+            {
+                let session = BrainSession::open_readonly(&root).expect("open readonly");
+                let bundle = session
+                    .retrieve_context_lexical(crate::context::ContextRequest {
+                        stage: "localization".to_string(),
+                        query: "zylophonecheck deployment pipeline".to_string(),
+                        budget_tokens: 4096,
+                        ..Default::default()
+                    })
+                    .expect("retrieve lexical");
+
+                assert!(
+                    bundle
+                        .capsules
+                        .iter()
+                        .any(|c| c.expansion_handle == format!("memory:{memory_id}")),
+                    "FTS-only lexical retrieval must surface the seeded memory; \
+                     got handles: {:?}",
+                    bundle
+                        .capsules
+                        .iter()
+                        .map(|c| &c.expansion_handle)
+                        .collect::<Vec<_>>()
+                );
             }
 
             fs::remove_dir_all(root).ok(); // best-effort on Windows

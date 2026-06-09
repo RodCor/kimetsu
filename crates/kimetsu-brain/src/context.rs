@@ -287,6 +287,16 @@ pub struct ContextRequest {
     /// from `BrokerSection.min_semantic_score` by the pipeline; callers
     /// that don't set it get the prior behaviour automatically.
     pub min_semantic_score: f32,
+    /// v1.0.0: absolute *lexical* relevance floor for memory candidates,
+    /// as the fraction of the query's IDF-weighted discriminating power a
+    /// memory must cover. Unlike `min_semantic_score` this needs no query
+    /// embedding, so it protects the FTS-only hook path. When > 0.0, memory
+    /// candidates below the floor are dropped BEFORE scoring (so they don't
+    /// even set the per-kind normalization max). Repo-file/manifest
+    /// candidates are unaffected. 0.0 (default) disables it — every existing
+    /// `..Default::default()` construction is unchanged. Populated from
+    /// `BrokerSection.min_lexical_coverage` by the pipeline.
+    pub min_lexical_coverage: f32,
     /// E3: inferred kind of the current task. Defaults to `Feature`
     /// (the neutral kind) so every existing `..Default::default()`
     /// construction is unchanged — Feature does NOT alter weights or
@@ -415,6 +425,49 @@ pub fn retrieve_context_with_embedder(
                 .iter()
                 .any(|k| capsule_matches_kind(&c.capsule, k))
         });
+    }
+
+    // v1.0.0: absolute LEXICAL relevance floor. The FTS-only hook path has
+    // no cosine, so the `min_semantic_score` floor below can't protect it —
+    // a broad conceptual query whose only matching tokens are corpus-
+    // ubiquitous (e.g. the project name) would otherwise surface unrelated
+    // memories, which per-kind normalization later promotes to relevance=1.0
+    // regardless of how weak the match is.
+    //
+    // We compute an IDF-weighted coverage in [0,1] over the query's CONTENT
+    // tokens (stopwords removed; ubiquitous tokens carry ~0 IDF so they don't
+    // drive coverage) and drop a memory candidate when its coverage is below
+    // the floor AND it has no semantic support. Applied BEFORE scoring so
+    // pruned rows don't even set the per-kind normalization max. Only memory
+    // candidates are floored — repo_file/manifest capsules pass through (an
+    // FTS match on file content is itself a relevance signal, and overview
+    // queries *want* the README). Inert when the floor is 0.0 or the query
+    // has no discriminating (non-ubiquitous) content token.
+    if request.min_lexical_coverage > 0.0 {
+        let content = content_tokens(&request.query);
+        if !content.is_empty() {
+            let idf = corpus_token_idf(conn, &content)?;
+            let total_idf: f32 = content
+                .iter()
+                .map(|t| idf.get(t).copied().unwrap_or(0.0))
+                .sum();
+            // Skip the floor when no content token is discriminating — every
+            // token is corpus-ubiquitous, so we have no signal to floor on.
+            if total_idf > f32::EPSILON {
+                candidates.retain(|c| {
+                    if c.capsule.kind != "memory" {
+                        return true; // repo_file / manifest pass through
+                    }
+                    // Semantic support keeps a lexically-thin but on-topic
+                    // memory on embeddings builds (cosine is None on the hook).
+                    if c.cosine.is_some_and(|cos| cos >= SEMANTIC_KEEP_COSINE) {
+                        return true;
+                    }
+                    weighted_coverage(&content, &idf, &c.capsule.summary)
+                        >= request.min_lexical_coverage
+                });
+            }
+        }
     }
 
     // E3: compose task-kind weight bias over stage weights, then renormalize.
@@ -1462,6 +1515,127 @@ fn freshness(created_at: &str) -> f32 {
     let age = OffsetDateTime::now_utc() - created_at;
     let age_days = age.whole_seconds().max(0) as f32 / 86_400.0;
     (-age_days / 30.0).exp().clamp(0.0, 1.0)
+}
+
+/// v1.0.0: a memory whose cosine to the query clears this bar is kept by
+/// the lexical floor even when it shares few query words — a genuine
+/// semantic match shouldn't be pruned for lexical thinness. Inert on the
+/// FTS-only hook path (cosine is always `None` there).
+const SEMANTIC_KEEP_COSINE: f32 = 0.20;
+
+/// v1.0.0: generic English function words carry no topical signal, so they
+/// are stripped before the IDF-weighted lexical floor. Kept deliberately
+/// small — only true stopwords. Content words like "repo" or "idea" are NOT
+/// here; their commonness is handled by IDF, not a hand-maintained list.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "your", "with", "this",
+    "that", "these", "those", "from", "into", "about", "what", "whats", "which",
+    "who", "whom", "how", "why", "when", "where", "can", "could", "would",
+    "should", "will", "shall", "does", "did", "was", "were", "been", "being",
+    "have", "has", "had", "its", "it", "is", "as", "at", "by", "of", "to", "in",
+    "on", "or", "an", "be", "do", "me", "my", "we", "us", "our", "im", "ive",
+    "let", "lets", "please", "tell", "give", "show", "want", "need", "get",
+    "got", "use", "using", "there", "their", "they", "them", "then", "than",
+    "some", "any", "all", "more", "most", "such", "via", "per",
+];
+
+/// v1.0.0: tokenize a query into deduped CONTENT tokens — the same word
+/// split as [`query_tokens`] but with stopwords removed and WITHOUT the
+/// `CLASS_HINTS` tool-name expansions (those are a retrieval *boost*, not
+/// part of the user's topical intent). Used only by the lexical floor.
+fn content_tokens(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(str::trim)
+        .filter(|part| part.len() >= 2)
+        .map(str::to_ascii_lowercase)
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+/// v1.0.0: discriminating weight for each content token over the
+/// (non-invalidated) memory corpus, where `df` is the number of memories
+/// whose text contains the token as a substring (matching
+/// [`lexical_relevance`]'s substring semantics). Only tokens that actually
+/// partition the corpus carry weight; the two useless extremes are zeroed:
+///
+///   * `df == N` — the token is in EVERY memory (the project name). `idf =
+///     ln((N+1)/(N+1)) = 0` falls out of the formula naturally.
+///   * `df == 0` — the token is in NO memory (an out-of-corpus word like a
+///     generic English verb). It can't distinguish one memory from another,
+///     so it's forced to 0. Leaving it at its (maximal) raw IDF would let a
+///     single generic query word sink every candidate's coverage below the
+///     floor — the on-topic memory that matches the *rare, in-corpus* word
+///     would be wrongly pruned.
+///
+/// Everything in between gets `idf = ln((N+1)/(df+1))` — rarer ⇒ larger.
+/// Best-effort: a query/count failure yields 0 for that token (fail-open).
+fn corpus_token_idf(
+    conn: &Connection,
+    tokens: &[String],
+) -> KimetsuResult<HashMap<String, f32>> {
+    let mut idf = HashMap::new();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if n == 0 {
+        return Ok(idf);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT COUNT(*) FROM memories \
+         WHERE invalidated_at IS NULL AND lower(text) LIKE ?1 ESCAPE '\\'",
+    )?;
+    for token in tokens {
+        let pattern = format!("%{}%", escape_like(token));
+        let df: i64 = stmt.query_row(params![pattern], |row| row.get(0)).unwrap_or(0);
+        // df == 0 → out-of-corpus, can't discriminate → weight 0.
+        let weight = if df == 0 {
+            0.0
+        } else {
+            (((n + 1) as f32) / ((df + 1) as f32)).ln().max(0.0)
+        };
+        idf.insert(token.clone(), weight);
+    }
+    Ok(idf)
+}
+
+/// Escape SQL `LIKE` wildcards in a token so a literal `%`/`_` in a query
+/// word can't widen the document-frequency match. Pairs with `ESCAPE '\'`.
+fn escape_like(token: &str) -> String {
+    token
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// v1.0.0: the IDF-weighted fraction of the query's discriminating power that
+/// `summary` lexically covers, in `[0,1]`. Tokens present in the haystack
+/// contribute their IDF weight to the numerator; all tokens contribute to the
+/// denominator. A summary that matches only the query's low-IDF (common)
+/// words scores near 0; one that matches the rare, topical words scores near
+/// 1. Returns 0 when the total weight is ~0 (all tokens ubiquitous).
+fn weighted_coverage(content: &[String], idf: &HashMap<String, f32>, summary: &str) -> f32 {
+    let haystack = summary.to_ascii_lowercase();
+    let mut total = 0.0f32;
+    let mut hit = 0.0f32;
+    for token in content {
+        let weight = idf.get(token).copied().unwrap_or(0.0);
+        total += weight;
+        if weight > 0.0 && haystack.contains(token.as_str()) {
+            hit += weight;
+        }
+    }
+    if total <= f32::EPSILON {
+        0.0
+    } else {
+        (hit / total).clamp(0.0, 1.0)
+    }
 }
 
 fn query_tokens(query: &str) -> Vec<String> {
@@ -2884,6 +3058,227 @@ mod tests {
             "Jaccard-only path must NOT collapse the two paraphrases (different words, \
              low token overlap → both survive MMR with max_capsules=2); capsule handles: {:?}",
             bundle_lean
+                .capsules
+                .iter()
+                .map(|c| &c.expansion_handle)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── v1.0.0: lexical relevance floor (A+B+C) ──────────────────────────
+
+    #[test]
+    fn content_tokens_strips_stopwords_keeps_topical_words() {
+        let got = content_tokens("Tell me about kimetsu, what's the idea of the repo");
+        // Stopwords (tell, me, about, what, the, of) dropped; "s" too short.
+        // Topical words kept; deduped (no second "the").
+        assert_eq!(got, vec!["kimetsu", "idea", "repo"]);
+    }
+
+    #[test]
+    fn weighted_coverage_ignores_zero_idf_tokens() {
+        // "kimetsu" is corpus-ubiquitous (idf 0); "idea" is rare (high idf);
+        // "repo" is mid. A summary that matches only the project name + a
+        // mid-idf word covers a minority of the discriminating weight.
+        let content = vec!["kimetsu".to_string(), "idea".to_string(), "repo".to_string()];
+        let mut idf = HashMap::new();
+        idf.insert("kimetsu".to_string(), 0.0);
+        idf.insert("idea".to_string(), 1.386);
+        idf.insert("repo".to_string(), 0.693);
+
+        // Matches kimetsu + repo, NOT idea → 0.693 / (1.386+0.693) ≈ 0.333.
+        let cov = weighted_coverage(&content, &idf, "global:fact - the git repo and kimetsu brain");
+        assert!((cov - 0.333).abs() < 0.01, "got {cov}");
+
+        // Matches the rare topical word → high coverage.
+        let cov_topical =
+            weighted_coverage(&content, &idf, "global:fact - the core idea of kimetsu");
+        assert!(cov_topical > 0.6, "got {cov_topical}");
+    }
+
+    #[test]
+    fn escape_like_neutralizes_wildcards() {
+        assert_eq!(escape_like("a_b%c"), "a\\_b\\%c");
+        assert_eq!(escape_like("plain"), "plain");
+    }
+
+    /// The reported regression, reproduced end-to-end on the FTS-only path:
+    /// a corpus of unrelated debugging war-stories that all happen to contain
+    /// the project name "kimetsu", queried with a broad conceptual prompt.
+    ///
+    /// * floor disabled (min_lexical_coverage = 0.0) → all the noise surfaces
+    ///   (pre-fix behaviour: incidental "kimetsu" overlap is enough).
+    /// * floor enabled (0.5) → the memories whose ONLY match is the corpus-
+    ///   ubiquitous project name (m2, m3) are dropped. m1 also contains the
+    ///   real word "repo", so it's a genuine (if weak) lexical match and
+    ///   survives — eliminating that kind of keyword-overlap-but-off-topic
+    ///   hit needs the semantic path, not lexical filtering. The win here is
+    ///   killing the pure-project-name matches, which were the bulk of the
+    ///   injected noise.
+    #[test]
+    fn lexical_floor_drops_offtopic_memories_sharing_project_name() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        let insert = |id: &str, text: &str| {
+            let norm = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "INSERT INTO memories (
+                     memory_id, scope, kind, text, normalized_text, confidence,
+                     source_event_id, provenance_snapshot_json, created_at,
+                     use_count, usefulness_score, embedding, embedding_model
+                 )
+                 VALUES (?1, 'global_user', 'fact', ?2, ?3, 0.9, NULL, '{}',
+                         '2026-06-01T00:00:00Z', 0, 0.0, NULL, NULL)",
+                rusqlite::params![id, text, norm],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![id, text],
+            )
+            .expect("insert fts");
+        };
+
+        // All three contain "kimetsu"; none contain "idea". Only m1 contains
+        // "repo" (as in "git repo") — mirrors the real war-stories.
+        insert(
+            "m1",
+            "When implementing a setup command that calls init_project, tests must call \
+             git_init_boundary before setup_cmd so ProjectPaths discover resolves to the temp \
+             dir instead of climbing to the real parent git repo including the user brain at kimetsu",
+        );
+        insert(
+            "m2",
+            "A member crate with default embeddings silently turned embeddings on for the entire \
+             cargo test workspace build graph because cargo unifies features; kimetsu-chat \
+             retrieval tests failed",
+        );
+        insert(
+            "m3",
+            "In toml 0.9 use toml from_str to parse a TOML document into a Value not str parse; \
+             implementing config get and set in kimetsu-cli",
+        );
+
+        let query = "Tell me about kimetsu, what's the idea of the repo".to_string();
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let handles = |bundle: &ContextBundle| {
+            bundle
+                .capsules
+                .iter()
+                .map(|c| c.expansion_handle.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Floor disabled: every off-topic memory surfaces (pre-fix behaviour).
+        let no_floor = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.clone(),
+                budget_tokens: 2000,
+                max_capsules: 8,
+                min_lexical_coverage: 0.0,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve without floor");
+        let before = handles(&no_floor);
+        assert!(
+            before.contains(&"memory:m2".to_string())
+                && before.contains(&"memory:m3".to_string()),
+            "sanity: without the floor the pure-project-name memories should surface; got {before:?}"
+        );
+
+        // Floor enabled: the pure-project-name matches (m2, m3) are dropped.
+        let floored = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &weights,
+            ContextRequest {
+                stage: "localization".to_string(),
+                query,
+                budget_tokens: 2000,
+                max_capsules: 8,
+                min_lexical_coverage: 0.5,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve with floor");
+        let after = handles(&floored);
+        assert!(
+            !after.contains(&"memory:m2".to_string())
+                && !after.contains(&"memory:m3".to_string()),
+            "the lexical floor must drop memories whose only match is the corpus-ubiquitous \
+             project name; surviving: {after:?}"
+        );
+    }
+
+    /// A genuinely on-topic query must NOT be over-pruned: a memory that
+    /// covers the query's rare, discriminating word survives the floor.
+    #[test]
+    fn lexical_floor_keeps_ontopic_memory() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+
+        let insert = |id: &str, text: &str| {
+            let norm = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "INSERT INTO memories (
+                     memory_id, scope, kind, text, normalized_text, confidence,
+                     source_event_id, provenance_snapshot_json, created_at,
+                     use_count, usefulness_score, embedding, embedding_model
+                 )
+                 VALUES (?1, 'global_user', 'fact', ?2, ?3, 0.9, NULL, '{}',
+                         '2026-06-01T00:00:00Z', 0, 0.0, NULL, NULL)",
+                rusqlite::params![id, text, norm],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![id, text],
+            )
+            .expect("insert fts");
+        };
+
+        // Two memories so "distiller" is rare (df=1) → high idf.
+        insert(
+            "d1",
+            "The distiller runs at session end and harvests durable lessons from the transcript",
+        );
+        insert("n1", "Unrelated note about git rebase and squashing commits");
+
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &kimetsu_core::config::BrokerWeights::default(),
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "how does the distiller work".to_string(),
+                budget_tokens: 2000,
+                min_lexical_coverage: 0.5,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        assert!(
+            bundle
+                .capsules
+                .iter()
+                .any(|c| c.expansion_handle == "memory:d1"),
+            "on-topic memory covering the rare query word must survive the floor; got: {:?}",
+            bundle
                 .capsules
                 .iter()
                 .map(|c| &c.expansion_handle)
