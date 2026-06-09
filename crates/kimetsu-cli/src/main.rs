@@ -4019,8 +4019,13 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         ..Default::default()
     };
 
-    let bundle = match project::retrieve_context_readonly_with_request(&workspace, request.clone())
-    {
+    // FTS-only retrieval: the UserPromptSubmit hook runs in a throwaway
+    // per-prompt process that can't reuse the long-lived MCP server's warm
+    // model cache, so loading the semantic embedder here risks a cold ONNX
+    // load that blows the host's 30s hook timeout. Semantic ANN recall stays
+    // with the warm MCP `kimetsu_brain_context` tool. See
+    // project::retrieve_context_lexical_readonly.
+    let bundle = match project::retrieve_context_lexical_readonly(&workspace, request.clone()) {
         Ok(b) => b,
         Err(_) => return Ok(()), // Brain not initialized — silent fail
     };
@@ -4129,12 +4134,7 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     };
 
     if recorded > 0 {
-        println!(
-            "[Kimetsu] {} lesson{} recorded this session.",
-            recorded,
-            if recorded == 1 { "" } else { "s" }
-        );
-        return Ok(());
+        return emit_stop_hook_json(stop_lessons_recorded_json(recorded));
     }
     // Short sessions exit silently — no nagging for quick lookups. The
     // count is transcript *lines* (user/assistant/tool messages), so the
@@ -4195,21 +4195,59 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         });
         let mut state = proactive_state::load(&state_path);
         if !state.harvest_cued() {
-            println!(
-                "[kimetsu-harvest] No lessons recorded this non-trivial session. If anything \
-                 durable was learned, run the kimetsu-memory-harvester agent in the background \
-                 to capture it — otherwise call kimetsu_brain_record."
-            );
+            emit_stop_hook_json(stop_harvest_cue_json())?;
             state.note_harvest_cue(proactive_state::now_unix());
             proactive_state::save(&state_path, &state);
             return Ok(());
         }
     }
 
-    println!(
-        "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record."
-    );
+    emit_stop_hook_json(stop_no_lessons_json())
+}
+
+/// Emit a Claude Code `Stop`-hook result on stdout. Claude Code validates a
+/// Stop hook's stdout as JSON (the advanced control object), so the hook must
+/// never print bare text — doing so trips "hook returned invalid stop hook
+/// JSON output". A `Null` value prints nothing (silent allow-stop).
+fn emit_stop_hook_json(value: serde_json::Value) -> KimetsuResult<()> {
+    if !value.is_null() {
+        println!("{}", serde_json::to_string(&value)?);
+    }
     Ok(())
+}
+
+/// User-facing banner confirming how many lessons were recorded. Surfaced via
+/// `systemMessage` (shown to the user; it does not re-enter the model).
+fn stop_lessons_recorded_json(recorded: usize) -> serde_json::Value {
+    serde_json::json!({
+        "systemMessage": format!(
+            "[Kimetsu] {recorded} lesson{} recorded this session.",
+            if recorded == 1 { "" } else { "s" }
+        ),
+    })
+}
+
+/// The end-of-session harvest cue. Uses `decision: "block"` so the cue text
+/// actually re-enters the model (plain stdout never reaches it in a Stop
+/// hook), prompting it to dispatch the harvester before the turn ends. The
+/// `stop_hook_active` + persisted `harvest_cued` guards keep this to one cue
+/// per session, so blocking cannot loop.
+fn stop_harvest_cue_json() -> serde_json::Value {
+    serde_json::json!({
+        "decision": "block",
+        "reason": "[kimetsu-harvest] No lessons recorded this non-trivial session. If anything \
+                   durable was learned, run the kimetsu-memory-harvester agent in the background \
+                   to capture it — otherwise call kimetsu_brain_record.",
+    })
+}
+
+/// User-facing fallback nudge when nothing was recorded and the harvest cue
+/// path did not fire. Informational only, so it uses `systemMessage`.
+fn stop_no_lessons_json() -> serde_json::Value {
+    serde_json::json!({
+        "systemMessage":
+            "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.",
+    })
 }
 
 /// The end-of-session harvest cue fires only when auto-harvest is on AND
@@ -5973,6 +6011,54 @@ mod tests {
         assert!(should_emit_stop_harvest_cue(true, false));
         assert!(!should_emit_stop_harvest_cue(true, true));
         assert!(!should_emit_stop_harvest_cue(false, false));
+    }
+
+    // ── Stop-hook output must be valid JSON (CC validates stdout as the
+    //    advanced control object; bare text trips "invalid stop hook JSON
+    //    output"). Every builder feeds `emit_stop_hook_json`, so asserting
+    //    they are JSON objects with the right control fields guarantees the
+    //    hook never prints bare text. ────────────────────────────────────────
+    #[test]
+    fn stop_hook_outputs_are_valid_json_objects() {
+        for value in [
+            stop_lessons_recorded_json(1),
+            stop_lessons_recorded_json(3),
+            stop_harvest_cue_json(),
+            stop_no_lessons_json(),
+        ] {
+            let serialized = serde_json::to_string(&value).expect("serializes");
+            let reparsed: serde_json::Value =
+                serde_json::from_str(&serialized).expect("round-trips as JSON");
+            assert!(reparsed.is_object(), "stop-hook output must be an object");
+        }
+    }
+
+    #[test]
+    fn stop_lessons_recorded_pluralizes() {
+        assert!(
+            stop_lessons_recorded_json(1)["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("1 lesson recorded")
+        );
+        assert!(
+            stop_lessons_recorded_json(2)["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("2 lessons recorded")
+        );
+    }
+
+    #[test]
+    fn stop_harvest_cue_blocks_so_it_reaches_the_model() {
+        let cue = stop_harvest_cue_json();
+        assert_eq!(cue["decision"], "block");
+        assert!(
+            cue["reason"]
+                .as_str()
+                .unwrap()
+                .contains("[kimetsu-harvest]")
+        );
     }
 
     // ── D2a: config_edit_with ─────────────────────────────────────────────────
