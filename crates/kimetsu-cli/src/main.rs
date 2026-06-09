@@ -704,6 +704,12 @@ enum BrainCommand {
     Warm,
     /// Inspect or control the embedder daemon.
     Daemon(DaemonArgs),
+    /// Measure retrieval quality (recall@k / MRR) against a committed fixture.
+    ///
+    /// Runs three modes — fts (lexical-only), semantic (ANN + cosine), and
+    /// semantic+rerank (cross-encoder final stage) — over a fixture file and
+    /// prints a comparison table.  Requires `--features embeddings`.
+    Eval(EvalArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -747,6 +753,13 @@ struct EmbedDaemonArgs {
 struct DaemonArgs {
     #[command(subcommand)]
     command: DaemonCommand,
+}
+
+#[derive(Debug, clap::Args)]
+struct EvalArgs {
+    /// Path to the eval fixture JSON file.
+    #[arg(long, default_value = "fixtures/eval-retrieval.json")]
+    fixture: PathBuf,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -3276,6 +3289,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::EmbedDaemon(args) => brain_embed_daemon(args),
         BrainCommand::Warm => brain_warm(),
         BrainCommand::Daemon(args) => brain_daemon(args),
+        BrainCommand::Eval(args) => brain_eval(args),
     }
 }
 
@@ -5908,6 +5922,264 @@ fn lock(command: LockCommand) -> KimetsuResult<()> {
             Ok(())
         }
     }
+}
+
+// ─── kimetsu brain eval ───────────────────────────────────────────────────────
+
+/// Dispatch for `kimetsu brain eval`.
+///
+/// On embeddings builds the full three-mode eval runs. On lean builds a
+/// clear stub message is printed — the user needs `--features embeddings`.
+fn brain_eval(args: EvalArgs) -> KimetsuResult<()> {
+    #[cfg(feature = "embeddings")]
+    {
+        brain_eval_inner(args)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = args;
+        println!("kimetsu brain eval requires an embeddings build.");
+        println!("Rebuild with: cargo build -p kimetsu-cli --features embeddings");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
+    use kimetsu_brain::embeddings::{NoopEmbedder, open_embedder_for_model, open_reranker_for_model};
+    use kimetsu_brain::eval::{EvalFixture, mean, mrr, recall_at_k};
+    use kimetsu_brain::project::{BrainSession, add_memory, init_project};
+    use kimetsu_core::memory::{MemoryKind, MemoryScope};
+    use kimetsu_core::paths::git_init_boundary;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // Disable the user brain for this process — we work in a hermetic temp dir.
+    // SAFETY: this is a one-shot CLI command; no other threads have started yet.
+    unsafe {
+        std::env::set_var("KIMETSU_USER_BRAIN", "0");
+    }
+
+    // ── 1. Load and validate fixture ─────────────────────────────────────────
+    let fixture_path = &args.fixture;
+    let fixture_text = std::fs::read_to_string(fixture_path).map_err(|e| {
+        format!("cannot read fixture {}: {e}", fixture_path.display())
+    })?;
+    let fixture: EvalFixture = serde_json::from_str(&fixture_text).map_err(|e| {
+        format!("invalid fixture JSON in {}: {e}", fixture_path.display())
+    })?;
+
+    // Validate: every relevant key must exist in memories.
+    let all_keys: std::collections::HashSet<&str> =
+        fixture.memories.iter().map(|m| m.key.as_str()).collect();
+    for case in &fixture.cases {
+        for rel in &case.relevant {
+            if !all_keys.contains(rel.as_str()) {
+                return Err(format!(
+                    "fixture validation error: relevant key {:?} in query {:?} does not exist in memories",
+                    rel, case.query
+                )
+                .into());
+            }
+        }
+    }
+
+    println!(
+        "eval fixture: {} memories, {} cases",
+        fixture.memories.len(),
+        fixture.cases.len()
+    );
+
+    // ── 2. Set up a hermetic temp brain ──────────────────────────────────────
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!("kimetsu-eval-{ts}"));
+    std::fs::create_dir_all(&tmp_root)?;
+    git_init_boundary(&tmp_root);
+
+    // Init the project brain.
+    init_project(&tmp_root, true).map_err(|e| format!("init_project: {e}"))?;
+
+    // Add all corpus memories and track key → memory_id mapping.
+    println!("adding {} memories to temp brain...", fixture.memories.len());
+    let mut key_to_id: HashMap<String, String> = HashMap::new();
+    for mem in &fixture.memories {
+        let memory_id = add_memory(
+            &tmp_root,
+            MemoryScope::Project,
+            MemoryKind::Fact,
+            &mem.text,
+        )
+        .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
+        key_to_id.insert(mem.key.clone(), memory_id);
+    }
+
+    // Build key → id lookup from the map (for ranking back to keys).
+    let id_to_key: HashMap<String, String> =
+        key_to_id.iter().map(|(k, v)| (v.clone(), k.clone())).collect();
+
+    // ── 3. Helper: run one mode, return ranked key list per case ─────────────
+    let run_mode = |mode_label: &str,
+                    embedder: &dyn kimetsu_brain::embeddings::Embedder,
+                    reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
+                    pool: usize,
+                    rerank_floor: f32,
+                    rerank_cap: usize|
+     -> KimetsuResult<(Vec<Vec<String>>, u128)> {
+        let session = BrainSession::open_readonly(&tmp_root)
+            .map_err(|e| format!("{mode_label} open_readonly: {e}"))?;
+
+        let t0 = Instant::now();
+        let mut per_case_ranked: Vec<Vec<String>> = Vec::new();
+
+        for case in &fixture.cases {
+            let fetch_cap = pool;
+            let request = ContextRequest {
+                stage: "localization".to_string(),
+                query: case.query.clone(),
+                budget_tokens: 6000,
+                max_capsules: fetch_cap,
+                min_semantic_score: 0.0, // disable floor for eval recall
+                min_lexical_coverage: 0.0, // disable floor for eval recall
+                ..Default::default()
+            };
+            let mut bundle = session
+                .retrieve_context_with_injected_embedder(request, embedder)
+                .map_err(|e| format!("{mode_label} retrieve: {e}"))?;
+
+            // Apply reranker when present.
+            if let Some(rr) = reranker {
+                bundle.capsules = rerank_capsules(
+                    &case.query,
+                    bundle.capsules,
+                    rr,
+                    rerank_floor,
+                    rerank_cap,
+                );
+            }
+
+            // Map capsule expansion_handle "memory:<id>" → fixture key.
+            let ranked_keys: Vec<String> = bundle
+                .capsules
+                .iter()
+                .filter_map(|c| {
+                    c.expansion_handle
+                        .strip_prefix("memory:")
+                        .and_then(|id| id_to_key.get(id))
+                        .cloned()
+                })
+                .collect();
+
+            per_case_ranked.push(ranked_keys);
+        }
+
+        let elapsed = t0.elapsed().as_millis();
+        Ok((per_case_ranked, elapsed))
+    };
+
+    // ── 4. Run the three modes ────────────────────────────────────────────────
+    let pool = 12usize;
+    let rerank_floor = 0.30f32;
+    let rerank_cap = 4usize;
+
+    print!("running fts mode...");
+    let (fts_ranked, fts_ms) =
+        run_mode("fts", &NoopEmbedder, None, pool, 0.0, 0)?;
+    println!(" done ({fts_ms} ms)");
+
+    print!("running semantic mode (loading embedder)...");
+    let semantic_embedder = open_embedder_for_model("bge-small-en-v1.5");
+    let (sem_ranked, sem_ms) =
+        run_mode("semantic", semantic_embedder.as_ref(), None, pool, 0.0, 0)?;
+    println!(" done ({sem_ms} ms)");
+
+    print!("running semantic+rerank mode (loading reranker)...");
+    let reranker_opt = open_reranker_for_model("jina-reranker-v1-turbo-en");
+    let reranker_ref: Option<&dyn kimetsu_brain::embeddings::Reranker> =
+        reranker_opt.as_deref();
+    let (rr_ranked, rr_ms) = run_mode(
+        "semantic+rerank",
+        semantic_embedder.as_ref(),
+        reranker_ref,
+        pool,
+        rerank_floor,
+        rerank_cap,
+    )?;
+    println!(" done ({rr_ms} ms)");
+
+    // ── 5. Compute metrics ────────────────────────────────────────────────────
+    let eval_cases = &fixture.cases;
+    let n = eval_cases.len();
+
+    // Separate cases with relevant items from noise cases.
+    let signal_indices: Vec<usize> = (0..n)
+        .filter(|&i| !eval_cases[i].relevant.is_empty())
+        .collect();
+    let noise_indices: Vec<usize> = (0..n)
+        .filter(|&i| eval_cases[i].relevant.is_empty())
+        .collect();
+
+    let compute_metrics = |ranked: &[Vec<String>]| -> (f64, f64, f64, f64) {
+        // recall@2, recall@4, MRR over signal cases
+        let r2: Vec<f64> = signal_indices
+            .iter()
+            .map(|&i| recall_at_k(&ranked[i], &eval_cases[i].relevant, 2))
+            .collect();
+        let r4: Vec<f64> = signal_indices
+            .iter()
+            .map(|&i| recall_at_k(&ranked[i], &eval_cases[i].relevant, 4))
+            .collect();
+        let mrr_vals: Vec<f64> = signal_indices
+            .iter()
+            .map(|&i| mrr(&ranked[i], &eval_cases[i].relevant))
+            .collect();
+        // Average noise capsule count for irrelevant cases.
+        let noise_avg = if noise_indices.is_empty() {
+            0.0
+        } else {
+            noise_indices.iter().map(|&i| ranked[i].len() as f64).sum::<f64>()
+                / noise_indices.len() as f64
+        };
+        (mean(&r2), mean(&r4), mean(&mrr_vals), noise_avg)
+    };
+
+    let (fts_r2, fts_r4, fts_mrr, fts_noise) = compute_metrics(&fts_ranked);
+    let (sem_r2, sem_r4, sem_mrr, sem_noise) = compute_metrics(&sem_ranked);
+    let (rr_r2, rr_r4, rr_mrr, rr_noise) = compute_metrics(&rr_ranked);
+
+    // ── 6. Print table ────────────────────────────────────────────────────────
+    println!();
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>22} {:>10}",
+        "mode", "recall@2", "recall@4", "MRR", "noise-capsules(irrelevant)", "elapsed_ms"
+    );
+    println!("{}", "-".repeat(90));
+    println!(
+        "{:<22} {:>10.3} {:>10.3} {:>10.3} {:>22.1} {:>10}",
+        "fts", fts_r2, fts_r4, fts_mrr, fts_noise, fts_ms
+    );
+    println!(
+        "{:<22} {:>10.3} {:>10.3} {:>10.3} {:>22.1} {:>10}",
+        "semantic", sem_r2, sem_r4, sem_mrr, sem_noise, sem_ms
+    );
+    println!(
+        "{:<22} {:>10.3} {:>10.3} {:>10.3} {:>22.1} {:>10}",
+        "semantic+rerank", rr_r2, rr_r4, rr_mrr, rr_noise, rr_ms
+    );
+    println!();
+    println!(
+        "signal cases: {}  |  noise (empty-relevant) cases: {}",
+        signal_indices.len(),
+        noise_indices.len()
+    );
+
+    // ── 7. Clean up temp dir (best-effort) ────────────────────────────────────
+    let _ = std::fs::remove_dir_all(&tmp_root);
+
+    Ok(())
 }
 
 #[cfg(test)]
