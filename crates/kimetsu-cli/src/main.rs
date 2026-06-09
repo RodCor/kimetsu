@@ -697,6 +697,13 @@ enum BrainCommand {
     ///   kimetsu brain backup /path/to/snapshot.db
     ///   kimetsu brain backup --workspace /path/to/repo
     Backup(BrainBackupArgs),
+    /// Internal: the warm embedder daemon entrypoint (spawned detached).
+    #[command(hide = true)]
+    EmbedDaemon(EmbedDaemonArgs),
+    /// Ensure the embedder daemon is running and warm (no-op on lean / when disabled).
+    Warm,
+    /// Inspect or control the embedder daemon.
+    Daemon(DaemonArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -723,6 +730,27 @@ struct ModelSetArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct EmbedDaemonArgs {
+    /// Embedder model id to load (resolved from config by the spawner).
+    #[arg(long)]
+    model: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum DaemonCommand {
+    /// Print daemon status (model, uptime, request count) or "not running".
+    Status,
+    /// Ask the running daemon to exit.
+    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -3241,6 +3269,9 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Export(args) => brain_export(args),
         BrainCommand::Import(args) => brain_import(args),
         BrainCommand::Backup(args) => brain_backup(args),
+        BrainCommand::EmbedDaemon(args) => brain_embed_daemon(args),
+        BrainCommand::Warm => brain_warm(),
+        BrainCommand::Daemon(args) => brain_daemon(args),
     }
 }
 
@@ -3702,6 +3733,101 @@ fn brain_backup(args: BrainBackupArgs) -> KimetsuResult<()> {
         fmt_bytes_brain(size),
         dest_path.display()
     );
+    Ok(())
+}
+
+// ── embed-daemon / warm / daemon subcommand handlers ─────────────────────────
+
+#[cfg(feature = "embeddings")]
+fn brain_embed_daemon(args: EmbedDaemonArgs) -> KimetsuResult<()> {
+    use embed_daemon::server::{serve, DaemonState};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let embedder = kimetsu_brain::embeddings::open_embedder_for_model(&args.model);
+    let loaded_ms = t0.elapsed().as_millis() as u64;
+    let state = Arc::new(DaemonState {
+        embedder,
+        model: args.model,
+        started: Instant::now(),
+        loaded_ms,
+        requests: AtomicU64::new(0),
+    });
+    // AddrInUse means another daemon already owns the name — exit 0.
+    match serve(state) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn brain_warm() -> KimetsuResult<()> {
+    let workspace = env::current_dir().unwrap_or_default();
+    let Some(model) = resolve_daemon_model(&workspace) else {
+        return Ok(()); // disabled by config/env — silent no-op
+    };
+    embed_daemon::client::ensure_daemon(&model);
+    Ok(())
+}
+
+#[cfg(feature = "embeddings")]
+fn brain_daemon(args: DaemonArgs) -> KimetsuResult<()> {
+    use embed_daemon::{client, proto};
+    let workspace = env::current_dir().unwrap_or_default();
+    let model = resolve_daemon_model(&workspace)
+        .unwrap_or_else(|| kimetsu_brain::embeddings::resolve_embedder_id(None).to_string());
+    match args.command {
+        DaemonCommand::Status => match client::request(&model, proto::Request::Ping) {
+            Some(proto::Response::Info { version, model, uptime_s, requests, loaded_ms }) => {
+                println!(
+                    "running: model={model} version={version} uptime={uptime_s}s requests={requests} load={loaded_ms}ms"
+                );
+                Ok(())
+            }
+            _ => {
+                println!("not running");
+                Ok(())
+            }
+        },
+        DaemonCommand::Stop => {
+            let _ = client::request(&model, proto::Request::Shutdown);
+            println!("stop requested");
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the daemon model id from config, honoring the kill switches.
+/// Returns `None` when the daemon must not be used.
+#[cfg(feature = "embeddings")]
+fn resolve_daemon_model(workspace: &std::path::Path) -> Option<String> {
+    if std::env::var("KIMETSU_EMBED_DAEMON").as_deref() == Ok("0") {
+        return None;
+    }
+    let paths = kimetsu_core::paths::ProjectPaths::discover(workspace).ok()?;
+    let config = project::load_config(&paths).ok()?;
+    if !config.embedder.enabled || !config.embedder.daemon {
+        return None;
+    }
+    Some(kimetsu_brain::embeddings::resolve_embedder_id(Some(config.embedder.model.as_str())).to_string())
+}
+
+// ── Lean (no embeddings) stubs ───────────────────────────────────────────────
+#[cfg(not(feature = "embeddings"))]
+fn brain_embed_daemon(_args: EmbedDaemonArgs) -> KimetsuResult<()> {
+    eprintln!("kimetsu: embeddings not built — no daemon");
+    Ok(())
+}
+#[cfg(not(feature = "embeddings"))]
+fn brain_warm() -> KimetsuResult<()> {
+    Ok(())
+}
+#[cfg(not(feature = "embeddings"))]
+fn brain_daemon(_args: DaemonArgs) -> KimetsuResult<()> {
+    println!("not running (embeddings not built)");
     Ok(())
 }
 
