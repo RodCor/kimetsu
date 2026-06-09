@@ -447,7 +447,14 @@ The core hook pattern is the same across MCP hosts:
   each turn. It reads the prompt from stdin, retrieves a context
   bundle, and injects it — so the model sees relevant memories without
   having to remember to ask. Zero-overhead: when the brain has nothing,
-  the hook emits nothing.
+  the hook emits nothing. On `embeddings` builds the hook first asks a
+  **warm embedder daemon** (`kimetsu brain embed-daemon`, one per user,
+  started/pre-warmed by `kimetsu brain warm` on `SessionStart`) for
+  *semantic* retrieval over a local socket; if the daemon is unreachable
+  within a tight budget it falls back to lexical FTS for that turn and
+  spawns the daemon for next time, so the prompt is never blocked. The
+  daemon holds the ONNX model in memory once, so no per-prompt cold load.
+  Toggles: `[embedder] daemon` / `warm_on_start`, or `KIMETSU_EMBED_DAEMON=0`.
 - **`Stop` → `kimetsu brain stop-hook`** fires when the host supports a
   stop event. It walks the transcript, counts `kimetsu_brain_record`
   calls, and prints a one-line post-turn banner — either confirming how

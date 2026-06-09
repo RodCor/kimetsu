@@ -10,6 +10,20 @@ breaking changes require a major bump.
 ## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
+  * **Warm embedder daemon — semantic recall at hook time.** The
+    `UserPromptSubmit` context-hook can now match memories by *meaning*, not
+    just lexically. A single per-user daemon (`kimetsu brain embed-daemon`,
+    keyed by embedder model) loads the ONNX model once and serves full
+    embedding/ANN retrieval to the hook over a local socket / named pipe
+    (`interprocess`); the hook is a thin client with a ≤750ms budget and a
+    hard fall-back to floored-FTS, so the prompt is never blocked. `kimetsu
+    brain warm` (wired to each harness's startup hook) pre-warms it so a
+    running session never pays a cold model load. One model in RAM regardless
+    of how many projects/agents are active. Config: `[embedder] daemon` and
+    `warm_on_start` toggle it; `[embedder] model` (and `kimetsu brain model
+    set`) pick the model. `KIMETSU_EMBED_DAEMON=0` is a runtime kill switch.
+    Embeddings builds only; lean builds keep the floored-FTS hook. New
+    `kimetsu brain daemon status|stop` to inspect/control it.
   * **Durable schema migrations.** brain.db now migrates forward
     automatically on open via a versioned, forward-only runner (each
     migration applied in one transaction). The DB is backed up to a
