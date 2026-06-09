@@ -454,11 +454,12 @@ The core hook pattern is the same across MCP hosts:
   within a tight budget (300ms) it falls back to lexical FTS for that turn
   and spawns the daemon for next time, so the prompt is never blocked. The
   daemon holds the ONNX model in memory once (no per-prompt cold load) and
-  finishes with a cross-encoder rerank: a 12-capsule pool is scored jointly
-  against the query, floored, and truncated — `kimetsu brain eval` measures
-  the win (recall@4 ~0.90 semantic vs ~0.72 FTS on the committed fixture).
-  Toggles: `[embedder] daemon` / `warm_on_start` / `reranker`, or
-  `KIMETSU_EMBED_DAEMON=0`.
+  serves hybrid semantic retrieval with an absolute cosine floor —
+  `kimetsu brain eval` measures the win (recall@4 ~0.90 semantic vs ~0.72
+  FTS on the committed fixture). An optional cross-encoder rerank stage
+  (`[embedder] reranker`, off by default) trades latency for top-position
+  precision. Toggles: `[embedder] daemon` / `warm_on_start` / `reranker`,
+  or `KIMETSU_EMBED_DAEMON=0`.
 - **`Stop` → `kimetsu brain stop-hook`** fires when the host supports a
   stop event. It walks the transcript, counts `kimetsu_brain_record`
   calls, and prints a one-line post-turn banner — either confirming how

@@ -12,6 +12,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Candidate pool the reranker judges before truncating to the caller's cap.
+/// 12 is the quality-optimal setting on the eval fixture. Reranking is an
+/// opt-in (`[embedder] reranker`, default off): a full-fidelity rerank of 12
+/// summaries costs ~0.5–1s on a typical CPU, which intentionally exceeds the
+/// hook's 300ms budget — users who enable it trade first-turn latency
+/// (FTS-fallback turns) for top-position precision once answers are cached
+/// warm. Snippet-truncation and smaller pools were tried and measurably
+/// regressed eval recall, so the knobs stay at quality-optimal values.
 const RERANK_POOL: usize = 12;
 
 /// Sigmoid-score floor — capsules the cross-encoder judges below this are noise.
@@ -104,10 +111,24 @@ impl DaemonState {
     }
 }
 
-/// Serve until a `Shutdown` request arrives. `state.embedder` is whatever the
-/// caller injected (the real model in production, a stub in tests).
+/// Serve until a `Shutdown` request arrives. Test-only convenience — the
+/// production entrypoint binds first (before model load) and calls
+/// [`serve_with_listener`] directly.
+#[cfg(test)]
 pub fn serve(state: Arc<DaemonState>) -> std::io::Result<()> {
     let listener = ipc::listen(&state.model)?;
+    serve_with_listener(listener, state)
+}
+
+/// Like [`serve`] but with a pre-bound listener. The daemon entrypoint binds
+/// BEFORE loading any model so a redundant spawn (live daemon already owns
+/// the socket) exits in milliseconds instead of after a multi-second model
+/// load — that doomed child otherwise holds inherited stdio handles and
+/// stalls the hook's caller for the whole load.
+pub fn serve_with_listener(
+    listener: interprocess::local_socket::Listener,
+    state: Arc<DaemonState>,
+) -> std::io::Result<()> {
     let workers = std::thread::available_parallelism()
         .map(|n| (usize::from(n) * 2).min(8))
         .unwrap_or(4);

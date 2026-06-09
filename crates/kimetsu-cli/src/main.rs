@@ -3758,10 +3758,31 @@ fn brain_backup(args: BrainBackupArgs) -> KimetsuResult<()> {
 
 #[cfg(feature = "embeddings")]
 fn brain_embed_daemon(args: EmbedDaemonArgs) -> KimetsuResult<()> {
-    use embed_daemon::server::{serve, DaemonState};
+    use embed_daemon::server::{serve_with_listener, DaemonState};
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::time::Instant;
+
+    // Bind BEFORE loading any model. A redundant spawn (a live daemon already
+    // owns the socket — AddrInUse / PermissionDenied / AlreadyExists are the
+    // Windows race variants) must exit in milliseconds, not after a
+    // multi-second model load: the doomed child inherits the spawning hook's
+    // stdio handles, so while it lives the hook's CALLER (the harness hook
+    // runner) is stalled waiting for stdout to close.
+    let listener = match embed_daemon::ipc::listen(&args.model) {
+        Ok(l) => l,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AddrInUse
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let t0 = Instant::now();
     let embedder = kimetsu_brain::embeddings::open_embedder_for_model(&args.model);
@@ -3775,22 +3796,7 @@ fn brain_embed_daemon(args: EmbedDaemonArgs) -> KimetsuResult<()> {
         loaded_ms,
         requests: AtomicU64::new(0),
     });
-    // AddrInUse / PermissionDenied / AlreadyExists all mean another daemon
-    // already owns the socket name (Windows race variants) — exit 0.
-    match serve(state) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::AddrInUse
-                    | std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::AlreadyExists
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
+    serve_with_listener(listener, state).map_err(Into::into)
 }
 
 #[cfg(feature = "embeddings")]
@@ -6081,6 +6087,7 @@ fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     };
 
     // ── 4. Run the three modes ────────────────────────────────────────────────
+    // Mirror the daemon's production constants (server.rs RERANK_POOL/FLOOR).
     let pool = 12usize;
     let rerank_floor = 0.30f32;
     let rerank_cap = 4usize;

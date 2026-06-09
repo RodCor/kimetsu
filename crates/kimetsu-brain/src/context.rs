@@ -2117,6 +2117,11 @@ pub fn rerank_capsules(
         return capsules;
     }
 
+    // Rerank on the FULL summary. Truncating to a snippet was tried for
+    // latency and measurably cratered quality on the eval fixture
+    // (recall@4 0.83 → 0.66, below even FTS) — the cross-encoder needs the
+    // whole lesson to judge relevance. Reranking is therefore a
+    // quality-over-latency opt-in, not part of the hook's 300ms budget.
     let docs: Vec<&str> = capsules.iter().map(|c| c.summary.as_str()).collect();
     let scores = match reranker.rerank(query, &docs) {
         Ok(s) => s,

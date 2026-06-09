@@ -36,10 +36,38 @@ fn exchange(model: &str, req: proto::Request) -> std::io::Result<proto::Response
     proto::read_line(&mut reader)
 }
 
+/// Windows: mark this process's std handles non-inheritable before spawning.
+/// Rust's `Command` passes `bInheritHandles=TRUE`, so every inheritable
+/// handle in the hook — including the stdout pipe the harness reads — gets
+/// duplicated into the daemon child. When that child WINS the bind and lives
+/// on as the daemon, it holds the hook's stdout open and the harness waits
+/// on pipe EOF until its hook timeout: the first prompt of a session would
+/// stall. Clearing HANDLE_FLAG_INHERIT on our own std handles is safe (it
+/// doesn't affect our own use of them) and breaks the leak at the source.
+#[cfg(windows)]
+fn unshare_std_handles() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle/SetHandleInformation on our own process's
+        // standard handles; null/invalid handles are skipped.
+        unsafe {
+            let handle = GetStdHandle(which);
+            if !handle.is_null() && handle as isize != -1 {
+                let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 /// Spawn `kimetsu brain embed-daemon --model <model> --reranker <reranker>`
 /// detached. Fire-and-forget: returns immediately; the model load happens
 /// inside the child.
 pub fn spawn_daemon(model: &str, reranker: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    unshare_std_handles();
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["brain", "embed-daemon", "--model", model, "--reranker", reranker])
