@@ -88,6 +88,18 @@ pub struct EmbedderSection {
     /// files loading unchanged.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// v1.0.0: use the warm embedder daemon for the `UserPromptSubmit`
+    /// hook. `false` ⇒ the hook never spawns/contacts a daemon and stays
+    /// on floored-FTS even on `embeddings` builds. Config equivalent of
+    /// `KIMETSU_EMBED_DAEMON=0`. `#[serde(default = "default_true")]`
+    /// keeps older configs loading with the daemon on.
+    #[serde(default = "default_true")]
+    pub daemon: bool,
+    /// v1.0.0: pre-warm the daemon at harness startup (via `kimetsu brain
+    /// warm`, wired to SessionStart). `false` ⇒ no startup spawn; the
+    /// daemon (if `daemon=true`) warms lazily on the first prompt instead.
+    #[serde(default = "default_true")]
+    pub warm_on_start: bool,
 }
 
 fn default_embedder_id() -> String {
@@ -103,6 +115,8 @@ impl Default for EmbedderSection {
         Self {
             model: default_embedder_id(),
             enabled: default_true(),
+            daemon: default_true(),
+            warm_on_start: default_true(),
         }
     }
 }
@@ -605,6 +619,13 @@ max_total_cost_usd = 250.0
         assert!(
             config.kimetsu.use_user_brain,
             "W3.3: kimetsu.use_user_brain must default to true"
+        );
+        // v1.0.0: daemon + warm_on_start default ON so existing installs get
+        // the warm-daemon path on upgrade.
+        assert!(config.embedder.daemon, "embedder.daemon must default to true");
+        assert!(
+            config.embedder.warm_on_start,
+            "embedder.warm_on_start must default to true"
         );
     }
 
