@@ -287,9 +287,17 @@ impl Reranker for StubReranker {
     }
 }
 
-/// v1.0.0: open a reranker by curated id. `"off"`/`"none"`/empty → None.
-/// Unknown ids fall back to the default jina turbo model. Lean builds
-/// always return None.
+/// v1.0.0: open a reranker by curated or user-defined id.
+///
+/// Resolution:
+///   1. `"off"`/`"none"`/`"noop"`/empty → `None` (disable).
+///   2. One of the 4 curated ids → `FastembedReranker::try_open` (builtin ONNX).
+///   3. Known alias (`jina-reranker-v1-tiny-en`, `ms-marco-tinybert-l-2-v2`,
+///      `ms-marco-minilm-l-4-v2`) or any id containing `/` → user-defined ONNX
+///      via HuggingFace Hub download.
+///   4. Anything else → fallback to the default curated jina-turbo.
+///
+/// Lean builds (no `embeddings` feature) always return `None`.
 pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
     let v = model_id.trim().to_ascii_lowercase();
     if v.is_empty() || matches!(v.as_str(), "off" | "none" | "noop") {
@@ -297,7 +305,32 @@ pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
     }
     #[cfg(feature = "embeddings")]
     {
-        fastembed_backend::FastembedReranker::try_open(model_id)
+        // Curated ids → builtin path.
+        const CURATED: &[&str] = &[
+            "jina-reranker-v1-turbo-en",
+            "bge-reranker-base",
+            "bge-reranker-v2-m3",
+            "jina-reranker-v2-base-multilingual",
+        ];
+        // User-defined alias ids → HF download path.
+        const USER_DEFINED_ALIASES: &[&str] = &[
+            "jina-reranker-v1-tiny-en",
+            "ms-marco-tinybert-l-2-v2",
+            "ms-marco-minilm-l-4-v2",
+        ];
+
+        if CURATED.contains(&v.as_str()) {
+            return fastembed_backend::FastembedReranker::try_open(model_id)
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn Reranker>);
+        }
+        if USER_DEFINED_ALIASES.contains(&v.as_str()) || v.contains('/') {
+            return fastembed_backend::FastembedReranker::try_open_user_defined(model_id)
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn Reranker>);
+        }
+        // Unknown → fallback to default curated turbo.
+        fastembed_backend::FastembedReranker::try_open("jina-reranker-v1-turbo-en")
             .ok()
             .map(|r| Box::new(r) as Box<dyn Reranker>)
     }
@@ -566,6 +599,82 @@ mod fastembed_backend {
     };
     use std::sync::{Arc, Mutex, OnceLock};
 
+    // ── HF Hub download helper (user-defined ONNX rerankers) ─────────────────
+
+    /// Alias table: lowercased stable id → HuggingFace repo id.
+    fn hf_repo_for_alias(lowercased: &str) -> Option<&'static str> {
+        match lowercased {
+            "jina-reranker-v1-tiny-en" => Some("jinaai/jina-reranker-v1-tiny-en"),
+            "ms-marco-tinybert-l-2-v2" => Some("Xenova/ms-marco-TinyBERT-L-2-v2"),
+            "ms-marco-minilm-l-4-v2" => Some("Xenova/ms-marco-MiniLM-L-4-v2"),
+            _ => None,
+        }
+    }
+
+    /// Download files for a user-defined reranker from HuggingFace Hub.
+    ///
+    /// Returns `(onnx_bytes, tokenizer_files)` or an `EmbedderError::LoadFailed`.
+    fn download_user_defined_reranker(
+        model_id: &str,
+    ) -> Result<
+        (fastembed::OnnxSource, fastembed::TokenizerFiles),
+        EmbedderError,
+    > {
+        use hf_hub::api::sync::Api;
+
+        let lowercased = model_id.trim().to_ascii_lowercase();
+        let repo_id: String = if let Some(alias) = hf_repo_for_alias(&lowercased) {
+            alias.to_string()
+        } else if lowercased.contains('/') {
+            // Raw HF repo id passed directly.
+            model_id.to_string()
+        } else {
+            return Err(EmbedderError::LoadFailed(format!(
+                "user-defined reranker: no HF repo mapping for {model_id:?}"
+            )));
+        };
+
+        let api = Api::new().map_err(|e| {
+            EmbedderError::LoadFailed(format!("hf-hub Api::new failed: {e}"))
+        })?;
+        let repo = api.model(repo_id.clone());
+
+        // Helper: download a required file or return LoadFailed.
+        let get_required = |filename: &str| -> Result<Vec<u8>, EmbedderError> {
+            let path = repo.get(filename).map_err(|e| {
+                EmbedderError::LoadFailed(format!(
+                    "{repo_id}/{filename}: download failed: {e}"
+                ))
+            })?;
+            std::fs::read(&path).map_err(|e| {
+                EmbedderError::LoadFailed(format!(
+                    "{repo_id}/{filename}: read failed: {e}"
+                ))
+            })
+        };
+
+        let tokenizer_file = get_required("tokenizer.json")?;
+        let config_file = get_required("config.json")?;
+        let tokenizer_config_file = get_required("tokenizer_config.json")?;
+        let special_tokens_map_file = get_required("special_tokens_map.json")?;
+
+        // Try `onnx/model.onnx` first, then `model.onnx` at root.
+        let onnx_path = repo.get("onnx/model.onnx").or_else(|_| repo.get("model.onnx")).map_err(|e| {
+            EmbedderError::LoadFailed(format!(
+                "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
+            ))
+        })?;
+
+        let tokenizer_files = fastembed::TokenizerFiles {
+            tokenizer_file,
+            config_file,
+            special_tokens_map_file,
+            tokenizer_config_file,
+        };
+
+        Ok((fastembed::OnnxSource::File(onnx_path), tokenizer_files))
+    }
+
     /// fastembed-backed embedder. Wraps the ONNX runtime in a
     /// `Mutex` because `TextEmbedding::embed` takes `&mut self`.
     /// The lock window is short (one inference per call); the
@@ -684,8 +793,12 @@ mod fastembed_backend {
     /// Wraps `TextRerank` in a `Mutex` because `rerank` takes `&mut self`.
     /// The lock window is short (one rerank call per request); the daemon's
     /// worker threads serialize cleanly through it.
+    ///
+    /// `model_id` is an owned `String` so both curated (`&'static str`
+    /// originates from a match arm) and user-defined (alias / HF repo id)
+    /// rerankers can share the same struct.
     pub struct FastembedReranker {
-        pub(super) model_id: &'static str,
+        model_id: String,
         engine: Mutex<TextRerank>,
     }
 
@@ -694,7 +807,7 @@ mod fastembed_backend {
         /// initialize a `TextRerank` engine. Unknown ids fall back to the
         /// jina-reranker-v1-turbo-en default.
         pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
-            let (kind, model_id) = match builtin_id {
+            let (kind, stable_id) = match builtin_id {
                 "bge-reranker-base" => (RerankerModel::BGERerankerBase, "bge-reranker-base"),
                 "bge-reranker-v2-m3" => (RerankerModel::BGERerankerV2M3, "bge-reranker-v2-m3"),
                 "jina-reranker-v2-base-multilingual" => (
@@ -710,6 +823,35 @@ mod fastembed_backend {
             let opts = RerankInitOptions::new(kind).with_show_download_progress(false);
             let engine = TextRerank::try_new(opts)
                 .map_err(|e| EmbedderError::LoadFailed(format!("fastembed reranker init: {e}")))?;
+            Ok(Self {
+                model_id: stable_id.to_string(),
+                engine: Mutex::new(engine),
+            })
+        }
+
+        /// Load a user-defined ONNX reranker by alias or raw HF repo id.
+        ///
+        /// Downloads the ONNX and tokenizer files from HuggingFace Hub (cached
+        /// locally) and constructs a `TextRerank` via
+        /// `try_new_from_user_defined`. The `model_id` stored in the struct is
+        /// the normalized alias (e.g. `"jina-reranker-v1-tiny-en"`) or the raw
+        /// repo id, lower-cased, so it is stable across calls.
+        pub fn try_open_user_defined(alias_or_repo: &str) -> Result<Self, EmbedderError> {
+            use fastembed::{RerankInitOptionsUserDefined, UserDefinedRerankingModel};
+
+            let (onnx_source, tokenizer_files) =
+                download_user_defined_reranker(alias_or_repo)?;
+
+            let model = UserDefinedRerankingModel::new(onnx_source, tokenizer_files);
+            let opts = RerankInitOptionsUserDefined::default();
+            let engine = TextRerank::try_new_from_user_defined(model, opts).map_err(|e| {
+                EmbedderError::LoadFailed(format!(
+                    "user-defined reranker {alias_or_repo:?} init: {e}"
+                ))
+            })?;
+
+            // Normalise the stored id to lower-case alias or repo id.
+            let model_id = alias_or_repo.trim().to_ascii_lowercase();
             Ok(Self {
                 model_id,
                 engine: Mutex::new(engine),
@@ -743,7 +885,7 @@ mod fastembed_backend {
         }
 
         fn model_id(&self) -> &str {
-            self.model_id
+            &self.model_id
         }
     }
 

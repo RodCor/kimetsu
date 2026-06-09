@@ -760,6 +760,11 @@ struct EvalArgs {
     /// Path to the eval fixture JSON file.
     #[arg(long, default_value = "fixtures/eval-retrieval.json")]
     fixture: PathBuf,
+    /// Comma-separated list of reranker model ids to benchmark (quality + latency).
+    /// When non-empty, one extra row is printed per reranker after the baseline table.
+    /// Example: `--rerankers jina-reranker-v1-turbo-en,jina-reranker-v1-tiny-en`
+    #[arg(long, default_value = "")]
+    rerankers: String,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -6183,7 +6188,228 @@ fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         noise_indices.len()
     );
 
-    // ── 7. Clean up temp dir (best-effort) ────────────────────────────────────
+    // ── 7. Optional per-reranker benchmark ───────────────────────────────────
+    let reranker_ids: Vec<&str> = args
+        .rerankers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if !reranker_ids.is_empty() {
+        // Struct to hold benchmark results for one reranker.
+        struct RankerBenchRow {
+            label: String,
+            load_ms: u128,
+            rerank_mean_ms: f64,
+            rerank_max_ms: u128,
+            r2: f64,
+            r4: f64,
+            mrr: f64,
+            noise: f64,
+            onnx_kb: Option<u64>,
+        }
+
+        // Helper: run the signal cases and time only the rerank step per query.
+        let run_reranker_bench =
+            |rr_id: &str| -> KimetsuResult<RankerBenchRow> {
+                use kimetsu_brain::context::rerank_capsules;
+
+                print!("  loading {rr_id}...");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let load_start = Instant::now();
+                let reranker_box = open_reranker_for_model(rr_id);
+                let load_ms = load_start.elapsed().as_millis();
+
+                let reranker_ref: Option<&dyn kimetsu_brain::embeddings::Reranker> =
+                    reranker_box.as_deref();
+
+                if reranker_ref.is_none() {
+                    println!(" SKIPPED (loader returned None)");
+                    return Err(format!("reranker {rr_id} failed to load").into());
+                }
+                println!(" loaded ({load_ms} ms)");
+
+                let session = kimetsu_brain::project::BrainSession::open_readonly(&tmp_root)
+                    .map_err(|e| format!("{rr_id} open_readonly: {e}"))?;
+                let rr = reranker_ref.unwrap();
+
+                let mut per_case_ranked: Vec<Vec<String>> = Vec::new();
+                let mut rerank_times_ms: Vec<u128> = Vec::new();
+
+                for case in fixture.cases.iter() {
+                    let request = kimetsu_brain::context::ContextRequest {
+                        stage: "localization".to_string(),
+                        query: case.query.clone(),
+                        budget_tokens: 6000,
+                        max_capsules: pool,
+                        min_semantic_score: 0.0,
+                        min_lexical_coverage: 0.0,
+                        ..Default::default()
+                    };
+                    let mut bundle = session
+                        .retrieve_context_with_injected_embedder(
+                            request,
+                            semantic_embedder.as_ref(),
+                        )
+                        .map_err(|e| format!("{rr_id} retrieve: {e}"))?;
+
+                    // Time only the rerank step.
+                    let rr_start = Instant::now();
+                    if !eval_cases[per_case_ranked.len()].relevant.is_empty() {
+                        bundle.capsules = rerank_capsules(
+                            &case.query,
+                            bundle.capsules,
+                            rr,
+                            rerank_floor,
+                            rerank_cap,
+                        );
+                        rerank_times_ms.push(rr_start.elapsed().as_millis());
+                    } else {
+                        // Noise case: still rerank so we get noise metric.
+                        bundle.capsules = rerank_capsules(
+                            &case.query,
+                            bundle.capsules,
+                            rr,
+                            rerank_floor,
+                            rerank_cap,
+                        );
+                    }
+
+                    let ranked_keys: Vec<String> = bundle
+                        .capsules
+                        .iter()
+                        .filter_map(|c| {
+                            c.expansion_handle
+                                .strip_prefix("memory:")
+                                .and_then(|id| id_to_key.get(id))
+                                .cloned()
+                        })
+                        .collect();
+                    per_case_ranked.push(ranked_keys);
+                }
+
+                let (r2, r4, mrr_val, noise) = compute_metrics(&per_case_ranked);
+
+                let rerank_mean_ms = if rerank_times_ms.is_empty() {
+                    0.0
+                } else {
+                    rerank_times_ms.iter().sum::<u128>() as f64 / rerank_times_ms.len() as f64
+                };
+                let rerank_max_ms = rerank_times_ms.into_iter().max().unwrap_or(0);
+
+                // Try to find the ONNX file size on disk (best-effort, no panic on miss).
+                let onnx_kb: Option<u64> = {
+                    let low = rr_id.trim().to_ascii_lowercase();
+                    // Map alias → HF repo id for cache-path lookup.
+                    let repo_id: &str = match low.as_str() {
+                        "jina-reranker-v1-tiny-en" => "jinaai/jina-reranker-v1-tiny-en",
+                        "ms-marco-tinybert-l-2-v2" => "Xenova/ms-marco-TinyBERT-L-2-v2",
+                        "ms-marco-minilm-l-4-v2" => "Xenova/ms-marco-MiniLM-L-4-v2",
+                        "jina-reranker-v1-turbo-en" => "jinaai/jina-reranker-v1-turbo-en",
+                        other => other,
+                    };
+                    // hf-hub default cache: ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/...
+                    let home_cache = std::env::var("HF_HOME").ok().map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            std::env::var("HOME").ok()
+                                .or_else(|| std::env::var("USERPROFILE").ok())
+                                .map(|h| std::path::PathBuf::from(h).join(".cache").join("huggingface").join("hub"))
+                        });
+                    home_cache.and_then(|cache_root| {
+                        let safe_name = repo_id.replace('/', "--");
+                        let snap_dir = cache_root.join(format!("models--{safe_name}")).join("snapshots");
+                        let mut best: Option<u64> = None;
+                        if let Ok(snaps) = std::fs::read_dir(&snap_dir) {
+                            'snap: for snap in snaps.flatten() {
+                                for candidate in ["onnx/model.onnx", "model.onnx"] {
+                                    let p = snap.path().join(candidate);
+                                    if let Ok(meta) = std::fs::metadata(&p) {
+                                        best = Some(meta.len() / 1024);
+                                        break 'snap;
+                                    }
+                                }
+                            }
+                        }
+                        best
+                    })
+                };
+
+                Ok(RankerBenchRow {
+                    label: rr_id.to_string(),
+                    load_ms,
+                    rerank_mean_ms,
+                    rerank_max_ms,
+                    r2,
+                    r4,
+                    mrr: mrr_val,
+                    noise,
+                    onnx_kb,
+                })
+            };
+
+        println!();
+        println!("=== Reranker benchmark (semantic base + per-reranker) ===");
+        println!();
+
+        // Print the semantic-only baseline row for comparison.
+        let col_w = 28usize;
+        println!(
+            "{:<col_w$} {:>9} {:>14} {:>13} {:>10} {:>10} {:>10} {:>8} {:>10}",
+            "reranker",
+            "load_ms",
+            "rerank_mean_ms",
+            "rerank_max_ms",
+            "recall@2",
+            "recall@4",
+            "MRR",
+            "noise",
+            "onnx_kb",
+        );
+        println!("{}", "-".repeat(118));
+        println!(
+            "{:<col_w$} {:>9} {:>14} {:>13} {:>10.3} {:>10.3} {:>10.3} {:>8.1} {:>10}",
+            "(semantic, no rerank)",
+            "-",
+            "-",
+            "-",
+            sem_r2,
+            sem_r4,
+            sem_mrr,
+            sem_noise,
+            "-",
+        );
+
+        let mut bench_rows: Vec<RankerBenchRow> = Vec::new();
+        for rr_id in &reranker_ids {
+            match run_reranker_bench(rr_id) {
+                Ok(row) => bench_rows.push(row),
+                Err(e) => eprintln!("  {rr_id}: skipped — {e}"),
+            }
+        }
+
+        for row in &bench_rows {
+            let onnx_str = row
+                .onnx_kb
+                .map(|kb| format!("{kb}"))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<col_w$} {:>9} {:>14.1} {:>13} {:>10.3} {:>10.3} {:>10.3} {:>8.1} {:>10}",
+                row.label,
+                row.load_ms,
+                row.rerank_mean_ms,
+                row.rerank_max_ms,
+                row.r2,
+                row.r4,
+                row.mrr,
+                row.noise,
+                onnx_str,
+            );
+        }
+        println!();
+    }
+
+    // ── 8. Clean up temp dir (best-effort) ────────────────────────────────────
     let _ = std::fs::remove_dir_all(&tmp_root);
 
     Ok(())
