@@ -63,4 +63,9 @@ ulid.workspace = true
 # spawning the long-lived embed daemon, so it can't hold the hook's stdout
 # pipe open and stall the harness (see embed_daemon::client).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

@@ -710,6 +710,13 @@ enum BrainCommand {
     /// semantic+rerank (cross-encoder final stage) — over a fixture file and
     /// prints a comparison table.  Requires `--features embeddings`.
     Eval(EvalArgs),
+    /// Measure retrieval quality, latency, and RAM across
+    /// embedder × reranker combinations.
+    ///
+    /// Each combination runs in a child process for honest RSS measurement.
+    /// Results are written to --out as JSON files + a summary.md table.
+    /// Requires `--features embeddings`.
+    Bench(BrainBenchArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -769,6 +776,33 @@ struct EvalArgs {
     /// cap (mirrors the daemon's RERANK_POOL; 12 is the production value).
     #[arg(long, default_value_t = 12)]
     pool: usize,
+}
+
+/// Args for `kimetsu brain bench`.
+#[derive(Debug, clap::Args)]
+struct BrainBenchArgs {
+    /// Path to the eval fixture JSON.
+    #[arg(long, default_value = "bench/dataset.json")]
+    dataset: PathBuf,
+    /// Comma-separated embedder ids to sweep.
+    #[arg(long, default_value = "bge-small-en-v1.5,jina-v2-base-code")]
+    embedders: String,
+    /// Comma-separated reranker ids to sweep.
+    #[arg(long, default_value = "off,jina-reranker-v1-turbo-en,jina-reranker-v1-tiny-en,ms-marco-tinybert-l-2-v2,ms-marco-minilm-l-4-v2")]
+    rerankers: String,
+    /// Candidate-pool size passed to retrieval before reranking.
+    #[arg(long, default_value_t = 12usize)]
+    pool: usize,
+    /// Final capsule cap after reranking.
+    #[arg(long, default_value_t = 4usize)]
+    cap: usize,
+    /// Directory to write per-combo JSON files and summary.md.
+    #[arg(long, default_value = "bench/results")]
+    out: PathBuf,
+    /// Internal: run a single embedder×reranker combo in-process and write
+    /// the combo JSON file.  Do NOT use directly — the orchestrator sets this.
+    #[arg(long, hide = true)]
+    single: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -3299,6 +3333,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Warm => brain_warm(),
         BrainCommand::Daemon(args) => brain_daemon(args),
         BrainCommand::Eval(args) => brain_eval(args),
+        BrainCommand::Bench(args) => brain_bench(args),
     }
 }
 
@@ -6415,6 +6450,559 @@ fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     }
 
     // ── 8. Clean up temp dir (best-effort) ────────────────────────────────────
+    let _ = std::fs::remove_dir_all(&tmp_root);
+
+    Ok(())
+}
+
+// ─── kimetsu brain bench ──────────────────────────────────────────────────────
+
+fn brain_bench(args: BrainBenchArgs) -> KimetsuResult<()> {
+    #[cfg(feature = "embeddings")]
+    {
+        brain_bench_inner(args)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = args;
+        println!("kimetsu brain bench requires an embeddings build.");
+        println!("Rebuild with: cargo build -p kimetsu-cli --features embeddings");
+        Ok(())
+    }
+}
+
+/// RSS helper (Windows only; returns None on other platforms or on failure).
+fn rss_mb() -> Option<f64> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let handle = GetCurrentProcess();
+            let mut pmc = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>();
+            pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if K32GetProcessMemoryInfo(handle, &mut pmc, pmc.cb) != 0 {
+                return Some(pmc.WorkingSetSize as f64 / (1024.0 * 1024.0));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+fn peak_rss_mb() -> Option<f64> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let handle = GetCurrentProcess();
+            let mut pmc = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>();
+            pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if K32GetProcessMemoryInfo(handle, &mut pmc, pmc.cb) != 0 {
+                return Some(pmc.PeakWorkingSetSize as f64 / (1024.0 * 1024.0));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn brain_bench_inner(args: BrainBenchArgs) -> KimetsuResult<()> {
+    if args.single {
+        brain_bench_single(args)
+    } else {
+        brain_bench_orchestrate(args)
+    }
+}
+
+/// Orchestrator: spawn one child per embedder×reranker combo, wait for all,
+/// read per-combo JSON files, print + write summary.
+#[cfg(feature = "embeddings")]
+fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
+    use std::time::Instant;
+
+    let embedders: Vec<&str> = args
+        .embedders
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let rerankers: Vec<&str> = args
+        .rerankers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let dataset = args.dataset.clone();
+    let out_dir = args.out.clone();
+    let pool = args.pool;
+    let cap = args.cap;
+
+    std::fs::create_dir_all(&out_dir)?;
+
+    let current_exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dataset_str = dataset.to_string_lossy().to_string();
+    let out_str = out_dir.to_string_lossy().to_string();
+
+    let total = embedders.len() * rerankers.len();
+    println!(
+        "brain bench: {} embedder(s) × {} reranker(s) = {} combos",
+        embedders.len(),
+        rerankers.len(),
+        total
+    );
+    println!("dataset: {}", dataset.display());
+    println!("output:  {}", out_dir.display());
+    println!();
+
+    let mut combo_idx = 0usize;
+    for &embedder in &embedders {
+        for &reranker in &rerankers {
+            combo_idx += 1;
+            print!("[{combo_idx}/{total}] {embedder} × {reranker} ... ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            let t0 = Instant::now();
+            let status = std::process::Command::new(&current_exe)
+                .arg("brain")
+                .arg("bench")
+                .arg("--dataset")
+                .arg(&dataset_str)
+                .arg("--embedders")
+                .arg(embedder)
+                .arg("--rerankers")
+                .arg(reranker)
+                .arg("--pool")
+                .arg(pool.to_string())
+                .arg("--cap")
+                .arg(cap.to_string())
+                .arg("--out")
+                .arg(&out_str)
+                .arg("--single")
+                .status()
+                .map_err(|e| format!("spawn child for {embedder}×{reranker}: {e}"))?;
+
+            let elapsed = t0.elapsed().as_secs_f64();
+            if status.success() {
+                println!("done ({elapsed:.1}s)");
+            } else {
+                println!("FAILED (exit={status})");
+            }
+        }
+    }
+
+    // Read all combo JSON files and build summary rows.
+    println!();
+    println!("reading results...");
+
+    #[derive(serde::Deserialize)]
+    struct ComboSummary {
+        recall_at_2: f64,
+        recall_at_4: f64,
+        mrr: f64,
+        mean_latency_ms: f64,
+        p95_latency_ms: f64,
+        noise_capsules: f64,
+    }
+    #[derive(serde::Deserialize)]
+    struct ComboResult {
+        embedder: String,
+        reranker: String,
+        embedder_load_ms: u128,
+        reranker_load_ms: u128,
+        peak_rss_mb: Option<f64>,
+        summary: ComboSummary,
+    }
+
+    let mut rows: Vec<ComboResult> = Vec::new();
+    for &embedder in &embedders {
+        for &reranker in &rerankers {
+            let safe_emb = embedder.replace(['/', '.', ' '], "-");
+            let safe_rr = reranker.replace(['/', '.', ' '], "-");
+            let fname = format!("combo-{safe_emb}-{safe_rr}.json");
+            let fpath = out_dir.join(&fname);
+            match std::fs::read_to_string(&fpath) {
+                Ok(text) => match serde_json::from_str::<ComboResult>(&text) {
+                    Ok(r) => rows.push(r),
+                    Err(e) => eprintln!("  warning: parse {fname}: {e}"),
+                },
+                Err(e) => eprintln!("  warning: read {fname}: {e}"),
+            }
+        }
+    }
+
+    // Sort by MRR desc.
+    rows.sort_by(|a, b| {
+        b.summary
+            .mrr
+            .partial_cmp(&a.summary.mrr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Build summary table.
+    let header = format!(
+        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} |",
+        "embedder",
+        "reranker",
+        "recall@2",
+        "recall@4",
+        "MRR",
+        "mean ms",
+        "p95 ms",
+        "noise_caps",
+        "load ms (emb+rr)",
+        "peak RSS MB"
+    );
+    let sep = format!(
+        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} |",
+        "", "", "", "", "", "", "", "", "", ""
+    );
+
+    let mut table_lines: Vec<String> = vec![header, sep];
+    for row in &rows {
+        let load_ms = row.embedder_load_ms + row.reranker_load_ms;
+        let rss_str = row
+            .peak_rss_mb
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        table_lines.push(format!(
+            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} |",
+            row.embedder,
+            row.reranker,
+            row.summary.recall_at_2,
+            row.summary.recall_at_4,
+            row.summary.mrr,
+            row.summary.mean_latency_ms,
+            row.summary.p95_latency_ms,
+            row.summary.noise_capsules,
+            load_ms,
+            rss_str,
+        ));
+    }
+
+    let summary_md = format!(
+        "# Kimetsu Retrieval Benchmark — Summary\n\nSorted by MRR descending.\n\n{}\n",
+        table_lines.join("\n")
+    );
+
+    let summary_path = out_dir.join("summary.md");
+    std::fs::write(&summary_path, &summary_md)?;
+    println!("wrote {}", summary_path.display());
+    println!();
+    println!("{summary_md}");
+
+    Ok(())
+}
+
+/// Worker: run a single embedder×reranker combo in-process, write combo JSON.
+#[cfg(feature = "embeddings")]
+fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
+    use kimetsu_brain::embeddings::{open_embedder_for_model, open_reranker_for_model};
+    use kimetsu_brain::eval::EvalFixture;
+    use kimetsu_brain::project::{BrainSession, add_memory, init_project};
+    use kimetsu_core::memory::{MemoryKind, MemoryScope};
+    use kimetsu_core::paths::git_init_boundary;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // Disable user brain.
+    unsafe {
+        std::env::set_var("KIMETSU_USER_BRAIN", "0");
+    }
+
+    let embedder_id = args
+        .embedders
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("bge-small-en-v1.5")
+        .to_string();
+    let reranker_id = args
+        .rerankers
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("off")
+        .to_string();
+
+    // ── 1. Load fixture ───────────────────────────────────────────────────────
+    let fixture_text = std::fs::read_to_string(&args.dataset).map_err(|e| {
+        format!("cannot read dataset {}: {e}", args.dataset.display())
+    })?;
+    let fixture: EvalFixture = serde_json::from_str(&fixture_text).map_err(|e| {
+        format!("invalid dataset JSON: {e}")
+    })?;
+
+    let all_keys: std::collections::HashSet<&str> =
+        fixture.memories.iter().map(|m| m.key.as_str()).collect();
+    for case in &fixture.cases {
+        for rel in &case.relevant {
+            if !all_keys.contains(rel.as_str()) {
+                return Err(format!(
+                    "dataset validation: key {:?} in query {:?} not in memories",
+                    rel, case.query
+                )
+                .into());
+            }
+        }
+    }
+
+    // ── 2. Load embedder (measure RSS before/after) ───────────────────────────
+    let rss_before_emb = rss_mb();
+    let t_emb = Instant::now();
+    // Set env so seeds use THIS embedder.
+    unsafe {
+        std::env::set_var("KIMETSU_BRAIN_EMBEDDER", &embedder_id);
+    }
+    let embedder = open_embedder_for_model(&embedder_id);
+    let embedder_load_ms = t_emb.elapsed().as_millis();
+    let rss_after_emb = rss_mb();
+
+    // ── 3. Load reranker ──────────────────────────────────────────────────────
+    let rss_before_rr = rss_mb();
+    let t_rr = Instant::now();
+    let reranker_box: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> =
+        if reranker_id == "off" {
+            None
+        } else {
+            open_reranker_for_model(&reranker_id)
+        };
+    let reranker_load_ms = t_rr.elapsed().as_millis();
+    let rss_after_rr = rss_mb();
+
+    // ── 4. Seed temp brain ────────────────────────────────────────────────────
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let safe_emb = embedder_id.replace(['/', '.', ' '], "-");
+    let safe_rr = reranker_id.replace(['/', '.', ' '], "-");
+    let tmp_root = std::env::temp_dir()
+        .join(format!("kimetsu-bench-{safe_emb}-{safe_rr}-{ts}"));
+    std::fs::create_dir_all(&tmp_root)?;
+    git_init_boundary(&tmp_root);
+
+    let t_seed = Instant::now();
+    init_project(&tmp_root, true).map_err(|e| format!("init_project: {e}"))?;
+
+    let mut key_to_id: HashMap<String, String> = HashMap::new();
+    for mem in &fixture.memories {
+        let id = add_memory(
+            &tmp_root,
+            MemoryScope::Project,
+            MemoryKind::Fact,
+            &mem.text,
+        )
+        .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
+        key_to_id.insert(mem.key.clone(), id);
+    }
+    let seed_ms = t_seed.elapsed().as_millis();
+    let id_to_key: HashMap<String, String> =
+        key_to_id.iter().map(|(k, v)| (v.clone(), k.clone())).collect();
+
+    // ── 5. Run cases ─────────────────────────────────────────────────────────
+    let session = BrainSession::open_readonly(&tmp_root)
+        .map_err(|e| format!("open_readonly: {e}"))?;
+
+    #[derive(serde::Serialize)]
+    struct ObtainedItem {
+        key: String,
+        score: f32,
+    }
+    #[derive(serde::Serialize)]
+    struct CaseResult {
+        query: String,
+        expected: Vec<String>,
+        obtained: Vec<ObtainedItem>,
+        hit_at_2: bool,
+        hit_at_4: bool,
+        mrr: f64,
+        latency_ms: u128,
+    }
+
+    let mut case_results: Vec<CaseResult> = Vec::new();
+    let mut latencies_ms: Vec<u128> = Vec::new();
+
+    for case in &fixture.cases {
+        let t0 = Instant::now();
+        let request = ContextRequest {
+            stage: "localization".to_string(),
+            query: case.query.clone(),
+            budget_tokens: 6000,
+            max_capsules: args.pool,
+            min_semantic_score: 0.0,
+            min_lexical_coverage: 0.0,
+            ..Default::default()
+        };
+        let mut bundle = session
+            .retrieve_context_with_injected_embedder(request, embedder.as_ref())
+            .map_err(|e| format!("retrieve: {e}"))?;
+
+        // Apply reranker or truncate.
+        if let Some(ref rr) = reranker_box {
+            bundle.capsules = rerank_capsules(
+                &case.query,
+                bundle.capsules,
+                rr.as_ref(),
+                0.0,
+                args.cap,
+            );
+        } else {
+            bundle.capsules.truncate(args.cap);
+        }
+
+        let latency_ms = t0.elapsed().as_millis();
+        latencies_ms.push(latency_ms);
+
+        // Map expansion_handle "memory:<id>" → key.
+        let obtained: Vec<ObtainedItem> = bundle
+            .capsules
+            .iter()
+            .map(|c| {
+                let key = c
+                    .expansion_handle
+                    .strip_prefix("memory:")
+                    .and_then(|id| id_to_key.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                ObtainedItem { key, score: c.score }
+            })
+            .collect();
+
+        let obtained_keys: Vec<String> = obtained.iter().map(|o| o.key.clone()).collect();
+
+        // Metrics.
+        let hit_at_2 = if case.relevant.is_empty() {
+            false
+        } else {
+            obtained_keys
+                .iter()
+                .take(2)
+                .any(|k| case.relevant.contains(k))
+        };
+        let hit_at_4 = if case.relevant.is_empty() {
+            false
+        } else {
+            obtained_keys
+                .iter()
+                .take(4)
+                .any(|k| case.relevant.contains(k))
+        };
+
+        let mrr_val = kimetsu_brain::eval::mrr(&obtained_keys, &case.relevant);
+
+        case_results.push(CaseResult {
+            query: case.query.clone(),
+            expected: case.relevant.clone(),
+            obtained,
+            hit_at_2,
+            hit_at_4,
+            mrr: mrr_val,
+            latency_ms,
+        });
+    }
+
+    // ── 6. Aggregate metrics ──────────────────────────────────────────────────
+    let signal_cases: Vec<_> = fixture
+        .cases
+        .iter()
+        .zip(&case_results)
+        .filter(|(c, _)| !c.relevant.is_empty())
+        .collect();
+    let noise_cases: Vec<_> = fixture
+        .cases
+        .iter()
+        .zip(&case_results)
+        .filter(|(c, _)| c.relevant.is_empty())
+        .collect();
+
+    let recall_at_2 = if signal_cases.is_empty() {
+        0.0
+    } else {
+        signal_cases.iter().map(|(_, r)| if r.hit_at_2 { 1.0f64 } else { 0.0 }).sum::<f64>()
+            / signal_cases.len() as f64
+    };
+    let recall_at_4 = if signal_cases.is_empty() {
+        0.0
+    } else {
+        signal_cases.iter().map(|(_, r)| if r.hit_at_4 { 1.0f64 } else { 0.0 }).sum::<f64>()
+            / signal_cases.len() as f64
+    };
+    let mrr_avg = if signal_cases.is_empty() {
+        0.0
+    } else {
+        signal_cases.iter().map(|(_, r)| r.mrr).sum::<f64>() / signal_cases.len() as f64
+    };
+    let mean_latency_ms = if latencies_ms.is_empty() {
+        0.0
+    } else {
+        latencies_ms.iter().sum::<u128>() as f64 / latencies_ms.len() as f64
+    };
+    let p95_latency_ms = {
+        let mut sorted = latencies_ms.clone();
+        sorted.sort_unstable();
+        if sorted.is_empty() {
+            0.0
+        } else {
+            let idx = ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
+            sorted[idx] as f64
+        }
+    };
+    let noise_capsules = if noise_cases.is_empty() {
+        0.0
+    } else {
+        noise_cases
+            .iter()
+            .map(|(_, r)| r.obtained.len() as f64)
+            .sum::<f64>()
+            / noise_cases.len() as f64
+    };
+
+    let peak = peak_rss_mb();
+
+    // ── 7. Write combo JSON ───────────────────────────────────────────────────
+    let combo_json = serde_json::json!({
+        "embedder": embedder_id,
+        "reranker": reranker_id,
+        "embedder_load_ms": embedder_load_ms,
+        "reranker_load_ms": reranker_load_ms,
+        "rss_before_embedder_mb": rss_before_emb,
+        "rss_after_embedder_mb": rss_after_emb,
+        "rss_before_reranker_mb": rss_before_rr,
+        "rss_after_reranker_mb": rss_after_rr,
+        "peak_rss_mb": peak,
+        "seed_ms": seed_ms,
+        "cases": case_results,
+        "summary": {
+            "recall_at_2": recall_at_2,
+            "recall_at_4": recall_at_4,
+            "mrr": mrr_avg,
+            "mean_latency_ms": mean_latency_ms,
+            "p95_latency_ms": p95_latency_ms,
+            "noise_capsules": noise_capsules,
+        }
+    });
+
+    std::fs::create_dir_all(&args.out)?;
+    let fname = format!("combo-{safe_emb}-{safe_rr}.json");
+    let fpath = args.out.join(&fname);
+    std::fs::write(&fpath, serde_json::to_string_pretty(&combo_json)?)?;
+
+    // ── 8. Cleanup ────────────────────────────────────────────────────────────
     let _ = std::fs::remove_dir_all(&tmp_root);
 
     Ok(())
