@@ -33,13 +33,14 @@ Sleep 2s
 Show
 
 # ── Beat 1: one command to prove the brain works ─────────────────────────────
-Type "kimetsu setup --host claude-code"
+Type "kimetsu setup --host claude-code --no-setup"
 Enter
-Sleep 6s
+# embeddings model loads in-process — give the selftest room
+Sleep 35s
 
 Type "kimetsu doctor --selftest"
 Enter
-Sleep 5s
+Sleep 20s
 # prints: ✓ recorded a memory and retrieved it — the brain works
 
 Sleep 1s
@@ -49,16 +50,16 @@ Enter
 # ── Beat 2: record a lesson the way an agent would ───────────────────────────
 Type `kimetsu brain memory add --scope project --kind failure_pattern "Tests pass alone but fail under 'cargo test --workspace': a new crate with default embeddings flips feature unification for every sibling crate. Keep new crates' default = [] and opt in explicitly."`
 Enter
-Sleep 3s
+Sleep 14s
 
 # ── Beat 3: retrieve it with DIFFERENT words — semantic recall ───────────────
 Type `kimetsu brain context "why does my test only break in the full CI run?"`
 Enter
-Sleep 6s
+Sleep 20s
 
 # ── Beat 4: the brain measures itself ────────────────────────────────────────
 Type "kimetsu brain insights"
 Enter
-Sleep 5s
+Sleep 12s
 
 Sleep 3s

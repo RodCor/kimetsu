@@ -15,6 +15,8 @@ starts where the last one left off.
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-informational)](https://www.rust-lang.org)
 
+<img src="docs/assets/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="920" />
+
 </div>
 
 ---
