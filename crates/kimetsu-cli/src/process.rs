@@ -264,6 +264,7 @@ fn kill_pid(pid: u32) -> Result<(), String> {
 /// Expected rows:    `"1234","C:\...\kimetsu.exe","kimetsu mcp serve --workspace C:\proj","20240615120000.000000+000"`
 ///
 /// Also accepts the legacy 3-column form (without CreationDate) for backwards compatibility.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_windows_proc_csv(output: &str, current_pid: u32) -> Vec<KimetsuProc> {
     let mut procs = Vec::new();
     let mut lines = output.lines().peekable();
@@ -450,6 +451,7 @@ pub fn parse_unix_ps(output: &str, current_pid: u32) -> Vec<KimetsuProc> {
 
 /// Parse a single CSV row, handling double-quoted fields (including embedded
 /// commas and escaped double-quotes `""`).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn parse_csv_row(row: &str) -> Vec<String> {
     let mut fields: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -501,6 +503,7 @@ fn parse_csv_row(row: &str) -> Vec<String> {
 /// This is a no-dep implementation to avoid pulling in a datetime crate.
 /// It deliberately uses simple integer arithmetic and returns `None` on any
 /// malformed input so the caller can fall back gracefully.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_wmi_datetime(s: &str) -> Option<u64> {
     // Minimum: "YYYYMMDDHHmmss" = 14 chars; with offset: 21+ chars.
     let s = s.trim();
@@ -562,6 +565,7 @@ pub fn parse_wmi_datetime(s: &str) -> Option<u64> {
 
 /// Days since 1970-01-01 for the given (year, month, day).
 /// Returns `None` for obviously invalid dates.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
     // Days in each month (non-leap year).
     const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -607,6 +611,7 @@ fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
 /// Used by `kimetsu update` to detect processes that hold the target binary
 /// locked before attempting the replace, so the user can be offered a chance
 /// to stop them interactively.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn processes_locking_target(target: &Path) -> Vec<KimetsuProc> {
     let target_canon = target
         .canonicalize()

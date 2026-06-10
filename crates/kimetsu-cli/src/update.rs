@@ -217,6 +217,7 @@ pub fn run(options: UpdateOptions) -> KimetsuResult<()> {
 
     let mut updated = 0usize;
     let mut failed = Vec::new();
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut stopped_mcp = 0usize;
     for install in installs {
         // ── Windows pre-flight: detect locking processes and offer to stop them.
@@ -867,17 +868,22 @@ fn kimetsu_version_at(path: &Path) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplaceOutcome {
     Updated,
+    // Constructed only on the Windows schedule-on-reboot path.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Scheduled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoveOutcome {
     Removed,
+    // Constructed only on the Windows schedule-on-reboot path.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Scheduled,
 }
 
 /// Decision outcome for the update pre-flight locking check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum PreflightAction {
     /// Stop the locking processes, then attempt the replace immediately.
     Stop,
@@ -899,6 +905,7 @@ pub enum PreflightAction {
 ///   the deferred-replace path is safe.)
 /// * Interactive (TTY, no `force`): print the list, prompt `[Y/n]`.
 ///   `Y` / empty → `Stop`; `n` → `Defer`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn decide_preflight_action<R: BufRead, W: Write>(
     locking: &[KimetsuProc],
     is_tty: bool,
