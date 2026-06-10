@@ -595,7 +595,7 @@ pub fn pick_builtin_model_from_env() -> &'static str {
 mod fastembed_backend {
     use super::{Embedder, EmbedderError, Reranker, pick_builtin_model_from_env};
     use fastembed::{
-        EmbeddingModel, InitOptions, RerankerModel, RerankInitOptions, TextEmbedding, TextRerank,
+        EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
     };
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -616,10 +616,7 @@ mod fastembed_backend {
     /// Returns `(onnx_bytes, tokenizer_files)` or an `EmbedderError::LoadFailed`.
     fn download_user_defined_reranker(
         model_id: &str,
-    ) -> Result<
-        (fastembed::OnnxSource, fastembed::TokenizerFiles),
-        EmbedderError,
-    > {
+    ) -> Result<(fastembed::OnnxSource, fastembed::TokenizerFiles), EmbedderError> {
         use hf_hub::api::sync::Api;
 
         let lowercased = model_id.trim().to_ascii_lowercase();
@@ -634,22 +631,17 @@ mod fastembed_backend {
             )));
         };
 
-        let api = Api::new().map_err(|e| {
-            EmbedderError::LoadFailed(format!("hf-hub Api::new failed: {e}"))
-        })?;
+        let api = Api::new()
+            .map_err(|e| EmbedderError::LoadFailed(format!("hf-hub Api::new failed: {e}")))?;
         let repo = api.model(repo_id.clone());
 
         // Helper: download a required file or return LoadFailed.
         let get_required = |filename: &str| -> Result<Vec<u8>, EmbedderError> {
             let path = repo.get(filename).map_err(|e| {
-                EmbedderError::LoadFailed(format!(
-                    "{repo_id}/{filename}: download failed: {e}"
-                ))
+                EmbedderError::LoadFailed(format!("{repo_id}/{filename}: download failed: {e}"))
             })?;
             std::fs::read(&path).map_err(|e| {
-                EmbedderError::LoadFailed(format!(
-                    "{repo_id}/{filename}: read failed: {e}"
-                ))
+                EmbedderError::LoadFailed(format!("{repo_id}/{filename}: read failed: {e}"))
             })
         };
 
@@ -659,11 +651,14 @@ mod fastembed_backend {
         let special_tokens_map_file = get_required("special_tokens_map.json")?;
 
         // Try `onnx/model.onnx` first, then `model.onnx` at root.
-        let onnx_path = repo.get("onnx/model.onnx").or_else(|_| repo.get("model.onnx")).map_err(|e| {
-            EmbedderError::LoadFailed(format!(
-                "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
-            ))
-        })?;
+        let onnx_path = repo
+            .get("onnx/model.onnx")
+            .or_else(|_| repo.get("model.onnx"))
+            .map_err(|e| {
+                EmbedderError::LoadFailed(format!(
+                    "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
+                ))
+            })?;
 
         let tokenizer_files = fastembed::TokenizerFiles {
             tokenizer_file,
@@ -839,8 +834,7 @@ mod fastembed_backend {
         pub fn try_open_user_defined(alias_or_repo: &str) -> Result<Self, EmbedderError> {
             use fastembed::{RerankInitOptionsUserDefined, UserDefinedRerankingModel};
 
-            let (onnx_source, tokenizer_files) =
-                download_user_defined_reranker(alias_or_repo)?;
+            let (onnx_source, tokenizer_files) = download_user_defined_reranker(alias_or_repo)?;
 
             let model = UserDefinedRerankingModel::new(onnx_source, tokenizer_files);
             let opts = RerankInitOptionsUserDefined::default();
@@ -1217,10 +1211,7 @@ mod tests {
         assert_eq!(scores.len(), docs.len(), "one score per document");
         // All scores in (0,1).
         for (i, &s) in scores.iter().enumerate() {
-            assert!(
-                s > 0.0 && s < 1.0,
-                "score[{i}] must be in (0,1), got {s}"
-            );
+            assert!(s > 0.0 && s < 1.0, "score[{i}] must be in (0,1), got {s}");
         }
     }
 

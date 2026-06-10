@@ -680,7 +680,7 @@ pub fn brain_context_tool(
     arguments: &serde_json::Value,
     reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
 ) -> Result<serde_json::Value, String> {
-    use kimetsu_brain::context::{rerank_capsules, ContextRequest};
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
 
     let query = arguments
         .get("query")
@@ -776,8 +776,13 @@ pub fn brain_context_tool(
         Ok(mut bundle) => {
             // Apply cross-encoder reranking when a reranker is present.
             if let Some(rr) = reranker {
-                bundle.capsules =
-                    rerank_capsules(&effective_query, bundle.capsules, rr, REMOTE_RERANK_FLOOR, cap);
+                bundle.capsules = rerank_capsules(
+                    &effective_query,
+                    bundle.capsules,
+                    rr,
+                    REMOTE_RERANK_FLOOR,
+                    cap,
+                );
             }
             Ok(json!({
                 "ok": true,
@@ -2399,8 +2404,7 @@ mod tests {
                 "max_capsules": 1,
             });
 
-            let result =
-                brain_context_tool(&root, &args, Some(&rr)).expect("brain_context_tool");
+            let result = brain_context_tool(&root, &args, Some(&rr)).expect("brain_context_tool");
 
             assert_eq!(result["ok"].as_bool(), Some(true), "ok false: {result}");
             // The reranker caps at max_capsules=1.

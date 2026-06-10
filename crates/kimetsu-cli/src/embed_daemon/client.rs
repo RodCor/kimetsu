@@ -70,10 +70,17 @@ pub fn spawn_daemon(model: &str, reranker: &str) -> std::io::Result<()> {
     unshare_std_handles();
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["brain", "embed-daemon", "--model", model, "--reranker", reranker])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.args([
+        "brain",
+        "embed-daemon",
+        "--model",
+        model,
+        "--reranker",
+        reranker,
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -100,6 +107,9 @@ mod tests {
     #[test]
     fn request_returns_none_when_no_daemon() {
         let got = request("no-daemon-here-zzz", proto::Request::Ping);
-        assert!(got.is_none(), "must be None (-> FTS fallback) when daemon absent");
+        assert!(
+            got.is_none(),
+            "must be None (-> FTS fallback) when daemon absent"
+        );
     }
 }

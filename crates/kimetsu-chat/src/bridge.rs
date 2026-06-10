@@ -5817,7 +5817,10 @@ mod tests {
             .iter()
             .filter(|g| g["hooks"][0]["command"] == "kimetsu brain warm")
             .count();
-        assert_eq!(warm_count, 1, "exactly one SessionStart warm group after two runs");
+        assert_eq!(
+            warm_count, 1,
+            "exactly one SessionStart warm group after two runs"
+        );
 
         fs::remove_dir_all(root).ok();
     }

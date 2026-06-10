@@ -1549,15 +1549,14 @@ const SEMANTIC_KEEP_COSINE: f32 = 0.20;
 /// small — only true stopwords. Content words like "repo" or "idea" are NOT
 /// here; their commonness is handled by IDF, not a hand-maintained list.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "but", "not", "you", "your", "with", "this",
-    "that", "these", "those", "from", "into", "about", "what", "whats", "which",
-    "who", "whom", "how", "why", "when", "where", "can", "could", "would",
-    "should", "will", "shall", "does", "did", "was", "were", "been", "being",
-    "have", "has", "had", "its", "it", "is", "as", "at", "by", "of", "to", "in",
-    "on", "or", "an", "be", "do", "me", "my", "we", "us", "our", "im", "ive",
-    "let", "lets", "please", "tell", "give", "show", "want", "need", "get",
-    "got", "use", "using", "there", "their", "they", "them", "then", "than",
-    "some", "any", "all", "more", "most", "such", "via", "per",
+    "the", "and", "for", "are", "but", "not", "you", "your", "with", "this", "that", "these",
+    "those", "from", "into", "about", "what", "whats", "which", "who", "whom", "how", "why",
+    "when", "where", "can", "could", "would", "should", "will", "shall", "does", "did", "was",
+    "were", "been", "being", "have", "has", "had", "its", "it", "is", "as", "at", "by", "of", "to",
+    "in", "on", "or", "an", "be", "do", "me", "my", "we", "us", "our", "im", "ive", "let", "lets",
+    "please", "tell", "give", "show", "want", "need", "get", "got", "use", "using", "there",
+    "their", "they", "them", "then", "than", "some", "any", "all", "more", "most", "such", "via",
+    "per",
 ];
 
 /// v1.0.0: tokenize a query into deduped CONTENT tokens — the same word
@@ -1596,10 +1595,7 @@ fn content_tokens(query: &str) -> Vec<String> {
 ///
 /// Everything in between gets `idf = ln((N+1)/(df+1))` — rarer ⇒ larger.
 /// Best-effort: a query/count failure yields 0 for that token (fail-open).
-fn corpus_token_idf(
-    conn: &Connection,
-    tokens: &[String],
-) -> KimetsuResult<HashMap<String, f32>> {
+fn corpus_token_idf(conn: &Connection, tokens: &[String]) -> KimetsuResult<HashMap<String, f32>> {
     let mut idf = HashMap::new();
     let n: i64 = conn
         .query_row(
@@ -1617,7 +1613,9 @@ fn corpus_token_idf(
     )?;
     for token in tokens {
         let pattern = format!("%{}%", escape_like(token));
-        let df: i64 = stmt.query_row(params![pattern], |row| row.get(0)).unwrap_or(0);
+        let df: i64 = stmt
+            .query_row(params![pattern], |row| row.get(0))
+            .unwrap_or(0);
         // df == 0 → out-of-corpus, can't discriminate → weight 0.
         let weight = if df == 0 {
             0.0
@@ -3275,14 +3273,22 @@ mod tests {
         // "kimetsu" is corpus-ubiquitous (idf 0); "idea" is rare (high idf);
         // "repo" is mid. A summary that matches only the project name + a
         // mid-idf word covers a minority of the discriminating weight.
-        let content = vec!["kimetsu".to_string(), "idea".to_string(), "repo".to_string()];
+        let content = vec![
+            "kimetsu".to_string(),
+            "idea".to_string(),
+            "repo".to_string(),
+        ];
         let mut idf = HashMap::new();
         idf.insert("kimetsu".to_string(), 0.0);
         idf.insert("idea".to_string(), 1.386);
         idf.insert("repo".to_string(), 0.693);
 
         // Matches kimetsu + repo, NOT idea → 0.693 / (1.386+0.693) ≈ 0.333.
-        let cov = weighted_coverage(&content, &idf, "global:fact - the git repo and kimetsu brain");
+        let cov = weighted_coverage(
+            &content,
+            &idf,
+            "global:fact - the git repo and kimetsu brain",
+        );
         assert!((cov - 0.333).abs() < 0.01, "got {cov}");
 
         // Matches the rare topical word → high coverage.
@@ -3385,8 +3391,7 @@ mod tests {
         .expect("retrieve without floor");
         let before = handles(&no_floor);
         assert!(
-            before.contains(&"memory:m2".to_string())
-                && before.contains(&"memory:m3".to_string()),
+            before.contains(&"memory:m2".to_string()) && before.contains(&"memory:m3".to_string()),
             "sanity: without the floor the pure-project-name memories should surface; got {before:?}"
         );
 
@@ -3409,8 +3414,7 @@ mod tests {
         .expect("retrieve with floor");
         let after = handles(&floored);
         assert!(
-            !after.contains(&"memory:m2".to_string())
-                && !after.contains(&"memory:m3".to_string()),
+            !after.contains(&"memory:m2".to_string()) && !after.contains(&"memory:m3".to_string()),
             "the lexical floor must drop memories whose only match is the corpus-ubiquitous \
              project name; surviving: {after:?}"
         );
@@ -3449,7 +3453,10 @@ mod tests {
             "d1",
             "The distiller runs at session end and harvests durable lessons from the transcript",
         );
-        insert("n1", "Unrelated note about git rebase and squashing commits");
+        insert(
+            "n1",
+            "Unrelated note about git rebase and squashing commits",
+        );
 
         let bundle = retrieve_context_with_embedder(
             &conn,

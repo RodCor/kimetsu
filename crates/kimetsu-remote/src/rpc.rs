@@ -228,7 +228,8 @@ async fn dispatch_request(
         && state.reranker.is_some()
     {
         let reranker = state.reranker.clone().expect("checked above");
-        let arguments = req.params
+        let arguments = req
+            .params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
@@ -241,8 +242,8 @@ async fn dispatch_request(
             Ok(Ok(value)) => {
                 // Wrap in the same `{content:[{type,text}]}` envelope that
                 // generic dispatch produces for tools/call results.
-                let text = serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| value.to_string());
+                let text =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
                 (
                     Outcome::Ok,
                     jsonrpc_ok(

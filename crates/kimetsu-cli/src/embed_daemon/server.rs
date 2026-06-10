@@ -7,8 +7,8 @@ use kimetsu_brain::context::ContextRequest;
 use kimetsu_brain::embeddings::Embedder;
 use kimetsu_brain::project::BrainSession;
 use std::io::BufReader;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Candidate pool the reranker judges before truncating to the caller's cap.
@@ -53,7 +53,11 @@ impl DaemonState {
     fn retrieve(&self, args: proto::RetrieveArgs) -> proto::Response {
         let session = match BrainSession::open_readonly(std::path::Path::new(&args.brain_root)) {
             Ok(s) => s,
-            Err(e) => return proto::Response::Error { message: format!("open: {e}") },
+            Err(e) => {
+                return proto::Response::Error {
+                    message: format!("open: {e}"),
+                };
+            }
         };
         // Clone query before it's moved into the request so we can pass it to
         // the reranker after retrieval.
@@ -61,16 +65,33 @@ impl DaemonState {
         let cap = args.max_capsules;
         // When reranking, over-fetch a larger candidate pool so the
         // cross-encoder sees enough diversity before truncating to `cap`.
-        let fetch_cap = if self.reranker.is_some() { cap.max(RERANK_POOL) } else { cap };
+        let fetch_cap = if self.reranker.is_some() {
+            cap.max(RERANK_POOL)
+        } else {
+            cap
+        };
         // Bump the token budget so the pool isn't budget-starved before the
         // reranker sees it.
         let budget = if self.reranker.is_some() {
-            (if args.budget_tokens == 0 { 2000 } else { args.budget_tokens }).max(6000)
+            (if args.budget_tokens == 0 {
+                2000
+            } else {
+                args.budget_tokens
+            })
+            .max(6000)
         } else {
-            if args.budget_tokens == 0 { 2000 } else { args.budget_tokens }
+            if args.budget_tokens == 0 {
+                2000
+            } else {
+                args.budget_tokens
+            }
         };
         let request = ContextRequest {
-            stage: if args.stage.is_empty() { "localization".into() } else { args.stage },
+            stage: if args.stage.is_empty() {
+                "localization".into()
+            } else {
+                args.stage
+            },
             query: args.query,
             budget_tokens: budget,
             min_score: args.min_score,
@@ -104,7 +125,9 @@ impl DaemonState {
                     top_score: bundle.top_score,
                 }
             }
-            Err(e) => proto::Response::Error { message: format!("retrieve: {e}") },
+            Err(e) => proto::Response::Error {
+                message: format!("retrieve: {e}"),
+            },
         }
     }
 }
@@ -139,17 +162,19 @@ pub fn serve_with_listener(
         let rx = rx.clone();
         let state = state.clone();
         let shutdown = shutdown.clone();
-        handles.push(std::thread::spawn(move || loop {
-            let conn = {
-                let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
-                guard.recv()
-            };
-            let Ok(conn) = conn else { break };
-            if handle_connection(&state, conn) {
-                shutdown.store(true, Ordering::Relaxed);
-                // Unblock our own accept() so the loop observes the flag and exits.
-                let _ = ipc::connect(&state.model);
-                break;
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let conn = {
+                    let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.recv()
+                };
+                let Ok(conn) = conn else { break };
+                if handle_connection(&state, conn) {
+                    shutdown.store(true, Ordering::Relaxed);
+                    // Unblock our own accept() so the loop observes the flag and exits.
+                    let _ = ipc::connect(&state.model);
+                    break;
+                }
             }
         }));
     }

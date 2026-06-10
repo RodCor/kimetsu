@@ -87,8 +87,8 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     #[cfg(not(feature = "embeddings"))]
     let reranker: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = None;
 
-    let mut state = AppState::with_rate_limit(data_dir, auth, args.rate_limit)
-        .with_reranker(reranker);
+    let mut state =
+        AppState::with_rate_limit(data_dir, auth, args.rate_limit).with_reranker(reranker);
     if let Some(ing) = ingest {
         state = state.with_ingest(std::sync::Arc::new(ing));
     }

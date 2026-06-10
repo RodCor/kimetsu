@@ -674,7 +674,10 @@ max_total_cost_usd = 250.0
         );
         // v1.0.0: daemon + warm_on_start default ON so existing installs get
         // the warm-daemon path on upgrade.
-        assert!(config.embedder.daemon, "embedder.daemon must default to true");
+        assert!(
+            config.embedder.daemon,
+            "embedder.daemon must default to true"
+        );
         assert!(
             config.embedder.warm_on_start,
             "embedder.warm_on_start must default to true"
@@ -691,8 +694,7 @@ max_total_cost_usd = 250.0
         // budget on real memories with the best benchmark quality, so the
         // reranker is ON by default.
         assert_eq!(
-            config.embedder.reranker,
-            "ms-marco-tinybert-l-2-v2",
+            config.embedder.reranker, "ms-marco-tinybert-l-2-v2",
             "embedder.reranker must default to ms-marco-tinybert-l-2-v2"
         );
     }

@@ -5,6 +5,7 @@
 //! All items are gated behind the `embeddings` feature — on lean builds there
 //! is no daemon and the hook stays on floored-FTS.
 
+#[cfg(feature = "embeddings")]
 pub mod proto;
 
 #[cfg(feature = "embeddings")]
@@ -18,4 +19,5 @@ pub mod client;
 
 /// Bumped only on a wire-incompatible protocol change. Encoded into the
 /// socket name so a new major routes to a fresh daemon.
+#[cfg(feature = "embeddings")]
 pub const PROTOCOL_MAJOR: u32 = 1;

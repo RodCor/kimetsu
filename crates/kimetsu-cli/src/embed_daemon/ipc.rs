@@ -5,10 +5,8 @@
 //! On Windows this uses named pipes; on Linux the abstract socket namespace;
 //! on other Unices `/tmp/<stem>` (courtesy of `GenericNamespaced`).
 
-use interprocess::local_socket::{
-    prelude::*, GenericNamespaced, ListenerOptions, Stream,
-};
 use interprocess::local_socket::Listener;
+use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
 use std::io;
 
 /// Sanitize a model name so it is safe to embed in a socket/pipe name.

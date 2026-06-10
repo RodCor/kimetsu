@@ -427,8 +427,7 @@ impl BrainSession {
         if configured >= 0.0 {
             return configured;
         }
-        let model =
-            embeddings::resolve_embedder_id(Some(self.config.embedder.model.as_str()));
+        let model = embeddings::resolve_embedder_id(Some(self.config.embedder.model.as_str()));
         if model.starts_with("bge") { 0.35 } else { 0.0 }
     }
 

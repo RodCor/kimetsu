@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn mrr_empty_ranked_is_zero() {
-        assert_eq!(mrr(&[], &s(&["a"]), ), 0.0);
+        assert_eq!(mrr(&[], &s(&["a"]),), 0.0);
     }
 
     #[test]
