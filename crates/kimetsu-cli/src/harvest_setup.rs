@@ -37,13 +37,56 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     target: &SetupTarget,
     scope_label: &str,
 ) -> std::io::Result<bool> {
-    write!(writer, "Set up the auto-harvest distiller now? [y/N]: ")?;
+    // Print the intro block BEFORE asking the y/N question.
+    writeln!(writer, "Auto-harvest — optional, automatic memory capture")?;
+    writeln!(
+        writer,
+        "  When a coding session ends, a small cheap model reads that session's"
+    )?;
+    writeln!(
+        writer,
+        "  transcript, distills any durable lessons, and saves them to your Kimetsu"
+    )?;
+    writeln!(
+        writer,
+        "  brain — so good memories get captured without you recording them by hand."
+    )?;
+    writeln!(writer)?;
+    writeln!(writer, "  Before enabling, know that it:")?;
+    writeln!(
+        writer,
+        "    - costs a little: one short call to a cheap model (e.g. Claude Haiku) per"
+    )?;
+    writeln!(writer, "      session, billed to the API key you provide;")?;
+    writeln!(
+        writer,
+        "    - sends that session's transcript to the provider you pick (Anthropic or"
+    )?;
+    writeln!(writer, "      OpenAI / a compatible endpoint);")?;
+    writeln!(
+        writer,
+        "    - stores your API key in a gitignored .env file, in plain text."
+    )?;
+    writeln!(writer)?;
+    writeln!(writer, "  Fully optional — turn it off any time with")?;
+    writeln!(
+        writer,
+        "  `kimetsu config set learning.auto_harvest false`. Press Enter to skip."
+    )?;
+    writeln!(writer)?;
+
+    write!(writer, "Enable auto-harvest now? [y/N]: ")?;
     writer.flush()?;
     if !read_line(reader)?.trim().eq_ignore_ascii_case("y") {
+        writeln!(
+            writer,
+            "Skipped — you can enable auto-harvest later by re-running \
+             `kimetsu plugin install` or editing project.toml."
+        )?;
         return Ok(false);
     }
 
-    write!(writer, "Harness [claude/codex] [claude]: ")?;
+    write!(writer, "Which agent is this for? [claude/codex] [claude]: ")?;
     writer.flush()?;
     let harness = read_line(reader)?.trim().to_lowercase();
     match harness.as_str() {
@@ -51,21 +94,26 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
         // Blank defaults to claude; accept the common aliases.
         "" | "claude" | "claude-code" | "cc" => {}
         other => {
-            writeln!(writer, "Unrecognized harness '{other}' - skipping setup.")?;
+            writeln!(
+                writer,
+                "Unrecognized agent '{other}' — skipping. \
+                 Re-run `kimetsu plugin install` to set it up."
+            )?;
             return Ok(false);
         }
     }
 
     write!(
         writer,
-        "Distiller provider [anthropic/openai] [anthropic]: "
+        "Which model should run the harvester? [anthropic/openai] [anthropic]: "
     )?;
     writer.flush()?;
     let provider_input = read_line(reader)?.trim().to_string();
     let Some(choice) = resolve_distiller_provider(&provider_input) else {
         writeln!(
             writer,
-            "Unrecognized distiller provider '{provider_input}' - skipping setup."
+            "Unrecognized provider '{provider_input}' — skipping. \
+             Re-run `kimetsu plugin install` to set it up."
         )?;
         return Ok(false);
     };
@@ -74,7 +122,11 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     writer.flush()?;
     let key = read_line(reader)?.trim().to_string();
     if key.is_empty() {
-        writeln!(writer, "No key entered - skipping setup.")?;
+        writeln!(
+            writer,
+            "Skipped — you can enable auto-harvest later by re-running \
+             `kimetsu plugin install` or editing project.toml."
+        )?;
         return Ok(false);
     }
 
@@ -82,7 +134,7 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     writer.flush()?;
     let base_url = read_line(reader)?.trim().to_string();
 
-    write!(writer, "Model [{}]: ", choice.default_model)?;
+    write!(writer, "Harvester model [{}]: ", choice.default_model)?;
     writer.flush()?;
     let mut model = read_line(reader)?.trim().to_string();
     if model.is_empty() {
@@ -103,12 +155,13 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
         upsert_env_var(&target.env_path, choice.base_url_env, &base_url)?;
     }
 
+    let pretty_env = kimetsu_core::paths::display_path(&target.env_path);
     writeln!(
         writer,
-        "\u{2713} Distiller configured for {scope_label} ({} model {model}). \
-         Key stored in {} (gitignored). Note: the key was entered in plain text.",
+        "\u{2713} Auto-harvest enabled for {scope_label} — {} model {model}. \
+         Key saved to {pretty_env} (gitignored). \
+         Turn it off any time with `kimetsu config set learning.auto_harvest false`.",
         choice.provider,
-        target.env_path.display()
     )?;
     Ok(true)
 }
@@ -126,16 +179,16 @@ fn resolve_distiller_provider(input: &str) -> Option<DistillerProviderChoice> {
             api_key_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_model: "claude-haiku-4-5",
-            key_prompt: "Anthropic API key (or Anthropic-compatible LiteLLM key): ",
-            base_url_prompt: "ANTHROPIC_BASE_URL (optional; blank for Anthropic, set for LiteLLM): ",
+            key_prompt: "Anthropic API key (saved to .env; create one at https://console.anthropic.com/settings/keys): ",
+            base_url_prompt: "Custom endpoint URL (optional — blank for Anthropic; set for a LiteLLM/proxy): ",
         }),
         "openai" | "oai" | "gpt" => Some(DistillerProviderChoice {
             provider: "openai",
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_model: "gpt-5.4-mini",
-            key_prompt: "OpenAI API key (or OpenAI-compatible endpoint key): ",
-            base_url_prompt: "OPENAI_BASE_URL (optional; blank for OpenAI, accepts root or /v1): ",
+            key_prompt: "OpenAI API key (saved to .env; create one at https://platform.openai.com/api-keys): ",
+            base_url_prompt: "Custom endpoint URL (optional — blank for OpenAI; accepts a root or /v1 URL): ",
         }),
         _ => None,
     }

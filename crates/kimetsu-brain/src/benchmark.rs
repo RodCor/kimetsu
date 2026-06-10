@@ -24,11 +24,12 @@ const TERMINAL_BENCH_SLUGS: &[&str] = &[
     "vulnerable-secret",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkWarmPolicy {
     ColdBrain,
     ReactiveWarm,
+    #[default]
     FullWarm,
 }
 
@@ -67,17 +68,12 @@ impl BenchmarkWarmPolicy {
     }
 }
 
-impl Default for BenchmarkWarmPolicy {
-    fn default() -> Self {
-        Self::FullWarm
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkMemoryRole {
     /// Exact run/task outcome memory. Useful evidence, but low-priority
     /// guidance because it often overfits one benchmark instance.
+    #[default]
     Episodic,
     /// A reusable tactic or operator that can transfer across task slugs.
     SemanticOperator,
@@ -109,12 +105,6 @@ impl BenchmarkMemoryRole {
 
     pub const fn is_generalizable(self) -> bool {
         matches!(self, Self::SemanticOperator | Self::AntiPattern)
-    }
-}
-
-impl Default for BenchmarkMemoryRole {
-    fn default() -> Self {
-        Self::Episodic
     }
 }
 
@@ -213,6 +203,8 @@ pub fn benchmark_query(
     }
 }
 
+// retrieval row builder — arg-struct refactor deferred
+#[allow(clippy::too_many_arguments)]
 pub fn build_benchmark_context(
     bundle: ContextBundle,
     task: &str,
@@ -531,6 +523,8 @@ fn prioritized_capsules(
         .collect()
 }
 
+// retrieval row builder — arg-struct refactor deferred
+#[allow(clippy::too_many_arguments)]
 fn format_playbook(
     dataset: &str,
     task: &str,

@@ -10,7 +10,7 @@ use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::ids::new_id;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
-use kimetsu_core::paths::ProjectPaths;
+use kimetsu_core::paths::{ProjectPaths, user_cache_dir_for};
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::{CodingRunOptions, PatchPlan, run_coding_dry_run};
@@ -266,11 +266,8 @@ pub fn run_benchmark(options: BenchOptions) -> KimetsuResult<BenchRunResult> {
     } else {
         None
     };
-    let output_dir = options
-        .repo
-        .canonicalize()
-        .unwrap_or(options.repo.clone())
-        .join(".kimetsu")
+    let repo_canonical = options.repo.canonicalize().unwrap_or(options.repo.clone());
+    let output_dir = user_cache_dir_for(&repo_canonical)
         .join("bench")
         .join(&bench_run_id);
     fs::create_dir_all(&output_dir)?;

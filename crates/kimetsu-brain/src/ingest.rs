@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::{DirEntry, WalkBuilder};
@@ -8,6 +9,9 @@ use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::paths::ProjectPaths;
 use rusqlite::{Connection, params};
 use time::OffsetDateTime;
+
+const HARD_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const HARD_MAX_TOTAL_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct RepoIngestSummary {
@@ -44,6 +48,7 @@ pub fn ingest_repo(
 ) -> KimetsuResult<RepoIngestSummary> {
     let repo_root = paths.repo_root.canonicalize()?;
     let skip_dirs = skip_dirs(config);
+    let (max_file_bytes, max_total_files) = effective_ingest_limits(config);
     let mut builder = WalkBuilder::new(&repo_root);
     builder
         .hidden(false)
@@ -77,14 +82,14 @@ pub fn ingest_repo(
             continue;
         }
 
-        match index_file(&repo_root, path, config.ingestion.max_file_bytes) {
+        if indexed.len() >= max_total_files {
+            break;
+        }
+
+        match index_file(&repo_root, path, max_file_bytes) {
             Ok(Some(file)) => indexed.push(file),
             Ok(None) => skipped += 1,
             Err(_) => skipped += 1,
-        }
-
-        if indexed.len() >= config.ingestion.max_total_files as usize {
-            break;
         }
     }
 
@@ -180,6 +185,13 @@ pub fn ingest_repo(
     })
 }
 
+fn effective_ingest_limits(config: &ProjectConfig) -> (u64, usize) {
+    let max_file_bytes = config.ingestion.max_file_bytes.min(HARD_MAX_FILE_BYTES);
+    let configured_total = usize::try_from(config.ingestion.max_total_files).unwrap_or(usize::MAX);
+    let max_total_files = configured_total.min(HARD_MAX_TOTAL_FILES);
+    (max_file_bytes, max_total_files)
+}
+
 fn skip_dirs(config: &ProjectConfig) -> HashSet<String> {
     let mut skip = [
         ".git",
@@ -225,7 +237,9 @@ fn index_file(
         return Ok(None);
     }
 
-    let bytes = fs::read(path)?;
+    let Some(bytes) = read_file_capped(path, max_file_bytes)? else {
+        return Ok(None);
+    };
     if looks_binary(&bytes) {
         return Ok(None);
     }
@@ -257,6 +271,18 @@ fn index_file(
         snippet,
         manifest,
     }))
+}
+
+fn read_file_capped(path: &Path, max_file_bytes: u64) -> KimetsuResult<Option<Vec<u8>>> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_file_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 fn repo_relative_path(repo_root: &Path, path: &Path) -> KimetsuResult<String> {
@@ -411,6 +437,34 @@ mod tests {
             !indexed.snippet.contains(secret),
             "raw secret leaked into snippet"
         );
+
+        fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[test]
+    fn effective_ingest_limits_clamp_hostile_project_config() {
+        let mut config = ProjectConfig::default_for_project("ingest-cap-test");
+        config.ingestion.max_file_bytes = u64::MAX;
+        config.ingestion.max_total_files = u64::MAX;
+
+        let (max_file_bytes, max_total_files) = effective_ingest_limits(&config);
+        assert_eq!(max_file_bytes, HARD_MAX_FILE_BYTES);
+        assert_eq!(max_total_files, HARD_MAX_TOTAL_FILES);
+    }
+
+    #[test]
+    fn read_file_capped_rejects_oversized_content() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let repo_root = std::env::temp_dir().join(format!("kimetsu_ingest_cap_{nanos}"));
+        fs::create_dir_all(&repo_root).expect("repo root");
+        let file = repo_root.join("large.txt");
+        fs::write(&file, b"0123456789abcdef").expect("write file");
+
+        let bytes = read_file_capped(&file, 8).expect("read capped");
+        assert!(bytes.is_none(), "oversized file must be rejected");
 
         fs::remove_dir_all(&repo_root).ok();
     }

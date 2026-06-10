@@ -1,10 +1,15 @@
 pub mod ambient;
+pub mod analytics;
+#[cfg(feature = "embeddings")]
+pub mod ann;
 pub mod benchmark;
 pub mod conflict;
 pub mod context;
 pub mod embeddings;
+pub mod eval;
 pub mod ingest;
 pub mod lock;
+pub mod migrate;
 pub mod project;
 pub mod projector;
 pub mod redact;

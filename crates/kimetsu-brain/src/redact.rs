@@ -148,98 +148,98 @@ fn patterns() -> &'static [SecretPattern] {
         // regex MUST be anchored at a unique prefix so we don't
         // shadow normal source text. Use word boundaries where the
         // pattern's prefix isn't already distinctive.
-        let mut out = Vec::new();
-        out.push(SecretPattern {
-            kind: "anthropic_oauth",
-            // Anthropic OAuth tokens: `sk-ant-` prefix + opaque tail.
-            // Tail is at least 32 chars of [A-Za-z0-9_-].
-            regex: Regex::new(r"sk-ant-[A-Za-z0-9_-]{32,}").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "openai_api_key",
-            // OpenAI keys: `sk-` (not `sk-ant-`) + 32+ chars.
-            // Negative lookahead isn't available in `regex`; we
-            // order anthropic_oauth FIRST so it claims those bytes
-            // before openai_api_key sees them.
-            regex: Regex::new(r"sk-[A-Za-z0-9_-]{32,}").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "github_pat",
-            // Classic + fine-grained GitHub PATs.
-            // ghp_/gho_/ghu_/ghs_/ghr_ + 36 base62.
-            // github_pat_ + base62/underscore length 50+.
-            regex: Regex::new(
-                r"(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}",
-            )
-            .unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "slack_token",
-            regex: Regex::new(r"xox[bopasr]-[A-Za-z0-9-]{10,}").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "aws_access_key",
-            // AKIA = long-lived, ASIA = STS temporary. Exactly 16
-            // uppercase alphanum after the prefix per AWS docs.
-            regex: Regex::new(r"(?:AKIA|ASIA)[A-Z0-9]{16}").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "jwt",
-            // Three base64url segments separated by dots; first
-            // starts with `eyJ` (base64url of `{"`). Cap total at
-            // 4096 chars so a runaway match doesn't blow the line.
-            regex: Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "private_key_pem",
-            // PEM-encoded private key BEGIN line — match the whole
-            // block so the entire payload is wiped.
-            regex: Regex::new(
-                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
-            )
-            .unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "google_api_key",
-            // Google-style API keys: AIza + 35 char tail.
-            regex: Regex::new(r"AIza[0-9A-Za-z_-]{35}").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "url_credentials",
-            // Credentials embedded in a connection-string URI:
-            // `scheme://user:password@host`. Common in env dumps and
-            // `.env` snippets (DATABASE_URL=postgres://u:p@host, redis://,
-            // amqp://, mongodb://, ...). The generic `password=` rule does
-            // NOT match this shape, so without it the password lands in
-            // brain.db in cleartext. Redact the `scheme://user:pass@` run;
-            // the host stays readable.
-            regex: Regex::new(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s:/@]{4,}@").unwrap(),
-        });
-        // Generic-assignment patterns. Lower-priority than the
-        // shape-specific ones above; ordered after them so e.g.
-        // `api_key=sk-...` claims the openai_api_key kind, not the
-        // generic_api_key kind.
-        out.push(SecretPattern {
-            kind: "generic_bearer",
-            // `Bearer <token>` in HTTP-style logs.
-            regex: Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]{12,}").unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "generic_api_key",
-            // `api_key = "..."` / `api-key:"..."` / `api_key=...`.
-            // Captures both quoted and bare values; value must be
-            // ≥12 chars of secret-looking content.
-            regex: Regex::new(r#"(?i)api[_\-]?key\s*[:=]\s*"?[A-Za-z0-9_\-]{12,}"?"#).unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "generic_token",
-            regex: Regex::new(r#"(?i)\btoken\s*[:=]\s*"?[A-Za-z0-9_\-\.]{20,}"?"#).unwrap(),
-        });
-        out.push(SecretPattern {
-            kind: "generic_password",
-            regex: Regex::new(r#"(?i)\bpassword\s*[:=]\s*"?[^\s"]{8,}"?"#).unwrap(),
-        });
-        out
+        vec![
+            SecretPattern {
+                kind: "anthropic_oauth",
+                // Anthropic OAuth tokens: `sk-ant-` prefix + opaque tail.
+                // Tail is at least 32 chars of [A-Za-z0-9_-].
+                regex: Regex::new(r"sk-ant-[A-Za-z0-9_-]{32,}").unwrap(),
+            },
+            SecretPattern {
+                kind: "openai_api_key",
+                // OpenAI keys: `sk-` (not `sk-ant-`) + 32+ chars.
+                // Negative lookahead isn't available in `regex`; we
+                // order anthropic_oauth FIRST so it claims those bytes
+                // before openai_api_key sees them.
+                regex: Regex::new(r"sk-[A-Za-z0-9_-]{32,}").unwrap(),
+            },
+            SecretPattern {
+                kind: "github_pat",
+                // Classic + fine-grained GitHub PATs.
+                // ghp_/gho_/ghu_/ghs_/ghr_ + 36 base62.
+                // github_pat_ + base62/underscore length 50+.
+                regex: Regex::new(
+                    r"(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}",
+                )
+                .unwrap(),
+            },
+            SecretPattern {
+                kind: "slack_token",
+                regex: Regex::new(r"xox[bopasr]-[A-Za-z0-9-]{10,}").unwrap(),
+            },
+            SecretPattern {
+                kind: "aws_access_key",
+                // AKIA = long-lived, ASIA = STS temporary. Exactly 16
+                // uppercase alphanum after the prefix per AWS docs.
+                regex: Regex::new(r"(?:AKIA|ASIA)[A-Z0-9]{16}").unwrap(),
+            },
+            SecretPattern {
+                kind: "jwt",
+                // Three base64url segments separated by dots; first
+                // starts with `eyJ` (base64url of `{"`). Cap total at
+                // 4096 chars so a runaway match doesn't blow the line.
+                regex: Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
+            },
+            SecretPattern {
+                kind: "private_key_pem",
+                // PEM-encoded private key BEGIN line — match the whole
+                // block so the entire payload is wiped.
+                regex: Regex::new(
+                    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+                )
+                .unwrap(),
+            },
+            SecretPattern {
+                kind: "google_api_key",
+                // Google-style API keys: AIza + 35 char tail.
+                regex: Regex::new(r"AIza[0-9A-Za-z_-]{35}").unwrap(),
+            },
+            SecretPattern {
+                kind: "url_credentials",
+                // Credentials embedded in a connection-string URI:
+                // `scheme://user:password@host`. Common in env dumps and
+                // `.env` snippets (DATABASE_URL=postgres://u:p@host, redis://,
+                // amqp://, mongodb://, ...). The generic `password=` rule does
+                // NOT match this shape, so without it the password lands in
+                // brain.db in cleartext. Redact the `scheme://user:pass@` run;
+                // the host stays readable.
+                regex: Regex::new(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s:/@]{4,}@").unwrap(),
+            },
+            // Generic-assignment patterns. Lower-priority than the
+            // shape-specific ones above; ordered after them so e.g.
+            // `api_key=sk-...` claims the openai_api_key kind, not the
+            // generic_api_key kind.
+            SecretPattern {
+                kind: "generic_bearer",
+                // `Bearer <token>` in HTTP-style logs.
+                regex: Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]{12,}").unwrap(),
+            },
+            SecretPattern {
+                kind: "generic_api_key",
+                // `api_key = "..."` / `api-key:"..."` / `api_key=...`.
+                // Captures both quoted and bare values; value must be
+                // ≥12 chars of secret-looking content.
+                regex: Regex::new(r#"(?i)api[_\-]?key\s*[:=]\s*"?[A-Za-z0-9_\-]{12,}"?"#).unwrap(),
+            },
+            SecretPattern {
+                kind: "generic_token",
+                regex: Regex::new(r#"(?i)\btoken\s*[:=]\s*"?[A-Za-z0-9_\-\.]{20,}"?"#).unwrap(),
+            },
+            SecretPattern {
+                kind: "generic_password",
+                regex: Regex::new(r#"(?i)\bpassword\s*[:=]\s*"?[^\s"]{8,}"?"#).unwrap(),
+            },
+        ]
     })
 }
 

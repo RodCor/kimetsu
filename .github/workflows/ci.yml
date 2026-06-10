@@ -3,7 +3,7 @@
 #
 # Jobs (all required for a green PR):
 #   fmt       — rustfmt check, no diffs allowed
-#   clippy    — clippy with warnings denied (-D warnings)
+#   clippy    — clippy hard gate: -D warnings on lean and embeddings flavors
 #   test      — full workspace test suite
 #   audit     — RUSTSEC advisory scan over the dependency tree
 #
@@ -44,11 +44,8 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    # Advisory for now: main carries a small pre-existing lint backlog.
-    # The job runs and surfaces warnings on every PR; once the backlog is
-    # cleared in a dedicated cleanup PR, drop `continue-on-error` and add
-    # `-D warnings` to make this a hard gate.
-    continue-on-error: true
+    # Hard gate on both the lean (no-default-features) and embeddings
+    # flavors. Any new warning fails the PR.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,7 +54,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-clippy
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features embeddings -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -66,9 +64,9 @@ jobs:
       fail-fast: false
       matrix:
         # Ubuntu is the primary gate; macOS guards the Apple-silicon
-        # build that ships in releases. Windows is exercised by the
-        # release workflow's build matrix.
-        os: [ubuntu-latest, macos-14]
+        # build that ships in releases. Windows now runs the full test
+        # suite here; the release workflow still does the build/smoke.
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

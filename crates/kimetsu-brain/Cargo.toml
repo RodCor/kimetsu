@@ -20,7 +20,7 @@ categories = ["database", "development-tools"]
 # retrieval that v0.4.2 ships, so `cargo install kimetsu-cli`
 # without --features embeddings never downloads a model.
 default = []
-embeddings = ["dep:fastembed"]
+embeddings = ["dep:fastembed", "dep:usearch", "dep:hf-hub"]
 
 [dependencies]
 blake3.workspace = true
@@ -30,14 +30,26 @@ blake3.workspace = true
 # required to build kimetsu). Pinned to 5.* — that's the line that
 # supports BGE-M3 + Jina-v2-base-code alongside BGE-small.
 fastembed = { version = "5", optional = true }
+# v1.0.0 reranker bench: user-defined ONNX model download via HuggingFace Hub.
+# Mirrors fastembed's own hf-hub usage (ureq sync API, no tokio).
+hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }
+# v1.0 Tier-3: usearch provides an HNSW approximate-NN index so retrieval and
+# conflict-detection candidate generation are ~O(log N) instead of a
+# brute-force O(N) scan. Native (C++); only pulled under `embeddings`, which is
+# already native (ort). The lean build never links it.
+usearch = { version = "2", optional = true }
 ignore.workspace = true
-kimetsu-core = { path = "../kimetsu-core", version = "0.9.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "1.0.0" }
 # v0.4.5: regex backs the secret-redaction patterns in
 # `kimetsu_brain::redact`. The crate is already a workspace pin
 # elsewhere; we just opt this crate into it now.
 regex.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["backup"] }
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+tracing.workspace = true
 ulid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

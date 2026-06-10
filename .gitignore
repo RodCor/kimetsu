@@ -44,3 +44,11 @@
 .claude/
 .codex/
 .mcp.json
+
+# Local Codex security-scan artifacts (not part of the project)
+.codex-security-scans/
+/docs/superpowers
+# Real-memory exports must never land in this PUBLIC repo — they belong in
+# the private kimetsu-bench repo, reviewed before commit (memories can carry
+# environment/work context).
+memories-export*.json

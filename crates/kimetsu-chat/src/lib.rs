@@ -31,12 +31,14 @@ pub mod skills;
 pub mod ui;
 
 pub use bridge::{
-    BridgeTarget, InstallScope, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan,
-    bridge_sync, plugin_install,
+    BridgeTarget, InstallScope, PluginInstallReport, PluginMode, PluginScopeStatus,
+    PluginUninstallReport, RemoteInstall, WiringState, bridge_export_skill, bridge_import_skill,
+    bridge_scan, bridge_sync, plugin_install, plugin_install_remote, plugin_status,
+    plugin_uninstall,
 };
 pub use commands::SlashCommand;
 pub use cost::CostMeter;
-pub use mcp_server::{McpServeConfig, serve_mcp};
+pub use mcp_server::{McpServeConfig, brain_context_tool, dispatch, serve_mcp};
 pub use repl::{ChatConfig, ChatError, ChatResult, run_repl};
 pub use skills::{SkillConfig, SkillRegistry, skill_origin_label};
 pub use ui::{ChatUi, ChatUiMode, rich_ui_enabled_from_env};

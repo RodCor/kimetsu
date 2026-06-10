@@ -16,6 +16,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const https = require("https");
+const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 
 const REPO = "RodCor/kimetsu";
@@ -28,6 +29,28 @@ function cacheRoot() {
     return path.join(os.homedir(), "Library", "Caches");
   }
   return process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+}
+
+// Persisted flavor preference, so the choice survives across runs without an
+// env var. `kimetsu npm-flavor embeddings|lean` writes this; the launcher reads
+// it when KIMETSU_NPM_FLAVOR isn't set.
+function flavorMarkerPath() {
+  return path.join(cacheRoot(), "kimetsu", "npm", "flavor");
+}
+
+function readFlavorMarker() {
+  try {
+    const v = fs.readFileSync(flavorMarkerPath(), "utf8").trim().toLowerCase();
+    return v === "embeddings" || v === "lean" ? v : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function writeFlavorMarker(flavor) {
+  const p = flavorMarkerPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, flavor + "\n");
 }
 
 function downloadUrl(version, assetName) {
@@ -82,6 +105,40 @@ function extract(archive, dest) {
   execFileSync("tar", ["-xf", archive, "-C", dest], { stdio: "ignore" });
 }
 
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+function checksumForAsset(manifest, assetName) {
+  for (const rawLine of manifest.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let match = line.match(/^([a-fA-F0-9]{64})\s+\*?(.+)$/);
+    if (match && match[2] === assetName) return match[1].toLowerCase();
+    match = line.match(/^SHA256 \((.+)\) = ([a-fA-F0-9]{64})$/);
+    if (match && match[1] === assetName) return match[2].toLowerCase();
+  }
+  return null;
+}
+
+async function verifyChecksum(archivePath, assetName, checksumsPath) {
+  const manifest = fs.readFileSync(checksumsPath, "utf8");
+  const expected = checksumForAsset(manifest, assetName);
+  if (!expected) {
+    throw new Error(`checksums.txt does not contain ${assetName}`);
+  }
+  const actual = await sha256File(archivePath);
+  if (actual !== expected) {
+    throw new Error(`checksum mismatch for ${assetName}: expected ${expected}, got ${actual}`);
+  }
+}
+
 async function ensureEmbeddingsBinary({ version, target, binName }) {
   const cacheDir = path.join(
     cacheRoot(),
@@ -100,8 +157,11 @@ async function ensureEmbeddingsBinary({ version, target, binName }) {
   const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "kimetsu-npm-"));
   try {
     const archivePath = path.join(workdir, assetName);
+    const checksumsPath = path.join(workdir, "checksums.txt");
     process.stderr.write(`kimetsu: fetching embeddings build (${assetName})…\n`);
     await download(downloadUrl(version, assetName), archivePath);
+    await download(downloadUrl(version, "checksums.txt"), checksumsPath);
+    await verifyChecksum(archivePath, assetName, checksumsPath);
 
     const extractDir = path.join(workdir, "extract");
     extract(archivePath, extractDir);
@@ -129,4 +189,9 @@ async function ensureEmbeddingsBinary({ version, target, binName }) {
   }
 }
 
-module.exports = { ensureEmbeddingsBinary };
+module.exports = {
+  ensureEmbeddingsBinary,
+  readFlavorMarker,
+  writeFlavorMarker,
+  flavorMarkerPath,
+};

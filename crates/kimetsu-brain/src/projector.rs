@@ -1,13 +1,100 @@
+use std::borrow::Cow;
+use std::str::FromStr;
+
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::event::Event;
+use kimetsu_core::ids::{EventId, RunId};
 use rusqlite::{Connection, params};
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::redact;
 use crate::schema;
+
+/// Event-schema durability seam. Normalizes an event written under an older
+/// `EVENT_SCHEMA_VERSION` to the current payload shape *before projection*,
+/// so a future version bump is a localized addition here rather than a
+/// projector rewrite. Identity today (`EVENT_SCHEMA_VERSION == 1`: every
+/// stored event is already current). When the event schema first changes,
+/// add `(kind, schema_version)`-keyed transforms that return `Cow::Owned`
+/// with the upgraded payload.
+fn upcast_event(event: &Event) -> Cow<'_, Event> {
+    // No historical versions to upcast yet.
+    Cow::Borrowed(event)
+}
 
 pub fn rebuild(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
     reset_projection(conn)?;
     apply_events(conn, events)
+}
+
+/// Rebuild the projection from the durable events table (in place). Reads
+/// every stored event, resets the derived tables, and re-projects — WITHOUT
+/// re-inserting events (so no duplication). Returns the number of events
+/// replayed.
+pub fn rebuild_in_place(conn: &Connection) -> KimetsuResult<usize> {
+    let events = read_events_ordered(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    reset_projection(&tx)?;
+    for event in &events {
+        project_event(&tx, event)?;
+    }
+    tx.commit()?;
+    Ok(events.len())
+}
+
+/// Read all stored events from the durable `events` table, ordered by
+/// (ts, event_id) so replay is deterministic and causal.
+fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT event_id, run_id, ts, kind, schema_version, payload_json
+        FROM events
+        ORDER BY ts, event_id
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let event_id_str: String = row.get(0)?;
+        let run_id_str: String = row.get(1)?;
+        let ts_str: String = row.get(2)?;
+        let kind: String = row.get(3)?;
+        let schema_version: u32 = row.get(4)?;
+        let payload_json: String = row.get(5)?;
+        Ok((
+            event_id_str,
+            run_id_str,
+            ts_str,
+            kind,
+            schema_version,
+            payload_json,
+        ))
+    })?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (event_id_str, run_id_str, ts_str, kind, schema_version, payload_json) = row?;
+        let event_id = EventId(
+            ulid::Ulid::from_str(&event_id_str)
+                .map_err(|e| format!("invalid event_id {event_id_str:?}: {e}"))?,
+        );
+        let run_id = RunId(
+            ulid::Ulid::from_str(&run_id_str)
+                .map_err(|e| format!("invalid run_id {run_id_str:?}: {e}"))?,
+        );
+        let ts = OffsetDateTime::parse(&ts_str, &Rfc3339)
+            .map_err(|e| format!("invalid ts {ts_str:?}: {e}"))?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        events.push(Event {
+            event_id,
+            run_id,
+            ts,
+            parent_event_id: None, // not stored; never read by the projector
+            kind,
+            schema_version,
+            payload,
+        });
+    }
+    Ok(events)
 }
 
 pub fn apply_events(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
@@ -20,21 +107,41 @@ pub fn apply_events(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
 }
 
 fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
+    // Wipe ONLY the derived/projected tables. The `events` table is the
+    // durable log and MUST survive a rebuild (rebuild replays it).
     conn.execute_batch(
         "
-        DELETE FROM events;
         DELETE FROM runs;
         DELETE FROM sources;
         DELETE FROM memories;
         DELETE FROM memory_proposals;
         DELETE FROM memories_fts;
+        DELETE FROM memory_citations;
+        DELETE FROM memory_conflicts;
         ",
     )?;
     Ok(())
 }
 
 fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let event = redact_memory_event(event);
+    let event = event.as_ref();
+    // Persist the event after memory payload redaction so durable replay tables
+    // never become a second secret store.
     insert_event(conn, event)?;
+    // Project the now-stored event into the derived tables.
+    project_event(conn, event)
+}
+
+/// Project a single event into the derived tables (the dispatch half of
+/// `apply_event`, WITHOUT inserting into the events table). Used by both the
+/// write path (after insert) and the in-place rebuild (events already stored).
+fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    // Project through the durability seam so older-schema events normalize
+    // to the current shape before dispatch.
+    let upcasted = upcast_event(event);
+    let redacted = redact_memory_event(upcasted.as_ref());
+    let event = redacted.as_ref();
 
     match event.kind.as_str() {
         "run.started" => apply_run_started(conn, event),
@@ -49,6 +156,59 @@ fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // malformed payload just no-ops.
         "memory.cited" => apply_memory_cited(conn, event),
         _ => Ok(()),
+    }
+}
+
+fn redact_memory_event(event: &Event) -> Cow<'_, Event> {
+    if !matches!(
+        event.kind.as_str(),
+        "memory.accepted" | "memory.proposed" | "memory.cited"
+    ) {
+        return Cow::Borrowed(event);
+    }
+    let (payload, changed) = redact_json_strings(&event.payload);
+    if changed {
+        Cow::Owned(Event {
+            payload,
+            ..event.clone()
+        })
+    } else {
+        Cow::Borrowed(event)
+    }
+}
+
+fn redact_json_strings(value: &serde_json::Value) -> (serde_json::Value, bool) {
+    match value {
+        serde_json::Value::String(text) => {
+            let redaction = redact::redact_secrets(text);
+            let changed = redaction.was_redacted();
+            (serde_json::Value::String(redaction.text), changed)
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            let values = values
+                .iter()
+                .map(|value| {
+                    let (value, did_change) = redact_json_strings(value);
+                    changed |= did_change;
+                    value
+                })
+                .collect();
+            (serde_json::Value::Array(values), changed)
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let map = map
+                .iter()
+                .map(|(key, value)| {
+                    let (value, did_change) = redact_json_strings(value);
+                    changed |= did_change;
+                    (key.clone(), value)
+                })
+                .collect();
+            (serde_json::Value::Object(map), changed)
+        }
+        other => (other.clone(), false),
     }
 }
 
@@ -91,7 +251,7 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     Ok(())
 }
 
-fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+pub(crate) fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let payload = serde_json::to_string(&event.payload)?;
     conn.execute(
         "
@@ -499,6 +659,8 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
         ",
         params![memory_id, ts_text(event)?, reason],
     )?;
+    #[cfg(feature = "embeddings")]
+    crate::ann::on_invalidate(conn, memory_id);
     Ok(())
 }
 
@@ -508,4 +670,515 @@ pub fn ensure_schema(conn: &Connection) -> KimetsuResult<()> {
 
 fn ts_text(event: &Event) -> KimetsuResult<String> {
     Ok(event.ts.format(&Rfc3339)?)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use kimetsu_core::event::Event;
+    use kimetsu_core::ids::RunId;
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    use super::{apply_events, upcast_event};
+    use crate::schema;
+
+    fn make_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        schema::initialize(&conn).expect("schema::initialize");
+        conn
+    }
+
+    fn make_event(run_id: RunId, kind: &str, payload: serde_json::Value) -> Event {
+        Event::new(run_id, kind, payload)
+    }
+
+    // ------------------------------------------------------------------
+    // A6-1. upcast_event is identity (Cow::Borrowed) at schema_version 1
+    // ------------------------------------------------------------------
+    #[test]
+    fn upcast_is_identity_at_v1() {
+        let run_id = RunId::new();
+        let event = make_event(
+            run_id,
+            "run.started",
+            json!({"project_id": "p1", "task": "t"}),
+        );
+        assert_eq!(
+            event.schema_version, 1,
+            "Event::new must stamp schema_version=1"
+        );
+
+        let cow = upcast_event(&event);
+        // Must be a Borrowed reference, not an owned clone.
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "upcast_event must return Cow::Borrowed for current schema_version"
+        );
+        // The payload fields must be unchanged.
+        let out = cow.as_ref();
+        assert_eq!(out.kind, event.kind);
+        assert_eq!(out.schema_version, event.schema_version);
+        assert_eq!(out.payload, event.payload);
+    }
+
+    // ------------------------------------------------------------------
+    // A6-2. Per-kind missing-field durability: every dispatched kind with
+    // an empty payload replays without panic/error.
+    // ------------------------------------------------------------------
+
+    fn assert_empty_payload_ok(kind: &str) {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let event = make_event(run_id, kind, json!({}));
+        let result = apply_events(&conn, &[event]);
+        assert!(
+            result.is_ok(),
+            "apply_events with empty payload for kind={kind:?} must return Ok(()), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_payload_run_started() {
+        assert_empty_payload_ok("run.started");
+    }
+
+    #[test]
+    fn empty_payload_run_finished() {
+        assert_empty_payload_ok("run.finished");
+    }
+
+    #[test]
+    fn empty_payload_run_failed() {
+        assert_empty_payload_ok("run.failed");
+    }
+
+    #[test]
+    fn empty_payload_run_aborted() {
+        assert_empty_payload_ok("run.aborted");
+    }
+
+    #[test]
+    fn empty_payload_memory_accepted() {
+        assert_empty_payload_ok("memory.accepted");
+    }
+
+    #[test]
+    fn empty_payload_memory_proposed() {
+        assert_empty_payload_ok("memory.proposed");
+    }
+
+    #[test]
+    fn empty_payload_memory_rejected() {
+        assert_empty_payload_ok("memory.rejected");
+    }
+
+    #[test]
+    fn empty_payload_memory_invalidated() {
+        assert_empty_payload_ok("memory.invalidated");
+    }
+
+    #[test]
+    fn empty_payload_memory_cited() {
+        assert_empty_payload_ok("memory.cited");
+    }
+
+    // ------------------------------------------------------------------
+    // A6-3. A well-formed run.started event still projects correctly
+    // after routing through the upcast seam.
+    // ------------------------------------------------------------------
+    #[test]
+    fn well_formed_run_started_projects_correctly() {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let event = make_event(
+            run_id,
+            "run.started",
+            json!({
+                "project_id": "proj-abc",
+                "task": "fix the bug",
+                "model": "claude-sonnet-4-6"
+            }),
+        );
+        apply_events(&conn, &[event])
+            .expect("apply_events must succeed for well-formed run.started");
+
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT run_id, project_id, task FROM runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("runs row must exist after apply_events");
+
+        assert_eq!(row.0, run_id.to_string());
+        assert_eq!(row.1, "proj-abc");
+        assert_eq!(row.2, "fix the bug");
+    }
+
+    // ------------------------------------------------------------------
+    // W1.1: reset_projection keeps the events table intact while wiping
+    // all derived/projected tables.
+    // ------------------------------------------------------------------
+    #[test]
+    fn reset_projection_keeps_events() {
+        use super::reset_projection;
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let mem_id = "mem-reset-test";
+
+        let events = vec![
+            make_event(
+                run_id,
+                "run.started",
+                json!({"project_id": "p", "task": "t"}),
+            ),
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": mem_id,
+                    "text": "hello",
+                    "scope": "global_user",
+                    "kind": "fact"
+                }),
+            ),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        // Preconditions: both events stored, memory projected.
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert!(event_count > 0, "events must be stored before reset");
+        let mem_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mem_count, 1, "memory must be projected before reset");
+
+        reset_projection(&conn).expect("reset_projection");
+
+        // Events MUST survive.
+        let event_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count_after, event_count,
+            "reset_projection must NOT delete from events"
+        );
+
+        // All derived tables must be empty.
+        let memories_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            memories_after, 0,
+            "memories must be cleared by reset_projection"
+        );
+
+        let runs_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs_after, 0, "runs must be cleared by reset_projection");
+
+        let citations_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_citations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            citations_after, 0,
+            "memory_citations must be cleared by reset_projection"
+        );
+
+        let conflicts_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_conflicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            conflicts_after, 0,
+            "memory_conflicts must be cleared by reset_projection"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // W1.2a: rebuild_in_place round-trips without duplicating events.
+    // ------------------------------------------------------------------
+    #[test]
+    fn rebuild_in_place_no_dup_events() {
+        use super::rebuild_in_place;
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let mem_id = "mem-dup-test";
+
+        let events = vec![
+            make_event(
+                run_id,
+                "run.started",
+                json!({"project_id": "p", "task": "t"}),
+            ),
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": mem_id,
+                    "text": "no dup",
+                    "scope": "global_user",
+                    "kind": "fact"
+                }),
+            ),
+            make_event(run_id, "run.finished", json!({"total_cost_usd": 0.01})),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        let event_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(event_count_before, 3, "expected 3 events seeded");
+
+        // Manually wipe derived tables to simulate a corrupted projection.
+        conn.execute_batch("DELETE FROM memories; DELETE FROM memories_fts;")
+            .unwrap();
+        let mem_count_wiped: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mem_count_wiped, 0, "memories wiped before rebuild_in_place");
+
+        let replayed = rebuild_in_place(&conn).expect("rebuild_in_place");
+
+        // Correct replay count.
+        assert_eq!(
+            replayed, 3,
+            "rebuild_in_place must return the number of events replayed"
+        );
+
+        // Memory is back.
+        let mem_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE memory_id = ?1",
+                [mem_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mem_exists, 1,
+            "memory must be re-projected after rebuild_in_place"
+        );
+
+        // NO duplicate events inserted.
+        let event_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count_after, event_count_before,
+            "rebuild_in_place must NOT insert duplicate events"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // W1.2b: rebuild_in_place reconstructs memory_citations (proves
+    // project_event runs the full dispatch including memory.cited).
+    // ------------------------------------------------------------------
+    #[test]
+    fn rebuild_in_place_reconstructs_citations() {
+        use super::rebuild_in_place;
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let mem_id = "mem-cite-test";
+
+        let events = vec![
+            make_event(
+                run_id,
+                "run.started",
+                json!({"project_id": "p", "task": "t"}),
+            ),
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": mem_id,
+                    "text": "cite me",
+                    "scope": "global_user",
+                    "kind": "fact"
+                }),
+            ),
+            make_event(
+                run_id,
+                "memory.cited",
+                json!({
+                    "memory_id": mem_id,
+                    "turn": 2,
+                    "rationale": "relevant context"
+                }),
+            ),
+            make_event(run_id, "run.finished", json!({"total_cost_usd": 0.0})),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        let citations_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_citations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            citations_before, 1,
+            "citation must exist after apply_events"
+        );
+
+        let replayed = rebuild_in_place(&conn).expect("rebuild_in_place");
+        assert_eq!(replayed, 4, "expected 4 events replayed");
+
+        let citations_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_citations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            citations_after, 1,
+            "memory_citations must be repopulated by rebuild_in_place"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // W1.2c: Event reconstruction fidelity — after rebuild_in_place the
+    // projected memory's text/scope/kind match the original.
+    // ------------------------------------------------------------------
+    #[test]
+    fn memory_proposed_redacts_event_and_projection_payloads() {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let event = make_event(
+            run_id,
+            "memory.proposed",
+            json!({
+                "proposal_id": "prop-redact",
+                "scope": "project",
+                "kind": "fact",
+                "text": format!("lesson uses {secret}"),
+                "rationale": format!("model repeated {secret}"),
+                "proposed_confidence": 0.5,
+                "source_event_ids": [],
+            }),
+        );
+        apply_events(&conn, &[event]).expect("apply_events");
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE kind = 'memory.proposed'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("event payload");
+        assert!(!payload.contains(secret), "event leaked secret: {payload}");
+        assert!(payload.contains("[REDACTED:anthropic_oauth]"));
+
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT text, rationale FROM memory_proposals WHERE proposal_id = 'prop-redact'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("proposal row");
+        assert!(!row.0.contains(secret), "proposal text leaked: {}", row.0);
+        assert!(
+            !row.1.contains(secret),
+            "proposal rationale leaked: {}",
+            row.1
+        );
+    }
+
+    #[test]
+    fn memory_cited_redacts_event_and_projection_rationale() {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf";
+        let event = make_event(
+            run_id,
+            "memory.cited",
+            json!({
+                "memory_id": "mem-redact",
+                "turn": 1,
+                "rationale": format!("used because output showed {secret}"),
+            }),
+        );
+        apply_events(&conn, &[event]).expect("apply_events");
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE kind = 'memory.cited'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("event payload");
+        assert!(!payload.contains(secret), "event leaked secret: {payload}");
+        assert!(payload.contains("[REDACTED:anthropic_oauth]"));
+
+        let rationale: String = conn
+            .query_row(
+                "SELECT rationale FROM memory_citations WHERE memory_id = 'mem-redact'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("citation rationale");
+        assert!(
+            !rationale.contains(secret),
+            "citation rationale leaked: {rationale}"
+        );
+        assert!(rationale.contains("[REDACTED:anthropic_oauth]"));
+    }
+
+    #[test]
+    fn rebuild_in_place_payload_fidelity() {
+        use super::rebuild_in_place;
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let mem_id = "mem-fidelity-test";
+        let expected_text = "Rust edition 2024 requires explicit use of `use` for trait impls";
+        let expected_scope = "project";
+        let expected_kind = "guideline";
+
+        let events = vec![
+            make_event(
+                run_id,
+                "run.started",
+                json!({"project_id": "p", "task": "t"}),
+            ),
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": mem_id,
+                    "text": expected_text,
+                    "scope": expected_scope,
+                    "kind": expected_kind,
+                    "confidence": 0.9
+                }),
+            ),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        // Wipe derived tables to force a full rebuild.
+        conn.execute_batch("DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM runs;")
+            .unwrap();
+
+        rebuild_in_place(&conn).expect("rebuild_in_place");
+
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT text, scope, kind FROM memories WHERE memory_id = ?1",
+                [mem_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("memory must exist after rebuild_in_place");
+
+        assert_eq!(row.0, expected_text, "text must round-trip through rebuild");
+        assert_eq!(
+            row.1, expected_scope,
+            "scope must round-trip through rebuild"
+        );
+        assert_eq!(row.2, expected_kind, "kind must round-trip through rebuild");
+    }
 }

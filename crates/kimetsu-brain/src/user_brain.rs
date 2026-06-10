@@ -34,7 +34,9 @@ use std::path::PathBuf;
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::ids::RunId;
 use kimetsu_core::memory::{MemoryKind, MemoryScope, normalize_memory_text};
-use kimetsu_core::paths::{user_brain_db_path, user_brain_enabled, user_kimetsu_dir};
+use kimetsu_core::paths::{
+    user_brain_db_path, user_brain_enabled, user_brain_enabled_with, user_kimetsu_dir,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -78,7 +80,70 @@ pub fn open_user_brain_readonly() -> KimetsuResult<Option<Connection>> {
         return Ok(None);
     }
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    schema::validate(&conn)?;
+    match schema::validate(&conn) {
+        Ok(()) => {}
+        // A stale user brain must not break an unrelated read-only project op;
+        // skip it this call. The next read-write open migrates it.
+        Err(e)
+            if e.downcast_ref::<crate::migrate::SchemaNeedsMigration>()
+                .is_some() =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(Some(conn))
+}
+
+/// W3.3: config-aware read-write open. Behaves like [`open_user_brain`]
+/// but resolves the enabled check from the project config's
+/// `use_user_brain` field with env override applied.
+///
+/// Precedence: `KIMETSU_USER_BRAIN` env > `config_use_user_brain` > default.
+pub fn open_user_brain_for_config(
+    config_use_user_brain: bool,
+) -> KimetsuResult<Option<Connection>> {
+    if !user_brain_enabled_with(config_use_user_brain) {
+        return Ok(None);
+    }
+    let Some(dir) = user_kimetsu_dir() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(&dir)?;
+    let db_path = dir.join("brain.db");
+    let conn = Connection::open(&db_path)?;
+    schema::initialize(&conn)?;
+    Ok(Some(conn))
+}
+
+/// W3.3: config-aware read-only open. Behaves like
+/// [`open_user_brain_readonly`] but resolves the enabled check from the
+/// project config's `use_user_brain` field with env override applied.
+///
+/// Precedence: `KIMETSU_USER_BRAIN` env > `config_use_user_brain` > default.
+pub fn open_user_brain_readonly_for_config(
+    config_use_user_brain: bool,
+) -> KimetsuResult<Option<Connection>> {
+    if !user_brain_enabled_with(config_use_user_brain) {
+        return Ok(None);
+    }
+    let Some(db_path) = user_brain_db_path() else {
+        return Ok(None);
+    };
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    match schema::validate(&conn) {
+        Ok(()) => {}
+        Err(e)
+            if e.downcast_ref::<crate::migrate::SchemaNeedsMigration>()
+                .is_some() =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    }
     Ok(Some(conn))
 }
 
@@ -179,7 +244,7 @@ pub fn add_user_memory(
     // behavior on the default build, fastembed-rs BGE-small when
     // the feature is on.
     let embedder = embeddings::open_default_embedder();
-    embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
+    let embedding_vec = embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
 
     // v0.5.2: conflict detection for user-brain writes too. The
     // user brain ships the same `memory_conflicts` schema (shared
@@ -187,12 +252,14 @@ pub fn add_user_memory(
     // memory conflicts` walks the project AND user brains via the
     // existing multi-brain plumbing. Best-effort: NoopEmbedder
     // returns 0 hits; failures are logged, not raised.
-    let conflicts = conflict::detect_and_record(
+    // Fix 4c: pass the precomputed vector to avoid re-embedding.
+    let conflicts = conflict::detect_and_record_with_vec(
         conn,
         &memory_id,
         &MemoryScope::GlobalUser,
         &kind.to_string(),
         text,
+        embedding_vec.as_deref(),
         embedder,
     );
     if conflicts > 0 {
@@ -411,11 +478,226 @@ mod tests {
         });
     }
 
+    // ------------------------------------------------------------------
+    // A5-4. open_user_brain_readonly degrades to Ok(None) on a stale user brain
+    // ------------------------------------------------------------------
+    #[test]
+    fn readonly_degrades_to_none_on_stale_schema() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-stale");
+        with_user_brain_at(&tmp, || {
+            // Write a v1 stub directly — only schema_info, no full schema.
+            // schema::validate reads only schema_info, so this is sufficient
+            // to trigger SchemaNeedsMigration without any other tables.
+            let db_path = tmp.join("brain.db");
+            {
+                let conn = rusqlite::Connection::open(&db_path).expect("open stub db");
+                conn.execute_batch(
+                    "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                     INSERT INTO schema_info VALUES ('kimetsu_schema_version', 1);",
+                )
+                .expect("seed v1 stub");
+            }
+            // The file exists but is at v1; open_user_brain_readonly must degrade
+            // to Ok(None) instead of propagating the SchemaNeedsMigration error.
+            let result = open_user_brain_readonly()
+                .expect("open_user_brain_readonly must not error on stale user brain");
+            assert!(
+                result.is_none(),
+                "stale user brain (v1 < target) must yield Ok(None), not an error"
+            );
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // A7: user-brain v1→v2 migration — backup sidecar + data preserved
+    // ------------------------------------------------------------------
+    #[test]
+    fn migration_upgrades_user_brain_creates_backup_and_preserves_data() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-migrate");
+        with_user_brain_at(&tmp, || {
+            // (a) Create the user brain and seed a GlobalUser memory.
+            //     open_user_brain() calls schema::initialize() which runs
+            //     run_migrations, leaving the DB at v2.
+            let mem_id = {
+                let conn = open_user_brain().expect("open ok").expect("enabled");
+                add_user_memory(
+                    &conn,
+                    MemoryKind::Preference,
+                    "A7 user-brain migration test",
+                    1.0,
+                )
+                .expect("add_user_memory")
+            };
+
+            // (b) Stamp the schema_info version back to 1 to simulate a
+            //     pre-upgrade DB.  The DDL is already v2-shaped; the
+            //     migration is idempotent, so re-running is safe.
+            let db_path = tmp.join("brain.db");
+            {
+                let conn = rusqlite::Connection::open(&db_path).expect("open for stamp-down");
+                conn.execute(
+                    "UPDATE schema_info SET value = 1 WHERE key = 'kimetsu_schema_version'",
+                    [],
+                )
+                .expect("stamp version back to 1");
+                let stamped: i64 = conn
+                    .query_row(
+                        "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("read stamped version");
+                assert_eq!(stamped, 1, "version should be 1 after stamp-down");
+            }
+
+            // (c) Re-open through open_user_brain() — calls schema::initialize
+            //     → run_migrations → migrates v1→v2 with a backup.
+            let conn = open_user_brain().expect("re-open ok").expect("enabled");
+
+            // Assert 1: version is back at 2.
+            let ver =
+                crate::migrate::current_version(&conn).expect("current_version after re-open");
+            assert_eq!(ver, 2, "user brain must be at v2 after re-open");
+
+            // Assert 2: backup sidecar brain.db.bak-1-2-* exists next to brain.db.
+            let bak_files: Vec<_> = std::fs::read_dir(&tmp)
+                .expect("read tmp dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("brain.db.bak-1-2-"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert_eq!(
+                bak_files.len(),
+                1,
+                "exactly one user-brain backup sidecar brain.db.bak-1-2-* must exist; found: {:?}",
+                bak_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+            );
+
+            // Assert 3: the seeded memory survives the migration.
+            let rows = list_user_memories(&conn).expect("list_user_memories");
+            assert!(
+                rows.iter().any(|r| r.memory_id == mem_id),
+                "seeded memory must survive v1→v2 migration; mem_id={mem_id}"
+            );
+        });
+    }
+
     fn tempdir_in_test(prefix: &str) -> std::path::PathBuf {
         // Don't pull in `tempfile` — the workspace doesn't use it
         // elsewhere in this crate. Roll a small helper.
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", Ulid::new()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    // ── W3.3: open_user_brain_for_config tests ───────────────────────
+
+    /// W3.3: config=false disables the user brain when env is unset.
+    #[test]
+    fn w3_open_user_brain_for_config_false_returns_none() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-w3-1");
+        let _guard = test_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev_enabled = std::env::var("KIMETSU_USER_BRAIN").ok();
+        let prev_dir = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_USER_BRAIN");
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", &tmp);
+        }
+        // config=false + env unset → None.
+        let result = open_user_brain_for_config(false).expect("no error");
+        assert!(
+            result.is_none(),
+            "config=false + env unset must return None"
+        );
+        assert!(
+            !tmp.join("brain.db").exists(),
+            "brain.db must not be created when user brain is off"
+        );
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_enabled {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN"),
+            }
+        }
+    }
+
+    /// W3.3: KIMETSU_USER_BRAIN=1 overrides config=false (env wins).
+    #[test]
+    fn w3_open_user_brain_env_enable_overrides_config_false() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-w3-2");
+        let _guard = test_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev_enabled = std::env::var("KIMETSU_USER_BRAIN").ok();
+        let prev_dir = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN", "1");
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", &tmp);
+        }
+        // env=1 overrides config=false → Some (brain enabled).
+        let result = open_user_brain_for_config(false).expect("no error");
+        assert!(
+            result.is_some(),
+            "KIMETSU_USER_BRAIN=1 must override config=false → brain enabled"
+        );
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_enabled {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN"),
+            }
+        }
+    }
+
+    /// W3.3: KIMETSU_USER_BRAIN=0 overrides config=true (env wins).
+    #[test]
+    fn w3_open_user_brain_env_disable_overrides_config_true() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-w3-3");
+        let _guard = test_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev_enabled = std::env::var("KIMETSU_USER_BRAIN").ok();
+        let prev_dir = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN", "0");
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", &tmp);
+        }
+        // env=0 overrides config=true → None.
+        let result = open_user_brain_for_config(true).expect("no error");
+        assert!(
+            result.is_none(),
+            "KIMETSU_USER_BRAIN=0 must override config=true → brain disabled"
+        );
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_enabled {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN"),
+            }
+        }
+    }
+
+    /// W3.3: config=true + env unset → user brain opens (default behavior).
+    #[test]
+    fn w3_open_user_brain_for_config_true_opens_normally() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-w3-4");
+        with_user_brain_at(&tmp, || {
+            let result = open_user_brain_for_config(true).expect("no error");
+            assert!(
+                result.is_some(),
+                "config=true + env unset must open the brain"
+            );
+            assert!(tmp.join("brain.db").exists());
+        });
     }
 }

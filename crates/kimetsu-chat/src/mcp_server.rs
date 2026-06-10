@@ -131,12 +131,22 @@ pub fn serve_mcp<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn handle_mcp_method(
+/// Transport-agnostic MCP method dispatch.
+///
+/// `allowed_tools = None` → full catalog (identical to the previous
+/// `handle_mcp_method` behaviour; stdio path uses this).
+///
+/// `allowed_tools = Some(set)`:
+///   - `"tools/list"` returns only entries whose `name` ∈ set.
+///   - `"tools/call"` returns an error before dispatching if the
+///     requested tool name is not in the set.
+pub fn dispatch(
     method: &str,
-    params: Value,
-    workspace: &Path,
+    params: serde_json::Value,
+    workspace: &std::path::Path,
     skills: &SkillConfig,
-) -> Result<Value, String> {
+    allowed_tools: Option<&std::collections::BTreeSet<&'static str>>,
+) -> Result<serde_json::Value, String> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
@@ -150,12 +160,54 @@ fn handle_mcp_method(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => {
+            let all = tool_definitions();
+            let tools = match allowed_tools {
+                None => all,
+                Some(set) => {
+                    let filtered: Vec<Value> = all
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|entry| {
+                            entry
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(|n| set.contains(n))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    Value::Array(filtered)
+                }
+            };
+            Ok(json!({ "tools": tools }))
+        }
         "tools/call" => {
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "tools/call missing name".to_string())?;
+            if let Some(set) = allowed_tools {
+                if !set.contains(name) {
+                    return Err(format!("tool `{name}` is not available in remote mode"));
+                }
+            }
+            // `allowed_tools.is_some()` is the remote-mode marker (see the
+            // dispatch docstring): remote serves cloned repos whose
+            // project.toml is untrusted, so only the operator-set env var
+            // can enable writes there. Local stdio consults project config
+            // (default: enabled — recording lessons is the product's own
+            // prescribed workflow).
+            if is_privileged_write_tool(name)
+                && !mcp_write_tools_enabled(workspace, allowed_tools.is_some())
+            {
+                return Err(format!(
+                    "tool `{name}` requires explicit approval; enable with \
+                     `kimetsu config set kimetsu.mcp_write_tools true` (local) or \
+                     KIMETSU_MCP_ENABLE_WRITE_TOOLS=1 (env override, required for remote)"
+                ));
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -220,6 +272,16 @@ fn handle_mcp_method(
     }
 }
 
+/// Thin wrapper for the stdio path: full catalog, no allowlist.
+fn handle_mcp_method(
+    method: &str,
+    params: Value,
+    workspace: &Path,
+    skills: &SkillConfig,
+) -> Result<Value, String> {
+    dispatch(method, params, workspace, skills, None)
+}
+
 fn call_tool(
     name: &str,
     arguments: Value,
@@ -228,6 +290,7 @@ fn call_tool(
 ) -> Result<Value, String> {
     match name {
         "kimetsu_brain_status" => Ok(kimetsu_brain_status(workspace)),
+        "kimetsu_brain_insights" => Ok(kimetsu_brain_insights(workspace, &arguments)),
         "kimetsu_brain_context" => Ok(kimetsu_brain_context(workspace, &arguments)),
         "kimetsu_brain_record" => Ok(kimetsu_brain_record(workspace, &arguments)),
         "kimetsu_benchmark_context" => Ok(kimetsu_benchmark_context(workspace, &arguments)),
@@ -342,6 +405,9 @@ fn call_tool(
                 .map(InstallScope::parse)
                 .transpose()?
                 .unwrap_or_default();
+            if matches!(scope, InstallScope::Global) {
+                return Err("global plugin install is not available through MCP; run the explicit CLI command instead".to_string());
+            }
             let mode = arguments
                 .get("mode")
                 .and_then(Value::as_str)
@@ -375,6 +441,61 @@ fn call_tool(
         "kimetsu_brain_config_show" => kimetsu_brain_config_show(workspace),
         other => Err(format!("unknown Kimetsu MCP tool `{other}`")),
     }
+}
+
+fn is_privileged_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "kimetsu_brain_record"
+            | "kimetsu_benchmark_record_outcome"
+            | "kimetsu_brain_memory_add"
+            | "kimetsu_brain_memory_accept"
+            | "kimetsu_brain_memory_reject"
+            | "kimetsu_brain_memory_invalidate"
+            | "kimetsu_brain_ingest_repo"
+            | "kimetsu_bridge_import"
+            | "kimetsu_bridge_export"
+            | "kimetsu_bridge_sync"
+            | "kimetsu_plugin_install"
+            | "kimetsu_brain_model_set"
+            | "kimetsu_brain_reindex"
+            | "kimetsu_brain_conflict_resolve"
+            | "kimetsu_brain_prune"
+    )
+}
+
+fn mcp_write_tools_enabled(workspace: &Path, remote: bool) -> bool {
+    let env = std::env::var("KIMETSU_MCP_ENABLE_WRITE_TOOLS").ok();
+    let config_allow = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|config| config.kimetsu.mcp_write_tools);
+    write_tools_decision(env.as_deref(), remote, config_allow)
+}
+
+/// v1.0.0: pure decision for the privileged-write gate.
+///
+/// Precedence:
+///   1. The env var, when SET, always wins — truthy enables, anything else
+///      disables. This is the operator override in both directions.
+///   2. Remote mode (env unset): always deny. The workspace config on a
+///      remote server comes from a cloned repo — untrusted input must not
+///      be able to enable writes.
+///   3. Local mode (env unset): the project's `kimetsu.mcp_write_tools`
+///      (default true — a local plugin install IS the trusted session, and
+///      the brain's own workflow instructs the agent to record lessons).
+///      An unreadable config also defaults to true.
+fn write_tools_decision(env: Option<&str>, remote: bool, config_allow: Option<bool>) -> bool {
+    if let Some(value) = env {
+        return matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        );
+    }
+    if remote {
+        return false;
+    }
+    config_allow.unwrap_or(true)
 }
 
 fn kimetsu_brain_status(workspace: &Path) -> Value {
@@ -448,6 +569,61 @@ fn kimetsu_brain_status(workspace: &Path) -> Value {
     })
 }
 
+/// v1.0 (C6): `kimetsu_brain_insights` — effectiveness analytics MCP tool.
+fn kimetsu_brain_insights(workspace: &Path, arguments: &Value) -> Value {
+    use kimetsu_brain::analytics::{self, InsightsOptions};
+
+    let last_n_runs = u32_arg(arguments, "last_n_runs", 50, 1, u32::MAX);
+    let since = optional_string_arg(arguments, "since");
+    let top = u32_arg(arguments, "top", 10, 1, u32::MAX);
+
+    let opts = InsightsOptions {
+        last_n_runs,
+        since,
+        top_n: top,
+    };
+
+    let report = match analytics::compute_insights(workspace, opts) {
+        Ok(r) => r,
+        Err(err) => {
+            return brain_unavailable_json(workspace, &format!("kimetsu_brain_insights: {err}"));
+        }
+    };
+
+    // Build a short interpretation string from headline numbers.
+    let citation_rate = report
+        .citation
+        .citation_rate
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    let acceptance_rate = report
+        .proposals
+        .acceptance_rate
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    let avg_tokens = report
+        .token_economy
+        .avg_injected_tokens
+        .map(|v| format!("{:.0} tokens/injection", v))
+        .unwrap_or_else(|| "n/a tokens/injection".to_string());
+    let interpretation = format!(
+        "Citation rate {citation_rate} ({cited}/{retrieved} memories cited), \
+         proposal acceptance {acceptance_rate} ({accepted}/{total} decided), \
+         token economy {avg_tokens}. Retrieval hit-rate n/a until C7.",
+        cited = report.citation.cited_total,
+        retrieved = report.citation.retrieved_total,
+        accepted = report.proposals.accepted,
+        total = report.proposals.accepted + report.proposals.rejected,
+    );
+
+    let report_json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    json!({
+        "ok": true,
+        "report": report_json,
+        "interpretation": interpretation,
+    })
+}
+
 /// v0.7: shared argument parsing for retrieval MCP tools. Callers pass
 /// their own defaults for `budget_tokens` and `max_capsules` since bench
 /// and brain use different values (2500/8 vs 6000/3).
@@ -475,7 +651,36 @@ fn parse_shared_retrieval_args(
 }
 
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    use kimetsu_brain::context::ContextRequest;
+    match brain_context_tool(workspace, arguments, None) {
+        Ok(v) => v,
+        Err(e) => brain_unavailable_json(workspace, &e),
+    }
+}
+
+/// Candidate pool the remote reranker judges before truncating to the caller's
+/// cap. Mirrors `RERANK_POOL` in `kimetsu-cli/src/embed_daemon/server.rs`.
+pub const REMOTE_RERANK_POOL: usize = 6;
+
+/// Sigmoid-score floor for the remote reranker — capsules scored below this
+/// are noise. Mirrors `RERANK_FLOOR` in `kimetsu-cli/src/embed_daemon/server.rs`.
+pub const REMOTE_RERANK_FLOOR: f32 = 0.30;
+
+/// Transport-agnostic body of the `kimetsu_brain_context` tool.
+///
+/// When `reranker` is `None` the behaviour is identical to the previous
+/// private implementation (used by the stdio MCP path). When `Some`:
+/// - over-fetches a larger candidate pool (`max_capsules = cap.max(REMOTE_RERANK_POOL)`)
+/// - bumps `budget_tokens` to at least 6000 so the pool isn't token-starved
+/// - retrieves, then calls `rerank_capsules` before serialising
+///
+/// The JSON response shape is byte-compatible with the `None` path so
+/// existing tests and the stdio consumer are unaffected.
+pub fn brain_context_tool(
+    workspace: &Path,
+    arguments: &serde_json::Value,
+    reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
+) -> Result<serde_json::Value, String> {
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
 
     let query = arguments
         .get("query")
@@ -483,16 +688,16 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         .unwrap_or("")
         .trim();
     if query.is_empty() {
-        return json!({
+        return Ok(json!({
             "ok": false,
             "error": "missing `query`",
             "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
-        });
+        }));
     }
     let shared = parse_shared_retrieval_args(arguments, 6000, 3);
     let stage = shared.stage.as_str();
     let budget_tokens = shared.budget_tokens;
-    let max_capsules = shared.max_capsules;
+    let cap = shared.max_capsules;
     // v0.6: score threshold and role preference controls.
     let min_score = arguments
         .get("min_score")
@@ -525,22 +730,39 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
     // `KIMETSU_BRAIN_AMBIENT=off`. The full ambient block is
     // surfaced in the response so the model knows what augmented
     // its retrieval.
-    let (effective_query, ambient_payload) =
-        augment_with_ambient(workspace, query, arguments, "include_ambient");
+    // W3.2: load broker.ambient from the project config (best-effort;
+    // default true keeps existing behavior when config is missing).
+    let config_ambient = load_config_ambient(workspace);
+    let (effective_query, ambient_payload) = augment_with_ambient(
+        workspace,
+        query,
+        arguments,
+        "include_ambient",
+        config_ambient,
+    );
+
+    // When reranking, over-fetch a larger candidate pool so the cross-encoder
+    // sees enough diversity before truncating to `cap`, and bump the token
+    // budget so the pool isn't starved. Same logic as the embed daemon.
+    let (fetch_cap, fetch_budget) = if reranker.is_some() {
+        (cap.max(REMOTE_RERANK_POOL), budget_tokens.max(6000))
+    } else {
+        (cap, budget_tokens)
+    };
 
     let request = ContextRequest {
         stage: stage.to_string(),
         query: effective_query.clone(),
-        budget_tokens,
+        budget_tokens: fetch_budget,
         tags,
         min_score,
-        max_capsules,
+        max_capsules: fetch_cap,
         prefer_roles,
         ..Default::default()
     };
 
     match project::retrieve_context_readonly_with_request(workspace, request) {
-        Ok(bundle) if bundle.skipped => json!({
+        Ok(bundle) if bundle.skipped => Ok(json!({
             "ok": true,
             "skipped": true,
             "top_score": bundle.top_score,
@@ -550,32 +772,44 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             "usage": {
                 "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
             }
-        }),
-        Ok(bundle) => json!({
-            "ok": true,
-            "skipped": false,
-            "top_score": bundle.top_score,
-            "usage": {
-                "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
-                "next_steps": [
-                    "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
-                    "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
-                    "Continue with the host harness's normal file/shell/edit tools.",
-                    "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
-                ]
-            },
-            "stage": bundle.stage,
-            "query": query,
-            "augmented_query": effective_query,
-            "ambient": ambient_payload,
-            "budget_tokens": bundle.budget_tokens,
-            "used_tokens": bundle.used_tokens,
-            "capsule_count": bundle.capsules.len(),
-            "excluded_count": bundle.excluded.len(),
-            "capsules": bundle.capsules,
-            "excluded": bundle.excluded,
-        }),
-        Err(err) => brain_unavailable_json(workspace, &err.to_string()),
+        })),
+        Ok(mut bundle) => {
+            // Apply cross-encoder reranking when a reranker is present.
+            if let Some(rr) = reranker {
+                bundle.capsules = rerank_capsules(
+                    &effective_query,
+                    bundle.capsules,
+                    rr,
+                    REMOTE_RERANK_FLOOR,
+                    cap,
+                );
+            }
+            Ok(json!({
+                "ok": true,
+                "skipped": false,
+                "top_score": bundle.top_score,
+                "usage": {
+                    "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
+                    "next_steps": [
+                        "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
+                        "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
+                        "Continue with the host harness's normal file/shell/edit tools.",
+                        "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
+                    ]
+                },
+                "stage": bundle.stage,
+                "query": query,
+                "augmented_query": effective_query,
+                "ambient": ambient_payload,
+                "budget_tokens": bundle.budget_tokens,
+                "used_tokens": bundle.used_tokens,
+                "capsule_count": bundle.capsules.len(),
+                "excluded_count": bundle.excluded.len(),
+                "capsules": bundle.capsules,
+                "excluded": bundle.excluded,
+            }))
+        }
+        Err(err) => Ok(brain_unavailable_json(workspace, &err.to_string())),
     }
 }
 
@@ -685,20 +919,36 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
     }
 }
 
+/// W3.2: load `broker.ambient` from the project config, best-effort.
+/// Returns `true` (the default) if the config is missing or unreadable
+/// so existing behavior is preserved when the project hasn't been
+/// initialized or the toml is absent.
+fn load_config_ambient(workspace: &Path) -> bool {
+    kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.ambient)
+        .unwrap_or(true)
+}
+
 /// v0.4.4: shared ambient-augmentation helper for the brain + benchmark
 /// MCP tools.
 ///
 /// Returns `(effective_query, ambient_payload)`. The payload is JSON
 /// (or `null` when ambient is disabled either per-call or globally),
 /// safe to embed directly into the response.
+///
+/// W3.2: `config_ambient` is the project config's `broker.ambient` value
+/// (default true). Resolution: `KIMETSU_BRAIN_AMBIENT` env > `config_ambient`.
 fn augment_with_ambient(
     workspace: &Path,
     query: &str,
     arguments: &Value,
     arg_key: &str,
+    config_ambient: bool,
 ) -> (String, Value) {
     let include = bool_arg(arguments, arg_key, true);
-    if !include || !kimetsu_brain::ambient::ambient_enabled() {
+    if !include || !kimetsu_brain::ambient::ambient_enabled_with(config_ambient) {
         return (query.to_string(), json!(null));
     }
     let ctx = kimetsu_brain::ambient::collect(workspace);
@@ -744,12 +994,15 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     // into the brain so it appends AFTER slug detection (otherwise
     // the suffix would confuse `normalize_task_slug`). The full
     // ambient block is also surfaced in the response payload.
+    // W3.2: honor broker.ambient from project config with env override.
+    let config_ambient = load_config_ambient(workspace);
     let include_ambient = bool_arg(arguments, "include_ambient", true);
-    let ambient_ctx = if include_ambient && kimetsu_brain::ambient::ambient_enabled() {
-        Some(kimetsu_brain::ambient::collect(workspace))
-    } else {
-        None
-    };
+    let ambient_ctx =
+        if include_ambient && kimetsu_brain::ambient::ambient_enabled_with(config_ambient) {
+            Some(kimetsu_brain::ambient::collect(workspace))
+        } else {
+            None
+        };
     let ambient_suffix = ambient_ctx
         .as_ref()
         .map(kimetsu_brain::ambient::render_as_query_suffix)
@@ -892,11 +1145,10 @@ fn kimetsu_brain_memory_top(workspace: &Path, arguments: &Value) -> Result<Value
 fn kimetsu_brain_memory_add(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let scope = MemoryScope::from_str(&string_arg(arguments, "scope")?)?;
     let kind = MemoryKind::from_str(
-        &arguments
+        arguments
             .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or("fact")
-            .to_string(),
+            .unwrap_or("fact"),
     )?;
     let text = string_arg(arguments, "text")?;
     let memory_id = project::add_memory(workspace, scope, kind, &text)
@@ -1861,6 +2113,18 @@ fn tool_definitions() -> Value {
             "name": "kimetsu_brain_config_show",
             "description": "Read the project.toml config (raw + parsed), including the active embedder, broker weights, and run limits.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "kimetsu_brain_insights",
+            "description": "Brain effectiveness analytics: retrieval hit-rate, citation rate, proposal acceptance, usefulness trend, harvest yield, token economy. Use to see whether the brain is helping and to tune it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "last_n_runs": { "type": "integer", "minimum": 1, "description": "Number of most-recent runs to include in the rolling window. Default 50." },
+                    "since": { "type": "string", "description": "ISO-8601 lower bound on run timestamps. When set, overrides last_n_runs." },
+                    "top": { "type": "integer", "minimum": 1, "description": "How many items to include in ranked lists (top-useful, prune-candidates). Default 10." }
+                }
+            }
         }
     ])
 }
@@ -1961,6 +2225,110 @@ mod tests {
     }
 
     #[test]
+    fn brain_insights_appears_in_tool_definitions() {
+        let result = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("tools/list");
+        let tools = result["tools"].as_array().unwrap();
+        let insights_tool = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("kimetsu_brain_insights"))
+            .expect("kimetsu_brain_insights must be in tool_definitions");
+        // Description must mention analytics.
+        assert!(
+            insights_tool["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("analytics"),
+            "kimetsu_brain_insights description should contain 'analytics'"
+        );
+        // Schema must accept optional last_n_runs, since, top.
+        let props = &insights_tool["inputSchema"]["properties"];
+        assert!(
+            props.get("last_n_runs").is_some(),
+            "schema must have last_n_runs"
+        );
+        assert!(props.get("since").is_some(), "schema must have since");
+        assert!(props.get("top").is_some(), "schema must have top");
+    }
+
+    #[test]
+    fn brain_insights_reports_missing_project_without_error() {
+        let root = temp_root("kimetsu-mcp-insights-no-brain");
+        fs::create_dir_all(&root).expect("create temp root");
+        let result = call_tool(
+            "kimetsu_brain_insights",
+            json!({}),
+            &root,
+            &SkillConfig::default(),
+        )
+        .expect("brain insights call");
+        // No brain — must return initialized:false, not panic.
+        assert_eq!(result["initialized"].as_bool(), Some(false));
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn brain_insights_returns_well_formed_report() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-insights-brain");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "insights mcp test fixture memory",
+            )
+            .expect("add memory");
+
+            let result = call_tool(
+                "kimetsu_brain_insights",
+                json!({ "last_n_runs": 50, "top": 5 }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("brain insights call");
+
+            assert_eq!(result["ok"].as_bool(), Some(true), "ok must be true");
+            // The report must have the top-level sections.
+            let report = &result["report"];
+            assert!(
+                report.get("retrieval").is_some(),
+                "report.retrieval missing"
+            );
+            assert!(report.get("citation").is_some(), "report.citation missing");
+            assert!(
+                report.get("proposals").is_some(),
+                "report.proposals missing"
+            );
+            assert!(
+                report.get("usefulness").is_some(),
+                "report.usefulness missing"
+            );
+            assert!(report.get("harvest").is_some(), "report.harvest missing");
+            assert!(report.get("corpus").is_some(), "report.corpus missing");
+            assert!(
+                report.get("token_economy").is_some(),
+                "report.token_economy missing"
+            );
+            // interpretation string must be present and non-empty.
+            let interp = result["interpretation"].as_str().unwrap_or("");
+            assert!(!interp.is_empty(), "interpretation must be non-empty");
+            // hit_rate is None (C7 not landed) — JSON null in the report.
+            assert!(
+                report["retrieval"]["hit_rate"].is_null(),
+                "hit_rate must be null (C7 not yet landed)"
+            );
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
+    }
+
+    #[test]
     fn brain_context_returns_memory_capsules() {
         let root = temp_root("kimetsu-mcp-brain");
         fs::create_dir_all(&root).expect("create temp root");
@@ -1997,6 +2365,66 @@ mod tests {
             "expected a memory capsule: {capsules:?}"
         );
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    /// v1.0.0: `brain_context_tool` with a `StubReranker` reorders and caps
+    /// capsules. Seeds two memories — one semantically close to the query, one
+    /// unrelated — and confirms the reranker places the closer one first and
+    /// respects `max_capsules`.
+    #[test]
+    fn brain_context_tool_with_stub_reranker_reorders_and_caps() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-rerank");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+
+            // High-relevance memory: shares many tokens with the query.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Use ripgrep for fast file search before broad reads",
+            )
+            .expect("add high-relevance memory");
+
+            // Low-relevance memory: unrelated tokens.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Quibblefrotz wobblecache unrelated zephyrqux datum",
+            )
+            .expect("add low-relevance memory");
+
+            let rr = kimetsu_brain::embeddings::StubReranker;
+            let args = json!({
+                "query": "search files ripgrep before reading",
+                "stage": "localization",
+                "min_score": 0.0,
+                "max_capsules": 1,
+            });
+
+            let result = brain_context_tool(&root, &args, Some(&rr)).expect("brain_context_tool");
+
+            assert_eq!(result["ok"].as_bool(), Some(true), "ok false: {result}");
+            // The reranker caps at max_capsules=1.
+            let capsules = result["capsules"].as_array().expect("capsules array");
+            assert!(
+                capsules.len() <= 1,
+                "reranker must cap to max_capsules=1, got {}: {result}",
+                capsules.len()
+            );
+            // The top capsule (if present) must be the ripgrep memory
+            // (higher token overlap with the query).
+            if let Some(top) = capsules.first() {
+                let summary = top["summary"].as_str().unwrap_or("");
+                assert!(
+                    summary.contains("ripgrep"),
+                    "StubReranker must rank the ripgrep memory first: {summary}"
+                );
+            }
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
     }
 
     #[test]
@@ -2175,5 +2603,249 @@ mod tests {
         // so ProjectPaths::discover resolves here, not a shared ancestor.
         kimetsu_core::paths::git_init_boundary(&root);
         root
+    }
+
+    // ── dispatch allowlist tests ──────────────────────────────────────────
+
+    /// (a) dispatch("tools/list", .., None) returns the full catalog.
+    #[test]
+    fn dispatch_no_allowlist_returns_full_catalog() {
+        use std::collections::BTreeSet;
+        let result = dispatch(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+            None,
+        )
+        .expect("dispatch tools/list None");
+        let tools = result["tools"].as_array().expect("tools array");
+        // Full catalog must contain representative tools from every category.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        for expected in &[
+            "kimetsu_brain_status",
+            "kimetsu_brain_context",
+            "kimetsu_brain_record",
+            "kimetsu_benchmark_context",
+            "kimetsu_benchmark_record_outcome",
+            "kimetsu_brain_memory_list",
+            "kimetsu_brain_memory_top",
+            "kimetsu_brain_memory_add",
+            "kimetsu_brain_memory_proposals",
+            "kimetsu_brain_memory_accept",
+            "kimetsu_brain_memory_reject",
+            "kimetsu_brain_memory_invalidate",
+            "kimetsu_brain_memory_blame",
+            "kimetsu_brain_memory_conflicts",
+            "kimetsu_brain_ingest_repo",
+            "kimetsu_bridge_status",
+            "kimetsu_skills_search",
+            "kimetsu_bridge_import",
+            "kimetsu_bridge_export",
+            "kimetsu_bridge_sync",
+            "kimetsu_plugin_install",
+            "kimetsu_brain_model_list",
+            "kimetsu_brain_model_set",
+            "kimetsu_brain_reindex",
+            "kimetsu_brain_memory_search",
+            "kimetsu_brain_conflict_resolve",
+            "kimetsu_brain_prune",
+            "kimetsu_brain_config_show",
+            "kimetsu_brain_insights",
+        ] {
+            assert!(
+                names.contains(expected),
+                "full catalog missing `{expected}`; got: {names:?}"
+            );
+        }
+        // Confirm handle_mcp_method returns the same count (byte-identical path).
+        let via_handle = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("handle_mcp_method tools/list");
+        assert_eq!(
+            result["tools"].as_array().unwrap().len(),
+            via_handle["tools"].as_array().unwrap().len(),
+            "dispatch(None) and handle_mcp_method must return the same number of tools"
+        );
+        let _ = BTreeSet::<&str>::new(); // suppress unused-import if needed
+    }
+
+    /// (b) dispatch("tools/list", .., Some({"kimetsu_brain_record"})) returns ONLY that tool.
+    #[test]
+    fn dispatch_allowlist_filters_tools_list() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_record");
+        let result = dispatch(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect("dispatch filtered tools/list");
+        let tools = result["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools.len(),
+            1,
+            "allowlist of 1 tool should yield exactly 1 entry, got: {tools:?}"
+        );
+        assert_eq!(
+            tools[0]["name"].as_str(),
+            Some("kimetsu_brain_record"),
+            "the returned tool must be kimetsu_brain_record"
+        );
+    }
+
+    /// (c) dispatch("tools/call", {name:"kimetsu_brain_ingest_repo",..}, Some(set_without_it))
+    ///     returns the "not available in remote mode" error without executing.
+    #[test]
+    fn dispatch_allowlist_blocks_unlisted_tool_call() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_record"); // ingest_repo is NOT in this set
+        let err = dispatch(
+            "tools/call",
+            json!({ "name": "kimetsu_brain_ingest_repo", "arguments": {} }),
+            Path::new("."),
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect_err("should be blocked by allowlist");
+        assert!(
+            err.contains("not available in remote mode"),
+            "error must mention 'not available in remote mode', got: {err:?}"
+        );
+        assert!(
+            err.contains("kimetsu_brain_ingest_repo"),
+            "error must name the blocked tool, got: {err:?}"
+        );
+    }
+
+    /// v1.0.0: the write gate is a pure decision — env (set = wins, both
+    /// directions) > remote deny > local config (default allow). Covering
+    /// it here keeps env manipulation out of the dispatch-level tests.
+    #[test]
+    fn write_tools_decision_precedence() {
+        // Env set: truthy enables everywhere (incl. remote), falsy disables
+        // everywhere (incl. local config-true).
+        assert!(write_tools_decision(Some("1"), true, Some(false)));
+        assert!(write_tools_decision(Some("on"), false, Some(false)));
+        assert!(!write_tools_decision(Some("0"), false, Some(true)));
+        assert!(!write_tools_decision(Some("nope"), false, None));
+        // Env unset, remote: always deny — cloned-repo config must not
+        // be able to enable writes.
+        assert!(!write_tools_decision(None, true, Some(true)));
+        assert!(!write_tools_decision(None, true, None));
+        // Env unset, local: config decides, default allow.
+        assert!(write_tools_decision(None, false, Some(true)));
+        assert!(!write_tools_decision(None, false, Some(false)));
+        assert!(write_tools_decision(None, false, None));
+    }
+
+    /// Local dispatch honors `kimetsu.mcp_write_tools = false`: the user's
+    /// personalization knob still hard-blocks privileged writes.
+    #[test]
+    fn dispatch_blocks_writes_when_config_disables_them() {
+        let root = temp_root("dispatch-write-gate-config");
+        fs::create_dir_all(&root).expect("create temp root");
+        kimetsu_brain::project::init_project(&root, false).expect("init project");
+        // Flip the knob the way `kimetsu config set` would.
+        let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+        let mut config = kimetsu_brain::project::load_config(&paths).expect("load config");
+        config.kimetsu.mcp_write_tools = false;
+        fs::write(&paths.project_toml, config.to_toml().expect("toml")).expect("write config");
+
+        let err = dispatch(
+            "tools/call",
+            json!({
+                "name": "kimetsu_brain_record",
+                "arguments": { "lesson": "persist this without approval" }
+            }),
+            &root,
+            &SkillConfig::default(),
+            None,
+        )
+        .expect_err("config-disabled write tools must be blocked");
+        assert!(err.contains("requires explicit approval"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Remote dispatch (allowed_tools = Some) ignores workspace config —
+    /// even `mcp_write_tools = true` in a (cloned, untrusted) project.toml
+    /// must not enable writes without the operator's env var.
+    #[test]
+    fn dispatch_remote_ignores_config_for_write_tools() {
+        use std::collections::BTreeSet;
+        let root = temp_root("dispatch-write-gate-remote");
+        fs::create_dir_all(&root).expect("create temp root");
+        kimetsu_brain::project::init_project(&root, false).expect("init project");
+        // Default config already has mcp_write_tools = true.
+
+        let mut allowed = BTreeSet::new();
+        allowed.insert("kimetsu_brain_record");
+        let err = dispatch(
+            "tools/call",
+            json!({
+                "name": "kimetsu_brain_record",
+                "arguments": { "lesson": "persist this without approval" }
+            }),
+            &root,
+            &SkillConfig::default(),
+            Some(&allowed),
+        )
+        .expect_err("remote write tools must stay env-gated");
+        assert!(err.contains("requires explicit approval"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn global_plugin_install_is_not_available_through_mcp_helper() {
+        let err = call_tool(
+            "kimetsu_plugin_install",
+            json!({ "target": "codex", "scope": "global" }),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect_err("global plugin install must be blocked");
+        assert!(err.contains("global plugin install is not available"));
+    }
+
+    /// (d) An allowed tools/call dispatches correctly (uses kimetsu_brain_status
+    ///     which returns initialized:false for a missing brain without executing any
+    ///     side-effects, so it's safe in a unit test).
+    #[test]
+    fn dispatch_allowlist_permits_listed_tool_call() {
+        use std::collections::BTreeSet;
+        let root = temp_root("dispatch-allowlist-permitted");
+        fs::create_dir_all(&root).expect("create temp root");
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_status");
+        let result = dispatch(
+            "tools/call",
+            json!({ "name": "kimetsu_brain_status", "arguments": {} }),
+            &root,
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect("allowed tool call should not be blocked");
+        // Result is wrapped in MCP content envelope.
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text");
+        let inner: Value = serde_json::from_str(text).expect("inner JSON");
+        // No brain initialized → initialized:false (not a panic or block error).
+        assert_eq!(
+            inner["initialized"].as_bool(),
+            Some(false),
+            "brain not initialized — expected initialized:false"
+        );
+        fs::remove_dir_all(root).expect("remove temp root");
     }
 }

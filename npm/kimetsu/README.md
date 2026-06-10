@@ -26,16 +26,20 @@ download** — it works under `npm install --ignore-scripts`.
 
 The default install is the **lean** build: fast lexical (FTS) retrieval, no model
 download. To opt into the semantic build (fastembed + ONNX; first run downloads
-BGE-small), set `KIMETSU_NPM_FLAVOR=embeddings`:
+BGE-small), run this **once** — the choice is remembered, no env var to keep set:
 
 ```bash
-KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai
+kimetsu npm-flavor embeddings   # fetch + use the semantic build (persists)
+kimetsu npm-flavor lean         # switch back
+kimetsu npm-flavor status       # show the current build
 ```
 
-With that env var set, the launcher fetches and caches the embeddings binary from
-the matching GitHub Release on first run. Embeddings prebuilts exist for
-**Linux x64, macOS Apple Silicon, and Windows x64** (the targets ONNX Runtime
-ships prebuilts for); elsewhere the launcher falls back to the lean build.
+`kimetsu npm-flavor embeddings` fetches and caches the embeddings binary from the
+matching GitHub Release and records the preference in
+`<cache>/kimetsu/npm/flavor`, so every later `kimetsu` uses it automatically.
+(`KIMETSU_NPM_FLAVOR=embeddings`/`=lean` still works as a per-run override.)
+Embeddings prebuilts exist for **Linux x64, macOS Apple Silicon, and Windows
+x64** (the targets ONNX Runtime ships prebuilts for); elsewhere it stays lean.
 
 ## Supported platforms
 

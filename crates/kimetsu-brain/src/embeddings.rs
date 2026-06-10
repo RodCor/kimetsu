@@ -23,8 +23,8 @@
 //! Wire compatibility:
 //!   * Embeddings are nullable. Pre-v0.4.2 rows have NULL embedding
 //!     + NULL embedding_model. The retrieval blender treats them as
-//!     "lexical-only" — they still score via FTS, they just don't
-//!     contribute to the cosine term.
+//!       "lexical-only" — they still score via FTS, they just don't
+//!       contribute to the cosine term.
 //!   * The `embedding_model` column carries an opaque string id
 //!     ("bge-small-en-v1.5", "stub-d8", etc.). Queries blend only
 //!     when the query's embedder id matches the row's stored id,
@@ -71,6 +71,17 @@ pub trait Embedder: Send + Sync {
     fn is_noop(&self) -> bool {
         false
     }
+
+    /// Embed many texts in as few backend calls as possible. The
+    /// production fastembed backend runs them through ONNX in batched
+    /// tensors (~10-40x faster than calling `embed` per text). The
+    /// returned Vec is 1:1 with `texts` (same order, same length).
+    /// The default impl loops `embed`, so non-batching embedders work
+    /// unchanged. On any failure the whole batch errors — callers that
+    /// want per-row resilience should fall back to `embed` per text.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
 }
 
 /// Implement `Embedder` for `Box<dyn Embedder>` so callers can hold
@@ -87,6 +98,9 @@ impl Embedder for Box<dyn Embedder> {
     }
     fn is_noop(&self) -> bool {
         (**self).is_noop()
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        (**self).embed_batch(texts)
     }
 }
 
@@ -217,6 +231,116 @@ impl Embedder for StubEmbedder {
     }
 }
 
+// ── Reranker trait + implementations ───────────────────────────────────────
+
+/// v1.0.0: cross-encoder reranker — scores (query, document) pairs jointly.
+/// Returns one sigmoid-normalized score in (0,1) per document, in DOCUMENT
+/// ORDER (not sorted). Implementations must be Send + Sync (the daemon
+/// shares one across worker threads).
+pub trait Reranker: Send + Sync {
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedderError>;
+    fn model_id(&self) -> &str;
+}
+
+/// Deterministic, dependency-free stub reranker for tests.
+///
+/// Scores a (query, document) pair by lowercase-tokenizing both on
+/// non-alphanumeric characters and computing token-overlap:
+///
+///   score = 0.05 + 0.9 * (|intersection| / |query_tokens|)
+///           clamped to (0,1)
+///
+/// This means no doc ever scores exactly 0 or 1, but docs with more query
+/// words in common always score higher. Safe to use in any test that doesn't
+/// need a real model.
+pub struct StubReranker;
+
+impl Reranker for StubReranker {
+    fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedderError> {
+        let query_tokens: std::collections::HashSet<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase())
+            .collect();
+        let q_len = query_tokens.len();
+        let scores = documents
+            .iter()
+            .map(|doc| {
+                if q_len == 0 {
+                    return 0.05_f32;
+                }
+                let doc_tokens: std::collections::HashSet<String> = doc
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.to_lowercase())
+                    .collect();
+                let intersection = query_tokens.intersection(&doc_tokens).count();
+                let overlap = intersection as f32 / q_len as f32;
+                (0.05 + 0.9 * overlap).clamp(0.0, 1.0)
+            })
+            .collect();
+        Ok(scores)
+    }
+
+    fn model_id(&self) -> &str {
+        "stub-reranker"
+    }
+}
+
+/// v1.0.0: open a reranker by curated or user-defined id.
+///
+/// Resolution:
+///   1. `"off"`/`"none"`/`"noop"`/empty → `None` (disable).
+///   2. One of the 4 curated ids → `FastembedReranker::try_open` (builtin ONNX).
+///   3. Known alias (`jina-reranker-v1-tiny-en`, `ms-marco-tinybert-l-2-v2`,
+///      `ms-marco-minilm-l-4-v2`) or any id containing `/` → user-defined ONNX
+///      via HuggingFace Hub download.
+///   4. Anything else → fallback to the default curated jina-turbo.
+///
+/// Lean builds (no `embeddings` feature) always return `None`.
+pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
+    let v = model_id.trim().to_ascii_lowercase();
+    if v.is_empty() || matches!(v.as_str(), "off" | "none" | "noop") {
+        return None;
+    }
+    #[cfg(feature = "embeddings")]
+    {
+        // Curated ids → builtin path.
+        const CURATED: &[&str] = &[
+            "jina-reranker-v1-turbo-en",
+            "bge-reranker-base",
+            "bge-reranker-v2-m3",
+            "jina-reranker-v2-base-multilingual",
+        ];
+        // User-defined alias ids → HF download path.
+        const USER_DEFINED_ALIASES: &[&str] = &[
+            "jina-reranker-v1-tiny-en",
+            "ms-marco-tinybert-l-2-v2",
+            "ms-marco-minilm-l-4-v2",
+        ];
+
+        if CURATED.contains(&v.as_str()) {
+            return fastembed_backend::FastembedReranker::try_open(model_id)
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn Reranker>);
+        }
+        if USER_DEFINED_ALIASES.contains(&v.as_str()) || v.contains('/') {
+            return fastembed_backend::FastembedReranker::try_open_user_defined(model_id)
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn Reranker>);
+        }
+        // Unknown → fallback to default curated turbo.
+        fastembed_backend::FastembedReranker::try_open("jina-reranker-v1-turbo-en")
+            .ok()
+            .map(|r| Box::new(r) as Box<dyn Reranker>)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = v;
+        None
+    }
+}
+
 /// Open the production-default embedder.
 ///
 /// Resolution (v0.4.3):
@@ -267,6 +391,26 @@ fn build_default_embedder() -> Box<dyn Embedder + Send + Sync> {
     Box::new(NoopEmbedder)
 }
 
+/// W3.1: config-aware embedder resolver.
+///
+/// Returns the shared real embedder when embeddings are enabled, or a
+/// static [`NoopEmbedder`] when they are disabled — so a project with
+/// `[embedder] enabled = false` gets FTS-only retrieval and writes no
+/// vectors, durably, without relying on the `KIMETSU_BRAIN_EMBEDDER`
+/// env var.
+///
+/// Precedence mirrors [`embedder_enabled_for_config`]:
+///   1. `KIMETSU_BRAIN_EMBEDDER` env disable value → Noop.
+///   2. `KIMETSU_BRAIN_EMBEDDER` real model id → real embedder.
+///   3. Env unset → `config_enabled` governs.
+pub fn open_embedder_for(config_enabled: bool) -> &'static dyn Embedder {
+    if embedder_enabled_for_config(config_enabled) {
+        open_default_embedder()
+    } else {
+        &NoopEmbedder
+    }
+}
+
 /// v0.8: open a FRESH (uncached) embedder for an explicit built-in
 /// model id. Unlike [`open_default_embedder`], this bypasses the
 /// process-static cache AND the env/override resolution — the caller
@@ -303,6 +447,35 @@ fn env_disables_embedder() -> bool {
     match std::env::var("KIMETSU_BRAIN_EMBEDDER") {
         Ok(value) => is_disable_value(&value.trim().to_ascii_lowercase()),
         Err(_) => false,
+    }
+}
+
+/// W3.1: config-aware enabled check. Resolution precedence:
+///   1. `KIMETSU_BRAIN_EMBEDDER` env is set to a disable value → false.
+///   2. `KIMETSU_BRAIN_EMBEDDER` env is set to a real model id → true
+///      (explicit model override = caller wants embeddings on).
+///   3. Env is unset → `config_enabled` governs.
+///
+/// Keep the env-only `env_disables_embedder()` working for back-compat
+/// callers (the `OnceLock` path).
+pub fn embedder_enabled_for_config(config_enabled: bool) -> bool {
+    // Precedence: env override > config > default.
+    match std::env::var("KIMETSU_BRAIN_EMBEDDER") {
+        Ok(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                // Empty string — treat as unset, fall through to config.
+                config_enabled
+            } else if is_disable_value(&v) {
+                // Explicit disable in env wins.
+                false
+            } else {
+                // A real model id in env = caller wants embeddings on.
+                true
+            }
+        }
+        // Env unset → config governs.
+        Err(_) => config_enabled,
     }
 }
 
@@ -420,9 +593,82 @@ pub fn pick_builtin_model_from_env() -> &'static str {
 // ~50-transitive-crate dep tree (ONNX runtime, tokenizers, etc).
 #[cfg(feature = "embeddings")]
 mod fastembed_backend {
-    use super::{Embedder, EmbedderError, pick_builtin_model_from_env};
-    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+    use super::{Embedder, EmbedderError, Reranker, pick_builtin_model_from_env};
+    use fastembed::{
+        EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
+    };
     use std::sync::{Arc, Mutex, OnceLock};
+
+    // ── HF Hub download helper (user-defined ONNX rerankers) ─────────────────
+
+    /// Alias table: lowercased stable id → HuggingFace repo id.
+    fn hf_repo_for_alias(lowercased: &str) -> Option<&'static str> {
+        match lowercased {
+            "jina-reranker-v1-tiny-en" => Some("jinaai/jina-reranker-v1-tiny-en"),
+            "ms-marco-tinybert-l-2-v2" => Some("Xenova/ms-marco-TinyBERT-L-2-v2"),
+            "ms-marco-minilm-l-4-v2" => Some("Xenova/ms-marco-MiniLM-L-4-v2"),
+            _ => None,
+        }
+    }
+
+    /// Download files for a user-defined reranker from HuggingFace Hub.
+    ///
+    /// Returns `(onnx_bytes, tokenizer_files)` or an `EmbedderError::LoadFailed`.
+    fn download_user_defined_reranker(
+        model_id: &str,
+    ) -> Result<(fastembed::OnnxSource, fastembed::TokenizerFiles), EmbedderError> {
+        use hf_hub::api::sync::Api;
+
+        let lowercased = model_id.trim().to_ascii_lowercase();
+        let repo_id: String = if let Some(alias) = hf_repo_for_alias(&lowercased) {
+            alias.to_string()
+        } else if lowercased.contains('/') {
+            // Raw HF repo id passed directly.
+            model_id.to_string()
+        } else {
+            return Err(EmbedderError::LoadFailed(format!(
+                "user-defined reranker: no HF repo mapping for {model_id:?}"
+            )));
+        };
+
+        let api = Api::new()
+            .map_err(|e| EmbedderError::LoadFailed(format!("hf-hub Api::new failed: {e}")))?;
+        let repo = api.model(repo_id.clone());
+
+        // Helper: download a required file or return LoadFailed.
+        let get_required = |filename: &str| -> Result<Vec<u8>, EmbedderError> {
+            let path = repo.get(filename).map_err(|e| {
+                EmbedderError::LoadFailed(format!("{repo_id}/{filename}: download failed: {e}"))
+            })?;
+            std::fs::read(&path).map_err(|e| {
+                EmbedderError::LoadFailed(format!("{repo_id}/{filename}: read failed: {e}"))
+            })
+        };
+
+        let tokenizer_file = get_required("tokenizer.json")?;
+        let config_file = get_required("config.json")?;
+        let tokenizer_config_file = get_required("tokenizer_config.json")?;
+        let special_tokens_map_file = get_required("special_tokens_map.json")?;
+
+        // Try `onnx/model.onnx` first, then `model.onnx` at root.
+        let onnx_path = repo
+            .get("onnx/model.onnx")
+            .or_else(|_| repo.get("model.onnx"))
+            .map_err(|e| {
+                EmbedderError::LoadFailed(format!(
+                    "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
+                ))
+            })?;
+
+        let tokenizer_files = fastembed::TokenizerFiles {
+            tokenizer_file,
+            config_file,
+            special_tokens_map_file,
+            tokenizer_config_file,
+        };
+
+        Ok((fastembed::OnnxSource::File(onnx_path), tokenizer_files))
+    }
 
     /// fastembed-backed embedder. Wraps the ONNX runtime in a
     /// `Mutex` because `TextEmbedding::embed` takes `&mut self`.
@@ -485,6 +731,35 @@ mod fastembed_backend {
         fn dim(&self) -> usize {
             self.dim
         }
+
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut guard = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let out = guard
+                .embed(texts, None)
+                .map_err(|e| EmbedderError::EmbedFailed(format!("fastembed embed_batch: {e}")))?;
+            if out.len() != texts.len() {
+                return Err(EmbedderError::EmbedFailed(format!(
+                    "fastembed returned {} vectors for {} texts",
+                    out.len(),
+                    texts.len()
+                )));
+            }
+            for v in &out {
+                if v.len() != self.dim {
+                    return Err(EmbedderError::DimMismatch {
+                        expected: self.dim,
+                        got: v.len(),
+                    });
+                }
+            }
+            Ok(out)
+        }
     }
 
     /// Shared handle. `open_default_embedder` boxes this into a
@@ -502,6 +777,109 @@ mod fastembed_backend {
         }
         fn dim(&self) -> usize {
             self.0.dim()
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            self.0.embed_batch(texts)
+        }
+    }
+
+    /// fastembed-backed cross-encoder reranker.
+    ///
+    /// Wraps `TextRerank` in a `Mutex` because `rerank` takes `&mut self`.
+    /// The lock window is short (one rerank call per request); the daemon's
+    /// worker threads serialize cleanly through it.
+    ///
+    /// `model_id` is an owned `String` so both curated (`&'static str`
+    /// originates from a match arm) and user-defined (alias / HF repo id)
+    /// rerankers can share the same struct.
+    pub struct FastembedReranker {
+        model_id: String,
+        engine: Mutex<TextRerank>,
+    }
+
+    impl FastembedReranker {
+        /// Map a curated id to the corresponding `RerankerModel` variant and
+        /// initialize a `TextRerank` engine. Unknown ids fall back to the
+        /// jina-reranker-v1-turbo-en default.
+        pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            let (kind, stable_id) = match builtin_id {
+                "bge-reranker-base" => (RerankerModel::BGERerankerBase, "bge-reranker-base"),
+                "bge-reranker-v2-m3" => (RerankerModel::BGERerankerV2M3, "bge-reranker-v2-m3"),
+                "jina-reranker-v2-base-multilingual" => (
+                    RerankerModel::JINARerankerV2BaseMultiligual,
+                    "jina-reranker-v2-base-multilingual",
+                ),
+                // jina-reranker-v1-turbo-en is the default + fallback.
+                _ => (
+                    RerankerModel::JINARerankerV1TurboEn,
+                    "jina-reranker-v1-turbo-en",
+                ),
+            };
+            let opts = RerankInitOptions::new(kind).with_show_download_progress(false);
+            let engine = TextRerank::try_new(opts)
+                .map_err(|e| EmbedderError::LoadFailed(format!("fastembed reranker init: {e}")))?;
+            Ok(Self {
+                model_id: stable_id.to_string(),
+                engine: Mutex::new(engine),
+            })
+        }
+
+        /// Load a user-defined ONNX reranker by alias or raw HF repo id.
+        ///
+        /// Downloads the ONNX and tokenizer files from HuggingFace Hub (cached
+        /// locally) and constructs a `TextRerank` via
+        /// `try_new_from_user_defined`. The `model_id` stored in the struct is
+        /// the normalized alias (e.g. `"jina-reranker-v1-tiny-en"`) or the raw
+        /// repo id, lower-cased, so it is stable across calls.
+        pub fn try_open_user_defined(alias_or_repo: &str) -> Result<Self, EmbedderError> {
+            use fastembed::{RerankInitOptionsUserDefined, UserDefinedRerankingModel};
+
+            let (onnx_source, tokenizer_files) = download_user_defined_reranker(alias_or_repo)?;
+
+            let model = UserDefinedRerankingModel::new(onnx_source, tokenizer_files);
+            let opts = RerankInitOptionsUserDefined::default();
+            let engine = TextRerank::try_new_from_user_defined(model, opts).map_err(|e| {
+                EmbedderError::LoadFailed(format!(
+                    "user-defined reranker {alias_or_repo:?} init: {e}"
+                ))
+            })?;
+
+            // Normalise the stored id to lower-case alias or repo id.
+            let model_id = alias_or_repo.trim().to_ascii_lowercase();
+            Ok(Self {
+                model_id,
+                engine: Mutex::new(engine),
+            })
+        }
+    }
+
+    impl Reranker for FastembedReranker {
+        fn rerank(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, EmbedderError> {
+            if documents.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut guard = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Pass documents as Vec<&str>; fastembed returns results sorted by
+            // score descending. Use .index to map back to document order.
+            let raw_results = guard
+                .rerank(query, documents, false, None)
+                .map_err(|e| EmbedderError::EmbedFailed(format!("fastembed rerank: {e}")))?;
+            let n = documents.len();
+            let mut scores = vec![0.0f32; n];
+            for result in raw_results {
+                if result.index < n {
+                    // Apply sigmoid to normalize logit → (0,1).
+                    scores[result.index] = 1.0 / (1.0 + (-result.score).exp());
+                }
+            }
+            Ok(scores)
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
         }
     }
 
@@ -558,20 +936,24 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// For other embedder errors we surface them up. The caller
 /// (`add_memory`, `add_user_memory`) can decide whether to fail the
 /// whole insert or log+continue — today they propagate.
+///
+/// Returns the computed embedding vector (so callers can reuse it
+/// for conflict detection without re-embedding). Returns `None` on
+/// Noop or NotImplemented — the same cases where the column stays NULL.
 pub fn embed_and_persist(
     conn: &rusqlite::Connection,
     memory_id: &str,
     text: &str,
     embedder: &dyn Embedder,
-) -> KimetsuResult<()> {
+) -> KimetsuResult<Option<Vec<f32>>> {
     if embedder.is_noop() {
-        return Ok(());
+        return Ok(None);
     }
     let vec = match embedder.embed(text) {
         Ok(v) => v,
         // NotImplemented is the contract for "skip silently". Treat
         // any embedder that signals it the same way as NoopEmbedder.
-        Err(EmbedderError::NotImplemented) => return Ok(()),
+        Err(EmbedderError::NotImplemented) => return Ok(None),
         Err(e) => return Err(format!("embed failed for memory {memory_id}: {e}").into()),
     };
     if vec.len() != embedder.dim() {
@@ -588,7 +970,31 @@ pub fn embed_and_persist(
         "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
         rusqlite::params![blob, embedder.model_id(), memory_id],
     )?;
-    Ok(())
+
+    // Tier-3: keep the warm usearch index current at add time. For in-memory
+    // DBs there is no cached handle — the rebuild-on-query path picks the row
+    // up, so we safely skip. Best-effort: an index failure must not abort a
+    // successful memory write.
+    #[cfg(feature = "embeddings")]
+    if let Some(handle) = crate::ann::cached_handle(conn) {
+        let rowid: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM memories WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(rowid) = rowid {
+            let mut guard = handle.write().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = guard.add(rowid, &vec) {
+                eprintln!(
+                    "kimetsu-brain: ann add failed for memory {memory_id}: {e} (index will reconcile on next open)"
+                );
+            }
+        }
+    }
+
+    Ok(Some(vec))
 }
 
 // --------- BLOB codec ---------
@@ -610,7 +1016,7 @@ pub fn encode_embedding(vec: &[f32]) -> Vec<u8> {
 /// Decode a BLOB back into a float vector. Optionally validates the
 /// expected dimension; pass `None` to accept any length.
 pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuResult<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
         return Err(format!("embedding blob length {} not a multiple of 4", bytes.len()).into());
     }
     let dim = bytes.len() / 4;
@@ -793,6 +1199,114 @@ mod tests {
         assert!(err.to_string().contains("does not match expected"));
     }
 
+    // ── v1.0.0 StubReranker tests ─────────────────────────────────────────────
+
+    /// StubReranker returns one score per document in document order.
+    #[test]
+    fn stub_reranker_returns_doc_order_scores() {
+        let r = StubReranker;
+        let query = "rust async tokio";
+        let docs = &["rust async tokio", "python django", "rust only"];
+        let scores = r.rerank(query, docs).expect("rerank should succeed");
+        assert_eq!(scores.len(), docs.len(), "one score per document");
+        // All scores in (0,1).
+        for (i, &s) in scores.iter().enumerate() {
+            assert!(s > 0.0 && s < 1.0, "score[{i}] must be in (0,1), got {s}");
+        }
+    }
+
+    /// Higher token overlap ⇒ higher score.
+    #[test]
+    fn stub_reranker_higher_overlap_scores_higher() {
+        let r = StubReranker;
+        let query = "rust async tokio";
+        // doc0: 3/3 tokens shared → highest
+        // doc1: 1/3 tokens shared → middle
+        // doc2: 0/3 tokens shared → lowest (0.05)
+        let docs = &["rust async tokio runtime", "rust only", "python django"];
+        let scores = r.rerank(query, docs).expect("rerank");
+        assert!(
+            scores[0] > scores[1],
+            "3-token overlap must beat 1-token overlap: {} vs {}",
+            scores[0],
+            scores[1]
+        );
+        assert!(
+            scores[1] > scores[2],
+            "1-token overlap must beat 0-token overlap: {} vs {}",
+            scores[1],
+            scores[2]
+        );
+    }
+
+    /// model_id is the stub constant.
+    #[test]
+    fn stub_reranker_model_id() {
+        let r = StubReranker;
+        assert_eq!(r.model_id(), "stub-reranker");
+    }
+
+    /// Empty query → all docs get the floor score 0.05.
+    #[test]
+    fn stub_reranker_empty_query_returns_floor() {
+        let r = StubReranker;
+        let docs = &["anything here", "another doc"];
+        let scores = r.rerank("", docs).expect("rerank");
+        for &s in &scores {
+            assert!(
+                (s - 0.05).abs() < 1e-6,
+                "empty query must yield 0.05, got {s}"
+            );
+        }
+    }
+
+    // ── embed_batch contract tests (Stub-backed, no model download) ───────────
+
+    /// `embed_batch` returns the same vectors, in the same order, as
+    /// calling `embed` on each text individually.
+    #[test]
+    fn embed_batch_matches_per_row() {
+        let e = StubEmbedder::new();
+        let texts = ["foo bar", "qux", "hello world"];
+        let batch = e.embed_batch(&texts).expect("embed_batch should succeed");
+        assert_eq!(batch.len(), texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let single = e.embed(text).expect("per-row embed should succeed");
+            assert_eq!(
+                batch[i], single,
+                "embed_batch[{i}] must match per-row embed for {text:?}"
+            );
+        }
+    }
+
+    /// `embed_batch(&[])` returns `Ok(vec![])` — empty slice, empty result.
+    #[test]
+    fn embed_batch_empty_is_empty() {
+        let e = StubEmbedder::new();
+        let result = e
+            .embed_batch(&[])
+            .expect("empty embed_batch should succeed");
+        assert!(result.is_empty(), "expected empty Vec, got {result:?}");
+    }
+
+    /// N texts → N vectors, each of length `dim()`.
+    #[test]
+    fn embed_batch_length_matches_input() {
+        let e = StubEmbedder::new();
+        let texts: Vec<&str> = vec!["alpha", "beta", "gamma", "delta", "epsilon"];
+        let batch = e.embed_batch(&texts).expect("embed_batch should succeed");
+        assert_eq!(batch.len(), texts.len(), "output len must equal input len");
+        for (i, v) in batch.iter().enumerate() {
+            assert_eq!(
+                v.len(),
+                e.dim(),
+                "vector[{i}] len {} != dim {}",
+                v.len(),
+                e.dim()
+            );
+        }
+    }
+
     /// v0.4.3: under the default Cargo build (no `embeddings` feature)
     /// `open_default_embedder` MUST return Noop so a `cargo install
     /// kimetsu-cli` user doesn't accidentally start downloading a
@@ -837,6 +1351,84 @@ mod tests {
             assert!(!env_disables_embedder(), "value {value:?} must NOT disable");
         }
         // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    // ── W3.1: embedder_enabled_for_config tests ──────────────────────
+
+    /// W3.1: config=false disables embedder when env is unset.
+    #[test]
+    fn w3_embedder_enabled_for_config_false_when_env_unset() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_BRAIN_EMBEDDER");
+        }
+        // config=false + env unset → disabled.
+        assert!(
+            !embedder_enabled_for_config(false),
+            "config=false + env unset must be disabled"
+        );
+        // config=true + env unset → enabled (default).
+        assert!(
+            embedder_enabled_for_config(true),
+            "config=true + env unset must be enabled"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// W3.1: KIMETSU_BRAIN_EMBEDDER=noop overrides config=true.
+    #[test]
+    fn w3_embedder_env_disable_overrides_config_true() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "noop");
+        }
+        assert!(
+            !embedder_enabled_for_config(true),
+            "KIMETSU_BRAIN_EMBEDDER=noop must override config=true"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// W3.1: a real model-id in env overrides config=false (explicit
+    /// model = caller wants embeddings on).
+    #[test]
+    fn w3_embedder_env_model_id_overrides_config_false() {
+        let lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "bge-m3");
+        }
+        assert!(
+            embedder_enabled_for_config(false),
+            "real model id in env must override config=false → enabled"
+        );
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),

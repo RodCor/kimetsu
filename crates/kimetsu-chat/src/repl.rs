@@ -48,6 +48,7 @@ use kimetsu_brain::project as brain_project;
 use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::ids::RunId;
+use kimetsu_core::paths::user_cache_dir_for;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
@@ -93,7 +94,7 @@ pub struct ChatConfig {
     /// when stdin/stdout are both terminals; tests and piped input stay
     /// line-buffered.
     pub raw_terminal_input: bool,
-    /// Persist chat transcripts/checkpoints under `.kimetsu/chat/sessions`.
+    /// Persist chat transcripts/checkpoints under `~/.kimetsu/cache/<id>/chat/sessions`.
     /// CLI enables this; library tests default off to avoid workspace writes.
     pub persist_sessions: bool,
 }
@@ -156,7 +157,18 @@ impl From<std::io::Error> for ChatError {
 /// the dependency direction (chat -> kimetsu-agent only, no benchmark adapter). The
 /// model round-trip itself is plumbed in [`run_repl_with_agent`] which
 /// lands in the v0.3.0 commit that wires the provider.
-pub fn run_repl<R: BufRead, W: Write>(
+pub fn run_repl<R: BufRead, W: Write>(reader: R, writer: W, config: ChatConfig) -> ChatResult<()> {
+    let result = run_repl_inner(reader, writer, config);
+    // REPL teardown: flush every warm ANN index to its sidecar so the next
+    // `kimetsu chat` starts warm. Runs on every exit (quit, EOF, or error).
+    // No-op for in-memory/test DBs and lean builds; index stays correct via
+    // reconcile-on-open even when skipped.
+    #[cfg(feature = "embeddings")]
+    kimetsu_brain::ann::save_all();
+    result
+}
+
+fn run_repl_inner<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     mut config: ChatConfig,
@@ -1037,7 +1049,6 @@ pub fn run_repl<R: BufRead, W: Write>(
         // and conversation context are external state.)
         let mut runtime = match ToolRuntime::new(&workspace, RunId::new()) {
             Ok(r) => r.with_config(ToolRuntimeConfig {
-                redact_secrets: false,
                 trace_fsync: false,
                 ..ToolRuntimeConfig::default()
             }),
@@ -1775,7 +1786,7 @@ fn edit_prompt_in_editor(workspace: &Path, current: &str) -> ChatResult<Option<S
             }
         })
         .unwrap_or_else(|| "vi".to_string());
-    let dir = workspace.join(".kimetsu").join("chat");
+    let dir = user_cache_dir_for(workspace).join("chat");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("prompt-{}.md", now_unix()));
     fs::write(&path, current)?;
@@ -2966,7 +2977,13 @@ fn expand_file_mentions(line: &str, workspace: &Path) -> Option<String> {
     let mut included = 0usize;
     for mention in mentions {
         let rel = mention.trim_matches(|ch| matches!(ch, ',' | ';' | ':' | ')'));
-        let path = workspace.join(rel);
+        let path = match resolve_mention_path(workspace, rel) {
+            Ok(path) => path,
+            Err(reason) => {
+                out.push_str(&format!("\n--- {rel} ---\n<{reason}>\n"));
+                continue;
+            }
+        };
         if !path.is_file() {
             out.push_str(&format!("\n--- {rel} ---\n<not found or not a file>\n"));
             continue;
@@ -2982,6 +2999,28 @@ fn expand_file_mentions(line: &str, workspace: &Path) -> Option<String> {
         }
     }
     if included == 0 { None } else { Some(out) }
+}
+
+fn resolve_mention_path(workspace: &Path, rel: &str) -> Result<PathBuf, &'static str> {
+    let requested = Path::new(rel);
+    if requested.is_absolute() {
+        return Err("blocked: absolute path outside workspace");
+    }
+    for component in requested.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => return Err("blocked: path must stay inside workspace"),
+        }
+    }
+    let full = workspace.join(requested);
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|_| "blocked: workspace is not readable")?;
+    let canonical = full.canonicalize().map_err(|_| "not found or not a file")?;
+    if !canonical.starts_with(&canonical_workspace) {
+        return Err("blocked: path outside workspace");
+    }
+    Ok(canonical)
 }
 
 struct ReviewCommandContext<'a> {
@@ -3782,6 +3821,9 @@ struct HookReport {
 
 impl HookRegistry {
     fn discover(workspace: &Path) -> Self {
+        if !workspace_hooks_enabled() {
+            return Self::default();
+        }
         let mut hooks = Vec::new();
         for root in [".kimetsu/hooks", ".claude/hooks", ".codex/hooks"] {
             let root = workspace.join(root);
@@ -3832,6 +3874,17 @@ impl HookRegistry {
         }
         Ok(report)
     }
+}
+
+fn workspace_hooks_enabled() -> bool {
+    std::env::var("KIMETSU_ENABLE_WORKSPACE_HOOKS")
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -4561,7 +4614,7 @@ struct ChatTask {
 
 impl TaskManager {
     fn new(workspace: PathBuf) -> Self {
-        let task_dir = workspace.join(".kimetsu").join("chat").join("tasks");
+        let task_dir = user_cache_dir_for(&workspace).join("chat").join("tasks");
         Self {
             workspace,
             task_dir,
@@ -4847,7 +4900,7 @@ fn export_transcript(
 }
 
 fn chat_session_dir(workspace: &Path) -> PathBuf {
-    workspace.join(".kimetsu").join("chat").join("sessions")
+    user_cache_dir_for(workspace).join("chat").join("sessions")
 }
 
 fn persist_session(
@@ -5784,6 +5837,23 @@ mod tests {
     }
 
     #[test]
+    fn file_mentions_reject_paths_outside_workspace() {
+        let root = temp_root("chat_mentions_block");
+        let outside = temp_root("chat_mentions_outside");
+        fs::write(outside.join("secret.txt"), "do not include").expect("secret");
+        let expanded = expand_file_mentions(
+            &format!(
+                "summarize @../{}",
+                outside.file_name().unwrap().to_string_lossy()
+            ),
+            &root,
+        );
+        assert!(expanded.is_none());
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    #[test]
     fn input_history_moves_backward_and_forward() {
         let mut state = ChatInputState::default();
         state.record("first");
@@ -5820,15 +5890,14 @@ mod tests {
     }
 
     #[test]
-    fn hook_registry_discovers_event_scripts() {
+    fn hook_registry_ignores_workspace_hooks_by_default() {
         let root = temp_root("chat_hooks");
         let dir = root.join(".kimetsu/hooks");
         fs::create_dir_all(&dir).expect("hooks dir");
         fs::write(dir.join("pre-turn.cmd"), "@echo off\necho ok\n").expect("hook");
 
         let hooks = HookRegistry::discover(&root);
-        assert_eq!(hooks.hooks.len(), 1);
-        assert_eq!(hooks.hooks[0].event, HookEvent::PreTurn);
+        assert!(hooks.hooks.is_empty());
         fs::remove_dir_all(root).ok();
     }
 

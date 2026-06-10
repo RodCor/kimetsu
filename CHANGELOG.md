@@ -2,9 +2,311 @@
 
 All notable changes to kimetsu land here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
-follow [SemVer](https://semver.org/spec/v2.0.0.html) with the
-caveat that pre-1.0 minor bumps may include breaking changes
-(documented in the release notes).
+follow [SemVer](https://semver.org/spec/v2.0.0.html). From v1.0.0
+onward the project follows SemVer normally: patch releases are
+bug-fix-only, minor releases are backward-compatible additions, and
+breaking changes require a major bump.
+
+## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
+
+ADDED
+  * **Remote cross-encoder rerank stage.** `kimetsu-remote serve` now applies a
+    cross-encoder reranker to every `kimetsu_brain_context` call (`--reranker`,
+    default `jina-reranker-v1-tiny-en`, operator-level; `"off"` disables; any
+    curated or HuggingFace ONNX id accepted). The default was chosen by the
+    100-memory benchmark: jina-tiny MRR 0.931 vs 0.914 for TinyBERT on the local
+    bench; the remote path has no hook-latency budget so the fastest effective
+    reranker wins. Benchmark lift with reranker: jina-v2-base-code MRR 0.904 →
+    0.906, bge-small MRR 0.901 → 0.909 (production floors active).
+
+  * **Model-aware AUTO semantic floor + kimetsu-remote benchmark.** `kimetsu
+    brain bench --remote` boots a real kimetsu-remote server per embedder,
+    drives the 100-case dataset over HTTP MCP (sequential + concurrent), and
+    reports quality/latency/throughput/server-RSS. Its first run caught a
+    real bug: the 0.35 cosine floor (calibrated on bge) was KILLING relevant
+    jina-v2 results on every production path (remote MRR 0.90 -> 0.77).
+    `broker.min_semantic_score` now defaults to -1.0 = AUTO: 0.35 on
+    bge-family models, disabled elsewhere (jina-v2 own precision keeps noise
+    low); explicit values still win. Confirmed: jina-v2 remote recovered to
+    MRR 0.906 / recall@4 0.939 on the 100-memory corpus (with the server
+    reranker: ~416ms/request, ~5 rps at concurrency 4, ~1.2GB peak RSS).
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
+  * **Local MCP write tools enabled by default (`kimetsu.mcp_write_tools`).**
+    The brain's own workflow tells the agent to record lessons
+    (`kimetsu_brain_record`, the Stop-hook harvest cue), but the privileged-
+    write gate default-denied unless `KIMETSU_MCP_ENABLE_WRITE_TOOLS=1` was
+    in the MCP server's env — so every session ended with the agent goaded
+    into a blocked call. The gate is now config-driven for the LOCAL stdio
+    server: `kimetsu.mcp_write_tools` (default true), personalizable via
+    `kimetsu config set kimetsu.mcp_write_tools false`. Precedence: the env
+    var when set always wins (both directions) > config > default. The
+    REMOTE server is unchanged — env-only, default-deny — because a cloned
+    repo's project.toml is untrusted input and must never enable writes.
+  * **Cross-encoder reranking (opt-in) + retrieval eval harness + 300ms
+    hook budget.** The warm daemon can apply a final cross-encoder rerank
+    stage: over-fetch a 12-capsule pool, score each (query, memory) pair
+    jointly with a fastembed reranker (`[embedder] reranker` = a curated id;
+    local default ms-marco-tinybert-l-2-v2; "off" disables), drop below a 0.30 relevance floor, truncate to the cap.
+    Every knob was chosen by measurement: `jina-reranker-v1-tiny-en`
+    (default) beat the larger turbo model on both quality and speed in the
+    head-to-head benchmark, a pool of 6 matches pool-12 quality exactly at
+    half the latency, and summaries must stay FULL (snippet truncation
+    cratered recall@4 from 0.83 to 0.66 — worse than FTS). With those
+    settings a warm rerank answers inside the 300ms hook budget on a real
+    brain (~265ms measured); slower machines degrade gracefully to
+    floored-FTS for that turn, or set `reranker = "off"`. Backing the
+    default path, the cosine floor: `broker.min_semantic_score` is
+    now ON by default (0.35) *and actually wired* (it previously defaulted
+    to 0.0 and was never populated from config in any production path). The
+    hook's daemon budget tightens 750ms → 300ms; a warm semantic answer
+    fits with ~70ms to spare, and misses fall back to floored FTS. Daemon
+    spawn hygiene for the lazy path: the entrypoint now binds the socket
+    BEFORE loading models (a redundant spawn exits in ms, not seconds), and
+    on Windows the hook clears HANDLE_FLAG_INHERIT on its std handles before
+    spawning so the long-lived daemon can never hold the harness's stdout
+    pipe open (previously the first prompt of a session could stall until
+    the host's hook timeout). New `kimetsu brain eval [--fixture ...]`
+    measures recall@2/4 + MRR across fts / semantic / semantic+rerank modes
+    against a committed fixture (`fixtures/eval-retrieval.json`), so ranking
+    changes are measurable: baseline shows semantic recall@4 0.90 / MRR 0.91
+    vs FTS 0.72 / 0.81. `--rerankers <ids>` benchmarks cross-encoders
+    head-to-head (quality + per-query latency) and `--pool` sweeps pool
+    sizes; non-curated models load as user-defined ONNX from any HuggingFace
+    repo via hf-hub. Benchmark results: jina-tiny recall@4 0.896 / MRR 0.938
+    at ~44ms per query (pool 6) vs turbo 0.833 / 0.875 at ~137ms (pool 12);
+    ms-marco TinyBERT-L-2 is ~5× faster still (8.5ms) but its quality
+    (0.715) merely matches FTS.
+  * **Warm embedder daemon — semantic recall at hook time.** The
+    `UserPromptSubmit` context-hook can now match memories by *meaning*, not
+    just lexically. A single per-user daemon (`kimetsu brain embed-daemon`,
+    keyed by embedder model) loads the ONNX model once and serves full
+    embedding/ANN retrieval to the hook over a local socket / named pipe
+    (`interprocess`); the hook is a thin client with a ≤300ms budget and a
+    hard fall-back to floored-FTS, so the prompt is never blocked. `kimetsu
+    brain warm` (wired to each harness's startup hook) pre-warms it so a
+    running session never pays a cold model load. One model in RAM regardless
+    of how many projects/agents are active. Config: `[embedder] daemon` and
+    `warm_on_start` toggle it; `[embedder] model` (and `kimetsu brain model
+    set`) pick the model. `KIMETSU_EMBED_DAEMON=0` is a runtime kill switch.
+    Embeddings builds only; lean builds keep the floored-FTS hook. New
+    `kimetsu brain daemon status|stop` to inspect/control it.
+  * **Durable schema migrations.** brain.db now migrates forward
+    automatically on open via a versioned, forward-only runner (each
+    migration applied in one transaction). The DB is backed up to a
+    `brain.db.bak-*` sidecar before any version-advancing migration
+    (skipped for empty brains; the three newest backups are kept).
+    Read-only opens of an un-migrated brain degrade gracefully; an
+    event-upcast seam keeps old traces replayable. The project.toml
+    config version is decoupled from the DB schema version so the
+    schema can evolve without breaking existing projects.
+  * **Proof-of-value analytics.** New `kimetsu brain insights` command
+    and `kimetsu_brain_insights` MCP tool: retrieval hit-rate &
+    skip-rate, citation rate, proposal acceptance rate, usefulness
+    trend, harvest yield, corpus health, and token economy — computed
+    over a configurable recent-runs window. A new `context.served`
+    event records every retrieval (hit or miss); `context.injected`
+    now carries injected-token counts.
+  * **Semantic retrieval (usearch HNSW ANN).** On the embeddings build, an
+    approximate-nearest-neighbour index (usearch HNSW) finds memories whose
+    *meaning* matches the query even with no shared words — **O(log N) per
+    query**, so retrieval stays fast as the corpus grows. The index is
+    candidate generation only; final ranking is an exact cosine rerank over the
+    stored f32 vectors, so the index can be quantized (**f16 by default**,
+    `i8`/`f32` via `KIMETSU_ANN_QUANTIZATION`) for a large RAM saving with
+    negligible quality loss. Retrieval is sharpened with embedding-MMR
+    (collapses true paraphrase duplicates) and an absolute semantic-relevance
+    floor (genuinely off-topic queries return nothing). Capsule caps are
+    config-driven (default 8) and injected tokens drop while the relevant
+    capsule is preserved. The lean (FTS-only) build is unchanged.
+  * **Scales to ~1M memories.** A million-memory corpus runs on modest
+    hardware: **~1.8 s p99 semantic retrieval and ~3 GB RAM at 1M** (f16
+    default; ~2.8 GB with `KIMETSU_ANN_QUANTIZATION=i8`). Both retrieval *and*
+    conflict-detection-on-write are O(log N) via the HNSW index — no
+    brute-force vector scan. Bulk ingest batches embedding; the index builds in
+    parallel across cores, maintains itself incrementally, persists a sidecar
+    so a restarted server loads instead of rebuilding, and Kimetsu Remote
+    pre-warms each repo's index on startup.
+  * **Proactive & cost-shrinking recall (the agent brain).** Before the
+    first implementation attempt, a tight retrieval surfaces a "Known
+    pitfalls" block (failure patterns / conventions) — proactive, not
+    just post-failure. Tasks are classified (Debug / Feature / Refactor /
+    Docs / Investigation) to route recall by kind. A per-run recall
+    ledger deduplicates capsules across stages (rendered once,
+    back-referenced after), and the long tail is injected as one-line
+    headlines the agent expands on demand via a new `expand_capsule`
+    tool — so brain overhead shrinks in relative terms as tasks grow
+    (an adaptive sublinear, per-run-capped budget).
+  * **`kimetsu config edit` and `kimetsu run abort`** are now fully
+    implemented: `config edit` opens `$EDITOR` on project.toml and
+    re-validates on save; `run abort` cleanly finalizes a dangling run.
+    No stub subcommands ship.
+  * **`kimetsu doctor --selftest`** proves the brain pipeline works
+    end-to-end (ingest → retrieve → record) without needing a live
+    model or network.
+  * **Process & maintenance commands.** `kimetsu ps` / `stop` /
+    `restart` list and stop running MCP servers (the host respawns one
+    on the next tool call); `doctor` now flags a stale running MCP
+    server after an update. `kimetsu brain export` / `import` move
+    memories between brains as portable JSON; `kimetsu brain memory
+    edit` / `undo` fix a bad recording in place; `kimetsu runs prune`
+    and `kimetsu brain compact` (VACUUM, optional event-trim) keep the
+    install lean.
+  * **Kimetsu Remote (beta) — the brain over HTTP MCP.** Under active testing;
+    the `kimetsu-remote` **server is a separate package** and is NOT installed by
+    `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` — install it on the
+    server with `npm install -g kimetsu-remote` or `cargo install kimetsu-remote
+    --features embeddings` (or its standalone GitHub-Release archive). A new
+    standalone `kimetsu-remote` server hosts one brain per repository under a
+    data dir and exposes the memory/retrieval/curation tools over remote MCP
+    (`POST /mcp/{repo}`), so a team — or you across machines — can share one
+    brain with no local checkout. Bearer-token auth (global or per-repo);
+    repo-keyed (the client supplies the id, derivable from the git remote);
+    the agent-facing pure-DB tool subset only (workdir/host-local tools are
+    excluded). Each repo brain is standalone (user-brain merge off). Plain
+    HTTP — terminate TLS at a reverse proxy. `kimetsu-remote serve --addr
+    0.0.0.0:8787 --data <dir> --token <t>` (build with `--features embeddings`
+    for semantic retrieval). Wire a host with `kimetsu plugin install
+    <claude-code|openclaw> --remote <url> [--repo <id>] [--token <t>]` — it
+    writes a `url`+`Authorization` MCP entry (no local hooks), deriving the repo
+    id from your git remote and referencing `${KIMETSU_REMOTE_TOKEN}` by default
+    so the secret isn't written to disk. The server ships as a separate package
+    (`npm i -g kimetsu-remote` / `cargo install kimetsu-remote --features
+    embeddings`) with its own standalone release archive. Hardening: per-token
+    rate limiting
+    (`--rate-limit <req/min>` → 429 when exceeded), a structured per-request log
+    + an unauthenticated `GET /metrics` (Prometheus text, aggregate counts by
+    outcome — no repo labels), and optional in-process HTTPS (build
+    `--features tls`, pass `--tls-cert`/`--tls-key`; rustls/ring, off by default
+    — a reverse proxy is still the recommended terminator). Optional shared
+    **org brain** (`--org-brain <dir>`, outside `--data`): `global_user`-scoped
+    memories are stored there and merged into every repo's retrieval
+    (cross-project team memory), while `project`-scoped memories stay per-repo.
+    Off by default — each repo brain is standalone. Optional **server-side
+    ingest** (`--repos-file` + `--checkout-dir`): the operator pre-registers
+    repo-id → git URL, the server clones/refreshes a managed checkout, and
+    `kimetsu_brain_ingest_repo` indexes its files into the repo's brain so
+    `context` retrieval includes file capsules remotely (clients can't trigger
+    arbitrary clones; private repos use the server's own git auth).
+  * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
+    on Anthropic models served through Amazon Bedrock (InvokeModel,
+    SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+    (+ optional `AWS_SESSION_TOKEN`) and `AWS_REGION` — no AWS SDK). Set
+    `[model] provider = "bedrock"` and/or `[learning.distiller]`; the two
+    are configured independently, so you can run the agent on Bedrock and
+    harvest on Bedrock or direct Claude/OpenAI.
+  * **Two more host integrations: Pi and OpenClaw.** `kimetsu plugin install
+    pi` wires a TypeScript extension (Pi has no MCP) plus a `kimetsu-brain`
+    skill; `kimetsu plugin install openclaw` registers the MCP server, a
+    hooks plugin, and a `kimetsu-context` skill. Both join Claude Code and
+    Codex across `plugin status`, `plugin uninstall`, and `setup` —
+    *which* hosts you wire is a runtime choice you change anytime, no
+    reinstall. **Every official prebuilt + npm binary (lean and embeddings)
+    includes all four host integrations;** they're opt-in Cargo features only
+    for a minimal source build, added with `--features pi,openclaw`. Every
+    embedded hook degrades to a silent no-op if the `kimetsu` binary isn't on
+    PATH, so a host is never left broken.
+  * **Full plugin lifecycle.** `kimetsu plugin status` shows what's wired
+    where (host × scope: installed / partial / absent + which pieces);
+    `kimetsu plugin uninstall <host>` removes only the wiring (keeping the
+    binary + brain); `kimetsu setup` runs init + plugin install + a
+    selftest in one command. `kimetsu brain backup` writes a consistent
+    full-DB snapshot via the SQLite online-backup API.
+  * A 5-minute quickstart was added to the README.
+
+CHANGED
+  * **Lean `.kimetsu/`.** The `brain.db` events table is now the
+    durable log — memory writes no longer create per-write `runs/<id>/`
+    directories, so a brain-only `.kimetsu/` holds just `brain.db` +
+    `project.toml`. Transient proactive / chat / bench output moved to
+    `~/.kimetsu/cache/`.
+  * **Bidirectional config — every optional feature is turn-off-able.**
+    `[embedder] enabled`, `[broker] ambient`, `[kimetsu] use_user_brain`
+    (plus the existing `[learning] auto_harvest` / distiller and
+    `[shell] redact_secrets`) are honored at runtime with the precedence
+    env override > config > default. New `kimetsu config set` / `get`
+    read and flip them from the CLI.
+  * **Tiered, non-orphaning uninstall.** `kimetsu uninstall` now removes
+    the host plugin wiring (Claude Code & Codex hooks / MCP / skills /
+    agents, workspace + global) via a 3-tier prompt — binary only /
+    + plugins (default) / + brains (typed confirm) — so it no longer
+    leaves hosts pointing at a missing binary. A binary locked by a
+    running kimetsu process is handled (offer to stop it / deferred
+    delete) instead of a misleading "needs admin".
+  * **Install/upgrade hardening.** Golden tests lock the
+    non-destructive config-merge for Claude/Codex hooks, MCP config,
+    and CLAUDE.md (user content always preserved; re-installs are
+    byte-idempotent). Windows now runs the full test suite in PR CI.
+  * **Clippy is a hard CI gate** (`-D warnings`) on both the lean and
+    embeddings builds.
+  * **Retrieval ordering is fully deterministic** — a stable tiebreak
+    eliminates non-reproducible ranking across runs.
+  * **Terser `--help` menu + flavored `--version`.** Top-level commands
+    show short imperative labels (full detail stays in
+    `kimetsu <cmd> --help`), and `kimetsu --version` reports the build
+    flavor — `1.0.0 (embeddings)` vs `(lean)` — so semantic-search
+    availability is obvious at a glance.
+  * **Run dirs self-prune.** New agent runs opportunistically GC run dirs
+    older than 30 days (keeping the newest 20; `KIMETSU_RUNS_GC=0` to
+    disable) — only at run creation, never on the hot brain-open path.
+  * **One-command npm semantic build.** `kimetsu npm-flavor embeddings`
+    fetches the semantic build once and persists the choice (in
+    `<cache>/kimetsu/npm/flavor`), so npm users no longer keep
+    `KIMETSU_NPM_FLAVOR` exported across runs; `lean`/`status` round it out
+    (the env var stays a per-run override).
+
+FIXED
+  * **Lexical retrieval no longer injects off-topic memories that merely
+    share the project name.** A broad conceptual prompt ("tell me about
+    kimetsu, what's the idea of the repo") surfaced narrow debugging
+    war-stories whose only overlap with the query was the corpus-ubiquitous
+    token "kimetsu". Root cause: on the FTS-only `UserPromptSubmit` hook path
+    there was no relevance floor (the cosine-based `min_semantic_score` is
+    inert without an embedding), and `normalize_and_score` divides relevance
+    by the *per-kind* max — so the best memory of each kind became
+    `relevance = 1.0` no matter how weak the actual match, easily clearing
+    the `min_score` gate on freshness + confidence alone. New
+    `broker.min_lexical_coverage` floor (default 0.5): query tokens are
+    stripped of stopwords and IDF-weighted over the memory corpus (so the
+    project name, present in nearly every memory, contributes ~0; a word in
+    *no* memory also contributes 0 since it can't discriminate), and a memory
+    is dropped before scoring when the IDF-weighted share of the query it
+    covers is below the floor and it has no semantic support. Repo-file and
+    manifest capsules pass through untouched. Memories whose only match is the
+    project name are now reliably dropped; the brain stays silent rather than
+    injecting noise. (Keyword-overlap-but-off-topic hits that match a real,
+    non-ubiquitous word still need the semantic path; this is a lexical floor.)
+  * **`Stop` hook no longer trips "invalid stop hook JSON output".**
+    `kimetsu brain stop-hook` printed a bare-text banner on stdout, but
+    Claude Code validates a Stop hook's stdout as the advanced JSON
+    control object — so the banner was rejected. The hook now emits a
+    well-formed JSON object: informational banners via `systemMessage`,
+    and the end-of-session harvest cue via `decision: "block"` so the
+    cue text actually re-enters the model (plain stdout never reached it
+    in a Stop hook, so the cue was previously inert). The one-cue-per-
+    session guards keep blocking from looping.
+  * **MSRV portability.** A 1.87-only API that violated the declared
+    `rust-version = "1.85"` MSRV was replaced with the compatible
+    1.85 equivalent.
+  * **GlobalUser memory writes work from any directory again** — a
+    regression where recording a global-user memory required a loadable
+    project is fixed.
+  * **`UserPromptSubmit` context-hook no longer risks the host's 30s
+    timeout.** The per-prompt hook runs in a throwaway process that
+    can't reuse the long-lived MCP server's warm model cache, so in the
+    embeddings build it was paying a cold fastembed/ONNX model load on
+    every prompt — fast on a warm OS file cache but able to exceed 30s
+    on a cold first prompt (worst under disk contention / AV scanning),
+    which fails the hook. The hook is now FTS-only (lexical retrieval,
+    no embedding model loaded); semantic ANN recall stays with the warm
+    MCP `kimetsu_brain_context` tool the agent calls. Steady-state hook
+    latency drops to ~300 ms regardless of build flavor.
 
 ## v0.9.0 — auto-harvested memories + SessionEnd distiller
 

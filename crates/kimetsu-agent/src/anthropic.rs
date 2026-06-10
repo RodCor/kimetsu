@@ -103,7 +103,10 @@ fn messages_url(base_url: &Option<String>) -> String {
 
 impl ModelProvider for AnthropicProvider {
     fn complete(&mut self, request: ModelRequest) -> KimetsuResult<ModelResponse> {
-        let body = build_request_body(&self.model, &request);
+        // Pass Some(model) — the direct API needs the model in the body.
+        // anthropic-version is carried in the HTTP header for the direct API,
+        // so we pass None here; the header is set explicitly below.
+        let body = build_anthropic_body(Some(&self.model), None, &request);
         let url = messages_url(&self.base_url);
         let response = self
             .client
@@ -123,16 +126,28 @@ impl ModelProvider for AnthropicProvider {
         if !status.is_success() {
             return Err(format!(
                 "anthropic request failed ({status}): {}",
-                response_error_summary(&response_text)
+                anthropic_error_summary(&response_text)
             )
             .into());
         }
 
-        parse_response(&response_text)
+        parse_anthropic_response(&response_text)
     }
 }
 
-fn build_request_body(model: &str, request: &ModelRequest) -> Value {
+/// Build the JSON body for an Anthropic-wire request.
+///
+/// - `model`: when `Some`, injects `"model": <value>` into the body (direct
+///   Anthropic API). Pass `None` for Bedrock — the model lives in the URL, not
+///   the body.
+/// - `anthropic_version`: when `Some`, injects `"anthropic_version": <value>`
+///   (Bedrock requires `"bedrock-2023-05-31"` here). Pass `None` for the direct
+///   API — the version is carried in the `anthropic-version` HTTP header there.
+pub(crate) fn build_anthropic_body(
+    model: Option<&str>,
+    anthropic_version: Option<&str>,
+    request: &ModelRequest,
+) -> Value {
     let mut system_parts = Vec::new();
     let mut messages = Vec::new();
 
@@ -164,11 +179,18 @@ fn build_request_body(model: &str, request: &ModelRequest) -> Value {
     }
 
     let mut body = json!({
-        "model": model,
         "max_tokens": request.max_output_tokens,
         "temperature": request.temperature,
         "messages": messages,
     });
+
+    if let Some(m) = model {
+        body["model"] = json!(m);
+    }
+
+    if let Some(v) = anthropic_version {
+        body["anthropic_version"] = json!(v);
+    }
 
     if !system_parts.is_empty() {
         body["system"] = json!(system_parts.join("\n\n"));
@@ -194,6 +216,12 @@ fn build_request_body(model: &str, request: &ModelRequest) -> Value {
     }
 
     body
+}
+
+/// Kept for back-compat within this module's tests (see below).
+#[cfg(test)]
+fn build_request_body(model: &str, request: &ModelRequest) -> Value {
+    build_anthropic_body(Some(model), None, request)
 }
 
 fn map_content_block(content: &MessageContent) -> Option<Value> {
@@ -223,7 +251,7 @@ fn map_content_block(content: &MessageContent) -> Option<Value> {
     }
 }
 
-fn parse_response(response_text: &str) -> KimetsuResult<ModelResponse> {
+pub(crate) fn parse_anthropic_response(response_text: &str) -> KimetsuResult<ModelResponse> {
     let response: AnthropicResponse = serde_json::from_str(response_text)?;
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -262,7 +290,7 @@ fn parse_response(response_text: &str) -> KimetsuResult<ModelResponse> {
     })
 }
 
-fn response_error_summary(response_text: &str) -> String {
+pub(crate) fn anthropic_error_summary(response_text: &str) -> String {
     let parsed = serde_json::from_str::<Value>(response_text).ok();
     let message = parsed
         .as_ref()
@@ -429,7 +457,7 @@ mod tests {
 
     #[test]
     fn response_maps_text_tool_use_and_usage() {
-        let response = parse_response(
+        let response = parse_anthropic_response(
             r#"{
                 "content": [
                     {"type": "text", "text": "Reading file."},

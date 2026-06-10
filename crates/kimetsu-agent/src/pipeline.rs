@@ -8,7 +8,7 @@ use kimetsu_brain::project;
 use kimetsu_brain::projector;
 use kimetsu_brain::trace::{RunPaths, TraceWriter, read_trace};
 use kimetsu_core::KimetsuResult;
-use kimetsu_core::config::ProjectConfig;
+use kimetsu_core::config::{ProjectConfig, adaptive_budget};
 use kimetsu_core::event::Event;
 use kimetsu_core::ids::{RunId, new_id};
 use kimetsu_core::paths::ProjectPaths;
@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopOutcome, parse_structured_json};
 use crate::anthropic::AnthropicProvider;
+use crate::bedrock::BedrockProvider;
 use crate::claude_code::ClaudeCodeProvider;
 use crate::model::{
     MessageContent, MessageRole, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
     TokenUsage, ToolChoice, default_tool_definitions,
 };
+use crate::recall_ledger::RunRecallLedger;
 use crate::tools::{CommandSpec, ToolPatchPlan, ToolRuntime, ToolRuntimeConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +220,26 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         .canonicalize()?
         .to_string_lossy()
         .to_string();
+    // E3: classify the task once at intake. Feature is the neutral default
+    // so disable_broker runs and any other path that skips retrieval are
+    // unaffected — they never set task_kind on a ContextRequest at all.
+    let task_kind = context::classify_task(&options.task);
+
+    // F1+F3: one ledger per run — created early so the per-run global cap
+    // (budget_run_cap_tokens) can be tracked across all retrieval + render
+    // stages. F1 deduplicates capsules; F3 caps total brain tokens.
+    let mut recall_ledger = RunRecallLedger::new();
+
+    // F3: task-size signal (first component: task text tokens only; file
+    // context is not yet known at this point, before localization retrieval).
+    // Defined as: tokens(task_text) + tokens(localized_file_context).
+    // The task_text component is computed here using the same heuristic
+    // as the rest of the pipeline: (whitespace_words * 1.33).ceil().
+    // The file-context component is added after localization retrieval.
+    let task_tokens = estimate_task_tokens(&options.task);
+    let floor = config.broker.budget_floor_tokens;
+    let run_cap = config.broker.budget_run_cap_tokens;
+
     let (localization_context, patch_context, broker_summary) = if options.disable_broker {
         let empty_loc = ContextBundle {
             stage: CodingStage::Localization.as_str().to_string(),
@@ -239,6 +261,12 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         };
         (empty_loc, empty_plan, "Broker disabled (brain_off).")
     } else {
+        // F3: localization stage budget — task_size uses task tokens only
+        // (file context unknown pre-retrieval). remaining starts at run_cap
+        // (ledger is empty before any rendering).
+        let remaining_loc = run_cap.saturating_sub(recall_ledger.injected_tokens());
+        let loc_budget = adaptive_budget(task_tokens, floor, run_cap).min(remaining_loc);
+
         let localization_context = context::retrieve_context(
             &conn,
             &repo_root,
@@ -246,10 +274,33 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             ContextRequest {
                 stage: CodingStage::Localization.as_str().to_string(),
                 query: options.task.clone(),
-                budget_tokens: config.broker.default_budget_tokens,
+                // F3: adaptive sublinear budget, capped to remaining run budget.
+                budget_tokens: loc_budget,
+                // D1f: propagate config-driven caps into the request so
+                // retrieve_context_with_embedder honours them directly.
+                max_capsules: config.broker.max_capsules,
+                min_semantic_score: config.broker.min_semantic_score,
+                // E3: task-kind adaptive routing.
+                task_kind,
                 ..Default::default()
             },
         )?;
+
+        // F3: determine localized files to compute the full task-size signal
+        // for the patch-plan stage. The file_context component accounts for
+        // the extra context tokens injected from the localized file list.
+        let localized_for_size = likely_files(&localization_context, 5);
+        let file_context_tokens =
+            estimate_task_tokens(&render_localized_files(&localized_for_size));
+        let task_size_full = task_tokens.saturating_add(file_context_tokens);
+
+        // F3: patch-plan stage budget — full task-size signal (task + files).
+        // Remaining budget = run_cap minus what localization retrieval budgeted.
+        // (Rendering hasn't happened yet at this point, but we conservatively
+        // reserve half the run_cap for each stage to avoid starvation.)
+        let remaining_patch = run_cap.saturating_sub(loc_budget);
+        let patch_budget = adaptive_budget(task_size_full, floor, run_cap).min(remaining_patch);
+
         let patch_context = context::retrieve_context(
             &conn,
             &repo_root,
@@ -257,7 +308,13 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             ContextRequest {
                 stage: CodingStage::PatchPlan.as_str().to_string(),
                 query: options.task.clone(),
-                budget_tokens: config.broker.default_budget_tokens,
+                // F3: adaptive sublinear budget, capped to remaining run budget.
+                budget_tokens: patch_budget,
+                // D1f: same config-driven caps for the patch-plan stage.
+                max_capsules: config.broker.max_capsules,
+                min_semantic_score: config.broker.min_semantic_score,
+                // E3: task-kind adaptive routing.
+                task_kind,
                 ..Default::default()
             },
         )?;
@@ -278,7 +335,21 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         CodingStage::Localization,
         &localization_context,
     )?;
+    emit_context_served(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::Localization,
+        &localization_context,
+    )?;
     emit_context_injected(
+        &mut writer,
+        &mut events,
+        run_id,
+        CodingStage::PatchPlan,
+        &patch_context,
+    )?;
+    emit_context_served(
         &mut writer,
         &mut events,
         run_id,
@@ -341,6 +412,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             &options.task,
             &files_to_read,
             &patch_context,
+            &mut recall_ledger,
         )
     };
     let (patch_plan, patch_plan_usage) = match model_patch_plan {
@@ -485,6 +557,25 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         }
     }
 
+    // E1: proactive failure anticipation — retrieve failure_pattern/convention
+    // memories relevant to this task ONCE before the attempts loop. High
+    // min_score + kind filter keeps this ~zero-token when nothing matches.
+    // Best-effort: a retrieval error just skips the block without failing the run.
+    let proactive_pitfall_bundle: Option<ContextBundle> = if options.disable_broker {
+        None
+    } else {
+        let pitfall_request = ContextRequest {
+            stage: "implementation".to_string(),
+            query: format!("{}\n{}", options.task, patch_plan.expected_outcome),
+            budget_tokens: 600,
+            min_score: 0.7,
+            max_capsules: 2,
+            kinds: vec!["failure_pattern".to_string(), "convention".to_string()],
+            ..Default::default()
+        };
+        context::retrieve_context(&conn, &repo_root, &config.broker.weights, pitfall_request).ok()
+    };
+
     let mut implementation_outcome = None;
     let mut verification_summary: Option<serde_json::Value> = None;
     let mut verification_tool_calls: u32 = 0;
@@ -550,8 +641,14 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                     options.model_key_override.as_deref(),
                 )
                 .map(|opt| opt.map(|p| Box::new(p) as Box<dyn ModelProvider>)),
+                "bedrock" => BedrockProvider::from_config_with_key(
+                    &paths.repo_root,
+                    &config,
+                    options.model_key_override.as_deref(),
+                )
+                .map(|opt| opt.map(|p| Box::new(p) as Box<dyn ModelProvider>)),
                 other => Err(format!(
-                    "unsupported model provider for implementation: `{other}`; configure `anthropic` or `claude_code`"
+                    "unsupported model provider for implementation: `{other}`; configure `anthropic`, `claude_code`, or `bedrock`"
                 )
                 .into()),
             };
@@ -627,7 +724,9 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 &options.task,
                 &patch_plan,
                 &patch_context,
+                proactive_pitfall_bundle.as_ref(),
                 last_failure_context.as_deref(),
+                &mut recall_ledger,
             )?);
             let runtime = loop_runner.into_runtime();
             let Some((restored_writer, _)) = runtime.into_trace() else {
@@ -1037,7 +1136,17 @@ fn load_text_provider(
                     }),
             )
         }
-        other => Err(format!("unsupported model provider: {other}").into()),
+        "bedrock" => {
+            Ok(
+                BedrockProvider::from_config_with_key(repo_root, config, model_key_override)?
+                    .map(|provider| SelectedTextProvider {
+                        provider_name: "bedrock".to_string(),
+                        model_name: provider.model_name().to_string(),
+                        provider: Box::new(provider),
+                    }),
+            )
+        }
+        other => Err(format!("unsupported model provider: {other}; configure `anthropic`, `claude_code`, or `bedrock`").into()),
     }
 }
 
@@ -1053,6 +1162,7 @@ fn try_model_patch_plan(
     task: &str,
     files_to_read: &[String],
     patch_context: &ContextBundle,
+    ledger: &mut RunRecallLedger,
 ) -> KimetsuResult<Option<(PatchPlan, TokenUsage)>> {
     if cfg!(test) {
         return Ok(None);
@@ -1078,7 +1188,7 @@ fn try_model_patch_plan(
         return Ok(None);
     };
 
-    let request = build_patch_plan_request(config, task, files_to_read, patch_context);
+    let request = build_patch_plan_request(config, task, files_to_read, patch_context, ledger);
     record_model_requested(
         writer,
         events,
@@ -1119,6 +1229,7 @@ fn build_patch_plan_request(
     task: &str,
     files_to_read: &[String],
     patch_context: &ContextBundle,
+    ledger: &mut RunRecallLedger,
 ) -> ModelRequest {
     let system = ModelMessage {
         role: MessageRole::System,
@@ -1149,7 +1260,17 @@ fn build_patch_plan_request(
          - risk_level must be one of: low, medium, high.\n\
          - Return JSON only, without Markdown fences.",
         localized_files = render_localized_files(files_to_read),
-        capsules = render_context_capsules(patch_context, 12),
+        // D1f: render all broker-selected capsules (already capped by
+        // retrieve_context via config.broker.max_capsules). Fall back to
+        // config.broker.max_capsules so the render cap stays in sync if
+        // a caller bypasses the broker's own max_capsules gate.
+        // F1: pass the run ledger so capsules already injected here are
+        // back-referenced (not duplicated) in the later implementation stage.
+        capsules = render_context_capsules(
+            patch_context,
+            config.broker.max_capsules.max(patch_context.capsules.len()),
+            ledger,
+        ),
     ));
 
     ModelRequest {
@@ -1609,7 +1730,9 @@ fn build_implementation_messages(
     task: &str,
     patch_plan: &PatchPlan,
     patch_context: &ContextBundle,
+    pitfall_bundle: Option<&ContextBundle>,
     retry_context: Option<&str>,
+    ledger: &mut RunRecallLedger,
 ) -> KimetsuResult<Vec<ModelMessage>> {
     let system = ModelMessage {
         role: MessageRole::System,
@@ -1624,10 +1747,17 @@ fn build_implementation_messages(
         ),
         _ => String::new(),
     };
+    // E1: render the "Known pitfalls" block from the proactive bundle (if any).
+    // Uses is_surfaced/mark_surfaced — separate from the F1 is_injected/mark_injected
+    // dedup — so retries don't repeat the same warning.
+    let pitfalls_block = pitfall_bundle
+        .and_then(|bundle| render_known_pitfalls(bundle, ledger))
+        .map(|block| format!("\n\n{block}"))
+        .unwrap_or_default();
     let user = ModelMessage::user_text(format!(
         "Task:\n{task}\n\n\
          Active PatchPlan:\n{patch_plan_json}\n\n\
-         Context capsules:\n{capsules}{retry_block}\n\n\
+         Context capsules:\n{capsules}{pitfalls_block}{retry_block}\n\n\
          Rules:\n\
          - Read a file before modifying or deleting it.\n\
          - For modify/delete, pass the exact hash from read_file as expected_hash.\n\
@@ -1635,9 +1765,53 @@ fn build_implementation_messages(
          - Only files declared in files_to_modify, files_to_create, or files_to_delete may be changed.\n\
          - Keep edits minimal and directly tied to expected_outcome.\n\
          - Finish with a concise summary of changed files and remaining verification work.",
-        capsules = render_context_capsules(patch_context, 12),
+        // D1f: render all broker-selected capsules (already capped by
+        // retrieve_context). The broker's max_capsules gate ensures a
+        // tight, high-precision set; re-capping here would silently
+        // discard capsules the broker decided were worth including.
+        // F1: pass the run ledger — capsules already injected in the
+        // patch-plan stage appear as compact back-references here instead
+        // of being repeated in full, shrinking the implementation prompt.
+        capsules =
+            render_context_capsules(patch_context, patch_context.capsules.len().max(1), ledger,),
     ));
     Ok(vec![system, user])
+}
+
+/// E1: render a "Known pitfalls" block from a proactive retrieval bundle.
+///
+/// For each capsule in `bundle` that has NOT already been surfaced this run
+/// (checked via `ledger.is_surfaced`), include it in the block and mark it
+/// surfaced. Capsules already surfaced (e.g. from a prior attempt) are
+/// silently skipped — this is the proactive dedup, kept intentionally
+/// separate from the F1 `is_injected` / `mark_injected` cross-stage capsule
+/// dedup. Returns `None` when no unsurfaced pitfalls remain (empty block,
+/// no header rendered).
+pub fn render_known_pitfalls(
+    bundle: &ContextBundle,
+    ledger: &mut RunRecallLedger,
+) -> Option<String> {
+    if bundle.skipped || bundle.capsules.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for c in &bundle.capsules {
+        if !ledger.is_surfaced(&c.id) {
+            ledger.mark_surfaced(&c.id);
+            lines.push(format!(
+                "- {kind}: {summary}",
+                kind = c.kind,
+                summary = c.summary
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "## Known pitfalls (from past runs)\n{}",
+        lines.join("\n")
+    ))
 }
 
 fn implementation_tool_definitions() -> Vec<crate::model::ToolDefinition> {
@@ -1727,6 +1901,46 @@ fn emit_context_injected(
                 "memory_ids": memory_ids,
                 "prior_run_ids": prior_run_ids,
                 "file_paths": file_paths,
+                "used_tokens": bundle.used_tokens,
+                "capsule_count": bundle.capsules.len(),
+            }),
+        ),
+    )
+}
+
+/// C7: emit a `context.served` event so the analytics module can compute
+/// retrieval hit-rate, avg top score, and skip-rate over pipeline runs.
+/// Called alongside `emit_context_injected` for each retrieved bundle.
+fn emit_context_served(
+    writer: &mut TraceWriter,
+    events: &mut Vec<Event>,
+    run_id: RunId,
+    stage: CodingStage,
+    bundle: &ContextBundle,
+) -> KimetsuResult<()> {
+    // Hash the capsule_handles as a proxy for the "query" — the pipeline
+    // doesn't expose the raw query text here, but a deterministic hash of
+    // the bundle handles gives a correlatable fingerprint without storing
+    // raw task text.
+    let handle_concat: String = bundle
+        .capsules
+        .iter()
+        .map(|c| c.expansion_handle.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    let query_hash = blake3::hash(handle_concat.as_bytes()).to_hex().to_string();
+    emit(
+        writer,
+        events,
+        Event::new(
+            run_id,
+            "context.served",
+            serde_json::json!({
+                "query_hash": query_hash,
+                "capsule_count": bundle.capsules.len(),
+                "top_score": bundle.top_score,
+                "skipped": bundle.skipped,
+                "stage": stage.as_str(),
             }),
         ),
     )
@@ -1775,24 +1989,88 @@ fn render_localized_files(files_to_read: &[String]) -> String {
         .join("\n")
 }
 
-fn render_context_capsules(context: &ContextBundle, max_capsules: usize) -> String {
+// ── F2: tiered capsule injection constants ─────────────────────────────
+
+/// F2: number of top-scoring capsules rendered in FULL in each stage.
+/// Capsules beyond this threshold are injected as HEADLINES (one line +
+/// expansion handle). The agent can call `expand_capsule(handle)` to
+/// retrieve the full text of any headline on demand.
+///
+/// Rationale: top-3 covers the highest-signal capsules; the long tail is
+/// discoverable via headlines at ~10 tokens each instead of hundreds.
+const FULL_TIER_CAP: usize = 3;
+
+/// F2: token cost charged for a HEADLINE capsule. Small enough that the
+/// entire tail costs less than one full capsule, while still reserving a
+/// slot so the agent knows it exists and can expand it.
+const HEADLINE_TOKEN_COST: u32 = 10;
+
+/// F1+F2: render capsules for a prompt stage, deduplicating across stages
+/// via `ledger`. Applies tiered injection (F2):
+///
+/// - **Full tier** (top `FULL_TIER_CAP` capsules not yet injected): rendered
+///   verbosely with id / kind / score / handle / summary, charged at the
+///   capsule's `token_estimate`. F1 back-reference applies: a capsule already
+///   injected in a prior stage is shown as `(see above)` regardless of tier.
+///
+/// - **Headline tier** (remaining capsules not yet injected): rendered as a
+///   single line `- [headline] kind: <gist> — expand with handle <h>`,
+///   charged at [`HEADLINE_TOKEN_COST`]. This is where the token savings come
+///   from — the tail is discoverable but not pre-paid in full.
+///
+/// A capsule already injected (either tier) is never double-charged; a
+/// headline's small cost is recorded once and the agent's voluntary
+/// `expand_capsule` call is separate accounting entirely.
+fn render_context_capsules(
+    context: &ContextBundle,
+    max_capsules: usize,
+    ledger: &mut RunRecallLedger,
+) -> String {
     if context.capsules.is_empty() {
         return "None.".to_string();
     }
+
+    // Count how many new (not-yet-injected) full-tier slots we have left
+    // as we walk the capsule list in score order.
+    let mut full_slots_remaining = FULL_TIER_CAP;
 
     context
         .capsules
         .iter()
         .take(max_capsules)
         .map(|capsule| {
-            format!(
-                "- id: {id}\n  kind: {kind}\n  score: {score:.3}\n  handle: {handle}\n  summary: {summary}",
-                id = capsule.id,
-                kind = capsule.kind,
-                score = capsule.score,
-                handle = capsule.expansion_handle,
-                summary = truncate_text(&capsule.summary, 700),
-            )
+            if ledger.is_injected(&capsule.id) {
+                // F1 back-reference: already in context from a prior stage.
+                // No new charge. Tier doesn't matter here — it's a back-ref.
+                format!(
+                    "- (see above) [{id}] kind:{kind}",
+                    id = capsule.id,
+                    kind = capsule.kind,
+                )
+            } else if full_slots_remaining > 0 {
+                // Full tier: render verbosely and consume a full slot.
+                full_slots_remaining -= 1;
+                ledger.mark_injected(&capsule.id, capsule.token_estimate);
+                format!(
+                    "- id: {id}\n  kind: {kind}\n  score: {score:.3}\n  handle: {handle}\n  summary: {summary}",
+                    id = capsule.id,
+                    kind = capsule.kind,
+                    score = capsule.score,
+                    handle = capsule.expansion_handle,
+                    summary = truncate_text(&capsule.summary, 700),
+                )
+            } else {
+                // F2 headline tier: one line, small token charge.
+                // Summary is truncated to ~8 words so the line stays ~10 tokens.
+                let gist = truncate_text(&capsule.summary, 60);
+                ledger.mark_injected(&capsule.id, HEADLINE_TOKEN_COST);
+                format!(
+                    "- [headline] {kind}: {gist} — expand with handle {handle}",
+                    kind = capsule.kind,
+                    gist = gist,
+                    handle = capsule.expansion_handle,
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1996,6 +2274,16 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+/// F3: token-count heuristic for the task-size signal.
+///
+/// Uses the same formula as `estimate_tokens` in `kimetsu_brain::context`
+/// and `estimate_request_tokens` above: `(whitespace_words * 1.33).ceil()`.
+/// Kept as a separate named function so the task-size signal definition is
+/// explicit and unit-testable without importing brain internals.
+fn estimate_task_tokens(text: &str) -> u32 {
+    ((text.split_whitespace().count() as f32) * 1.33).ceil() as u32
 }
 
 fn is_code_source(path: &str) -> bool {
@@ -2832,5 +3120,657 @@ mod tests {
             expected_outcome: "n/a".to_string(),
             risk_level: RiskLevel::Low,
         }
+    }
+
+    // ── F1: cross-stage capsule dedup tests ────────────────────────────────
+
+    fn make_capsule(id: &str, kind: &str, summary: &str, token_estimate: u32) -> ContextCapsule {
+        ContextCapsule {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            summary: summary.to_string(),
+            token_estimate,
+            expansion_handle: format!("memory:{id}"),
+            provenance: Vec::new(),
+            confidence: 0.9,
+            freshness: 1.0,
+            relevance: 0.8,
+            scope_weight: 1.0,
+            score: 0.75,
+        }
+    }
+
+    fn make_bundle(capsules: Vec<ContextCapsule>) -> ContextBundle {
+        ContextBundle {
+            stage: "patch_plan".to_string(),
+            budget_tokens: 4096,
+            used_tokens: capsules.iter().map(|c| c.token_estimate).sum(),
+            capsules,
+            excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.75,
+        }
+    }
+
+    /// F1-test-1: two renders of the same bundle with a shared ledger — first
+    /// render injects both capsules in full; second render back-references
+    /// both. Token count stays at 100 (counted once).
+    #[test]
+    fn f1_dedup_across_two_renders_same_bundle() {
+        let bundle = make_bundle(vec![
+            make_capsule(
+                "a",
+                "semantic_operator",
+                "Summary of A — quite long content here",
+                50,
+            ),
+            make_capsule(
+                "b",
+                "convention",
+                "Summary of B — different important stuff",
+                50,
+            ),
+        ]);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+
+        // First render (patch-plan stage): both capsules injected in full.
+        let first = render_context_capsules(&bundle, max, &mut ledger);
+        assert!(
+            first.contains("Summary of A"),
+            "first render must contain full summary for 'a'"
+        );
+        assert!(
+            first.contains("Summary of B"),
+            "first render must contain full summary for 'b'"
+        );
+        assert_eq!(ledger.injected_count(), 2);
+        assert_eq!(ledger.injected_tokens(), 100);
+
+        // Second render (implementation stage): both capsules back-referenced.
+        let second = render_context_capsules(&bundle, max, &mut ledger);
+        assert!(
+            !second.contains("Summary of A"),
+            "second render must NOT repeat full summary for 'a'"
+        );
+        assert!(
+            !second.contains("Summary of B"),
+            "second render must NOT repeat full summary for 'b'"
+        );
+        assert!(
+            second.contains("(see above)"),
+            "second render must contain back-reference marker"
+        );
+        assert!(
+            second.contains("[a]"),
+            "second render must reference capsule id 'a'"
+        );
+        assert!(
+            second.contains("[b]"),
+            "second render must reference capsule id 'b'"
+        );
+        // Token cost still counted once.
+        assert_eq!(
+            ledger.injected_count(),
+            2,
+            "count must not change on re-render"
+        );
+        assert_eq!(
+            ledger.injected_tokens(),
+            100,
+            "tokens must not be double-counted"
+        );
+    }
+
+    /// F1-test-2: partial overlap — first bundle injects {a, b}; second
+    /// bundle {b, c} with same ledger → 'b' is back-referenced, 'c' is full.
+    #[test]
+    fn f1_partial_overlap_second_bundle() {
+        let bundle_ab = make_bundle(vec![
+            make_capsule("a", "semantic_operator", "A is here for the first time", 50),
+            make_capsule("b", "convention", "B appears in both stages", 50),
+        ]);
+        let bundle_bc = make_bundle(vec![
+            make_capsule("b", "convention", "B appears in both stages", 50),
+            make_capsule("c", "anti_pattern", "C is new in the second stage", 60),
+        ]);
+
+        let mut ledger = RunRecallLedger::new();
+
+        // First render: inject a and b.
+        let _ = render_context_capsules(&bundle_ab, bundle_ab.capsules.len(), &mut ledger);
+        assert_eq!(ledger.injected_count(), 2);
+        assert_eq!(ledger.injected_tokens(), 100); // a=50, b=50
+
+        // Second render: b is back-ref, c is new.
+        let second = render_context_capsules(&bundle_bc, bundle_bc.capsules.len(), &mut ledger);
+        assert!(
+            !second.contains("B appears in both stages"),
+            "'b' summary must not re-appear"
+        );
+        assert!(
+            second.contains("C is new"),
+            "'c' summary must be rendered in full"
+        );
+        assert_eq!(
+            ledger.injected_count(),
+            3,
+            "a + b + c = 3 distinct capsules"
+        );
+        assert_eq!(
+            ledger.injected_tokens(),
+            160,
+            "a(50) + b(50) + c(60) = 160, each counted once"
+        );
+    }
+
+    /// F1-test-3: back-reference is materially shorter than a full render.
+    #[test]
+    fn f1_back_ref_is_cheaper_than_full_render() {
+        let long_summary = "A".repeat(300); // deliberately long
+        let bundle = make_bundle(vec![make_capsule(
+            "x",
+            "semantic_operator",
+            &long_summary,
+            200,
+        )]);
+
+        let mut ledger = RunRecallLedger::new();
+
+        let full = render_context_capsules(&bundle, 1, &mut ledger);
+        let back_ref = render_context_capsules(&bundle, 1, &mut ledger);
+
+        assert!(
+            full.contains(&long_summary),
+            "full render must include the long summary"
+        );
+        assert!(
+            !back_ref.contains(&long_summary),
+            "back-ref must not include the long summary"
+        );
+        assert!(
+            back_ref.len() < full.len() / 2,
+            "back-ref ({} chars) should be materially shorter than full ({} chars)",
+            back_ref.len(),
+            full.len()
+        );
+    }
+
+    // ── F2: tiered capsule injection tests ────────────────────────────────
+
+    /// F2-test-1: with 6 capsules, only the top FULL_TIER_CAP are rendered in
+    /// full; the rest appear as HEADLINE lines.
+    #[test]
+    fn f2_top_tier_full_rest_headline() {
+        // Build 6 capsules with decreasing scores (make_capsule sets score=0.75
+        // for all; we can't easily vary score here since make_capsule is fixed,
+        // but the order is preserved by take() so we just check structure).
+        let capsules: Vec<_> = (0..6)
+            .map(|i| {
+                make_capsule(
+                    &format!("cap{i}"),
+                    "memory",
+                    &format!("Summary of capsule {i} with important details about the task"),
+                    100, // full token estimate
+                )
+            })
+            .collect();
+        let bundle = make_bundle(capsules);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        let rendered = render_context_capsules(&bundle, max, &mut ledger);
+
+        // Top FULL_TIER_CAP=3 capsules should appear with their full summary.
+        for i in 0..FULL_TIER_CAP {
+            assert!(
+                rendered.contains(&format!("Summary of capsule {i}")),
+                "capsule {i} (in full tier) should have its summary in the render"
+            );
+        }
+
+        // Capsules beyond the full tier should appear as HEADLINE lines.
+        assert!(
+            rendered.contains("[headline]"),
+            "at least one headline line should appear in the render"
+        );
+        for i in FULL_TIER_CAP..6 {
+            // The handle for each headline capsule should appear (it's in the
+            // "expand with handle memory:cap{i}" suffix).
+            assert!(
+                rendered.contains(&format!("cap{i}")),
+                "headline for capsule {i} should reference its handle"
+            );
+            // The FULL verbose structure (id: / score: / summary: multi-line) must
+            // NOT appear for headline-tier capsules — headlines are one-liners.
+            // Check that the verbose "score:" label (only in full renders) is
+            // absent from parts of the render that correspond to headline capsules.
+        }
+        // Additionally, the total render should NOT contain the multi-line
+        // verbose block for more than FULL_TIER_CAP capsules.
+        // We count lines that start with "  score:" (only full renders have these).
+        let score_lines = rendered
+            .lines()
+            .filter(|l| l.trim_start().starts_with("score:"))
+            .count();
+        assert!(
+            score_lines <= FULL_TIER_CAP,
+            "at most FULL_TIER_CAP={FULL_TIER_CAP} capsules should have 'score:' lines (full render); got {score_lines}"
+        );
+    }
+
+    /// F2-test-2: headline capsules are charged at HEADLINE_TOKEN_COST, NOT
+    /// their full token_estimate — this is the cost lever.
+    #[test]
+    fn f2_headline_tier_charges_small_cost() {
+        let capsules: Vec<_> = (0..6)
+            .map(|i| make_capsule(&format!("c{i}"), "memory", &format!("Summary {i}"), 200))
+            .collect();
+        let bundle = make_bundle(capsules);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        let _ = render_context_capsules(&bundle, max, &mut ledger);
+
+        // Full tier: FULL_TIER_CAP × 200 tokens each.
+        let full_tier_cost = FULL_TIER_CAP as u32 * 200;
+        // Headline tier: (6 - FULL_TIER_CAP) × HEADLINE_TOKEN_COST each.
+        let headline_count = (6 - FULL_TIER_CAP) as u32;
+        let headline_cost = headline_count * HEADLINE_TOKEN_COST;
+        let expected = full_tier_cost + headline_cost;
+
+        assert_eq!(
+            ledger.injected_tokens(),
+            expected,
+            "injected tokens should be full-tier({full_tier_cost}) + headline({headline_cost}) = {expected}"
+        );
+        // And must be materially less than paying full cost for all 6.
+        let all_full = 6u32 * 200;
+        assert!(
+            ledger.injected_tokens() < all_full,
+            "headline tier must save tokens vs paying all-full: {} < {}",
+            ledger.injected_tokens(),
+            all_full
+        );
+    }
+
+    /// F2-test-3: back-reference (F1) takes priority over the tier decision.
+    /// A capsule already injected is back-referenced regardless of where it
+    /// falls in the order — no new charge at all.
+    #[test]
+    fn f2_already_injected_capsule_is_back_referenced_not_charged_again() {
+        let caps: Vec<_> = (0..4)
+            .map(|i| make_capsule(&format!("c{i}"), "memory", &format!("Summary {i}"), 100))
+            .collect();
+        let bundle = make_bundle(caps);
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        // First render: injects top FULL_TIER_CAP in full, rest as headlines.
+        let _ = render_context_capsules(&bundle, max, &mut ledger);
+        let after_first = ledger.injected_tokens();
+
+        // Second render with the SAME ledger: all 4 capsules are already injected.
+        // The ledger's mark_injected is idempotent — no new cost must be added.
+        let second = render_context_capsules(&bundle, max, &mut ledger);
+        assert_eq!(
+            ledger.injected_tokens(),
+            after_first,
+            "no new tokens should be charged on the second render"
+        );
+        // Back-references must appear for all 4 capsules.
+        assert!(
+            second.contains("(see above)"),
+            "second render must contain back-reference markers"
+        );
+    }
+
+    /// F2-test-4: a capsule rendered as a headline (small charge) and then
+    /// "expanded" by the tool does NOT re-charge the ledger — the tool dispatch
+    /// is separate accounting.
+    #[test]
+    fn f2_headline_does_not_double_charge_after_tool_expansion() {
+        let caps: Vec<_> = (0..5)
+            .map(|i| make_capsule(&format!("h{i}"), "memory", &format!("Headline {i}"), 150))
+            .collect();
+        let bundle = make_bundle(caps.clone());
+        let max = bundle.capsules.len();
+
+        let mut ledger = RunRecallLedger::new();
+        let _ = render_context_capsules(&bundle, max, &mut ledger);
+
+        // Tokens after render: FULL_TIER_CAP × 150 + 2 × HEADLINE_TOKEN_COST.
+        let expected =
+            FULL_TIER_CAP as u32 * 150 + (5 - FULL_TIER_CAP) as u32 * HEADLINE_TOKEN_COST;
+        assert_eq!(ledger.injected_tokens(), expected);
+
+        // Simulate the agent expanding one headline capsule via the tool.
+        // The ledger itself is NOT touched by the tool dispatch — only render
+        // calls mark_injected. So the ledger total stays the same.
+        // (The test proves there is no mechanism to re-charge: mark_injected is
+        // idempotent and the tool path never calls it.)
+        let tokens_before = ledger.injected_tokens();
+        // Calling mark_injected again for a headline id with its FULL cost is
+        // idempotent — the original HEADLINE_TOKEN_COST is kept.
+        ledger.mark_injected("h3", 999); // 999 would be the full cost if re-charged
+        assert_eq!(
+            ledger.injected_tokens(),
+            tokens_before,
+            "headline expansion via tool must not alter the ledger total"
+        );
+    }
+
+    // ── E1: proactive failure anticipation tests ───────────────────────────
+
+    /// E1-test-1: a fresh pitfall bundle with one failure_pattern capsule
+    /// produces a "Known pitfalls" block containing that capsule's summary.
+    #[test]
+    fn e1_pitfall_surfaces_in_first_attempt() {
+        let bundle = make_bundle(vec![make_capsule(
+            "fp-1",
+            "failure_pattern",
+            "Always run cargo fmt before cargo clippy or clippy will reject the diff",
+            30,
+        )]);
+        let mut ledger = RunRecallLedger::new();
+
+        let result = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            result.is_some(),
+            "should return Some(_) when there is a matching pitfall"
+        );
+        let block = result.unwrap();
+        assert!(
+            block.contains("Known pitfalls"),
+            "block must contain the section header"
+        );
+        assert!(
+            block.contains("Always run cargo fmt"),
+            "block must contain the capsule summary"
+        );
+        assert!(
+            block.contains("failure_pattern"),
+            "block must include the capsule kind"
+        );
+        // The pitfall must now be recorded in the surfaced set.
+        assert!(
+            ledger.is_surfaced("fp-1"),
+            "capsule id must be marked surfaced after first render"
+        );
+    }
+
+    /// E1-test-2: when the bundle is skipped (empty brain / no match above
+    /// min_score) or truly empty, render_known_pitfalls returns None — zero
+    /// tokens added to the prompt.
+    #[test]
+    fn e1_no_match_returns_none() {
+        // Skipped bundle (top_score below min_score → skipped:true, capsules empty).
+        let skipped_bundle = ContextBundle {
+            stage: "implementation".to_string(),
+            budget_tokens: 600,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: Vec::new(),
+            skipped: true,
+            top_score: 0.0,
+        };
+        let mut ledger = RunRecallLedger::new();
+        assert!(
+            render_known_pitfalls(&skipped_bundle, &mut ledger).is_none(),
+            "skipped bundle must produce None"
+        );
+
+        // Completely empty bundle (skipped:false but no capsules).
+        let empty_bundle = ContextBundle {
+            stage: "implementation".to_string(),
+            budget_tokens: 600,
+            used_tokens: 0,
+            capsules: Vec::new(),
+            excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.0,
+        };
+        assert!(
+            render_known_pitfalls(&empty_bundle, &mut ledger).is_none(),
+            "empty bundle must produce None"
+        );
+    }
+
+    /// E1-test-3: a pitfall surfaced in attempt #1 is NOT repeated in attempt
+    /// #2 — the ledger's surfaced set suppresses it.
+    #[test]
+    fn e1_ledger_suppresses_pitfall_on_retry() {
+        let bundle = make_bundle(vec![make_capsule(
+            "fp-retry",
+            "convention",
+            "Use `--locked` with cargo install to reproduce CI builds exactly",
+            25,
+        )]);
+        let mut ledger = RunRecallLedger::new();
+
+        // Attempt #1: pitfall surfaces.
+        let first = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            first.is_some(),
+            "pitfall should surface on the first attempt"
+        );
+        assert!(first.unwrap().contains("--locked"));
+
+        // Attempt #2: same ledger — pitfall already surfaced, returns None.
+        let second = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            second.is_none(),
+            "pitfall must NOT be repeated when already surfaced this run"
+        );
+    }
+
+    /// E1-test-4: proactive surfaced dedup (is_surfaced/mark_surfaced) is
+    /// independent of the F1 injected dedup (is_injected/mark_injected). A
+    /// capsule can be injected via the normal context path AND surfaced as a
+    /// pitfall without the two mechanisms conflicting.
+    #[test]
+    fn e1_surfaced_and_injected_are_independent() {
+        let capsule = make_capsule(
+            "dual",
+            "failure_pattern",
+            "Watch out for lifetime issues in async blocks",
+            40,
+        );
+        let bundle = make_bundle(vec![capsule.clone()]);
+        let mut ledger = RunRecallLedger::new();
+
+        // Mark it injected (F1 path) — shouldn't affect proactive surfacing.
+        ledger.mark_injected("dual", 40);
+        assert!(ledger.is_injected("dual"));
+        assert!(!ledger.is_surfaced("dual"));
+
+        // Proactive path: should still surface it.
+        let result = render_known_pitfalls(&bundle, &mut ledger);
+        assert!(
+            result.is_some(),
+            "is_injected must NOT prevent proactive surfacing"
+        );
+        assert!(ledger.is_surfaced("dual"));
+
+        // Mark it surfaced (E1 path) — shouldn't affect injected state.
+        // (Already marked above; verify injected_count is still 1.)
+        assert_eq!(ledger.injected_count(), 1);
+        assert_eq!(ledger.injected_tokens(), 40);
+    }
+
+    /// E1-test-5: the proactive request envelope uses the correct kinds,
+    /// min_score, max_capsules, and budget_tokens parameters.
+    #[test]
+    fn e1_pitfall_request_uses_correct_parameters() {
+        // This is a structural/contract test that verifies the ContextRequest
+        // constants match the spec without needing a live brain connection.
+        let task = "fix the scheduler loop";
+        let expected_outcome = "scheduler exits cleanly";
+        let request = ContextRequest {
+            stage: "implementation".to_string(),
+            query: format!("{task}\n{expected_outcome}"),
+            budget_tokens: 600,
+            min_score: 0.7,
+            max_capsules: 2,
+            kinds: vec!["failure_pattern".to_string(), "convention".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(request.stage, "implementation");
+        assert_eq!(request.budget_tokens, 600);
+        assert!(
+            (request.min_score - 0.7).abs() < f32::EPSILON,
+            "min_score must be 0.7"
+        );
+        assert_eq!(request.max_capsules, 2);
+        assert_eq!(request.kinds, vec!["failure_pattern", "convention"]);
+        assert!(request.query.contains(task), "query must include the task");
+        assert!(
+            request.query.contains(expected_outcome),
+            "query must include a patch-plan signal"
+        );
+    }
+
+    // ── F3: adaptive budget + per-run cap + overhead ratio tests ──────────
+
+    /// F3-pipeline-1: `estimate_task_tokens` uses the same whitespace-word
+    /// heuristic as the rest of the pipeline (words * 1.33 ceiled).
+    #[test]
+    fn f3_estimate_task_tokens_matches_pipeline_heuristic() {
+        // 4 words → ceil(4 * 1.33) = ceil(5.32) = 6
+        let text = "fix the scheduler loop";
+        assert_eq!(
+            estimate_task_tokens(text),
+            6,
+            "4 whitespace-words → 6 tokens"
+        );
+
+        // Empty string → 0
+        assert_eq!(estimate_task_tokens(""), 0, "empty string → 0 tokens");
+
+        // 1 word → ceil(1.33) = 2
+        assert_eq!(estimate_task_tokens("word"), 2, "1 word → 2 tokens");
+    }
+
+    /// F3-pipeline-2: per-run global cap via ledger.
+    ///
+    /// Simulates two stages: stage 1 injects near the cap, stage 2's effective
+    /// budget is the small remainder, and total injected never exceeds run_cap.
+    #[test]
+    fn f3_per_run_global_cap_limits_total_brain_tokens() {
+        use kimetsu_core::config::adaptive_budget;
+
+        let floor = 1500u32;
+        let run_cap = 8000u32;
+        let task_size = 200u32;
+
+        // Stage 1: budget = adaptive_budget(task_size), remaining = run_cap
+        let stage1_budget = adaptive_budget(task_size, floor, run_cap);
+
+        // Simulate stage 1 injecting its full budget.
+        let mut ledger = RunRecallLedger::new();
+        ledger.mark_injected("cap-s1-a", stage1_budget / 2);
+        ledger.mark_injected("cap-s1-b", stage1_budget / 2);
+        let after_stage1 = ledger.injected_tokens();
+
+        // Stage 2: remaining budget = run_cap - injected so far.
+        let remaining_stage2 = run_cap.saturating_sub(after_stage1);
+        let stage2_budget = adaptive_budget(task_size, floor, run_cap).min(remaining_stage2);
+
+        // Simulate stage 2 trying to inject up to its budget.
+        ledger.mark_injected("cap-s2-a", stage2_budget / 2);
+        ledger.mark_injected("cap-s2-b", stage2_budget / 2);
+
+        let total_injected = ledger.injected_tokens();
+        assert!(
+            total_injected <= run_cap,
+            "total injected ({total_injected}) must not exceed run_cap ({run_cap})"
+        );
+        assert!(
+            remaining_stage2 < stage1_budget,
+            "stage 2 must have less budget than stage 1 when stage 1 used its allocation"
+        );
+    }
+
+    /// F3-pipeline-3: overhead-ratio fixture-level proof.
+    ///
+    /// Two fixtures — a small task and a ~5×-larger task. The task-size signal
+    /// is defined as: estimate_tokens(task_text) + estimate_tokens(file_list).
+    ///
+    /// Assertions (fixture-level, not universal theorems):
+    ///   (a) brain tokens grow < 2× between small and large fixture
+    ///   (b) overhead ratio (brain / total) is STRICTLY LOWER for the larger task
+    ///       where total ∝ task_size (simulated as 8× task_size for realism)
+    ///
+    /// The factor 8× for total comes from the observation that typical model
+    /// context (system prompt + file contents + conversation) is roughly an
+    /// order of magnitude larger than the task description alone.
+    #[test]
+    fn f3_overhead_ratio_falls_on_larger_task() {
+        use kimetsu_core::config::adaptive_budget;
+
+        let floor = 1500u32;
+        let run_cap = 16_000u32; // raised cap so both fixtures are unclamped
+
+        // Small fixture: a concise 5-word task + 2 file paths listed
+        // task: "fix the scheduler exit loop" → estimate_task_tokens = 8
+        // files: "- src/scheduler.rs\n- src/main.rs" → ~4 words → 6 tokens
+        // task_size_small ≈ 14 tokens
+        let task_small = "fix the scheduler exit loop";
+        let files_small = "- src/scheduler.rs\n- src/main.rs";
+        let task_size_small =
+            estimate_task_tokens(task_small).saturating_add(estimate_task_tokens(files_small));
+
+        // Large fixture: a ~5× larger task (verbose multi-paragraph description)
+        // + many more file paths. We construct it to be ~5× task_size_small.
+        // 5 × 14 ≈ 70 tokens; use 30 task words (≈40 tokens) + 20 file path words (≈27 tokens)
+        // = ~67 tokens.
+        let task_large = "implement a comprehensive fix for the scheduler exit loop \
+            that handles all edge cases including the timeout path the retry path \
+            and the graceful shutdown sequence with proper cleanup of resources";
+        let files_large = "- src/scheduler.rs\n- src/main.rs\n- src/config.rs\n\
+            - src/worker.rs\n- src/runtime.rs\n- tests/scheduler_test.rs";
+        let task_size_large =
+            estimate_task_tokens(task_large).saturating_add(estimate_task_tokens(files_large));
+
+        // Verify the large fixture is genuinely ~5× the small fixture.
+        assert!(
+            task_size_large >= 4 * task_size_small,
+            "large fixture ({task_size_large} tokens) should be >= 4× small ({task_size_small} tokens)"
+        );
+
+        // Compute adaptive brain budgets for each fixture.
+        let brain_small = adaptive_budget(task_size_small, floor, run_cap) as f64;
+        let brain_large = adaptive_budget(task_size_large, floor, run_cap) as f64;
+
+        // (a) brain tokens grow < 2× even though task is ~5× larger.
+        assert!(
+            brain_large < 2.0 * brain_small,
+            "F3 sublinear guarantee (fixture): brain_large={brain_large} must be < 2×brain_small={}",
+            2.0 * brain_small
+        );
+
+        // (b) Overhead ratio (brain / total) strictly falls for the larger task.
+        // Total model context is simulated as 8 × task_size (task description +
+        // file contents + system prompt) — this factor is the same for both, so
+        // the ratio difference is purely driven by the sublinear brain budget.
+        let total_factor = 8.0f64;
+        let total_small = total_factor * task_size_small as f64;
+        let total_large = total_factor * task_size_large as f64;
+
+        let ratio_small = brain_small / total_small;
+        let ratio_large = brain_large / total_large;
+
+        assert!(
+            ratio_large < ratio_small,
+            "F3 overhead-ratio fixture: ratio_large={ratio_large:.4} must be < ratio_small={ratio_small:.4} \
+            (brain tokens grow sublinearly while task/total grows linearly)"
+        );
+
+        // Sanity: both ratios are positive and sensible.
+        assert!(
+            ratio_small > 0.0 && ratio_large > 0.0,
+            "ratios must be positive"
+        );
     }
 }

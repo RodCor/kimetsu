@@ -1,0 +1,38 @@
+{
+  "name": "kimetsu-remote",
+  "version": "0.0.0",
+  "description": "Kimetsu Remote (beta) — server-hosted Kimetsu brain over HTTP MCP. Installs the prebuilt native server binary for your platform. Separate from the `kimetsu-ai` CLI.",
+  "keywords": [
+    "kimetsu",
+    "mcp",
+    "server",
+    "brain",
+    "remote"
+  ],
+  "homepage": "https://github.com/RodCor/kimetsu#readme",
+  "bugs": {
+    "url": "https://github.com/RodCor/kimetsu/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RodCor/kimetsu.git",
+    "directory": "npm/kimetsu-remote"
+  },
+  "license": "MIT OR Apache-2.0",
+  "type": "commonjs",
+  "bin": {
+    "kimetsu-remote": "bin/cli.js"
+  },
+  "files": [
+    "bin/cli.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "@kimetsu-ai/remote-linux-x64": "0.0.0",
+    "@kimetsu-ai/remote-darwin-arm64": "0.0.0",
+    "@kimetsu-ai/remote-win32-x64": "0.0.0"
+  }
+}

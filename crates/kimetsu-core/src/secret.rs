@@ -153,6 +153,7 @@ mod tests {
     #[test]
     fn parent_struct_derive_debug_does_not_leak() {
         #[derive(Debug)]
+        #[allow(dead_code)] // fields only written, not read; struct exists to test Debug redaction
         struct Provider {
             api_key: SecretString,
             model: String,

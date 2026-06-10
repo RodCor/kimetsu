@@ -1,10 +1,64 @@
 use rusqlite::Connection;
 
-use kimetsu_core::{KIMETSU_SCHEMA_VERSION, KimetsuResult};
+use kimetsu_core::KimetsuResult;
+
+/// Apply performance-tuning SQLite pragmas to `conn`.
+///
+/// Safe on both read-write AND read-only connections: pragmas that cannot
+/// be set on a read-only DB (WAL mode, mmap_size) are skipped when they
+/// error, so the same function is called unconditionally from every open path.
+///
+/// Pragmas set:
+/// - `cache_size = -65536`      → 64 MiB page cache (negative = KiB)
+/// - `mmap_size = 268435456`    → 256 MiB memory-mapped I/O window
+/// - `synchronous = NORMAL`     → safe under WAL; avoids full fsync per commit
+/// - `temp_store = MEMORY`      → keep temp tables / sort buffers in RAM
+///
+/// `journal_mode = WAL` and `busy_timeout` are set by `create_baseline`
+/// (the read-write init path); they are NOT repeated here because
+/// `PRAGMA journal_mode` is a structural change that errors on read-only
+/// connections (the mode is already persisted in the DB file header).
+pub fn apply_pragmas(conn: &Connection) -> KimetsuResult<()> {
+    // cache_size and temp_store are safe on any connection.
+    conn.pragma_update(None, "cache_size", -65536_i64)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+
+    // mmap_size and synchronous may fail on a read-only connection opened
+    // against a DB that's being written by another process in WAL mode.
+    // Best-effort: ignore errors from these two.
+    let _ = conn.pragma_update(None, "mmap_size", 268_435_456_i64);
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+
+    Ok(())
+}
 
 pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
+    apply_pragmas(conn)?;
+    create_baseline(conn)?;
+    crate::migrate::run_migrations(conn)?;
+
+    // T3c: the old brute-force `memory_vec` vec0 virtual table is gone (usearch
+    // supersedes it). Best-effort drop to reclaim space in upgraded brains.
+    //
+    // Best-effort: a vec0 vtable can't be dropped without the (now-removed)
+    // sqlite-vec module loaded, so this DROP raises "no such module: vec0" on
+    // upgraded brains. We deliberately ignore the Result so that error can NEVER
+    // propagate and break connection-open. An orphaned, never-accessed
+    // memory_vec is harmless — SQLite loads a vtable module lazily, only on
+    // access, and nothing in the codebase queries memory_vec anymore. New brains
+    // never create it.
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS memory_vec;");
+
+    Ok(())
+}
+
+/// Create the baseline v1 schema (pragmas + all tables/indexes/FTS as of the
+/// original v1 shape). Seeds `schema_info` with version **1** so the migration
+/// runner knows where to start. On an existing DB every CREATE is a no-op
+/// (`IF NOT EXISTS`).
+fn create_baseline(conn: &Connection) -> KimetsuResult<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    conn.pragma_update(None, "busy_timeout", 15_000)?;
 
     conn.execute_batch(
         "
@@ -118,7 +172,17 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
             USING fts5(memory_id UNINDEXED, text, kind, scope);
         ",
     )?;
+    Ok(())
+}
 
+/// The v1→v2 migration: folds every historical in-place patch
+/// (additive columns, citations/conflicts tables, FTS reshapes) into one
+/// idempotent step. Real-world DBs were all stamped v1, so this brings
+/// them — and freshly-created baselines — to the v2 shape.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner. Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
     // In-place column additions for v0.1 brain.db files predating each
     // column. Each ALTER is idempotent: we ignore the duplicate-column error
     // so an upgraded binary opens an older brain.db without forcing a
@@ -245,36 +309,41 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     ensure_memories_fts_shape(conn)?;
     ensure_repo_manifests_fts_shape(conn)?;
 
-    let schema_version: i64 = conn.query_row(
-        "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
-        [],
-        |row| row.get(0),
+    // v1.0 (Tier-1 perf): covering index for scope + embedding_model
+    // filtering in conflict detection and ANN pool fetch. Additive — the
+    // IF NOT EXISTS guard makes it idempotent on already-upgraded DBs.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_scope_model_active
+             ON memories (scope, embedding_model, invalidated_at);",
     )?;
-
-    if schema_version != KIMETSU_SCHEMA_VERSION {
-        return Err(format!(
-            "brain.db schema version {schema_version} does not match expected {KIMETSU_SCHEMA_VERSION}; run `kimetsu brain rebuild`"
-        )
-        .into());
-    }
 
     Ok(())
 }
 
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
-    let schema_version: i64 = conn.query_row(
+    // Apply performance pragmas on read-only connections too. The helper
+    // skips pragmas that error (journal_mode/mmap_size on some read-only
+    // opens), so this is always safe to call here.
+    apply_pragmas(conn)?;
+    use kimetsu_core::KIMETSU_SCHEMA_VERSION;
+    let current: i64 = conn.query_row(
         "SELECT value FROM schema_info WHERE key = 'kimetsu_schema_version'",
         [],
         |row| row.get(0),
     )?;
-
-    if schema_version != KIMETSU_SCHEMA_VERSION {
+    let target = KIMETSU_SCHEMA_VERSION;
+    if current > target {
         return Err(format!(
-            "brain.db schema version {schema_version} does not match expected {KIMETSU_SCHEMA_VERSION}; run `kimetsu brain rebuild`"
+            "brain.db schema version {current} was written by a newer Kimetsu (this binary expects {target}); upgrade Kimetsu"
         )
         .into());
     }
-
+    if current < target {
+        return Err(Box::new(crate::migrate::SchemaNeedsMigration {
+            from: current,
+            to: target,
+        }));
+    }
     Ok(())
 }
 
@@ -345,4 +414,241 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> KimetsuResu
         }
     }
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate;
+    use rusqlite::Connection;
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("query_map")
+            .map(|r| r.expect("row"))
+            .collect()
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    // ------------------------------------------------------------------
+    // 1. Fresh init reaches v2 with full shape
+    // ------------------------------------------------------------------
+    #[test]
+    fn fresh_init_reaches_v2_with_full_shape() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("initialize");
+
+        // Version must be 2.
+        assert_eq!(
+            migrate::current_version(&conn).expect("current_version"),
+            2,
+            "fresh DB must be at schema version 2 after initialize"
+        );
+
+        // Post-migration columns exist on `memories`.
+        let mem_cols = column_names(&conn, "memories");
+        assert!(
+            mem_cols.contains(&"embedding".to_string()),
+            "memories must have `embedding` column"
+        );
+        assert!(
+            mem_cols.contains(&"embedding_model".to_string()),
+            "memories must have `embedding_model` column"
+        );
+        assert!(
+            mem_cols.contains(&"last_useful_at".to_string()),
+            "memories must have `last_useful_at` column"
+        );
+
+        // Tables added by the migration exist.
+        assert!(
+            table_exists(&conn, "memory_citations"),
+            "memory_citations table must exist"
+        );
+        assert!(
+            table_exists(&conn, "memory_conflicts"),
+            "memory_conflicts table must exist"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Idempotent re-run: run_migrations again after initialize is a no-op
+    // ------------------------------------------------------------------
+    #[test]
+    fn idempotent_rerun_preserves_data() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("initialize");
+
+        // Insert a memories row.
+        conn.execute_batch(
+            "INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text,
+                confidence, provenance_snapshot_json, created_at,
+                use_count, usefulness_score
+             ) VALUES (
+                'mem-1', 'test', 'fact', 'hello world', 'hello world',
+                0.9, '{}', '2024-01-01T00:00:00Z',
+                0, 0.0
+             );",
+        )
+        .expect("insert row");
+
+        // Re-run migrations — must be a no-op at target.
+        let outcome = migrate::run_migrations(&conn).expect("second run_migrations");
+        assert_eq!(
+            outcome.applied,
+            Vec::<i64>::new(),
+            "second run_migrations must apply nothing"
+        );
+        assert_eq!(
+            migrate::current_version(&conn).expect("current_version"),
+            2,
+            "version must still be 2"
+        );
+
+        // Data must be intact.
+        let text: String = conn
+            .query_row(
+                "SELECT text FROM memories WHERE memory_id = 'mem-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row must survive");
+        assert_eq!(text, "hello world");
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Idempotent initialize: calling initialize twice succeeds, version stays 2
+    // ------------------------------------------------------------------
+    #[test]
+    fn idempotent_initialize_twice() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("first initialize");
+        initialize(&conn).expect("second initialize must not error");
+        assert_eq!(
+            migrate::current_version(&conn).expect("current_version"),
+            2,
+            "version must still be 2 after double initialize"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 1: apply_pragmas sets the tuned cache_size on both RW and RO
+    // ------------------------------------------------------------------
+    #[test]
+    fn apply_pragmas_sets_cache_size_on_rw_connection() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        initialize(&conn).expect("initialize");
+        // After initialize (which calls apply_pragmas), cache_size must be -65536
+        // (the negative-KiB form we set). SQLite may return it as a page count
+        // (positive) or keep the -KiB form; we just assert it's not the default
+        // -2000 pages, which is what SQLite uses without any pragma_update.
+        let cache_size: i64 = conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .expect("cache_size query");
+        assert_ne!(
+            cache_size, -2000,
+            "cache_size must have been updated from the 2 MiB default, got {cache_size}"
+        );
+        // The tuned value should be a large negative number (KiB) or a large
+        // positive page count — either way not the stock default.
+        assert!(
+            !(-2000..=2000).contains(&cache_size),
+            "cache_size should reflect the 64 MiB tuning (not default -2000), got {cache_size}"
+        );
+    }
+
+    /// Fix 1: validate() (the read-only open path) also calls apply_pragmas.
+    /// We can't open a true read-only connection to an in-memory DB via OpenFlags,
+    /// so we exercise the helper directly and verify it doesn't error.
+    #[test]
+    fn apply_pragmas_does_not_error_on_in_memory_conn() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        apply_pragmas(&conn).expect("apply_pragmas must not error on a fresh in-memory conn");
+        let cache_size: i64 = conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .expect("cache_size");
+        assert!(
+            !(-2000..=2000).contains(&cache_size),
+            "apply_pragmas must update cache_size from the default, got {cache_size}"
+        );
+    }
+
+    // Helper: seed an in-memory conn with only schema_info at the given version.
+    fn seed_schema_info(version: i64) -> Connection {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO schema_info VALUES ('kimetsu_schema_version', {version});"
+        ))
+        .expect("seed schema_info");
+        conn
+    }
+
+    // ------------------------------------------------------------------
+    // A5-1. validate Ok at target version
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_ok_at_target() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
+        let conn = seed_schema_info(KIMETSU_SCHEMA_VERSION);
+        validate(&conn).expect("validate at target must return Ok(())");
+    }
+
+    // ------------------------------------------------------------------
+    // A5-2. validate returns SchemaNeedsMigration for an older DB
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_returns_needs_migration_for_older_db() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
+        let conn = seed_schema_info(1);
+        let err = validate(&conn).expect_err("validate on v1 DB must return Err");
+        let snm = err
+            .downcast_ref::<migrate::SchemaNeedsMigration>()
+            .expect("error must downcast to SchemaNeedsMigration");
+        assert_eq!(
+            snm,
+            &migrate::SchemaNeedsMigration {
+                from: 1,
+                to: KIMETSU_SCHEMA_VERSION,
+            },
+            "SchemaNeedsMigration must carry the correct from/to versions"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A5-3. validate hard-errors (non-SchemaNeedsMigration) for a newer DB
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_hard_errors_for_newer_db() {
+        let conn = seed_schema_info(999);
+        let err = validate(&conn).expect_err("validate on v999 DB must return Err");
+        assert!(
+            err.downcast_ref::<migrate::SchemaNeedsMigration>()
+                .is_none(),
+            "error for a newer DB must NOT downcast to SchemaNeedsMigration"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer"),
+            "error message must contain 'newer', got: {msg}"
+        );
+    }
 }
