@@ -803,6 +803,15 @@ struct BrainBenchArgs {
     /// the combo JSON file.  Do NOT use directly — the orchestrator sets this.
     #[arg(long, hide = true)]
     single: bool,
+    /// Benchmark kimetsu-remote over HTTP instead of the local in-process path.
+    /// Spawns the release server binary, seeds a temp brain, and measures
+    /// per-case latency (sequential + concurrent), recall@k, MRR, and server RSS.
+    /// Rerankers are ignored (the remote path has no rerank stage).
+    #[arg(long)]
+    remote: bool,
+    /// Number of parallel HTTP workers for the concurrent latency pass (--remote only).
+    #[arg(long, default_value_t = 4usize)]
+    concurrency: usize,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -6520,7 +6529,9 @@ fn peak_rss_mb() -> Option<f64> {
 
 #[cfg(feature = "embeddings")]
 fn brain_bench_inner(args: BrainBenchArgs) -> KimetsuResult<()> {
-    if args.single {
+    if args.remote {
+        brain_bench_remote(args)
+    } else if args.single {
         brain_bench_single(args)
     } else {
         brain_bench_orchestrate(args)
@@ -6699,6 +6710,635 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
     );
 
     let summary_path = out_dir.join("summary.md");
+    std::fs::write(&summary_path, &summary_md)?;
+    println!("wrote {}", summary_path.display());
+    println!();
+    println!("{summary_md}");
+
+    Ok(())
+}
+
+/// RSS of an external process by PID (Windows only).
+#[cfg(all(feature = "embeddings", target_os = "windows"))]
+fn process_rss_mb(pid: u32) -> Option<f64> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut pmc = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = K32GetProcessMemoryInfo(handle, &mut pmc, pmc.cb) != 0;
+        CloseHandle(handle);
+        if ok {
+            Some(pmc.WorkingSetSize as f64 / (1024.0 * 1024.0))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(all(feature = "embeddings", not(target_os = "windows")))]
+fn process_rss_mb(_pid: u32) -> Option<f64> {
+    None
+}
+
+/// Remote bench: spawn kimetsu-remote, seed a temp brain, measure HTTP MCP retrieval.
+#[cfg(feature = "embeddings")]
+fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::eval::EvalFixture;
+    use kimetsu_brain::project::{add_memory, init_project};
+    use kimetsu_core::memory::{MemoryKind, MemoryScope};
+    use kimetsu_core::paths::git_init_boundary;
+    use std::collections::HashMap;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    // ── 0. Locate workspace root and server binary ────────────────────────────
+    // Find workspace root by walking up from current_exe.
+    let current_exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // target/release/kimetsu.exe  →  workspace root is three levels up.
+    let workspace_root = current_exe
+        .parent() // target/release/
+        .and_then(|p| p.parent()) // target/
+        .and_then(|p| p.parent()) // workspace root
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "cannot derive workspace root from current_exe".to_string())?;
+
+    #[cfg(windows)]
+    let server_bin = workspace_root.join("target").join("release").join("kimetsu-remote.exe");
+    #[cfg(not(windows))]
+    let server_bin = workspace_root.join("target").join("release").join("kimetsu-remote");
+
+    if !server_bin.exists() {
+        return Err(format!(
+            "kimetsu-remote release binary not found at {}\n\
+             Build it first:\n  cargo build --release -p kimetsu-remote --features embeddings",
+            server_bin.display()
+        ).into());
+    }
+
+    // ── 1. Load fixture ───────────────────────────────────────────────────────
+    let fixture_text = std::fs::read_to_string(&args.dataset)
+        .map_err(|e| format!("cannot read dataset {}: {e}", args.dataset.display()))?;
+    let fixture: EvalFixture = serde_json::from_str(&fixture_text)
+        .map_err(|e| format!("invalid dataset JSON: {e}"))?;
+
+    let all_keys: std::collections::HashSet<&str> =
+        fixture.memories.iter().map(|m| m.key.as_str()).collect();
+    for case in &fixture.cases {
+        for rel in &case.relevant {
+            if !all_keys.contains(rel.as_str()) {
+                return Err(format!(
+                    "dataset validation: key {:?} in query {:?} not in memories",
+                    rel, case.query
+                ).into());
+            }
+        }
+    }
+
+    let embedders: Vec<&str> = args
+        .embedders
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    println!("brain bench --remote: {} embedder(s) (rerankers ignored — remote has no rerank stage)", embedders.len());
+    println!("NOTE: remote applies PRODUCTION floors (min_lexical_coverage 0.5, min_semantic_score 0.35).");
+    println!("      Quality numbers are NOT directly comparable to local floors-off results.");
+    println!("dataset: {}", args.dataset.display());
+    println!("output:  {}", args.out.display());
+    println!("concurrency: {}", args.concurrency);
+    println!();
+
+    std::fs::create_dir_all(&args.out)?;
+
+    #[derive(serde::Serialize)]
+    struct RemoteCaseResult {
+        query: String,
+        expected: Vec<String>,
+        obtained: Vec<String>,
+        hit_at_2: bool,
+        hit_at_4: bool,
+        mrr: f64,
+        latency_ms: u128,
+        error: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct RemoteComboResult {
+        embedder: String,
+        seed_ms: u128,
+        rss_after_warm_mb: Option<f64>,
+        peak_rss_mb: Option<f64>,
+        cases: Vec<RemoteCaseResult>,
+        summary: RemoteComboSummary,
+        concurrent: RemoteConcurrentStats,
+    }
+
+    #[derive(serde::Serialize)]
+    struct RemoteComboSummary {
+        recall_at_2: f64,
+        recall_at_4: f64,
+        mrr: f64,
+        mean_latency_ms: f64,
+        p95_latency_ms: f64,
+        noise_capsules: f64,
+        error_cases: usize,
+    }
+
+    #[derive(serde::Serialize)]
+    struct RemoteConcurrentStats {
+        mean_ms: f64,
+        p95_ms: f64,
+        total_wall_ms: u128,
+        throughput_rps: f64,
+    }
+
+    type SummaryRow = (String, RemoteComboSummary, RemoteConcurrentStats, Option<f64>, Option<f64>);
+    let mut summary_rows: Vec<SummaryRow> = Vec::new();
+
+    for &embedder_id in &embedders {
+        println!("[remote] embedder: {embedder_id}");
+
+        // ── 2. Pick a free port ───────────────────────────────────────────────
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("bind free port: {e}"))?;
+        let port = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?.port();
+        drop(listener); // release so the server can bind it
+
+        // ── 3. Seed temp brain ────────────────────────────────────────────────
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let safe_emb = embedder_id.replace(['/', '.', ' '], "-");
+        // data dir: contains benchrepo/
+        let data_dir = std::env::temp_dir().join(format!("kimetsu-remote-bench-{safe_emb}-{ts}"));
+        let repo_root = data_dir.join("benchrepo");
+        std::fs::create_dir_all(&repo_root)?;
+        git_init_boundary(&repo_root);
+
+        // Set env before seeding so memories use this embedder.
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_EMBEDDER", embedder_id);
+            std::env::set_var("KIMETSU_USER_BRAIN", "0");
+        }
+
+        let t_seed = Instant::now();
+        init_project(&repo_root, false).map_err(|e| format!("init_project: {e}"))?;
+
+        let mut key_to_id: HashMap<String, String> = HashMap::new();
+        for mem in &fixture.memories {
+            let id = add_memory(
+                &repo_root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                &mem.text,
+            )
+            .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
+            key_to_id.insert(mem.key.clone(), id);
+        }
+        let seed_ms = t_seed.elapsed().as_millis();
+        let id_to_key: HashMap<String, String> =
+            key_to_id.iter().map(|(k, v)| (v.clone(), k.clone())).collect();
+        println!("  seeded {} memories in {seed_ms}ms", fixture.memories.len());
+
+        // ── 4. Spawn server ───────────────────────────────────────────────────
+        let addr = format!("127.0.0.1:{port}");
+        let token = "benchtoken";
+        let mut server = std::process::Command::new(&server_bin)
+            .arg("serve")
+            .arg("--addr")
+            .arg(&addr)
+            .arg("--data")
+            .arg(&data_dir)
+            .arg("--token")
+            .arg(token)
+            .arg("--rate-limit")
+            .arg("0")
+            .env("KIMETSU_BRAIN_EMBEDDER", embedder_id)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1")
+            // Suppress server log noise during bench
+            .env("RUST_LOG", "warn")
+            .spawn()
+            .map_err(|e| format!("spawn kimetsu-remote: {e}"))?;
+
+        let server_pid = server.id();
+
+        // ── 5. Poll readiness (GET /healthz, up to 60s) ───────────────────────
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("build reqwest client: {e}"))?;
+
+        let health_url = format!("http://{addr}/healthz");
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            match client.get(&health_url).send() {
+                Ok(r) if r.status().is_success() => {
+                    ready = true;
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+        if !ready {
+            let _ = server.kill();
+            return Err(format!("kimetsu-remote did not become ready within 60s (port {port})").into());
+        }
+        println!("  server ready on :{port}");
+
+        // ── 6. Record RSS after warm ──────────────────────────────────────────
+        let rss_after_warm = process_rss_mb(server_pid);
+
+        // ── 7. Sequential pass ────────────────────────────────────────────────
+        let mcp_url = format!("http://{addr}/mcp/benchrepo");
+        let auth_header = format!("Bearer {token}");
+
+        // Helper: call kimetsu_brain_context over HTTP, return (obtained_keys, latency_ms, error).
+        let call_context = |query: &str, id: u64| -> (Vec<String>, u128, Option<String>) {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "kimetsu_brain_context",
+                    "arguments": {
+                        "query": query,
+                        "budget_tokens": 6000,
+                        "max_capsules": 4
+                    }
+                }
+            });
+            let t0 = Instant::now();
+            let resp = client
+                .post(&mcp_url)
+                .header("Authorization", &auth_header)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send();
+            let latency_ms = t0.elapsed().as_millis();
+
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => return (vec![], latency_ms, Some(format!("HTTP error: {e}"))),
+            };
+
+            let json: serde_json::Value = match resp.json() {
+                Ok(v) => v,
+                Err(e) => return (vec![], latency_ms, Some(format!("JSON parse error: {e}"))),
+            };
+
+            // Check for JSON-RPC error
+            if let Some(err_obj) = json.get("error") {
+                let msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                return (vec![], latency_ms, Some(format!("RPC error: {msg}")));
+            }
+
+            // Parse the result: result.content[0].text → JSON string → capsules
+            let text = json
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            if text.is_empty() {
+                return (vec![], latency_ms, Some("empty text in result".to_string()));
+            }
+
+            let inner: serde_json::Value = match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => return (vec![], latency_ms, Some(format!("inner JSON parse: {e}"))),
+            };
+
+            // skipped case → no capsules (intentional, not an error)
+            if inner.get("skipped").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return (vec![], latency_ms, None);
+            }
+
+            let capsules = inner
+                .get("capsules")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let keys: Vec<String> = capsules
+                .iter()
+                .filter_map(|cap| {
+                    cap.get("expansion_handle")
+                        .and_then(|h| h.as_str())
+                        .and_then(|h| h.strip_prefix("memory:"))
+                        .and_then(|id| id_to_key.get(id))
+                        .cloned()
+                })
+                .collect();
+
+            (keys, latency_ms, None)
+        };
+
+        let mut case_results: Vec<RemoteCaseResult> = Vec::new();
+        let mut seq_latencies: Vec<u128> = Vec::new();
+
+        for (idx, case) in fixture.cases.iter().enumerate() {
+            let (obtained, latency_ms, error) = call_context(&case.query, idx as u64);
+            seq_latencies.push(latency_ms);
+
+            let hit_at_2 = if case.relevant.is_empty() {
+                false
+            } else {
+                obtained.iter().take(2).any(|k| case.relevant.contains(k))
+            };
+            let hit_at_4 = if case.relevant.is_empty() {
+                false
+            } else {
+                obtained.iter().take(4).any(|k| case.relevant.contains(k))
+            };
+            let mrr_val = kimetsu_brain::eval::mrr(&obtained, &case.relevant);
+
+            case_results.push(RemoteCaseResult {
+                query: case.query.clone(),
+                expected: case.relevant.clone(),
+                obtained,
+                hit_at_2,
+                hit_at_4,
+                mrr: mrr_val,
+                latency_ms,
+                error,
+            });
+        }
+
+        println!("  sequential pass done ({} cases)", case_results.len());
+
+        // ── 8. Concurrent pass ────────────────────────────────────────────────
+        let concurrency = args.concurrency.max(1);
+        let cases_arc: std::sync::Arc<Vec<_>> = std::sync::Arc::new(
+            fixture.cases.iter().enumerate().map(|(i, c)| (i, c.query.clone())).collect()
+        );
+        let t_conc_start = Instant::now();
+
+        // Split cases into chunks for each worker thread.
+        let chunk_size = cases_arc.len().div_ceil(concurrency);
+        let mut handles = vec![];
+        let client_clone = client.clone();
+        let mcp_url_clone = mcp_url.clone();
+        let auth_clone = auth_header.clone();
+        let id_to_key_arc = std::sync::Arc::new(id_to_key.clone());
+
+        // We collect latencies per case from concurrent workers.
+        let conc_latencies_arc: std::sync::Arc<std::sync::Mutex<Vec<(usize, u128)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for chunk_idx in 0..concurrency {
+            let cases = std::sync::Arc::clone(&cases_arc);
+            let client_t = client_clone.clone();
+            let url_t = mcp_url_clone.clone();
+            let auth_t = auth_clone.clone();
+            let id_to_key_t = std::sync::Arc::clone(&id_to_key_arc);
+            let out_t = std::sync::Arc::clone(&conc_latencies_arc);
+
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(cases.len());
+            if start >= end {
+                continue;
+            }
+
+            let handle = std::thread::spawn(move || {
+                for case_idx in start..end {
+                    let (i, ref query) = cases[case_idx];
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": i as u64 + 10000,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "kimetsu_brain_context",
+                            "arguments": {
+                                "query": query,
+                                "budget_tokens": 6000,
+                                "max_capsules": 4
+                            }
+                        }
+                    });
+                    let t0 = Instant::now();
+                    let _ = client_t
+                        .post(&url_t)
+                        .header("Authorization", &auth_t)
+                        .header("Content-Type", "application/json")
+                        .json(&body)
+                        .send();
+                    let latency_ms = t0.elapsed().as_millis();
+                    let _ = id_to_key_t.get(""); // suppress unused warning
+                    out_t.lock().unwrap().push((i, latency_ms));
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let total_wall_ms = t_conc_start.elapsed().as_millis();
+        let conc_lats_raw = conc_latencies_arc.lock().unwrap().clone();
+        let mut conc_latencies: Vec<u128> = conc_lats_raw.iter().map(|(_, l)| *l).collect();
+        conc_latencies.sort_unstable();
+
+        let conc_mean_ms = if conc_latencies.is_empty() {
+            0.0
+        } else {
+            conc_latencies.iter().sum::<u128>() as f64 / conc_latencies.len() as f64
+        };
+        let conc_p95_ms = if conc_latencies.is_empty() {
+            0.0
+        } else {
+            let idx = ((conc_latencies.len() as f64 * 0.95) as usize).min(conc_latencies.len() - 1);
+            conc_latencies[idx] as f64
+        };
+        let throughput_rps = if total_wall_ms == 0 {
+            0.0
+        } else {
+            fixture.cases.len() as f64 / (total_wall_ms as f64 / 1000.0)
+        };
+
+        println!(
+            "  concurrent pass done: mean={conc_mean_ms:.0}ms p95={conc_p95_ms:.0}ms throughput={throughput_rps:.1}rps"
+        );
+
+        // ── 9. Record peak RSS, kill server ───────────────────────────────────
+        let peak_rss = process_rss_mb(server_pid);
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        // ── 10. Aggregate metrics ─────────────────────────────────────────────
+        let signal_cases: Vec<_> = fixture
+            .cases
+            .iter()
+            .zip(&case_results)
+            .filter(|(c, _)| !c.relevant.is_empty())
+            .collect();
+        let noise_cases: Vec<_> = fixture
+            .cases
+            .iter()
+            .zip(&case_results)
+            .filter(|(c, _)| c.relevant.is_empty())
+            .collect();
+
+        let recall_at_2 = if signal_cases.is_empty() {
+            0.0
+        } else {
+            signal_cases
+                .iter()
+                .map(|(_, r)| if r.hit_at_2 { 1.0f64 } else { 0.0 })
+                .sum::<f64>()
+                / signal_cases.len() as f64
+        };
+        let recall_at_4 = if signal_cases.is_empty() {
+            0.0
+        } else {
+            signal_cases
+                .iter()
+                .map(|(_, r)| if r.hit_at_4 { 1.0f64 } else { 0.0 })
+                .sum::<f64>()
+                / signal_cases.len() as f64
+        };
+        let mrr_avg = if signal_cases.is_empty() {
+            0.0
+        } else {
+            signal_cases.iter().map(|(_, r)| r.mrr).sum::<f64>() / signal_cases.len() as f64
+        };
+        let mut sorted_seq = seq_latencies.clone();
+        sorted_seq.sort_unstable();
+        let mean_latency_ms = if sorted_seq.is_empty() {
+            0.0
+        } else {
+            sorted_seq.iter().sum::<u128>() as f64 / sorted_seq.len() as f64
+        };
+        let p95_latency_ms = if sorted_seq.is_empty() {
+            0.0
+        } else {
+            let idx = ((sorted_seq.len() as f64 * 0.95) as usize).min(sorted_seq.len() - 1);
+            sorted_seq[idx] as f64
+        };
+        let noise_capsules = if noise_cases.is_empty() {
+            0.0
+        } else {
+            noise_cases
+                .iter()
+                .map(|(_, r)| r.obtained.len() as f64)
+                .sum::<f64>()
+                / noise_cases.len() as f64
+        };
+        let error_cases = case_results.iter().filter(|r| r.error.is_some()).count();
+
+        let summary = RemoteComboSummary {
+            recall_at_2,
+            recall_at_4,
+            mrr: mrr_avg,
+            mean_latency_ms,
+            p95_latency_ms,
+            noise_capsules,
+            error_cases,
+        };
+        let concurrent = RemoteConcurrentStats {
+            mean_ms: conc_mean_ms,
+            p95_ms: conc_p95_ms,
+            total_wall_ms,
+            throughput_rps,
+        };
+
+        println!(
+            "  recall@2={:.3} recall@4={:.3} MRR={:.3} seq_mean={:.0}ms seq_p95={:.0}ms errors={}",
+            summary.recall_at_2,
+            summary.recall_at_4,
+            summary.mrr,
+            summary.mean_latency_ms,
+            summary.p95_latency_ms,
+            summary.error_cases,
+        );
+
+        // ── 11. Write per-embedder JSON ───────────────────────────────────────
+        let combo = RemoteComboResult {
+            embedder: embedder_id.to_string(),
+            seed_ms,
+            rss_after_warm_mb: rss_after_warm,
+            peak_rss_mb: peak_rss,
+            cases: case_results,
+            summary: RemoteComboSummary {
+                recall_at_2,
+                recall_at_4,
+                mrr: mrr_avg,
+                mean_latency_ms,
+                p95_latency_ms,
+                noise_capsules,
+                error_cases,
+            },
+            concurrent: RemoteConcurrentStats {
+                mean_ms: conc_mean_ms,
+                p95_ms: conc_p95_ms,
+                total_wall_ms,
+                throughput_rps,
+            },
+        };
+        let fname = format!("remote-{safe_emb}.json");
+        let fpath = args.out.join(&fname);
+        std::fs::write(&fpath, serde_json::to_string_pretty(&combo)?)?;
+        println!("  wrote {}", fpath.display());
+        println!();
+
+        summary_rows.push((embedder_id.to_string(), summary, concurrent, rss_after_warm, peak_rss));
+    }
+
+    // ── 12. Write summary table ───────────────────────────────────────────────
+    let caveat = "\
+> **NOTE — remote production floors**: the remote path applies `min_lexical_coverage = 0.5` and \
+`min_semantic_score = 0.35` (default config). Quality numbers are **NOT** directly comparable to \
+the local bench's floors-off results — noise cases below these thresholds are intentional \
+precision wins, not recall failures. The remote path also has **no reranker** stage.\n";
+
+    let header = format!(
+        "| {:<25} | {:>8} | {:>8} | {:>7} | {:>9} | {:>8} | {:>12} | {:>10} | {:>14} | {:>11} | {:>11} |",
+        "embedder", "recall@2", "recall@4", "MRR", "seq mean", "seq p95", "conc mean ms", "conc p95", "throughput rps", "warm RSS MB", "peak RSS MB"
+    );
+    let sep = format!(
+        "| {:-<25} | {:-<8} | {:-<8} | {:-<7} | {:-<9} | {:-<8} | {:-<12} | {:-<10} | {:-<14} | {:-<11} | {:-<11} |",
+        "", "", "", "", "", "", "", "", "", "", ""
+    );
+
+    let mut table_lines = vec![header, sep];
+    for (embedder, summary, concurrent, warm_rss, peak_rss) in &summary_rows {
+        let warm_str = warm_rss.map(|v| format!("{v:.0}")).unwrap_or_else(|| "n/a".to_string());
+        let peak_str = peak_rss.map(|v| format!("{v:.0}")).unwrap_or_else(|| "n/a".to_string());
+        table_lines.push(format!(
+            "| {:<25} | {:>8.3} | {:>8.3} | {:>7.3} | {:>9.1} | {:>8.1} | {:>12.1} | {:>10.1} | {:>14.1} | {:>11} | {:>11} |",
+            embedder,
+            summary.recall_at_2,
+            summary.recall_at_4,
+            summary.mrr,
+            summary.mean_latency_ms,
+            summary.p95_latency_ms,
+            concurrent.mean_ms,
+            concurrent.p95_ms,
+            concurrent.throughput_rps,
+            warm_str,
+            peak_str,
+        ));
+    }
+
+    let summary_md = format!(
+        "# Kimetsu Remote Benchmark — Summary\n\n{caveat}\nSorted by embedder.\n\n{}\n",
+        table_lines.join("\n")
+    );
+
+    let summary_path = args.out.join("remote-summary.md");
     std::fs::write(&summary_path, &summary_md)?;
     println!("wrote {}", summary_path.display());
     println!();
