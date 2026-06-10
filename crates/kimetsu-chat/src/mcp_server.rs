@@ -193,9 +193,19 @@ pub fn dispatch(
                     return Err(format!("tool `{name}` is not available in remote mode"));
                 }
             }
-            if is_privileged_write_tool(name) && !mcp_write_tools_enabled() {
+            // `allowed_tools.is_some()` is the remote-mode marker (see the
+            // dispatch docstring): remote serves cloned repos whose
+            // project.toml is untrusted, so only the operator-set env var
+            // can enable writes there. Local stdio consults project config
+            // (default: enabled — recording lessons is the product's own
+            // prescribed workflow).
+            if is_privileged_write_tool(name)
+                && !mcp_write_tools_enabled(workspace, allowed_tools.is_some())
+            {
                 return Err(format!(
-                    "tool `{name}` requires explicit user approval; set KIMETSU_MCP_ENABLE_WRITE_TOOLS=1 only for trusted sessions"
+                    "tool `{name}` requires explicit approval; enable with \
+                     `kimetsu config set kimetsu.mcp_write_tools true` (local) or \
+                     KIMETSU_MCP_ENABLE_WRITE_TOOLS=1 (env override, required for remote)"
                 ));
             }
             let arguments = params
@@ -454,15 +464,38 @@ fn is_privileged_write_tool(name: &str) -> bool {
     )
 }
 
-fn mcp_write_tools_enabled() -> bool {
-    std::env::var("KIMETSU_MCP_ENABLE_WRITE_TOOLS")
-        .map(|value| {
-            matches!(
-                value.trim(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
+fn mcp_write_tools_enabled(workspace: &Path, remote: bool) -> bool {
+    let env = std::env::var("KIMETSU_MCP_ENABLE_WRITE_TOOLS").ok();
+    let config_allow = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|config| config.kimetsu.mcp_write_tools);
+    write_tools_decision(env.as_deref(), remote, config_allow)
+}
+
+/// v1.0.0: pure decision for the privileged-write gate.
+///
+/// Precedence:
+///   1. The env var, when SET, always wins — truthy enables, anything else
+///      disables. This is the operator override in both directions.
+///   2. Remote mode (env unset): always deny. The workspace config on a
+///      remote server comes from a cloned repo — untrusted input must not
+///      be able to enable writes.
+///   3. Local mode (env unset): the project's `kimetsu.mcp_write_tools`
+///      (default true — a local plugin install IS the trusted session, and
+///      the brain's own workflow instructs the agent to record lessons).
+///      An unreadable config also defaults to true.
+fn write_tools_decision(env: Option<&str>, remote: bool, config_allow: Option<bool>) -> bool {
+    if let Some(value) = env {
+        return matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        );
+    }
+    if remote {
+        return false;
+    }
+    config_allow.unwrap_or(true)
 }
 
 fn kimetsu_brain_status(workspace: &Path) -> Value {
@@ -2583,20 +2616,83 @@ mod tests {
         );
     }
 
+    /// v1.0.0: the write gate is a pure decision — env (set = wins, both
+    /// directions) > remote deny > local config (default allow). Covering
+    /// it here keeps env manipulation out of the dispatch-level tests.
     #[test]
-    fn dispatch_blocks_privileged_write_tools_by_default() {
+    fn write_tools_decision_precedence() {
+        // Env set: truthy enables everywhere (incl. remote), falsy disables
+        // everywhere (incl. local config-true).
+        assert!(write_tools_decision(Some("1"), true, Some(false)));
+        assert!(write_tools_decision(Some("on"), false, Some(false)));
+        assert!(!write_tools_decision(Some("0"), false, Some(true)));
+        assert!(!write_tools_decision(Some("nope"), false, None));
+        // Env unset, remote: always deny — cloned-repo config must not
+        // be able to enable writes.
+        assert!(!write_tools_decision(None, true, Some(true)));
+        assert!(!write_tools_decision(None, true, None));
+        // Env unset, local: config decides, default allow.
+        assert!(write_tools_decision(None, false, Some(true)));
+        assert!(!write_tools_decision(None, false, Some(false)));
+        assert!(write_tools_decision(None, false, None));
+    }
+
+    /// Local dispatch honors `kimetsu.mcp_write_tools = false`: the user's
+    /// personalization knob still hard-blocks privileged writes.
+    #[test]
+    fn dispatch_blocks_writes_when_config_disables_them() {
+        let root = temp_root("dispatch-write-gate-config");
+        fs::create_dir_all(&root).expect("create temp root");
+        kimetsu_brain::project::init_project(&root, false).expect("init project");
+        // Flip the knob the way `kimetsu config set` would.
+        let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+        let mut config = kimetsu_brain::project::load_config(&paths).expect("load config");
+        config.kimetsu.mcp_write_tools = false;
+        fs::write(&paths.project_toml, config.to_toml().expect("toml")).expect("write config");
+
         let err = dispatch(
             "tools/call",
             json!({
                 "name": "kimetsu_brain_record",
                 "arguments": { "lesson": "persist this without approval" }
             }),
-            Path::new("."),
+            &root,
             &SkillConfig::default(),
             None,
         )
-        .expect_err("write tools must require explicit approval");
-        assert!(err.contains("requires explicit user approval"));
+        .expect_err("config-disabled write tools must be blocked");
+        assert!(err.contains("requires explicit approval"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Remote dispatch (allowed_tools = Some) ignores workspace config —
+    /// even `mcp_write_tools = true` in a (cloned, untrusted) project.toml
+    /// must not enable writes without the operator's env var.
+    #[test]
+    fn dispatch_remote_ignores_config_for_write_tools() {
+        use std::collections::BTreeSet;
+        let root = temp_root("dispatch-write-gate-remote");
+        fs::create_dir_all(&root).expect("create temp root");
+        kimetsu_brain::project::init_project(&root, false).expect("init project");
+        // Default config already has mcp_write_tools = true.
+
+        let mut allowed = BTreeSet::new();
+        allowed.insert("kimetsu_brain_record");
+        let err = dispatch(
+            "tools/call",
+            json!({
+                "name": "kimetsu_brain_record",
+                "arguments": { "lesson": "persist this without approval" }
+            }),
+            &root,
+            &SkillConfig::default(),
+            Some(&allowed),
+        )
+        .expect_err("remote write tools must stay env-gated");
+        assert!(err.contains("requires explicit approval"));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

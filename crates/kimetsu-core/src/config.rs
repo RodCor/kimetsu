@@ -31,6 +31,7 @@ impl ProjectConfig {
                 project_id: project_id.into(),
                 schema_version: KIMETSU_CONFIG_VERSION,
                 use_user_brain: default_true(),
+                mcp_write_tools: default_true(),
             },
             model: ModelSection::default(),
             broker: BrokerSection::default(),
@@ -65,6 +66,20 @@ pub struct KimetsuSection {
     /// unchanged (they get `use_user_brain = true`).
     #[serde(default = "default_true")]
     pub use_user_brain: bool,
+    /// v1.0.0: allow the LOCAL stdio MCP server to expose privileged write
+    /// tools (`kimetsu_brain_record`, `memory_add/accept/reject`, …).
+    /// Default true: the local plugin install on your own machine is the
+    /// "trusted session" the gate exists for, and the brain's own workflow
+    /// (CLAUDE.md guidance, the Stop-hook harvest cue) instructs the agent
+    /// to record lessons — a default-deny gate contradicted that at every
+    /// session end. Personalize via `kimetsu config set
+    /// kimetsu.mcp_write_tools false`. Precedence:
+    /// `KIMETSU_MCP_ENABLE_WRITE_TOOLS` env (set = wins, truthy/falsy) >
+    /// this field > default (true). The REMOTE server ignores this field
+    /// entirely (a cloned repo's project.toml is untrusted there) and
+    /// stays env-only, default-deny.
+    #[serde(default = "default_true")]
+    pub mcp_write_tools: bool,
 }
 
 /// v0.8: embedding-model selection. `model` is one of the curated
@@ -662,6 +677,13 @@ max_total_cost_usd = 250.0
             "embedder.warm_on_start must default to true"
         );
         // v1.0.0: reranker defaults to jina-reranker-v1-turbo-en so existing
+        // v1.0.0: a config without mcp_write_tools loads with local write
+        // tools ENABLED, so the record-a-lesson workflow the brain itself
+        // prescribes works out of the box on upgrade.
+        assert!(
+            config.kimetsu.mcp_write_tools,
+            "kimetsu.mcp_write_tools must default to true"
+        );
         // v1.0.0: jina-tiny + pool 6 measured as fitting the hook's 300ms
         // budget on real memories with the best benchmark quality, so the
         // reranker is ON by default.

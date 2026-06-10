@@ -10,6 +10,17 @@ breaking changes require a major bump.
 ## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
+  * **Local MCP write tools enabled by default (`kimetsu.mcp_write_tools`).**
+    The brain's own workflow tells the agent to record lessons
+    (`kimetsu_brain_record`, the Stop-hook harvest cue), but the privileged-
+    write gate default-denied unless `KIMETSU_MCP_ENABLE_WRITE_TOOLS=1` was
+    in the MCP server's env — so every session ended with the agent goaded
+    into a blocked call. The gate is now config-driven for the LOCAL stdio
+    server: `kimetsu.mcp_write_tools` (default true), personalizable via
+    `kimetsu config set kimetsu.mcp_write_tools false`. Precedence: the env
+    var when set always wins (both directions) > config > default. The
+    REMOTE server is unchanged — env-only, default-deny — because a cloned
+    repo's project.toml is untrusted input and must never enable writes.
   * **Cross-encoder reranking (opt-in) + retrieval eval harness + 300ms
     hook budget.** The warm daemon can apply a final cross-encoder rerank
     stage: over-fetch a 12-capsule pool, score each (query, memory) pair
