@@ -20,8 +20,14 @@ Set Padding 12
 Set TypingSpeed 40ms
 
 # ── Hidden setup: a fresh scratch project ────────────────────────────────────
-Hidden
-Type "mkdir kimetsu-demo && cd kimetsu-demo && git init -q && clear"
+Hide
+Type "mkdir kimetsu-demo"
+Enter
+Type "cd kimetsu-demo"
+Enter
+Type "git init -q"
+Enter
+Type "clear"
 Enter
 Sleep 2s
 Show
