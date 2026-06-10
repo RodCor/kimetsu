@@ -103,5 +103,12 @@ jobs:
           # upgrade path. cargo-audit reports zero actual vulnerabilities;
           # this ignore keeps the job green on the informational notice.
           # Re-evaluate when an upstream dependency drops `paste`.
-          ignore: RUSTSEC-2024-0436
+          #
+          # RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained (informational
+          # notice; its functionality moved into rustls-pki-types). Transitive
+          # via axum-server (kimetsu-remote in-process TLS) — no first-party
+          # usage and no axum-server release without it yet. cargo-audit
+          # reports zero actual vulnerabilities. Re-evaluate when axum-server
+          # migrates to rustls-pki-types.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2025-0134
 
