@@ -313,13 +313,17 @@ pub struct BrokerSection {
     /// path more often. Inert on lean (NoopEmbedder) builds because
     /// there is no query embedding to compare against.
     ///
-    /// Default 0.35 (v1.0.0, was 0.0/disabled): with the warm daemon now
-    /// serving semantic retrieval to every prompt, the floor needs teeth by
-    /// default — bge-family cosines for genuinely related pairs sit well
-    /// above ~0.5 while unrelated pairs cluster below ~0.4, so 0.35 trims
-    /// clear noise without starving recall. Tune against `kimetsu brain
-    /// eval`; set 0.0 to restore the old keep-everything behaviour.
-    /// `#[serde(default = …)]` keeps older configs loading with the floor on.
+    /// Default -1.0 = AUTO (v1.0.0): the right floor is MODEL-DEPENDENT,
+    /// because cosine scales differ per embedder. bge-family cosines for
+    /// related pairs sit well above ~0.5 with noise below ~0.4, so auto
+    /// resolves to 0.35 there. jina-v2 cosines run lower — the remote
+    /// benchmark showed a 0.35 floor KILLING relevant results outright
+    /// (MRR 0.90 → 0.77, recall@2 == recall@4) — and that model's own
+    /// precision already keeps noise low (~1.2 vs bge's ~4.0 capsules on
+    /// no-answer queries, floors off), so auto resolves to 0.0 (disabled)
+    /// for non-bge models. Set an explicit value to override auto in
+    /// either direction; 0.0 disables. `#[serde(default = …)]` keeps older
+    /// configs loading with auto.
     #[serde(default = "default_min_semantic_score")]
     pub min_semantic_score: f32,
     /// v1.0.0: absolute *lexical* relevance floor for memory candidates,
@@ -370,7 +374,7 @@ fn default_max_capsules() -> usize {
 }
 
 fn default_min_semantic_score() -> f32 {
-    0.35
+    -1.0
 }
 
 fn default_min_lexical_coverage() -> f32 {
@@ -645,7 +649,7 @@ max_total_cost_usd = 250.0
         assert_eq!(config.broker.max_capsules, 8);
         // v1.0.0: the semantic floor is ON by default (was 0.0/disabled) now
         // that the warm daemon serves semantic retrieval to every prompt.
-        assert_eq!(config.broker.min_semantic_score, 0.35);
+        assert_eq!(config.broker.min_semantic_score, -1.0, "auto sentinel");
         // v1.0.0: a config without min_lexical_coverage loads with the floor
         // active at its default (0.5), so existing installs gain the relevance
         // gate on upgrade.

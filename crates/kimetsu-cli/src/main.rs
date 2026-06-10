@@ -7300,9 +7300,10 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
     // ── 12. Write summary table ───────────────────────────────────────────────
     let caveat = "\
 > **NOTE — remote production floors**: the remote path applies `min_lexical_coverage = 0.5` and \
-`min_semantic_score = 0.35` (default config). Quality numbers are **NOT** directly comparable to \
-the local bench's floors-off results — noise cases below these thresholds are intentional \
-precision wins, not recall failures. The remote path also has **no reranker** stage.\n";
+the AUTO semantic floor (0.35 on bge-family, 0.0 elsewhere — cosine scales are model-dependent). \
+Quality numbers are **NOT** directly comparable to the local bench's floors-off results — noise \
+cases dropped by the floors are intentional precision wins, not recall failures. The remote path \
+also has **no reranker** stage.\n";
 
     let header = format!(
         "| {:<25} | {:>8} | {:>8} | {:>7} | {:>9} | {:>8} | {:>12} | {:>10} | {:>14} | {:>11} | {:>11} |",

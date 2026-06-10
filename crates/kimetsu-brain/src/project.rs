@@ -401,7 +401,7 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         if request.min_semantic_score == 0.0 {
-            request.min_semantic_score = self.config.broker.min_semantic_score;
+            request.min_semantic_score = self.resolved_min_semantic_score();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
@@ -412,6 +412,24 @@ impl BrainSession {
             &extras,
             embeddings::open_embedder_for(self.config.embedder.enabled),
         )
+    }
+
+    /// v1.0.0: resolve the semantic floor for this session's embedder. The
+    /// config default is the AUTO sentinel (-1.0): cosine scales are
+    /// MODEL-DEPENDENT — 0.35 suits bge-family distributions, but the remote
+    /// benchmark showed the same floor killing relevant jina-v2 results
+    /// outright (MRR 0.90 → 0.77, recall@2 == recall@4) — so auto applies
+    /// the bge-calibrated floor only to bge models and disables it
+    /// elsewhere (jina-v2's own precision keeps noise low without it).
+    /// Explicit non-negative config values are used as-is for any model.
+    fn resolved_min_semantic_score(&self) -> f32 {
+        let configured = self.config.broker.min_semantic_score;
+        if configured >= 0.0 {
+            return configured;
+        }
+        let model =
+            embeddings::resolve_embedder_id(Some(self.config.embedder.model.as_str()));
+        if model.starts_with("bge") { 0.35 } else { 0.0 }
     }
 
     /// v0.8: proactive (mid-work) retrieval. Pins [`NoopEmbedder`] so
@@ -485,7 +503,7 @@ impl BrainSession {
         // v1.0.0: semantic floor from config too — this is the daemon's path,
         // where a real query embedding makes the cosine floor effective.
         if request.min_semantic_score == 0.0 {
-            request.min_semantic_score = self.config.broker.min_semantic_score;
+            request.min_semantic_score = self.resolved_min_semantic_score();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
