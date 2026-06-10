@@ -1572,6 +1572,9 @@ fn content_tokens(query: &str) -> Vec<String> {
         .filter(|part| part.len() >= 2)
         .map(str::to_ascii_lowercase)
         .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        // Stem AFTER the stopword check ("during" must not stem to "dur"
+        // and dodge the list) so inflected variants share one IDF entry.
+        .map(|t| light_stem(&t).to_string())
         .filter(|t| seen.insert(t.clone()))
         .collect()
 }
@@ -1659,12 +1662,34 @@ fn weighted_coverage(content: &[String], idf: &HashMap<String, f32>, summary: &s
     }
 }
 
+/// v1.0.0: light query-side stemming — strip the common English inflection
+/// suffixes so "benchmarked"/"benchmarking" reduce to "benchmark". Because
+/// downstream matching is substring (`lexical_relevance`, the IDF `LIKE`
+/// document-frequency count) and FTS-prefix (`fts_query` appends `*`), the
+/// stem matches every variant in the corpus while the inflected form matches
+/// none of them — an unstemmed "benchmarked" gets df=0, loses all IDF
+/// weight, and the relevance floor goes blind on the query's one
+/// discriminating word. Haystacks stay raw; only query tokens are stemmed.
+/// Conservative: a suffix is stripped only when ≥4 chars remain, and only
+/// one suffix is stripped.
+fn light_stem(token: &str) -> &str {
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(stem) = token.strip_suffix(suffix)
+            && stem.len() >= 4
+        {
+            return stem;
+        }
+    }
+    token
+}
+
 fn query_tokens(query: &str) -> Vec<String> {
     let mut tokens: Vec<String> = query
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .map(str::trim)
         .filter(|part| part.len() >= 2)
         .map(str::to_ascii_lowercase)
+        .map(|t| light_stem(&t).to_string())
         .collect();
     // MP-17 #11: task-class routing — augment the query with tool-aware
     // tokens so MP-17b's tool-proficiency capsules surface higher when
@@ -3155,6 +3180,90 @@ mod tests {
         // Stopwords (tell, me, about, what, the, of) dropped; "s" too short.
         // Topical words kept; deduped (no second "the").
         assert_eq!(got, vec!["kimetsu", "idea", "repo"]);
+    }
+
+    #[test]
+    fn light_stem_strips_one_inflection_suffix() {
+        assert_eq!(light_stem("benchmarked"), "benchmark");
+        assert_eq!(light_stem("benchmarking"), "benchmark");
+        assert_eq!(light_stem("repos"), "repo");
+        // Too short after stripping → untouched.
+        assert_eq!(light_stem("does"), "does");
+        assert_eq!(light_stem("toml"), "toml");
+    }
+
+    /// Real-world regression: "Can you find out how kimetsu is benchmarked?"
+    /// surfaced off-topic memories because the inflected "benchmarked"
+    /// matched nothing (FTS prefix `benchmarked*` and IDF `%benchmarked%`
+    /// both miss "benchmark"), zeroing the query's only discriminating
+    /// token. With query-side stemming the benchmark memory surfaces and
+    /// the off-topic ones stay below the floor.
+    #[test]
+    fn stemmed_query_matches_inflected_corpus_through_floor() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let insert = |id: &str, text: &str| {
+            let norm = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "INSERT INTO memories (
+                     memory_id, scope, kind, text, normalized_text, confidence,
+                     source_event_id, provenance_snapshot_json, created_at,
+                     use_count, usefulness_score, embedding, embedding_model
+                 )
+                 VALUES (?1, 'global_user', 'fact', ?2, ?3, 0.9, NULL, '{}',
+                         '2026-06-01T00:00:00Z', 0, 0.0, NULL, NULL)",
+                rusqlite::params![id, text, norm],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'global_user')",
+                rusqlite::params![id, text],
+            )
+            .expect("insert fts");
+        };
+        insert(
+            "m_bench",
+            "kimetsu benchmark runs go through the kbench binary and the Terminal-Bench driver",
+        );
+        insert(
+            "m_doctor",
+            "kimetsu doctor version-skew check parses process start times on Windows via CIM",
+        );
+        insert(
+            "m_gc",
+            "kimetsu runs auto-GC on run creation; keep the env guard at the trigger site",
+        );
+
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &kimetsu_core::config::BrokerWeights::default(),
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "Can you find out how kimetsu is benchmarked?".to_string(),
+                budget_tokens: 2000,
+                max_capsules: 2,
+                min_lexical_coverage: 0.5,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+        let handles: Vec<_> = bundle
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        assert!(
+            handles.contains(&"memory:m_bench"),
+            "stemmed 'benchmarked' must surface the benchmark memory; got {handles:?}"
+        );
+        assert!(
+            !handles.contains(&"memory:m_doctor") && !handles.contains(&"memory:m_gc"),
+            "off-topic memories sharing only 'kimetsu' must stay below the floor; got {handles:?}"
+        );
     }
 
     #[test]

@@ -420,7 +420,14 @@ impl BrainSession {
     /// cheap. `request.kinds` should restrict to actionable kinds; the
     /// caller sets a high `min_score` and `max_capsules: 1` so recall is
     /// rare and confident (the human-brain "it comes to you" model).
-    pub fn retrieve_proactive(&self, request: ContextRequest) -> KimetsuResult<ContextBundle> {
+    pub fn retrieve_proactive(&self, mut request: ContextRequest) -> KimetsuResult<ContextBundle> {
+        // v1.0.0: the lexical floor applies here too — proactive recall is
+        // FTS-only, so without it an off-topic memory sharing a ubiquitous
+        // token with the command line (e.g. "config") can take the single
+        // proactive slot.
+        if request.min_lexical_coverage == 0.0 {
+            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
+        }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         context::retrieve_context_with_embedder(
             &self.conn,
