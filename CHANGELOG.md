@@ -15,11 +15,15 @@ ADDED
     stage: over-fetch a 12-capsule pool, score each (query, memory) pair
     jointly with a fastembed reranker (`[embedder] reranker` = a curated id;
     default `"off"`), drop below a 0.30 relevance floor, truncate to the cap.
-    It defaults OFF because the trade was measured, not assumed: full-
-    fidelity reranking costs ~0.5–1s on a typical CPU (beyond the hook's
-    budget), and snippet/pool shrinking to force it under budget regressed
-    eval recall@4 from 0.83 to 0.66 — worse than FTS. The default hook path
-    is instead semantic + the cosine floor: `broker.min_semantic_score` is
+    Every knob was chosen by measurement: `jina-reranker-v1-tiny-en`
+    (default) beat the larger turbo model on both quality and speed in the
+    head-to-head benchmark, a pool of 6 matches pool-12 quality exactly at
+    half the latency, and summaries must stay FULL (snippet truncation
+    cratered recall@4 from 0.83 to 0.66 — worse than FTS). With those
+    settings a warm rerank answers inside the 300ms hook budget on a real
+    brain (~265ms measured); slower machines degrade gracefully to
+    floored-FTS for that turn, or set `reranker = "off"`. Backing the
+    default path, the cosine floor: `broker.min_semantic_score` is
     now ON by default (0.35) *and actually wired* (it previously defaulted
     to 0.0 and was never populated from config in any production path). The
     hook's daemon budget tightens 750ms → 300ms; a warm semantic answer
@@ -34,12 +38,12 @@ ADDED
     against a committed fixture (`fixtures/eval-retrieval.json`), so ranking
     changes are measurable: baseline shows semantic recall@4 0.90 / MRR 0.91
     vs FTS 0.72 / 0.81. `--rerankers <ids>` benchmarks cross-encoders
-    head-to-head (quality + per-query latency); non-curated models load as
-    user-defined ONNX from any HuggingFace repo via hf-hub. Measured result:
-    `jina-reranker-v1-tiny-en` beats the bigger turbo model on both quality
-    (recall@4 0.896 / MRR 0.938 vs 0.833 / 0.875) and speed (~95ms vs ~137ms
-    per query) and is the recommended opt-in; ms-marco TinyBERT-L-2 is ~11×
-    faster still (8.5ms) but its quality (0.715) merely matches FTS.
+    head-to-head (quality + per-query latency) and `--pool` sweeps pool
+    sizes; non-curated models load as user-defined ONNX from any HuggingFace
+    repo via hf-hub. Benchmark results: jina-tiny recall@4 0.896 / MRR 0.938
+    at ~44ms per query (pool 6) vs turbo 0.833 / 0.875 at ~137ms (pool 12);
+    ms-marco TinyBERT-L-2 is ~5× faster still (8.5ms) but its quality
+    (0.715) merely matches FTS.
   * **Warm embedder daemon — semantic recall at hook time.** The
     `UserPromptSubmit` context-hook can now match memories by *meaning*, not
     just lexically. A single per-user daemon (`kimetsu brain embed-daemon`,

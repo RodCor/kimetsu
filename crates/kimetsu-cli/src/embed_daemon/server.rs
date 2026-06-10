@@ -12,14 +12,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Candidate pool the reranker judges before truncating to the caller's cap.
-/// 12 is the quality-optimal setting on the eval fixture. Reranking is an
-/// opt-in (`[embedder] reranker`, default off): a full-fidelity rerank of 12
-/// summaries costs ~0.5–1s on a typical CPU, which intentionally exceeds the
-/// hook's 300ms budget — users who enable it trade first-turn latency
-/// (FTS-fallback turns) for top-position precision once answers are cached
-/// warm. Snippet-truncation and smaller pools were tried and measurably
-/// regressed eval recall, so the knobs stay at quality-optimal values.
-const RERANK_POOL: usize = 12;
+/// 6: measured on the eval fixture (full summaries, jina-tiny), pool 6
+/// matches pool 12's quality exactly (recall@2/4 0.882/0.896, MRR 0.938,
+/// noise 0) at half the rerank latency (~44ms vs ~95ms per query) — the
+/// earlier pool-shrink regression was the snippet truncation, not the pool.
+/// NOTE: summaries must stay FULL — truncating them cratered recall.
+const RERANK_POOL: usize = 6;
 
 /// Sigmoid-score floor — capsules the cross-encoder judges below this are noise.
 const RERANK_FLOOR: f32 = 0.30;

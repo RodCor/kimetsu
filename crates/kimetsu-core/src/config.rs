@@ -108,17 +108,15 @@ pub struct EmbedderSection {
     /// `ms-marco-tinybert-l-2-v2`, `ms-marco-minilm-l-4-v2`), or any
     /// HuggingFace `org/repo` with an ONNX export.
     ///
-    /// Off by default because it's a measured quality-over-latency trade:
-    /// reranking a 12-capsule pool of real (long) memories exceeds the
-    /// hook's 300ms budget on a typical CPU, while the default semantic
-    /// path (hybrid cosine + the `min_semantic_score` floor) already
-    /// scores recall@4 ≈ 0.90 / MRR 0.91 on the eval fixture at ~100ms.
-    /// Benchmarked (`kimetsu brain eval --rerankers …`): the best opt-in is
-    /// `jina-reranker-v1-tiny-en` — recall@4 0.896 / MRR 0.938, ~95ms per
-    /// query on short capsules, noise → 0 — beating the larger turbo model
-    /// on BOTH quality and speed. Enable it when top-position precision
-    /// matters more than first-turn latency; validate on your own corpus
-    /// with `kimetsu brain eval`.
+    /// Default `jina-reranker-v1-tiny-en`, chosen by benchmark
+    /// (`kimetsu brain eval --rerankers …`): it beats the larger turbo
+    /// model on BOTH quality (recall@2 0.882 / recall@4 0.896 / MRR 0.938,
+    /// noise → 0) and speed, and with the daemon's pool of 6 a warm rerank
+    /// answers inside the hook's 300ms budget on the real brain (~265ms
+    /// measured). On slower machines a miss degrades gracefully to
+    /// floored-FTS for that turn. `"off"` disables reranking (the hook
+    /// then serves hybrid-semantic + cosine floor, ~100ms warm). Validate
+    /// changes on your own corpus with `kimetsu brain eval`.
     #[serde(default = "default_reranker_id")]
     pub reranker: String,
 }
@@ -128,7 +126,7 @@ fn default_embedder_id() -> String {
 }
 
 fn default_reranker_id() -> String {
-    "off".to_string()
+    "jina-reranker-v1-tiny-en".to_string()
 }
 
 fn default_true() -> bool {
@@ -664,13 +662,13 @@ max_total_cost_usd = 250.0
             "embedder.warm_on_start must default to true"
         );
         // v1.0.0: reranker defaults to jina-reranker-v1-turbo-en so existing
-        // v1.0.0: reranking is a measured quality-over-latency OPT-IN — a
-        // full-fidelity rerank exceeds the hook's 300ms budget, so the
-        // default is off and the semantic+floor path serves the hook.
+        // v1.0.0: jina-tiny + pool 6 measured as fitting the hook's 300ms
+        // budget on real memories with the best benchmark quality, so the
+        // reranker is ON by default.
         assert_eq!(
             config.embedder.reranker,
-            "off",
-            "embedder.reranker must default to off (opt-in)"
+            "jina-reranker-v1-tiny-en",
+            "embedder.reranker must default to jina-reranker-v1-tiny-en"
         );
     }
 

@@ -765,6 +765,10 @@ struct EvalArgs {
     /// Example: `--rerankers jina-reranker-v1-turbo-en,jina-reranker-v1-tiny-en`
     #[arg(long, default_value = "")]
     rerankers: String,
+    /// Candidate-pool size handed to the reranker before truncating to the
+    /// cap (mirrors the daemon's RERANK_POOL; 12 is the production value).
+    #[arg(long, default_value_t = 12)]
+    pool: usize,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -6092,8 +6096,9 @@ fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     };
 
     // ── 4. Run the three modes ────────────────────────────────────────────────
-    // Mirror the daemon's production constants (server.rs RERANK_POOL/FLOOR).
-    let pool = 12usize;
+    // Pool mirrors the daemon's RERANK_POOL by default; --pool overrides it
+    // for pool-size experiments.
+    let pool = args.pool.max(1);
     let rerank_floor = 0.30f32;
     let rerank_cap = 4usize;
 
