@@ -136,6 +136,18 @@ cargo install kimetsu-cli --features embeddings,pi,openclaw
 
 # From source
 cargo install --path crates/kimetsu-cli   # add --features embeddings,pi,openclaw for full build
+
+### Retrieval quality (benchmarked defaults)
+
+The embeddings build retrieves with **jina-v2-base-code** (embedder) +
+**ms-marco-tinybert-l-2-v2** (cross-encoder reranker), chosen with
+`kimetsu brain bench` on a 100-case dataset built from real exported
+memories: **recall@4 0.966, MRR 0.938, ~43ms per rerank, ~4× less
+off-topic noise** than the bge-small baseline (FTS-only scores MRR ~0.81).
+Swap models with `kimetsu config set embedder.model|reranker …` (then
+`kimetsu brain reindex`), and re-judge on your own corpus with
+`kimetsu brain bench` — see "Retrieval models & benchmarking" in
+[HOW-KIMETSU-WORKS](docs/HOW-KIMETSU-WORKS.md).
 ```
 
 Prefer not to touch the Rust toolchain? Two options.

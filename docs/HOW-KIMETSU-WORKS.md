@@ -455,12 +455,11 @@ The core hook pattern is the same across MCP hosts:
   and spawns the daemon for next time, so the prompt is never blocked. The
   daemon holds the ONNX model in memory once (no per-prompt cold load) and
   serves hybrid semantic retrieval with an absolute cosine floor, finished
-  by a cross-encoder rerank of a 6-capsule pool (`jina-reranker-v1-tiny-en`
-  by default — chosen by benchmark; `[embedder] reranker = "off"` disables).
-  `kimetsu brain eval` measures the stack (recall@4 ~0.90 / MRR 0.94
-  reranked vs ~0.72 / 0.81 FTS on the committed fixture) and
-  `--rerankers`/`--pool` benchmark alternatives. Toggles: `[embedder]
-  daemon` / `warm_on_start` / `reranker`, or `KIMETSU_EMBED_DAEMON=0`.
+  by a cross-encoder rerank of a 6-capsule pool (`ms-marco-tinybert-l-2-v2`
+  by default, paired with the `jina-v2-base-code` embedder — both chosen by
+  benchmark; see "Retrieval models & benchmarking" below). Toggles:
+  `[embedder] daemon` / `warm_on_start` / `reranker`, or
+  `KIMETSU_EMBED_DAEMON=0`.
 - **`Stop` → `kimetsu brain stop-hook`** fires when the host supports a
   stop event. It walks the transcript, counts `kimetsu_brain_record`
   calls, and prints a one-line post-turn banner — either confirming how
@@ -554,6 +553,56 @@ stdio command, deriving the repo id from your git remote and referencing
   arbitrary clones; private repos use the server's own git auth.
 
 ---
+
+
+## 7b. Retrieval models & benchmarking (local)
+
+The local retrieval stack is **embedder + cross-encoder reranker**, both
+running warm inside the embed daemon. Defaults were chosen with
+`kimetsu brain bench` — a benchmark built from REAL exported memories
+(`bench/dataset.json`, 100 cases: keyword, paraphrase, oblique, confusable,
+in-domain no-answer, open multi-answer) that records expected-vs-obtained
+per case, latency, and RAM per embedder × reranker combo:
+
+| embedder          | reranker     | recall@2 | recall@4 |  MRR  | mean ms | noise | peak RSS |
+|-------------------|--------------|----------|----------|-------|---------|-------|----------|
+| bge-small-en-v1.5 | minilm-l-4   | 0.954    | 0.989    | 0.953 | 442     | 4.0   | 1.3 GB   |
+| **jina-v2-base-code** | **tinybert-l-2** | 0.943 | 0.966 | 0.938 | **43**  | **1.2** | 1.5 GB |
+| bge-small-en-v1.5 | jina-turbo   | 0.954    | 0.989    | 0.947 | 819     | 4.0   | 1.5 GB   |
+| jina-v2-base-code | off          | 0.954    | 0.966    | 0.928 | 28      | 1.2   | 1.5 GB   |
+| bge-small-en-v1.5 | off          | 0.931    | 0.966    | 0.911 | 16      | 4.0   | 354 MB   |
+
+The default (**jina-v2-base-code + ms-marco-tinybert-l-2-v2**) sits within
+noise of the best quality, injects ~4× less off-topic noise than bge-small,
+and reranks in ~43ms — far inside the hook's 300ms budget. Quality
+differences between rerankers are 1–3 cases at this corpus size; any
+reranker reliably beats none. Trade-off: ~1.5 GB resident daemon (the
+lean-RAM alternative is `bge-small-en-v1.5` + `tinybert`, ~525 MB).
+
+**Swapping models** (all local, takes effect after a daemon restart):
+
+```bash
+kimetsu config set embedder.model bge-small-en-v1.5      # or bge-m3, jina-v2-base-code
+kimetsu config set embedder.reranker jina-reranker-v1-tiny-en   # or off, minilm, any HF org/repo ONNX
+kimetsu brain reindex          # REQUIRED after an embedder change (vector dims differ)
+kimetsu brain daemon stop      # next prompt/warm spawns a daemon with the new models
+```
+
+`KIMETSU_BRAIN_EMBEDDER` overrides the config per-process. Non-curated
+rerankers load as user-defined ONNX from any HuggingFace repo.
+
+**Re-judging as your brain grows** — the benchmark's value compounds:
+
+```bash
+kimetsu brain export bench/memories-export.json   # refresh the dataset source
+kimetsu brain bench                               # full grid -> bench/results/summary.md
+kimetsu brain eval                                # fixture-based quick check (recall@k, MRR)
+```
+
+Watch-item: the semantic floor (`broker.min_semantic_score`, 0.35) was
+calibrated on bge-family cosine distributions; if you see over- or
+under-filtering after an embedder change, re-tune it against
+`kimetsu brain eval`.
 
 ## 8. The bridge
 

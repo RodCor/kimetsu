@@ -10,6 +10,14 @@ breaking changes require a major bump.
 ## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **Local MCP write tools enabled by default (`kimetsu.mcp_write_tools`).**
     The brain's own workflow tells the agent to record lessons
     (`kimetsu_brain_record`, the Stop-hook harvest cue), but the privileged-
@@ -283,6 +291,14 @@ FIXED
 ## v0.9.0 — auto-harvested memories + SessionEnd distiller
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **Credentialed SessionEnd distiller (opt-in).** A second, deterministic
     memory-harvest path alongside the v0.9.0 in-agent harvester. `kimetsu plugin
     install claude-code` and `kimetsu plugin install codex` now run an
@@ -351,6 +367,14 @@ FIXED
 ## v0.8.4 — non-destructive plugin install + global scope
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **Global plugin install.** `kimetsu plugin install <target> --scope global`
     installs the Kimetsu surface into the user's home for every session —
     `~/.claude/` + `~/.claude.json` (`mcpServers`) for Claude Code, and
@@ -370,6 +394,14 @@ FIXED
 ## v0.8.3 — npm distribution
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu-ai`
     installs the prebuilt native binary for your platform, no Rust toolchain
     required. Uses the esbuild/turbo model: per-platform packages
@@ -403,6 +435,14 @@ The release that makes the brain **proactive** and gives the agent (and user)
 full control over it from inside Claude Code / Codex.
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **Proactive recall (mid-work).** New `PreToolUse` / `PostToolUse` Bash hooks
     surface a relevant memory *while the agent works*, not just on prompt:
     - after a **failed** Bash command, surface a matching `failure_pattern` /
@@ -470,6 +510,14 @@ capture without duplication, retrieve without asking, and surface
 what was learned each session.
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **Semantic dedup at capture.** `propose_or_merge_memory` (new in
     `kimetsu-brain`) runs before any memory is written. Exact dups
     short-circuit; near-dups (cosine ≥ 0.85, same scope) merge into
@@ -507,6 +555,14 @@ Retrieval and capture become silent by default and only speak up when
 they have something worth saying.
 
 ADDED
+  * **Benchmark-chosen retrieval defaults: jina-v2-base-code + TinyBERT.**
+    `kimetsu brain bench` (100 real-memory cases) drove the defaults:
+    embedder `jina-v2-base-code` (recovers oblique queries bge-small never
+    pools; ~4x less off-topic noise) + reranker `ms-marco-tinybert-l-2-v2`
+    (~43ms, within noise of the best MRR). Existing brains need
+    `kimetsu brain reindex` after upgrading (vector dims 384 -> 768); set
+    `embedder.model`/`embedder.reranker` back to taste and re-judge with
+    `kimetsu brain bench`. Lean-RAM alternative: bge-small + tinybert.
   * **`kimetsu_brain_context` zero-overhead contract.** When the brain
     has nothing relevant it returns `skipped: true` and injects nothing —
     so a host agent can call it on every non-trivial task without paying

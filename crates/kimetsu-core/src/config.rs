@@ -123,25 +123,24 @@ pub struct EmbedderSection {
     /// `ms-marco-tinybert-l-2-v2`, `ms-marco-minilm-l-4-v2`), or any
     /// HuggingFace `org/repo` with an ONNX export.
     ///
-    /// Default `jina-reranker-v1-tiny-en`, chosen by benchmark
-    /// (`kimetsu brain eval --rerankers …`): it beats the larger turbo
-    /// model on BOTH quality (recall@2 0.882 / recall@4 0.896 / MRR 0.938,
-    /// noise → 0) and speed, and with the daemon's pool of 6 a warm rerank
-    /// answers inside the hook's 300ms budget on the real brain (~265ms
-    /// measured). On slower machines a miss degrades gracefully to
-    /// floored-FTS for that turn. `"off"` disables reranking (the hook
-    /// then serves hybrid-semantic + cosine floor, ~100ms warm). Validate
-    /// changes on your own corpus with `kimetsu brain eval`.
+    /// Default `ms-marco-tinybert-l-2-v2`, chosen with `kimetsu brain
+    /// bench` on the 100-case real-memory dataset: paired with the
+    /// `jina-v2-base-code` embedder it lands within noise of the best
+    /// quality (MRR 0.938 vs 0.953 top) at ~43ms per rerank — far inside
+    /// the hook's 300ms budget. On slower machines a miss degrades
+    /// gracefully to floored-FTS for that turn. `"off"` disables
+    /// reranking. Validate changes on your own corpus with
+    /// `kimetsu brain bench` / `kimetsu brain eval`.
     #[serde(default = "default_reranker_id")]
     pub reranker: String,
 }
 
 fn default_embedder_id() -> String {
-    "bge-small-en-v1.5".to_string()
+    "jina-v2-base-code".to_string()
 }
 
 fn default_reranker_id() -> String {
-    "jina-reranker-v1-tiny-en".to_string()
+    "ms-marco-tinybert-l-2-v2".to_string()
 }
 
 fn default_true() -> bool {
@@ -630,7 +629,7 @@ max_total_model_turns = 30
 max_total_cost_usd = 250.0
 "#;
         let config = ProjectConfig::from_toml(toml).expect("pre-v0.8 toml must load");
-        assert_eq!(config.embedder.model, "bge-small-en-v1.5");
+        assert_eq!(config.embedder.model, "jina-v2-base-code");
         // A pre-v0.8.5 toml has no [learning] section — auto-harvest
         // defaults on so existing installs gain the behavior on upgrade.
         assert!(config.learning.auto_harvest);
@@ -689,8 +688,8 @@ max_total_cost_usd = 250.0
         // reranker is ON by default.
         assert_eq!(
             config.embedder.reranker,
-            "jina-reranker-v1-tiny-en",
-            "embedder.reranker must default to jina-reranker-v1-tiny-en"
+            "ms-marco-tinybert-l-2-v2",
+            "embedder.reranker must default to ms-marco-tinybert-l-2-v2"
         );
     }
 
