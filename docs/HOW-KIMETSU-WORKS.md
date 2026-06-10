@@ -597,25 +597,29 @@ kimetsu brain bench --remote --embedders bge-small-en-v1.5 --dataset bench/datas
 
 The local retrieval stack is **embedder + cross-encoder reranker**, both
 running warm inside the embed daemon. Defaults were chosen with
-`kimetsu brain bench` — a benchmark built from REAL exported memories
-(`bench/dataset.json`, 100 cases: keyword, paraphrase, oblique, confusable,
-in-domain no-answer, open multi-answer) that records expected-vs-obtained
-per case, latency, and RAM per embedder × reranker combo:
+`kimetsu brain bench` — a benchmark seeded from REAL exported memories
+(`bench/dataset-100.json`: 100 memories in confusable topic clusters, 210
+cases — keyword, paraphrase, oblique, confusable, in-domain no-answer, open
+multi-answer) that records expected-vs-obtained per case, latency, and RAM
+per embedder × reranker combo (floors off — raw ranking quality):
 
-| embedder          | reranker     | recall@2 | recall@4 |  MRR  | mean ms | noise | peak RSS |
-|-------------------|--------------|----------|----------|-------|---------|-------|----------|
-| bge-small-en-v1.5 | minilm-l-4   | 0.954    | 0.989    | 0.953 | 442     | 4.0   | 1.3 GB   |
-| **jina-v2-base-code** | **tinybert-l-2** | 0.943 | 0.966 | 0.938 | **43**  | **1.2** | 1.5 GB |
-| bge-small-en-v1.5 | jina-turbo   | 0.954    | 0.989    | 0.947 | 819     | 4.0   | 1.5 GB   |
-| jina-v2-base-code | off          | 0.954    | 0.966    | 0.928 | 28      | 1.2   | 1.5 GB   |
-| bge-small-en-v1.5 | off          | 0.931    | 0.966    | 0.911 | 16      | 4.0   | 354 MB   |
+| embedder          | reranker     | recall@2 | recall@4 |  MRR  | mean ms | peak RSS |
+|-------------------|--------------|----------|----------|-------|---------|----------|
+| jina-v2-base-code | jina-turbo   | 0.954    | 0.975    | 0.933 | 552     | 2.0 GB   |
+| jina-v2-base-code | jina-tiny    | 0.949    | 0.975    | 0.931 | 414     | 2.0 GB   |
+| jina-v2-base-code | minilm-l-4   | 0.949    | 0.959    | 0.927 | 372     | 2.3 GB   |
+| **jina-v2-base-code** | **tinybert-l-2** | 0.914 | 0.949 | 0.914 | **132** | 1.5 GB |
+| jina-v2-base-code | off          | 0.929    | 0.939    | 0.915 | 106     | 1.5 GB   |
+| bge-small-en-v1.5 | off          | 0.919    | 0.934    | 0.905 | 446     | 359 MB   |
 
-The default (**jina-v2-base-code + ms-marco-tinybert-l-2-v2**) sits within
-noise of the best quality, injects ~4× less off-topic noise than bge-small,
-and reranks in ~43ms — far inside the hook's 300ms budget. Quality
-differences between rerankers are 1–3 cases at this corpus size; any
-reranker reliably beats none. Trade-off: ~1.5 GB resident daemon (the
-lean-RAM alternative is `bge-small-en-v1.5` + `tinybert`, ~525 MB).
+The default (**jina-v2-base-code + ms-marco-tinybert-l-2-v2**) is the
+fastest reranked combo, within ~2% MRR of the grid best, and its rerank
+stage fits the hook's 300ms budget. The jina-v2 embedder beats bge-small
+across every reranker on this corpus (it recovers oblique, dev-phrased
+queries bge never pools). Any reranker reliably beats none; the top three
+rerankers are within noise of each other. Trade-off: ~1.5 GB resident
+daemon (the lean-RAM option is `bge-small-en-v1.5`, ~360-525 MB, at
+~1-3% lower MRR).
 
 **Swapping models** (all local, takes effect after a daemon restart):
 

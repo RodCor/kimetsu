@@ -141,9 +141,10 @@ cargo install --path crates/kimetsu-cli   # add --features embeddings,pi,opencla
 
 The embeddings build retrieves with **jina-v2-base-code** (embedder) +
 **ms-marco-tinybert-l-2-v2** (cross-encoder reranker), chosen with
-`kimetsu brain bench` on a 100-case dataset built from real exported
-memories: **recall@4 0.966, MRR 0.938, ~43ms per rerank, ~4× less
-off-topic noise** than the bge-small baseline (FTS-only scores MRR ~0.81).
+`kimetsu brain bench` on a 100-memory / 210-case confusable-cluster
+dataset seeded from real exported memories: **recall@4 0.949, MRR 0.914
+at ~132ms per retrieval+rerank** (the fastest combo within ~2% of the
+0.933 grid best; FTS-only scores MRR ~0.81 on the eval fixture).
 Swap models with `kimetsu config set embedder.model|reranker …` (then
 `kimetsu brain reindex`), and re-judge on your own corpus with
 `kimetsu brain bench` — see "Retrieval models & benchmarking" in

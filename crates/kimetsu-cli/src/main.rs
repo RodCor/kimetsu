@@ -6913,7 +6913,7 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         // ── 4. Spawn server ───────────────────────────────────────────────────
         let addr = format!("127.0.0.1:{port}");
         let token = "benchtoken";
-        let mut server = std::process::Command::new(&server_bin)
+        let server = std::process::Command::new(&server_bin)
             .arg("serve")
             .arg("--addr")
             .arg(&addr)
@@ -6931,7 +6931,19 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
             .spawn()
             .map_err(|e| format!("spawn kimetsu-remote: {e}"))?;
 
-        let server_pid = server.id();
+        // Kill-on-drop guard: any `?` between here and the explicit kill
+        // below would otherwise orphan a live server holding its port and
+        // a lock on the temp data dir.
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut server = ChildGuard(server);
+
+        let server_pid = server.0.id();
 
         // ── 5. Poll readiness (GET /healthz, up to 60s) ───────────────────────
         let client = reqwest::blocking::Client::builder()
@@ -6952,7 +6964,7 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
             }
         }
         if !ready {
-            let _ = server.kill();
+            let _ = server.0.kill();
             return Err(format!("kimetsu-remote did not become ready within 60s (port {port})").into());
         }
         println!("  server ready on :{port}");
@@ -7174,8 +7186,8 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
 
         // ── 9. Record peak RSS, kill server ───────────────────────────────────
         let peak_rss = process_rss_mb(server_pid);
-        let _ = server.kill();
-        let _ = server.wait();
+        let _ = server.0.kill();
+        let _ = server.0.wait();
         let _ = std::fs::remove_dir_all(&data_dir);
 
         // ── 10. Aggregate metrics ─────────────────────────────────────────────

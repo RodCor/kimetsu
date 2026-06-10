@@ -2149,8 +2149,12 @@ pub fn rerank_capsules(
     // quality-over-latency opt-in, not part of the hook's 300ms budget.
     let docs: Vec<&str> = capsules.iter().map(|c| c.summary.as_str()).collect();
     let scores = match reranker.rerank(query, &docs) {
-        Ok(s) => s,
-        Err(_) => {
+        // The trait contract is one score per doc in doc order; a custom
+        // third-party reranker that returns a short vec would otherwise
+        // silently drop the unscored tail via the zip below — treat a
+        // length mismatch as an error and fail open instead.
+        Ok(s) if s.len() == docs.len() => s,
+        _ => {
             // Fail-open: preserve input order, just apply cap.
             let mut out = capsules;
             if cap > 0 && out.len() > cap {
