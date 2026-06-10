@@ -10,6 +10,15 @@ breaking changes require a major bump.
 ## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
+  * **Remote cross-encoder rerank stage.** `kimetsu-remote serve` now applies a
+    cross-encoder reranker to every `kimetsu_brain_context` call (`--reranker`,
+    default `jina-reranker-v1-tiny-en`, operator-level; `"off"` disables; any
+    curated or HuggingFace ONNX id accepted). The default was chosen by the
+    100-memory benchmark: jina-tiny MRR 0.931 vs 0.914 for TinyBERT on the local
+    bench; the remote path has no hook-latency budget so the fastest effective
+    reranker wins. Benchmark lift with reranker: jina-v2-base-code MRR 0.904 →
+    0.906, bge-small MRR 0.901 → 0.909 (production floors active).
+
   * **Model-aware AUTO semantic floor + kimetsu-remote benchmark.** `kimetsu
     brain bench --remote` boots a real kimetsu-remote server per embedder,
     drives the 100-case dataset over HTTP MCP (sequential + concurrent), and

@@ -552,6 +552,44 @@ stdio command, deriving the repo id from your git remote and referencing
   retrieval includes **file capsules** remotely too. Clients can't trigger
   arbitrary clones; private repos use the server's own git auth.
 
+### Retrieval models on the server
+
+The remote server runs a **cross-encoder reranker** stage on every
+`kimetsu_brain_context` call — the same stage the local daemon uses, but
+operator-configured rather than per-repo.
+
+**`--reranker <model>`** (default `jina-reranker-v1-tiny-en`, operator-level):
+over-fetches a candidate pool of 6 capsules, runs the cross-encoder, drops noise
+capsules below sigmoid score 0.30, and truncates to the caller's `max_capsules`.
+`"off"` disables reranking. Any curated id or HuggingFace ONNX path is accepted
+(same model registry as the local daemon).  The default was chosen by the 100-memory
+benchmark — jina-tiny MRR 0.931 vs 0.914 for TinyBERT on the local bench; remote
+has no hook-latency budget so the lightest reranker wins.
+
+The **embedder** comes from per-repo config or `KIMETSU_BRAIN_EMBEDDER` (set before
+seeding; reindex required after changes). The reranker is an operator flag and
+cannot be overridden by a cloned repo's `project.toml` (untrusted on a server).
+
+**Remote benchmark results** (100-case dataset, WITH jina-tiny reranker, production
+floors active):
+
+| embedder          | recall@2 | recall@4 |  MRR  | seq mean | rps  | peak RSS |
+|-------------------|----------|----------|-------|----------|------|----------|
+| jina-v2-base-code | 0.924    | 0.939    | 0.906 | 416ms    |  5.0 | 1198 MB  |
+| bge-small-en-v1.5 | 0.929    | 0.939    | 0.909 | 700ms    |  3.8 |  697 MB  |
+
+vs. pre-rerank baselines: jina-v2 was MRR 0.904, bge-small was MRR 0.901.
+
+```bash
+# Re-judge as your brain grows (one embedder per invocation):
+kimetsu brain bench --remote --embedders jina-v2-base-code --dataset bench/dataset-100.json --out bench/results-100
+kimetsu brain bench --remote --embedders bge-small-en-v1.5 --dataset bench/dataset-100.json --out bench/results-100
+```
+
+> **One embedder per invocation** — multi-embedder `--remote` runs seed later combos with the
+> first embedder's vectors (process-global singleton). Kill stray `kimetsu-remote` processes
+> between runs.
+
 ---
 
 

@@ -806,7 +806,7 @@ struct BrainBenchArgs {
     /// Benchmark kimetsu-remote over HTTP instead of the local in-process path.
     /// Spawns the release server binary, seeds a temp brain, and measures
     /// per-case latency (sequential + concurrent), recall@k, MRR, and server RSS.
-    /// Rerankers are ignored (the remote path has no rerank stage).
+    /// The server reranks with its `--reranker` flag (default jina-tiny).
     #[arg(long)]
     remote: bool,
     /// Number of parallel HTTP workers for the concurrent latency pass (--remote only).
@@ -6809,7 +6809,7 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    println!("brain bench --remote: {} embedder(s) (rerankers ignored — remote has no rerank stage)", embedders.len());
+    println!("brain bench --remote: {} embedder(s) (server reranks with --reranker default jina-tiny)", embedders.len());
     println!("NOTE: remote applies PRODUCTION floors (min_lexical_coverage 0.5, min_semantic_score 0.35).");
     println!("      Quality numbers are NOT directly comparable to local floors-off results.");
     println!("dataset: {}", args.dataset.display());
@@ -7302,8 +7302,8 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
 > **NOTE — remote production floors**: the remote path applies `min_lexical_coverage = 0.5` and \
 the AUTO semantic floor (0.35 on bge-family, 0.0 elsewhere — cosine scales are model-dependent). \
 Quality numbers are **NOT** directly comparable to the local bench's floors-off results — noise \
-cases dropped by the floors are intentional precision wins, not recall failures. The remote path \
-also has **no reranker** stage.\n";
+cases dropped by the floors are intentional precision wins, not recall failures. The remote server \
+reranks with `--reranker` (default `jina-reranker-v1-tiny-en`, operator-level, `off` disables).\n";
 
     let header = format!(
         "| {:<25} | {:>8} | {:>8} | {:>7} | {:>9} | {:>8} | {:>12} | {:>10} | {:>14} | {:>11} | {:>11} |",

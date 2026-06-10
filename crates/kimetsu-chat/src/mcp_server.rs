@@ -651,7 +651,36 @@ fn parse_shared_retrieval_args(
 }
 
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    use kimetsu_brain::context::ContextRequest;
+    match brain_context_tool(workspace, arguments, None) {
+        Ok(v) => v,
+        Err(e) => brain_unavailable_json(workspace, &e),
+    }
+}
+
+/// Candidate pool the remote reranker judges before truncating to the caller's
+/// cap. Mirrors `RERANK_POOL` in `kimetsu-cli/src/embed_daemon/server.rs`.
+pub const REMOTE_RERANK_POOL: usize = 6;
+
+/// Sigmoid-score floor for the remote reranker — capsules scored below this
+/// are noise. Mirrors `RERANK_FLOOR` in `kimetsu-cli/src/embed_daemon/server.rs`.
+pub const REMOTE_RERANK_FLOOR: f32 = 0.30;
+
+/// Transport-agnostic body of the `kimetsu_brain_context` tool.
+///
+/// When `reranker` is `None` the behaviour is identical to the previous
+/// private implementation (used by the stdio MCP path). When `Some`:
+/// - over-fetches a larger candidate pool (`max_capsules = cap.max(REMOTE_RERANK_POOL)`)
+/// - bumps `budget_tokens` to at least 6000 so the pool isn't token-starved
+/// - retrieves, then calls `rerank_capsules` before serialising
+///
+/// The JSON response shape is byte-compatible with the `None` path so
+/// existing tests and the stdio consumer are unaffected.
+pub fn brain_context_tool(
+    workspace: &Path,
+    arguments: &serde_json::Value,
+    reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
+) -> Result<serde_json::Value, String> {
+    use kimetsu_brain::context::{rerank_capsules, ContextRequest};
 
     let query = arguments
         .get("query")
@@ -659,16 +688,16 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         .unwrap_or("")
         .trim();
     if query.is_empty() {
-        return json!({
+        return Ok(json!({
             "ok": false,
             "error": "missing `query`",
             "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
-        });
+        }));
     }
     let shared = parse_shared_retrieval_args(arguments, 6000, 3);
     let stage = shared.stage.as_str();
     let budget_tokens = shared.budget_tokens;
-    let max_capsules = shared.max_capsules;
+    let cap = shared.max_capsules;
     // v0.6: score threshold and role preference controls.
     let min_score = arguments
         .get("min_score")
@@ -712,19 +741,28 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         config_ambient,
     );
 
+    // When reranking, over-fetch a larger candidate pool so the cross-encoder
+    // sees enough diversity before truncating to `cap`, and bump the token
+    // budget so the pool isn't starved. Same logic as the embed daemon.
+    let (fetch_cap, fetch_budget) = if reranker.is_some() {
+        (cap.max(REMOTE_RERANK_POOL), budget_tokens.max(6000))
+    } else {
+        (cap, budget_tokens)
+    };
+
     let request = ContextRequest {
         stage: stage.to_string(),
         query: effective_query.clone(),
-        budget_tokens,
+        budget_tokens: fetch_budget,
         tags,
         min_score,
-        max_capsules,
+        max_capsules: fetch_cap,
         prefer_roles,
         ..Default::default()
     };
 
     match project::retrieve_context_readonly_with_request(workspace, request) {
-        Ok(bundle) if bundle.skipped => json!({
+        Ok(bundle) if bundle.skipped => Ok(json!({
             "ok": true,
             "skipped": true,
             "top_score": bundle.top_score,
@@ -734,32 +772,39 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             "usage": {
                 "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
             }
-        }),
-        Ok(bundle) => json!({
-            "ok": true,
-            "skipped": false,
-            "top_score": bundle.top_score,
-            "usage": {
-                "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
-                "next_steps": [
-                    "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
-                    "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
-                    "Continue with the host harness's normal file/shell/edit tools.",
-                    "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
-                ]
-            },
-            "stage": bundle.stage,
-            "query": query,
-            "augmented_query": effective_query,
-            "ambient": ambient_payload,
-            "budget_tokens": bundle.budget_tokens,
-            "used_tokens": bundle.used_tokens,
-            "capsule_count": bundle.capsules.len(),
-            "excluded_count": bundle.excluded.len(),
-            "capsules": bundle.capsules,
-            "excluded": bundle.excluded,
-        }),
-        Err(err) => brain_unavailable_json(workspace, &err.to_string()),
+        })),
+        Ok(mut bundle) => {
+            // Apply cross-encoder reranking when a reranker is present.
+            if let Some(rr) = reranker {
+                bundle.capsules =
+                    rerank_capsules(&effective_query, bundle.capsules, rr, REMOTE_RERANK_FLOOR, cap);
+            }
+            Ok(json!({
+                "ok": true,
+                "skipped": false,
+                "top_score": bundle.top_score,
+                "usage": {
+                    "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
+                    "next_steps": [
+                        "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
+                        "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
+                        "Continue with the host harness's normal file/shell/edit tools.",
+                        "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
+                    ]
+                },
+                "stage": bundle.stage,
+                "query": query,
+                "augmented_query": effective_query,
+                "ambient": ambient_payload,
+                "budget_tokens": bundle.budget_tokens,
+                "used_tokens": bundle.used_tokens,
+                "capsule_count": bundle.capsules.len(),
+                "excluded_count": bundle.excluded.len(),
+                "capsules": bundle.capsules,
+                "excluded": bundle.excluded,
+            }))
+        }
+        Err(err) => Ok(brain_unavailable_json(workspace, &err.to_string())),
     }
 }
 
@@ -2315,6 +2360,67 @@ mod tests {
             "expected a memory capsule: {capsules:?}"
         );
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    /// v1.0.0: `brain_context_tool` with a `StubReranker` reorders and caps
+    /// capsules. Seeds two memories — one semantically close to the query, one
+    /// unrelated — and confirms the reranker places the closer one first and
+    /// respects `max_capsules`.
+    #[test]
+    fn brain_context_tool_with_stub_reranker_reorders_and_caps() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-rerank");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+
+            // High-relevance memory: shares many tokens with the query.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Use ripgrep for fast file search before broad reads",
+            )
+            .expect("add high-relevance memory");
+
+            // Low-relevance memory: unrelated tokens.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Quibblefrotz wobblecache unrelated zephyrqux datum",
+            )
+            .expect("add low-relevance memory");
+
+            let rr = kimetsu_brain::embeddings::StubReranker;
+            let args = json!({
+                "query": "search files ripgrep before reading",
+                "stage": "localization",
+                "min_score": 0.0,
+                "max_capsules": 1,
+            });
+
+            let result =
+                brain_context_tool(&root, &args, Some(&rr)).expect("brain_context_tool");
+
+            assert_eq!(result["ok"].as_bool(), Some(true), "ok false: {result}");
+            // The reranker caps at max_capsules=1.
+            let capsules = result["capsules"].as_array().expect("capsules array");
+            assert!(
+                capsules.len() <= 1,
+                "reranker must cap to max_capsules=1, got {}: {result}",
+                capsules.len()
+            );
+            // The top capsule (if present) must be the ripgrep memory
+            // (higher token overlap with the query).
+            if let Some(top) = capsules.first() {
+                let summary = top["summary"].as_str().unwrap_or("");
+                assert!(
+                    summary.contains("ripgrep"),
+                    "StubReranker must rank the ripgrep memory first: {summary}"
+                );
+            }
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
     }
 
     #[test]

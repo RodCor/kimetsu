@@ -327,6 +327,22 @@ references `${KIMETSU_REMOTE_TOKEN}` (set that env var where your agent runs)
 rather than writing the token to disk; pass `--token <t>` to embed a literal.
 The remote surfaces the memory/retrieval/curation tools by default.
 
+**Retrieval quality.** The server reranks `kimetsu_brain_context` results with a
+cross-encoder (`--reranker`, default `jina-reranker-v1-tiny-en`, operator-level —
+`"off"` disables, any curated/HF id accepted). Benchmark results on the 100-memory
+dataset (production floors active, jina-tiny reranker):
+
+| embedder          | MRR   | seq mean | rps  | peak RSS |
+|-------------------|-------|----------|------|----------|
+| jina-v2-base-code | 0.906 | 416ms    |  5.0 | 1.2 GB   |
+| bge-small-en-v1.5 | 0.909 | 700ms    |  3.8 |  697 MB  |
+
+The embedder is set per-repo via config or `KIMETSU_BRAIN_EMBEDDER`; the reranker
+is operator-owned and cannot be overridden by a repo's `project.toml`.
+See §7a "Retrieval models on the server" in
+[HOW-KIMETSU-WORKS.md](docs/HOW-KIMETSU-WORKS.md) for the full table and
+how to re-run the benchmark.
+
 **Server-side ingest (optional).** To make file-capsule retrieval work remotely,
 let the server keep a managed clone of each repo. The operator pre-registers
 repos in a TOML file (so clients can't make the server clone arbitrary URLs):

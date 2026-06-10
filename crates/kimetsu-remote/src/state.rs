@@ -19,6 +19,10 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Present when `--repos-file` enables server-side ingest.
     pub ingest: Option<Arc<IngestState>>,
+    /// Operator-configured cross-encoder reranker for `kimetsu_brain_context`.
+    /// `None` on lean builds or when `--reranker off` is passed.
+    /// Wrapped in `Arc` so `AppState` stays cheaply `Clone`.
+    pub reranker: Option<Arc<dyn kimetsu_brain::embeddings::Reranker>>,
 }
 
 impl AppState {
@@ -40,11 +44,24 @@ impl AppState {
             limiter: Arc::new(RateLimiter::new(per_minute)),
             metrics: Arc::new(Metrics::default()),
             ingest: None,
+            reranker: None,
         }
     }
 
     pub fn with_ingest(mut self, ingest: Arc<IngestState>) -> Self {
         self.ingest = Some(ingest);
+        self
+    }
+
+    /// Set the operator-level reranker (loaded once at startup).
+    pub fn with_reranker(
+        mut self,
+        reranker: Option<Box<dyn kimetsu_brain::embeddings::Reranker>>,
+    ) -> Self {
+        self.reranker = reranker.map(|r| {
+            let r: Arc<dyn kimetsu_brain::embeddings::Reranker> = Arc::from(r);
+            r
+        });
         self
     }
 }

@@ -70,6 +70,13 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     pub tls_key: Option<PathBuf>,
 
+    /// Operator-level cross-encoder rerank stage for `kimetsu_brain_context`.
+    /// `"off"` disables reranking. Any curated or HuggingFace model id is accepted.
+    /// Default chosen by the 100-memory benchmark: jina-tiny MRR 0.931 vs 0.914
+    /// for tinybert; remote has no hook-latency budget so the fastest reranker wins.
+    #[arg(long, default_value = "jina-reranker-v1-tiny-en")]
+    pub reranker: String,
+
     /// Tracing filter (else `RUST_LOG` / `KIMETSU_LOG`).
     #[arg(long)]
     pub log: Option<String>,
@@ -151,6 +158,7 @@ mod tests {
             checkout_dir: None,
             tls_cert: None,
             tls_key: None,
+            reranker: "jina-reranker-v1-tiny-en".to_string(),
             log: None,
         }
     }

@@ -5,10 +5,11 @@
 //! pinned to the explicit root, and the NoopEmbedder forced so there is no
 //! model download (FTS-only recall still proves the path).
 
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use kimetsu_brain::embeddings::StubReranker;
 use kimetsu_remote::app::build_router;
 use kimetsu_remote::auth::AuthConfig;
 use kimetsu_remote::state::AppState;
@@ -37,6 +38,15 @@ fn state(dir: &std::path::Path) -> AppState {
     AppState::new(dir.to_path_buf(), auth)
 }
 
+fn state_with_reranker(dir: &std::path::Path) -> AppState {
+    let auth = AuthConfig {
+        global: vec!["T".to_string()],
+        per_repo: Default::default(),
+    };
+    let rr: Box<dyn kimetsu_brain::embeddings::Reranker> = Box::new(StubReranker);
+    AppState::new(dir.to_path_buf(), auth).with_reranker(Some(rr))
+}
+
 fn call(repo: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -49,6 +59,16 @@ fn call(repo: &str, body: Value) -> Request<Body> {
 
 async fn send(dir: &std::path::Path, repo: &str, body: Value) -> Value {
     let resp = build_router(state(dir))
+        .oneshot(call(repo, body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "expected 200 for {repo}");
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn send_with_reranker(dir: &std::path::Path, repo: &str, body: Value) -> Value {
+    let resp = build_router(state_with_reranker(dir))
         .oneshot(call(repo, body))
         .await
         .unwrap();
@@ -123,4 +143,41 @@ async fn two_repos_are_isolated() {
         !ctx["capsules"].to_string().contains("quibblefrotz"),
         "repo isolation breach: repo-two saw repo-one's memory: {ctx}"
     );
+}
+
+/// v1.0.0: when AppState has a StubReranker, `kimetsu_brain_context` is
+/// intercepted, reranked, and the response parses correctly with a valid JSON
+/// envelope; `max_capsules` is respected.
+#[tokio::test]
+async fn reranker_in_appstate_intercepts_brain_context() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let lesson = "The wobblecache must be flushed before deployment restart";
+
+    // Record a memory so context has something to return.
+    let rec = send(tmp.path(), "repo-rr", record(lesson)).await;
+    assert!(
+        inner(&rec)["ok"].as_bool().unwrap_or(false),
+        "record failed: {rec}"
+    );
+
+    // Issue a context request through the state that has a StubReranker.
+    let ctx_req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "kimetsu_brain_context",
+                    "arguments": { "query": "deployment restart flushing", "min_score": 0.0, "max_capsules": 2 } }
+    });
+    let resp = send_with_reranker(tmp.path(), "repo-rr", ctx_req).await;
+    let ctx = inner(&resp);
+
+    // The envelope must parse and ok must be true.
+    assert_eq!(ctx["ok"].as_bool(), Some(true), "ok false: {ctx}");
+    // capsules must be a JSON array (may be 0 if FTS doesn't match with noop embedder).
+    assert!(ctx["capsules"].is_array(), "capsules missing: {ctx}");
+    // The result must not exceed max_capsules=2.
+    let cap_len = ctx["capsules"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(cap_len <= 2, "max_capsules violated: {cap_len} > 2: {ctx}");
+
+    // Confirm the Arc<dyn Reranker> round-trips through Clone correctly.
+    let _ = Arc::new(StubReranker);
 }

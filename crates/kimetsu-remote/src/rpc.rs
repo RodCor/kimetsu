@@ -220,6 +220,57 @@ async fn dispatch_request(
         return handle_server_ingest(ingest, &repo, &root, id, session).await;
     }
 
+    // 6c. `kimetsu_brain_context` with a server-side reranker: intercept before
+    // generic dispatch so we can inject the reranker into the tool body.
+    // The allowlist + auth + rate-limit checks above have already run.
+    if req.method == "tools/call"
+        && req.params.get("name").and_then(|n| n.as_str()) == Some("kimetsu_brain_context")
+        && state.reranker.is_some()
+    {
+        let reranker = state.reranker.clone().expect("checked above");
+        let arguments = req.params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let res = tokio::task::spawn_blocking(move || {
+            kimetsu_chat::brain_context_tool(&root, &arguments, Some(reranker.as_ref()))
+        })
+        .await;
+
+        return match res {
+            Ok(Ok(value)) => {
+                // Wrap in the same `{content:[{type,text}]}` envelope that
+                // generic dispatch produces for tools/call results.
+                let text = serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string());
+                (
+                    Outcome::Ok,
+                    jsonrpc_ok(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": text }]
+                        }),
+                        session,
+                    ),
+                )
+            }
+            Ok(Err(msg)) => (
+                Outcome::Ok,
+                jsonrpc_err(StatusCode::OK, id, -32000, &msg, session),
+            ),
+            Err(join) => (
+                Outcome::Error,
+                jsonrpc_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    id,
+                    -32603,
+                    &format!("internal error: {join}"),
+                    session,
+                ),
+            ),
+        };
+    }
+
     // 7. Run the (blocking) dispatch off the async pool.
     let allow = crate::catalog::allowlist(state.ingest.is_some());
     let skills = state.skills.clone();

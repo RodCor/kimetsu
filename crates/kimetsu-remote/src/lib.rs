@@ -66,7 +66,29 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         &data_dir,
     )?;
 
-    let mut state = AppState::with_rate_limit(data_dir, auth, args.rate_limit);
+    // Load the operator-configured reranker ONCE at startup.
+    // On lean builds `open_reranker_for_model` always returns None.
+    #[cfg(feature = "embeddings")]
+    let reranker = {
+        let rr = kimetsu_brain::embeddings::open_reranker_for_model(&args.reranker);
+        match &rr {
+            Some(r) => tracing::info!(
+                model = r.model_id(),
+                "--reranker loaded; kimetsu_brain_context will rerank with {}",
+                r.model_id()
+            ),
+            None => tracing::info!(
+                "--reranker '{}' → disabled (off / lean build)",
+                args.reranker
+            ),
+        }
+        rr
+    };
+    #[cfg(not(feature = "embeddings"))]
+    let reranker: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = None;
+
+    let mut state = AppState::with_rate_limit(data_dir, auth, args.rate_limit)
+        .with_reranker(reranker);
     if let Some(ing) = ingest {
         state = state.with_ingest(std::sync::Arc::new(ing));
     }
