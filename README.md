@@ -6,7 +6,7 @@
 
 ### Give your coding agent a memory that gets sharper every run.
 
-**Evidence-first memory for MCP-capable coding agents and Kimetsu's own terminal chat.**
+**Evidence-first memory for coding agents and Kimetsu's own terminal chat.**
 Kimetsu sits beside your AI agent, watches what actually solves problems,
 remembers it, and feeds the high-signal context back — so the next run
 starts where the last one left off.
