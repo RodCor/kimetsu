@@ -130,8 +130,8 @@ the top-N inside a token budget.
 
 **Candidate generation.** Lexical FTS5 always provides candidates. On the
 embeddings build the broker *also* runs an approximate-nearest-neighbour query
-against an in-database **sqlite-vec** index (a `vec0` virtual table, statically
-linked into the bundled SQLite) and **unions** those semantic hits with the FTS
+against a **usearch HNSW** index (persisted as a `brain.usearch` sidecar next to
+brain.db, f16-quantized by default, O(log N) per query) and **unions** those hits with the FTS
 set — so a memory whose *meaning* matches the query can surface even when it
 shares no words with it. Lean builds use the FTS candidate set alone.
 
@@ -756,7 +756,7 @@ Environment variables that override the matching config field at runtime
 - It's not a sandbox. Tools run on the host machine.
 - It's not an external vector DB. The brain is still a single SQLite file per
   project (FTS5 + optional cosine). On the embeddings build the semantic index
-  is an *in-database* sqlite-vec ANN (`vec0`) table — no separate vector store,
+  is a usearch HNSW sidecar (`brain.usearch`) next to brain.db — no separate vector store,
   no service to run. Backups are still `cp brain.db` (and the brain also
   auto-backs-up to a `brain.db.bak-*` sidecar before any schema migration).
 
