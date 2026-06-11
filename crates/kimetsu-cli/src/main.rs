@@ -4738,6 +4738,18 @@ fn brain_tune_sweep(
             "note: fewer than 30 personal eval cases ({}). Using fixture file for relative sweep.",
             eval.cases.len()
         );
+        // Fix 3: guard --apply behind personal data.
+        // In fixture mode MRR≡0 for every combo (fixture IDs don't match real
+        // memories), so the objective degenerates to pure token-minimisation.
+        // Applying the resulting floors would optimise for fewer tokens at the
+        // cost of recall.  Refuse --apply until the user has ≥30 cited cases.
+        if args.apply {
+            println!(
+                "note: fixture mode is relative-only — --apply refused. \
+                 Accumulate ≥30 cited cases first (see `kimetsu brain tune --status`)."
+            );
+            return Ok(());
+        }
     }
 
     let n = cases.len();
@@ -4917,6 +4929,12 @@ fn brain_tune_sweep(
     }
 
     if !args.apply {
+        if !using_personal {
+            println!(
+                "note: fixture mode — results are relative only; \
+                 --apply is disabled until you have ≥30 cited cases."
+            );
+        }
         println!(
             "DRY RUN — to apply floor changes: kimetsu brain tune --apply\n\
              (floor changes: lex {:.2}→{:.2}, sem {:.3}→{:.3})",
@@ -11067,6 +11085,71 @@ mod tune_tests {
             };
             // Should not panic; prints 0 cases.
             brain_tune(args).expect("tune --status on empty brain");
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 3: --apply in fixture-fallback mode must leave project.toml
+    // and tune-history.json untouched.
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix3_apply_in_fixture_mode_leaves_config_untouched() {
+        with_user_brain_disabled(|| {
+            let root = tune_test_root("fix3");
+            fs::create_dir_all(&root).expect("create root");
+            project::init_project(&root, false).expect("init");
+
+            // Ensure no fixture file exists, so the sweep falls back AND
+            // exits early (no eval cases).  Either way --apply must not
+            // write anything.
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+            let config_before = project::load_config(&paths).expect("config before");
+            let toml_mtime_before = fs::metadata(&paths.project_toml)
+                .expect("project.toml must exist")
+                .modified()
+                .expect("mtime");
+
+            let history_path = paths.kimetsu_dir.join("tune-history.json");
+            assert!(
+                !history_path.exists(),
+                "tune-history.json must not exist before test"
+            );
+
+            let args = TuneArgs {
+                status: false,
+                cost_weight: 0.005,
+                apply: true, // --apply with < 30 personal cases → fixture mode
+                revert: false,
+                workspace: Some(root.clone()),
+            };
+            brain_tune(args).expect("brain_tune must not error in fixture mode");
+
+            // project.toml must not have been modified.
+            let config_after = project::load_config(&paths).expect("config after");
+            assert_eq!(
+                config_before.broker.min_lexical_coverage, config_after.broker.min_lexical_coverage,
+                "fix3: --apply in fixture mode must not change min_lexical_coverage"
+            );
+            assert_eq!(
+                config_before.broker.min_semantic_score, config_after.broker.min_semantic_score,
+                "fix3: --apply in fixture mode must not change min_semantic_score"
+            );
+            let toml_mtime_after = fs::metadata(&paths.project_toml)
+                .expect("project.toml must still exist")
+                .modified()
+                .expect("mtime after");
+            assert_eq!(
+                toml_mtime_before, toml_mtime_after,
+                "fix3: project.toml mtime must not change in fixture mode with --apply"
+            );
+
+            // tune-history.json must not have been written.
+            assert!(
+                !history_path.exists(),
+                "fix3: tune-history.json must not be created when --apply runs in fixture mode"
+            );
 
             fs::remove_dir_all(&root).ok();
         });
