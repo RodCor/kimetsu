@@ -2560,6 +2560,140 @@ pub struct MemoryExport {
     pub created_at: Option<String>,
 }
 
+/// Strip the trailing `(context: …)` segment from a memory text produced by
+/// the distiller / `brain record` workflow, leaving only the lesson body.
+///
+/// Matches the literal pattern ` (context: <anything>)` at the very end of
+/// the trimmed string. The match is case-sensitive to avoid false positives.
+///
+/// Returns the original `text` unchanged when:
+///   - the pattern is absent, or
+///   - stripping would leave an empty or whitespace-only string (safety
+///     fallback: a blank lesson is worse than a slightly noisy one).
+///
+/// # Examples
+/// ```
+/// # use kimetsu_brain::project::redact_context_suffix;
+/// assert_eq!(
+///     redact_context_suffix("always use --locked (context: cargo build)"),
+///     "always use --locked"
+/// );
+/// assert_eq!(
+///     redact_context_suffix("bare lesson"),
+///     "bare lesson"
+/// );
+/// ```
+pub fn redact_context_suffix(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    // Pattern: " (context: …)" where the parenthesised segment is at the end.
+    // Walk backwards to find the matching open-paren for a ` (context: ` prefix.
+    if let Some(pos) = find_trailing_context_paren(trimmed) {
+        let candidate = trimmed[..pos].trim_end();
+        if !candidate.is_empty() {
+            return candidate;
+        }
+    }
+    text
+}
+
+/// Strip the leading `[tags: …]` prefix from a memory text, leaving only the
+/// lesson body (and any trailing context segment unless that is separately
+/// stripped by [`redact_context_suffix`]).
+///
+/// Matches `[tags: …] ` at the very start of the trimmed string.
+/// Returns the original `text` when:
+///   - the pattern is absent, or
+///   - stripping would leave an empty or whitespace-only string.
+///
+/// # Examples
+/// ```
+/// # use kimetsu_brain::project::redact_tags_prefix;
+/// assert_eq!(
+///     redact_tags_prefix("[tags: rust, cargo] always use --locked"),
+///     "always use --locked"
+/// );
+/// assert_eq!(
+///     redact_tags_prefix("no tags here"),
+///     "no tags here"
+/// );
+/// ```
+pub fn redact_tags_prefix(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("[tags: ") {
+        if let Some(close) = rest.find(']') {
+            let after = rest[close + 1..].trim_start();
+            if !after.is_empty() {
+                return after;
+            }
+        }
+    }
+    text
+}
+
+/// Apply export-time redaction to a single `MemoryExport`'s text field
+/// according to the requested flags. Returns a new `MemoryExport` with the
+/// text replaced (or the original when no patterns match and the safety
+/// fallback applies).
+///
+/// The two-step order matters: strip tags first, then context, so that a
+/// memory like `[tags: rust] lesson body (context: foo)` becomes
+/// `lesson body` when both flags are active.
+pub fn apply_export_redaction(
+    entry: MemoryExport,
+    redact: bool,
+    redact_tags: bool,
+) -> MemoryExport {
+    if !redact && !redact_tags {
+        return entry;
+    }
+    let mut text: &str = &entry.text;
+    // Temporary storage so we can chain borrows without lifetime woes.
+    let after_tags: String;
+    let after_ctx: String;
+    if redact_tags {
+        let stripped = redact_tags_prefix(text);
+        after_tags = stripped.to_string();
+        text = &after_tags;
+    }
+    if redact {
+        let stripped = redact_context_suffix(text);
+        after_ctx = stripped.to_string();
+        text = &after_ctx;
+    }
+    MemoryExport {
+        text: text.to_string(),
+        ..entry
+    }
+}
+
+// Helper: find the byte offset of the opening ` (context: ` run that closes
+// at the very end of `s` (which must already be trimmed of trailing
+// whitespace). Returns `None` when no such suffix is present.
+fn find_trailing_context_paren(s: &str) -> Option<usize> {
+    // We look for a closing `)` at the end, then walk left to find ` (context: `.
+    if !s.ends_with(')') {
+        return None;
+    }
+    // The minimum suffix is ` (context: x)` — 13 chars.
+    let bytes = s.as_bytes();
+    // Find the matching open paren by scanning backwards from the terminal `)`.
+    let close = s.len() - 1;
+    // We need at least " (context: " before the close paren, so start scanning
+    // no further than close - len(" (context: ") = close - 11.
+    // Use a simple prefix search scanning from the right.
+    let prefix = b" (context: ";
+    for start in (0..close).rev() {
+        if start + prefix.len() > close {
+            continue;
+        }
+        if &bytes[start..start + prefix.len()] == prefix {
+            // Found the open sequence; the segment is s[start..=close].
+            return Some(start);
+        }
+    }
+    None
+}
+
 /// Summary returned by [`import_memories`].
 #[derive(Debug, Clone, Default)]
 pub struct ImportSummary {
@@ -2574,10 +2708,14 @@ pub struct ImportSummary {
 /// Export active memories as a vec of portable records.
 ///
 /// `scope` and `kind` are optional filters; `None` means "all".
+/// `redact` strips the trailing `(context: …)` segment from each text.
+/// `redact_tags` additionally strips the leading `[tags: …]` prefix.
 pub fn export_memories(
     start: &Path,
     scope: Option<MemoryScope>,
     kind: Option<MemoryKind>,
+    redact: bool,
+    redact_tags: bool,
 ) -> KimetsuResult<Vec<MemoryExport>> {
     // Build the SQL dynamically based on the optional filters, including
     // `created_at` so the JSON record carries the origin timestamp.
@@ -2642,7 +2780,7 @@ pub fn export_memories(
 
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        out.push(apply_export_redaction(row?, redact, redact_tags));
     }
     Ok(out)
 }
@@ -5304,7 +5442,7 @@ max_total_cost_usd = 250.0
             .expect("add fp");
 
             // Export
-            let exported = export_memories(&root_a, None, None).expect("export");
+            let exported = export_memories(&root_a, None, None, false, false).expect("export");
             assert_eq!(exported.len(), 3, "must export all 3 active memories");
 
             // All fields present
@@ -5385,6 +5523,8 @@ max_total_cost_usd = 250.0
                 &root,
                 Some(MemoryScope::Project),
                 Some(MemoryKind::FailurePattern),
+                false,
+                false,
             )
             .expect("export filtered");
             assert_eq!(
@@ -5396,13 +5536,14 @@ max_total_cost_usd = 250.0
             assert!(filtered.iter().all(|e| e.kind == "failure_pattern"));
 
             // Scope-only filter: all project memories
-            let scope_only =
-                export_memories(&root, Some(MemoryScope::Project), None).expect("scope filter");
+            let scope_only = export_memories(&root, Some(MemoryScope::Project), None, false, false)
+                .expect("scope filter");
             assert_eq!(scope_only.len(), 3, "3 project-scope memories total");
 
             // Kind-only filter: all failure_patterns (project + repo)
-            let kind_only = export_memories(&root, None, Some(MemoryKind::FailurePattern))
-                .expect("kind filter");
+            let kind_only =
+                export_memories(&root, None, Some(MemoryKind::FailurePattern), false, false)
+                    .expect("kind filter");
             assert_eq!(
                 kind_only.len(),
                 3,
@@ -5563,6 +5704,144 @@ max_total_cost_usd = 250.0
             );
 
             fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ── Q5b: export redact ────────────────────────────────────────────────────
+
+    /// Pure-fn tests for `redact_context_suffix` edge cases.
+    #[test]
+    fn redact_context_suffix_strips_trailing_context() {
+        assert_eq!(
+            redact_context_suffix("always use --locked (context: cargo build)"),
+            "always use --locked"
+        );
+        // Multiple spaces before (context: …) are consumed by trim_end.
+        assert_eq!(
+            redact_context_suffix("lesson body   (context: some task)"),
+            "lesson body"
+        );
+        // No pattern → unchanged.
+        assert_eq!(redact_context_suffix("bare lesson"), "bare lesson");
+        // Safety fallback: stripping would leave empty → original returned.
+        assert_eq!(
+            redact_context_suffix("(context: only context)"),
+            "(context: only context)"
+        );
+        // Nested parens in context segment — only the outermost suffix is stripped.
+        assert_eq!(
+            redact_context_suffix("lesson (context: (nested) task)"),
+            "lesson"
+        );
+        // Trailing whitespace after the close paren is tolerated by trim_end.
+        assert_eq!(redact_context_suffix("lesson (context: task)  "), "lesson");
+    }
+
+    /// Pure-fn tests for `redact_tags_prefix` edge cases.
+    #[test]
+    fn redact_tags_prefix_strips_leading_tags() {
+        assert_eq!(
+            redact_tags_prefix("[tags: rust, cargo] always use --locked"),
+            "always use --locked"
+        );
+        // No pattern → unchanged.
+        assert_eq!(redact_tags_prefix("no tags here"), "no tags here");
+        // Safety fallback: stripping would leave empty → original returned.
+        assert_eq!(redact_tags_prefix("[tags: only-tag]"), "[tags: only-tag]");
+        // Leading whitespace before [tags: is preserved by trim_start then not stripped.
+        assert_eq!(redact_tags_prefix("  [tags: rust] lesson"), "lesson");
+    }
+
+    /// `apply_export_redaction` with both flags false → no change.
+    #[test]
+    fn apply_export_redaction_no_flags_is_passthrough() {
+        let entry = MemoryExport {
+            text: "[tags: rust] lesson (context: task)".to_string(),
+            scope: "project".to_string(),
+            kind: "fact".to_string(),
+            confidence: 1.0,
+            created_at: None,
+        };
+        let out = apply_export_redaction(entry.clone(), false, false);
+        assert_eq!(out.text, entry.text);
+    }
+
+    /// `apply_export_redaction` with `redact=true` strips context only.
+    #[test]
+    fn apply_export_redaction_redact_only_strips_context() {
+        let entry = MemoryExport {
+            text: "[tags: rust] lesson (context: task)".to_string(),
+            scope: "project".to_string(),
+            kind: "fact".to_string(),
+            confidence: 1.0,
+            created_at: None,
+        };
+        let out = apply_export_redaction(entry, true, false);
+        assert_eq!(out.text, "[tags: rust] lesson");
+    }
+
+    /// `apply_export_redaction` with both flags strips tags then context.
+    #[test]
+    fn apply_export_redaction_both_flags_strips_tags_and_context() {
+        let entry = MemoryExport {
+            text: "[tags: rust, cargo] lesson (context: task)".to_string(),
+            scope: "project".to_string(),
+            kind: "fact".to_string(),
+            confidence: 1.0,
+            created_at: None,
+        };
+        let out = apply_export_redaction(entry, true, true);
+        assert_eq!(out.text, "lesson");
+    }
+
+    /// End-to-end: export with `--redact`, import, then re-import deduplicates.
+    ///
+    /// Verifies that the normalized-text dedup path works correctly with
+    /// redacted texts — the stripped form must normalize identically on
+    /// second import.
+    #[test]
+    fn export_redact_import_roundtrip_and_dedup() {
+        with_user_brain_disabled(|| {
+            let root_a = test_root();
+            init_project(&root_a, false).expect("init A");
+
+            // Seed a memory that has the context suffix the distiller adds.
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "use --locked for reproducibility (context: cargo test failing)",
+            )
+            .expect("add memory");
+
+            // Export with redact=true.
+            let exported =
+                export_memories(&root_a, None, None, true, false).expect("export redacted");
+            assert_eq!(exported.len(), 1);
+            assert_eq!(
+                exported[0].text, "use --locked for reproducibility",
+                "context suffix must be stripped"
+            );
+
+            // Import into a fresh project.
+            let root_b = test_root();
+            init_project(&root_b, false).expect("init B");
+            let s1 = import_memories(&root_b, &exported, None).expect("import 1");
+            assert_eq!(s1.imported, 1, "first import must create 1 row");
+            assert_eq!(s1.deduped, 0);
+
+            // Re-import the same redacted slice → must dedup, not double-insert.
+            let s2 = import_memories(&root_b, &exported, None).expect("import 2");
+            assert_eq!(s2.imported, 0, "second import must dedup");
+            assert_eq!(s2.deduped, 1);
+
+            // List shows the redacted text (not the original context-annotated form).
+            let mems = list_memories(&root_b).expect("list");
+            assert_eq!(mems.len(), 1);
+            assert_eq!(mems[0].text, "use --locked for reproducibility");
+
+            fs::remove_dir_all(&root_a).ok();
+            fs::remove_dir_all(&root_b).ok();
         });
     }
 
