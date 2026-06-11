@@ -1223,6 +1223,7 @@ pub fn list_memories_top(start: &Path, opts: TopOptions) -> KimetsuResult<Vec<Me
             SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
             FROM memories
             WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
               AND use_count >= ?1
               AND lower(scope) = lower(?2)
             ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
@@ -1236,6 +1237,7 @@ pub fn list_memories_top(start: &Path, opts: TopOptions) -> KimetsuResult<Vec<Me
             SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
             FROM memories
             WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
               AND use_count >= ?1
             ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
             LIMIT ?2
@@ -1336,6 +1338,7 @@ pub fn prune_low_usefulness(start: &Path, opts: PruneOptions) -> KimetsuResult<P
                 SELECT memory_id, scope, kind, text, use_count, usefulness_score
                 FROM memories
                 WHERE invalidated_at IS NULL
+                  AND superseded_by IS NULL
                   AND use_count >= ?1
                   AND (usefulness_score / CAST(use_count AS REAL)) <= ?2
                   AND lower(scope) = lower(?3)
@@ -1349,6 +1352,7 @@ pub fn prune_low_usefulness(start: &Path, opts: PruneOptions) -> KimetsuResult<P
                 SELECT memory_id, scope, kind, text, use_count, usefulness_score
                 FROM memories
                 WHERE invalidated_at IS NULL
+                  AND superseded_by IS NULL
                   AND use_count >= ?1
                   AND (usefulness_score / CAST(use_count AS REAL)) <= ?2
                 ORDER BY (usefulness_score / CAST(use_count AS REAL)) ASC
@@ -1652,6 +1656,7 @@ fn search_memories_in_conn(
         FROM memories_fts
         JOIN memories m ON m.memory_id = memories_fts.memory_id
         WHERE m.invalidated_at IS NULL
+          AND m.superseded_by IS NULL
           AND memories_fts MATCH ?
         ",
     );
@@ -6683,6 +6688,194 @@ max_total_cost_usd = 250.0
                 row_count, 1,
                 "memory_citations row must exist after MCP cite"
             );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 2: search_memories must not return superseded rows
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix2_search_excludes_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Add a memory that will be superseded, and a live one.
+            let superseded_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "unique superseded keyword alpha",
+            )
+            .expect("add superseded");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "live memory unrelated topic",
+            )
+            .expect("add live");
+
+            // Mark the first memory as superseded via direct SQL (simulating
+            // a prior consolidation run).
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load for stamp");
+                conn.execute(
+                    "UPDATE memories SET superseded_by = 'fake-survivor' \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&superseded_id],
+                )
+                .expect("stamp superseded_by");
+            }
+
+            // Search must not return the superseded row.
+            let hits = search_memories(&root, "unique superseded keyword alpha", 20, 0, None, None)
+                .expect("search");
+            assert!(
+                !hits.iter().any(|h| h.memory_id == superseded_id),
+                "superseded row must not appear in search results"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 4: list_memories_top and prune_low_usefulness must not include
+    // superseded rows
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix4_top_excludes_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Add a memory and give it a high score + use_count.
+            let superseded_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "memory to be superseded with high usefulness",
+            )
+            .expect("add");
+
+            // Stamp it as superseded AND give it high stats.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories \
+                     SET superseded_by = 'fake-survivor', \
+                         use_count = 10, usefulness_score = 50.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&superseded_id],
+                )
+                .expect("stamp");
+            }
+
+            // Also add a live memory with lower but real stats.
+            let live_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "live memory with normal stats",
+            )
+            .expect("add live");
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories SET use_count = 5, usefulness_score = 5.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&live_id],
+                )
+                .expect("seed stats");
+            }
+
+            let opts = TopOptions {
+                scope: None,
+                min_uses: 1,
+                limit: 20,
+            };
+            let top = list_memories_top(&root, opts).expect("list_memories_top");
+
+            assert!(
+                !top.iter().any(|r| r.memory_id == superseded_id),
+                "superseded row must not appear in top"
+            );
+            assert!(
+                top.iter().any(|r| r.memory_id == live_id),
+                "live row must appear in top"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    #[test]
+    fn fix4_prune_excludes_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let superseded_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "memory to be superseded with low usefulness",
+            )
+            .expect("add");
+
+            // Stamp it as superseded AND give it a very negative score.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories \
+                     SET superseded_by = 'fake-survivor', \
+                         use_count = 10, usefulness_score = -99.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&superseded_id],
+                )
+                .expect("stamp");
+            }
+
+            // A live memory with a negative score (qualifies for prune).
+            let live_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "live memory with negative usefulness for prune",
+            )
+            .expect("add live");
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories SET use_count = 5, usefulness_score = -5.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&live_id],
+                )
+                .expect("seed stats");
+            }
+
+            let opts = PruneOptions {
+                scope: None,
+                min_uses: 1,
+                max_ratio: -0.1,
+                apply: false,
+            };
+            let summary = prune_low_usefulness(&root, opts).expect("prune");
+
+            assert!(
+                !summary
+                    .candidates
+                    .iter()
+                    .any(|c| c.memory_id == superseded_id),
+                "superseded row must not appear in prune candidates"
+            );
+            assert!(
+                summary.candidates.iter().any(|c| c.memory_id == live_id),
+                "live negative-score row must appear in prune candidates"
+            );
+
             std::fs::remove_dir_all(&root).ok();
         });
     }
