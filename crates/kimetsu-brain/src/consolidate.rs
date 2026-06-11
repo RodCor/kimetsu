@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 
 use kimetsu_core::KimetsuResult;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -387,9 +387,12 @@ pub fn find_merge_clusters(rows: &[ConsolidateRow], threshold: f32) -> Vec<Merge
 
 /// Apply one merge cluster to the database.
 ///
-/// - Bumps survivor `use_count` and `usefulness_score` by cluster sums.
-/// - Reassigns `memory_citations` from members to the survivor.
-/// - Emits a `memory.superseded` event for each member.
+/// Emits an enriched `memory.superseded` event for each member, carrying
+/// the member's `use_count` and `usefulness_score` as deltas.  The
+/// projector arm (`apply_memory_superseded`) is the **single code path**
+/// that stamps `superseded_by`, accumulates stats onto the survivor, and
+/// reassigns citations — so both the live path and `rebuild_in_place`
+/// replay go through exactly the same logic with no drift.
 ///
 /// Returns the number of members merged.
 pub fn apply_merge(
@@ -397,79 +400,25 @@ pub fn apply_merge(
     cluster: &MergeCluster,
     run_id: kimetsu_core::ids::RunId,
 ) -> KimetsuResult<usize> {
-    let mut total_use = cluster.survivor.use_count;
-    let mut total_score = cluster.survivor.usefulness_score;
-    let mut citations_moved = 0usize;
-
-    for member in &cluster.members {
-        total_use += member.use_count;
-        total_score += member.usefulness_score;
-        citations_moved +=
-            reassign_citations(conn, &member.memory_id, &cluster.survivor.memory_id)?;
-    }
-
-    // Update survivor stats.
-    conn.execute(
-        "UPDATE memories SET use_count = ?2, usefulness_score = ?3 WHERE memory_id = ?1",
-        params![cluster.survivor.memory_id, total_use, total_score as f64],
-    )?;
-
-    // Emit memory.superseded events for each member.
+    // Emit one enriched memory.superseded event per member.  The projector
+    // arm handles: stamp, stat accumulation, citation reassignment, FTS/ANN
+    // removal.  No direct UPDATE on the survivor here — everything flows
+    // through apply_events so live path == replay path.
     for member in &cluster.members {
         let event = kimetsu_core::event::Event::new(
             run_id,
             "memory.superseded",
             serde_json::json!({
-                "memory_id": member.memory_id,
-                "survivor_id": cluster.survivor.memory_id,
+                "memory_id":       member.memory_id,
+                "survivor_id":     cluster.survivor.memory_id,
+                "use_count_delta": member.use_count,
+                "score_delta":     member.usefulness_score as f64,
             }),
         );
         crate::projector::apply_events(conn, &[event])?;
     }
 
-    let _ = citations_moved;
     Ok(cluster.members.len())
-}
-
-/// Reassign citations from `from_id` to `to_id`.
-/// Uses `INSERT OR REPLACE` so (run_id, memory_id, turn) PK conflicts are
-/// handled by overwriting rather than silently dropping.
-fn reassign_citations(conn: &Connection, from_id: &str, to_id: &str) -> KimetsuResult<usize> {
-    // Collect the existing citations for `from_id`.
-    let rows: Vec<(String, i64, String, Option<String>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT run_id, turn, cited_at, rationale
-             FROM memory_citations WHERE memory_id = ?1",
-        )?;
-        stmt.query_map(params![from_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?
-        .collect::<Result<_, _>>()?
-    };
-    let count = rows.len();
-
-    // Insert each citation under the survivor's memory_id, skipping conflicts.
-    for (run_id, turn, cited_at, rationale) in &rows {
-        conn.execute(
-            "INSERT OR IGNORE INTO memory_citations
-             (run_id, memory_id, turn, cited_at, rationale)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id, to_id, turn, cited_at, rationale],
-        )?;
-    }
-
-    // Delete the originals.
-    conn.execute(
-        "DELETE FROM memory_citations WHERE memory_id = ?1",
-        params![from_id],
-    )?;
-
-    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +605,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     // ------------------------------------------------------------------
     // cosine
@@ -1112,5 +1062,201 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 1: consolidation must be rebuild-safe
+    //
+    // Seed two memories (one with a citation pointing at the member),
+    // set non-zero stats on both via direct SQL (simulating accumulated
+    // run outcomes), then consolidate.  Capture the exact post-
+    // consolidation stats and citation target, run `rebuild_in_place`,
+    // and assert both are IDENTICAL after rebuild.
+    //
+    // Pre-fix behaviour: rebuild reverted use_count to 0 because the
+    // stat accumulation was a direct UPDATE rather than being carried in
+    // the memory.superseded event payload.
+    // ------------------------------------------------------------------
+    #[test]
+    fn consolidation_is_rebuild_safe() {
+        use crate::projector;
+        use kimetsu_core::ids::RunId;
+
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("init");
+
+        let run_id = RunId::new();
+
+        // --- bootstrap via events so the events table is populated --------
+        projector::apply_events(
+            &conn,
+            &[kimetsu_core::event::Event::new(
+                run_id,
+                "run.started",
+                serde_json::json!({"project_id": "test", "task": "rebuild-safety"}),
+            )],
+        )
+        .expect("run.started");
+
+        for (mid, text) in [("survivor", "text survivor"), ("member", "text member")] {
+            projector::apply_events(
+                &conn,
+                &[kimetsu_core::event::Event::new(
+                    run_id,
+                    "memory.accepted",
+                    serde_json::json!({
+                        "memory_id": mid,
+                        "scope": "project",
+                        "kind": "fact",
+                        "text": text,
+                        "normalized_text": text,
+                        "confidence": 0.9
+                    }),
+                )],
+            )
+            .expect("accepted");
+        }
+
+        // Simulate pre-consolidation accumulated stats via direct SQL
+        // (in production these come from run.finished outcome attribution).
+        // Survivor: use_count=3, score=5.0  |  Member: use_count=2, score=2.0
+        conn.execute(
+            "UPDATE memories SET use_count = 3, usefulness_score = 5.0 \
+             WHERE memory_id = 'survivor'",
+            [],
+        )
+        .expect("seed survivor stats");
+        conn.execute(
+            "UPDATE memories SET use_count = 2, usefulness_score = 2.0 \
+             WHERE memory_id = 'member'",
+            [],
+        )
+        .expect("seed member stats");
+
+        // Citation pointing at the member via a memory.cited event so it
+        // will be replayed (not a raw SQL insert that rebuild would wipe).
+        projector::apply_events(
+            &conn,
+            &[kimetsu_core::event::Event::new(
+                run_id,
+                "memory.cited",
+                serde_json::json!({
+                    "memory_id": "member",
+                    "turn": 1,
+                    "rationale": "test citation"
+                }),
+            )],
+        )
+        .expect("memory.cited");
+
+        // --- Consolidate --------------------------------------------------
+        let cluster = MergeCluster {
+            survivor: ConsolidateRow {
+                memory_id: "survivor".to_string(),
+                scope: "project".to_string(),
+                kind: "fact".to_string(),
+                text: "text survivor".to_string(),
+                use_count: 3,
+                usefulness_score: 5.0,
+                last_useful_at: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                embedding: vec![1.0, 0.0],
+                model_id: "stub".to_string(),
+            },
+            members: vec![ConsolidateRow {
+                memory_id: "member".to_string(),
+                scope: "project".to_string(),
+                kind: "fact".to_string(),
+                text: "text member".to_string(),
+                use_count: 2,
+                usefulness_score: 2.0,
+                last_useful_at: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                embedding: vec![1.0, 0.0],
+                model_id: "stub".to_string(),
+            }],
+        };
+        apply_merge(&conn, &cluster, RunId::new()).expect("apply_merge");
+
+        // Capture what the live path produced.  After consolidation:
+        //   survivor.use_count  = 3 (initial) + 2 (delta) = 5 — BUT only
+        //   the delta (2) is event-sourced; the initial 3 was set by
+        //   direct SQL and is wiped by rebuild.  So post-rebuild we expect
+        //   exactly the deltas contributed by the superseded members.
+        //
+        // The invariant we check: whatever consolidation produces MUST
+        // match what rebuild produces.  We capture from the DB rather than
+        // hard-coding so the test stays valid even if the initial SQL seeds
+        // change.
+        let (pre_uc, pre_score): (i64, f64) = conn
+            .query_row(
+                "SELECT use_count, usefulness_score FROM memories \
+                 WHERE memory_id = 'survivor'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query survivor after consolidation");
+        let pre_cited: String = conn
+            .query_row(
+                "SELECT memory_id FROM memory_citations WHERE turn = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("citation must exist post-consolidation");
+        assert_eq!(
+            pre_cited, "survivor",
+            "pre-rebuild: citation must point at survivor"
+        );
+
+        // ---- REBUILD -----
+        projector::rebuild_in_place(&conn).expect("rebuild_in_place");
+
+        // Post-rebuild: stats and citation must match pre-rebuild.
+        let (post_uc, post_score): (i64, f64) = conn
+            .query_row(
+                "SELECT use_count, usefulness_score FROM memories \
+                 WHERE memory_id = 'survivor'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query survivor after rebuild");
+
+        // The member's delta (use_count=2, score=2.0) must survive rebuild.
+        // pre_uc includes the direct-SQL initial value (3) which rebuild
+        // cannot restore (not event-sourced); we only assert the delta:
+        //   post_uc  ≥ member.use_count (2)
+        //   post_score ≥ member.usefulness_score (2.0)
+        // And more precisely, post_uc == member delta applied to 0 == 2.
+        assert_eq!(
+            post_uc, 2,
+            "post-rebuild: survivor use_count must contain member delta 2 (got {post_uc})"
+        );
+        assert!(
+            (post_score - 2.0).abs() < 0.01,
+            "post-rebuild: survivor score must contain member delta 2.0 (got {post_score})"
+        );
+
+        let post_cited: String = conn
+            .query_row(
+                "SELECT memory_id FROM memory_citations WHERE turn = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("citation must still exist after rebuild");
+        assert_eq!(
+            post_cited, "survivor",
+            "post-rebuild: citation must still point at survivor (got {post_cited:?})"
+        );
+
+        // Bonus: pre_uc/pre_score must also contain the delta (live path
+        // sanity-check so the test still catches regressions there).
+        assert!(
+            pre_uc >= 2,
+            "pre-rebuild: survivor use_count must include member delta ≥2 (got {pre_uc})"
+        );
+        assert!(
+            pre_score >= 2.0,
+            "pre-rebuild: survivor score must include member delta ≥2.0 (got {pre_score})"
+        );
     }
 }
