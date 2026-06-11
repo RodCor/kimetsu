@@ -946,7 +946,11 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
 fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let memory_id = match arguments.get("memory_id").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => return Ok(json!({ "ok": false, "error": "memory_id is required and must be non-empty" })),
+        _ => {
+            return Ok(
+                json!({ "ok": false, "error": "memory_id is required and must be non-empty" }),
+            );
+        }
     };
     let note = arguments.get("note").and_then(Value::as_str);
     match project::record_mcp_citation(workspace, memory_id, note) {
@@ -2962,7 +2966,11 @@ mod tests {
                 std::env::remove_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS");
             }
 
-            assert_eq!(result["ok"].as_bool(), Some(true), "cite must return ok:true");
+            assert_eq!(
+                result["ok"].as_bool(),
+                Some(true),
+                "cite must return ok:true"
+            );
 
             let (_paths, _config, conn) = project::load_project(&root).expect("load");
             let count: i64 = conn

@@ -303,7 +303,11 @@ mod tests {
             seed_memory_cited(&conn, &mid, 3 * 3600);
 
             let eval = build_personal_eval(&conn, 1800).expect("build");
-            assert_eq!(eval.cases.len(), 0, "out-of-window citation → no positive case");
+            assert_eq!(
+                eval.cases.len(),
+                0,
+                "out-of-window citation → no positive case"
+            );
             assert_eq!(eval.noise_count, 1, "should count 1 noise entry");
             std::fs::remove_dir_all(&root).ok();
         });
