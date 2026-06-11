@@ -385,6 +385,31 @@ pub struct BrokerSection {
     /// files loading unchanged.
     #[serde(default = "default_true")]
     pub ambient: bool,
+    /// v1.5 (Story 2.1): render-time capsule compression. When true (default),
+    /// capsule summaries are compressed with [`compress_for_render`] before
+    /// being injected into hook stdout or MCP tool responses. Compression
+    /// strips `[tags: ...]` / `(context: ...)` annotations and caps at 3
+    /// sentences. Ranking is NEVER affected — compression runs only after
+    /// retrieval and reranking. Set false to inject full memory text (useful
+    /// for debugging or when summaries are already concise).
+    ///
+    /// `#[serde(default = "default_true")]` keeps pre-v1.5 project.toml files
+    /// loading cleanly (they get compression ON).
+    #[serde(default = "default_true")]
+    pub compress_capsules: bool,
+    /// v1.5 (Story 2.3): session-scoped cross-turn capsule dedupe. When true
+    /// (default), the `UserPromptSubmit` context hook skips capsules whose
+    /// `expansion_handle` was already injected earlier in the same session
+    /// (tracked via the proactive-state sidecar). A soft policy: skipping only
+    /// happens when at least one NEW capsule remains — if dedupe would empty
+    /// the injection entirely, all capsules are injected anyway (a repeated
+    /// top memory may still be the right context). Set false to disable
+    /// session dedupe and always inject the full ranked set.
+    ///
+    /// `#[serde(default = "default_true")]` keeps pre-v1.5 project.toml files
+    /// loading cleanly (they get session dedupe ON).
+    #[serde(default = "default_true")]
+    pub session_dedupe: bool,
 }
 
 fn default_max_capsules() -> usize {
@@ -418,6 +443,8 @@ impl Default for BrokerSection {
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
+            compress_capsules: default_true(),
+            session_dedupe: default_true(),
         }
     }
 }
@@ -722,6 +749,18 @@ max_total_cost_usd = 250.0
             config.learning.store_queries,
             "learning.store_queries must default to true"
         );
+        // v1.5 (Story 2.1): a pre-v1.5 project.toml without broker.compress_capsules
+        // must load cleanly and default to true (compression ON).
+        assert!(
+            config.broker.compress_capsules,
+            "broker.compress_capsules must default to true"
+        );
+        // v1.5 (Story 2.3): a pre-v1.5 project.toml without broker.session_dedupe
+        // must load cleanly and default to true (dedupe ON).
+        assert!(
+            config.broker.session_dedupe,
+            "broker.session_dedupe must default to true"
+        );
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
@@ -910,6 +949,25 @@ max_total_cost_usd = 250.0
         assert!(
             config.model.price_per_mtok.is_none(),
             "price_per_mtok must default to None when absent from project.toml"
+        );
+    }
+
+    /// v1.5 (Story 2.1+2.3): compress_capsules and session_dedupe survive a
+    /// round-trip through serialize → deserialize when set to false.
+    #[test]
+    fn broker_v1_5_fields_round_trip_as_false() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.broker.compress_capsules = false;
+        config.broker.session_dedupe = false;
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            !reloaded.broker.compress_capsules,
+            "compress_capsules must survive as false"
+        );
+        assert!(
+            !reloaded.broker.session_dedupe,
+            "session_dedupe must survive as false"
         );
     }
 

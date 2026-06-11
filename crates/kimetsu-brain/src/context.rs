@@ -2009,8 +2009,119 @@ fn lexical_relevance(tokens: &[String], haystack: &str) -> f32 {
     matches as f32 / tokens.len() as f32
 }
 
-fn estimate_tokens(text: &str) -> u32 {
+pub fn estimate_tokens(text: &str) -> u32 {
     ((text.split_whitespace().count() as f32) * 1.33).ceil() as u32
+}
+
+// -----------------------------------------------------------------------
+// v1.5 (Story 2.1): render-time capsule compression
+// -----------------------------------------------------------------------
+
+/// Render-time compression: strips the `[tags: ...]` prefix and the trailing
+/// `(context: ...)` suffix, then caps at the first `max_sentences` sentences.
+///
+/// **Architectural invariant**: this function is called ONLY at render time —
+/// after retrieval and reranking. Ranking inputs, stored `summary` text, and
+/// the eval/bench retrieval paths are never affected. The full text stays
+/// available via `expansion_handle`.
+///
+/// Sentence splitting uses `". "` / `".\n"` boundaries (simple, reliable,
+/// UTF-8-safe). Common abbreviation edge cases are deliberately NOT handled —
+/// the savings far outweigh an occasional mid-abbreviation split.
+///
+/// The `scope:kind - ` prefix that memory summaries carry (e.g.
+/// `"project:fact - Some lesson here."`) is preserved: compression applies
+/// only to the text *after* the ` - ` separator.
+///
+/// Fallback: never returns an empty string — when trimming would leave nothing,
+/// the original input is returned unchanged.
+pub fn compress_for_render(summary: &str, max_sentences: usize) -> String {
+    if max_sentences == 0 {
+        return summary.to_string();
+    }
+
+    // ── 1. Strip [tags: ...] prefix (if present) ─────────────────────────
+    let text = if let Some(rest) = summary.strip_prefix('[') {
+        // Find the closing ']' followed by optional whitespace
+        if let Some(idx) = rest.find(']') {
+            rest[idx + 1..].trim_start()
+        } else {
+            summary
+        }
+    } else {
+        summary
+    };
+
+    // ── 2. Strip (context: ...) suffix (if present) ──────────────────────
+    let text = if let Some(idx) = text.rfind('(') {
+        let candidate = text[..idx].trim_end();
+        // Only strip if the parenthetical looks like a trailing annotation
+        // (contains a ':' inside), to avoid stripping content parentheses.
+        let inner = &text[idx + 1..];
+        if inner.contains(':') && inner.trim_end().ends_with(')') {
+            candidate
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+
+    // ── 3. Detect and preserve "scope:kind - " prefix ────────────────────
+    let (scope_prefix, body) = if let Some(dash_pos) = text.find(" - ") {
+        let prefix_candidate = &text[..dash_pos];
+        // Must look like "word:word" (no spaces in the prefix part)
+        if !prefix_candidate.contains(' ') && prefix_candidate.contains(':') {
+            let body_start = dash_pos + 3; // len(" - ")
+            (&text[..body_start], &text[body_start..])
+        } else {
+            ("", text)
+        }
+    } else {
+        ("", text)
+    };
+
+    // ── 4. Cap at max_sentences on the body ──────────────────────────────
+    let compressed_body = cap_sentences(body, max_sentences);
+
+    // ── 5. Reassemble; fallback to original if result would be empty ─────
+    let result = if scope_prefix.is_empty() {
+        compressed_body.to_string()
+    } else {
+        format!("{scope_prefix}{compressed_body}")
+    };
+
+    if result.trim().is_empty() {
+        summary.to_string()
+    } else {
+        result
+    }
+}
+
+/// Return the first `n` sentences from `text`, where sentences end at
+/// `". "` or `".\n"` boundaries. The terminal period is included in the
+/// returned slice. If fewer than `n` sentences exist the full text is returned.
+fn cap_sentences(text: &str, n: usize) -> &str {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut count = 0;
+    let mut i = 0;
+    while i < len {
+        // Look for ". " or ".\n" — a period followed by whitespace.
+        if bytes[i] == b'.' {
+            let next = i + 1;
+            if next < len && (bytes[next] == b' ' || bytes[next] == b'\n') {
+                count += 1;
+                if count >= n {
+                    // Include the period, trim trailing whitespace on the slice.
+                    return text[..=i].trim_end();
+                }
+            }
+        }
+        i += 1;
+    }
+    // Fewer than n sentences — return the whole text.
+    text.trim_end()
 }
 
 fn excerpt(text: &str) -> String {
@@ -4611,5 +4722,127 @@ mod tests {
         use crate::embeddings::StubReranker;
         let out = rerank_capsules("query", vec![], &StubReranker, 0.0, 0);
         assert!(out.is_empty());
+    }
+
+    // ── v1.5 Story 2.1: compress_for_render unit tests ──────────────────────
+
+    /// CFR-1: short text (< 3 sentences) is returned unchanged (no truncation).
+    #[test]
+    fn compress_for_render_short_text_unchanged() {
+        let text = "project:fact - Use cargo fmt before committing.";
+        let out = compress_for_render(text, 3);
+        assert_eq!(out, text, "short text must not be altered");
+    }
+
+    /// CFR-2: [tags: ...] prefix is stripped before capping.
+    #[test]
+    fn compress_for_render_strips_tags_prefix() {
+        let text = "[tags: rust, cargo] Always run cargo clippy before submitting a PR.";
+        let out = compress_for_render(text, 3);
+        assert!(
+            !out.starts_with('['),
+            "tags prefix must be stripped, got: {out:?}"
+        );
+        assert!(
+            out.contains("cargo clippy"),
+            "body must remain, got: {out:?}"
+        );
+    }
+
+    /// CFR-3: (context: ...) trailing suffix is stripped.
+    #[test]
+    fn compress_for_render_strips_context_suffix() {
+        let text =
+            "project:fact - Use cargo fmt. Always clippy clean. (context: Kimetsu brain lesson)";
+        let out = compress_for_render(text, 5);
+        assert!(
+            !out.contains("(context:"),
+            "context suffix must be stripped, got: {out:?}"
+        );
+        assert!(out.contains("cargo fmt"), "body must remain, got: {out:?}");
+    }
+
+    /// CFR-4: multi-sentence body is capped at max_sentences.
+    #[test]
+    fn compress_for_render_caps_sentences() {
+        let text =
+            "project:fact - First sentence. Second sentence. Third sentence. Fourth sentence.";
+        let out = compress_for_render(text, 2);
+        // Must contain "First" and "Second" but not "Third" or "Fourth".
+        assert!(out.contains("First"), "first sentence must be present");
+        assert!(out.contains("Second"), "second sentence must be present");
+        assert!(
+            !out.contains("Third"),
+            "third sentence must be truncated, got: {out:?}"
+        );
+    }
+
+    /// CFR-5: scope:kind prefix is preserved after compression.
+    #[test]
+    fn compress_for_render_preserves_scope_prefix() {
+        let text = "global_user:convention - First rule. Second rule. Third rule. Fourth rule.";
+        let out = compress_for_render(text, 2);
+        assert!(
+            out.starts_with("global_user:convention - "),
+            "scope prefix must be preserved, got: {out:?}"
+        );
+        assert!(out.contains("First"), "first sentence must remain");
+        assert!(!out.contains("Third"), "third sentence must be truncated");
+    }
+
+    /// CFR-6: empty string never panics and returns the original (empty) string.
+    #[test]
+    fn compress_for_render_empty_input_safe() {
+        let out = compress_for_render("", 3);
+        assert_eq!(out, "", "empty input must return empty string");
+    }
+
+    /// CFR-7: max_sentences=0 returns the original text unchanged (opt-out).
+    #[test]
+    fn compress_for_render_zero_max_sentences_returns_original() {
+        let text = "project:fact - Some lesson that is quite long. It keeps going. And going.";
+        let out = compress_for_render(text, 0);
+        assert_eq!(out, text);
+    }
+
+    /// CFR-8: exotic UTF-8 (multi-byte characters) is handled safely.
+    #[test]
+    fn compress_for_render_utf8_safe() {
+        let text = "project:fact - こんにちは世界. Hello world. Third sentence. Fourth sentence.";
+        // Should not panic; body trimming is purely ASCII-safe (splitting on b'.')
+        let out = compress_for_render(text, 2);
+        assert!(!out.is_empty(), "UTF-8 text must not produce empty output");
+        // The first Japanese sentence period is b'.', so cap at 2 means we cut after the 2nd.
+        assert!(!out.contains("Third"), "third sentence must be truncated");
+    }
+
+    /// CFR-9: long memory (>60 tokens) is compressed by >=25%.
+    /// Acceptance test for the Story 2.1 token-reduction gate.
+    #[test]
+    fn compress_for_render_long_memory_reduces_tokens_by_25_percent() {
+        // Representative long memory text (8 sentences, well over 60 tokens).
+        let long_summary = "project:fact - When a SQLite WAL file exists from a crashed process, \
+            opening the DB causes the WAL to be replayed. The replayed WAL may contain \
+            partial writes that corrupt the DB. Always check for WAL files before opening. \
+            Delete the WAL only after verifying the DB is consistent. Use PRAGMA integrity_check \
+            to validate after opening. If integrity_check fails, restore from backup. Never \
+            truncate the WAL without replaying it first. This pattern applies to any \
+            crash-recovery scenario.";
+
+        let raw_tokens = estimate_tokens(long_summary);
+        assert!(
+            raw_tokens > 60,
+            "test precondition: raw memory must be >60 tokens, got {raw_tokens}"
+        );
+
+        let compressed = compress_for_render(long_summary, 3);
+        let compressed_tokens = estimate_tokens(&compressed);
+
+        let reduction = 1.0 - (compressed_tokens as f64 / raw_tokens as f64);
+        assert!(
+            reduction >= 0.25,
+            "compression must reduce tokens by >=25% on long memories; \
+             raw={raw_tokens} compressed={compressed_tokens} reduction={reduction:.2}"
+        );
     }
 }

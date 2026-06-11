@@ -194,6 +194,43 @@ pub fn looks_like_failure(tool_response: &str) -> bool {
     FAILURE_MARKERS.iter().any(|m| lc.contains(m))
 }
 
+// -----------------------------------------------------------------------
+// v1.5 (Story 2.3): session-scoped cross-turn capsule dedupe
+// -----------------------------------------------------------------------
+
+/// Pure dedupe-decision function. Given a slice of capsules and the current
+/// session state, returns the indices of capsules that should be injected:
+///
+///   * Capsules whose `expansion_handle` is already surfaced this session
+///     are skipped.
+///   * **Soft policy**: if the filter would leave zero capsules (every
+///     candidate is already surfaced), the full input slice is returned
+///     — a repeated top memory may still be the right context.
+///   * Capsules with an empty `expansion_handle` are never tracked and
+///     always pass through.
+///
+/// Returns a `Vec<usize>` of indices into `handles` that survive the filter.
+/// Callers iterate these to collect the actual capsule objects and later
+/// call `state.mark_surfaced` on the included handles.
+///
+/// This is a pure function of (handles, state) with no I/O — easy to unit
+/// test without touching the file system.
+pub fn dedupe_filter(handles: &[&str], state: &SessionState) -> Vec<usize> {
+    let new_indices: Vec<usize> = handles
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.is_empty() || !state.is_surfaced(h))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Soft policy: never empty the injection.
+    if new_indices.is_empty() {
+        (0..handles.len()).collect()
+    } else {
+        new_indices
+    }
+}
+
 impl SessionState {
     pub fn is_surfaced(&self, memory_id: &str) -> bool {
         self.surfaced_memory_ids.iter().any(|id| id == memory_id)
@@ -419,5 +456,99 @@ mod tests {
             error_signature("compiling...\nerror: linker `link.exe` not found\nmore").unwrap();
         assert!(sig.to_ascii_lowercase().contains("linker"));
         assert!(error_signature("").is_none());
+    }
+
+    // ── v1.5 Story 2.3: dedupe_filter unit tests ─────────────────────────────
+
+    /// DD-1: a handle not in the session state passes through.
+    #[test]
+    fn dedupe_filter_passes_unsurfaced_handles() {
+        let state = SessionState::default();
+        let handles = ["memory:aaa", "memory:bbb"];
+        let indices = dedupe_filter(&handles, &state);
+        assert_eq!(indices, vec![0, 1], "unsurfaced capsules must all pass");
+    }
+
+    /// DD-2: a handle already surfaced this session is filtered out.
+    #[test]
+    fn dedupe_filter_removes_surfaced_handles() {
+        let mut state = SessionState::default();
+        state.mark_surfaced("memory:aaa");
+
+        let handles = ["memory:aaa", "memory:bbb"];
+        let indices = dedupe_filter(&handles, &state);
+        // Only index 1 ("memory:bbb") should pass.
+        assert_eq!(indices, vec![1], "surfaced capsule must be filtered");
+    }
+
+    /// DD-3: soft policy — if ALL handles are already surfaced, the full
+    /// set is returned (never empty the injection).
+    #[test]
+    fn dedupe_filter_never_empties_injection() {
+        let mut state = SessionState::default();
+        state.mark_surfaced("memory:aaa");
+        state.mark_surfaced("memory:bbb");
+
+        let handles = ["memory:aaa", "memory:bbb"];
+        let indices = dedupe_filter(&handles, &state);
+        // Soft policy: return all indices rather than an empty vec.
+        assert_eq!(indices, vec![0, 1], "must not empty the injection set");
+    }
+
+    /// DD-4: empty expansion_handle is never tracked and always passes through.
+    #[test]
+    fn dedupe_filter_passes_empty_handle_always() {
+        let mut state = SessionState::default();
+        // Even if we tried to surface an empty string, it should always pass.
+        state.mark_surfaced("");
+
+        let handles = ["", "memory:real"];
+        let indices = dedupe_filter(&handles, &state);
+        // Both pass: "" is always a pass-through, "memory:real" is new.
+        assert!(indices.contains(&0), "empty handle must always pass");
+        assert!(indices.contains(&1), "new real handle must pass");
+    }
+
+    /// DD-5: mix of surfaced and new — only new handles pass,
+    /// provided at least one is new (soft-policy not triggered).
+    #[test]
+    fn dedupe_filter_mixed_keeps_new_only() {
+        let mut state = SessionState::default();
+        state.mark_surfaced("memory:old1");
+        state.mark_surfaced("memory:old2");
+
+        let handles = ["memory:old1", "memory:new", "memory:old2"];
+        let indices = dedupe_filter(&handles, &state);
+        assert_eq!(indices, vec![1], "only the new handle must pass");
+    }
+
+    /// DD-6: proactive-state roundtrip — save surfaced handles, reload,
+    /// and verify dedupe_filter still sees them as surfaced.
+    #[test]
+    fn dedupe_filter_survives_state_roundtrip() {
+        let tmp = std::env::temp_dir();
+        let state_dir = tmp.join(format!(
+            "kimetsu-dedupe-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let path = session_path(&state_dir, Some("test-session-dedupe"));
+
+        let mut state = SessionState::default();
+        state.mark_surfaced("memory:persisted");
+        save(&path, &state);
+
+        let reloaded = load(&path);
+        let handles = ["memory:persisted", "memory:fresh"];
+        let indices = dedupe_filter(&handles, &reloaded);
+        assert_eq!(
+            indices,
+            vec![1],
+            "persisted handle must still be deduplicated after reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }
