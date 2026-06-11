@@ -2518,11 +2518,7 @@ pub fn emit_regret_for_cited_memories(start: &Path, events: &[kimetsu_core::even
 /// so no corresponding `runs` row is required. The event is inserted then
 /// projected (populating `memory_citations`) in one connection, and the
 /// regret sidecar is checked best-effort.
-pub fn record_mcp_citation(
-    start: &Path,
-    memory_id: &str,
-    note: Option<&str>,
-) -> KimetsuResult<()> {
+pub fn record_mcp_citation(start: &Path, memory_id: &str, note: Option<&str>) -> KimetsuResult<()> {
     let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
@@ -2537,10 +2533,10 @@ pub fn record_mcp_citation(
     }
     let event = kimetsu_core::event::Event::new(sentinel_run_id, "memory.cited", payload);
     // apply_events calls insert_event + project_event in one transaction.
-    projector::apply_events(&conn, &[event.clone()])?;
+    projector::apply_events(&conn, std::slice::from_ref(&event))?;
 
     // Best-effort regret check.
-    emit_regret_for_cited_memories(start, &[event]);
+    emit_regret_for_cited_memories(start, std::slice::from_ref(&event));
 
     Ok(())
 }
@@ -6398,7 +6394,10 @@ max_total_cost_usd = 250.0
                     |r| r.get(0),
                 )
                 .expect("count");
-            assert_eq!(row_count, 1, "memory_citations row must exist after MCP cite");
+            assert_eq!(
+                row_count, 1,
+                "memory_citations row must exist after MCP cite"
+            );
             std::fs::remove_dir_all(&root).ok();
         });
     }

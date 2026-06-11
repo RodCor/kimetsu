@@ -4472,8 +4472,7 @@ fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
         return brain_tune_revert(&workspace);
     }
 
-    let eval = build_personal_eval(&conn, 1800)
-        .map_err(|e| format!("build_personal_eval: {e}"))?;
+    let eval = build_personal_eval(&conn, 1800).map_err(|e| format!("build_personal_eval: {e}"))?;
 
     let positive_count = eval.cases.len();
     let noise_count = eval.noise_count;
@@ -4532,7 +4531,7 @@ fn kind_coverage_from_eval(
         }
     }
     let mut vec: Vec<(String, usize)> = counts.into_iter().collect();
-    vec.sort_by(|a, b| b.1.cmp(&a.1));
+    vec.sort_by_key(|a| std::cmp::Reverse(a.1));
     vec
 }
 
@@ -4542,13 +4541,13 @@ fn brain_tune_sweep(
     args: TuneArgs,
     eval: kimetsu_brain::tuneset::PersonalEval,
 ) -> KimetsuResult<()> {
-    use kimetsu_brain::context::{rerank_capsules, ContextRequest};
-    use kimetsu_brain::embeddings::{open_reranker_for_model, NoopEmbedder};
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
+    use kimetsu_brain::embeddings::{NoopEmbedder, open_reranker_for_model};
     use kimetsu_brain::eval::{mean, mrr};
     use kimetsu_brain::project::BrainSession;
     use kimetsu_brain::tune::{
-        append_tune_history, compute_objective, select_winner, train_holdout_split,
-        ComboResult, TuneCombo, TuneHistoryEntry,
+        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history, compute_objective,
+        select_winner, train_holdout_split,
     };
     use std::collections::HashMap;
     use time::format_description::well_known::Rfc3339;
@@ -4577,8 +4576,8 @@ fn brain_tune_sweep(
         }
         let text = std::fs::read_to_string(fallback_fixture_path)
             .map_err(|e| format!("read fixture: {e}"))?;
-        let fixture: kimetsu_brain::eval::EvalFixture = serde_json::from_str(&text)
-            .map_err(|e| format!("parse fixture: {e}"))?;
+        let fixture: kimetsu_brain::eval::EvalFixture =
+            serde_json::from_str(&text).map_err(|e| format!("parse fixture: {e}"))?;
         // Fixture uses key-based relevance, not memory_ids. For the sweep
         // we need memory_ids. We cannot map them here (fixture is hermetic).
         // Instead: use fixture cases as-is for MRR calculation but note that
@@ -4622,10 +4621,8 @@ fn brain_tune_sweep(
     );
 
     // Cache reranker handles (load once, reuse).
-    let mut reranker_cache: HashMap<
-        String,
-        Option<Box<dyn kimetsu_brain::embeddings::Reranker>>,
-    > = HashMap::new();
+    let mut reranker_cache: HashMap<String, Option<Box<dyn kimetsu_brain::embeddings::Reranker>>> =
+        HashMap::new();
     for rr_id in kimetsu_brain::tune::RERANKER_IDS {
         let rr: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = if *rr_id == "off" {
             None
@@ -4636,72 +4633,74 @@ fn brain_tune_sweep(
     }
 
     // Helper: evaluate one combo over a slice of cases.
-    let evaluate_cases = |combo: &TuneCombo,
-                          case_slice: &[&kimetsu_brain::eval::EvalCase]|
-     -> (f64, f64) {
-        let session = match BrainSession::open_readonly(workspace) {
-            Ok(s) => s,
-            Err(_) => return (0.0, 0.0),
-        };
-        let rr_ref = reranker_cache
-            .get(&combo.reranker_id)
-            .and_then(|r| r.as_deref());
-        let rerank_floor = 0.30f32;
-        let rerank_cap = 4usize;
-        let pool = 8usize;
-
-        let mut mrr_vals: Vec<f64> = Vec::new();
-        let mut token_vals: Vec<f64> = Vec::new();
-
-        for case in case_slice {
-            let request = ContextRequest {
-                stage: "localization".to_string(),
-                query: case.query.clone(),
-                budget_tokens: 6000,
-                max_capsules: pool,
-                min_semantic_score: combo.min_semantic_score,
-                min_lexical_coverage: combo.min_lexical_coverage,
-                ..Default::default()
+    let evaluate_cases =
+        |combo: &TuneCombo, case_slice: &[&kimetsu_brain::eval::EvalCase]| -> (f64, f64) {
+            let session = match BrainSession::open_readonly(workspace) {
+                Ok(s) => s,
+                Err(_) => return (0.0, 0.0),
             };
-            let mut bundle =
-                match session.retrieve_context_with_injected_embedder(request, &NoopEmbedder) {
-                    Ok(b) => b,
-                    Err(_) => continue,
+            let rr_ref = reranker_cache
+                .get(&combo.reranker_id)
+                .and_then(|r| r.as_deref());
+            let rerank_floor = 0.30f32;
+            let rerank_cap = 4usize;
+            let pool = 8usize;
+
+            let mut mrr_vals: Vec<f64> = Vec::new();
+            let mut token_vals: Vec<f64> = Vec::new();
+
+            for case in case_slice {
+                let request = ContextRequest {
+                    stage: "localization".to_string(),
+                    query: case.query.clone(),
+                    budget_tokens: 6000,
+                    max_capsules: pool,
+                    min_semantic_score: combo.min_semantic_score,
+                    min_lexical_coverage: combo.min_lexical_coverage,
+                    ..Default::default()
                 };
-            if let Some(rr) = rr_ref {
-                bundle.capsules =
-                    rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
+                let mut bundle =
+                    match session.retrieve_context_with_injected_embedder(request, &NoopEmbedder) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                if let Some(rr) = rr_ref {
+                    bundle.capsules =
+                        rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
+                }
+
+                let ranked_ids: Vec<String> = bundle
+                    .capsules
+                    .iter()
+                    .filter_map(|c| {
+                        c.expansion_handle
+                            .strip_prefix("memory:")
+                            .map(str::to_string)
+                    })
+                    .collect();
+
+                let mrr_val = mrr(&ranked_ids, &case.relevant);
+                mrr_vals.push(mrr_val);
+
+                let tokens: f64 = bundle
+                    .capsules
+                    .iter()
+                    .map(|c| c.token_estimate as f64)
+                    .sum();
+                token_vals.push(tokens);
             }
 
-            let ranked_ids: Vec<String> = bundle
-                .capsules
-                .iter()
-                .filter_map(|c| {
-                    c.expansion_handle
-                        .strip_prefix("memory:")
-                        .map(str::to_string)
-                })
-                .collect();
-
-            let mrr_val = mrr(&ranked_ids, &case.relevant);
-            mrr_vals.push(mrr_val);
-
-            let tokens: f64 = bundle
-                .capsules
-                .iter()
-                .map(|c| c.token_estimate as f64)
-                .sum();
-            token_vals.push(tokens);
-        }
-
-        (mean(&mrr_vals), mean(&token_vals))
-    };
+            (mean(&mrr_vals), mean(&token_vals))
+        };
 
     // Evaluate current config on holdout for baseline.
     let (baseline_holdout_mrr, baseline_holdout_tokens) =
         evaluate_cases(&current_combo, &holdout_cases);
-    let baseline_holdout_obj =
-        compute_objective(baseline_holdout_mrr, baseline_holdout_tokens, args.cost_weight);
+    let baseline_holdout_obj = compute_objective(
+        baseline_holdout_mrr,
+        baseline_holdout_tokens,
+        args.cost_weight,
+    );
 
     // Sweep all combos on TRAIN set.
     let all_combos = TuneCombo::all_combos();
@@ -4747,7 +4746,9 @@ fn brain_tune_sweep(
     );
     println!(
         "Best combo:      lex={:.2} sem={:.3} rr={}",
-        winner.combo.min_lexical_coverage, winner.combo.min_semantic_score, winner.combo.reranker_id
+        winner.combo.min_lexical_coverage,
+        winner.combo.min_semantic_score,
+        winner.combo.reranker_id
     );
     println!(
         "Train objective: {:.4}  (MRR {:.4}, avg_tokens {:.1})",
@@ -10403,8 +10404,8 @@ mod tune_tests {
     use std::fs;
 
     fn tune_test_root(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("kimetsu-tune-cli-{label}-{}", ulid::Ulid::new()));
+        let root =
+            std::env::temp_dir().join(format!("kimetsu-tune-cli-{label}-{}", ulid::Ulid::new()));
         git_init_boundary(&root);
         root
     }
@@ -10437,8 +10438,7 @@ mod tune_tests {
             // Config must NOT have changed.
             let config_after = project::load_config(&paths).expect("config after");
             assert_eq!(
-                config_before.broker.min_lexical_coverage,
-                config_after.broker.min_lexical_coverage,
+                config_before.broker.min_lexical_coverage, config_after.broker.min_lexical_coverage,
                 "dry-run must not change min_lexical_coverage"
             );
 

@@ -7,9 +7,8 @@
 //! Sweep space (config-addressable only):
 //!   - min_lexical_coverage ∈ {0.3, 0.4, 0.5, 0.6}
 //!   - min_semantic_score   ∈ {-1.0(auto), 0.0, 0.25, 0.35, 0.45}
-//!   - reranker id          ∈ {off, ms-marco-tinybert-l-2-v2,
-//!                              jina-reranker-v1-tiny-en,
-//!                              ms-marco-minilm-l-4-v2}
+//!   - reranker id ∈ {off, ms-marco-tinybert-l-2-v2, jina-reranker-v1-tiny-en,
+//!     ms-marco-minilm-l-4-v2}
 //!
 //! NOT swept (compile-time or complex-deploy):
 //!   - RERANK_POOL (compile-time const in the daemon) — deferred.
@@ -17,8 +16,6 @@
 //! Objective: mean_MRR - cost_weight * mean_injected_tokens
 
 use serde::{Deserialize, Serialize};
-
-use crate::eval::EvalCase;
 
 // ─── Sweep parameter space ────────────────────────────────────────────────────
 
@@ -111,9 +108,11 @@ pub fn train_holdout_split(case_count: usize) -> (Vec<usize>, Vec<usize>) {
 /// Select the best combo from a slice of `ComboResult` by objective score.
 /// Returns `None` when the slice is empty.
 pub fn select_winner(results: &[ComboResult]) -> Option<&ComboResult> {
-    results
-        .iter()
-        .max_by(|a, b| a.objective.partial_cmp(&b.objective).unwrap_or(std::cmp::Ordering::Equal))
+    results.iter().max_by(|a, b| {
+        a.objective
+            .partial_cmp(&b.objective)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 // ─── Tune history I/O ─────────────────────────────────────────────────────────
@@ -264,8 +263,3 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
-
-// Suppress unused import warning for EvalCase (used in doc context).
-const _: fn() = || {
-    let _: &[EvalCase] = &[];
-};
