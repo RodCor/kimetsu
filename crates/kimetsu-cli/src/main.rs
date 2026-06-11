@@ -1056,6 +1056,16 @@ struct BrainExportArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Strip the trailing `(context: …)` segment from each exported memory text.
+    /// Useful when sharing memories between projects: the context annotation is
+    /// project-specific and not meaningful elsewhere.
+    #[arg(long)]
+    redact: bool,
+    /// Additionally strip the leading `[tags: …]` prefix from each exported
+    /// memory text. Implies a fully clean lesson body with no metadata.
+    /// Only effective when combined with `--redact`.
+    #[arg(long)]
+    redact_tags: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1765,10 +1775,13 @@ fn restart_cmd(args: RestartArgs) -> KimetsuResult<()> {
 /// 4. None present + TTY → prompt with the provided `reader`.
 ///
 /// Factored as a pure-ish function so it can be unit-tested without real installs.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_setup_hosts(
     arg: Option<&str>,
     present_claude: bool,
     present_codex: bool,
+    present_cursor: bool,
+    present_gemini: bool,
     present_openclaw: bool,
     present_pi: bool,
     is_tty: bool,
@@ -1791,6 +1804,12 @@ pub fn resolve_setup_hosts(
     }
     if present_codex {
         detected.push(BridgeTarget::Codex);
+    }
+    if present_cursor {
+        detected.push(BridgeTarget::Cursor);
+    }
+    if present_gemini {
+        detected.push(BridgeTarget::GeminiCli);
     }
     #[cfg(feature = "openclaw")]
     if present_openclaw {
@@ -1818,13 +1837,15 @@ pub fn resolve_setup_hosts(
         Ok(vec![BridgeTarget::ClaudeCode])
     } else {
         #[cfg(all(feature = "pi", feature = "openclaw"))]
-        let prompt = "Which host agent do you use? [claude-code/codex/openclaw/pi/both]: ";
+        let prompt =
+            "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/openclaw/pi/both]: ";
         #[cfg(all(feature = "pi", not(feature = "openclaw")))]
-        let prompt = "Which host agent do you use? [claude-code/codex/pi/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/pi/both]: ";
         #[cfg(all(not(feature = "pi"), feature = "openclaw"))]
-        let prompt = "Which host agent do you use? [claude-code/codex/openclaw/both]: ";
+        let prompt =
+            "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/openclaw/both]: ";
         #[cfg(all(not(feature = "pi"), not(feature = "openclaw")))]
-        let prompt = "Which host agent do you use? [claude-code/codex/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/both]: ";
         print!("{prompt}");
         io::stdout().flush().ok();
         let mut line = String::new();
@@ -1844,9 +1865,10 @@ pub fn resolve_setup_hosts(
     }
 }
 
-/// Detect whether the home config directories for Claude Code, Codex, OpenClaw, and Pi exist.
-/// Returns `(claude_present, codex_present, openclaw_present, pi_present)`.
-fn detect_present_hosts() -> (bool, bool, bool, bool) {
+/// Detect whether the home config directories for Claude Code, Codex, Cursor, Gemini CLI,
+/// OpenClaw, and Pi exist.
+/// Returns `(claude_present, codex_present, cursor_present, gemini_present, openclaw_present, pi_present)`.
+fn detect_present_hosts() -> (bool, bool, bool, bool, bool, bool) {
     let home = std::env::var_os("USERPROFILE")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
@@ -1854,11 +1876,15 @@ fn detect_present_hosts() -> (bool, bool, bool, bool) {
 
     let home = match home {
         Some(h) => h,
-        None => return (false, false, false, false),
+        None => return (false, false, false, false, false, false),
     };
 
     let claude_present = home.join(".claude").is_dir();
     let codex_present = home.join(".codex").is_dir();
+    // Cursor: global config lives in ~/.cursor
+    let cursor_present = home.join(".cursor").is_dir();
+    // Gemini CLI: global config lives in ~/.gemini
+    let gemini_present = home.join(".gemini").is_dir();
     #[cfg(feature = "openclaw")]
     let openclaw_present = home.join(".openclaw").is_dir();
     #[cfg(not(feature = "openclaw"))]
@@ -1867,7 +1893,14 @@ fn detect_present_hosts() -> (bool, bool, bool, bool) {
     let pi_present = home.join(".pi").is_dir();
     #[cfg(not(feature = "pi"))]
     let pi_present = false;
-    (claude_present, codex_present, openclaw_present, pi_present)
+    (
+        claude_present,
+        codex_present,
+        cursor_present,
+        gemini_present,
+        openclaw_present,
+        pi_present,
+    )
 }
 
 /// `kimetsu setup` — one-command onboarding.
@@ -1921,13 +1954,22 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
     // ── Step 2: Choose host(s) ────────────────────────────────────────────────
     println!();
     println!("[2/4] Selecting host(s)...");
-    let (present_claude, present_codex, present_openclaw, present_pi) = detect_present_hosts();
+    let (
+        present_claude,
+        present_codex,
+        present_cursor,
+        present_gemini,
+        present_openclaw,
+        present_pi,
+    ) = detect_present_hosts();
     let is_tty = io::stdin().is_terminal();
     let stdin = io::stdin();
     let hosts = resolve_setup_hosts(
         args.host.as_deref(),
         present_claude,
         present_codex,
+        present_cursor,
+        present_gemini,
         present_openclaw,
         present_pi,
         is_tty,
@@ -1969,6 +2011,8 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            BridgeTarget::Cursor => "Cursor",
+            BridgeTarget::GeminiCli => "Gemini CLI",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -2126,6 +2170,8 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            BridgeTarget::Cursor => "Cursor",
+            BridgeTarget::GeminiCli => "Gemini CLI",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -2520,6 +2566,8 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 BridgeTarget::ClaudeCode => "Claude Code",
                 BridgeTarget::Codex => "Codex",
                 BridgeTarget::Kimetsu => "Kimetsu",
+                BridgeTarget::Cursor => "Cursor",
+                BridgeTarget::GeminiCli => "Gemini CLI",
                 #[cfg(feature = "openclaw")]
                 BridgeTarget::OpenClaw => "OpenClaw",
                 #[cfg(feature = "pi")]
@@ -3843,7 +3891,8 @@ fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
         })
         .transpose()?;
 
-    let memories = project::export_memories(&workspace, scope, kind)?;
+    let memories =
+        project::export_memories(&workspace, scope, kind, args.redact, args.redact_tags)?;
     let json = serde_json::to_string_pretty(&memories)
         .map_err(|e| format!("brain export: failed to serialize: {e}"))?;
 
@@ -10339,6 +10388,8 @@ ambient = false
             false,
             false,
             false,
+            false,
+            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -10355,6 +10406,8 @@ ambient = false
             false,
             false,
             false,
+            false,
+            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -10365,32 +10418,72 @@ ambient = false
     fn resolve_setup_hosts_auto_only_claude_present() {
         use kimetsu_chat::BridgeTarget;
         // Only Claude present → Claude.
-        let hosts =
-            resolve_setup_hosts(None, true, false, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_only_codex_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, true, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Codex]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_both_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, true, true, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex]);
     }
 
     #[test]
     fn resolve_setup_hosts_neither_present_non_tty_defaults_claude() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode]);
     }
 
@@ -10400,6 +10493,8 @@ ambient = false
         // Simulated TTY input "codex\n".
         let hosts = resolve_setup_hosts(
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -10415,6 +10510,8 @@ ambient = false
     fn resolve_setup_hosts_bad_host_arg_returns_error() {
         let result = resolve_setup_hosts(
             Some("not-a-host"),
+            false,
+            false,
             false,
             false,
             false,
@@ -10468,6 +10565,8 @@ ambient = false
             false,
             false,
             false,
+            false,
+            false,
             true,
             Cursor::new(b"both\n"),
         )
@@ -10479,8 +10578,18 @@ ambient = false
     #[test]
     fn resolve_setup_hosts_auto_only_pi_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, true, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
@@ -10490,6 +10599,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("pi"),
+            false,
+            false,
             false,
             false,
             false,
@@ -10505,9 +10616,18 @@ ambient = false
     #[test]
     fn resolve_setup_hosts_tty_scripted_pi() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, false, true, Cursor::new(b"pi\n"))
-                .unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Cursor::new(b"pi\n"),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
@@ -10516,8 +10636,18 @@ ambient = false
     fn resolve_setup_hosts_auto_only_openclaw_present() {
         use kimetsu_chat::BridgeTarget;
         // Only OpenClaw present → OpenClaw detected.
-        let hosts =
-            resolve_setup_hosts(None, false, false, true, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
     }
 
@@ -10527,6 +10657,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("openclaw"),
+            false,
+            false,
             false,
             false,
             false,
@@ -10544,6 +10676,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("claw"),
+            false,
+            false,
             false,
             false,
             false,
@@ -10580,6 +10714,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             None,
+            false,
+            false,
             false,
             false,
             false,
