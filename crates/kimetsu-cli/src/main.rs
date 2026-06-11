@@ -4542,7 +4542,7 @@ fn brain_tune_sweep(
     eval: kimetsu_brain::tuneset::PersonalEval,
 ) -> KimetsuResult<()> {
     use kimetsu_brain::context::{ContextRequest, rerank_capsules};
-    use kimetsu_brain::embeddings::{NoopEmbedder, open_reranker_for_model};
+    use kimetsu_brain::embeddings::{open_embedder_for, open_reranker_for_model};
     use kimetsu_brain::eval::{mean, mrr};
     use kimetsu_brain::project::BrainSession;
     use kimetsu_brain::tune::{
@@ -4553,6 +4553,18 @@ fn brain_tune_sweep(
     use time::format_description::well_known::Rfc3339;
 
     let config = project::load_config(paths)?;
+    // Tune against the PRODUCTION retrieval pipeline: the same embedder
+    // resolution as retrieve_context_with_request. On embeddings builds this
+    // loads the real model (semantic floors only discriminate with real
+    // cosines); lean builds degrade to Noop and sweep FTS-only — the status
+    // output should make that visible to the user.
+    let embedder = open_embedder_for(config.embedder.enabled);
+    if embedder.is_noop() {
+        println!(
+            "note: lean build/embedder disabled — sweeping FTS-only retrieval \
+             (semantic floor values will not differentiate)"
+        );
+    }
     let current_combo = TuneCombo {
         min_lexical_coverage: config.broker.min_lexical_coverage,
         min_semantic_score: config.broker.min_semantic_score,
@@ -4660,7 +4672,7 @@ fn brain_tune_sweep(
                     ..Default::default()
                 };
                 let mut bundle =
-                    match session.retrieve_context_with_injected_embedder(request, &NoopEmbedder) {
+                    match session.retrieve_context_with_injected_embedder(request, embedder) {
                         Ok(b) => b,
                         Err(_) => continue,
                     };
