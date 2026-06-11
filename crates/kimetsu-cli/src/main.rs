@@ -724,6 +724,12 @@ enum BrainCommand {
     /// net-positive / net-negative verdict.  Honest negatives are shown as
     /// such.  Use `--json` for stable machine-readable output.
     Roi(RoiArgs),
+    /// Self-tuning sweep — optimize retrieval config from personal eval data.
+    ///
+    /// --status: show accumulated eval cases and readiness.
+    /// --apply: write the winning config to project.toml (dry-run by default).
+    /// --revert: restore the previous tune-history entry.
+    Tune(TuneArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -883,6 +889,27 @@ struct SessionEndHookArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain tune`.
+#[derive(Debug, Args)]
+struct TuneArgs {
+    /// Show personal eval-set statistics without running the sweep.
+    #[arg(long)]
+    status: bool,
+    /// Cost penalty weight per estimated token injected per query.
+    /// Default 0.005 ≈ one MRR rank position ≈ 200 tokens.
+    #[arg(long, default_value_t = 0.005f64)]
+    cost_weight: f64,
+    /// Apply the winning config to project.toml (without this flag, dry-run only).
+    #[arg(long)]
+    apply: bool,
+    /// Revert the most recent tune-history entry.
+    #[arg(long)]
+    revert: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
 }
 
 /// Args for `kimetsu brain roi`.
@@ -3368,6 +3395,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Eval(args) => brain_eval(args),
         BrainCommand::Bench(args) => brain_bench(args),
         BrainCommand::Roi(args) => brain_roi(args),
+        BrainCommand::Tune(args) => brain_tune(args),
     }
 }
 
@@ -4426,6 +4454,101 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         }
     }
 
+    Ok(())
+}
+
+/// v1.5: `kimetsu brain tune` — personal eval readiness + optional sweep.
+fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::tuneset::build_personal_eval;
+
+    let workspace = args
+        .workspace
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+    let (_paths2, _config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+
+    if args.revert {
+        return brain_tune_revert(&workspace);
+    }
+
+    let eval = build_personal_eval(&conn, 1800)
+        .map_err(|e| format!("build_personal_eval: {e}"))?;
+
+    let positive_count = eval.cases.len();
+    let noise_count = eval.noise_count;
+
+    let readiness = if positive_count >= 30 {
+        "READY — enough cases for a meaningful sweep."
+    } else {
+        "accumulating — synthetic fixture will be used for the sweep (< 30 positive cases)."
+    };
+
+    // Coverage by memory kind (from relevant memory ids).
+    let kind_coverage = kind_coverage_from_eval(&conn, &eval.cases);
+
+    println!("=== kimetsu brain tune --status ===");
+    println!("Positive cases (query + ≥1 cited memory): {positive_count}");
+    println!("Noise entries  (served, no citation):     {noise_count}");
+    if let Some(o) = &eval.oldest {
+        println!("Oldest positive case: {o}");
+    }
+    if let Some(n) = &eval.newest {
+        println!("Newest positive case: {n}");
+    }
+    println!();
+    println!("Coverage by memory kind:");
+    for (kind, count) in &kind_coverage {
+        println!("  {kind:<22} {count}");
+    }
+    println!();
+    println!("Readiness: {readiness}");
+
+    if args.status {
+        return Ok(());
+    }
+
+    // Sweep (or dry-run report).
+    brain_tune_sweep(&workspace, &paths, args, eval)
+}
+
+fn kind_coverage_from_eval(
+    conn: &rusqlite::Connection,
+    cases: &[kimetsu_brain::eval::EvalCase],
+) -> Vec<(String, usize)> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for case in cases {
+        for mid in &case.relevant {
+            let kind: Option<String> = conn
+                .query_row(
+                    "SELECT kind FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![mid],
+                    |r| r.get(0),
+                )
+                .ok();
+            let kind = kind.unwrap_or_else(|| "unknown".to_string());
+            *counts.entry(kind).or_default() += 1;
+        }
+    }
+    let mut vec: Vec<(String, usize)> = counts.into_iter().collect();
+    vec.sort_by(|a, b| b.1.cmp(&a.1));
+    vec
+}
+
+fn brain_tune_sweep(
+    workspace: &std::path::Path,
+    _paths: &kimetsu_core::paths::ProjectPaths,
+    args: TuneArgs,
+    eval: kimetsu_brain::tuneset::PersonalEval,
+) -> KimetsuResult<()> {
+    let _ = (workspace, args, eval);
+    println!("[tune] Sweep not yet implemented — coming in Task 5.");
+    Ok(())
+}
+
+fn brain_tune_revert(_workspace: &std::path::Path) -> KimetsuResult<()> {
+    println!("[tune] Revert not yet implemented — coming in Task 5.");
     Ok(())
 }
 
