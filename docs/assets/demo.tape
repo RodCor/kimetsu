@@ -17,7 +17,8 @@ Set FontSize 12
 Set Width 1100
 Set Height 620
 Set Padding 12
-Set TypingSpeed 40ms
+Set TypingSpeed 30ms
+Set PlaybackSpeed 2.0
 
 # ── Hidden setup: a fresh scratch project ────────────────────────────────────
 Hide
