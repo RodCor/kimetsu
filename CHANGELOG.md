@@ -7,6 +7,105 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v1.5.0 — pays for itself
+
+ADDED
+  * **Telemetry capture.** Raw query text is now stored in `context.served`
+    telemetry events when `[learning] store_queries = true` (default; set
+    `false` to revert to the pre-v1.5 query-hash-only behavior). A
+    `session_id` field is also written when the host provides one (Claude Code
+    hooks; absent for hosts that do not emit it). Dropped-capsule sidecar
+    (`~/.kimetsu/cache/<hash>/dropped_capsules.json`) records capsules that
+    were floor-filtered out so that a later citation of one is detected as a
+    `retrieval.regret` event, feeding the self-tuning loop. All telemetry
+    stays on-machine; nothing is exported.
+
+  * **ROI ledger — `kimetsu brain roi`.** Conservative per-kind token-savings
+    estimates (failure_pattern=1500, command=400, convention=300, fact=500,
+    preference=200 tokens per citation) minus brain-injection overhead give a
+    net-positive / net-negative verdict. Dollar estimates are shown when the
+    active model is recognized from a built-in price table (Claude 3/4, GPT-4/5
+    families, Bedrock routing prefixes) or when `[model] price_per_mtok` is set
+    in `project.toml`. `--window 7d|30d|all` and `--json` for scripting. The
+    Stop hook appends a per-session savings sentence when ≥1 citation occurred;
+    zero-citation sessions are silent. Calibration methodology and honest
+    limitations: `docs/ROI-METHODOLOGY.md`.
+
+  * **Token budget — render-time capsule compression and session dedupe.**
+    Two `[broker]` toggles, both default `true`:
+    - `compress_capsules`: capsule summaries are compressed at render time
+      (strips `[tags: ...]` / `(context: ...)` annotations, caps at 3
+      sentences). Ranking is never affected — this runs only after retrieval
+      and reranking. Set `false` to inject full memory text.
+    - `session_dedupe`: the `UserPromptSubmit` hook skips capsules whose
+      handle was already injected earlier in the same session (tracked via
+      the proactive-state sidecar). Soft policy: falls back to injecting all
+      capsules when dedupe would produce an empty set. This addresses the
+      pre-v1.5 behavior where the main hook re-injected the same top capsule
+      on every prompt of a long session.
+
+  * **Self-Tuning Brain — `kimetsu_brain_cite` MCP tool + `kimetsu brain tune`.**
+    `kimetsu_brain_cite` is a new write-gated MCP tool that records a
+    `memory.cited` event from inside an MCP session, closing the ground-truth
+    gap when the model leans on a memory but doesn't explicitly call
+    `cite_memory`. Personal eval set: `tuneset` builds positive eval cases from
+    `context.served` + citation joins (exact session_id or ±30-minute window
+    fallback). `kimetsu brain tune --status` reports case count and kind
+    coverage. `kimetsu brain tune` (dry-run by default) sweeps `broker.min_fts_coverage`
+    ∈ {0.3, 0.4, 0.5, 0.6} × `broker.min_semantic_score` ∈ {-1.0(AUTO), 0.0, 0.25,
+    0.35, 0.45} against the production embedder; `--apply` writes only the
+    floor parameters (not the reranker — that change is recommended separately);
+    `--revert` restores the previous tune-history entry. A holdout guardrail
+    (deterministic 20% split) prevents writing a config that regresses the
+    holdout objective.
+
+  * **Consolidation — `kimetsu brain consolidate` + `kimetsu brain triage`.**
+    Schema migrated to **v3** (`superseded_by` column + index on `memories`).
+    `brain consolidate` (Story 3.1, default): brute-force cosine scan within the
+    same embedding model; clusters at ≥ 0.92 cosine (configurable with
+    `--threshold`) are merged — survivor keeps its id and text, members get
+    `superseded_by` set and a `memory.superseded` event written (rebuild-safe);
+    citations are reassigned to the survivor. `--distill` (Story 3.2): looser
+    clusters (0.75–0.85 cosine band, ≥3 memories, ≥1 shared tag) are fed to
+    the configured distiller; result lands as a memory proposal for human
+    review; prints clusters and exits 0 when no distiller is configured.
+    `brain triage` (Story 3.3): interactive per-item keep / prune / skip of
+    memories below a usefulness and age threshold (`--score-floor 0.2`,
+    `--age-days 30`); `--prune-all --yes` for batch non-interactive pruning.
+
+  * **Reach — export redact, Cursor + Gemini CLI installers, CI embeddings job.**
+    `kimetsu brain export --redact` strips the `(context: …)` segment from
+    exported memory text; `--redact-tags` (requires `--redact`) additionally
+    strips the `[tags: …]` prefix. Both flags are useful for sharing brains
+    without leaking workspace-specific file paths or tag metadata.
+    `kimetsu plugin install cursor` and `kimetsu plugin install gemini-cli`
+    write MCP config (`.cursor/mcp.json` / `.gemini/settings.json`) and an
+    always-on guidance file (`.cursor/rules/kimetsu-brain/rule.md` for workspace
+    installs; `GEMINI.md` merged into the project root or `~/.gemini/GEMINI.md`
+    for global installs). Neither host has a `UserPromptSubmit`-style hook
+    system, so MCP + the guidance file are the complete integration surface.
+    **Note: Cursor and Gemini CLI config schemas were inferred from their public
+    docs as of June 2026 and have not been verified against live host builds —
+    treat these installers as a starting-point and check the generated files
+    before committing them.** CI: a new `test-embeddings` job (ubuntu-only,
+    `--features embeddings`, HuggingFace + fastembed cache) runs alongside the
+    existing lean test matrix.
+
+CHANGED
+  * `kimetsu.mcp_write_tools` gate now covers `kimetsu_brain_cite` alongside
+    the existing write tools (same env / config / default-true logic for the
+    local stdio server; remote server remains env-only, default-deny).
+  * Stop hook output includes a per-session token-savings line when the brain
+    was cited at least once that session.
+  * `brain.db` schema advanced from **v2 → v3** (automatic on first
+    read-write open; sidecar backup taken per the existing migration policy).
+  * `brain export` gains `--redact` / `--redact-tags` flags (no behavior
+    change for existing callers).
+
+FIXED
+  * Tune sweep now runs against the production embedder (not the Noop embedder
+    used in tests), so floor calibration is on real vectors.
+
 ## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
