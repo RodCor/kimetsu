@@ -169,6 +169,15 @@ impl Default for EmbedderSection {
 pub struct LearningSection {
     #[serde(default = "default_auto_harvest")]
     pub auto_harvest: bool,
+    /// v1.5: store the raw retrieval query in local `context.served`
+    /// telemetry so the self-tuning loop can build a personal eval set.
+    /// Data never leaves the machine and is never exported. Set false to
+    /// keep only the query hash (the pre-v1.5 behavior). Default true so
+    /// new installs gain the eval-set signal immediately on upgrade;
+    /// `#[serde(default = "default_true")]` keeps pre-v1.5 project.toml
+    /// files loading cleanly (they get store_queries = true).
+    #[serde(default = "default_true")]
+    pub store_queries: bool,
     /// Opt-in credentialed SessionEnd distiller (configured by the install
     /// wizard). Disabled by default; `#[serde(default)]` keeps older
     /// project.toml files loading.
@@ -184,6 +193,7 @@ impl Default for LearningSection {
     fn default() -> Self {
         Self {
             auto_harvest: default_auto_harvest(),
+            store_queries: default_true(),
             distiller: DistillerSection::default(),
         }
     }
@@ -696,6 +706,13 @@ max_total_cost_usd = 250.0
         assert_eq!(
             config.embedder.reranker, "ms-marco-tinybert-l-2-v2",
             "embedder.reranker must default to ms-marco-tinybert-l-2-v2"
+        );
+        // v1.5: a pre-v1.5 project.toml has no learning.store_queries —
+        // defaults to true so existing installs gain the eval-set signal
+        // on upgrade without any config change.
+        assert!(
+            config.learning.store_queries,
+            "learning.store_queries must default to true"
         );
     }
 

@@ -4316,17 +4316,32 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap_or(0);
 
+    // Parse the full hook payload once so we can extract both `prompt`
+    // and `session_id` (Change A + Change B).
+    let hook_payload: Option<serde_json::Value> = if input.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str(input.trim()).ok()
+    };
+
+    // Change B: extract session_id — present in Claude Code's
+    // UserPromptSubmit payload; absent in Codex / plain-text fallbacks.
+    let session_id: Option<String> = hook_payload
+        .as_ref()
+        .and_then(|v| v.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+
     // Extract the prompt text from the hook payload
-    let prompt = if input.trim().is_empty() {
-        String::new()
-    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
-        v.get("prompt")
+    let prompt = match &hook_payload {
+        Some(v) => v
+            .get("prompt")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
-            .to_string()
-    } else {
-        // Plain text fallback
-        input.trim().to_string()
+            .to_string(),
+        None if !input.trim().is_empty() => input.trim().to_string(), // plain-text fallback
+        None => String::new(),
     };
 
     // Too short to be meaningful
@@ -4357,26 +4372,52 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     // logged. Best-effort (let _ =) — telemetry must never break the hook.
     // Gate behind KIMETSU_BRAIN_LOG_RETRIEVAL=0 opt-out (default ON).
     if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() != Ok("0") {
-        let top_score = bundle.top_score;
-        let query_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            request.query.hash(&mut h);
-            format!("{:016x}", h.finish())
-        };
-        let _ = project::log_telemetry_event(
-            &workspace,
-            "context.served",
-            serde_json::json!({
-                "query_hash": query_hash,
-                "capsule_count": bundle.capsules.len(),
-                "top_score": top_score,
-                "skipped": bundle.skipped,
-                "stage": &request.stage,
-                "retrieval_path": retrieval_path,
-            }),
-        );
+        // Change A: load store_queries from project config best-effort.
+        // Telemetry must never break the hook, so any config error just
+        // falls through to the safe default (true = store the query).
+        let store_queries = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+            .ok()
+            .and_then(|paths| project::load_config(&paths).ok())
+            .map(|cfg| cfg.learning.store_queries)
+            .unwrap_or(true);
+
+        let payload = build_served_event_payload(ServedEventArgs {
+            query: &request.query,
+            capsule_count: bundle.capsules.len(),
+            top_score: bundle.top_score,
+            skipped: bundle.skipped,
+            stage: &request.stage,
+            retrieval_path,
+            store_queries,
+            session_id: session_id.as_deref(),
+        });
+        let _ = project::log_telemetry_event(&workspace, "context.served", payload);
+    }
+
+    // Change C1: capture top-10 dropped MEMORY capsules to the rolling
+    // sidecar. Best-effort — telemetry must never break the hook.
+    // We capture AFTER the telemetry event so a slow sidecar write
+    // doesn't block the event. Only capsules whose expansion_handle
+    // starts with "memory:" are interesting for regret detection.
+    {
+        use kimetsu_brain::dropped_capsule;
+        let cache_dir = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+            .ok()
+            .map(|p| kimetsu_core::paths::user_cache_dir_for(&p.repo_root));
+        if let Some(cache_dir) = cache_dir {
+            let dropped_ids = bundle
+                .excluded
+                .iter()
+                .filter(|c| c.expansion_handle.starts_with("memory:"))
+                .filter_map(|c| {
+                    c.expansion_handle
+                        .strip_prefix("memory:")
+                        .map(str::to_string)
+                })
+                .take(10);
+            let now = dropped_capsule::now_secs();
+            dropped_capsule::append_dropped(&cache_dir, dropped_ids, now);
+        }
     }
 
     if bundle.skipped || bundle.capsules.is_empty() {
@@ -4397,6 +4438,68 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
 
     print_user_prompt_submit_context(&additional_context)?;
     Ok(())
+}
+
+/// v1.5: inputs for the `context.served` telemetry payload builder.
+///
+/// Grouped into a struct to keep [`build_served_event_payload`] under
+/// the clippy `too_many_arguments` threshold and to make call-sites
+/// self-documenting.
+pub struct ServedEventArgs<'a> {
+    /// Raw retrieval query text.
+    pub query: &'a str,
+    /// How many capsules were included in the bundle.
+    pub capsule_count: usize,
+    /// Best composite score before the skip check.
+    pub top_score: f32,
+    /// True when the top score was below `min_score` (no injection).
+    pub skipped: bool,
+    /// Retrieval stage tag (e.g. `"localization"`).
+    pub stage: &'a str,
+    /// `"daemon"` or `"fts_fallback"`.
+    pub retrieval_path: &'a str,
+    /// When true, include the raw query text in the payload.
+    /// When false, only the hash is stored (pre-v1.5 behavior).
+    pub store_queries: bool,
+    /// Claude Code session id from the hook payload, when available.
+    /// Codex and plain-text fallbacks may omit it.
+    pub session_id: Option<&'a str>,
+}
+
+/// v1.5: pure builder for the `context.served` telemetry payload.
+///
+/// Extracted so the logic can be unit-tested without hitting the FS or
+/// spawning hooks. Always emits `query_hash` for backward compatibility;
+/// adds `query` only when `args.store_queries` is true; adds `session_id`
+/// only when present.
+pub fn build_served_event_payload(args: ServedEventArgs<'_>) -> serde_json::Value {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    args.query.hash(&mut h);
+    let query_hash = format!("{:016x}", h.finish());
+
+    let mut map = serde_json::Map::new();
+    map.insert("query_hash".into(), serde_json::json!(query_hash));
+    if args.store_queries {
+        map.insert("query".into(), serde_json::json!(args.query));
+    }
+    map.insert(
+        "capsule_count".into(),
+        serde_json::json!(args.capsule_count),
+    );
+    map.insert("top_score".into(), serde_json::json!(args.top_score));
+    map.insert("skipped".into(), serde_json::json!(args.skipped));
+    map.insert("stage".into(), serde_json::json!(args.stage));
+    map.insert(
+        "retrieval_path".into(),
+        serde_json::json!(args.retrieval_path),
+    );
+    if let Some(sid) = args.session_id {
+        map.insert("session_id".into(), serde_json::json!(sid));
+    }
+    serde_json::Value::Object(map)
 }
 
 fn print_user_prompt_submit_context(additional_context: &str) -> KimetsuResult<()> {
@@ -9368,5 +9471,131 @@ ambient = false
         assert_eq!(bundle.capsules[0].kind, "memory");
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);
+    }
+
+    // ── build_served_event_payload unit tests (Changes A + B) ───────────────
+
+    fn make_payload(store_queries: bool, session_id: Option<&str>) -> serde_json::Value {
+        build_served_event_payload(ServedEventArgs {
+            query: "what is the answer to life",
+            capsule_count: 3,
+            top_score: 0.72,
+            skipped: false,
+            stage: "localization",
+            retrieval_path: "daemon",
+            store_queries,
+            session_id,
+        })
+    }
+
+    #[test]
+    fn served_event_payload_always_includes_query_hash() {
+        let payload = make_payload(false, None);
+        assert!(
+            payload.get("query_hash").is_some(),
+            "query_hash must always be present"
+        );
+        // When store_queries is false, raw query must be absent.
+        assert!(
+            payload.get("query").is_none(),
+            "query must be absent when store_queries=false"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_includes_raw_query_when_store_queries_true() {
+        let query = "how does the embedding daemon flush its cache";
+        let payload = build_served_event_payload(ServedEventArgs {
+            query,
+            capsule_count: 5,
+            top_score: 0.85,
+            skipped: false,
+            stage: "implementation",
+            retrieval_path: "daemon",
+            store_queries: true,
+            session_id: None,
+        });
+        assert_eq!(
+            payload.get("query").and_then(|v| v.as_str()),
+            Some(query),
+            "raw query must be present when store_queries=true"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_includes_session_id_when_present() {
+        let payload = make_payload(true, Some("ses-abc-123"));
+        assert_eq!(
+            payload.get("session_id").and_then(|v| v.as_str()),
+            Some("ses-abc-123"),
+            "session_id must appear when provided"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_omits_session_id_when_absent() {
+        let payload = make_payload(false, None);
+        assert!(
+            payload.get("session_id").is_none(),
+            "session_id must be absent when not provided"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_hash_is_stable_for_same_query() {
+        let p1 = build_served_event_payload(ServedEventArgs {
+            query: "stable hash test",
+            capsule_count: 1,
+            top_score: 0.5,
+            skipped: false,
+            stage: "loc",
+            retrieval_path: "daemon",
+            store_queries: false,
+            session_id: None,
+        });
+        let p2 = build_served_event_payload(ServedEventArgs {
+            query: "stable hash test",
+            capsule_count: 1,
+            top_score: 0.5,
+            skipped: false,
+            stage: "loc",
+            retrieval_path: "daemon",
+            store_queries: false,
+            session_id: None,
+        });
+        assert_eq!(
+            p1.get("query_hash").and_then(|v| v.as_str()),
+            p2.get("query_hash").and_then(|v| v.as_str()),
+            "query_hash must be deterministic for the same query"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_has_required_fields() {
+        let payload = build_served_event_payload(ServedEventArgs {
+            query: "check fields",
+            capsule_count: 2,
+            top_score: 0.6,
+            skipped: false,
+            stage: "localization",
+            retrieval_path: "fts_fallback",
+            store_queries: true,
+            session_id: Some("s1"),
+        });
+        for field in &[
+            "query_hash",
+            "query",
+            "capsule_count",
+            "top_score",
+            "skipped",
+            "stage",
+            "retrieval_path",
+            "session_id",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "missing required field: {field}"
+            );
+        }
     }
 }
