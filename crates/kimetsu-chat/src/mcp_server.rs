@@ -12,7 +12,7 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) When a retrieved memory materially helped, call kimetsu_brain_cite with its memory_id — this closes the ground-truth loop and powers self-tuning. (4) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
@@ -61,6 +61,8 @@ const BRIDGE_EXPORT_DESCRIPTION: &str = "Export a canonical or discovered skill 
 const BRIDGE_SYNC_DESCRIPTION: &str = "Bulk-import all discovered non-Kimetsu skills into .kimetsu/extensions. Use for setup or migration, not during a narrow task unless the user asked to synchronize capabilities. This writes files and may touch many skill bundles.";
 
 const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, the kimetsu-bridge skill, and the kimetsu-memory-harvester custom agent; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome. Set scope=workspace (default) to install into this workspace, or scope=global to install into the user's home (~/.claude, ~/.claude.json, ~/.codex) for all sessions. Existing user hooks are preserved (merged, not replaced).";
+
+const BRAIN_CITE_DESCRIPTION: &str = "Call when a retrieved Kimetsu memory materially helped you solve the current task. This records a ground-truth citation that powers Kimetsu's self-tuning: the brain learns which memories actually earn their keep. ROI: each citation trains the retrieval objective so future queries surface that memory sooner. Pass memory_id (from the capsule's provenance or kimetsu_brain_memory_list) and an optional note describing how it helped.";
 
 #[derive(Debug, Clone)]
 pub struct McpServeConfig {
@@ -293,6 +295,7 @@ fn call_tool(
         "kimetsu_brain_insights" => Ok(kimetsu_brain_insights(workspace, &arguments)),
         "kimetsu_brain_context" => Ok(kimetsu_brain_context(workspace, &arguments)),
         "kimetsu_brain_record" => Ok(kimetsu_brain_record(workspace, &arguments)),
+        "kimetsu_brain_cite" => kimetsu_brain_cite(workspace, &arguments),
         "kimetsu_benchmark_context" => Ok(kimetsu_benchmark_context(workspace, &arguments)),
         "kimetsu_benchmark_record_outcome" => {
             kimetsu_benchmark_record_outcome(workspace, &arguments)
@@ -447,6 +450,7 @@ fn is_privileged_write_tool(name: &str) -> bool {
     matches!(
         name,
         "kimetsu_brain_record"
+            | "kimetsu_brain_cite"
             | "kimetsu_benchmark_record_outcome"
             | "kimetsu_brain_memory_add"
             | "kimetsu_brain_memory_accept"
@@ -932,6 +936,31 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "usage": "Memory proposed for review (low confidence). Run `kimetsu brain memory review` to accept or reject."
         }),
         Err(err) => json!({ "ok": false, "error": err.to_string() }),
+    }
+}
+
+/// Record a ground-truth citation for a memory that materially helped.
+/// Writes a `memory.cited` event with the all-zero sentinel run_id so
+/// it links to no active run — this is the MCP path (primary Claude Code usage)
+/// where there is no agent run in progress.
+fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let memory_id = match arguments.get("memory_id").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
+            return Ok(
+                json!({ "ok": false, "error": "memory_id is required and must be non-empty" }),
+            );
+        }
+    };
+    let note = arguments.get("note").and_then(Value::as_str);
+    match project::record_mcp_citation(workspace, memory_id, note) {
+        Ok(()) => Ok(json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "recorded": "memory.cited",
+            "usage": "Citation recorded. This closes the ground-truth loop and trains Kimetsu's self-tuning objective."
+        })),
+        Err(err) => Ok(json!({ "ok": false, "error": err.to_string() })),
     }
 }
 
@@ -1782,6 +1811,18 @@ fn tool_definitions() -> Value {
                     "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "Boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
                 },
                 "required": ["query"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_cite",
+            "description": BRAIN_CITE_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "The memory_id of the retrieved memory that helped (from capsule provenance or kimetsu_brain_memory_list)." },
+                    "note": { "type": "string", "description": "Optional short description of how the memory helped." }
+                },
+                "required": ["memory_id"]
             }
         },
         {
@@ -2863,5 +2904,84 @@ mod tests {
             "brain not initialized — expected initialized:false"
         );
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    // v1.5: kimetsu_brain_cite tests
+    #[test]
+    fn cite_tool_listed_and_write_gated() {
+        let result = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("tools/list");
+        let tools = result["tools"].as_array().unwrap();
+        let cite = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("kimetsu_brain_cite"))
+            .expect("kimetsu_brain_cite must appear in tools/list");
+        assert!(
+            cite["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("self-tuning"),
+            "description must mention self-tuning"
+        );
+    }
+
+    #[test]
+    fn cite_tool_is_write_gated() {
+        assert!(
+            is_privileged_write_tool("kimetsu_brain_cite"),
+            "kimetsu_brain_cite must be privileged"
+        );
+    }
+
+    #[test]
+    fn cite_tool_writes_memory_citations_row() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-cite-test");
+            fs::create_dir_all(&root).expect("create root");
+            project::init_project(&root, false).expect("init");
+            let memory_id = project::add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "cite MCP test memory",
+            )
+            .expect("add memory");
+
+            unsafe {
+                std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1");
+            }
+            let result = call_tool(
+                "kimetsu_brain_cite",
+                json!({ "memory_id": memory_id, "note": "it helped" }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("call kimetsu_brain_cite");
+            unsafe {
+                std::env::remove_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS");
+            }
+
+            assert_eq!(
+                result["ok"].as_bool(),
+                Some(true),
+                "cite must return ok:true"
+            );
+
+            let (_paths, _config, conn) = project::load_project(&root).expect("load");
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_citations WHERE memory_id = ?1",
+                    [memory_id.as_str()],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(count, 1, "memory_citations row must exist");
+            fs::remove_dir_all(root).ok();
+        });
     }
 }

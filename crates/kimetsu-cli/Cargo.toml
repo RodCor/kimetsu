@@ -50,7 +50,9 @@ kimetsu-core = { path = "../kimetsu-core", version = "1.0.0" }
 # v0.4.6: `kimetsu doctor` serializes its report struct so --json
 # output can be piped into CI / hooks.
 reqwest.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
+time.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true

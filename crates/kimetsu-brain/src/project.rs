@@ -2512,6 +2512,35 @@ pub fn emit_regret_for_cited_memories(start: &Path, events: &[kimetsu_core::even
     }
 }
 
+/// v1.5: write a `memory.cited` event from the MCP `kimetsu_brain_cite` tool.
+///
+/// Uses the same sentinel run_id as [`log_telemetry_event`] (all-zero ULID)
+/// so no corresponding `runs` row is required. The event is inserted then
+/// projected (populating `memory_citations`) in one connection, and the
+/// regret sidecar is checked best-effort.
+pub fn record_mcp_citation(start: &Path, memory_id: &str, note: Option<&str>) -> KimetsuResult<()> {
+    let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+
+    let sentinel_run_id = RunId(ulid::Ulid::nil());
+    let mut payload = serde_json::json!({
+        "memory_id": memory_id,
+        "turn": 0,
+    });
+    if let Some(n) = note {
+        payload["rationale"] = serde_json::json!(n);
+    }
+    let event = kimetsu_core::event::Event::new(sentinel_run_id, "memory.cited", payload);
+    // apply_events calls insert_event + project_event in one transaction.
+    projector::apply_events(&conn, std::slice::from_ref(&event))?;
+
+    // Best-effort regret check.
+    emit_regret_for_cited_memories(start, std::slice::from_ref(&event));
+
+    Ok(())
+}
+
 // ── Q5: portable memory export / import ──────────────────────────────────────
 
 /// A single memory in the portable JSON exchange format.
@@ -6335,6 +6364,40 @@ max_total_cost_usd = 250.0
                     None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
                 }
             }
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // v1.5: record_mcp_citation
+    #[test]
+    fn record_mcp_citation_writes_memory_citations_row() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "record_mcp_citation test fixture",
+            )
+            .expect("add memory");
+
+            record_mcp_citation(&root, &memory_id, Some("helped with test"))
+                .expect("record_mcp_citation");
+
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let row_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_citations WHERE memory_id = ?1",
+                    rusqlite::params![&memory_id],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                row_count, 1,
+                "memory_citations row must exist after MCP cite"
+            );
             std::fs::remove_dir_all(&root).ok();
         });
     }
