@@ -15,6 +15,8 @@ starts where the last one left off.
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-informational)](https://www.rust-lang.org)
 
+<img src="docs/assets/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="920" />
+
 </div>
 
 ---
@@ -79,8 +81,9 @@ in **[HOW-KIMETSU-WORKS](docs/HOW-KIMETSU-WORKS.md)**.
 ## Quickstart
 
 ```bash
-# 1. Install (cargo shown; npm + prebuilt archives in docs/INSTALL.md)
-cargo install kimetsu-cli --features embeddings   # or plain for the lean FTS build
+# 1. Install — no Rust toolchain needed (cargo + prebuilt archives in docs/INSTALL.md)
+npm install -g kimetsu-ai
+kimetsu npm-flavor embeddings        # one-time: enable semantic retrieval
 
 # 2. Wire it into your host agent — init + install + selftest in one shot
 cd /your/project
