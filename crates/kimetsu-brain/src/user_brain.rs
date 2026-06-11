@@ -282,6 +282,7 @@ pub fn list_user_memories(conn: &Connection) -> KimetsuResult<Vec<MemoryRow>> {
         SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
         FROM memories
         WHERE invalidated_at IS NULL
+          AND superseded_by IS NULL
         ORDER BY created_at DESC
         LIMIT 100
         ",
@@ -554,26 +555,28 @@ mod tests {
             //     → run_migrations → migrates v1→v2 with a backup.
             let conn = open_user_brain().expect("re-open ok").expect("enabled");
 
-            // Assert 1: version is back at 2.
+            // Assert 1: version is at 3 (v1→v2→v3 migration chain).
             let ver =
                 crate::migrate::current_version(&conn).expect("current_version after re-open");
-            assert_eq!(ver, 2, "user brain must be at v2 after re-open");
+            assert_eq!(ver, 3, "user brain must be at v3 after re-open");
 
-            // Assert 2: backup sidecar brain.db.bak-1-2-* exists next to brain.db.
+            // Assert 2: backup sidecar brain.db.bak-1-3-* exists next to brain.db
+            // (migrating from v1 to target v3 produces one backup named with the
+            // full from-to span: brain.db.bak-<from>-<to>-<ts>).
             let bak_files: Vec<_> = std::fs::read_dir(&tmp)
                 .expect("read tmp dir")
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .map(|n| n.starts_with("brain.db.bak-1-2-"))
+                        .map(|n| n.starts_with("brain.db.bak-1-3-"))
                         .unwrap_or(false)
                 })
                 .collect();
             assert_eq!(
                 bak_files.len(),
                 1,
-                "exactly one user-brain backup sidecar brain.db.bak-1-2-* must exist; found: {:?}",
+                "exactly one user-brain backup sidecar brain.db.bak-1-3-* must exist; found: {:?}",
                 bak_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
             );
 

@@ -53,11 +53,18 @@ pub struct MigrationOutcome {
 /// contiguous starting at 2 (version 1 is the baseline `CREATE`, not a
 /// migration step).
 fn migrations() -> &'static [Migration] {
-    &[Migration {
-        version: 2,
-        description: "fold additive columns, citations/conflicts tables, and FTS reshapes",
-        up: crate::schema::migrate_v1_to_v2,
-    }]
+    &[
+        Migration {
+            version: 2,
+            description: "fold additive columns, citations/conflicts tables, and FTS reshapes",
+            up: crate::schema::migrate_v1_to_v2,
+        },
+        Migration {
+            version: 3,
+            description: "add superseded_by column + index for near-duplicate merge (Story 3.1)",
+            up: crate::schema::migrate_v2_to_v3,
+        },
+    ]
 }
 
 /// Return the code's compile-time target schema version.

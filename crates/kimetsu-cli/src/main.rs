@@ -730,6 +730,39 @@ enum BrainCommand {
     /// --apply: write the winning config to project.toml (dry-run by default).
     /// --revert: restore the previous tune-history entry.
     Tune(TuneArgs),
+    /// Merge near-duplicate memories and optionally distil loose clusters.
+    ///
+    /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
+    /// memories with cosine ≥ THRESHOLD (default 0.92) are merged — survivor keeps
+    /// its text/id; members get `superseded_by` set and are removed from retrieval.
+    /// Citations are reassigned to the survivor so `memory blame` stays accurate.
+    ///
+    /// Story 3.2 (--distill): looser clusters (0.75–0.85 cosine band) of ≥ 3
+    /// memories sharing ≥ 1 domain tag are fed to the configured distiller (same
+    /// model the SessionEnd hook uses). Result lands as a memory proposal for human
+    /// review. If no distiller is configured, prints the clusters and exits 0.
+    ///
+    /// Examples:
+    ///   kimetsu brain consolidate --dry-run
+    ///   kimetsu brain consolidate --yes
+    ///   kimetsu brain consolidate --threshold 0.88 --yes
+    ///   kimetsu brain consolidate --distill --dry-run
+    ///   kimetsu brain consolidate --distill --yes
+    Consolidate(ConsolidateArgs),
+    /// List fading memories and prune them interactively.
+    ///
+    /// Shows memories with usefulness_score < SCORE_FLOOR (default 0.2) AND
+    /// last_useful_at / created_at older than AGE_DAYS (default 30 days),
+    /// with id / kind / age / usefulness / text-head.
+    ///
+    /// Interactive per-item [k]eep / [p]rune / [s]kip (requires a TTY).
+    /// Use --prune-all --yes for batch non-interactive pruning.
+    ///
+    /// Examples:
+    ///   kimetsu brain triage
+    ///   kimetsu brain triage --score-floor 0.1 --age-days 60
+    ///   kimetsu brain triage --prune-all --yes
+    Triage(TriageArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -910,6 +943,49 @@ struct TuneArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<std::path::PathBuf>,
+}
+
+/// Args for `kimetsu brain consolidate` (Stories 3.1 + 3.2).
+#[derive(Debug, Args)]
+struct ConsolidateArgs {
+    /// Print merge plan without writing to the DB.
+    #[arg(long)]
+    dry_run: bool,
+    /// Cosine similarity threshold for near-duplicate clustering (Story 3.1).
+    /// Memories with cosine ≥ threshold are merged. Default: 0.92.
+    #[arg(long, default_value_t = 0.92f32)]
+    threshold: f32,
+    /// Skip the interactive confirmation prompt (required when stdin is not a TTY).
+    #[arg(long)]
+    yes: bool,
+    /// Also run Story 3.2 distillation of loose clusters (0.75–0.85 band).
+    /// Result lands as a memory proposal for human review.
+    /// Requires a configured distiller; prints clusters and exits 0 otherwise.
+    #[arg(long)]
+    distill: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain triage` (Story 3.3).
+#[derive(Debug, Args)]
+struct TriageArgs {
+    /// Usefulness score floor: memories below this threshold are candidates.
+    #[arg(long, default_value_t = 0.2f32)]
+    score_floor: f32,
+    /// Age threshold in days: memories last useful (or created) before this are candidates.
+    #[arg(long, default_value_t = 30u32)]
+    age_days: u32,
+    /// Prune all candidates non-interactively (requires --yes).
+    #[arg(long)]
+    prune_all: bool,
+    /// Skip the confirmation prompt for --prune-all.
+    #[arg(long)]
+    yes: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 /// Args for `kimetsu brain roi`.
@@ -3396,6 +3472,8 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Bench(args) => brain_bench(args),
         BrainCommand::Roi(args) => brain_roi(args),
         BrainCommand::Tune(args) => brain_tune(args),
+        BrainCommand::Consolidate(args) => brain_consolidate(args),
+        BrainCommand::Triage(args) => brain_triage(args),
     }
 }
 
@@ -4849,6 +4927,385 @@ fn brain_tune_revert(workspace: &std::path::Path) -> KimetsuResult<()> {
         "Reverted: lex_coverage={:.2}, sem_score={:.3} (from tune at {})",
         entry.before.min_lexical_coverage, entry.before.min_semantic_score, entry.timestamp
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.1 + 3.2: kimetsu brain consolidate
+// ---------------------------------------------------------------------------
+
+fn brain_consolidate(args: ConsolidateArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::consolidate::{
+        ConsolidateOptions, DistillOptions, find_distill_clusters, load_embeddable_rows,
+        run_consolidation,
+    };
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let (paths, _config, conn) = kimetsu_brain::project::load_project(&workspace)?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    // --- Story 3.1: near-duplicate merge ---
+    // --distill is additive; 3.1 merge always runs alongside it.
+    {
+        let opts = ConsolidateOptions {
+            threshold: args.threshold,
+            dry_run: args.dry_run,
+        };
+
+        if !args.dry_run && !args.yes {
+            // Check TTY requirement.
+            if !io::stdin().is_terminal() {
+                return Err(
+                    "stdin is not a TTY; pass --yes to confirm consolidation non-interactively"
+                        .into(),
+                );
+            }
+            // Interactive prompt.
+            write!(
+                out,
+                "Consolidate near-duplicate memories (threshold={:.2})? [y/N] ",
+                args.threshold
+            )?;
+            out.flush()?;
+            let mut line = String::new();
+            io::stdin().lock().read_line(&mut line)?;
+            let answer = line.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                writeln!(out, "Aborted.")?;
+                return Ok(());
+            }
+        }
+
+        run_consolidation(&conn, &opts, &mut out)?;
+    }
+
+    // --- Story 3.2: cluster distillation (--distill flag) ---
+    if args.distill {
+        let dopts = DistillOptions::default();
+        let by_model = load_embeddable_rows(&conn)?;
+        let all_rows: Vec<_> = by_model.into_values().flatten().collect();
+        let clusters = find_distill_clusters(&all_rows, &dopts);
+
+        if clusters.is_empty() {
+            writeln!(
+                out,
+                "\nNo distillable clusters found (lo={:.2} hi={:.2}, min_size={}).",
+                dopts.lo, dopts.hi, dopts.min_cluster_size
+            )?;
+            return Ok(());
+        }
+
+        // Try to resolve a distiller.
+        let resolved = distiller::resolve_distiller(&workspace);
+
+        if resolved.is_none() || args.dry_run {
+            writeln!(
+                out,
+                "\nDistillable clusters ({} found — lo={:.2} hi={:.2}):",
+                clusters.len(),
+                dopts.lo,
+                dopts.hi
+            )?;
+            for (i, cluster) in clusters.iter().enumerate() {
+                writeln!(
+                    out,
+                    "\nCluster {} [tags: {}]:",
+                    i + 1,
+                    cluster.shared_tags.join(", ")
+                )?;
+                for m in &cluster.memories {
+                    writeln!(
+                        out,
+                        "  [{}] {}",
+                        m.memory_id,
+                        &m.text[..m.text.len().min(80)]
+                    )?;
+                }
+            }
+            if resolved.is_none() {
+                writeln!(
+                    out,
+                    "\nNo distiller configured — printed clusters above. Configure [learning.distiller] to auto-distil."
+                )?;
+            }
+            return Ok(());
+        }
+
+        // Distiller is available — generate proposals.
+        let distiller_resolved = resolved.unwrap();
+        let mut proposals_created = 0usize;
+        for cluster in &clusters {
+            let cluster_text = cluster
+                .memories
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("{}. {}", i + 1, m.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt = format!(
+                "Distill these {} related lessons into ONE general principle \
+                 (2-4 sentences, imperative, no project-specific context):\n\n{cluster_text}",
+                cluster.memories.len()
+            );
+            let mut provider = distiller::make_provider_for_resolved(&distiller_resolved);
+            if let Some(ref mut p) = provider {
+                let lessons = distiller::distill_lessons(&prompt, p.as_mut());
+                for lesson in lessons {
+                    let result = kimetsu_brain::project::propose_memory(
+                        &distiller_resolved.record_start,
+                        distiller_resolved.scope,
+                        MemoryKind::Convention,
+                        &lesson.lesson,
+                        lesson.confidence.clamp(0.0, 1.0),
+                        &format!(
+                            "distilled from cluster [tags: {}]",
+                            cluster.shared_tags.join(", ")
+                        ),
+                    );
+                    if result.is_ok() {
+                        proposals_created += 1;
+                    }
+                }
+            }
+        }
+
+        writeln!(
+            out,
+            "\nCreated {proposals_created} distillation proposal(s). Review with: kimetsu brain memory proposals"
+        )?;
+        drop(paths);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.3: kimetsu brain triage
+// ---------------------------------------------------------------------------
+
+fn brain_triage(args: TriageArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let (_paths, _config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let stdin = io::stdin();
+    let mut sin = stdin.lock();
+
+    let candidates = triage_candidates(&conn, args.score_floor, args.age_days)?;
+
+    if candidates.is_empty() {
+        writeln!(
+            out,
+            "No fading memories found (score_floor={:.2}, age_days={}).",
+            args.score_floor, args.age_days
+        )?;
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "{} fading memor{} (score < {:.2}, age > {}d):",
+        candidates.len(),
+        if candidates.len() == 1 { "y" } else { "ies" },
+        args.score_floor,
+        args.age_days
+    )?;
+
+    if args.prune_all {
+        if !args.yes {
+            if !io::stdin().is_terminal() {
+                return Err(
+                    "stdin is not a TTY; pass --yes to confirm --prune-all non-interactively"
+                        .into(),
+                );
+            }
+            write!(out, "Prune all {} candidates? [y/N] ", candidates.len())?;
+            out.flush()?;
+            let mut line = String::new();
+            sin.read_line(&mut line)?;
+            let answer = line.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                writeln!(out, "Aborted.")?;
+                return Ok(());
+            }
+        }
+        let mut pruned = 0usize;
+        for c in &candidates {
+            let reason = format!(
+                "triage_prune score={:.2} age_days={}",
+                c.usefulness_score, c.age_days
+            );
+            if kimetsu_brain::project::invalidate_memory(&workspace, &c.memory_id, Some(&reason))
+                .is_ok()
+            {
+                pruned += 1;
+            }
+        }
+        writeln!(
+            out,
+            "Pruned {pruned} memor{}.",
+            if pruned == 1 { "y" } else { "ies" }
+        )?;
+        return Ok(());
+    }
+
+    // Interactive per-item loop.
+    if !io::stdin().is_terminal() {
+        // Non-TTY with no --prune-all: just print the list.
+        for c in &candidates {
+            writeln!(
+                out,
+                "[{}] {}/{} age={}d score={:.2} — {}",
+                c.memory_id,
+                c.scope,
+                c.kind,
+                c.age_days,
+                c.usefulness_score,
+                &c.text[..c.text.len().min(80)]
+            )?;
+        }
+        writeln!(out, "\nPass --prune-all --yes to prune non-interactively.")?;
+        return Ok(());
+    }
+
+    triage_interactive_loop(&workspace, &candidates, &mut sin, &mut out)
+}
+
+/// A fading memory candidate for triage.
+#[derive(Debug)]
+struct TriageCandidate {
+    memory_id: String,
+    scope: String,
+    kind: String,
+    text: String,
+    age_days: i64,
+    usefulness_score: f32,
+}
+
+/// Query the DB for triage candidates.
+fn triage_candidates(
+    conn: &rusqlite::Connection,
+    score_floor: f32,
+    age_days: u32,
+) -> KimetsuResult<Vec<TriageCandidate>> {
+    use rusqlite::params;
+    use time::OffsetDateTime;
+
+    // Compute the cutoff timestamp.
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - time::Duration::days(i64::from(age_days));
+    let cutoff_str = cutoff
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, scope, kind, text, usefulness_score,
+                COALESCE(last_useful_at, created_at) AS ref_ts
+         FROM memories
+         WHERE invalidated_at IS NULL
+           AND superseded_by IS NULL
+           AND usefulness_score < ?1
+           AND COALESCE(last_useful_at, created_at) < ?2
+         ORDER BY usefulness_score ASC, COALESCE(last_useful_at, created_at) ASC
+         LIMIT 200",
+    )?;
+
+    let rows = stmt.query_map(params![score_floor as f64, cutoff_str], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (memory_id, scope, kind, text, score, ref_ts) = row?;
+        let age = {
+            use time::format_description::well_known::Rfc3339;
+            OffsetDateTime::parse(&ref_ts, &Rfc3339)
+                .map(|t| (now - t).whole_days().max(0))
+                .unwrap_or(0)
+        };
+        candidates.push(TriageCandidate {
+            memory_id,
+            scope,
+            kind,
+            text,
+            age_days: age,
+            usefulness_score: score as f32,
+        });
+    }
+    Ok(candidates)
+}
+
+/// Interactive decision loop — mirrors the `decide_preflight_action` pattern
+/// in update.rs. Generic over BufRead + Write for testability.
+fn triage_interactive_loop<R: io::BufRead, W: io::Write>(
+    workspace: &std::path::Path,
+    candidates: &[TriageCandidate],
+    reader: &mut R,
+    writer: &mut W,
+) -> KimetsuResult<()> {
+    let mut pruned = 0usize;
+    let mut kept = 0usize;
+    let mut skipped = 0usize;
+
+    for c in candidates {
+        writeln!(
+            writer,
+            "\n[{}] {}/{} age={}d score={:.2}",
+            c.memory_id, c.scope, c.kind, c.age_days, c.usefulness_score
+        )?;
+        writeln!(writer, "  {}", &c.text[..c.text.len().min(120)])?;
+        write!(writer, "  [k]eep / [p]rune / [s]kip: ")?;
+        writer.flush()?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        match line.trim().to_ascii_lowercase().as_str() {
+            "p" | "prune" => {
+                let reason = format!(
+                    "triage_prune score={:.2} age_days={}",
+                    c.usefulness_score, c.age_days
+                );
+                if kimetsu_brain::project::invalidate_memory(workspace, &c.memory_id, Some(&reason))
+                    .is_ok()
+                {
+                    pruned += 1;
+                    writeln!(writer, "  → pruned.")?;
+                } else {
+                    writeln!(writer, "  → prune failed.")?;
+                }
+            }
+            "k" | "keep" => {
+                kept += 1;
+                writeln!(writer, "  → kept.")?;
+            }
+            _ => {
+                skipped += 1;
+                writeln!(writer, "  → skipped.")?;
+            }
+        }
+    }
+
+    writeln!(
+        writer,
+        "\nTriage complete: {} pruned, {} kept, {} skipped.",
+        pruned, kept, skipped
+    )?;
     Ok(())
 }
 
