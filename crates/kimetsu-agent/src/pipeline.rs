@@ -1099,7 +1099,12 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
         ),
     )?;
 
-    projector::apply_events(&conn, &read_trace(&run_paths.trace_jsonl)?)?;
+    let trace_events = read_trace(&run_paths.trace_jsonl)?;
+    projector::apply_events(&conn, &trace_events)?;
+    // v1.5: best-effort regret detection — check whether any cited memory
+    // was in the recent-dropped window (excluded by the relevance floor
+    // in the hook but cited by the model), and emit retrieval.regret events.
+    project::emit_regret_for_cited_memories(&paths.repo_root, &trace_events);
 
     Ok(CodingRunResult {
         run_id,

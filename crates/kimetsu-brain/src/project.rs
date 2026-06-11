@@ -2459,6 +2459,59 @@ pub fn log_telemetry_event(
     Ok(())
 }
 
+/// v1.5: scan `events` for `memory.cited` entries and, for each cited
+/// memory id, check the dropped-capsule sidecar. When a cited memory
+/// was in the recent-dropped window (it was excluded by the relevance
+/// floor but the model cited it anyway), emit a `retrieval.regret`
+/// telemetry event and remove the entry from the sidecar.
+///
+/// Purely best-effort: any sidecar or telemetry error is swallowed so
+/// citation recording is never disrupted. Called from the pipeline
+/// after `projector::apply_events` so citations are already in the DB
+/// before we check for regrets.
+///
+/// Cross-process note: the sidecar is written by the `brain_context_hook`
+/// (CLI process) and read here by the pipeline / MCP-server process.
+/// Both derive the same cache dir from the repo root, so they
+/// naturally share the file without coordination.
+pub fn emit_regret_for_cited_memories(start: &Path, events: &[kimetsu_core::event::Event]) {
+    use crate::dropped_capsule;
+    use kimetsu_core::paths::{ProjectPaths, user_cache_dir_for};
+
+    // Derive the project cache dir; silently skip if the brain is not
+    // initialised (e.g. during one-off tests that don't init a project).
+    let cache_dir = match ProjectPaths::discover(start) {
+        Ok(paths) => user_cache_dir_for(&paths.repo_root),
+        Err(_) => return,
+    };
+
+    let cited_at = dropped_capsule::now_secs();
+
+    for event in events {
+        if event.kind != "memory.cited" {
+            continue;
+        }
+        let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Best-effort: swallow any sidecar error.
+        let Some(dropped_entry) = dropped_capsule::take_if_dropped(&cache_dir, memory_id, cited_at)
+        else {
+            continue;
+        };
+        // Emit the regret event.
+        let _ = log_telemetry_event(
+            start,
+            "retrieval.regret",
+            serde_json::json!({
+                "memory_id": memory_id,
+                "dropped_at": dropped_entry.dropped_at,
+                "cited_at": cited_at,
+            }),
+        );
+    }
+}
+
 // ── Q5: portable memory export / import ──────────────────────────────────────
 
 /// A single memory in the portable JSON exchange format.

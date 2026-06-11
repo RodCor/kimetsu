@@ -5,6 +5,7 @@ pub mod ann;
 pub mod benchmark;
 pub mod conflict;
 pub mod context;
+pub mod dropped_capsule;
 pub mod embeddings;
 pub mod eval;
 pub mod ingest;
