@@ -275,6 +275,13 @@ pub struct ModelSection {
     /// loading cleanly.
     #[serde(default = "default_region_env")]
     pub region_env: String,
+    /// v1.5: override the built-in $/MTok price table for the ROI ledger.
+    /// When set, this value is used for USD conversion instead of the
+    /// approximate built-in table.  Useful for private-endpoint pricing or
+    /// non-standard model deployments.  `#[serde(default)]` keeps all
+    /// pre-v1.5 project.toml files loading cleanly (they get `None`).
+    #[serde(default)]
+    pub price_per_mtok: Option<f64>,
 }
 
 fn default_region_env() -> String {
@@ -292,6 +299,7 @@ impl Default for ModelSection {
             request_timeout_secs: 120,
             region: None,
             region_env: default_region_env(),
+            price_per_mtok: None,
         }
     }
 }
@@ -854,5 +862,69 @@ max_total_cost_usd = 250.0
                 "task_size={size}: budget={b} must be <= run_cap=8000"
             );
         }
+    }
+
+    /// v1.5: a pre-v1.5 project.toml without `model.price_per_mtok` must
+    /// load cleanly and default to `None` (backward compatibility).
+    #[test]
+    fn pre_v1_5_config_without_price_per_mtok_loads_with_none() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-sonnet-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-v1.5 toml must load");
+        assert!(
+            config.model.price_per_mtok.is_none(),
+            "price_per_mtok must default to None when absent from project.toml"
+        );
+    }
+
+    /// v1.5: when `model.price_per_mtok` is set in project.toml it must
+    /// round-trip cleanly through serialize → deserialize.
+    #[test]
+    fn price_per_mtok_round_trips() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.model.price_per_mtok = Some(7.5);
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert_eq!(
+            reloaded.model.price_per_mtok,
+            Some(7.5),
+            "price_per_mtok must round-trip"
+        );
     }
 }
