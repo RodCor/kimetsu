@@ -671,6 +671,7 @@ pub fn add_memory(
             SELECT memory_id FROM memories
             WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
               AND invalidated_at IS NULL
+              AND superseded_by IS NULL
             LIMIT 1
             ",
             rusqlite::params![scope.to_string(), kind.to_string(), normalized],
@@ -864,6 +865,7 @@ pub fn propose_or_merge_memory(
                 "SELECT memory_id FROM memories
                  WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
                    AND invalidated_at IS NULL
+                   AND superseded_by IS NULL
                  LIMIT 1",
                 rusqlite::params![scope.to_string(), kind.to_string(), normalized],
                 |row| row.get::<_, String>(0),
@@ -2584,6 +2586,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
                AND lower(scope) = lower(?1)
                AND lower(kind)  = lower(?2)
              ORDER BY created_at DESC",
@@ -2593,6 +2596,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
                AND lower(scope) = lower(?1)
              ORDER BY created_at DESC",
             vec![s.to_string()],
@@ -2601,6 +2605,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
                AND lower(kind) = lower(?1)
              ORDER BY created_at DESC",
             vec![k.to_string()],
@@ -2609,6 +2614,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
              ORDER BY created_at DESC",
             vec![],
         ),

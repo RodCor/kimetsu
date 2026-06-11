@@ -155,6 +155,9 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // a retrieved capsule. Best-effort — a missing or
         // malformed payload just no-ops.
         "memory.cited" => apply_memory_cited(conn, event),
+        // Story 3.1: near-duplicate merge — stamp superseded_by on merged members,
+        // remove their FTS rows, and drop them from the ANN index.
+        "memory.superseded" => apply_memory_superseded(conn, event),
         _ => Ok(()),
     }
 }
@@ -661,6 +664,46 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
     )?;
     #[cfg(feature = "embeddings")]
     crate::ann::on_invalidate(conn, memory_id);
+    Ok(())
+}
+
+/// Story 3.1: project a `memory.superseded` event.
+///
+/// Payload fields:
+///   `memory_id`    — the member being superseded (its text was merged into survivor)
+///   `survivor_id`  — the memory that absorbs the cluster
+///
+/// Projection:
+///   1. Stamp `superseded_by = survivor_id` on the member row.
+///   2. Delete the member's FTS row so it stops appearing in lexical retrieval.
+///   3. Remove the member from the ANN index (embeddings feature only).
+///
+/// The member row is intentionally NOT invalidated — `blame` can still see
+/// it and trace it to its survivor via `superseded_by`.
+fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some(survivor_id) = event.payload.get("survivor_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+
+    // 1. Stamp superseded_by on the member.
+    conn.execute(
+        "UPDATE memories SET superseded_by = ?2 WHERE memory_id = ?1",
+        params![memory_id, survivor_id],
+    )?;
+
+    // 2. Remove from FTS index.
+    conn.execute(
+        "DELETE FROM memories_fts WHERE memory_id = ?1",
+        params![memory_id],
+    )?;
+
+    // 3. Remove from ANN index (embeddings feature only).
+    #[cfg(feature = "embeddings")]
+    crate::ann::on_supersede(conn, memory_id);
+
     Ok(())
 }
 

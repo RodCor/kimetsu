@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod ann;
 pub mod benchmark;
 pub mod conflict;
+pub mod consolidate;
 pub mod context;
 pub mod dropped_capsule;
 pub mod embeddings;

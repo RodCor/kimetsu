@@ -81,7 +81,7 @@ recovery). The materialized tables:
 
 ### Durable upgrades: schema migrations
 
-brain.db carries a schema version (`KIMETSU_SCHEMA_VERSION`, currently **2**)
+brain.db carries a schema version (`KIMETSU_SCHEMA_VERSION`, currently **3**)
 in its `schema_info` table. On every read-write open, a versioned,
 forward-only migration runner brings the DB up to the binary's target. Each
 migration runs inside **one transaction** (the DDL and the version bump commit

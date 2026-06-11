@@ -765,6 +765,7 @@ fn memory_ann_candidates(
                 last_useful_at
          FROM   memories
          WHERE  invalidated_at IS NULL
+           AND  superseded_by IS NULL
            AND  embedding_model = ?{model_param}
            AND  rowid IN ({placeholders})",
         model_param = knn_rowids.len() + 1
@@ -932,6 +933,7 @@ fn latest_memory_candidates(
                last_useful_at
         FROM memories
         WHERE invalidated_at IS NULL
+          AND superseded_by IS NULL
         ORDER BY created_at DESC
         LIMIT ?1
         ",
@@ -1012,6 +1014,7 @@ fn memory_fts_candidates(
         JOIN memories m
           ON m.memory_id = memories_fts.memory_id
         WHERE m.invalidated_at IS NULL
+          AND m.superseded_by IS NULL
           AND memories_fts MATCH ?1
         ORDER BY rank
         LIMIT ?2
