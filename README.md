@@ -81,8 +81,9 @@ in **[HOW-KIMETSU-WORKS](docs/HOW-KIMETSU-WORKS.md)**.
 ## Quickstart
 
 ```bash
-# 1. Install (cargo shown; npm + prebuilt archives in docs/INSTALL.md)
-cargo install kimetsu-cli --features embeddings   # or plain for the lean FTS build
+# 1. Install — no Rust toolchain needed (cargo + prebuilt archives in docs/INSTALL.md)
+npm install -g kimetsu-ai
+kimetsu npm-flavor embeddings        # one-time: enable semantic retrieval
 
 # 2. Wire it into your host agent — init + install + selftest in one shot
 cd /your/project
