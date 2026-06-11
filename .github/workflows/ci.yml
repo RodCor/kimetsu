@@ -89,6 +89,36 @@ jobs:
           KIMETSU_USER_BRAIN: "0"
         run: cargo test --workspace --locked -- --test-threads=1
 
+  test-embeddings:
+    name: test (embeddings, ubuntu)
+    runs-on: ubuntu-latest
+    # Closes #22: run the full test suite compiled with the `embeddings` feature
+    # (ONNX/fastembed) on Linux only.  macOS/Windows are covered by `test`
+    # (which feature-unifies the workspace and already pulls in the embeddings
+    # code paths), but the explicit ubuntu run here pins an embeddings-specific
+    # build cache and ensures the feature compiles cleanly as a distinct slice.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-embeddings
+      # Cache the HuggingFace model files and the fastembed on-disk ONNX cache
+      # so repeated runs do not re-download ~200 MB of weights.
+      - name: Cache HuggingFace / fastembed model files
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            .fastembed_cache
+          key: embeddings-models-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: embeddings-models-${{ runner.os }}-
+      - name: cargo test (embeddings)
+        env:
+          KIMETSU_USER_BRAIN: "0"
+        run: cargo test --workspace --locked --features embeddings -- --test-threads=1
+
   audit:
     name: cargo-audit (RUSTSEC)
     runs-on: ubuntu-latest
