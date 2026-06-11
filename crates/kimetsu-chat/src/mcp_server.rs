@@ -784,6 +784,22 @@ pub fn brain_context_tool(
                     cap,
                 );
             }
+
+            // v1.5 (Story 2.1): render-time compression. Load compress_capsules
+            // best-effort — any config error means no compression (safe default).
+            // Ranking is NEVER affected; this runs after retrieval + reranking.
+            let compress = kimetsu_core::paths::ProjectPaths::discover(workspace)
+                .ok()
+                .and_then(|paths| project::load_config(&paths).ok())
+                .map(|cfg| cfg.broker.compress_capsules)
+                .unwrap_or(false);
+            if compress {
+                use kimetsu_brain::context::compress_for_render;
+                for capsule in &mut bundle.capsules {
+                    capsule.summary = compress_for_render(&capsule.summary, 3);
+                }
+            }
+
             Ok(json!({
                 "ok": true,
                 "skipped": false,

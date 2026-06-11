@@ -4570,19 +4570,80 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         return Ok(()); // Nothing relevant — zero output
     }
 
+    // v1.5: load broker.compress_capsules + broker.session_dedupe best-effort.
+    // The hook must never fail on config errors — fallback to defaults (both ON).
+    let (compress_capsules, session_dedupe) =
+        kimetsu_core::paths::ProjectPaths::discover(&workspace)
+            .ok()
+            .and_then(|paths| project::load_config(&paths).ok())
+            .map(|cfg| (cfg.broker.compress_capsules, cfg.broker.session_dedupe))
+            .unwrap_or((true, true));
+
+    // v1.5 (Story 2.3): session-scoped cross-turn dedupe.
+    // Load the proactive-state sidecar (already used by proactive hooks) to
+    // track which capsule handles were injected earlier this session.
+    // The context hook has session_id from the hook payload (Change B).
+    let state_path = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .map(|p| {
+            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
+            proactive_state::session_path(&cache_dir, session_id.as_deref())
+        });
+    let mut state = state_path
+        .as_deref()
+        .map(proactive_state::load)
+        .unwrap_or_default();
+
+    // Apply soft dedupe: filter already-surfaced handles, but fall back to the
+    // full set if filtering would leave nothing (a repeated top memory may still
+    // be the right context). Uses the pure `dedupe_filter` function.
+    let capsules_to_render: Vec<_> = if session_dedupe {
+        let handles: Vec<&str> = bundle
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        let indices = proactive_state::dedupe_filter(&handles, &state);
+        indices.into_iter().map(|i| &bundle.capsules[i]).collect()
+    } else {
+        bundle.capsules.iter().collect()
+    };
+
     let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
-    for capsule in &bundle.capsules {
+    for capsule in &capsules_to_render {
+        // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
+        // reranking, purely on the injected text. Full summary untouched in DB.
+        let rendered: String = if compress_capsules {
+            kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+        } else {
+            capsule.summary.clone()
+        };
         // Strip the "scope:kind - " prefix from the summary for readability
-        let text = capsule
-            .summary
+        let text = rendered
             .split(" - ")
             .nth(1)
-            .unwrap_or(&capsule.summary);
+            .map(str::to_string)
+            .unwrap_or(rendered);
         additional_context.push('\n');
-        additional_context.push_str(text);
+        additional_context.push_str(&text);
     }
 
     print_user_prompt_submit_context(&additional_context)?;
+
+    // v1.5 (Story 2.3): persist newly surfaced handles so subsequent prompts
+    // in the same session skip them. Best-effort — state write must never
+    // break the hook's primary output.
+    if session_dedupe {
+        for capsule in &capsules_to_render {
+            if !capsule.expansion_handle.is_empty() {
+                state.mark_surfaced(&capsule.expansion_handle);
+            }
+        }
+        if let Some(ref path) = state_path {
+            proactive_state::save(path, &state);
+        }
+    }
+
     Ok(())
 }
 
@@ -5020,13 +5081,16 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     };
     // Honor the configured embedder id for consistency (proactive
     // retrieval is lexical-only, but this keeps labels coherent). Also
-    // capture the auto-harvest toggle for the resolution cue below.
-    let auto_harvest = match project::load_config(&paths) {
+    // capture the auto-harvest toggle and render flags.
+    let (auto_harvest, compress_capsules) = match project::load_config(&paths) {
         Ok(config) => {
             kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
-            config.learning.auto_harvest
+            (
+                config.learning.auto_harvest,
+                config.broker.compress_capsules,
+            )
         }
-        Err(_) => true,
+        Err(_) => (true, true),
     };
 
     let mut input = String::new();
@@ -5150,11 +5214,18 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
         return Ok(());
     };
 
-    let body = capsule
-        .summary
+    // v1.5 (Story 2.1): render-time compression for the proactive hook.
+    // Runs AFTER retrieval — ranking and stored text are unaffected.
+    let rendered: String = if compress_capsules {
+        kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+    } else {
+        capsule.summary.clone()
+    };
+    let body = rendered
         .split(" - ")
         .nth(1)
-        .unwrap_or(&capsule.summary);
+        .map(str::to_string)
+        .unwrap_or(rendered);
     let header = proactive_header(event, loop_mode);
     let additional_context = format!("{header}\n{body}");
 
@@ -6935,6 +7006,12 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
         mean_latency_ms: f64,
         p95_latency_ms: f64,
         noise_capsules: f64,
+        /// v1.5 (Story 2.1): mean rendered tokens per capsule after compression.
+        #[serde(default)]
+        rendered_tokens_mean: f64,
+        /// v1.5 (Story 2.1): mean raw (uncompressed) tokens per capsule.
+        #[serde(default)]
+        raw_tokens_mean: f64,
     }
     #[derive(serde::Deserialize)]
     struct ComboResult {
@@ -6973,7 +7050,7 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     // Build summary table.
     let header = format!(
-        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} |",
+        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} | {:>12} | {:>14} |",
         "embedder",
         "reranker",
         "recall@2",
@@ -6983,11 +7060,13 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
         "p95 ms",
         "noise_caps",
         "load ms (emb+rr)",
-        "peak RSS MB"
+        "peak RSS MB",
+        "raw_tok_mean",
+        "rend_tok_mean",
     );
     let sep = format!(
-        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} |",
-        "", "", "", "", "", "", "", "", "", ""
+        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} | {:-<12} | {:-<14} |",
+        "", "", "", "", "", "", "", "", "", "", "", ""
     );
 
     let mut table_lines: Vec<String> = vec![header, sep];
@@ -6998,7 +7077,7 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "n/a".to_string());
         table_lines.push(format!(
-            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} |",
+            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} | {:>12.1} | {:>14.1} |",
             row.embedder,
             row.reranker,
             row.summary.recall_at_2,
@@ -7009,6 +7088,8 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
             row.summary.noise_capsules,
             load_ms,
             rss_str,
+            row.summary.raw_tokens_mean,
+            row.summary.rendered_tokens_mean,
         ));
     }
 
@@ -7850,6 +7931,10 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         hit_at_4: bool,
         mrr: f64,
         latency_ms: u128,
+        /// v1.5 (Story 2.1): mean rendered tokens across the returned capsules
+        /// after compress_for_render(3) vs raw token estimates.
+        raw_tokens_mean: f64,
+        rendered_tokens_mean: f64,
     }
 
     let mut case_results: Vec<CaseResult> = Vec::new();
@@ -7921,6 +8006,28 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
         let mrr_val = kimetsu_brain::eval::mrr(&obtained_keys, &case.relevant);
 
+        // v1.5 (Story 2.1): token estimates — raw vs compressed — for the
+        // rendered capsule set. Computed per-case, averaged in the summary.
+        let (raw_tokens_mean, rendered_tokens_mean) = {
+            use kimetsu_brain::context::{compress_for_render, estimate_tokens};
+            let n = bundle.capsules.len();
+            if n == 0 {
+                (0.0, 0.0)
+            } else {
+                let raw: u32 = bundle
+                    .capsules
+                    .iter()
+                    .map(|c| estimate_tokens(&c.summary))
+                    .sum();
+                let rendered: u32 = bundle
+                    .capsules
+                    .iter()
+                    .map(|c| estimate_tokens(&compress_for_render(&c.summary, 3)))
+                    .sum();
+                (raw as f64 / n as f64, rendered as f64 / n as f64)
+            }
+        };
+
         case_results.push(CaseResult {
             query: case.query.clone(),
             expected: case.relevant.clone(),
@@ -7929,6 +8036,8 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             hit_at_4,
             mrr: mrr_val,
             latency_ms,
+            raw_tokens_mean,
+            rendered_tokens_mean,
         });
     }
 
@@ -7996,6 +8105,18 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     let peak = peak_rss_mb();
 
+    // v1.5 (Story 2.1): aggregate rendered-token means across all cases.
+    let (agg_raw_tokens_mean, agg_rendered_tokens_mean) = {
+        let n = case_results.len();
+        if n == 0 {
+            (0.0, 0.0)
+        } else {
+            let raw_sum: f64 = case_results.iter().map(|r| r.raw_tokens_mean).sum();
+            let rend_sum: f64 = case_results.iter().map(|r| r.rendered_tokens_mean).sum();
+            (raw_sum / n as f64, rend_sum / n as f64)
+        }
+    };
+
     // ── 7. Write combo JSON ───────────────────────────────────────────────────
     let combo_json = serde_json::json!({
         "embedder": embedder_id,
@@ -8016,6 +8137,9 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             "mean_latency_ms": mean_latency_ms,
             "p95_latency_ms": p95_latency_ms,
             "noise_capsules": noise_capsules,
+            // v1.5 (Story 2.1): token-budget intelligence
+            "raw_tokens_mean": agg_raw_tokens_mean,
+            "rendered_tokens_mean": agg_rendered_tokens_mean,
         }
     });
 
