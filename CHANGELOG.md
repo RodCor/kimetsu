@@ -51,7 +51,7 @@ ADDED
     `cite_memory`. Personal eval set: `tuneset` builds positive eval cases from
     `context.served` + citation joins (exact session_id or ±30-minute window
     fallback). `kimetsu brain tune --status` reports case count and kind
-    coverage. `kimetsu brain tune` (dry-run by default) sweeps `broker.min_fts_coverage`
+    coverage. `kimetsu brain tune` (dry-run by default) sweeps `broker.min_lexical_coverage`
     ∈ {0.3, 0.4, 0.5, 0.6} × `broker.min_semantic_score` ∈ {-1.0(AUTO), 0.0, 0.25,
     0.35, 0.45} against the production embedder; `--apply` writes only the
     floor parameters (not the reranker — that change is recommended separately);
