@@ -178,7 +178,7 @@ selection is unchanged.
 Tunable knobs in `[broker]`:
 
 - `max_capsules` (default **8**) — hard cap on capsules rendered into a prompt.
-- `min_semantic_score` (default `0.0` = off) — the embeddings-only relevance
+- `min_semantic_score` (default `-1.0` = AUTO: 0.35 on bge-family, off otherwise) — the embeddings-only relevance
   floor described above.
 - `budget_floor_tokens` (default `1500`) and `budget_run_cap_tokens`
   (default `8000`) — bounds for the adaptive per-run budget (see the agent
@@ -420,7 +420,7 @@ skip interactively. `--prune-all --yes` for non-interactive batch pruning.
 
 `kimetsu brain tune --status` shows how many positive eval cases the brain has
 accumulated (from `context.served` + citation joins). `kimetsu brain tune`
-sweeps `broker.min_fts_coverage` × `broker.min_semantic_score` against the
+sweeps `broker.min_lexical_coverage` × `broker.min_semantic_score` against the
 production embedder and picks the combo that maximises the objective on the
 training split. A holdout guardrail (deterministic 20% split) prevents
 writing a config that regresses holdout quality. `--apply` writes only the
@@ -753,7 +753,7 @@ model = "bge-small-en-v1.5"   # or "bge-m3", "jina-v2-base-code"
 default_budget_tokens = 6000  # flat fallback; the adaptive budget supersedes it
 ambient = true                # false → don't append workspace context to queries
 max_capsules = 8              # hard cap on capsules rendered into a prompt
-min_semantic_score = 0.0      # >0 sets the embeddings-only relevance floor
+min_semantic_score = -1.0     # AUTO (bge: 0.35, others: off); >0 sets an explicit floor
 budget_floor_tokens = 1500    # adaptive-budget floor (small tasks not starved)
 budget_run_cap_tokens = 8000  # per-run ceiling on brain-injected tokens
 compress_capsules = true      # v1.5: compress rendered capsule text (strips tags/context

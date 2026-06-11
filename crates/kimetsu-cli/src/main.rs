@@ -1061,9 +1061,9 @@ struct BrainExportArgs {
     /// project-specific and not meaningful elsewhere.
     #[arg(long)]
     redact: bool,
-    /// Additionally strip the leading `[tags: …]` prefix from each exported
-    /// memory text. Implies a fully clean lesson body with no metadata.
-    /// Only effective when combined with `--redact`.
+    /// Strip the leading `[tags: …]` prefix from each exported memory text.
+    /// Usable on its own (tags only) or with `--redact` for a fully clean
+    /// lesson body with no metadata.
     #[arg(long)]
     redact_tags: bool,
 }

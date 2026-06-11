@@ -15,7 +15,7 @@ ADDED
     `false` to revert to the pre-v1.5 query-hash-only behavior). A
     `session_id` field is also written when the host provides one (Claude Code
     hooks; absent for hosts that do not emit it). Dropped-capsule sidecar
-    (`~/.kimetsu/cache/<hash>/dropped_capsules.json`) records capsules that
+    (`~/.kimetsu/cache/<hash>/dropped-recent.json`) records capsules that
     were floor-filtered out so that a later citation of one is detected as a
     `retrieval.regret` event, feeding the self-tuning loop. All telemetry
     stays on-machine; nothing is exported.

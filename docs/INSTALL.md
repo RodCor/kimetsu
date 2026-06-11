@@ -5,7 +5,7 @@ install time — **lean vs semantic (embeddings)** — because that's the only p
 baked into the binary. *Which host agents you use* (Claude Code, Codex, Pi,
 OpenClaw) is a **runtime** choice you change anytime with `kimetsu plugin
 install`/`uninstall` — no reinstall. The official prebuilt + npm binaries
-include all four host integrations; a bare source `cargo install` is minimal and
+include all six host integrations; a bare source `cargo install` is minimal and
 adds them with `--features pi,openclaw`.
 
 ## cargo
@@ -51,7 +51,7 @@ For **Linux / macOS / Windows** on every
 [GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put
 `kimetsu` / `kimetsu.exe` somewhere on `PATH` (`~/.local/bin`, `/usr/local/bin`,
 or `%USERPROFILE%\.cargo\bin`). Every prebuilt archive — lean and embeddings —
-bundles all four host integrations, so switching hosts never needs a reinstall.
+bundles all six host integrations, so switching hosts never needs a reinstall.
 Lean archives are published for Linux,
 macOS Intel, macOS Apple Silicon, and Windows. Embeddings archives are
 published where ONNX Runtime prebuilts are available: Linux x86_64,
