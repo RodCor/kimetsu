@@ -15,6 +15,7 @@ pub mod project;
 pub mod projector;
 pub mod redact;
 pub mod reindex;
+pub mod roi;
 pub mod schema;
 pub mod trace;
 pub mod user_brain;

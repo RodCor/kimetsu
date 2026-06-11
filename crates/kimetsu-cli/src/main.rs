@@ -717,6 +717,13 @@ enum BrainCommand {
     /// Results are written to --out as JSON files + a summary.md table.
     /// Requires `--features embeddings`.
     Bench(BrainBenchArgs),
+    /// ROI ledger — did kimetsu pay for itself?
+    ///
+    /// Estimates token savings from cited memories (conservative per-kind
+    /// calibration), subtracts brain-injection overhead, and shows a
+    /// net-positive / net-negative verdict.  Honest negatives are shown as
+    /// such.  Use `--json` for stable machine-readable output.
+    Roi(RoiArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -873,6 +880,20 @@ struct StopHookArgs {
 
 #[derive(Debug, Args)]
 struct SessionEndHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain roi`.
+#[derive(Debug, Args)]
+struct RoiArgs {
+    /// Time window: "7d", "30d", or "all". Default: 30d.
+    #[arg(long, default_value = "30d")]
+    window: String,
+    /// Emit machine-readable JSON (stable RoiReport schema).
+    #[arg(long)]
+    json: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -3346,6 +3367,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Daemon(args) => brain_daemon(args),
         BrainCommand::Eval(args) => brain_eval(args),
         BrainCommand::Bench(args) => brain_bench(args),
+        BrainCommand::Roi(args) => brain_roi(args),
     }
 }
 
@@ -4300,6 +4322,130 @@ fn brain_insights(
     Ok(())
 }
 
+/// v1.5: `kimetsu brain roi` — ROI ledger.
+fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::roi::{RoiWindow, roi_report};
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let window = RoiWindow::parse(&args.window)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    let (_paths, config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+    let report = roi_report(
+        &conn,
+        window,
+        &config.model.model,
+        config.model.price_per_mtok,
+    )?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human output.
+    let window_label = match report.window_days {
+        Some(d) => format!("last {d} days"),
+        None => "all time".to_string(),
+    };
+    println!("── ROI Ledger ({window_label}) ────────────────────────");
+    println!("  served events:        {}", report.served_events);
+    println!("  citations:            {}", report.citations);
+    println!(
+        "  injected tokens:      {}",
+        format_token_count(report.injected_tokens)
+    );
+    println!(
+        "  est. saved tokens:    {}",
+        format_token_count(report.estimated_saved_tokens)
+    );
+    let net_sign = if report.net_tokens >= 0 { "+" } else { "" };
+    println!("  net tokens:           {net_sign}{}", report.net_tokens);
+
+    if let Some(ref usd) = report.usd {
+        println!(
+            "── USD ({} $/MTok) ─────────────────────────────",
+            {
+                // Reverse-lookup the price to show it.
+                kimetsu_brain::roi::resolve_price_per_mtok(
+                    &config.model.model,
+                    config.model.price_per_mtok,
+                )
+                .map(|p| format!("{p:.2}"))
+                .unwrap_or_else(|| "?".to_string())
+            }
+        );
+        println!("  saved:  ${:.4}", usd.saved);
+        println!("  spent:  ${:.4}", usd.spent);
+        let net_usd_sign = if usd.net >= 0.0 { "+" } else { "" };
+        println!("  net:    {net_usd_sign}${:.4}", usd.net);
+    }
+
+    // Verdict line.
+    println!("──────────────────────────────────────────────");
+    if report.citations == 0 {
+        println!(
+            "  No retrieval activity recorded yet — the ledger starts \
+             counting as you work."
+        );
+    } else if report.net_tokens >= 0 {
+        match &report.usd {
+            Some(u) if u.net >= 0.0 => println!(
+                "  Net positive: kimetsu saved you ~{} tokens (~${:.4}) this window.",
+                format_token_count(report.estimated_saved_tokens),
+                u.net,
+            ),
+            _ => println!(
+                "  Net positive: kimetsu saved you ~{} tokens this window.",
+                format_token_count(report.estimated_saved_tokens),
+            ),
+        }
+    } else {
+        // Honest negative.
+        match &report.usd {
+            Some(u) => println!(
+                "  Net negative: brain overhead exceeded savings by ~{} tokens (~${:.4}) this window.",
+                format_token_count(
+                    report
+                        .injected_tokens
+                        .saturating_sub(report.estimated_saved_tokens)
+                ),
+                (u.spent - u.saved).abs(),
+            ),
+            None => println!(
+                "  Net negative: brain overhead exceeded savings by ~{} tokens this window.",
+                format_token_count(
+                    report
+                        .injected_tokens
+                        .saturating_sub(report.estimated_saved_tokens)
+                ),
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a token count with thousands separator (space).
+fn format_token_count(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut out = String::new();
+    let rem = s.len() % 3;
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (i % 3 == rem) {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// v0.6: `kimetsu brain context-hook` — UserPromptSubmit hook.
 /// Reads `{"prompt":"..."}` JSON from stdin, retrieves relevant capsules,
 /// prints Codex/Claude-compatible hook JSON to stdout for injection.
@@ -4524,6 +4670,8 @@ fn user_prompt_submit_context_output(additional_context: &str) -> serde_json::Va
 /// file Claude Code writes) instead of a non-existent inline array, and
 /// — when nothing was recorded in a non-trivial session — points at the
 /// memory-harvester subagent. Silent exit for short sessions.
+/// v1.5: when the session had ≥1 citation, appends a savings sentence to
+/// the `systemMessage` banner.
 fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     use std::io::Read;
 
@@ -4560,8 +4708,15 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     };
 
+    // v1.5: compute per-session ROI (best-effort; errors are silently ignored).
+    let sid = session.get("session_id").and_then(|v| v.as_str());
+    let session_savings = compute_stop_hook_savings(&workspace, sid);
+
     if recorded > 0 {
-        return emit_stop_hook_json(stop_lessons_recorded_json(recorded));
+        return emit_stop_hook_json(stop_lessons_recorded_json_with_savings(
+            recorded,
+            session_savings.as_deref(),
+        ));
     }
     // Short sessions exit silently — no nagging for quick lookups. The
     // count is transcript *lines* (user/assistant/tool messages), so the
@@ -4587,7 +4742,6 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .map(|c| c.learning.auto_harvest)
         .unwrap_or(true);
     let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
-    let sid = session.get("session_id").and_then(|v| v.as_str());
     let state_path = paths.as_ref().map(|p| {
         let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
         proactive_state::session_path(&cache_dir, sid)
@@ -4629,7 +4783,30 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    emit_stop_hook_json(stop_no_lessons_json())
+    emit_stop_hook_json(stop_no_lessons_json_with_savings(
+        session_savings.as_deref(),
+    ))
+}
+
+/// v1.5: Compute a per-session savings sentence for the Stop hook.
+///
+/// Best-effort: returns `None` on any error (DB not found, no data, etc.)
+/// so the hook never fails due to ROI computation.
+///
+/// Returns `None` also when there are zero citations this session (silence
+/// is the correct behavior — we don't dilute the harvest cue).
+fn compute_stop_hook_savings(workspace: &Path, session_id: Option<&str>) -> Option<String> {
+    use kimetsu_brain::roi::session_roi;
+
+    let (paths, config, conn) = kimetsu_brain::project::load_project_readonly(workspace).ok()?;
+    let _ = paths; // suppress unused warning
+    let sr = session_roi(
+        &conn,
+        session_id,
+        &config.model.model,
+        config.model.price_per_mtok,
+    )?;
+    Some(sr.savings_sentence())
 }
 
 /// Emit a Claude Code `Stop`-hook result on stdout. Claude Code validates a
@@ -4645,13 +4822,29 @@ fn emit_stop_hook_json(value: serde_json::Value) -> KimetsuResult<()> {
 
 /// User-facing banner confirming how many lessons were recorded. Surfaced via
 /// `systemMessage` (shown to the user; it does not re-enter the model).
+/// Kept for test compatibility; production code uses `_with_savings` directly.
+#[cfg_attr(not(test), allow(dead_code))]
 fn stop_lessons_recorded_json(recorded: usize) -> serde_json::Value {
-    serde_json::json!({
-        "systemMessage": format!(
-            "[Kimetsu] {recorded} lesson{} recorded this session.",
-            if recorded == 1 { "" } else { "s" }
-        ),
-    })
+    stop_lessons_recorded_json_with_savings(recorded, None)
+}
+
+/// v1.5: lessons-recorded banner with optional savings sentence appended.
+/// When `savings` is `Some`, it is appended after the lessons line.
+/// The original `stop_lessons_recorded_json` delegates here so existing tests
+/// continue to pass unchanged.
+fn stop_lessons_recorded_json_with_savings(
+    recorded: usize,
+    savings: Option<&str>,
+) -> serde_json::Value {
+    let base = format!(
+        "[Kimetsu] {recorded} lesson{} recorded this session.",
+        if recorded == 1 { "" } else { "s" }
+    );
+    let msg = match savings {
+        Some(s) => format!("{base} {s}"),
+        None => base,
+    };
+    serde_json::json!({ "systemMessage": msg })
 }
 
 /// The end-of-session harvest cue. Uses `decision: "block"` so the cue text
@@ -4670,11 +4863,21 @@ fn stop_harvest_cue_json() -> serde_json::Value {
 
 /// User-facing fallback nudge when nothing was recorded and the harvest cue
 /// path did not fire. Informational only, so it uses `systemMessage`.
+/// Kept for test compatibility; production code uses `_with_savings` directly.
+#[cfg_attr(not(test), allow(dead_code))]
 fn stop_no_lessons_json() -> serde_json::Value {
-    serde_json::json!({
-        "systemMessage":
-            "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.",
-    })
+    stop_no_lessons_json_with_savings(None)
+}
+
+/// v1.5: no-lessons nudge with optional savings sentence appended.
+fn stop_no_lessons_json_with_savings(savings: Option<&str>) -> serde_json::Value {
+    let base =
+        "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.";
+    let msg = match savings {
+        Some(s) => format!("{base} {s}"),
+        None => base.to_string(),
+    };
+    serde_json::json!({ "systemMessage": msg })
 }
 
 /// The end-of-session harvest cue fires only when auto-harvest is on AND
@@ -8211,6 +8414,64 @@ mod tests {
                 .unwrap()
                 .contains("[kimetsu-harvest]")
         );
+    }
+
+    // ── v1.5 Stop-hook savings sentence tests ────────────────────────────────
+
+    #[test]
+    fn stop_lessons_recorded_with_savings_appends_sentence() {
+        let v =
+            stop_lessons_recorded_json_with_savings(2, Some("[Kimetsu] Brain saved ~500 tokens."));
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("2 lessons recorded"), "{msg}");
+        assert!(msg.contains("Brain saved"), "{msg}");
+    }
+
+    #[test]
+    fn stop_lessons_recorded_without_savings_unchanged() {
+        let with = stop_lessons_recorded_json_with_savings(1, None);
+        let without = stop_lessons_recorded_json(1);
+        assert_eq!(
+            with["systemMessage"].as_str().unwrap(),
+            without["systemMessage"].as_str().unwrap(),
+            "None savings must produce identical output"
+        );
+    }
+
+    #[test]
+    fn stop_no_lessons_with_savings_appends_sentence() {
+        let v = stop_no_lessons_json_with_savings(Some("[Kimetsu] Brain saved ~200 tokens."));
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("No lessons recorded"), "{msg}");
+        assert!(msg.contains("Brain saved"), "{msg}");
+    }
+
+    #[test]
+    fn stop_no_lessons_without_savings_unchanged() {
+        let with = stop_no_lessons_json_with_savings(None);
+        let without = stop_no_lessons_json();
+        assert_eq!(
+            with["systemMessage"].as_str().unwrap(),
+            without["systemMessage"].as_str().unwrap(),
+            "None savings must produce identical output"
+        );
+    }
+
+    #[test]
+    fn stop_hook_with_savings_outputs_are_valid_json_objects() {
+        for value in [
+            stop_lessons_recorded_json_with_savings(1, Some("savings.")),
+            stop_no_lessons_json_with_savings(Some("savings.")),
+        ] {
+            let serialized = serde_json::to_string(&value).expect("serializes");
+            let reparsed: serde_json::Value =
+                serde_json::from_str(&serialized).expect("round-trips");
+            assert!(reparsed.is_object(), "must be a JSON object");
+            assert!(
+                reparsed["systemMessage"].is_string(),
+                "must have systemMessage string"
+            );
+        }
     }
 
     // ── D2a: config_edit_with ─────────────────────────────────────────────────
