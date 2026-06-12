@@ -253,6 +253,14 @@ pub fn cached_handle(conn: &Connection) -> Option<Handle> {
     reg.get(&sidecar).cloned()
 }
 
+/// Remove a superseded memory from the cached ANN index by its `memory_id`.
+/// Mirrors `on_invalidate` — superseded rows are excluded from ANN retrieval
+/// the same way invalidated rows are. No-op for in-memory DBs / cold indexes
+/// (reconcile-on-open handles those).
+pub fn on_supersede(conn: &Connection, memory_id: &str) {
+    on_invalidate(conn, memory_id);
+}
+
 /// Remove a memory from the cached index by its `memory_id` (no-op for
 /// in-memory DBs / cold indexes — reconcile-on-open will catch it).
 pub fn on_invalidate(conn: &Connection, memory_id: &str) {
@@ -347,7 +355,8 @@ impl AnnIndex {
     fn reserve_and_load_active(&mut self, conn: &Connection) -> KimetsuResult<()> {
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories
-             WHERE invalidated_at IS NULL AND embedding IS NOT NULL AND embedding_model = ?1",
+             WHERE invalidated_at IS NULL AND superseded_by IS NULL
+               AND embedding IS NOT NULL AND embedding_model = ?1",
             rusqlite::params![self.model_id],
             |r| r.get(0),
         )?;
@@ -361,7 +370,8 @@ impl AnnIndex {
         const BUILD_CHUNK: usize = 16384;
         let mut stmt = conn.prepare(
             "SELECT rowid, embedding FROM memories
-             WHERE invalidated_at IS NULL AND embedding IS NOT NULL AND embedding_model = ?1
+             WHERE invalidated_at IS NULL AND superseded_by IS NULL
+               AND embedding IS NOT NULL AND embedding_model = ?1
              ORDER BY rowid",
         )?;
         let mut rows_iter = stmt.query(rusqlite::params![self.model_id])?;
@@ -570,7 +580,8 @@ impl AnnIndex {
         const RECONCILE_CHUNK: usize = 16384;
         let delta_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories
-             WHERE invalidated_at IS NULL AND embedding IS NOT NULL
+             WHERE invalidated_at IS NULL AND superseded_by IS NULL
+               AND embedding IS NOT NULL
                AND embedding_model = ?1 AND rowid > ?2",
             rusqlite::params![self.model_id, self.max_rowid_indexed],
             |r| r.get(0),
@@ -582,7 +593,8 @@ impl AnnIndex {
         }
         let mut stmt = conn.prepare(
             "SELECT rowid, embedding FROM memories
-             WHERE invalidated_at IS NULL AND embedding IS NOT NULL
+             WHERE invalidated_at IS NULL AND superseded_by IS NULL
+               AND embedding IS NOT NULL
                AND embedding_model = ?1 AND rowid > ?2 ORDER BY rowid",
         )?;
         let mut rows_iter = stmt.query(rusqlite::params![self.model_id, self.max_rowid_indexed])?;
@@ -618,12 +630,16 @@ impl AnnIndex {
         drop(stmt);
         self.max_rowid_indexed = max_rowid;
 
-        // 3b. Remove rows now invalidated (only those <= the watermark; newer
-        //     ones were never added). `remove` is a no-op if absent.
+        // 3b. Remove rows now invalidated or superseded (only those <=
+        //     the watermark; newer ones were never added). `remove` is a
+        //     no-op if absent. Superseded rows are treated the same as
+        //     invalidated: they stop appearing as ANN candidates so
+        //     retrieval queries only surface the survivor.
         let gone: Vec<i64> = {
             let mut stmt = conn.prepare(
                 "SELECT rowid FROM memories
-                 WHERE invalidated_at IS NOT NULL AND rowid <= ?1",
+                 WHERE (invalidated_at IS NOT NULL OR superseded_by IS NOT NULL)
+                   AND rowid <= ?1",
             )?;
             stmt.query_map(rusqlite::params![self.max_rowid_indexed], |r| {
                 r.get::<_, i64>(0)

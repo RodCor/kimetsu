@@ -169,6 +169,15 @@ impl Default for EmbedderSection {
 pub struct LearningSection {
     #[serde(default = "default_auto_harvest")]
     pub auto_harvest: bool,
+    /// v1.5: store the raw retrieval query in local `context.served`
+    /// telemetry so the self-tuning loop can build a personal eval set.
+    /// Data never leaves the machine and is never exported. Set false to
+    /// keep only the query hash (the pre-v1.5 behavior). Default true so
+    /// new installs gain the eval-set signal immediately on upgrade;
+    /// `#[serde(default = "default_true")]` keeps pre-v1.5 project.toml
+    /// files loading cleanly (they get store_queries = true).
+    #[serde(default = "default_true")]
+    pub store_queries: bool,
     /// Opt-in credentialed SessionEnd distiller (configured by the install
     /// wizard). Disabled by default; `#[serde(default)]` keeps older
     /// project.toml files loading.
@@ -184,6 +193,7 @@ impl Default for LearningSection {
     fn default() -> Self {
         Self {
             auto_harvest: default_auto_harvest(),
+            store_queries: default_true(),
             distiller: DistillerSection::default(),
         }
     }
@@ -265,6 +275,13 @@ pub struct ModelSection {
     /// loading cleanly.
     #[serde(default = "default_region_env")]
     pub region_env: String,
+    /// v1.5: override the built-in $/MTok price table for the ROI ledger.
+    /// When set, this value is used for USD conversion instead of the
+    /// approximate built-in table.  Useful for private-endpoint pricing or
+    /// non-standard model deployments.  `#[serde(default)]` keeps all
+    /// pre-v1.5 project.toml files loading cleanly (they get `None`).
+    #[serde(default)]
+    pub price_per_mtok: Option<f64>,
 }
 
 fn default_region_env() -> String {
@@ -282,6 +299,7 @@ impl Default for ModelSection {
             request_timeout_secs: 120,
             region: None,
             region_env: default_region_env(),
+            price_per_mtok: None,
         }
     }
 }
@@ -367,6 +385,31 @@ pub struct BrokerSection {
     /// files loading unchanged.
     #[serde(default = "default_true")]
     pub ambient: bool,
+    /// v1.5 (Story 2.1): render-time capsule compression. When true (default),
+    /// capsule summaries are compressed with [`compress_for_render`] before
+    /// being injected into hook stdout or MCP tool responses. Compression
+    /// strips `[tags: ...]` / `(context: ...)` annotations and caps at 3
+    /// sentences. Ranking is NEVER affected — compression runs only after
+    /// retrieval and reranking. Set false to inject full memory text (useful
+    /// for debugging or when summaries are already concise).
+    ///
+    /// `#[serde(default = "default_true")]` keeps pre-v1.5 project.toml files
+    /// loading cleanly (they get compression ON).
+    #[serde(default = "default_true")]
+    pub compress_capsules: bool,
+    /// v1.5 (Story 2.3): session-scoped cross-turn capsule dedupe. When true
+    /// (default), the `UserPromptSubmit` context hook skips capsules whose
+    /// `expansion_handle` was already injected earlier in the same session
+    /// (tracked via the proactive-state sidecar). A soft policy: skipping only
+    /// happens when at least one NEW capsule remains — if dedupe would empty
+    /// the injection entirely, all capsules are injected anyway (a repeated
+    /// top memory may still be the right context). Set false to disable
+    /// session dedupe and always inject the full ranked set.
+    ///
+    /// `#[serde(default = "default_true")]` keeps pre-v1.5 project.toml files
+    /// loading cleanly (they get session dedupe ON).
+    #[serde(default = "default_true")]
+    pub session_dedupe: bool,
 }
 
 fn default_max_capsules() -> usize {
@@ -400,6 +443,8 @@ impl Default for BrokerSection {
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
+            compress_capsules: default_true(),
+            session_dedupe: default_true(),
         }
     }
 }
@@ -697,6 +742,25 @@ max_total_cost_usd = 250.0
             config.embedder.reranker, "ms-marco-tinybert-l-2-v2",
             "embedder.reranker must default to ms-marco-tinybert-l-2-v2"
         );
+        // v1.5: a pre-v1.5 project.toml has no learning.store_queries —
+        // defaults to true so existing installs gain the eval-set signal
+        // on upgrade without any config change.
+        assert!(
+            config.learning.store_queries,
+            "learning.store_queries must default to true"
+        );
+        // v1.5 (Story 2.1): a pre-v1.5 project.toml without broker.compress_capsules
+        // must load cleanly and default to true (compression ON).
+        assert!(
+            config.broker.compress_capsules,
+            "broker.compress_capsules must default to true"
+        );
+        // v1.5 (Story 2.3): a pre-v1.5 project.toml without broker.session_dedupe
+        // must load cleanly and default to true (dedupe ON).
+        assert!(
+            config.broker.session_dedupe,
+            "broker.session_dedupe must default to true"
+        );
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
@@ -837,5 +901,88 @@ max_total_cost_usd = 250.0
                 "task_size={size}: budget={b} must be <= run_cap=8000"
             );
         }
+    }
+
+    /// v1.5: a pre-v1.5 project.toml without `model.price_per_mtok` must
+    /// load cleanly and default to `None` (backward compatibility).
+    #[test]
+    fn pre_v1_5_config_without_price_per_mtok_loads_with_none() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-sonnet-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-v1.5 toml must load");
+        assert!(
+            config.model.price_per_mtok.is_none(),
+            "price_per_mtok must default to None when absent from project.toml"
+        );
+    }
+
+    /// v1.5 (Story 2.1+2.3): compress_capsules and session_dedupe survive a
+    /// round-trip through serialize → deserialize when set to false.
+    #[test]
+    fn broker_v1_5_fields_round_trip_as_false() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.broker.compress_capsules = false;
+        config.broker.session_dedupe = false;
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            !reloaded.broker.compress_capsules,
+            "compress_capsules must survive as false"
+        );
+        assert!(
+            !reloaded.broker.session_dedupe,
+            "session_dedupe must survive as false"
+        );
+    }
+
+    /// v1.5: when `model.price_per_mtok` is set in project.toml it must
+    /// round-trip cleanly through serialize → deserialize.
+    #[test]
+    fn price_per_mtok_round_trips() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.model.price_per_mtok = Some(7.5);
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert_eq!(
+            reloaded.model.price_per_mtok,
+            Some(7.5),
+            "price_per_mtok must round-trip"
+        );
     }
 }

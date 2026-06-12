@@ -155,6 +155,9 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // a retrieved capsule. Best-effort — a missing or
         // malformed payload just no-ops.
         "memory.cited" => apply_memory_cited(conn, event),
+        // Story 3.1: near-duplicate merge — stamp superseded_by on merged members,
+        // remove their FTS rows, and drop them from the ANN index.
+        "memory.superseded" => apply_memory_superseded(conn, event),
         _ => Ok(()),
     }
 }
@@ -661,6 +664,123 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
     )?;
     #[cfg(feature = "embeddings")]
     crate::ann::on_invalidate(conn, memory_id);
+    Ok(())
+}
+
+/// Story 3.1: project a `memory.superseded` event.
+///
+/// Payload fields:
+///   `memory_id`       — the member being superseded (merged into survivor)
+///   `survivor_id`     — the memory that absorbs the cluster
+///   `use_count_delta` — member's use_count contribution (optional, default 0)
+///   `score_delta`     — member's usefulness_score contribution (optional, default 0)
+///
+/// Projection:
+///   1. Stamp `superseded_by = survivor_id` on the member row.
+///   2. Add member's use_count_delta / score_delta to the survivor row.
+///   3. Reassign the member's citations to the survivor.
+///   4. Delete the member's FTS row so it stops appearing in lexical retrieval.
+///   5. Remove the member from the ANN index (embeddings feature only).
+///
+/// The member row is intentionally NOT invalidated — `blame` can still see
+/// it and trace it to its survivor via `superseded_by`.
+///
+/// This is the single canonical projection path used by BOTH the live
+/// consolidation path (via `apply_events`) and `rebuild_in_place` (replay),
+/// so the two can never drift.
+fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some(survivor_id) = event.payload.get("survivor_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let use_count_delta = event
+        .payload
+        .get("use_count_delta")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let score_delta = event
+        .payload
+        .get("score_delta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    // 1. Stamp superseded_by on the member.
+    conn.execute(
+        "UPDATE memories SET superseded_by = ?2 WHERE memory_id = ?1",
+        params![memory_id, survivor_id],
+    )?;
+
+    // 2. Accumulate the member's stats onto the survivor.
+    if use_count_delta != 0 || score_delta != 0.0 {
+        conn.execute(
+            "UPDATE memories
+             SET use_count       = use_count       + ?2,
+                 usefulness_score = usefulness_score + ?3
+             WHERE memory_id = ?1",
+            params![survivor_id, use_count_delta, score_delta],
+        )?;
+    }
+
+    // 3. Reassign citations from member to survivor (shared helper).
+    reassign_citations_projection(conn, memory_id, survivor_id)?;
+
+    // 4. Remove from FTS index.
+    conn.execute(
+        "DELETE FROM memories_fts WHERE memory_id = ?1",
+        params![memory_id],
+    )?;
+
+    // 5. Remove from ANN index (embeddings feature only).
+    #[cfg(feature = "embeddings")]
+    crate::ann::on_supersede(conn, memory_id);
+
+    Ok(())
+}
+
+/// Shared citation-reassignment helper used by both the live consolidation
+/// path and the replay path (`apply_memory_superseded`).  Keeping a single
+/// implementation prevents the two paths from drifting.
+///
+/// Copies every `memory_citations` row from `from_id` to `to_id`
+/// (INSERT OR IGNORE — skip conflicts), then deletes the originals.
+pub(crate) fn reassign_citations_projection(
+    conn: &Connection,
+    from_id: &str,
+    to_id: &str,
+) -> KimetsuResult<()> {
+    // Collect existing citations for `from_id`.
+    let rows: Vec<(String, i64, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT run_id, turn, cited_at, rationale
+             FROM memory_citations WHERE memory_id = ?1",
+        )?;
+        stmt.query_map(params![from_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+
+    for (run_id, turn, cited_at, rationale) in &rows {
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_citations
+             (run_id, memory_id, turn, cited_at, rationale)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id, to_id, turn, cited_at, rationale],
+        )?;
+    }
+
+    conn.execute(
+        "DELETE FROM memory_citations WHERE memory_id = ?1",
+        params![from_id],
+    )?;
+
     Ok(())
 }
 

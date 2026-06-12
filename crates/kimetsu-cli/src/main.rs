@@ -717,6 +717,52 @@ enum BrainCommand {
     /// Results are written to --out as JSON files + a summary.md table.
     /// Requires `--features embeddings`.
     Bench(BrainBenchArgs),
+    /// ROI ledger — did kimetsu pay for itself?
+    ///
+    /// Estimates token savings from cited memories (conservative per-kind
+    /// calibration), subtracts brain-injection overhead, and shows a
+    /// net-positive / net-negative verdict.  Honest negatives are shown as
+    /// such.  Use `--json` for stable machine-readable output.
+    Roi(RoiArgs),
+    /// Self-tuning sweep — optimize retrieval config from personal eval data.
+    ///
+    /// --status: show accumulated eval cases and readiness.
+    /// --apply: write the winning config to project.toml (dry-run by default).
+    /// --revert: restore the previous tune-history entry.
+    Tune(TuneArgs),
+    /// Merge near-duplicate memories and optionally distil loose clusters.
+    ///
+    /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
+    /// memories with cosine ≥ THRESHOLD (default 0.92) are merged — survivor keeps
+    /// its text/id; members get `superseded_by` set and are removed from retrieval.
+    /// Citations are reassigned to the survivor so `memory blame` stays accurate.
+    ///
+    /// Story 3.2 (--distill): looser clusters (0.75–0.85 cosine band) of ≥ 3
+    /// memories sharing ≥ 1 domain tag are fed to the configured distiller (same
+    /// model the SessionEnd hook uses). Result lands as a memory proposal for human
+    /// review. If no distiller is configured, prints the clusters and exits 0.
+    ///
+    /// Examples:
+    ///   kimetsu brain consolidate --dry-run
+    ///   kimetsu brain consolidate --yes
+    ///   kimetsu brain consolidate --threshold 0.88 --yes
+    ///   kimetsu brain consolidate --distill --dry-run
+    ///   kimetsu brain consolidate --distill --yes
+    Consolidate(ConsolidateArgs),
+    /// List fading memories and prune them interactively.
+    ///
+    /// Shows memories with usefulness_score < SCORE_FLOOR (default 0.2) AND
+    /// last_useful_at / created_at older than AGE_DAYS (default 30 days),
+    /// with id / kind / age / usefulness / text-head.
+    ///
+    /// Interactive per-item [k]eep / [p]rune / [s]kip (requires a TTY).
+    /// Use --prune-all --yes for batch non-interactive pruning.
+    ///
+    /// Examples:
+    ///   kimetsu brain triage
+    ///   kimetsu brain triage --score-floor 0.1 --age-days 60
+    ///   kimetsu brain triage --prune-all --yes
+    Triage(TriageArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -878,6 +924,84 @@ struct SessionEndHookArgs {
     workspace: Option<PathBuf>,
 }
 
+/// Args for `kimetsu brain tune`.
+#[derive(Debug, Args)]
+struct TuneArgs {
+    /// Show personal eval-set statistics without running the sweep.
+    #[arg(long)]
+    status: bool,
+    /// Cost penalty weight per estimated token injected per query.
+    /// Default 0.005 ≈ one MRR rank position ≈ 200 tokens.
+    #[arg(long, default_value_t = 0.005f64)]
+    cost_weight: f64,
+    /// Apply the winning config to project.toml (without this flag, dry-run only).
+    #[arg(long)]
+    apply: bool,
+    /// Revert the most recent tune-history entry.
+    #[arg(long)]
+    revert: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
+}
+
+/// Args for `kimetsu brain consolidate` (Stories 3.1 + 3.2).
+#[derive(Debug, Args)]
+struct ConsolidateArgs {
+    /// Print merge plan without writing to the DB.
+    #[arg(long)]
+    dry_run: bool,
+    /// Cosine similarity threshold for near-duplicate clustering (Story 3.1).
+    /// Memories with cosine ≥ threshold are merged. Default: 0.92.
+    #[arg(long, default_value_t = 0.92f32)]
+    threshold: f32,
+    /// Skip the interactive confirmation prompt (required when stdin is not a TTY).
+    #[arg(long)]
+    yes: bool,
+    /// Also run Story 3.2 distillation of loose clusters (0.75–0.85 band).
+    /// Result lands as a memory proposal for human review.
+    /// Requires a configured distiller; prints clusters and exits 0 otherwise.
+    #[arg(long)]
+    distill: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain triage` (Story 3.3).
+#[derive(Debug, Args)]
+struct TriageArgs {
+    /// Usefulness score floor: memories below this threshold are candidates.
+    #[arg(long, default_value_t = 0.2f32)]
+    score_floor: f32,
+    /// Age threshold in days: memories last useful (or created) before this are candidates.
+    #[arg(long, default_value_t = 30u32)]
+    age_days: u32,
+    /// Prune all candidates non-interactively (requires --yes).
+    #[arg(long)]
+    prune_all: bool,
+    /// Skip the confirmation prompt for --prune-all.
+    #[arg(long)]
+    yes: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain roi`.
+#[derive(Debug, Args)]
+struct RoiArgs {
+    /// Time window: "7d", "30d", or "all". Default: 30d.
+    #[arg(long, default_value = "30d")]
+    window: String,
+    /// Emit machine-readable JSON (stable RoiReport schema).
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct ReindexArgs {
     /// Which DB(s) to reindex: `project`, `user`, or `all`.
@@ -932,6 +1056,16 @@ struct BrainExportArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Strip the trailing `(context: …)` segment from each exported memory text.
+    /// Useful when sharing memories between projects: the context annotation is
+    /// project-specific and not meaningful elsewhere.
+    #[arg(long)]
+    redact: bool,
+    /// Strip the leading `[tags: …]` prefix from each exported memory text.
+    /// Usable on its own (tags only) or with `--redact` for a fully clean
+    /// lesson body with no metadata.
+    #[arg(long)]
+    redact_tags: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1641,10 +1775,13 @@ fn restart_cmd(args: RestartArgs) -> KimetsuResult<()> {
 /// 4. None present + TTY → prompt with the provided `reader`.
 ///
 /// Factored as a pure-ish function so it can be unit-tested without real installs.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_setup_hosts(
     arg: Option<&str>,
     present_claude: bool,
     present_codex: bool,
+    present_cursor: bool,
+    present_gemini: bool,
     present_openclaw: bool,
     present_pi: bool,
     is_tty: bool,
@@ -1667,6 +1804,12 @@ pub fn resolve_setup_hosts(
     }
     if present_codex {
         detected.push(BridgeTarget::Codex);
+    }
+    if present_cursor {
+        detected.push(BridgeTarget::Cursor);
+    }
+    if present_gemini {
+        detected.push(BridgeTarget::GeminiCli);
     }
     #[cfg(feature = "openclaw")]
     if present_openclaw {
@@ -1694,13 +1837,15 @@ pub fn resolve_setup_hosts(
         Ok(vec![BridgeTarget::ClaudeCode])
     } else {
         #[cfg(all(feature = "pi", feature = "openclaw"))]
-        let prompt = "Which host agent do you use? [claude-code/codex/openclaw/pi/both]: ";
+        let prompt =
+            "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/openclaw/pi/both]: ";
         #[cfg(all(feature = "pi", not(feature = "openclaw")))]
-        let prompt = "Which host agent do you use? [claude-code/codex/pi/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/pi/both]: ";
         #[cfg(all(not(feature = "pi"), feature = "openclaw"))]
-        let prompt = "Which host agent do you use? [claude-code/codex/openclaw/both]: ";
+        let prompt =
+            "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/openclaw/both]: ";
         #[cfg(all(not(feature = "pi"), not(feature = "openclaw")))]
-        let prompt = "Which host agent do you use? [claude-code/codex/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/both]: ";
         print!("{prompt}");
         io::stdout().flush().ok();
         let mut line = String::new();
@@ -1720,9 +1865,10 @@ pub fn resolve_setup_hosts(
     }
 }
 
-/// Detect whether the home config directories for Claude Code, Codex, OpenClaw, and Pi exist.
-/// Returns `(claude_present, codex_present, openclaw_present, pi_present)`.
-fn detect_present_hosts() -> (bool, bool, bool, bool) {
+/// Detect whether the home config directories for Claude Code, Codex, Cursor, Gemini CLI,
+/// OpenClaw, and Pi exist.
+/// Returns `(claude_present, codex_present, cursor_present, gemini_present, openclaw_present, pi_present)`.
+fn detect_present_hosts() -> (bool, bool, bool, bool, bool, bool) {
     let home = std::env::var_os("USERPROFILE")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
@@ -1730,11 +1876,15 @@ fn detect_present_hosts() -> (bool, bool, bool, bool) {
 
     let home = match home {
         Some(h) => h,
-        None => return (false, false, false, false),
+        None => return (false, false, false, false, false, false),
     };
 
     let claude_present = home.join(".claude").is_dir();
     let codex_present = home.join(".codex").is_dir();
+    // Cursor: global config lives in ~/.cursor
+    let cursor_present = home.join(".cursor").is_dir();
+    // Gemini CLI: global config lives in ~/.gemini
+    let gemini_present = home.join(".gemini").is_dir();
     #[cfg(feature = "openclaw")]
     let openclaw_present = home.join(".openclaw").is_dir();
     #[cfg(not(feature = "openclaw"))]
@@ -1743,7 +1893,14 @@ fn detect_present_hosts() -> (bool, bool, bool, bool) {
     let pi_present = home.join(".pi").is_dir();
     #[cfg(not(feature = "pi"))]
     let pi_present = false;
-    (claude_present, codex_present, openclaw_present, pi_present)
+    (
+        claude_present,
+        codex_present,
+        cursor_present,
+        gemini_present,
+        openclaw_present,
+        pi_present,
+    )
 }
 
 /// `kimetsu setup` — one-command onboarding.
@@ -1797,13 +1954,22 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
     // ── Step 2: Choose host(s) ────────────────────────────────────────────────
     println!();
     println!("[2/4] Selecting host(s)...");
-    let (present_claude, present_codex, present_openclaw, present_pi) = detect_present_hosts();
+    let (
+        present_claude,
+        present_codex,
+        present_cursor,
+        present_gemini,
+        present_openclaw,
+        present_pi,
+    ) = detect_present_hosts();
     let is_tty = io::stdin().is_terminal();
     let stdin = io::stdin();
     let hosts = resolve_setup_hosts(
         args.host.as_deref(),
         present_claude,
         present_codex,
+        present_cursor,
+        present_gemini,
         present_openclaw,
         present_pi,
         is_tty,
@@ -1845,6 +2011,8 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            BridgeTarget::Cursor => "Cursor",
+            BridgeTarget::GeminiCli => "Gemini CLI",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -2002,6 +2170,8 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::ClaudeCode => "Claude Code",
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
+            BridgeTarget::Cursor => "Cursor",
+            BridgeTarget::GeminiCli => "Gemini CLI",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -2396,6 +2566,8 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 BridgeTarget::ClaudeCode => "Claude Code",
                 BridgeTarget::Codex => "Codex",
                 BridgeTarget::Kimetsu => "Kimetsu",
+                BridgeTarget::Cursor => "Cursor",
+                BridgeTarget::GeminiCli => "Gemini CLI",
                 #[cfg(feature = "openclaw")]
                 BridgeTarget::OpenClaw => "OpenClaw",
                 #[cfg(feature = "pi")]
@@ -3346,6 +3518,10 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Daemon(args) => brain_daemon(args),
         BrainCommand::Eval(args) => brain_eval(args),
         BrainCommand::Bench(args) => brain_bench(args),
+        BrainCommand::Roi(args) => brain_roi(args),
+        BrainCommand::Tune(args) => brain_tune(args),
+        BrainCommand::Consolidate(args) => brain_consolidate(args),
+        BrainCommand::Triage(args) => brain_triage(args),
     }
 }
 
@@ -3715,7 +3891,8 @@ fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
         })
         .transpose()?;
 
-    let memories = project::export_memories(&workspace, scope, kind)?;
+    let memories =
+        project::export_memories(&workspace, scope, kind, args.redact, args.redact_tags)?;
     let json = serde_json::to_string_pretty(&memories)
         .map_err(|e| format!("brain export: failed to serialize: {e}"))?;
 
@@ -4300,6 +4477,922 @@ fn brain_insights(
     Ok(())
 }
 
+/// v1.5: `kimetsu brain roi` — ROI ledger.
+fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::roi::{RoiWindow, roi_report};
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let window = RoiWindow::parse(&args.window)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    let (_paths, config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+    let report = roi_report(
+        &conn,
+        window,
+        &config.model.model,
+        config.model.price_per_mtok,
+    )?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human output.
+    let window_label = match report.window_days {
+        Some(d) => format!("last {d} days"),
+        None => "all time".to_string(),
+    };
+    println!("── ROI Ledger ({window_label}) ────────────────────────");
+    println!("  served events:        {}", report.served_events);
+    println!("  citations:            {}", report.citations);
+    println!(
+        "  injected tokens:      {}",
+        format_token_count(report.injected_tokens)
+    );
+    println!(
+        "  est. saved tokens:    {}",
+        format_token_count(report.estimated_saved_tokens)
+    );
+    let net_sign = if report.net_tokens >= 0 { "+" } else { "" };
+    println!("  net tokens:           {net_sign}{}", report.net_tokens);
+
+    if let Some(ref usd) = report.usd {
+        println!(
+            "── USD ({} $/MTok) ─────────────────────────────",
+            {
+                // Reverse-lookup the price to show it.
+                kimetsu_brain::roi::resolve_price_per_mtok(
+                    &config.model.model,
+                    config.model.price_per_mtok,
+                )
+                .map(|p| format!("{p:.2}"))
+                .unwrap_or_else(|| "?".to_string())
+            }
+        );
+        println!("  saved:  ${:.4}", usd.saved);
+        println!("  spent:  ${:.4}", usd.spent);
+        let net_usd_sign = if usd.net >= 0.0 { "+" } else { "" };
+        println!("  net:    {net_usd_sign}${:.4}", usd.net);
+    }
+
+    // Verdict line.
+    println!("──────────────────────────────────────────────");
+    if report.citations == 0 {
+        println!(
+            "  No retrieval activity recorded yet — the ledger starts \
+             counting as you work."
+        );
+    } else if report.net_tokens >= 0 {
+        match &report.usd {
+            Some(u) if u.net >= 0.0 => println!(
+                "  Net positive: kimetsu saved you ~{} tokens (~${:.4}) this window.",
+                format_token_count(report.estimated_saved_tokens),
+                u.net,
+            ),
+            _ => println!(
+                "  Net positive: kimetsu saved you ~{} tokens this window.",
+                format_token_count(report.estimated_saved_tokens),
+            ),
+        }
+    } else {
+        // Honest negative.
+        match &report.usd {
+            Some(u) => println!(
+                "  Net negative: brain overhead exceeded savings by ~{} tokens (~${:.4}) this window.",
+                format_token_count(
+                    report
+                        .injected_tokens
+                        .saturating_sub(report.estimated_saved_tokens)
+                ),
+                (u.spent - u.saved).abs(),
+            ),
+            None => println!(
+                "  Net negative: brain overhead exceeded savings by ~{} tokens this window.",
+                format_token_count(
+                    report
+                        .injected_tokens
+                        .saturating_sub(report.estimated_saved_tokens)
+                ),
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// v1.5: `kimetsu brain tune` — personal eval readiness + optional sweep.
+fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::tuneset::build_personal_eval;
+
+    let workspace = args
+        .workspace
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+    let (_paths2, _config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+
+    if args.revert {
+        return brain_tune_revert(&workspace);
+    }
+
+    let eval = build_personal_eval(&conn, 1800).map_err(|e| format!("build_personal_eval: {e}"))?;
+
+    let positive_count = eval.cases.len();
+    let noise_count = eval.noise_count;
+
+    let readiness = if positive_count >= 30 {
+        "READY — enough cases for a meaningful sweep."
+    } else {
+        "accumulating — synthetic fixture will be used for the sweep (< 30 positive cases)."
+    };
+
+    // Coverage by memory kind (from relevant memory ids).
+    let kind_coverage = kind_coverage_from_eval(&conn, &eval.cases);
+
+    println!("=== kimetsu brain tune --status ===");
+    println!("Positive cases (query + ≥1 cited memory): {positive_count}");
+    println!("Noise entries  (served, no citation):     {noise_count}");
+    if let Some(o) = &eval.oldest {
+        println!("Oldest positive case: {o}");
+    }
+    if let Some(n) = &eval.newest {
+        println!("Newest positive case: {n}");
+    }
+    println!();
+    println!("Coverage by memory kind:");
+    for (kind, count) in &kind_coverage {
+        println!("  {kind:<22} {count}");
+    }
+    println!();
+    println!("Readiness: {readiness}");
+
+    if args.status {
+        return Ok(());
+    }
+
+    // Sweep (or dry-run report).
+    brain_tune_sweep(&workspace, &paths, args, eval)
+}
+
+fn kind_coverage_from_eval(
+    conn: &rusqlite::Connection,
+    cases: &[kimetsu_brain::eval::EvalCase],
+) -> Vec<(String, usize)> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for case in cases {
+        for mid in &case.relevant {
+            let kind: Option<String> = conn
+                .query_row(
+                    "SELECT kind FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![mid],
+                    |r| r.get(0),
+                )
+                .ok();
+            let kind = kind.unwrap_or_else(|| "unknown".to_string());
+            *counts.entry(kind).or_default() += 1;
+        }
+    }
+    let mut vec: Vec<(String, usize)> = counts.into_iter().collect();
+    vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+    vec
+}
+
+fn brain_tune_sweep(
+    workspace: &std::path::Path,
+    paths: &kimetsu_core::paths::ProjectPaths,
+    args: TuneArgs,
+    eval: kimetsu_brain::tuneset::PersonalEval,
+) -> KimetsuResult<()> {
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
+    use kimetsu_brain::embeddings::{open_embedder_for, open_reranker_for_model};
+    use kimetsu_brain::eval::{mean, mrr};
+    use kimetsu_brain::project::BrainSession;
+    use kimetsu_brain::tune::{
+        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history, compute_objective,
+        select_winner, train_holdout_split,
+    };
+    use std::collections::HashMap;
+    use time::format_description::well_known::Rfc3339;
+
+    let config = project::load_config(paths)?;
+    // Tune against the PRODUCTION retrieval pipeline: the same embedder
+    // resolution as retrieve_context_with_request. On embeddings builds this
+    // loads the real model (semantic floors only discriminate with real
+    // cosines); lean builds degrade to Noop and sweep FTS-only — the status
+    // output should make that visible to the user.
+    let embedder = open_embedder_for(config.embedder.enabled);
+    if embedder.is_noop() {
+        println!(
+            "note: lean build/embedder disabled — sweeping FTS-only retrieval \
+             (semantic floor values will not differentiate)"
+        );
+    }
+    let current_combo = TuneCombo {
+        min_lexical_coverage: config.broker.min_lexical_coverage,
+        min_semantic_score: config.broker.min_semantic_score,
+        reranker_id: config.embedder.reranker.clone(),
+    };
+
+    // Choose eval cases: personal if READY, else fall back to fixture.
+    let fallback_fixture_path = std::path::Path::new("fixtures/eval-retrieval.json");
+    let (cases, using_personal) = if eval.cases.len() >= 30 {
+        (eval.cases.clone(), true)
+    } else {
+        // Load the committed fixture.
+        if !fallback_fixture_path.exists() {
+            println!(
+                "note: fewer than 30 personal eval cases ({}) and no fixture at {}. \
+                 Sweep skipped. Accumulate more sessions with store_queries=true.",
+                eval.cases.len(),
+                fallback_fixture_path.display()
+            );
+            return Ok(());
+        }
+        let text = std::fs::read_to_string(fallback_fixture_path)
+            .map_err(|e| format!("read fixture: {e}"))?;
+        let fixture: kimetsu_brain::eval::EvalFixture =
+            serde_json::from_str(&text).map_err(|e| format!("parse fixture: {e}"))?;
+        // Fixture uses key-based relevance, not memory_ids. For the sweep
+        // we need memory_ids. We cannot map them here (fixture is hermetic).
+        // Instead: use fixture cases as-is for MRR calculation but note that
+        // relevant ids won't match real DB memories → MRR will be 0.
+        // The sweep is still meaningful for comparing COMBOS relatively.
+        let eval_cases: Vec<kimetsu_brain::eval::EvalCase> = fixture
+            .cases
+            .into_iter()
+            .map(|c| kimetsu_brain::eval::EvalCase {
+                query: c.query,
+                relevant: c.relevant,
+            })
+            .collect();
+        (eval_cases, false)
+    };
+
+    if !using_personal {
+        println!(
+            "note: fewer than 30 personal eval cases ({}). Using fixture file for relative sweep.",
+            eval.cases.len()
+        );
+        // Fix 3: guard --apply behind personal data.
+        // In fixture mode MRR≡0 for every combo (fixture IDs don't match real
+        // memories), so the objective degenerates to pure token-minimisation.
+        // Applying the resulting floors would optimise for fewer tokens at the
+        // cost of recall.  Refuse --apply until the user has ≥30 cited cases.
+        if args.apply {
+            println!(
+                "note: fixture mode is relative-only — --apply refused. \
+                 Accumulate ≥30 cited cases first (see `kimetsu brain tune --status`)."
+            );
+            return Ok(());
+        }
+    }
+
+    let n = cases.len();
+    if n == 0 {
+        println!("No eval cases available. Run more sessions with store_queries=true.");
+        return Ok(());
+    }
+
+    let (train_idx, holdout_idx) = train_holdout_split(n);
+    let train_cases: Vec<&kimetsu_brain::eval::EvalCase> =
+        train_idx.iter().map(|&i| &cases[i]).collect();
+    let holdout_cases: Vec<&kimetsu_brain::eval::EvalCase> =
+        holdout_idx.iter().map(|&i| &cases[i]).collect();
+
+    println!(
+        "Sweep: {} combos × {} train / {} holdout cases",
+        kimetsu_brain::tune::TuneCombo::all_combos().len(),
+        train_cases.len(),
+        holdout_cases.len()
+    );
+
+    // Cache reranker handles (load once, reuse).
+    let mut reranker_cache: HashMap<String, Option<Box<dyn kimetsu_brain::embeddings::Reranker>>> =
+        HashMap::new();
+    for rr_id in kimetsu_brain::tune::RERANKER_IDS {
+        let rr: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = if *rr_id == "off" {
+            None
+        } else {
+            open_reranker_for_model(rr_id)
+        };
+        reranker_cache.insert(rr_id.to_string(), rr);
+    }
+
+    // Helper: evaluate one combo over a slice of cases.
+    let evaluate_cases =
+        |combo: &TuneCombo, case_slice: &[&kimetsu_brain::eval::EvalCase]| -> (f64, f64) {
+            let session = match BrainSession::open_readonly(workspace) {
+                Ok(s) => s,
+                Err(_) => return (0.0, 0.0),
+            };
+            let rr_ref = reranker_cache
+                .get(&combo.reranker_id)
+                .and_then(|r| r.as_deref());
+            let rerank_floor = 0.30f32;
+            let rerank_cap = 4usize;
+            let pool = 8usize;
+
+            let mut mrr_vals: Vec<f64> = Vec::new();
+            let mut token_vals: Vec<f64> = Vec::new();
+
+            for case in case_slice {
+                let request = ContextRequest {
+                    stage: "localization".to_string(),
+                    query: case.query.clone(),
+                    budget_tokens: 6000,
+                    max_capsules: pool,
+                    min_semantic_score: combo.min_semantic_score,
+                    min_lexical_coverage: combo.min_lexical_coverage,
+                    ..Default::default()
+                };
+                let mut bundle =
+                    match session.retrieve_context_with_injected_embedder(request, embedder) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                if let Some(rr) = rr_ref {
+                    bundle.capsules =
+                        rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
+                }
+
+                let ranked_ids: Vec<String> = bundle
+                    .capsules
+                    .iter()
+                    .filter_map(|c| {
+                        c.expansion_handle
+                            .strip_prefix("memory:")
+                            .map(str::to_string)
+                    })
+                    .collect();
+
+                let mrr_val = mrr(&ranked_ids, &case.relevant);
+                mrr_vals.push(mrr_val);
+
+                let tokens: f64 = bundle
+                    .capsules
+                    .iter()
+                    .map(|c| c.token_estimate as f64)
+                    .sum();
+                token_vals.push(tokens);
+            }
+
+            (mean(&mrr_vals), mean(&token_vals))
+        };
+
+    // Evaluate current config on holdout for baseline.
+    let (baseline_holdout_mrr, baseline_holdout_tokens) =
+        evaluate_cases(&current_combo, &holdout_cases);
+    let baseline_holdout_obj = compute_objective(
+        baseline_holdout_mrr,
+        baseline_holdout_tokens,
+        args.cost_weight,
+    );
+
+    // Sweep all combos on TRAIN set.
+    let all_combos = TuneCombo::all_combos();
+    let mut combo_results: Vec<ComboResult> = Vec::new();
+
+    for (i, combo) in all_combos.iter().enumerate() {
+        if i % 10 == 0 {
+            print!("\r  sweeping combo {}/{} ...", i + 1, all_combos.len());
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+        let (mmrr, mtok) = evaluate_cases(combo, &train_cases);
+        let obj = compute_objective(mmrr, mtok, args.cost_weight);
+        combo_results.push(ComboResult {
+            combo: combo.clone(),
+            mean_mrr: mmrr,
+            mean_tokens: mtok,
+            objective: obj,
+        });
+    }
+    println!();
+
+    let winner = match select_winner(&combo_results) {
+        Some(w) => w,
+        None => {
+            println!("No combos evaluated. Nothing to tune.");
+            return Ok(());
+        }
+    };
+
+    // Evaluate winner on HOLDOUT.
+    let (holdout_mrr, holdout_tokens) = evaluate_cases(&winner.combo, &holdout_cases);
+    let holdout_obj = compute_objective(holdout_mrr, holdout_tokens, args.cost_weight);
+    let improvement = holdout_obj - baseline_holdout_obj;
+
+    println!();
+    println!("=== Tune Sweep Results ===");
+    println!(
+        "Current config:  lex={:.2} sem={:.3} rr={}",
+        current_combo.min_lexical_coverage,
+        current_combo.min_semantic_score,
+        current_combo.reranker_id
+    );
+    println!(
+        "Best combo:      lex={:.2} sem={:.3} rr={}",
+        winner.combo.min_lexical_coverage,
+        winner.combo.min_semantic_score,
+        winner.combo.reranker_id
+    );
+    println!(
+        "Train objective: {:.4}  (MRR {:.4}, avg_tokens {:.1})",
+        winner.objective, winner.mean_mrr, winner.mean_tokens
+    );
+    println!(
+        "Holdout objective: {:.4} vs baseline {:.4} (improvement: {:+.4})",
+        holdout_obj, baseline_holdout_obj, improvement
+    );
+
+    if improvement < 0.01 {
+        println!();
+        println!(
+            "verdict: no change recommended (holdout improvement {improvement:+.4} < 0.01 threshold)"
+        );
+        return Ok(());
+    }
+
+    println!();
+    // Reranker change recommendation (never auto-applied).
+    if winner.combo.reranker_id != current_combo.reranker_id {
+        println!(
+            "note: reranker change recommended ({} → {}) — apply manually after \
+             downloading the model and restarting the MCP daemon.",
+            current_combo.reranker_id, winner.combo.reranker_id
+        );
+    }
+
+    if !args.apply {
+        if !using_personal {
+            println!(
+                "note: fixture mode — results are relative only; \
+                 --apply is disabled until you have ≥30 cited cases."
+            );
+        }
+        println!(
+            "DRY RUN — to apply floor changes: kimetsu brain tune --apply\n\
+             (floor changes: lex {:.2}→{:.2}, sem {:.3}→{:.3})",
+            current_combo.min_lexical_coverage,
+            winner.combo.min_lexical_coverage,
+            current_combo.min_semantic_score,
+            winner.combo.min_semantic_score,
+        );
+        return Ok(());
+    }
+
+    // --apply: write floors to project.toml (reranker change only recommended).
+    let mut new_config = project::load_config(paths)?;
+    new_config.broker.min_lexical_coverage = winner.combo.min_lexical_coverage;
+    new_config.broker.min_semantic_score = winner.combo.min_semantic_score;
+    std::fs::write(&paths.project_toml, new_config.to_toml()?)?;
+
+    // Snapshot to tune-history.
+    let now_str = time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let history_entry = TuneHistoryEntry {
+        timestamp: now_str,
+        before: current_combo,
+        after: winner.combo.clone(),
+        train_objective: winner.objective,
+        holdout_objective: holdout_obj,
+        holdout_mrr,
+        baseline_holdout_objective: baseline_holdout_obj,
+    };
+    append_tune_history(&paths.kimetsu_dir, history_entry)?;
+
+    println!(
+        "Applied: lex_coverage={:.2}, sem_score={:.3} → project.toml updated.",
+        winner.combo.min_lexical_coverage, winner.combo.min_semantic_score
+    );
+    println!("Snaphotted to .kimetsu/tune-history.json");
+
+    Ok(())
+}
+
+fn brain_tune_revert(workspace: &std::path::Path) -> KimetsuResult<()> {
+    use kimetsu_brain::tune::latest_tune_history;
+
+    let paths = kimetsu_core::paths::ProjectPaths::discover(workspace)?;
+    let Some(entry) = latest_tune_history(&paths.kimetsu_dir)? else {
+        println!("No tune history found — nothing to revert.");
+        return Ok(());
+    };
+
+    let mut config = project::load_config(&paths)?;
+    config.broker.min_lexical_coverage = entry.before.min_lexical_coverage;
+    config.broker.min_semantic_score = entry.before.min_semantic_score;
+    std::fs::write(&paths.project_toml, config.to_toml()?)?;
+
+    println!(
+        "Reverted: lex_coverage={:.2}, sem_score={:.3} (from tune at {})",
+        entry.before.min_lexical_coverage, entry.before.min_semantic_score, entry.timestamp
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.1 + 3.2: kimetsu brain consolidate
+// ---------------------------------------------------------------------------
+
+fn brain_consolidate(args: ConsolidateArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::consolidate::{
+        ConsolidateOptions, DistillOptions, find_distill_clusters, load_embeddable_rows,
+        run_consolidation,
+    };
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let (paths, _config, conn) = kimetsu_brain::project::load_project(&workspace)?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    // --- Story 3.1: near-duplicate merge ---
+    // --distill is additive; 3.1 merge always runs alongside it.
+    {
+        let opts = ConsolidateOptions {
+            threshold: args.threshold,
+            dry_run: args.dry_run,
+        };
+
+        if !args.dry_run && !args.yes {
+            // Check TTY requirement.
+            if !io::stdin().is_terminal() {
+                return Err(
+                    "stdin is not a TTY; pass --yes to confirm consolidation non-interactively"
+                        .into(),
+                );
+            }
+            // Interactive prompt.
+            write!(
+                out,
+                "Consolidate near-duplicate memories (threshold={:.2})? [y/N] ",
+                args.threshold
+            )?;
+            out.flush()?;
+            let mut line = String::new();
+            io::stdin().lock().read_line(&mut line)?;
+            let answer = line.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                writeln!(out, "Aborted.")?;
+                return Ok(());
+            }
+        }
+
+        run_consolidation(&conn, &opts, &mut out)?;
+    }
+
+    // --- Story 3.2: cluster distillation (--distill flag) ---
+    if args.distill {
+        let dopts = DistillOptions::default();
+        let by_model = load_embeddable_rows(&conn)?;
+        let all_rows: Vec<_> = by_model.into_values().flatten().collect();
+        let clusters = find_distill_clusters(&all_rows, &dopts);
+
+        if clusters.is_empty() {
+            writeln!(
+                out,
+                "\nNo distillable clusters found (lo={:.2} hi={:.2}, min_size={}).",
+                dopts.lo, dopts.hi, dopts.min_cluster_size
+            )?;
+            return Ok(());
+        }
+
+        // Try to resolve a distiller.
+        let resolved = distiller::resolve_distiller(&workspace);
+
+        if resolved.is_none() || args.dry_run {
+            writeln!(
+                out,
+                "\nDistillable clusters ({} found — lo={:.2} hi={:.2}):",
+                clusters.len(),
+                dopts.lo,
+                dopts.hi
+            )?;
+            for (i, cluster) in clusters.iter().enumerate() {
+                writeln!(
+                    out,
+                    "\nCluster {} [tags: {}]:",
+                    i + 1,
+                    cluster.shared_tags.join(", ")
+                )?;
+                for m in &cluster.memories {
+                    writeln!(
+                        out,
+                        "  [{}] {}",
+                        m.memory_id,
+                        &m.text[..m.text.len().min(80)]
+                    )?;
+                }
+            }
+            if resolved.is_none() {
+                writeln!(
+                    out,
+                    "\nNo distiller configured — printed clusters above. Configure [learning.distiller] to auto-distil."
+                )?;
+            }
+            return Ok(());
+        }
+
+        // Distiller is available — generate proposals.
+        let distiller_resolved = resolved.unwrap();
+        let mut proposals_created = 0usize;
+        for cluster in &clusters {
+            let cluster_text = cluster
+                .memories
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("{}. {}", i + 1, m.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt = format!(
+                "Distill these {} related lessons into ONE general principle \
+                 (2-4 sentences, imperative, no project-specific context):\n\n{cluster_text}",
+                cluster.memories.len()
+            );
+            let mut provider = distiller::make_provider_for_resolved(&distiller_resolved);
+            if let Some(ref mut p) = provider {
+                let lessons = distiller::distill_lessons(&prompt, p.as_mut());
+                for lesson in lessons {
+                    let result = kimetsu_brain::project::propose_memory(
+                        &distiller_resolved.record_start,
+                        distiller_resolved.scope,
+                        MemoryKind::Convention,
+                        &lesson.lesson,
+                        lesson.confidence.clamp(0.0, 1.0),
+                        &format!(
+                            "distilled from cluster [tags: {}]",
+                            cluster.shared_tags.join(", ")
+                        ),
+                    );
+                    if result.is_ok() {
+                        proposals_created += 1;
+                    }
+                }
+            }
+        }
+
+        writeln!(
+            out,
+            "\nCreated {proposals_created} distillation proposal(s). Review with: kimetsu brain memory proposals"
+        )?;
+        drop(paths);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.3: kimetsu brain triage
+// ---------------------------------------------------------------------------
+
+fn brain_triage(args: TriageArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let (_paths, _config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let stdin = io::stdin();
+    let mut sin = stdin.lock();
+
+    let candidates = triage_candidates(&conn, args.score_floor, args.age_days)?;
+
+    if candidates.is_empty() {
+        writeln!(
+            out,
+            "No fading memories found (score_floor={:.2}, age_days={}).",
+            args.score_floor, args.age_days
+        )?;
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "{} fading memor{} (score < {:.2}, age > {}d):",
+        candidates.len(),
+        if candidates.len() == 1 { "y" } else { "ies" },
+        args.score_floor,
+        args.age_days
+    )?;
+
+    if args.prune_all {
+        if !args.yes {
+            if !io::stdin().is_terminal() {
+                return Err(
+                    "stdin is not a TTY; pass --yes to confirm --prune-all non-interactively"
+                        .into(),
+                );
+            }
+            write!(out, "Prune all {} candidates? [y/N] ", candidates.len())?;
+            out.flush()?;
+            let mut line = String::new();
+            sin.read_line(&mut line)?;
+            let answer = line.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                writeln!(out, "Aborted.")?;
+                return Ok(());
+            }
+        }
+        let mut pruned = 0usize;
+        for c in &candidates {
+            let reason = format!(
+                "triage_prune score={:.2} age_days={}",
+                c.usefulness_score, c.age_days
+            );
+            if kimetsu_brain::project::invalidate_memory(&workspace, &c.memory_id, Some(&reason))
+                .is_ok()
+            {
+                pruned += 1;
+            }
+        }
+        writeln!(
+            out,
+            "Pruned {pruned} memor{}.",
+            if pruned == 1 { "y" } else { "ies" }
+        )?;
+        return Ok(());
+    }
+
+    // Interactive per-item loop.
+    if !io::stdin().is_terminal() {
+        // Non-TTY with no --prune-all: just print the list.
+        for c in &candidates {
+            writeln!(
+                out,
+                "[{}] {}/{} age={}d score={:.2} — {}",
+                c.memory_id,
+                c.scope,
+                c.kind,
+                c.age_days,
+                c.usefulness_score,
+                &c.text[..c.text.len().min(80)]
+            )?;
+        }
+        writeln!(out, "\nPass --prune-all --yes to prune non-interactively.")?;
+        return Ok(());
+    }
+
+    triage_interactive_loop(&workspace, &candidates, &mut sin, &mut out)
+}
+
+/// A fading memory candidate for triage.
+#[derive(Debug)]
+struct TriageCandidate {
+    memory_id: String,
+    scope: String,
+    kind: String,
+    text: String,
+    age_days: i64,
+    usefulness_score: f32,
+}
+
+/// Query the DB for triage candidates.
+fn triage_candidates(
+    conn: &rusqlite::Connection,
+    score_floor: f32,
+    age_days: u32,
+) -> KimetsuResult<Vec<TriageCandidate>> {
+    use rusqlite::params;
+    use time::OffsetDateTime;
+
+    // Compute the cutoff timestamp.
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - time::Duration::days(i64::from(age_days));
+    let cutoff_str = cutoff
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, scope, kind, text, usefulness_score,
+                COALESCE(last_useful_at, created_at) AS ref_ts
+         FROM memories
+         WHERE invalidated_at IS NULL
+           AND superseded_by IS NULL
+           AND usefulness_score < ?1
+           AND COALESCE(last_useful_at, created_at) < ?2
+         ORDER BY usefulness_score ASC, COALESCE(last_useful_at, created_at) ASC
+         LIMIT 200",
+    )?;
+
+    let rows = stmt.query_map(params![score_floor as f64, cutoff_str], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (memory_id, scope, kind, text, score, ref_ts) = row?;
+        let age = {
+            use time::format_description::well_known::Rfc3339;
+            OffsetDateTime::parse(&ref_ts, &Rfc3339)
+                .map(|t| (now - t).whole_days().max(0))
+                .unwrap_or(0)
+        };
+        candidates.push(TriageCandidate {
+            memory_id,
+            scope,
+            kind,
+            text,
+            age_days: age,
+            usefulness_score: score as f32,
+        });
+    }
+    Ok(candidates)
+}
+
+/// Interactive decision loop — mirrors the `decide_preflight_action` pattern
+/// in update.rs. Generic over BufRead + Write for testability.
+fn triage_interactive_loop<R: io::BufRead, W: io::Write>(
+    workspace: &std::path::Path,
+    candidates: &[TriageCandidate],
+    reader: &mut R,
+    writer: &mut W,
+) -> KimetsuResult<()> {
+    let mut pruned = 0usize;
+    let mut kept = 0usize;
+    let mut skipped = 0usize;
+
+    for c in candidates {
+        writeln!(
+            writer,
+            "\n[{}] {}/{} age={}d score={:.2}",
+            c.memory_id, c.scope, c.kind, c.age_days, c.usefulness_score
+        )?;
+        writeln!(writer, "  {}", &c.text[..c.text.len().min(120)])?;
+        write!(writer, "  [k]eep / [p]rune / [s]kip: ")?;
+        writer.flush()?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        match line.trim().to_ascii_lowercase().as_str() {
+            "p" | "prune" => {
+                let reason = format!(
+                    "triage_prune score={:.2} age_days={}",
+                    c.usefulness_score, c.age_days
+                );
+                if kimetsu_brain::project::invalidate_memory(workspace, &c.memory_id, Some(&reason))
+                    .is_ok()
+                {
+                    pruned += 1;
+                    writeln!(writer, "  → pruned.")?;
+                } else {
+                    writeln!(writer, "  → prune failed.")?;
+                }
+            }
+            "k" | "keep" => {
+                kept += 1;
+                writeln!(writer, "  → kept.")?;
+            }
+            _ => {
+                skipped += 1;
+                writeln!(writer, "  → skipped.")?;
+            }
+        }
+    }
+
+    writeln!(
+        writer,
+        "\nTriage complete: {} pruned, {} kept, {} skipped.",
+        pruned, kept, skipped
+    )?;
+    Ok(())
+}
+
+/// Format a token count with thousands separator (space).
+fn format_token_count(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut out = String::new();
+    let rem = s.len() % 3;
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (i % 3 == rem) {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// v0.6: `kimetsu brain context-hook` — UserPromptSubmit hook.
 /// Reads `{"prompt":"..."}` JSON from stdin, retrieves relevant capsules,
 /// prints Codex/Claude-compatible hook JSON to stdout for injection.
@@ -4316,17 +5409,32 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap_or(0);
 
+    // Parse the full hook payload once so we can extract both `prompt`
+    // and `session_id` (Change A + Change B).
+    let hook_payload: Option<serde_json::Value> = if input.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str(input.trim()).ok()
+    };
+
+    // Change B: extract session_id — present in Claude Code's
+    // UserPromptSubmit payload; absent in Codex / plain-text fallbacks.
+    let session_id: Option<String> = hook_payload
+        .as_ref()
+        .and_then(|v| v.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+
     // Extract the prompt text from the hook payload
-    let prompt = if input.trim().is_empty() {
-        String::new()
-    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
-        v.get("prompt")
+    let prompt = match &hook_payload {
+        Some(v) => v
+            .get("prompt")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
-            .to_string()
-    } else {
-        // Plain text fallback
-        input.trim().to_string()
+            .to_string(),
+        None if !input.trim().is_empty() => input.trim().to_string(), // plain-text fallback
+        None => String::new(),
     };
 
     // Too short to be meaningful
@@ -4357,46 +5465,195 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     // logged. Best-effort (let _ =) — telemetry must never break the hook.
     // Gate behind KIMETSU_BRAIN_LOG_RETRIEVAL=0 opt-out (default ON).
     if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() != Ok("0") {
-        let top_score = bundle.top_score;
-        let query_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            request.query.hash(&mut h);
-            format!("{:016x}", h.finish())
-        };
-        let _ = project::log_telemetry_event(
-            &workspace,
-            "context.served",
-            serde_json::json!({
-                "query_hash": query_hash,
-                "capsule_count": bundle.capsules.len(),
-                "top_score": top_score,
-                "skipped": bundle.skipped,
-                "stage": &request.stage,
-                "retrieval_path": retrieval_path,
-            }),
-        );
+        // Change A: load store_queries from project config best-effort.
+        // Telemetry must never break the hook, so any config error just
+        // falls through to the safe default (true = store the query).
+        let store_queries = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+            .ok()
+            .and_then(|paths| project::load_config(&paths).ok())
+            .map(|cfg| cfg.learning.store_queries)
+            .unwrap_or(true);
+
+        let payload = build_served_event_payload(ServedEventArgs {
+            query: &request.query,
+            capsule_count: bundle.capsules.len(),
+            top_score: bundle.top_score,
+            skipped: bundle.skipped,
+            stage: &request.stage,
+            retrieval_path,
+            store_queries,
+            session_id: session_id.as_deref(),
+        });
+        let _ = project::log_telemetry_event(&workspace, "context.served", payload);
+    }
+
+    // Change C1: capture top-10 dropped MEMORY capsules to the rolling
+    // sidecar. Best-effort — telemetry must never break the hook.
+    // We capture AFTER the telemetry event so a slow sidecar write
+    // doesn't block the event. Only capsules whose expansion_handle
+    // starts with "memory:" are interesting for regret detection.
+    {
+        use kimetsu_brain::dropped_capsule;
+        let cache_dir = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+            .ok()
+            .map(|p| kimetsu_core::paths::user_cache_dir_for(&p.repo_root));
+        if let Some(cache_dir) = cache_dir {
+            let dropped_ids = bundle
+                .excluded
+                .iter()
+                .filter(|c| c.expansion_handle.starts_with("memory:"))
+                .filter_map(|c| {
+                    c.expansion_handle
+                        .strip_prefix("memory:")
+                        .map(str::to_string)
+                })
+                .take(10);
+            let now = dropped_capsule::now_secs();
+            dropped_capsule::append_dropped(&cache_dir, dropped_ids, now);
+        }
     }
 
     if bundle.skipped || bundle.capsules.is_empty() {
         return Ok(()); // Nothing relevant — zero output
     }
 
+    // v1.5: load broker.compress_capsules + broker.session_dedupe best-effort.
+    // The hook must never fail on config errors — fallback to defaults (both ON).
+    let (compress_capsules, session_dedupe) =
+        kimetsu_core::paths::ProjectPaths::discover(&workspace)
+            .ok()
+            .and_then(|paths| project::load_config(&paths).ok())
+            .map(|cfg| (cfg.broker.compress_capsules, cfg.broker.session_dedupe))
+            .unwrap_or((true, true));
+
+    // v1.5 (Story 2.3): session-scoped cross-turn dedupe.
+    // Load the proactive-state sidecar (already used by proactive hooks) to
+    // track which capsule handles were injected earlier this session.
+    // The context hook has session_id from the hook payload (Change B).
+    let state_path = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .map(|p| {
+            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
+            proactive_state::session_path(&cache_dir, session_id.as_deref())
+        });
+    let mut state = state_path
+        .as_deref()
+        .map(proactive_state::load)
+        .unwrap_or_default();
+
+    // Apply soft dedupe: filter already-surfaced handles, but fall back to the
+    // full set if filtering would leave nothing (a repeated top memory may still
+    // be the right context). Uses the pure `dedupe_filter` function.
+    let capsules_to_render: Vec<_> = if session_dedupe {
+        let handles: Vec<&str> = bundle
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        let indices = proactive_state::dedupe_filter(&handles, &state);
+        indices.into_iter().map(|i| &bundle.capsules[i]).collect()
+    } else {
+        bundle.capsules.iter().collect()
+    };
+
     let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
-    for capsule in &bundle.capsules {
+    for capsule in &capsules_to_render {
+        // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
+        // reranking, purely on the injected text. Full summary untouched in DB.
+        let rendered: String = if compress_capsules {
+            kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+        } else {
+            capsule.summary.clone()
+        };
         // Strip the "scope:kind - " prefix from the summary for readability
-        let text = capsule
-            .summary
+        let text = rendered
             .split(" - ")
             .nth(1)
-            .unwrap_or(&capsule.summary);
+            .map(str::to_string)
+            .unwrap_or(rendered);
         additional_context.push('\n');
-        additional_context.push_str(text);
+        additional_context.push_str(&text);
     }
 
     print_user_prompt_submit_context(&additional_context)?;
+
+    // v1.5 (Story 2.3): persist newly surfaced handles so subsequent prompts
+    // in the same session skip them. Best-effort — state write must never
+    // break the hook's primary output.
+    if session_dedupe {
+        for capsule in &capsules_to_render {
+            if !capsule.expansion_handle.is_empty() {
+                state.mark_surfaced(&capsule.expansion_handle);
+            }
+        }
+        if let Some(ref path) = state_path {
+            proactive_state::save(path, &state);
+        }
+    }
+
     Ok(())
+}
+
+/// v1.5: inputs for the `context.served` telemetry payload builder.
+///
+/// Grouped into a struct to keep [`build_served_event_payload`] under
+/// the clippy `too_many_arguments` threshold and to make call-sites
+/// self-documenting.
+pub struct ServedEventArgs<'a> {
+    /// Raw retrieval query text.
+    pub query: &'a str,
+    /// How many capsules were included in the bundle.
+    pub capsule_count: usize,
+    /// Best composite score before the skip check.
+    pub top_score: f32,
+    /// True when the top score was below `min_score` (no injection).
+    pub skipped: bool,
+    /// Retrieval stage tag (e.g. `"localization"`).
+    pub stage: &'a str,
+    /// `"daemon"` or `"fts_fallback"`.
+    pub retrieval_path: &'a str,
+    /// When true, include the raw query text in the payload.
+    /// When false, only the hash is stored (pre-v1.5 behavior).
+    pub store_queries: bool,
+    /// Claude Code session id from the hook payload, when available.
+    /// Codex and plain-text fallbacks may omit it.
+    pub session_id: Option<&'a str>,
+}
+
+/// v1.5: pure builder for the `context.served` telemetry payload.
+///
+/// Extracted so the logic can be unit-tested without hitting the FS or
+/// spawning hooks. Always emits `query_hash` for backward compatibility;
+/// adds `query` only when `args.store_queries` is true; adds `session_id`
+/// only when present.
+pub fn build_served_event_payload(args: ServedEventArgs<'_>) -> serde_json::Value {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    args.query.hash(&mut h);
+    let query_hash = format!("{:016x}", h.finish());
+
+    let mut map = serde_json::Map::new();
+    map.insert("query_hash".into(), serde_json::json!(query_hash));
+    if args.store_queries {
+        map.insert("query".into(), serde_json::json!(args.query));
+    }
+    map.insert(
+        "capsule_count".into(),
+        serde_json::json!(args.capsule_count),
+    );
+    map.insert("top_score".into(), serde_json::json!(args.top_score));
+    map.insert("skipped".into(), serde_json::json!(args.skipped));
+    map.insert("stage".into(), serde_json::json!(args.stage));
+    map.insert(
+        "retrieval_path".into(),
+        serde_json::json!(args.retrieval_path),
+    );
+    if let Some(sid) = args.session_id {
+        map.insert("session_id".into(), serde_json::json!(sid));
+    }
+    serde_json::Value::Object(map)
 }
 
 fn print_user_prompt_submit_context(additional_context: &str) -> KimetsuResult<()> {
@@ -4421,6 +5678,8 @@ fn user_prompt_submit_context_output(additional_context: &str) -> serde_json::Va
 /// file Claude Code writes) instead of a non-existent inline array, and
 /// — when nothing was recorded in a non-trivial session — points at the
 /// memory-harvester subagent. Silent exit for short sessions.
+/// v1.5: when the session had ≥1 citation, appends a savings sentence to
+/// the `systemMessage` banner.
 fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     use std::io::Read;
 
@@ -4457,8 +5716,15 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     };
 
+    // v1.5: compute per-session ROI (best-effort; errors are silently ignored).
+    let sid = session.get("session_id").and_then(|v| v.as_str());
+    let session_savings = compute_stop_hook_savings(&workspace, sid);
+
     if recorded > 0 {
-        return emit_stop_hook_json(stop_lessons_recorded_json(recorded));
+        return emit_stop_hook_json(stop_lessons_recorded_json_with_savings(
+            recorded,
+            session_savings.as_deref(),
+        ));
     }
     // Short sessions exit silently — no nagging for quick lookups. The
     // count is transcript *lines* (user/assistant/tool messages), so the
@@ -4484,7 +5750,6 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .map(|c| c.learning.auto_harvest)
         .unwrap_or(true);
     let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
-    let sid = session.get("session_id").and_then(|v| v.as_str());
     let state_path = paths.as_ref().map(|p| {
         let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
         proactive_state::session_path(&cache_dir, sid)
@@ -4526,7 +5791,30 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    emit_stop_hook_json(stop_no_lessons_json())
+    emit_stop_hook_json(stop_no_lessons_json_with_savings(
+        session_savings.as_deref(),
+    ))
+}
+
+/// v1.5: Compute a per-session savings sentence for the Stop hook.
+///
+/// Best-effort: returns `None` on any error (DB not found, no data, etc.)
+/// so the hook never fails due to ROI computation.
+///
+/// Returns `None` also when there are zero citations this session (silence
+/// is the correct behavior — we don't dilute the harvest cue).
+fn compute_stop_hook_savings(workspace: &Path, session_id: Option<&str>) -> Option<String> {
+    use kimetsu_brain::roi::session_roi;
+
+    let (paths, config, conn) = kimetsu_brain::project::load_project_readonly(workspace).ok()?;
+    let _ = paths; // suppress unused warning
+    let sr = session_roi(
+        &conn,
+        session_id,
+        &config.model.model,
+        config.model.price_per_mtok,
+    )?;
+    Some(sr.savings_sentence())
 }
 
 /// Emit a Claude Code `Stop`-hook result on stdout. Claude Code validates a
@@ -4542,13 +5830,29 @@ fn emit_stop_hook_json(value: serde_json::Value) -> KimetsuResult<()> {
 
 /// User-facing banner confirming how many lessons were recorded. Surfaced via
 /// `systemMessage` (shown to the user; it does not re-enter the model).
+/// Kept for test compatibility; production code uses `_with_savings` directly.
+#[cfg_attr(not(test), allow(dead_code))]
 fn stop_lessons_recorded_json(recorded: usize) -> serde_json::Value {
-    serde_json::json!({
-        "systemMessage": format!(
-            "[Kimetsu] {recorded} lesson{} recorded this session.",
-            if recorded == 1 { "" } else { "s" }
-        ),
-    })
+    stop_lessons_recorded_json_with_savings(recorded, None)
+}
+
+/// v1.5: lessons-recorded banner with optional savings sentence appended.
+/// When `savings` is `Some`, it is appended after the lessons line.
+/// The original `stop_lessons_recorded_json` delegates here so existing tests
+/// continue to pass unchanged.
+fn stop_lessons_recorded_json_with_savings(
+    recorded: usize,
+    savings: Option<&str>,
+) -> serde_json::Value {
+    let base = format!(
+        "[Kimetsu] {recorded} lesson{} recorded this session.",
+        if recorded == 1 { "" } else { "s" }
+    );
+    let msg = match savings {
+        Some(s) => format!("{base} {s}"),
+        None => base,
+    };
+    serde_json::json!({ "systemMessage": msg })
 }
 
 /// The end-of-session harvest cue. Uses `decision: "block"` so the cue text
@@ -4567,11 +5871,21 @@ fn stop_harvest_cue_json() -> serde_json::Value {
 
 /// User-facing fallback nudge when nothing was recorded and the harvest cue
 /// path did not fire. Informational only, so it uses `systemMessage`.
+/// Kept for test compatibility; production code uses `_with_savings` directly.
+#[cfg_attr(not(test), allow(dead_code))]
 fn stop_no_lessons_json() -> serde_json::Value {
-    serde_json::json!({
-        "systemMessage":
-            "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.",
-    })
+    stop_no_lessons_json_with_savings(None)
+}
+
+/// v1.5: no-lessons nudge with optional savings sentence appended.
+fn stop_no_lessons_json_with_savings(savings: Option<&str>) -> serde_json::Value {
+    let base =
+        "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.";
+    let msg = match savings {
+        Some(s) => format!("{base} {s}"),
+        None => base.to_string(),
+    };
+    serde_json::json!({ "systemMessage": msg })
 }
 
 /// The end-of-session harvest cue fires only when auto-harvest is on AND
@@ -4714,13 +6028,16 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     };
     // Honor the configured embedder id for consistency (proactive
     // retrieval is lexical-only, but this keeps labels coherent). Also
-    // capture the auto-harvest toggle for the resolution cue below.
-    let auto_harvest = match project::load_config(&paths) {
+    // capture the auto-harvest toggle and render flags.
+    let (auto_harvest, compress_capsules) = match project::load_config(&paths) {
         Ok(config) => {
             kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
-            config.learning.auto_harvest
+            (
+                config.learning.auto_harvest,
+                config.broker.compress_capsules,
+            )
         }
-        Err(_) => true,
+        Err(_) => (true, true),
     };
 
     let mut input = String::new();
@@ -4844,11 +6161,18 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
         return Ok(());
     };
 
-    let body = capsule
-        .summary
+    // v1.5 (Story 2.1): render-time compression for the proactive hook.
+    // Runs AFTER retrieval — ranking and stored text are unaffected.
+    let rendered: String = if compress_capsules {
+        kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+    } else {
+        capsule.summary.clone()
+    };
+    let body = rendered
         .split(" - ")
         .nth(1)
-        .unwrap_or(&capsule.summary);
+        .map(str::to_string)
+        .unwrap_or(rendered);
     let header = proactive_header(event, loop_mode);
     let additional_context = format!("{header}\n{body}");
 
@@ -6629,6 +7953,12 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
         mean_latency_ms: f64,
         p95_latency_ms: f64,
         noise_capsules: f64,
+        /// v1.5 (Story 2.1): mean rendered tokens per capsule after compression.
+        #[serde(default)]
+        rendered_tokens_mean: f64,
+        /// v1.5 (Story 2.1): mean raw (uncompressed) tokens per capsule.
+        #[serde(default)]
+        raw_tokens_mean: f64,
     }
     #[derive(serde::Deserialize)]
     struct ComboResult {
@@ -6667,7 +7997,7 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     // Build summary table.
     let header = format!(
-        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} |",
+        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} | {:>12} | {:>14} |",
         "embedder",
         "reranker",
         "recall@2",
@@ -6677,11 +8007,13 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
         "p95 ms",
         "noise_caps",
         "load ms (emb+rr)",
-        "peak RSS MB"
+        "peak RSS MB",
+        "raw_tok_mean",
+        "rend_tok_mean",
     );
     let sep = format!(
-        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} |",
-        "", "", "", "", "", "", "", "", "", ""
+        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} | {:-<12} | {:-<14} |",
+        "", "", "", "", "", "", "", "", "", "", "", ""
     );
 
     let mut table_lines: Vec<String> = vec![header, sep];
@@ -6692,7 +8024,7 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "n/a".to_string());
         table_lines.push(format!(
-            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} |",
+            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} | {:>12.1} | {:>14.1} |",
             row.embedder,
             row.reranker,
             row.summary.recall_at_2,
@@ -6703,6 +8035,8 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
             row.summary.noise_capsules,
             load_ms,
             rss_str,
+            row.summary.raw_tokens_mean,
+            row.summary.rendered_tokens_mean,
         ));
     }
 
@@ -7544,6 +8878,10 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         hit_at_4: bool,
         mrr: f64,
         latency_ms: u128,
+        /// v1.5 (Story 2.1): mean rendered tokens across the returned capsules
+        /// after compress_for_render(3) vs raw token estimates.
+        raw_tokens_mean: f64,
+        rendered_tokens_mean: f64,
     }
 
     let mut case_results: Vec<CaseResult> = Vec::new();
@@ -7615,6 +8953,28 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
         let mrr_val = kimetsu_brain::eval::mrr(&obtained_keys, &case.relevant);
 
+        // v1.5 (Story 2.1): token estimates — raw vs compressed — for the
+        // rendered capsule set. Computed per-case, averaged in the summary.
+        let (raw_tokens_mean, rendered_tokens_mean) = {
+            use kimetsu_brain::context::{compress_for_render, estimate_tokens};
+            let n = bundle.capsules.len();
+            if n == 0 {
+                (0.0, 0.0)
+            } else {
+                let raw: u32 = bundle
+                    .capsules
+                    .iter()
+                    .map(|c| estimate_tokens(&c.summary))
+                    .sum();
+                let rendered: u32 = bundle
+                    .capsules
+                    .iter()
+                    .map(|c| estimate_tokens(&compress_for_render(&c.summary, 3)))
+                    .sum();
+                (raw as f64 / n as f64, rendered as f64 / n as f64)
+            }
+        };
+
         case_results.push(CaseResult {
             query: case.query.clone(),
             expected: case.relevant.clone(),
@@ -7623,6 +8983,8 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             hit_at_4,
             mrr: mrr_val,
             latency_ms,
+            raw_tokens_mean,
+            rendered_tokens_mean,
         });
     }
 
@@ -7690,6 +9052,18 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     let peak = peak_rss_mb();
 
+    // v1.5 (Story 2.1): aggregate rendered-token means across all cases.
+    let (agg_raw_tokens_mean, agg_rendered_tokens_mean) = {
+        let n = case_results.len();
+        if n == 0 {
+            (0.0, 0.0)
+        } else {
+            let raw_sum: f64 = case_results.iter().map(|r| r.raw_tokens_mean).sum();
+            let rend_sum: f64 = case_results.iter().map(|r| r.rendered_tokens_mean).sum();
+            (raw_sum / n as f64, rend_sum / n as f64)
+        }
+    };
+
     // ── 7. Write combo JSON ───────────────────────────────────────────────────
     let combo_json = serde_json::json!({
         "embedder": embedder_id,
@@ -7710,6 +9084,9 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             "mean_latency_ms": mean_latency_ms,
             "p95_latency_ms": p95_latency_ms,
             "noise_capsules": noise_capsules,
+            // v1.5 (Story 2.1): token-budget intelligence
+            "raw_tokens_mean": agg_raw_tokens_mean,
+            "rendered_tokens_mean": agg_rendered_tokens_mean,
         }
     });
 
@@ -8108,6 +9485,64 @@ mod tests {
                 .unwrap()
                 .contains("[kimetsu-harvest]")
         );
+    }
+
+    // ── v1.5 Stop-hook savings sentence tests ────────────────────────────────
+
+    #[test]
+    fn stop_lessons_recorded_with_savings_appends_sentence() {
+        let v =
+            stop_lessons_recorded_json_with_savings(2, Some("[Kimetsu] Brain saved ~500 tokens."));
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("2 lessons recorded"), "{msg}");
+        assert!(msg.contains("Brain saved"), "{msg}");
+    }
+
+    #[test]
+    fn stop_lessons_recorded_without_savings_unchanged() {
+        let with = stop_lessons_recorded_json_with_savings(1, None);
+        let without = stop_lessons_recorded_json(1);
+        assert_eq!(
+            with["systemMessage"].as_str().unwrap(),
+            without["systemMessage"].as_str().unwrap(),
+            "None savings must produce identical output"
+        );
+    }
+
+    #[test]
+    fn stop_no_lessons_with_savings_appends_sentence() {
+        let v = stop_no_lessons_json_with_savings(Some("[Kimetsu] Brain saved ~200 tokens."));
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("No lessons recorded"), "{msg}");
+        assert!(msg.contains("Brain saved"), "{msg}");
+    }
+
+    #[test]
+    fn stop_no_lessons_without_savings_unchanged() {
+        let with = stop_no_lessons_json_with_savings(None);
+        let without = stop_no_lessons_json();
+        assert_eq!(
+            with["systemMessage"].as_str().unwrap(),
+            without["systemMessage"].as_str().unwrap(),
+            "None savings must produce identical output"
+        );
+    }
+
+    #[test]
+    fn stop_hook_with_savings_outputs_are_valid_json_objects() {
+        for value in [
+            stop_lessons_recorded_json_with_savings(1, Some("savings.")),
+            stop_no_lessons_json_with_savings(Some("savings.")),
+        ] {
+            let serialized = serde_json::to_string(&value).expect("serializes");
+            let reparsed: serde_json::Value =
+                serde_json::from_str(&serialized).expect("round-trips");
+            assert!(reparsed.is_object(), "must be a JSON object");
+            assert!(
+                reparsed["systemMessage"].is_string(),
+                "must have systemMessage string"
+            );
+        }
     }
 
     // ── D2a: config_edit_with ─────────────────────────────────────────────────
@@ -8971,6 +10406,8 @@ ambient = false
             false,
             false,
             false,
+            false,
+            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -8987,6 +10424,8 @@ ambient = false
             false,
             false,
             false,
+            false,
+            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -8997,32 +10436,72 @@ ambient = false
     fn resolve_setup_hosts_auto_only_claude_present() {
         use kimetsu_chat::BridgeTarget;
         // Only Claude present → Claude.
-        let hosts =
-            resolve_setup_hosts(None, true, false, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_only_codex_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, true, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Codex]);
     }
 
     #[test]
     fn resolve_setup_hosts_auto_both_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, true, true, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode, BridgeTarget::Codex]);
     }
 
     #[test]
     fn resolve_setup_hosts_neither_present_non_tty_defaults_claude() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::ClaudeCode]);
     }
 
@@ -9032,6 +10511,8 @@ ambient = false
         // Simulated TTY input "codex\n".
         let hosts = resolve_setup_hosts(
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -9047,6 +10528,8 @@ ambient = false
     fn resolve_setup_hosts_bad_host_arg_returns_error() {
         let result = resolve_setup_hosts(
             Some("not-a-host"),
+            false,
+            false,
             false,
             false,
             false,
@@ -9100,6 +10583,8 @@ ambient = false
             false,
             false,
             false,
+            false,
+            false,
             true,
             Cursor::new(b"both\n"),
         )
@@ -9111,8 +10596,18 @@ ambient = false
     #[test]
     fn resolve_setup_hosts_auto_only_pi_present() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, true, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
@@ -9122,6 +10617,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("pi"),
+            false,
+            false,
             false,
             false,
             false,
@@ -9137,9 +10634,18 @@ ambient = false
     #[test]
     fn resolve_setup_hosts_tty_scripted_pi() {
         use kimetsu_chat::BridgeTarget;
-        let hosts =
-            resolve_setup_hosts(None, false, false, false, false, true, Cursor::new(b"pi\n"))
-                .unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Cursor::new(b"pi\n"),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::Pi]);
     }
 
@@ -9148,8 +10654,18 @@ ambient = false
     fn resolve_setup_hosts_auto_only_openclaw_present() {
         use kimetsu_chat::BridgeTarget;
         // Only OpenClaw present → OpenClaw detected.
-        let hosts =
-            resolve_setup_hosts(None, false, false, true, false, false, Cursor::new(b"")).unwrap();
+        let hosts = resolve_setup_hosts(
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            Cursor::new(b""),
+        )
+        .unwrap();
         assert_eq!(hosts, vec![BridgeTarget::OpenClaw]);
     }
 
@@ -9159,6 +10675,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("openclaw"),
+            false,
+            false,
             false,
             false,
             false,
@@ -9176,6 +10694,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("claw"),
+            false,
+            false,
             false,
             false,
             false,
@@ -9212,6 +10732,8 @@ ambient = false
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -9368,5 +10890,268 @@ ambient = false
         assert_eq!(bundle.capsules[0].kind, "memory");
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);
+    }
+
+    // ── build_served_event_payload unit tests (Changes A + B) ───────────────
+
+    fn make_payload(store_queries: bool, session_id: Option<&str>) -> serde_json::Value {
+        build_served_event_payload(ServedEventArgs {
+            query: "what is the answer to life",
+            capsule_count: 3,
+            top_score: 0.72,
+            skipped: false,
+            stage: "localization",
+            retrieval_path: "daemon",
+            store_queries,
+            session_id,
+        })
+    }
+
+    #[test]
+    fn served_event_payload_always_includes_query_hash() {
+        let payload = make_payload(false, None);
+        assert!(
+            payload.get("query_hash").is_some(),
+            "query_hash must always be present"
+        );
+        // When store_queries is false, raw query must be absent.
+        assert!(
+            payload.get("query").is_none(),
+            "query must be absent when store_queries=false"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_includes_raw_query_when_store_queries_true() {
+        let query = "how does the embedding daemon flush its cache";
+        let payload = build_served_event_payload(ServedEventArgs {
+            query,
+            capsule_count: 5,
+            top_score: 0.85,
+            skipped: false,
+            stage: "implementation",
+            retrieval_path: "daemon",
+            store_queries: true,
+            session_id: None,
+        });
+        assert_eq!(
+            payload.get("query").and_then(|v| v.as_str()),
+            Some(query),
+            "raw query must be present when store_queries=true"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_includes_session_id_when_present() {
+        let payload = make_payload(true, Some("ses-abc-123"));
+        assert_eq!(
+            payload.get("session_id").and_then(|v| v.as_str()),
+            Some("ses-abc-123"),
+            "session_id must appear when provided"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_omits_session_id_when_absent() {
+        let payload = make_payload(false, None);
+        assert!(
+            payload.get("session_id").is_none(),
+            "session_id must be absent when not provided"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_hash_is_stable_for_same_query() {
+        let p1 = build_served_event_payload(ServedEventArgs {
+            query: "stable hash test",
+            capsule_count: 1,
+            top_score: 0.5,
+            skipped: false,
+            stage: "loc",
+            retrieval_path: "daemon",
+            store_queries: false,
+            session_id: None,
+        });
+        let p2 = build_served_event_payload(ServedEventArgs {
+            query: "stable hash test",
+            capsule_count: 1,
+            top_score: 0.5,
+            skipped: false,
+            stage: "loc",
+            retrieval_path: "daemon",
+            store_queries: false,
+            session_id: None,
+        });
+        assert_eq!(
+            p1.get("query_hash").and_then(|v| v.as_str()),
+            p2.get("query_hash").and_then(|v| v.as_str()),
+            "query_hash must be deterministic for the same query"
+        );
+    }
+
+    #[test]
+    fn served_event_payload_has_required_fields() {
+        let payload = build_served_event_payload(ServedEventArgs {
+            query: "check fields",
+            capsule_count: 2,
+            top_score: 0.6,
+            skipped: false,
+            stage: "localization",
+            retrieval_path: "fts_fallback",
+            store_queries: true,
+            session_id: Some("s1"),
+        });
+        for field in &[
+            "query_hash",
+            "query",
+            "capsule_count",
+            "top_score",
+            "skipped",
+            "stage",
+            "retrieval_path",
+            "session_id",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "missing required field: {field}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tune_tests {
+    use super::*;
+    use kimetsu_brain::user_brain::with_user_brain_disabled;
+    use kimetsu_core::paths::git_init_boundary;
+    use std::fs;
+
+    fn tune_test_root(label: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("kimetsu-tune-cli-{label}-{}", ulid::Ulid::new()));
+        git_init_boundary(&root);
+        root
+    }
+
+    /// End-to-end: dry-run sweep over a temp brain with synthetic eval data.
+    /// Verifies that --status prints case count and --apply (when >0 cases)
+    /// writes tune-history.json. Uses the lean (Noop) embedder so it works
+    /// in non-embeddings builds (floors still sweep on FTS).
+    #[test]
+    fn brain_tune_dry_run_does_not_modify_config() {
+        with_user_brain_disabled(|| {
+            let root = tune_test_root("dryrun");
+            fs::create_dir_all(&root).expect("create root");
+            project::init_project(&root, false).expect("init");
+
+            let args = TuneArgs {
+                status: false,
+                cost_weight: 0.005,
+                apply: false, // DRY RUN
+                revert: false,
+                workspace: Some(root.clone()),
+            };
+
+            // Read config before.
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+            let config_before = project::load_config(&paths).expect("config before");
+
+            brain_tune(args).expect("tune dry-run");
+
+            // Config must NOT have changed.
+            let config_after = project::load_config(&paths).expect("config after");
+            assert_eq!(
+                config_before.broker.min_lexical_coverage, config_after.broker.min_lexical_coverage,
+                "dry-run must not change min_lexical_coverage"
+            );
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    #[test]
+    fn brain_tune_status_shows_zero_cases_when_empty() {
+        with_user_brain_disabled(|| {
+            let root = tune_test_root("status");
+            fs::create_dir_all(&root).expect("create root");
+            project::init_project(&root, false).expect("init");
+
+            let args = TuneArgs {
+                status: true,
+                cost_weight: 0.005,
+                apply: false,
+                revert: false,
+                workspace: Some(root.clone()),
+            };
+            // Should not panic; prints 0 cases.
+            brain_tune(args).expect("tune --status on empty brain");
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 3: --apply in fixture-fallback mode must leave project.toml
+    // and tune-history.json untouched.
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix3_apply_in_fixture_mode_leaves_config_untouched() {
+        with_user_brain_disabled(|| {
+            let root = tune_test_root("fix3");
+            fs::create_dir_all(&root).expect("create root");
+            project::init_project(&root, false).expect("init");
+
+            // Ensure no fixture file exists, so the sweep falls back AND
+            // exits early (no eval cases).  Either way --apply must not
+            // write anything.
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+            let config_before = project::load_config(&paths).expect("config before");
+            let toml_mtime_before = fs::metadata(&paths.project_toml)
+                .expect("project.toml must exist")
+                .modified()
+                .expect("mtime");
+
+            let history_path = paths.kimetsu_dir.join("tune-history.json");
+            assert!(
+                !history_path.exists(),
+                "tune-history.json must not exist before test"
+            );
+
+            let args = TuneArgs {
+                status: false,
+                cost_weight: 0.005,
+                apply: true, // --apply with < 30 personal cases → fixture mode
+                revert: false,
+                workspace: Some(root.clone()),
+            };
+            brain_tune(args).expect("brain_tune must not error in fixture mode");
+
+            // project.toml must not have been modified.
+            let config_after = project::load_config(&paths).expect("config after");
+            assert_eq!(
+                config_before.broker.min_lexical_coverage, config_after.broker.min_lexical_coverage,
+                "fix3: --apply in fixture mode must not change min_lexical_coverage"
+            );
+            assert_eq!(
+                config_before.broker.min_semantic_score, config_after.broker.min_semantic_score,
+                "fix3: --apply in fixture mode must not change min_semantic_score"
+            );
+            let toml_mtime_after = fs::metadata(&paths.project_toml)
+                .expect("project.toml must still exist")
+                .modified()
+                .expect("mtime after");
+            assert_eq!(
+                toml_mtime_before, toml_mtime_after,
+                "fix3: project.toml mtime must not change in fixture mode with --apply"
+            );
+
+            // tune-history.json must not have been written.
+            assert!(
+                !history_path.exists(),
+                "fix3: tune-history.json must not be created when --apply runs in fixture mode"
+            );
+
+            fs::remove_dir_all(&root).ok();
+        });
     }
 }

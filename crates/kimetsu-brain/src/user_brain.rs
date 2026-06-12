@@ -189,6 +189,7 @@ pub fn add_user_memory(
             SELECT memory_id FROM memories
             WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
               AND invalidated_at IS NULL
+              AND superseded_by IS NULL
             LIMIT 1
             ",
             rusqlite::params!["global_user".to_string(), kind.to_string(), &normalized],
@@ -282,6 +283,7 @@ pub fn list_user_memories(conn: &Connection) -> KimetsuResult<Vec<MemoryRow>> {
         SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
         FROM memories
         WHERE invalidated_at IS NULL
+          AND superseded_by IS NULL
         ORDER BY created_at DESC
         LIMIT 100
         ",
@@ -554,26 +556,28 @@ mod tests {
             //     → run_migrations → migrates v1→v2 with a backup.
             let conn = open_user_brain().expect("re-open ok").expect("enabled");
 
-            // Assert 1: version is back at 2.
+            // Assert 1: version is at 3 (v1→v2→v3 migration chain).
             let ver =
                 crate::migrate::current_version(&conn).expect("current_version after re-open");
-            assert_eq!(ver, 2, "user brain must be at v2 after re-open");
+            assert_eq!(ver, 3, "user brain must be at v3 after re-open");
 
-            // Assert 2: backup sidecar brain.db.bak-1-2-* exists next to brain.db.
+            // Assert 2: backup sidecar brain.db.bak-1-3-* exists next to brain.db
+            // (migrating from v1 to target v3 produces one backup named with the
+            // full from-to span: brain.db.bak-<from>-<to>-<ts>).
             let bak_files: Vec<_> = std::fs::read_dir(&tmp)
                 .expect("read tmp dir")
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .map(|n| n.starts_with("brain.db.bak-1-2-"))
+                        .map(|n| n.starts_with("brain.db.bak-1-3-"))
                         .unwrap_or(false)
                 })
                 .collect();
             assert_eq!(
                 bak_files.len(),
                 1,
-                "exactly one user-brain backup sidecar brain.db.bak-1-2-* must exist; found: {:?}",
+                "exactly one user-brain backup sidecar brain.db.bak-1-3-* must exist; found: {:?}",
                 bak_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
             );
 
@@ -698,6 +702,53 @@ mod tests {
                 "config=true + env unset must open the brain"
             );
             assert!(tmp.join("brain.db").exists());
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 5: add_user_memory dedup must not collapse onto superseded rows
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix5_dedup_does_not_collapse_onto_superseded_row() {
+        let tmp = tempdir_in_test("kimetsu-user-brain-fix5");
+        with_user_brain_at(&tmp, || {
+            let conn = open_user_brain().expect("open").expect("enabled");
+
+            // Insert a memory and immediately stamp it as superseded.
+            let original = add_user_memory(&conn, MemoryKind::Preference, "use anyhow", 1.0)
+                .expect("original");
+            conn.execute(
+                "UPDATE memories SET superseded_by = 'fake-survivor' WHERE memory_id = ?1",
+                rusqlite::params![&original],
+            )
+            .expect("stamp superseded");
+
+            // Adding the same normalized text again must create a NEW row,
+            // not return the superseded one.
+            let second =
+                add_user_memory(&conn, MemoryKind::Preference, "use anyhow", 1.0).expect("second");
+            assert_ne!(
+                original, second,
+                "adding a text that matches only a superseded row must produce a new memory_id"
+            );
+
+            // Both rows exist; original is superseded, second is active.
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(count, 2, "two rows: original (superseded) + new active");
+
+            let second_superseded: Option<String> = conn
+                .query_row(
+                    "SELECT superseded_by FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![&second],
+                    |r| r.get(0),
+                )
+                .expect("query second");
+            assert!(
+                second_superseded.is_none(),
+                "newly created row must not be superseded"
+            );
         });
     }
 }

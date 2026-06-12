@@ -361,7 +361,9 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
                 "
                 SELECT memory_id, text, usefulness_score, use_count
                 FROM memories
-                WHERE invalidated_at IS NULL AND use_count >= 1
+                WHERE invalidated_at IS NULL
+                  AND superseded_by IS NULL
+                  AND use_count >= 1
                 ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
                 LIMIT ?1
                 ",
@@ -387,6 +389,7 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
                 SELECT memory_id, text, usefulness_score, use_count
                 FROM memories
                 WHERE invalidated_at IS NULL
+                  AND superseded_by IS NULL
                   AND use_count >= 3
                   AND (usefulness_score / CAST(use_count AS REAL)) <= -0.2
                 ORDER BY (usefulness_score / CAST(use_count AS REAL)) ASC

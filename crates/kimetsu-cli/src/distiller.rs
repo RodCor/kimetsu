@@ -396,6 +396,47 @@ pub fn run_session_end_hook(workspace: &Path) {
     run_distiller_for_transcript(workspace, transcript_path);
 }
 
+/// Construct a boxed `ModelProvider` from a `ResolvedDistiller`, consuming
+/// the credential fields. Returns `None` when the provider variant is unknown
+/// or credential construction fails.
+pub fn make_provider_for_resolved(resolved: &ResolvedDistiller) -> Option<Box<dyn ModelProvider>> {
+    match resolved.provider.as_str() {
+        "anthropic" => AnthropicProvider::for_distiller(
+            &resolved.model,
+            resolved.key.clone(),
+            resolved.base_url.clone(),
+            resolved.timeout_secs,
+        )
+        .ok()
+        .map(|p| Box::new(p) as Box<dyn ModelProvider>),
+        "openai" => OpenAiProvider::for_distiller(
+            &resolved.model,
+            resolved.key.clone(),
+            resolved.base_url.clone(),
+            resolved.timeout_secs,
+        )
+        .ok()
+        .map(|p| Box::new(p) as Box<dyn ModelProvider>),
+        "bedrock" => {
+            let region = resolved.region.clone()?;
+            let secret_key = resolved.secret_key.clone()?;
+            BedrockProvider::for_distiller(
+                &resolved.model,
+                region,
+                resolved.key.clone(),
+                secret_key,
+                resolved.session_token.clone(),
+                1024,
+                0.2,
+                resolved.timeout_secs,
+            )
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn ModelProvider>)
+        }
+        _ => None,
+    }
+}
+
 /// Run the configured distiller against a known transcript path. Used by
 /// SessionEnd hooks where available, and by Codex Stop hooks because current
 /// Codex releases expose Stop but not SessionEnd.

@@ -29,9 +29,9 @@ the same expensive exploration you already paid for last week.
 
 Kimetsu fixes the forgetting. It's a **sidecar brain**: a single Rust binary
 that runs next to any supported host agent through MCP (Claude Code, Codex, Pi,
-OpenClaw) or as its own terminal chat — or, in beta, server-hosted over HTTP MCP
-and shared across a team. It learns which memories the model *actually used to
-win*, and lets that knowledge compound across runs.
+OpenClaw, Cursor, Gemini CLI) or as its own terminal chat — or, in beta,
+server-hosted over HTTP MCP and shared across a team. It learns which memories
+the model *actually used to win*, and lets that knowledge compound across runs.
 
 - **It remembers.** Project conventions, failure patterns, the exact command
   that regenerates your schema — captured once, retrieved automatically.
@@ -101,6 +101,8 @@ watch it come back:
 kimetsu brain memory add --scope project --kind convention "Use cargo nextest for all test runs"
 kimetsu brain context "how do I run tests?"   # broker-ranked context bundle
 kimetsu brain insights                        # is the brain actually helping?
+kimetsu brain roi                             # did it pay for itself? (token savings vs overhead)
+kimetsu brain tune                            # self-tune retrieval floors from your own eval data
 ```
 
 Prefer a standalone REPL? `kimetsu chat --workspace . --project .` is a full

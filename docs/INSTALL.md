@@ -5,7 +5,7 @@ install time — **lean vs semantic (embeddings)** — because that's the only p
 baked into the binary. *Which host agents you use* (Claude Code, Codex, Pi,
 OpenClaw) is a **runtime** choice you change anytime with `kimetsu plugin
 install`/`uninstall` — no reinstall. The official prebuilt + npm binaries
-include all four host integrations; a bare source `cargo install` is minimal and
+include all six host integrations; a bare source `cargo install` is minimal and
 adds them with `--features pi,openclaw`.
 
 ## cargo
@@ -51,7 +51,7 @@ For **Linux / macOS / Windows** on every
 [GitHub Release](https://github.com/RodCor/kimetsu/releases). Extract the archive and put
 `kimetsu` / `kimetsu.exe` somewhere on `PATH` (`~/.local/bin`, `/usr/local/bin`,
 or `%USERPROFILE%\.cargo\bin`). Every prebuilt archive — lean and embeddings —
-bundles all four host integrations, so switching hosts never needs a reinstall.
+bundles all six host integrations, so switching hosts never needs a reinstall.
 Lean archives are published for Linux,
 macOS Intel, macOS Apple Silicon, and Windows. Embeddings archives are
 published where ONNX Runtime prebuilts are available: Linux x86_64,
@@ -89,13 +89,15 @@ are only needed for benchmark runs.
 ## Wiring host agents
 
 Wire Kimetsu into any supported host. The built-in installers cover Claude Code,
-Codex, Pi, and OpenClaw:
+Codex, Pi, OpenClaw, Cursor, and Gemini CLI:
 
 ```bash
-kimetsu plugin install claude   --workspace .  # writes .mcp.json + .claude/settings.json
-kimetsu plugin install codex    --workspace .  # writes .codex/config.toml + .codex/hooks.json + skill + agent
-kimetsu plugin install openclaw --workspace .  # MCP server + hooks plugin + skill in .openclaw/ (requires --features openclaw on source builds)
-kimetsu plugin install pi       --workspace .  # TS extension (Pi has no MCP) + skill in .pi/ (requires --features pi on source builds)
+kimetsu plugin install claude      --workspace .  # writes .mcp.json + .claude/settings.json
+kimetsu plugin install codex       --workspace .  # writes .codex/config.toml + .codex/hooks.json + skill + agent
+kimetsu plugin install openclaw    --workspace .  # MCP server + hooks plugin + skill in .openclaw/ (requires --features openclaw on source builds)
+kimetsu plugin install pi          --workspace .  # TS extension (Pi has no MCP) + skill in .pi/ (requires --features pi on source builds)
+kimetsu plugin install cursor      --workspace .  # writes .cursor/mcp.json + .cursor/rules/kimetsu-brain/rule.md
+kimetsu plugin install gemini-cli  --workspace .  # writes .gemini/settings.json + merges GEMINI.md into project root
 
 # Install globally for every project (writes to the host's home config dir):
 kimetsu plugin install claude --scope global
@@ -112,6 +114,15 @@ kimetsu setup --host claude-code
 kimetsu plugin uninstall claude-code --yes   # drop the old host's wiring
 kimetsu plugin install pi                     # wire the new one
 ```
+
+**Cursor and Gemini CLI:** neither host has a `UserPromptSubmit`-style hook
+system, so MCP + an always-on guidance file are the complete integration
+surface for those hosts (no automatic prompt-time context injection; the
+model must call `kimetsu_brain_context` manually). **The config schemas for
+Cursor (`.cursor/mcp.json`) and Gemini CLI (`.gemini/settings.json`) were
+inferred from their public documentation as of June 2026 and have not been
+verified against live host builds — review the generated files before
+committing them.**
 
 `--scope` defaults to `workspace`. The installer **merges** into existing
 config: if you already have hooks — even on the same events Kimetsu uses

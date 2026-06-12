@@ -52,6 +52,14 @@ pub fn initialize(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// Test seam: exposes `create_baseline` so integration tests in sibling
+/// modules can build a v1 DB without going through the full `initialize`
+/// (which would run all migrations and advance to the current version).
+#[cfg(test)]
+pub fn create_baseline_for_test(conn: &Connection) -> KimetsuResult<()> {
+    create_baseline(conn)
+}
+
 /// Create the baseline v1 schema (pragmas + all tables/indexes/FTS as of the
 /// original v1 shape). Seeds `schema_info` with version **1** so the migration
 /// runner knows where to start. On an existing DB every CREATE is a no-op
@@ -320,6 +328,26 @@ pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// The v2→v3 migration: add `superseded_by` column to `memories`.
+///
+/// Superseded rows point at their survivor via this column.  Retrieval,
+/// listing, and export already filter `invalidated_at IS NULL`; this
+/// migration adds a companion `AND superseded_by IS NULL` guard to all
+/// such queries (applied in `context.rs`, `user_brain.rs`, and
+/// `project.rs`).  The FTS index and ANN index keep the same "remove on
+/// supersede" semantics as invalidation.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner. Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v2_to_v3(conn: &Connection) -> KimetsuResult<()> {
+    add_column_if_missing(conn, "memories", "superseded_by TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_superseded
+             ON memories (superseded_by);",
+    )?;
+    Ok(())
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only
@@ -448,18 +476,18 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1. Fresh init reaches v2 with full shape
+    // 1. Fresh init reaches v3 with full shape
     // ------------------------------------------------------------------
     #[test]
-    fn fresh_init_reaches_v2_with_full_shape() {
+    fn fresh_init_reaches_v3_with_full_shape() {
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("initialize");
 
-        // Version must be 2.
+        // Version must be 3.
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            2,
-            "fresh DB must be at schema version 2 after initialize"
+            3,
+            "fresh DB must be at schema version 3 after initialize"
         );
 
         // Post-migration columns exist on `memories`.
@@ -475,6 +503,11 @@ mod tests {
         assert!(
             mem_cols.contains(&"last_useful_at".to_string()),
             "memories must have `last_useful_at` column"
+        );
+        // v3: superseded_by column
+        assert!(
+            mem_cols.contains(&"superseded_by".to_string()),
+            "memories must have `superseded_by` column after v3 migration"
         );
 
         // Tables added by the migration exist.
@@ -519,8 +552,8 @@ mod tests {
         );
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            2,
-            "version must still be 2"
+            3,
+            "version must still be 3"
         );
 
         // Data must be intact.
@@ -535,7 +568,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 3. Idempotent initialize: calling initialize twice succeeds, version stays 2
+    // 3. Idempotent initialize: calling initialize twice succeeds, version stays 3
     // ------------------------------------------------------------------
     #[test]
     fn idempotent_initialize_twice() {
@@ -544,8 +577,8 @@ mod tests {
         initialize(&conn).expect("second initialize must not error");
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            2,
-            "version must still be 2 after double initialize"
+            3,
+            "version must still be 3 after double initialize"
         );
     }
 
@@ -630,6 +663,52 @@ mod tests {
                 to: KIMETSU_SCHEMA_VERSION,
             },
             "SchemaNeedsMigration must carry the correct from/to versions"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A5-v3. v2→v3 migration adds superseded_by + index
+    // ------------------------------------------------------------------
+    #[test]
+    fn v2_to_v3_migration_adds_superseded_by() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Seed a v2 DB manually (baseline + v1→v2 migration, no v2→v3).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        conn.execute(
+            "UPDATE schema_info SET value = 2 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v2");
+
+        // superseded_by must NOT exist yet.
+        let cols_before = column_names(&conn, "memories");
+        assert!(
+            !cols_before.contains(&"superseded_by".to_string()),
+            "superseded_by must not exist before v3 migration"
+        );
+
+        // Run v2→v3.
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+
+        // Now it must exist.
+        let cols_after = column_names(&conn, "memories");
+        assert!(
+            cols_after.contains(&"superseded_by".to_string()),
+            "superseded_by must exist after v3 migration"
+        );
+
+        // Index must also exist.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_superseded'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query index");
+        assert_eq!(
+            idx_count, 1,
+            "idx_memories_superseded must exist after v3 migration"
         );
     }
 

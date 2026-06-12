@@ -81,7 +81,7 @@ recovery). The materialized tables:
 
 ### Durable upgrades: schema migrations
 
-brain.db carries a schema version (`KIMETSU_SCHEMA_VERSION`, currently **2**)
+brain.db carries a schema version (`KIMETSU_SCHEMA_VERSION`, currently **3**)
 in its `schema_info` table. On every read-write open, a versioned,
 forward-only migration runner brings the DB up to the binary's target. Each
 migration runs inside **one transaction** (the DDL and the version bump commit
@@ -178,7 +178,7 @@ selection is unchanged.
 Tunable knobs in `[broker]`:
 
 - `max_capsules` (default **8**) — hard cap on capsules rendered into a prompt.
-- `min_semantic_score` (default `0.0` = off) — the embeddings-only relevance
+- `min_semantic_score` (default `-1.0` = AUTO: 0.35 on bge-family, off otherwise) — the embeddings-only relevance
   floor described above.
 - `budget_floor_tokens` (default `1500`) and `budget_run_cap_tokens`
   (default `8000`) — bounds for the adaptive per-run budget (see the agent
@@ -390,6 +390,43 @@ These are backed by two event additions: a **`context.served`** event logs
 injected-token count — so the hit-rate and token-economy numbers are real
 counts, not estimates.
 
+### ROI ledger
+
+`kimetsu brain roi [--window 7d|30d|all] [--json]` estimates how much the
+brain saved you. It sums conservative per-kind token credits for every cited
+memory (failure_pattern=1500, command=400, convention=300, fact=500,
+preference=200 tokens), subtracts injected-token overhead, and shows a
+net-positive / net-negative verdict. Dollar values are shown when the active
+model is in the built-in price table or when `[model] price_per_mtok` is set.
+Honest negatives are displayed as-is. The Stop hook appends a per-session
+savings line when ≥1 citation occurred. Methodology: `docs/ROI-METHODOLOGY.md`.
+
+### Consolidation and triage
+
+`kimetsu brain consolidate` merges near-duplicate memories that accumulated
+different phrasings of the same lesson. Default threshold: cosine ≥ 0.92
+within the same embedding model. The survivor keeps its id and text; members
+get `superseded_by` set (schema v3) and a `memory.superseded` event so
+`brain rebuild` reproduces the merge. Citations are reassigned to the survivor.
+`--distill` adds a second pass: loose clusters (0.75–0.85 cosine, ≥3 memories,
+≥1 shared tag) are fed to the configured distiller and the result lands as a
+memory proposal for review. `--dry-run` prints the plan without writing.
+
+`kimetsu brain triage` lists memories below a usefulness + age threshold
+(defaults: score < 0.2 and last-useful > 30 days) and prompts keep / prune /
+skip interactively. `--prune-all --yes` for non-interactive batch pruning.
+
+### Self-tuning
+
+`kimetsu brain tune --status` shows how many positive eval cases the brain has
+accumulated (from `context.served` + citation joins). `kimetsu brain tune`
+sweeps `broker.min_lexical_coverage` × `broker.min_semantic_score` against the
+production embedder and picks the combo that maximises the objective on the
+training split. A holdout guardrail (deterministic 20% split) prevents
+writing a config that regresses holdout quality. `--apply` writes only the
+floor parameters to `project.toml`; `--revert` restores the previous entry.
+Dry-run by default.
+
 ---
 
 ## 7. The MCP surface
@@ -421,6 +458,7 @@ Run `kimetsu mcp serve` and the host harness gets ~28
 | `kimetsu_benchmark_record_outcome` | Record run outcome → proposal |
 | `kimetsu_bridge_status` / `_export` / `_import` / `_sync` | Cross-harness skill registry + install/sync |
 | `kimetsu_skills_search` / `kimetsu_skill` | Find / invoke a portable skill |
+| `kimetsu_brain_cite` | (write-gated) Record that a retrieved memory materially helped — closes the ground-truth loop for self-tuning |
 | `cite_memory` | (in-run) Mark a memory as cited |
 | `expand_capsule` | (in-run) Expand a lazily-injected capsule headline to full detail by resolving its `memory:` / `file:` handle (§3a) |
 
@@ -715,9 +753,12 @@ model = "bge-small-en-v1.5"   # or "bge-m3", "jina-v2-base-code"
 default_budget_tokens = 6000  # flat fallback; the adaptive budget supersedes it
 ambient = true                # false → don't append workspace context to queries
 max_capsules = 8              # hard cap on capsules rendered into a prompt
-min_semantic_score = 0.0      # >0 sets the embeddings-only relevance floor
+min_semantic_score = -1.0     # AUTO (bge: 0.35, others: off); >0 sets an explicit floor
 budget_floor_tokens = 1500    # adaptive-budget floor (small tasks not starved)
 budget_run_cap_tokens = 8000  # per-run ceiling on brain-injected tokens
+compress_capsules = true      # v1.5: compress rendered capsule text (strips tags/context
+                              # annotations, caps at 3 sentences); ranking unaffected
+session_dedupe = true         # v1.5: skip capsules already injected this session
 
 [broker.weights]
 relevance = 0.50
@@ -753,6 +794,9 @@ max_total_cost_usd = 250.0    # advisory under subscription providers
 
 [learning]
 auto_harvest = true
+store_queries = true        # v1.5: include raw query text in context.served telemetry
+                            # (on-machine only; powers the personal eval set for brain tune)
+                            # set false to revert to query-hash-only (pre-v1.5 behavior)
 
 [learning.distiller]
 enabled = false

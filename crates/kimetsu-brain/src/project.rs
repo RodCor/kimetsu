@@ -671,6 +671,7 @@ pub fn add_memory(
             SELECT memory_id FROM memories
             WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
               AND invalidated_at IS NULL
+              AND superseded_by IS NULL
             LIMIT 1
             ",
             rusqlite::params![scope.to_string(), kind.to_string(), normalized],
@@ -864,6 +865,7 @@ pub fn propose_or_merge_memory(
                 "SELECT memory_id FROM memories
                  WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
                    AND invalidated_at IS NULL
+                   AND superseded_by IS NULL
                  LIMIT 1",
                 rusqlite::params![scope.to_string(), kind.to_string(), normalized],
                 |row| row.get::<_, String>(0),
@@ -1221,6 +1223,7 @@ pub fn list_memories_top(start: &Path, opts: TopOptions) -> KimetsuResult<Vec<Me
             SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
             FROM memories
             WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
               AND use_count >= ?1
               AND lower(scope) = lower(?2)
             ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
@@ -1234,6 +1237,7 @@ pub fn list_memories_top(start: &Path, opts: TopOptions) -> KimetsuResult<Vec<Me
             SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
             FROM memories
             WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
               AND use_count >= ?1
             ORDER BY (usefulness_score / CAST(use_count AS REAL)) DESC, use_count DESC
             LIMIT ?2
@@ -1334,6 +1338,7 @@ pub fn prune_low_usefulness(start: &Path, opts: PruneOptions) -> KimetsuResult<P
                 SELECT memory_id, scope, kind, text, use_count, usefulness_score
                 FROM memories
                 WHERE invalidated_at IS NULL
+                  AND superseded_by IS NULL
                   AND use_count >= ?1
                   AND (usefulness_score / CAST(use_count AS REAL)) <= ?2
                   AND lower(scope) = lower(?3)
@@ -1347,6 +1352,7 @@ pub fn prune_low_usefulness(start: &Path, opts: PruneOptions) -> KimetsuResult<P
                 SELECT memory_id, scope, kind, text, use_count, usefulness_score
                 FROM memories
                 WHERE invalidated_at IS NULL
+                  AND superseded_by IS NULL
                   AND use_count >= ?1
                   AND (usefulness_score / CAST(use_count AS REAL)) <= ?2
                 ORDER BY (usefulness_score / CAST(use_count AS REAL)) ASC
@@ -1650,6 +1656,7 @@ fn search_memories_in_conn(
         FROM memories_fts
         JOIN memories m ON m.memory_id = memories_fts.memory_id
         WHERE m.invalidated_at IS NULL
+          AND m.superseded_by IS NULL
           AND memories_fts MATCH ?
         ",
     );
@@ -2459,6 +2466,88 @@ pub fn log_telemetry_event(
     Ok(())
 }
 
+/// v1.5: scan `events` for `memory.cited` entries and, for each cited
+/// memory id, check the dropped-capsule sidecar. When a cited memory
+/// was in the recent-dropped window (it was excluded by the relevance
+/// floor but the model cited it anyway), emit a `retrieval.regret`
+/// telemetry event and remove the entry from the sidecar.
+///
+/// Purely best-effort: any sidecar or telemetry error is swallowed so
+/// citation recording is never disrupted. Called from the pipeline
+/// after `projector::apply_events` so citations are already in the DB
+/// before we check for regrets.
+///
+/// Cross-process note: the sidecar is written by the `brain_context_hook`
+/// (CLI process) and read here by the pipeline / MCP-server process.
+/// Both derive the same cache dir from the repo root, so they
+/// naturally share the file without coordination.
+pub fn emit_regret_for_cited_memories(start: &Path, events: &[kimetsu_core::event::Event]) {
+    use crate::dropped_capsule;
+    use kimetsu_core::paths::{ProjectPaths, user_cache_dir_for};
+
+    // Derive the project cache dir; silently skip if the brain is not
+    // initialised (e.g. during one-off tests that don't init a project).
+    let cache_dir = match ProjectPaths::discover(start) {
+        Ok(paths) => user_cache_dir_for(&paths.repo_root),
+        Err(_) => return,
+    };
+
+    let cited_at = dropped_capsule::now_secs();
+
+    for event in events {
+        if event.kind != "memory.cited" {
+            continue;
+        }
+        let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Best-effort: swallow any sidecar error.
+        let Some(dropped_entry) = dropped_capsule::take_if_dropped(&cache_dir, memory_id, cited_at)
+        else {
+            continue;
+        };
+        // Emit the regret event.
+        let _ = log_telemetry_event(
+            start,
+            "retrieval.regret",
+            serde_json::json!({
+                "memory_id": memory_id,
+                "dropped_at": dropped_entry.dropped_at,
+                "cited_at": cited_at,
+            }),
+        );
+    }
+}
+
+/// v1.5: write a `memory.cited` event from the MCP `kimetsu_brain_cite` tool.
+///
+/// Uses the same sentinel run_id as [`log_telemetry_event`] (all-zero ULID)
+/// so no corresponding `runs` row is required. The event is inserted then
+/// projected (populating `memory_citations`) in one connection, and the
+/// regret sidecar is checked best-effort.
+pub fn record_mcp_citation(start: &Path, memory_id: &str, note: Option<&str>) -> KimetsuResult<()> {
+    let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+
+    let sentinel_run_id = RunId(ulid::Ulid::nil());
+    let mut payload = serde_json::json!({
+        "memory_id": memory_id,
+        "turn": 0,
+    });
+    if let Some(n) = note {
+        payload["rationale"] = serde_json::json!(n);
+    }
+    let event = kimetsu_core::event::Event::new(sentinel_run_id, "memory.cited", payload);
+    // apply_events calls insert_event + project_event in one transaction.
+    projector::apply_events(&conn, std::slice::from_ref(&event))?;
+
+    // Best-effort regret check.
+    emit_regret_for_cited_memories(start, std::slice::from_ref(&event));
+
+    Ok(())
+}
+
 // ── Q5: portable memory export / import ──────────────────────────────────────
 
 /// A single memory in the portable JSON exchange format.
@@ -2476,6 +2565,140 @@ pub struct MemoryExport {
     pub created_at: Option<String>,
 }
 
+/// Strip the trailing `(context: …)` segment from a memory text produced by
+/// the distiller / `brain record` workflow, leaving only the lesson body.
+///
+/// Matches the literal pattern ` (context: <anything>)` at the very end of
+/// the trimmed string. The match is case-sensitive to avoid false positives.
+///
+/// Returns the original `text` unchanged when:
+///   - the pattern is absent, or
+///   - stripping would leave an empty or whitespace-only string (safety
+///     fallback: a blank lesson is worse than a slightly noisy one).
+///
+/// # Examples
+/// ```
+/// # use kimetsu_brain::project::redact_context_suffix;
+/// assert_eq!(
+///     redact_context_suffix("always use --locked (context: cargo build)"),
+///     "always use --locked"
+/// );
+/// assert_eq!(
+///     redact_context_suffix("bare lesson"),
+///     "bare lesson"
+/// );
+/// ```
+pub fn redact_context_suffix(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    // Pattern: " (context: …)" where the parenthesised segment is at the end.
+    // Walk backwards to find the matching open-paren for a ` (context: ` prefix.
+    if let Some(pos) = find_trailing_context_paren(trimmed) {
+        let candidate = trimmed[..pos].trim_end();
+        if !candidate.is_empty() {
+            return candidate;
+        }
+    }
+    text
+}
+
+/// Strip the leading `[tags: …]` prefix from a memory text, leaving only the
+/// lesson body (and any trailing context segment unless that is separately
+/// stripped by [`redact_context_suffix`]).
+///
+/// Matches `[tags: …] ` at the very start of the trimmed string.
+/// Returns the original `text` when:
+///   - the pattern is absent, or
+///   - stripping would leave an empty or whitespace-only string.
+///
+/// # Examples
+/// ```
+/// # use kimetsu_brain::project::redact_tags_prefix;
+/// assert_eq!(
+///     redact_tags_prefix("[tags: rust, cargo] always use --locked"),
+///     "always use --locked"
+/// );
+/// assert_eq!(
+///     redact_tags_prefix("no tags here"),
+///     "no tags here"
+/// );
+/// ```
+pub fn redact_tags_prefix(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("[tags: ") {
+        if let Some(close) = rest.find(']') {
+            let after = rest[close + 1..].trim_start();
+            if !after.is_empty() {
+                return after;
+            }
+        }
+    }
+    text
+}
+
+/// Apply export-time redaction to a single `MemoryExport`'s text field
+/// according to the requested flags. Returns a new `MemoryExport` with the
+/// text replaced (or the original when no patterns match and the safety
+/// fallback applies).
+///
+/// The two-step order matters: strip tags first, then context, so that a
+/// memory like `[tags: rust] lesson body (context: foo)` becomes
+/// `lesson body` when both flags are active.
+pub fn apply_export_redaction(
+    entry: MemoryExport,
+    redact: bool,
+    redact_tags: bool,
+) -> MemoryExport {
+    if !redact && !redact_tags {
+        return entry;
+    }
+    let mut text: &str = &entry.text;
+    // Temporary storage so we can chain borrows without lifetime woes.
+    let after_tags: String;
+    let after_ctx: String;
+    if redact_tags {
+        let stripped = redact_tags_prefix(text);
+        after_tags = stripped.to_string();
+        text = &after_tags;
+    }
+    if redact {
+        let stripped = redact_context_suffix(text);
+        after_ctx = stripped.to_string();
+        text = &after_ctx;
+    }
+    MemoryExport {
+        text: text.to_string(),
+        ..entry
+    }
+}
+
+// Helper: find the byte offset of the opening ` (context: ` run that closes
+// at the very end of `s` (which must already be trimmed of trailing
+// whitespace). Returns `None` when no such suffix is present.
+fn find_trailing_context_paren(s: &str) -> Option<usize> {
+    // We look for a closing `)` at the end, then walk left to find ` (context: `.
+    if !s.ends_with(')') {
+        return None;
+    }
+    // The minimum suffix is ` (context: x)` — 13 chars.
+    let bytes = s.as_bytes();
+    // Find the matching open paren by scanning backwards from the terminal `)`.
+    let close = s.len() - 1;
+    // We need at least " (context: " before the close paren, so start scanning
+    // no further than close - len(" (context: ") = close - 11.
+    // Use a simple prefix search scanning from the right.
+    let prefix = b" (context: ";
+    for start in (0..close).rev() {
+        if start + prefix.len() > close {
+            continue;
+        }
+        if &bytes[start..start + prefix.len()] == prefix {
+            // Found the open sequence; the segment is s[start..=close].
+            return Some(start);
+        }
+    }
+    None
+}
+
 /// Summary returned by [`import_memories`].
 #[derive(Debug, Clone, Default)]
 pub struct ImportSummary {
@@ -2490,10 +2713,14 @@ pub struct ImportSummary {
 /// Export active memories as a vec of portable records.
 ///
 /// `scope` and `kind` are optional filters; `None` means "all".
+/// `redact` strips the trailing `(context: …)` segment from each text.
+/// `redact_tags` additionally strips the leading `[tags: …]` prefix.
 pub fn export_memories(
     start: &Path,
     scope: Option<MemoryScope>,
     kind: Option<MemoryKind>,
+    redact: bool,
+    redact_tags: bool,
 ) -> KimetsuResult<Vec<MemoryExport>> {
     // Build the SQL dynamically based on the optional filters, including
     // `created_at` so the JSON record carries the origin timestamp.
@@ -2502,6 +2729,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
                AND lower(scope) = lower(?1)
                AND lower(kind)  = lower(?2)
              ORDER BY created_at DESC",
@@ -2511,6 +2739,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
                AND lower(scope) = lower(?1)
              ORDER BY created_at DESC",
             vec![s.to_string()],
@@ -2519,6 +2748,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
                AND lower(kind) = lower(?1)
              ORDER BY created_at DESC",
             vec![k.to_string()],
@@ -2527,6 +2757,7 @@ pub fn export_memories(
             "SELECT scope, kind, text, confidence, created_at
              FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
              ORDER BY created_at DESC",
             vec![],
         ),
@@ -2554,7 +2785,7 @@ pub fn export_memories(
 
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        out.push(apply_export_redaction(row?, redact, redact_tags));
     }
     Ok(out)
 }
@@ -5216,7 +5447,7 @@ max_total_cost_usd = 250.0
             .expect("add fp");
 
             // Export
-            let exported = export_memories(&root_a, None, None).expect("export");
+            let exported = export_memories(&root_a, None, None, false, false).expect("export");
             assert_eq!(exported.len(), 3, "must export all 3 active memories");
 
             // All fields present
@@ -5297,6 +5528,8 @@ max_total_cost_usd = 250.0
                 &root,
                 Some(MemoryScope::Project),
                 Some(MemoryKind::FailurePattern),
+                false,
+                false,
             )
             .expect("export filtered");
             assert_eq!(
@@ -5308,13 +5541,14 @@ max_total_cost_usd = 250.0
             assert!(filtered.iter().all(|e| e.kind == "failure_pattern"));
 
             // Scope-only filter: all project memories
-            let scope_only =
-                export_memories(&root, Some(MemoryScope::Project), None).expect("scope filter");
+            let scope_only = export_memories(&root, Some(MemoryScope::Project), None, false, false)
+                .expect("scope filter");
             assert_eq!(scope_only.len(), 3, "3 project-scope memories total");
 
             // Kind-only filter: all failure_patterns (project + repo)
-            let kind_only = export_memories(&root, None, Some(MemoryKind::FailurePattern))
-                .expect("kind filter");
+            let kind_only =
+                export_memories(&root, None, Some(MemoryKind::FailurePattern), false, false)
+                    .expect("kind filter");
             assert_eq!(
                 kind_only.len(),
                 3,
@@ -5475,6 +5709,144 @@ max_total_cost_usd = 250.0
             );
 
             fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ── Q5b: export redact ────────────────────────────────────────────────────
+
+    /// Pure-fn tests for `redact_context_suffix` edge cases.
+    #[test]
+    fn redact_context_suffix_strips_trailing_context() {
+        assert_eq!(
+            redact_context_suffix("always use --locked (context: cargo build)"),
+            "always use --locked"
+        );
+        // Multiple spaces before (context: …) are consumed by trim_end.
+        assert_eq!(
+            redact_context_suffix("lesson body   (context: some task)"),
+            "lesson body"
+        );
+        // No pattern → unchanged.
+        assert_eq!(redact_context_suffix("bare lesson"), "bare lesson");
+        // Safety fallback: stripping would leave empty → original returned.
+        assert_eq!(
+            redact_context_suffix("(context: only context)"),
+            "(context: only context)"
+        );
+        // Nested parens in context segment — only the outermost suffix is stripped.
+        assert_eq!(
+            redact_context_suffix("lesson (context: (nested) task)"),
+            "lesson"
+        );
+        // Trailing whitespace after the close paren is tolerated by trim_end.
+        assert_eq!(redact_context_suffix("lesson (context: task)  "), "lesson");
+    }
+
+    /// Pure-fn tests for `redact_tags_prefix` edge cases.
+    #[test]
+    fn redact_tags_prefix_strips_leading_tags() {
+        assert_eq!(
+            redact_tags_prefix("[tags: rust, cargo] always use --locked"),
+            "always use --locked"
+        );
+        // No pattern → unchanged.
+        assert_eq!(redact_tags_prefix("no tags here"), "no tags here");
+        // Safety fallback: stripping would leave empty → original returned.
+        assert_eq!(redact_tags_prefix("[tags: only-tag]"), "[tags: only-tag]");
+        // Leading whitespace before [tags: is preserved by trim_start then not stripped.
+        assert_eq!(redact_tags_prefix("  [tags: rust] lesson"), "lesson");
+    }
+
+    /// `apply_export_redaction` with both flags false → no change.
+    #[test]
+    fn apply_export_redaction_no_flags_is_passthrough() {
+        let entry = MemoryExport {
+            text: "[tags: rust] lesson (context: task)".to_string(),
+            scope: "project".to_string(),
+            kind: "fact".to_string(),
+            confidence: 1.0,
+            created_at: None,
+        };
+        let out = apply_export_redaction(entry.clone(), false, false);
+        assert_eq!(out.text, entry.text);
+    }
+
+    /// `apply_export_redaction` with `redact=true` strips context only.
+    #[test]
+    fn apply_export_redaction_redact_only_strips_context() {
+        let entry = MemoryExport {
+            text: "[tags: rust] lesson (context: task)".to_string(),
+            scope: "project".to_string(),
+            kind: "fact".to_string(),
+            confidence: 1.0,
+            created_at: None,
+        };
+        let out = apply_export_redaction(entry, true, false);
+        assert_eq!(out.text, "[tags: rust] lesson");
+    }
+
+    /// `apply_export_redaction` with both flags strips tags then context.
+    #[test]
+    fn apply_export_redaction_both_flags_strips_tags_and_context() {
+        let entry = MemoryExport {
+            text: "[tags: rust, cargo] lesson (context: task)".to_string(),
+            scope: "project".to_string(),
+            kind: "fact".to_string(),
+            confidence: 1.0,
+            created_at: None,
+        };
+        let out = apply_export_redaction(entry, true, true);
+        assert_eq!(out.text, "lesson");
+    }
+
+    /// End-to-end: export with `--redact`, import, then re-import deduplicates.
+    ///
+    /// Verifies that the normalized-text dedup path works correctly with
+    /// redacted texts — the stripped form must normalize identically on
+    /// second import.
+    #[test]
+    fn export_redact_import_roundtrip_and_dedup() {
+        with_user_brain_disabled(|| {
+            let root_a = test_root();
+            init_project(&root_a, false).expect("init A");
+
+            // Seed a memory that has the context suffix the distiller adds.
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "use --locked for reproducibility (context: cargo test failing)",
+            )
+            .expect("add memory");
+
+            // Export with redact=true.
+            let exported =
+                export_memories(&root_a, None, None, true, false).expect("export redacted");
+            assert_eq!(exported.len(), 1);
+            assert_eq!(
+                exported[0].text, "use --locked for reproducibility",
+                "context suffix must be stripped"
+            );
+
+            // Import into a fresh project.
+            let root_b = test_root();
+            init_project(&root_b, false).expect("init B");
+            let s1 = import_memories(&root_b, &exported, None).expect("import 1");
+            assert_eq!(s1.imported, 1, "first import must create 1 row");
+            assert_eq!(s1.deduped, 0);
+
+            // Re-import the same redacted slice → must dedup, not double-insert.
+            let s2 = import_memories(&root_b, &exported, None).expect("import 2");
+            assert_eq!(s2.imported, 0, "second import must dedup");
+            assert_eq!(s2.deduped, 1);
+
+            // List shows the redacted text (not the original context-annotated form).
+            let mems = list_memories(&root_b).expect("list");
+            assert_eq!(mems.len(), 1);
+            assert_eq!(mems[0].text, "use --locked for reproducibility");
+
+            fs::remove_dir_all(&root_a).ok();
+            fs::remove_dir_all(&root_b).ok();
         });
     }
 
@@ -6282,6 +6654,228 @@ max_total_cost_usd = 250.0
                     None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
                 }
             }
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // v1.5: record_mcp_citation
+    #[test]
+    fn record_mcp_citation_writes_memory_citations_row() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "record_mcp_citation test fixture",
+            )
+            .expect("add memory");
+
+            record_mcp_citation(&root, &memory_id, Some("helped with test"))
+                .expect("record_mcp_citation");
+
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let row_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_citations WHERE memory_id = ?1",
+                    rusqlite::params![&memory_id],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                row_count, 1,
+                "memory_citations row must exist after MCP cite"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 2: search_memories must not return superseded rows
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix2_search_excludes_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Add a memory that will be superseded, and a live one.
+            let superseded_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "unique superseded keyword alpha",
+            )
+            .expect("add superseded");
+            add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "live memory unrelated topic",
+            )
+            .expect("add live");
+
+            // Mark the first memory as superseded via direct SQL (simulating
+            // a prior consolidation run).
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load for stamp");
+                conn.execute(
+                    "UPDATE memories SET superseded_by = 'fake-survivor' \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&superseded_id],
+                )
+                .expect("stamp superseded_by");
+            }
+
+            // Search must not return the superseded row.
+            let hits = search_memories(&root, "unique superseded keyword alpha", 20, 0, None, None)
+                .expect("search");
+            assert!(
+                !hits.iter().any(|h| h.memory_id == superseded_id),
+                "superseded row must not appear in search results"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fix 4: list_memories_top and prune_low_usefulness must not include
+    // superseded rows
+    // ------------------------------------------------------------------
+    #[test]
+    fn fix4_top_excludes_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Add a memory and give it a high score + use_count.
+            let superseded_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "memory to be superseded with high usefulness",
+            )
+            .expect("add");
+
+            // Stamp it as superseded AND give it high stats.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories \
+                     SET superseded_by = 'fake-survivor', \
+                         use_count = 10, usefulness_score = 50.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&superseded_id],
+                )
+                .expect("stamp");
+            }
+
+            // Also add a live memory with lower but real stats.
+            let live_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "live memory with normal stats",
+            )
+            .expect("add live");
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories SET use_count = 5, usefulness_score = 5.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&live_id],
+                )
+                .expect("seed stats");
+            }
+
+            let opts = TopOptions {
+                scope: None,
+                min_uses: 1,
+                limit: 20,
+            };
+            let top = list_memories_top(&root, opts).expect("list_memories_top");
+
+            assert!(
+                !top.iter().any(|r| r.memory_id == superseded_id),
+                "superseded row must not appear in top"
+            );
+            assert!(
+                top.iter().any(|r| r.memory_id == live_id),
+                "live row must appear in top"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    #[test]
+    fn fix4_prune_excludes_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let superseded_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "memory to be superseded with low usefulness",
+            )
+            .expect("add");
+
+            // Stamp it as superseded AND give it a very negative score.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories \
+                     SET superseded_by = 'fake-survivor', \
+                         use_count = 10, usefulness_score = -99.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&superseded_id],
+                )
+                .expect("stamp");
+            }
+
+            // A live memory with a negative score (qualifies for prune).
+            let live_id = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "live memory with negative usefulness for prune",
+            )
+            .expect("add live");
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                conn.execute(
+                    "UPDATE memories SET use_count = 5, usefulness_score = -5.0 \
+                     WHERE memory_id = ?1",
+                    rusqlite::params![&live_id],
+                )
+                .expect("seed stats");
+            }
+
+            let opts = PruneOptions {
+                scope: None,
+                min_uses: 1,
+                max_ratio: -0.1,
+                apply: false,
+            };
+            let summary = prune_low_usefulness(&root, opts).expect("prune");
+
+            assert!(
+                !summary
+                    .candidates
+                    .iter()
+                    .any(|c| c.memory_id == superseded_id),
+                "superseded row must not appear in prune candidates"
+            );
+            assert!(
+                summary.candidates.iter().any(|c| c.memory_id == live_id),
+                "live negative-score row must appear in prune candidates"
+            );
+
             std::fs::remove_dir_all(&root).ok();
         });
     }
