@@ -7,6 +7,18 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v1.5.1 — version-stamp re-release
+
+Identical feature set to v1.5.0. The v1.5.0 artifacts were built before the
+workspace version bump, so their binaries self-report `1.0.0` (which also
+broke the crates.io publish — `kimetsu-core@1.0.0` already existed). npm
+forbids reusing a published version, so the corrected release ships as
+v1.5.1. If you installed v1.5.0 from npm or the GitHub release, update.
+
+FIXED
+  * Workspace and inter-crate versions stamped correctly (`kimetsu --version`
+    now reports the release version; crates.io publish unblocked).
+
 ## v1.5.0 — pays for itself
 
 ADDED
