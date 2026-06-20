@@ -100,14 +100,28 @@ pub fn load(path: &Path) -> DroppedCapsuleState {
         .unwrap_or_default()
 }
 
+/// Atomic write: serialise `state` to a sibling `.tmp` file, then rename
+/// it over `path`.  Because rename is atomic on the same filesystem, the
+/// reader always sees either the old file or the new one — never a torn
+/// partial write.  Failures are swallowed (callers use best-effort I/O).
+fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = fs::create_dir_all(parent);
+    let Ok(text) = serde_json::to_string(value) else {
+        return;
+    };
+    // Build a sibling temp path: <file>.tmp  (same dir → same filesystem).
+    let tmp_path = path.with_extension("tmp");
+    if fs::write(&tmp_path, &text).is_ok() {
+        let _ = fs::rename(&tmp_path, path);
+    }
+}
+
 /// Best-effort save — failures are swallowed.
 pub fn save(path: &Path, state: &DroppedCapsuleState) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string(state) {
-        let _ = fs::write(path, text);
-    }
+    atomic_write_json(path, state);
 }
 
 /// Append new dropped memory ids to the sidecar (best-effort, write-back).
@@ -220,5 +234,42 @@ mod tests {
     fn prune_window_empty_input_is_safe() {
         let pruned = prune_window(vec![], 1_000_000, WINDOW_SECS);
         assert!(pruned.is_empty());
+    }
+
+    /// S4.3: `save` must write atomically (temp-then-rename) so the reader
+    /// never sees a partially-written file.  After save the target must be
+    /// readable AND the sibling `.tmp` must NOT remain on disk.
+    #[test]
+    fn save_is_atomic_no_tmp_leftover() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let cache_dir = std::env::temp_dir().join(format!("kimetsu-atomic-dc-test-{nanos}"));
+        std::fs::create_dir_all(&cache_dir).expect("mkdir");
+        let path = sidecar_path(&cache_dir);
+
+        let state = DroppedCapsuleState {
+            entries: vec![entry("mem-atomic", 999_999)],
+        };
+        save(&path, &state);
+
+        // The target file must exist and be readable.
+        let loaded = load(&path);
+        assert_eq!(
+            loaded.entries.len(),
+            1,
+            "saved state must be loadable after atomic write"
+        );
+        assert_eq!(loaded.entries[0].memory_id, "mem-atomic");
+
+        // The sibling .tmp must have been consumed by the rename.
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            ".tmp sibling must not remain after atomic save"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

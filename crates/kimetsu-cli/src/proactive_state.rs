@@ -113,14 +113,23 @@ pub fn load(path: &Path) -> SessionState {
         .unwrap_or_default()
 }
 
-/// Best-effort save — failures are swallowed (a hook must never break
-/// the agent's turn just because it couldn't persist its own state).
+/// Atomic write: serialise `state` to a sibling `.tmp` file, then rename
+/// it over `path`.  rename(2) is atomic on the same filesystem so a reader
+/// always sees either the previous complete file or the new complete file —
+/// never a torn partial write.  All failures are swallowed; a hook must
+/// never break the agent's turn because of a state-persistence hiccup.
 pub fn save(path: &Path, state: &SessionState) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string(state) {
-        let _ = fs::write(path, text);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = fs::create_dir_all(parent);
+    let Ok(text) = serde_json::to_string(state) else {
+        return;
+    };
+    // Same dir → same filesystem, so the rename below is always atomic.
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, &text).is_ok() {
+        let _ = fs::rename(&tmp, path);
     }
 }
 
@@ -520,6 +529,41 @@ mod tests {
         let handles = ["memory:old1", "memory:new", "memory:old2"];
         let indices = dedupe_filter(&handles, &state);
         assert_eq!(indices, vec![1], "only the new handle must pass");
+    }
+
+    /// S4.3: `save` must use an atomic temp+rename so the reader never sees a
+    /// torn file.  After a successful save the target file must exist and be
+    /// loadable, and the sibling `.tmp` file must NOT remain on disk.
+    #[test]
+    fn save_is_atomic_no_tmp_leftover() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "kimetsu-atomic-ps-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let path = session_path(&tmp_dir, Some("atomic-test"));
+
+        let mut state = SessionState::default();
+        state.mark_surfaced("mem-atomic");
+        save(&path, &state);
+
+        // The target file must exist and be readable.
+        let loaded = load(&path);
+        assert!(
+            loaded.is_surfaced("mem-atomic"),
+            "saved state must be loadable"
+        );
+
+        // The sibling .tmp file must have been cleaned up by the rename.
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "sibling .tmp file must not remain after atomic save"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     /// DD-6: proactive-state roundtrip — save surfaced handles, reload,

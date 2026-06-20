@@ -3175,35 +3175,40 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
             Ok(())
         }
         ConfigCommand::Set { key, value } => {
-            eprintln!(
-                "note: `config set` re-serialises the file — TOML comments are not preserved. \
-                 Use `config edit` to hand-edit with comments."
-            );
             let cwd = env::current_dir()?;
             let paths = kimetsu_core::paths::ProjectPaths::discover(&cwd)?;
 
-            // 1. Read the on-disk file into a toml::Value so we preserve all
-            //    existing keys and detect the existing type for coercion.
+            // S4.2: use toml_edit for a surgical, comment-preserving write.
+            // The previous approach serialized through toml::Value which
+            // drops all TOML comments and reformats the file.  toml_edit
+            // parses into a `DocumentMut` that preserves comments, whitespace,
+            // and unknown keys — only the touched leaf changes.
             let disk_text = std::fs::read_to_string(&paths.project_toml).map_err(|e| {
                 format!(
                     "config set: could not read {}: {e}",
                     paths.project_toml.display()
                 )
             })?;
-            let mut root: toml::Value = toml::from_str(&disk_text)
-                .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
 
-            // 2. Determine the existing type at this key (for coercion).
-            let existing = get_toml_path(&root, &key).cloned();
+            // 1. Use the plain toml::Value tree to resolve the existing type
+            //    (for coercion) and to validate the result — both remain cheap.
+            let root_val: toml::Value = toml::from_str(&disk_text)
+                .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
+            let existing = get_toml_path(&root_val, &key).cloned();
             let typed_value =
                 parse_scalar(&value, existing.as_ref()).map_err(|e| format!("config set: {e}"))?;
 
-            // 3. Navigate/create the path and set the leaf.
-            set_toml_path(&mut root, &key, typed_value).map_err(|e| format!("config set: {e}"))?;
+            // 2. Parse into toml_edit document (preserves comments/formatting).
+            let mut doc: toml_edit::DocumentMut = disk_text
+                .parse()
+                .map_err(|e| format!("config set: project.toml is invalid TOML (edit): {e}"))?;
 
-            // 4. Serialise back to text and validate through ProjectConfig.
-            let new_text = toml::to_string_pretty(&root)
-                .map_err(|e| format!("config set: failed to serialise: {e}"))?;
+            // 3. Navigate/set the leaf surgically in the edit document.
+            set_toml_edit_path(&mut doc, &key, &typed_value)
+                .map_err(|e| format!("config set: {e}"))?;
+
+            // 4. Render and validate through ProjectConfig before writing.
+            let new_text = doc.to_string();
             project::load_config_from_text(&new_text).map_err(|e| {
                 format!("config set: result is not a valid config — {e}. File NOT written.")
             })?;
@@ -3260,6 +3265,10 @@ fn get_toml_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value
 /// Navigate/create a dotted key path (`a.b.c`) in `root` (a `toml::Value::Table`)
 /// and set the leaf to `value`. Intermediate segments are created as empty tables
 /// when absent. Returns `Err` if an intermediate segment exists but is not a table.
+///
+/// NOTE: this function is kept for unit tests only.  Production config writes use
+/// `set_toml_edit_path` which preserves TOML comments.
+#[cfg(test)]
 fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<(), String> {
     let segments: Vec<&str> = key.split('.').collect();
     let (leaf_key, parents) = segments
@@ -3294,6 +3303,69 @@ fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) -> Resul
         .as_table_mut()
         .unwrap()
         .insert(leaf_key.to_string(), value);
+    Ok(())
+}
+
+/// S4.2 — Surgical, comment-preserving write via `toml_edit`.
+///
+/// Navigate/create a dotted key path (`a.b.c`) inside a `toml_edit::DocumentMut`
+/// and overwrite the leaf with `value` (a `toml::Value` for type information).
+/// Intermediate tables are created when absent. Returns `Err` when an
+/// intermediate segment is not a table.
+///
+/// This preserves all TOML comments, whitespace, and unknown keys because
+/// `toml_edit` operates on the concrete syntax tree rather than a typed struct.
+fn set_toml_edit_path(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: &toml::Value,
+) -> Result<(), String> {
+    let segments: Vec<&str> = key.split('.').collect();
+    let (leaf_key, parents) = segments
+        .split_last()
+        .ok_or_else(|| "key must not be empty".to_string())?;
+
+    // Navigate into parent tables, creating inline tables when absent.
+    let mut current: &mut toml_edit::Item = doc.as_item_mut();
+    for seg in parents {
+        // If the segment doesn't exist yet, insert an empty table.
+        if current.get(seg).is_none() {
+            if let Some(tbl) = current.as_table_mut() {
+                tbl.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
+            } else {
+                return Err(format!("cannot set `{key}`: `{seg}` is not a table"));
+            }
+        }
+        current = current
+            .get_mut(seg)
+            .ok_or_else(|| format!("cannot set `{key}`: `{seg}` not found after insert"))?;
+        if !current.is_table() && !current.is_inline_table() {
+            return Err(format!("cannot set `{key}`: `{seg}` is not a table"));
+        }
+    }
+
+    // Convert the toml::Value leaf into a toml_edit::Value.
+    let edit_val: toml_edit::Value = match value {
+        toml::Value::Boolean(b) => toml_edit::Value::from(*b),
+        toml::Value::Integer(n) => toml_edit::Value::from(*n),
+        toml::Value::Float(f) => toml_edit::Value::from(*f),
+        toml::Value::String(s) => toml_edit::Value::from(s.as_str()),
+        other => {
+            // Fallback: round-trip through TOML text for complex types.
+            let text = toml::to_string(other)
+                .map_err(|e| format!("cannot serialise value for `{key}`: {e}"))?;
+            text.trim()
+                .parse::<toml_edit::Value>()
+                .map_err(|e| format!("cannot parse serialised value for `{key}`: {e}"))?
+        }
+    };
+
+    if let Some(tbl) = current.as_table_mut() {
+        tbl.insert(leaf_key, toml_edit::Item::Value(edit_val));
+    } else {
+        return Err(format!("cannot set `{key}`: parent segment is not a table"));
+    }
+
     Ok(())
 }
 
@@ -4946,11 +5018,26 @@ fn brain_tune_sweep(
         return Ok(());
     }
 
-    // --apply: write floors to project.toml (reranker change only recommended).
-    let mut new_config = project::load_config(paths)?;
-    new_config.broker.min_lexical_coverage = winner.combo.min_lexical_coverage;
-    new_config.broker.min_semantic_score = winner.combo.min_semantic_score;
-    std::fs::write(&paths.project_toml, new_config.to_toml()?)?;
+    // --apply: write floors to project.toml using surgical toml_edit so that
+    // user comments and unknown keys are preserved (S4.2).
+    let disk_text = std::fs::read_to_string(&paths.project_toml)
+        .map_err(|e| format!("tune --apply: could not read project.toml: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = disk_text
+        .parse()
+        .map_err(|e| format!("tune --apply: project.toml is invalid TOML: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_lexical_coverage",
+        &toml::Value::Float(winner.combo.min_lexical_coverage as f64),
+    )
+    .map_err(|e| format!("tune --apply: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_semantic_score",
+        &toml::Value::Float(winner.combo.min_semantic_score as f64),
+    )
+    .map_err(|e| format!("tune --apply: {e}"))?;
+    std::fs::write(&paths.project_toml, doc.to_string())?;
 
     // Snapshot to tune-history.
     let now_str = time::OffsetDateTime::now_utc()
@@ -4985,10 +5072,25 @@ fn brain_tune_revert(workspace: &std::path::Path) -> KimetsuResult<()> {
         return Ok(());
     };
 
-    let mut config = project::load_config(&paths)?;
-    config.broker.min_lexical_coverage = entry.before.min_lexical_coverage;
-    config.broker.min_semantic_score = entry.before.min_semantic_score;
-    std::fs::write(&paths.project_toml, config.to_toml()?)?;
+    // S4.2: surgical write via toml_edit preserves user comments.
+    let disk_text = std::fs::read_to_string(&paths.project_toml)
+        .map_err(|e| format!("tune revert: could not read project.toml: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = disk_text
+        .parse()
+        .map_err(|e| format!("tune revert: project.toml is invalid TOML: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_lexical_coverage",
+        &toml::Value::Float(entry.before.min_lexical_coverage as f64),
+    )
+    .map_err(|e| format!("tune revert: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_semantic_score",
+        &toml::Value::Float(entry.before.min_semantic_score as f64),
+    )
+    .map_err(|e| format!("tune revert: {e}"))?;
+    std::fs::write(&paths.project_toml, doc.to_string())?;
 
     println!(
         "Reverted: lex_coverage={:.2}, sem_score={:.3} (from tune at {})",
@@ -9933,13 +10035,16 @@ ambient = false
 
             let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
 
-            // --- set embedder.enabled = false ---
+            // --- set embedder.enabled = false via toml_edit (S4.2 path) ---
             let disk_text = std::fs::read_to_string(&paths.project_toml).expect("read toml");
-            let mut root_val: toml::Value = toml::from_str(&disk_text).expect("parse");
+            // Resolve existing type via toml::Value (used for coercion).
+            let root_val: toml::Value = toml::from_str(&disk_text).expect("parse");
             let existing = get_toml_path(&root_val, "embedder.enabled").cloned();
             let typed = parse_scalar("false", existing.as_ref()).expect("parse false as bool");
-            set_toml_path(&mut root_val, "embedder.enabled", typed).expect("set");
-            let new_text = toml::to_string_pretty(&root_val).expect("serialise");
+            // Surgical write preserves comments.
+            let mut doc: toml_edit::DocumentMut = disk_text.parse().expect("parse edit doc");
+            set_toml_edit_path(&mut doc, "embedder.enabled", &typed).expect("set");
+            let new_text = doc.to_string();
             project::load_config_from_text(&new_text).expect("validate");
             std::fs::write(&paths.project_toml, &new_text).expect("write");
 
@@ -9957,6 +10062,73 @@ ambient = false
 
             fs::remove_dir_all(root).ok();
         });
+    }
+
+    // ── S4.2: set_toml_edit_path (comment-preservation) ──────────────────────
+
+    /// S4.2: `set_toml_edit_path` must update only the touched key while
+    /// leaving comments and unknown keys intact in the serialised output.
+    #[test]
+    fn set_toml_edit_path_preserves_comments_and_unknown_keys() {
+        // A minimal project.toml snippet with a comment AND a non-schema key
+        // ("custom_key") that serde would drop on a full round-trip.
+        let original = r#"
+# This is a user comment that must survive a config set.
+[kimetsu]
+project_id = "demo"
+schema_version = 10
+
+[broker]
+default_budget_tokens = 6000
+min_lexical_coverage = 0.5
+# A per-section comment.
+custom_key = "preserved"
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+"#;
+        let mut doc: toml_edit::DocumentMut = original.parse().expect("parse toml_edit");
+
+        set_toml_edit_path(
+            &mut doc,
+            "broker.min_lexical_coverage",
+            &toml::Value::Float(0.4),
+        )
+        .expect("set must succeed");
+
+        let result = doc.to_string();
+
+        // The comment must survive.
+        assert!(
+            result.contains("user comment that must survive"),
+            "top-level comment must be preserved; got:\n{result}"
+        );
+        assert!(
+            result.contains("A per-section comment"),
+            "section comment must be preserved; got:\n{result}"
+        );
+
+        // The unknown key must survive.
+        assert!(
+            result.contains("custom_key"),
+            "unknown key must be preserved; got:\n{result}"
+        );
+
+        // The updated value must be present on the min_lexical_coverage line.
+        assert!(
+            result.contains("min_lexical_coverage = 0.4"),
+            "updated value must appear on the key line; got:\n{result}"
+        );
+
+        // The old value must NOT remain on the min_lexical_coverage key
+        // (note: 0.5 may appear on other lines like broker.weights.relevance).
+        assert!(
+            !result.contains("min_lexical_coverage = 0.5"),
+            "old min_lexical_coverage = 0.5 must be replaced; got:\n{result}"
+        );
     }
 
     // ── Q7: runs prune helpers ────────────────────────────────────────────────
