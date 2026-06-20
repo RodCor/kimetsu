@@ -404,20 +404,208 @@ fn normalize_distiller_provider(provider: &str) -> Option<&'static str> {
 /// `kimetsu brain session-end-hook` entry. Reads the SessionEnd payload
 /// from stdin, and if the distiller is enabled + credentialed, distills
 /// the transcript and records lessons. Silent no-op otherwise.
+///
+/// Also auto-captures a work episode (Story 1.3): whether or not a cheap
+/// model is configured, an episode is written.  With a cheap model the
+/// episode fields are model-distilled; without one, the rule-based fallback
+/// assembles the episode from the transcript view.
 pub fn run_session_end_hook(workspace: &Path) {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).ok();
     let payload: serde_json::Value =
         serde_json::from_str(input.trim()).unwrap_or(serde_json::Value::Null);
 
-    let Some(transcript_path) = payload
+    let transcript_path = payload
         .get("transcript_path")
         .and_then(|v| v.as_str())
-        .filter(|p| !p.trim().is_empty())
-    else {
-        return;
+        .filter(|p| !p.trim().is_empty());
+
+    if let Some(tp) = transcript_path {
+        run_distiller_for_transcript(workspace, tp);
+    }
+
+    // Story 1.3: auto-capture episode at SessionEnd (best-effort, never fails
+    // the hook).
+    capture_episode_at_session_end(workspace, transcript_path.unwrap_or(""));
+}
+
+/// Capture a work episode at SessionEnd.  Tries the cheap model first;
+/// degrades gracefully to the rule-based fallback if none is configured or
+/// if the model call fails.  Best-effort — silently swallows all errors so
+/// the session shutdown is never blocked.
+pub fn capture_episode_at_session_end(workspace: &Path, transcript_path: &str) {
+    capture_episode_now(workspace, transcript_path, "");
+}
+
+/// Capture an episode now (manual checkpoint or auto-capture).
+///
+/// `note` is an optional annotation from the user.
+/// Returns `true` if the episode was written successfully.
+pub fn capture_episode_now(workspace: &Path, transcript_path: &str, note: &str) -> bool {
+    use kimetsu_brain::episode::{capture_episode, rule_based_episode};
+    use kimetsu_core::paths::ProjectPaths;
+
+    // Resolve the repo_root from the workspace.  If the project can't be
+    // found this is a non-project dir and we skip silently.
+    let repo_root = match ProjectPaths::discover(workspace) {
+        Ok(p) => p.repo_root.to_string_lossy().to_string(),
+        Err(_) => return false,
     };
-    run_distiller_for_transcript(workspace, transcript_path);
+
+    let view = if transcript_path.is_empty() {
+        String::new()
+    } else {
+        build_transcript_view(transcript_path, MAX_VIEW_CHARS)
+    };
+
+    // Try cheap model first; fall back to rule-based.
+    let episode_payload = if let Some(resolved) = resolve_distiller(workspace) {
+        distill_episode_with_model(&view, &resolved, &repo_root, note)
+            .unwrap_or_else(|| kimetsu_brain::episode::rule_based_episode(&view, &repo_root, note))
+    } else {
+        rule_based_episode(&view, &repo_root, note)
+    };
+
+    // Write the episode event.  Best-effort.
+    match capture_episode(workspace, episode_payload) {
+        Ok(_id) => true,
+        Err(_) => false,
+    }
+}
+
+/// Prompt the cheap model to distill an episode from the transcript view.
+/// Returns `None` on any error (caller falls back to rule-based).
+fn distill_episode_with_model(
+    view: &str,
+    resolved: &ResolvedDistiller,
+    repo_root: &str,
+    note: &str,
+) -> Option<kimetsu_brain::episode::EpisodePayload> {
+    const EPISODE_SYSTEM: &str = "You are Kimetsu's session recorder. From the transcript below, extract a concise \
+        work episode in JSON with these EXACT keys (all strings/arrays of strings):\n\
+        {\"task\": \"the main goal\", \"summary\": \"what was done\", \
+        \"open_threads\": [\"what still needs doing\"], \
+        \"dead_ends\": [\"what failed and why\"], \
+        \"hypothesis\": \"current best theory or approach\"}\n\
+        Be concrete. Keep each field to one sentence max. If a field is empty use \"\" or []. \
+        Reply with ONLY the JSON object, no prose.";
+
+    if view.trim().is_empty() {
+        return None;
+    }
+
+    let mut provider = make_provider_for_resolved(resolved)?;
+
+    let request = kimetsu_agent::model::ModelRequest {
+        messages: vec![
+            kimetsu_agent::model::ModelMessage {
+                role: kimetsu_agent::model::MessageRole::System,
+                content: vec![kimetsu_agent::model::MessageContent::Text {
+                    text: EPISODE_SYSTEM.to_string(),
+                }],
+            },
+            kimetsu_agent::model::ModelMessage::user_text(view),
+        ],
+        tools: Vec::new(),
+        tool_choice: kimetsu_agent::model::ToolChoice::None,
+        max_output_tokens: 512,
+        temperature: 0.1,
+        metadata: serde_json::Value::Null,
+    };
+
+    let response = provider.complete(request).ok()?;
+    let text = response.text.as_deref().unwrap_or("");
+
+    // Parse the JSON object from the model output.
+    parse_episode_json(text, repo_root, note)
+}
+
+/// Extract and parse the episode JSON object from model output.
+fn parse_episode_json(
+    text: &str,
+    repo_root: &str,
+    note: &str,
+) -> Option<kimetsu_brain::episode::EpisodePayload> {
+    // Find the first `{...}` top-level object.
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let json_str = &text[start..=end?];
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+    let task = val
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let summary = val
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let open_threads = val
+        .get("open_threads")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let dead_ends = val
+        .get("dead_ends")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let hypothesis = val
+        .get("hypothesis")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(kimetsu_brain::episode::EpisodePayload {
+        task,
+        summary,
+        open_threads,
+        dead_ends,
+        hypothesis,
+        note: note.to_string(),
+        repo_root: repo_root.to_string(),
+        memory_ids: Vec::new(),
+    })
 }
 
 /// Construct a boxed `ModelProvider` from a `ResolvedDistiller`, consuming

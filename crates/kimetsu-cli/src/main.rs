@@ -154,6 +154,31 @@ enum Command {
     /// Takes a new user from zero to a verified working brain in ONE command,
     /// instead of running `init` + `plugin install` + `doctor --selftest` separately.
     Setup(SetupArgs),
+    /// Save a mid-session work checkpoint now.
+    ///
+    /// Captures the current work episode (task, open threads, dead-ends,
+    /// hypothesis) into the brain so the next session can resume from here.
+    /// Optionally accepts a short note to add context.
+    ///
+    /// The episode is per-repo: one live episode per git repo at a time.
+    /// A new checkpoint supersedes the previous one.
+    ///
+    /// Examples:
+    ///   kimetsu checkpoint
+    ///   kimetsu checkpoint "about to try the new approach"
+    ///   kimetsu checkpoint --workspace /path/to/repo "switching branches"
+    Checkpoint(CheckpointArgs),
+    /// Print the last saved work episode for the current repo.
+    ///
+    /// Shows what you were working on, what's open, what failed, and the
+    /// current working hypothesis — so you can pick up exactly where you
+    /// left off.  Prints a friendly message when no episode has been saved
+    /// yet.
+    ///
+    /// Examples:
+    ///   kimetsu resume
+    ///   kimetsu resume --workspace /path/to/repo
+    Resume(ResumeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -636,6 +661,26 @@ enum BrainCommand {
     /// Host SessionEnd hook — runs the credentialed distiller.
     #[command(name = "session-end-hook")]
     SessionEndHook(SessionEndHookArgs),
+    /// Host SessionStart hook — injects the repo digest + episodic resume as
+    /// `additionalContext` so the agent's FIRST turn already knows the repo
+    /// and the current task without an exploratory ls/cat/grep tour.
+    ///
+    /// Output is JSON in the Claude Code `additionalContext` hook format.
+    /// Silent when: `[broker] warm_start = false`, no digest exists, AND
+    /// no live episode exists (pure optional feature).
+    ///
+    /// Gated by `[broker] warm_start` (default true).
+    #[command(name = "session-start-hook")]
+    SessionStartHook(SessionStartHookArgs),
+    /// Build (or rebuild) the repo digest and write it to `.kimetsu/digest.md`.
+    ///
+    /// The digest is a ~400-token summary of the repo: top-usefulness
+    /// memories, manifest (Cargo.toml/package.json/…) summary, and recent
+    /// work focus.  It is cached by a content hash and reused at SessionStart.
+    ///
+    /// Pass `--refresh` to force a rebuild even when the cache is fresh.
+    #[command(name = "digest")]
+    Digest(DigestArgs),
     /// Reclaim dead disk space in brain.db.
     ///
     /// Without flags this is a safe, read-only-equivalent operation: SQLite
@@ -919,6 +964,42 @@ struct StopHookArgs {
 
 #[derive(Debug, Args)]
 struct SessionEndHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SessionStartHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DigestArgs {
+    /// Force a rebuild even when the cached digest is fresh.
+    #[arg(long)]
+    refresh: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu checkpoint`.
+#[derive(Debug, Args)]
+struct CheckpointArgs {
+    /// Optional note to attach to this checkpoint.
+    #[arg(value_name = "NOTE")]
+    note: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu resume`.
+#[derive(Debug, Args)]
+struct ResumeArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1556,6 +1637,8 @@ fn run() -> KimetsuResult<()> {
         Command::Stop(args) => stop_cmd(args),
         Command::Restart(args) => restart_cmd(args),
         Command::Setup(args) => setup_cmd(args),
+        Command::Checkpoint(args) => checkpoint_cmd(args),
+        Command::Resume(args) => resume_cmd(args),
     }
 }
 
@@ -1576,6 +1659,83 @@ fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
         keep_plugins: args.keep_plugins,
         delete_user_data: args.delete_user_data,
     })
+}
+
+// ── kimetsu checkpoint ────────────────────────────────────────────────────────
+
+/// `kimetsu checkpoint [note]` — manually save a mid-session work episode.
+fn checkpoint_cmd(args: CheckpointArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let note = args.note.as_deref().unwrap_or("");
+
+    // Use capture_episode_now with an empty transcript (manual save does not
+    // require a transcript — the note itself is sufficient context).
+    let ok = distiller::capture_episode_now(&workspace, "", note);
+
+    if ok {
+        println!("[Kimetsu] Work checkpoint saved.");
+        if !note.is_empty() {
+            println!("  Note: {note}");
+        }
+    } else {
+        // Could not write — likely no project initialised here.
+        eprintln!(
+            "[Kimetsu] Could not save checkpoint: no Kimetsu project found at {}.\n\
+             Run `kimetsu init` to initialise one.",
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+// ── kimetsu resume ────────────────────────────────────────────────────────────
+
+/// `kimetsu resume` — print the last saved work episode.
+fn resume_cmd(args: ResumeArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    match kimetsu_brain::episode::load_live_episode_for_workspace(&workspace) {
+        Ok(Some(ep)) => {
+            println!("── Resume: last session ──────────────────────────────");
+            if !ep.task.is_empty() {
+                println!("Task:       {}", ep.task);
+            }
+            if !ep.summary.is_empty() {
+                println!("Summary:    {}", ep.summary);
+            }
+            if !ep.open_threads.is_empty() {
+                println!("Open:       {}", ep.open_threads.join("; "));
+            }
+            if !ep.dead_ends.is_empty() {
+                println!("Avoid:      {}", ep.dead_ends.join("; "));
+            }
+            if !ep.hypothesis.is_empty() {
+                println!("Hypothesis: {}", ep.hypothesis);
+            }
+            if !ep.note.is_empty() {
+                println!("Note:       {}", ep.note);
+            }
+            println!("Saved:      {}", ep.created_at);
+            println!("─────────────────────────────────────────────────────");
+        }
+        Ok(None) => {
+            println!("[Kimetsu] No work episode saved for this repo yet.");
+            println!("  Episodes are captured automatically at session end.");
+            println!("  You can save one now with: kimetsu checkpoint");
+        }
+        Err(e) => {
+            eprintln!("[Kimetsu] Could not load episode: {e}");
+            eprintln!(
+                "  Make sure a Kimetsu project is initialised at {}.",
+                workspace.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ── kimetsu ps ───────────────────────────────────────────────────────────────
@@ -3581,6 +3741,18 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             distiller::run_session_end_hook(&workspace);
             Ok(())
         }
+        BrainCommand::SessionStartHook(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            brain_session_start_hook(&workspace)
+        }
+        BrainCommand::Digest(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            brain_digest_cmd(&workspace, args.refresh)
+        }
         BrainCommand::Compact(args) => brain_compact(args),
         BrainCommand::Export(args) => brain_export(args),
         BrainCommand::Import(args) => brain_import(args),
@@ -3864,6 +4036,83 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 }
 
 // ── Q8: brain compact ────────────────────────────────────────────────────────
+
+// ── Flagship 1 Pass B: session-start-hook + digest command ───────────────────
+
+/// `kimetsu brain session-start-hook`
+///
+/// Flagship 1 / Pass B / Story 1.5: SessionStart hook that injects the
+/// repo digest (1.1) + episodic resume (Pass A) as `additionalContext` so
+/// the agent's first turn knows the repo and task without exploratory I/O.
+///
+/// Output format: Claude Code `additionalContext` JSON.
+/// Gated by `[broker] warm_start` (default true).
+/// Silent when no digest AND no live episode.
+fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
+    // Gate: load warm_start from config (best-effort; default ON).
+    let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| kimetsu_brain::project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.warm_start)
+        .unwrap_or(true);
+
+    if !warm_start_enabled {
+        return Ok(());
+    }
+
+    // 1. Repo digest (story 1.1).
+    let digest = kimetsu_brain::digest::build_or_load_digest(workspace, false);
+
+    // 2. Episodic resume (Pass A, story 1.4).
+    let resume = kimetsu_brain::episode::render_resume_context(workspace);
+
+    // Silent when neither has content.
+    if digest.is_none() && resume.is_none() {
+        return Ok(());
+    }
+
+    // Assemble additionalContext.
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &digest {
+        parts.push(format!("## Repo context\n{d}"));
+    }
+    if let Some(r) = &resume {
+        parts.push(format!("## Your prior session\n{r}"));
+    }
+    let additional_context = parts.join("\n\n");
+
+    // ROI attribution (best-effort).
+    let digest_chars = digest.as_ref().map(|d| d.len()).unwrap_or(0);
+    let resume_chars = resume.as_ref().map(|r| r.len()).unwrap_or(0);
+    kimetsu_brain::digest::record_warmstart_served(workspace, digest_chars, resume_chars);
+
+    // Emit Claude Code SessionStart additionalContext JSON.
+    let output = serde_json::json!({
+        "continue": true,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": additional_context,
+        },
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// `kimetsu brain digest [--refresh]`
+///
+/// Flagship 1 / Pass B / Story 1.1: build (or rebuild) the repo digest.
+/// Prints the digest to stdout and writes `.kimetsu/digest.md`.
+fn brain_digest_cmd(workspace: &Path, refresh: bool) -> KimetsuResult<()> {
+    match kimetsu_brain::digest::build_or_load_digest(workspace, refresh) {
+        Some(digest) => {
+            println!("{digest}");
+        }
+        None => {
+            eprintln!("[Kimetsu] No digest content: brain may not be initialized or empty.");
+        }
+    }
+    Ok(())
+}
 
 /// `kimetsu brain compact [--purge-invalidated] [--trim-events-older-than <dur>] [--json]`
 ///

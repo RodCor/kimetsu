@@ -389,6 +389,18 @@ pub(crate) fn migrate_v3_to_v4(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// The v4→v5 migration: add the `work_episodes` per-repo episodic-resume
+/// projection table (Flagship 1, Story 1.3).
+///
+/// `work_episodes` is a **projection** derivable from `work.episode` events:
+/// `reset_projection` clears it and `rebuild_in_place` repopulates it.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner.  Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v4_to_v5(conn: &Connection) -> KimetsuResult<()> {
+    crate::episode::create_work_episodes_table(conn)
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only
@@ -517,15 +529,15 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1. Fresh init reaches v4 with full shape
+    // 1. Fresh init reaches v5 with full shape
     // ------------------------------------------------------------------
     #[test]
-    fn fresh_init_reaches_v4_with_full_shape() {
+    fn fresh_init_reaches_v5_with_full_shape() {
         use kimetsu_core::KIMETSU_SCHEMA_VERSION;
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("initialize");
 
-        // Version must be at target (currently 4).
+        // Version must be at target (currently 5).
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
             KIMETSU_SCHEMA_VERSION,
@@ -566,6 +578,11 @@ mod tests {
             table_exists(&conn, "memory_edges"),
             "memory_edges table must exist after v4 migration"
         );
+        // v5: episodic resume table
+        assert!(
+            table_exists(&conn, "work_episodes"),
+            "work_episodes table must exist after v5 migration"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -599,8 +616,8 @@ mod tests {
         );
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            4,
-            "version must still be 4"
+            kimetsu_core::KIMETSU_SCHEMA_VERSION,
+            "version must still be at target"
         );
 
         // Data must be intact.
@@ -828,5 +845,48 @@ mod tests {
             )
             .expect("query idx_memory_edges_dst");
         assert_eq!(dst_idx, 1, "idx_memory_edges_dst must exist");
+    }
+
+    // ------------------------------------------------------------------
+    // F1-v5. v4→v5 migration adds work_episodes table + indexes
+    // ------------------------------------------------------------------
+    #[test]
+    fn v4_to_v5_migration_adds_work_episodes() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Build a v4 DB (baseline + v1→v2 + v2→v3 + v3→v4, no v4→v5).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+        migrate_v3_to_v4(&conn).expect("migrate_v3_to_v4");
+        conn.execute(
+            "UPDATE schema_info SET value = 4 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v4");
+
+        // work_episodes must NOT exist yet.
+        assert!(
+            !table_exists(&conn, "work_episodes"),
+            "work_episodes must not exist before v5 migration"
+        );
+
+        // Run v4→v5.
+        migrate_v4_to_v5(&conn).expect("migrate_v4_to_v5");
+
+        // Table must now exist.
+        assert!(
+            table_exists(&conn, "work_episodes"),
+            "work_episodes must exist after v5 migration"
+        );
+
+        // Repo-live index must exist.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_episodes_repo_live'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_episodes_repo_live");
+        assert_eq!(idx, 1, "idx_episodes_repo_live must exist");
     }
 }

@@ -119,6 +119,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
         DELETE FROM memory_citations;
         DELETE FROM memory_conflicts;
         DELETE FROM memory_edges;
+        DELETE FROM work_episodes;
         ",
     )?;
     Ok(())
@@ -159,6 +160,8 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // Story 3.1: near-duplicate merge — stamp superseded_by on merged members,
         // remove their FTS rows, and drop them from the ANN index.
         "memory.superseded" => apply_memory_superseded(conn, event),
+        // Flagship 1 / Story 1.3: episodic work-resume.
+        "work.episode" => crate::episode::project_work_episode(conn, event),
         _ => Ok(()),
     }
 }
@@ -944,6 +947,12 @@ mod tests {
         assert_empty_payload_ok("memory.cited");
     }
 
+    // F1: empty payload work.episode must not panic/error.
+    #[test]
+    fn empty_payload_work_episode() {
+        assert_empty_payload_ok("work.episode");
+    }
+
     // ------------------------------------------------------------------
     // A6-3. A well-formed run.started event still projects correctly
     // after routing through the upcast seam.
@@ -1057,6 +1066,15 @@ mod tests {
         assert_eq!(
             conflicts_after, 0,
             "memory_conflicts must be cleared by reset_projection"
+        );
+
+        // work_episodes must also be cleared.
+        let episodes_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_episodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            episodes_after, 0,
+            "work_episodes must be cleared by reset_projection"
         );
     }
 
