@@ -556,28 +556,33 @@ mod tests {
             //     → run_migrations → migrates v1→v2 with a backup.
             let conn = open_user_brain().expect("re-open ok").expect("enabled");
 
-            // Assert 1: version is at 3 (v1→v2→v3 migration chain).
+            // Assert 1: version is at current target (v1→v2→v3→v4 migration chain).
+            use kimetsu_core::KIMETSU_SCHEMA_VERSION;
             let ver =
                 crate::migrate::current_version(&conn).expect("current_version after re-open");
-            assert_eq!(ver, 3, "user brain must be at v3 after re-open");
+            assert_eq!(
+                ver, KIMETSU_SCHEMA_VERSION,
+                "user brain must be at current target version after re-open"
+            );
 
-            // Assert 2: backup sidecar brain.db.bak-1-3-* exists next to brain.db
-            // (migrating from v1 to target v3 produces one backup named with the
-            // full from-to span: brain.db.bak-<from>-<to>-<ts>).
+            // Assert 2: backup sidecar brain.db.bak-1-<target>-* exists next to
+            // brain.db (migrating from v1 to current target produces one backup
+            // named with the full from-to span: brain.db.bak-<from>-<to>-<ts>).
+            let bak_prefix = format!("brain.db.bak-1-{KIMETSU_SCHEMA_VERSION}-");
             let bak_files: Vec<_> = std::fs::read_dir(&tmp)
                 .expect("read tmp dir")
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .map(|n| n.starts_with("brain.db.bak-1-3-"))
+                        .map(|n| n.starts_with(&bak_prefix))
                         .unwrap_or(false)
                 })
                 .collect();
             assert_eq!(
                 bak_files.len(),
                 1,
-                "exactly one user-brain backup sidecar brain.db.bak-1-3-* must exist; found: {:?}",
+                "exactly one user-brain backup sidecar {bak_prefix}* must exist; found: {:?}",
                 bak_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
             );
 

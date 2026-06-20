@@ -2,6 +2,8 @@ pub mod ambient;
 pub mod analytics;
 #[cfg(feature = "embeddings")]
 pub mod ann;
+/// S5.1: retrieval backend trait + FlatBackend implementation.
+pub(crate) mod backend;
 pub mod benchmark;
 pub mod conflict;
 pub mod consolidate;

@@ -64,6 +64,11 @@ fn migrations() -> &'static [Migration] {
             description: "add superseded_by column + index for near-duplicate merge (Story 3.1)",
             up: crate::schema::migrate_v2_to_v3,
         },
+        Migration {
+            version: 4,
+            description: "add memory_edges typed-edge projection table (S5.2 graph-lite backend)",
+            up: crate::schema::migrate_v3_to_v4,
+        },
     ]
 }
 
