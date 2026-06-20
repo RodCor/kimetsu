@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-agent"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-brain"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "blake3",
  "fastembed",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-chat"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-cli"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "clap",
  "interprocess",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-core"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-e2e"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "kimetsu-agent",
  "kimetsu-brain",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-remote"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "axum",
  "axum-server",
