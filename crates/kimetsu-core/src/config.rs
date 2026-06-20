@@ -577,6 +577,18 @@ pub struct BrokerSection {
     /// loading cleanly (they get session dedupe ON).
     #[serde(default = "default_true")]
     pub session_dedupe: bool,
+    /// Flagship 1 / Pass B: inject the repo digest + work-resume context at
+    /// SessionStart. When true (default), `kimetsu brain session-start-hook`
+    /// prints `additionalContext` JSON combining the ~400-token repo digest
+    /// (1.1) and the episodic resume (Pass A).  Set false to suppress the
+    /// warm-start injection entirely — useful when the host already provides
+    /// repo context or the digest is not yet built.
+    ///
+    /// `#[serde(default = "default_true")]` keeps pre-Flagship-1 project.toml
+    /// files loading cleanly (they get warm_start ON — the feature is additive
+    /// and defaults to enabled so fresh installs get it immediately).
+    #[serde(default = "default_true")]
+    pub warm_start: bool,
 }
 
 fn default_max_capsules() -> usize {
@@ -612,6 +624,7 @@ impl Default for BrokerSection {
             ambient: default_true(),
             compress_capsules: default_true(),
             session_dedupe: default_true(),
+            warm_start: default_true(),
         }
     }
 }
@@ -927,6 +940,12 @@ max_total_cost_usd = 250.0
         assert!(
             config.broker.session_dedupe,
             "broker.session_dedupe must default to true"
+        );
+        // Flagship 1 Pass B: a pre-Flagship-1 project.toml without
+        // broker.warm_start must load cleanly and default to true (warm-start ON).
+        assert!(
+            config.broker.warm_start,
+            "broker.warm_start must default to true"
         );
         // S5.1: a pre-S5 project.toml without [storage] must load cleanly
         // and default to backend = "flat" (the existing FTS + ANN path).

@@ -3088,12 +3088,29 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
             "hooks": [{ "type": "command", "command": "kimetsu brain session-end-hook" }]
         }),
     );
+    // Flagship 1 Pass B: SessionStart now runs TWO commands in order:
+    //   1. `kimetsu brain warm` — pre-warms the embedder daemon (unchanged).
+    //   2. `kimetsu brain session-start-hook` — injects repo digest + episodic
+    //      resume as additionalContext. Claude Code confirmed to support
+    //      SessionStart additionalContext injection (verified against live docs).
+    //
+    // Hosts that have NOT been verified to support additionalContext in
+    // SessionStart (Codex, Cursor, GeminiCli, Pi, OpenClaw) do NOT get the
+    // session-start-hook wired here.  Only Claude Code is wired.
+    // Add wiring for each host once verified against live docs/schema.
     upsert_kimetsu_hook(
         hooks_obj,
         "SessionStart",
         serde_json::json!({
             "matcher": "",
-            "hooks": [{ "type": "command", "command": "kimetsu brain warm" }]
+            "hooks": [
+                { "type": "command", "command": "kimetsu brain warm" },
+                {
+                    "type": "command",
+                    "command": "kimetsu brain session-start-hook",
+                    "statusMessage": "Kimetsu warm-start: loading repo context"
+                }
+            ]
         }),
     );
     if proactive {
@@ -6322,8 +6339,12 @@ mod tests {
 
     // ── Warm-daemon startup hook tests ────────────────────────────────────────
 
-    /// Claude Code settings.json must include a SessionStart group that warms
-    /// the embedder daemon. The group must survive idempotent re-runs.
+    /// Claude Code settings.json must include a SessionStart group that:
+    ///   1. warms the embedder daemon (`kimetsu brain warm`).
+    ///   2. injects warm-start context (`kimetsu brain session-start-hook`).
+    ///
+    /// Both commands must be in the same Kimetsu hook group.
+    /// The group must survive idempotent re-runs.
     #[test]
     fn claude_hooks_include_sessionstart_warm() {
         let root = temp_root("claude_sessionstart_warm");
@@ -6342,6 +6363,19 @@ mod tests {
             ss.iter()
                 .any(|g| g["hooks"][0]["command"] == "kimetsu brain warm"),
             "SessionStart must warm the embedder daemon"
+        );
+        // Flagship 1 Pass B: session-start-hook must also be wired.
+        assert!(
+            ss.iter().any(|g| {
+                g["hooks"].as_array().is_some_and(|cmds| {
+                    cmds.iter().any(|c| {
+                        c["command"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("session-start-hook"))
+                    })
+                })
+            }),
+            "SessionStart must include session-start-hook for warm-start context injection"
         );
 
         // Idempotent: second run must not add a second group.

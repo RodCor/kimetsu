@@ -661,6 +661,26 @@ enum BrainCommand {
     /// Host SessionEnd hook — runs the credentialed distiller.
     #[command(name = "session-end-hook")]
     SessionEndHook(SessionEndHookArgs),
+    /// Host SessionStart hook — injects the repo digest + episodic resume as
+    /// `additionalContext` so the agent's FIRST turn already knows the repo
+    /// and the current task without an exploratory ls/cat/grep tour.
+    ///
+    /// Output is JSON in the Claude Code `additionalContext` hook format.
+    /// Silent when: `[broker] warm_start = false`, no digest exists, AND
+    /// no live episode exists (pure optional feature).
+    ///
+    /// Gated by `[broker] warm_start` (default true).
+    #[command(name = "session-start-hook")]
+    SessionStartHook(SessionStartHookArgs),
+    /// Build (or rebuild) the repo digest and write it to `.kimetsu/digest.md`.
+    ///
+    /// The digest is a ~400-token summary of the repo: top-usefulness
+    /// memories, manifest (Cargo.toml/package.json/…) summary, and recent
+    /// work focus.  It is cached by a content hash and reused at SessionStart.
+    ///
+    /// Pass `--refresh` to force a rebuild even when the cache is fresh.
+    #[command(name = "digest")]
+    Digest(DigestArgs),
     /// Reclaim dead disk space in brain.db.
     ///
     /// Without flags this is a safe, read-only-equivalent operation: SQLite
@@ -944,6 +964,23 @@ struct StopHookArgs {
 
 #[derive(Debug, Args)]
 struct SessionEndHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SessionStartHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DigestArgs {
+    /// Force a rebuild even when the cached digest is fresh.
+    #[arg(long)]
+    refresh: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -3704,6 +3741,18 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             distiller::run_session_end_hook(&workspace);
             Ok(())
         }
+        BrainCommand::SessionStartHook(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            brain_session_start_hook(&workspace)
+        }
+        BrainCommand::Digest(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            brain_digest_cmd(&workspace, args.refresh)
+        }
         BrainCommand::Compact(args) => brain_compact(args),
         BrainCommand::Export(args) => brain_export(args),
         BrainCommand::Import(args) => brain_import(args),
@@ -3987,6 +4036,83 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 }
 
 // ── Q8: brain compact ────────────────────────────────────────────────────────
+
+// ── Flagship 1 Pass B: session-start-hook + digest command ───────────────────
+
+/// `kimetsu brain session-start-hook`
+///
+/// Flagship 1 / Pass B / Story 1.5: SessionStart hook that injects the
+/// repo digest (1.1) + episodic resume (Pass A) as `additionalContext` so
+/// the agent's first turn knows the repo and task without exploratory I/O.
+///
+/// Output format: Claude Code `additionalContext` JSON.
+/// Gated by `[broker] warm_start` (default true).
+/// Silent when no digest AND no live episode.
+fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
+    // Gate: load warm_start from config (best-effort; default ON).
+    let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| kimetsu_brain::project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.warm_start)
+        .unwrap_or(true);
+
+    if !warm_start_enabled {
+        return Ok(());
+    }
+
+    // 1. Repo digest (story 1.1).
+    let digest = kimetsu_brain::digest::build_or_load_digest(workspace, false);
+
+    // 2. Episodic resume (Pass A, story 1.4).
+    let resume = kimetsu_brain::episode::render_resume_context(workspace);
+
+    // Silent when neither has content.
+    if digest.is_none() && resume.is_none() {
+        return Ok(());
+    }
+
+    // Assemble additionalContext.
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &digest {
+        parts.push(format!("## Repo context\n{d}"));
+    }
+    if let Some(r) = &resume {
+        parts.push(format!("## Your prior session\n{r}"));
+    }
+    let additional_context = parts.join("\n\n");
+
+    // ROI attribution (best-effort).
+    let digest_chars = digest.as_ref().map(|d| d.len()).unwrap_or(0);
+    let resume_chars = resume.as_ref().map(|r| r.len()).unwrap_or(0);
+    kimetsu_brain::digest::record_warmstart_served(workspace, digest_chars, resume_chars);
+
+    // Emit Claude Code SessionStart additionalContext JSON.
+    let output = serde_json::json!({
+        "continue": true,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": additional_context,
+        },
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// `kimetsu brain digest [--refresh]`
+///
+/// Flagship 1 / Pass B / Story 1.1: build (or rebuild) the repo digest.
+/// Prints the digest to stdout and writes `.kimetsu/digest.md`.
+fn brain_digest_cmd(workspace: &Path, refresh: bool) -> KimetsuResult<()> {
+    match kimetsu_brain::digest::build_or_load_digest(workspace, refresh) {
+        Some(digest) => {
+            println!("{digest}");
+        }
+        None => {
+            eprintln!("[Kimetsu] No digest content: brain may not be initialized or empty.");
+        }
+    }
+    Ok(())
+}
 
 /// `kimetsu brain compact [--purge-invalidated] [--trim-events-older-than <dur>] [--json]`
 ///
