@@ -22,6 +22,14 @@ pub struct ProjectConfig {
     /// auto-harvest on).
     #[serde(default)]
     pub learning: LearningSection,
+    /// S1.2: top-level cheap-model override. When present, takes
+    /// precedence over `[learning.distiller]` as the resolved cheap
+    /// model for all consumers (distiller, consolidation, future
+    /// digest/ask). Entirely optional — when absent the resolver falls
+    /// back to `[learning.distiller]` for back-compat. `#[serde(default)]`
+    /// keeps all existing project.toml files loading unchanged.
+    #[serde(default)]
+    pub cheap_model: Option<CheapModelSection>,
 }
 
 impl ProjectConfig {
@@ -40,7 +48,35 @@ impl ProjectConfig {
             run: RunSection::default(),
             embedder: EmbedderSection::default(),
             learning: LearningSection::default(),
+            cheap_model: None,
         }
+    }
+
+    /// S1.2: resolve the effective cheap-model config.
+    ///
+    /// Resolution order (first wins):
+    ///   1. `[cheap_model]` if present AND `enabled = true` — explicit top-level
+    ///      section introduced in S1.2.
+    ///   2. `[learning.distiller]` if `enabled = true` — back-compat alias so
+    ///      any existing config with `[learning.distiller]` keeps working with
+    ///      zero changes.
+    ///   3. `None` — no cheap model configured; consumers degrade gracefully
+    ///      (no panic, feature just does not run — same as distiller-absent
+    ///      behaviour before S1.2).
+    ///
+    /// FUTURE consumers (digest/resume/skill/ask) must call this resolver so
+    /// resolution stays in ONE place.
+    pub fn cheap_model(&self) -> Option<CheapModelSection> {
+        if let Some(ref cm) = self.cheap_model {
+            if cm.enabled {
+                return Some(cm.clone());
+            }
+        }
+        // Back-compat: treat an enabled [learning.distiller] as the cheap model.
+        if self.learning.distiller.enabled {
+            return Some(CheapModelSection::from_distiller(&self.learning.distiller));
+        }
+        None
     }
 
     pub fn from_toml(value: &str) -> KimetsuResult<Self> {
@@ -253,6 +289,95 @@ impl Default for DistillerSection {
             base_url_env: default_distiller_base_url_env(),
             region: None,
             region_env: default_distiller_region_env(),
+        }
+    }
+}
+
+/// S1.2: top-level cheap-model config. Same shape as `DistillerSection`
+/// (provider / model / api_key_env / base_url_env / region / region_env) but
+/// with `provider` now including `"ollama"` (S1.1).
+///
+/// Providers:
+///   - `"anthropic"` / `"claude"` — Anthropic API.
+///   - `"openai"` / `"gpt"` / `"oai"` — OpenAI-compatible API.
+///   - `"ollama"` — local Ollama server (OpenAI-compatible at
+///     `http://localhost:11434/v1`). No API key required. Recommended
+///     small instruct models: `qwen2.5:3b`, `llama3.2:3b`.
+///     Override the endpoint with `base_url_env` (default env var
+///     `OLLAMA_BASE_URL`).
+///   - `"bedrock"` / `"aws"` — AWS Bedrock.
+///
+/// `#[serde(default)]` on the `ProjectConfig` field keeps all existing
+/// project.toml files loading unchanged (`cheap_model = None`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheapModelSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cheap_model_provider")]
+    pub provider: String,
+    #[serde(default = "default_cheap_model_model")]
+    pub model: String,
+    /// Env-var name that holds the API key (not required for `ollama`).
+    #[serde(default = "default_cheap_model_api_key_env")]
+    pub api_key_env: String,
+    /// Env-var name that holds the base URL override. For `ollama` the
+    /// default resolved URL is `http://localhost:11434/v1` when this env
+    /// var is absent or empty.
+    #[serde(default = "default_cheap_model_base_url_env")]
+    pub base_url_env: String,
+    /// AWS Bedrock: literal region. Takes precedence over `region_env`.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS Bedrock: env-var name that holds the region (default `"AWS_REGION"`).
+    #[serde(default = "default_cheap_model_region_env")]
+    pub region_env: String,
+}
+
+fn default_cheap_model_provider() -> String {
+    "anthropic".to_string()
+}
+fn default_cheap_model_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+fn default_cheap_model_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+fn default_cheap_model_base_url_env() -> String {
+    "ANTHROPIC_BASE_URL".to_string()
+}
+fn default_cheap_model_region_env() -> String {
+    "AWS_REGION".to_string()
+}
+
+impl Default for CheapModelSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_cheap_model_provider(),
+            model: default_cheap_model_model(),
+            api_key_env: default_cheap_model_api_key_env(),
+            base_url_env: default_cheap_model_base_url_env(),
+            region: None,
+            region_env: default_cheap_model_region_env(),
+        }
+    }
+}
+
+impl CheapModelSection {
+    /// S1.1: for `provider = "ollama"`, return the default base URL
+    /// (`http://localhost:11434/v1`) when no override is configured.
+    pub const OLLAMA_DEFAULT_BASE_URL: &'static str = "http://localhost:11434/v1";
+
+    /// Construct from a `DistillerSection` for back-compat resolution.
+    pub fn from_distiller(d: &DistillerSection) -> Self {
+        Self {
+            enabled: d.enabled,
+            provider: d.provider.clone(),
+            model: d.model.clone(),
+            api_key_env: d.api_key_env.clone(),
+            base_url_env: d.base_url_env.clone(),
+            region: d.region.clone(),
+            region_env: d.region_env.clone(),
         }
     }
 }
@@ -983,6 +1108,163 @@ max_total_cost_usd = 250.0
             reloaded.model.price_per_mtok,
             Some(7.5),
             "price_per_mtok must round-trip"
+        );
+    }
+
+    // ── S1.2: cheap_model() resolver tests ───────────────────────────────
+
+    /// S1.2-a: a toml with only `[learning.distiller]` (no `[cheap_model]`)
+    /// resolves via back-compat and returns the distiller's settings.
+    #[test]
+    fn s1_2_a_learning_distiller_back_compat() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.learning.distiller.enabled = true;
+        config.learning.distiller.provider = "openai".to_string();
+        config.learning.distiller.model = "gpt-5.4-mini".to_string();
+        config.cheap_model = None;
+
+        let resolved = config.cheap_model().expect("back-compat must resolve");
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.model, "gpt-5.4-mini");
+        assert!(resolved.enabled);
+    }
+
+    /// S1.2-b: `[cheap_model]` takes precedence over `[learning.distiller]`
+    /// when both are present and enabled.
+    #[test]
+    fn s1_2_b_cheap_model_takes_precedence() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.learning.distiller.enabled = true;
+        config.learning.distiller.provider = "anthropic".to_string();
+        config.learning.distiller.model = "claude-haiku-4-5".to_string();
+        config.cheap_model = Some(super::CheapModelSection {
+            enabled: true,
+            provider: "ollama".to_string(),
+            model: "qwen2.5:3b".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url_env: "OLLAMA_BASE_URL".to_string(),
+            region: None,
+            region_env: "AWS_REGION".to_string(),
+        });
+
+        let resolved = config.cheap_model().expect("cheap_model must resolve");
+        assert_eq!(
+            resolved.provider, "ollama",
+            "[cheap_model] must win over [learning.distiller]"
+        );
+        assert_eq!(resolved.model, "qwen2.5:3b");
+    }
+
+    /// S1.2-c: provider=ollama round-trips and the OLLAMA_DEFAULT_BASE_URL
+    /// constant has the expected value.
+    #[test]
+    fn s1_2_c_ollama_default_base_url() {
+        assert_eq!(
+            super::CheapModelSection::OLLAMA_DEFAULT_BASE_URL,
+            "http://localhost:11434/v1",
+            "ollama default base URL must point to localhost:11434/v1"
+        );
+
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.cheap_model = Some(super::CheapModelSection {
+            enabled: true,
+            provider: "ollama".to_string(),
+            model: "llama3.2:3b".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url_env: "OLLAMA_BASE_URL".to_string(),
+            region: None,
+            region_env: "AWS_REGION".to_string(),
+        });
+
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        let cm = reloaded.cheap_model().expect("ollama section must resolve");
+        assert_eq!(cm.provider, "ollama");
+        assert_eq!(cm.model, "llama3.2:3b");
+    }
+
+    /// S1.2-d: absent/disabled cheap model → resolver returns None;
+    /// consumers that call `.cheap_model()` degrade gracefully (no panic).
+    #[test]
+    fn s1_2_d_absent_disabled_returns_none() {
+        // (i) Neither section present/enabled.
+        let config = ProjectConfig::default_for_project("demo");
+        assert!(
+            config.cheap_model().is_none(),
+            "no cheap model configured: must return None"
+        );
+
+        // (ii) [cheap_model] present but disabled.
+        let mut config2 = ProjectConfig::default_for_project("demo");
+        config2.cheap_model = Some(super::CheapModelSection {
+            enabled: false,
+            ..super::CheapModelSection::default()
+        });
+        assert!(
+            config2.cheap_model().is_none(),
+            "disabled cheap_model must return None"
+        );
+
+        // (iii) [learning.distiller] present but disabled → back-compat returns None.
+        let mut config3 = ProjectConfig::default_for_project("demo");
+        config3.learning.distiller.enabled = false;
+        assert!(
+            config3.cheap_model().is_none(),
+            "disabled learning.distiller must return None via back-compat"
+        );
+    }
+
+    /// S1.2: a pre-S1.2 project.toml (no `[cheap_model]` section) must load
+    /// cleanly with `cheap_model = None`.
+    #[test]
+    fn pre_s1_2_config_without_cheap_model_loads_cleanly() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-S1.2 toml must load");
+        assert!(
+            config.cheap_model.is_none(),
+            "cheap_model field must be None when absent from project.toml"
+        );
+        // And the resolver must return None (no distiller enabled either).
+        assert!(
+            config.cheap_model().is_none(),
+            "cheap_model() must return None when no cheap model is configured"
         );
     }
 }

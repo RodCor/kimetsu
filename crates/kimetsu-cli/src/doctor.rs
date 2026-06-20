@@ -36,9 +36,11 @@ use std::time::SystemTime;
 
 use kimetsu_brain::{ambient, embeddings, project, redact, user_brain};
 use kimetsu_core::KimetsuResult;
+use kimetsu_core::config::CheapModelSection;
 use kimetsu_core::paths::ProjectPaths;
 use serde::Serialize;
 
+use crate::distiller::resolve_distiller;
 use crate::process::{KimetsuProc, ProcKind};
 
 /// Per-check status.
@@ -117,6 +119,7 @@ pub fn run(workspace: &Path, opts: DoctorOptions) -> KimetsuResult<DoctorReport>
         check_redact_smoke(),
         check_ambient_collect(workspace),
         check_embedder_default(),
+        check_cheap_model(workspace),
         check_mcp_tools_advertised(workspace, opts.skip_mcp),
         check_hooks_installed(workspace),
         check_running_mcp_servers(),
@@ -429,6 +432,106 @@ fn check_embedder_default() -> CheckReport {
             detail: Some(format!("{} ({} dim)", embedder.model_id(), embedder.dim())),
         }
     }
+}
+
+/// S1.3: check the configured cheap model. When the resolved provider is
+/// `ollama`, probe the endpoint (a GET to /api/tags) and report
+/// reachable/unreachable as an informational Warn — does NOT cause doctor
+/// to exit 1.
+fn check_cheap_model(workspace: &Path) -> CheckReport {
+    const NAME: &str = "cheap model (distiller / harvester)";
+    const CATEGORY: &str = "learning";
+
+    // Resolve the cheap model config.
+    let resolved = resolve_distiller(workspace);
+    let Some(ref r) = resolved else {
+        return CheckReport {
+            name: NAME,
+            category: CATEGORY,
+            outcome: Outcome::Skip {
+                reason: "no cheap model configured — session-end distillation and \
+                         consolidation distillation will not run. Configure \
+                         [cheap_model] or [learning.distiller] to enable."
+                    .into(),
+            },
+            detail: None,
+        };
+    };
+
+    // For non-ollama providers: the credential check already happened in
+    // resolve_distiller; report configured + provider/model.
+    if r.provider != "ollama" {
+        return CheckReport {
+            name: NAME,
+            category: CATEGORY,
+            outcome: Outcome::Pass,
+            detail: Some(format!("provider={} model={}", r.provider, r.model)),
+        };
+    }
+
+    // S1.3: Ollama — probe the endpoint; informational only (no hard fail).
+    let base_url = r
+        .base_url
+        .as_deref()
+        .unwrap_or(CheapModelSection::OLLAMA_DEFAULT_BASE_URL);
+    let tags_url = format!(
+        "{}/api/tags",
+        base_url.trim_end_matches("/v1").trim_end_matches('/')
+    );
+
+    let reachable = probe_ollama(&tags_url);
+    if reachable {
+        CheckReport {
+            name: NAME,
+            category: CATEGORY,
+            outcome: Outcome::Pass,
+            detail: Some(format!(
+                "provider=ollama model={} endpoint={base_url} reachable",
+                r.model
+            )),
+        }
+    } else {
+        CheckReport {
+            name: NAME,
+            category: CATEGORY,
+            // Warn, not Fail — the Ollama server may just not be running yet.
+            outcome: Outcome::Warn {
+                reason: format!(
+                    "provider=ollama endpoint {base_url} unreachable — \
+                     is Ollama running? Start with `ollama serve` or \
+                     `ollama run {model}`.",
+                    model = r.model
+                ),
+            },
+            detail: None,
+        }
+    }
+}
+
+/// Best-effort GET to the Ollama /api/tags endpoint. Returns `true` when
+/// the server responds with any HTTP status (even an error), `false` on
+/// connection failure. Hermetic: 2-second timeout, no external crate deps.
+fn probe_ollama(url: &str) -> bool {
+    // Parse the URL to extract host and port for a raw TCP connect.
+    // We only need to know the server is reachable, not that tags are valid.
+    let stripped = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    use std::net::TcpStream;
+    use std::time::Duration;
+    TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:11434".parse().unwrap()),
+        Duration::from_secs(2),
+    )
+    .is_ok()
 }
 
 fn check_mcp_tools_advertised(_workspace: &Path, skip: bool) -> CheckReport {
