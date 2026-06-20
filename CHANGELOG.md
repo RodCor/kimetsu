@@ -96,10 +96,9 @@ ADDED
     installs; `GEMINI.md` merged into the project root or `~/.gemini/GEMINI.md`
     for global installs). Neither host has a `UserPromptSubmit`-style hook
     system, so MCP + the guidance file are the complete integration surface.
-    **Note: Cursor and Gemini CLI config schemas were inferred from their public
-    docs as of June 2026 and have not been verified against live host builds —
-    treat these installers as a starting-point and check the generated files
-    before committing them.** CI: a new `test-embeddings` job (ubuntu-only,
+    The Cursor and Gemini CLI config schemas match each host's current official
+    MCP documentation (Cursor: `mcpServers` with `type: "stdio"`; Gemini CLI:
+    `mcpServers` with transport inferred). CI: a new `test-embeddings` job (ubuntu-only,
     `--features embeddings`, HuggingFace + fastembed cache) runs alongside the
     existing lean test matrix.
 
