@@ -10,6 +10,8 @@ pub mod consolidate;
 pub mod context;
 pub mod dropped_capsule;
 pub mod embeddings;
+/// Flagship 1 / Story 1.3: episodic work-resume capture, storage, and surface.
+pub mod episode;
 pub mod eval;
 pub mod ingest;
 pub mod lock;

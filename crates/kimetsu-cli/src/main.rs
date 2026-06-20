@@ -154,6 +154,31 @@ enum Command {
     /// Takes a new user from zero to a verified working brain in ONE command,
     /// instead of running `init` + `plugin install` + `doctor --selftest` separately.
     Setup(SetupArgs),
+    /// Save a mid-session work checkpoint now.
+    ///
+    /// Captures the current work episode (task, open threads, dead-ends,
+    /// hypothesis) into the brain so the next session can resume from here.
+    /// Optionally accepts a short note to add context.
+    ///
+    /// The episode is per-repo: one live episode per git repo at a time.
+    /// A new checkpoint supersedes the previous one.
+    ///
+    /// Examples:
+    ///   kimetsu checkpoint
+    ///   kimetsu checkpoint "about to try the new approach"
+    ///   kimetsu checkpoint --workspace /path/to/repo "switching branches"
+    Checkpoint(CheckpointArgs),
+    /// Print the last saved work episode for the current repo.
+    ///
+    /// Shows what you were working on, what's open, what failed, and the
+    /// current working hypothesis — so you can pick up exactly where you
+    /// left off.  Prints a friendly message when no episode has been saved
+    /// yet.
+    ///
+    /// Examples:
+    ///   kimetsu resume
+    ///   kimetsu resume --workspace /path/to/repo
+    Resume(ResumeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -924,6 +949,25 @@ struct SessionEndHookArgs {
     workspace: Option<PathBuf>,
 }
 
+/// Args for `kimetsu checkpoint`.
+#[derive(Debug, Args)]
+struct CheckpointArgs {
+    /// Optional note to attach to this checkpoint.
+    #[arg(value_name = "NOTE")]
+    note: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu resume`.
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 /// Args for `kimetsu brain tune`.
 #[derive(Debug, Args)]
 struct TuneArgs {
@@ -1556,6 +1600,8 @@ fn run() -> KimetsuResult<()> {
         Command::Stop(args) => stop_cmd(args),
         Command::Restart(args) => restart_cmd(args),
         Command::Setup(args) => setup_cmd(args),
+        Command::Checkpoint(args) => checkpoint_cmd(args),
+        Command::Resume(args) => resume_cmd(args),
     }
 }
 
@@ -1576,6 +1622,83 @@ fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
         keep_plugins: args.keep_plugins,
         delete_user_data: args.delete_user_data,
     })
+}
+
+// ── kimetsu checkpoint ────────────────────────────────────────────────────────
+
+/// `kimetsu checkpoint [note]` — manually save a mid-session work episode.
+fn checkpoint_cmd(args: CheckpointArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let note = args.note.as_deref().unwrap_or("");
+
+    // Use capture_episode_now with an empty transcript (manual save does not
+    // require a transcript — the note itself is sufficient context).
+    let ok = distiller::capture_episode_now(&workspace, "", note);
+
+    if ok {
+        println!("[Kimetsu] Work checkpoint saved.");
+        if !note.is_empty() {
+            println!("  Note: {note}");
+        }
+    } else {
+        // Could not write — likely no project initialised here.
+        eprintln!(
+            "[Kimetsu] Could not save checkpoint: no Kimetsu project found at {}.\n\
+             Run `kimetsu init` to initialise one.",
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+// ── kimetsu resume ────────────────────────────────────────────────────────────
+
+/// `kimetsu resume` — print the last saved work episode.
+fn resume_cmd(args: ResumeArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    match kimetsu_brain::episode::load_live_episode_for_workspace(&workspace) {
+        Ok(Some(ep)) => {
+            println!("── Resume: last session ──────────────────────────────");
+            if !ep.task.is_empty() {
+                println!("Task:       {}", ep.task);
+            }
+            if !ep.summary.is_empty() {
+                println!("Summary:    {}", ep.summary);
+            }
+            if !ep.open_threads.is_empty() {
+                println!("Open:       {}", ep.open_threads.join("; "));
+            }
+            if !ep.dead_ends.is_empty() {
+                println!("Avoid:      {}", ep.dead_ends.join("; "));
+            }
+            if !ep.hypothesis.is_empty() {
+                println!("Hypothesis: {}", ep.hypothesis);
+            }
+            if !ep.note.is_empty() {
+                println!("Note:       {}", ep.note);
+            }
+            println!("Saved:      {}", ep.created_at);
+            println!("─────────────────────────────────────────────────────");
+        }
+        Ok(None) => {
+            println!("[Kimetsu] No work episode saved for this repo yet.");
+            println!("  Episodes are captured automatically at session end.");
+            println!("  You can save one now with: kimetsu checkpoint");
+        }
+        Err(e) => {
+            eprintln!("[Kimetsu] Could not load episode: {e}");
+            eprintln!(
+                "  Make sure a Kimetsu project is initialised at {}.",
+                workspace.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ── kimetsu ps ───────────────────────────────────────────────────────────────

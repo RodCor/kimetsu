@@ -69,6 +69,11 @@ fn migrations() -> &'static [Migration] {
             description: "add memory_edges typed-edge projection table (S5.2 graph-lite backend)",
             up: crate::schema::migrate_v3_to_v4,
         },
+        Migration {
+            version: 5,
+            description: "add work_episodes projection table (Flagship 1 episodic resume, Story 1.3)",
+            up: crate::schema::migrate_v4_to_v5,
+        },
     ]
 }
 
