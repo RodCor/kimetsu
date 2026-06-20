@@ -13,7 +13,7 @@ use kimetsu_agent::model::{
 };
 use kimetsu_agent::openai::OpenAiProvider;
 use kimetsu_brain::project;
-use kimetsu_core::config::ProjectConfig;
+use kimetsu_core::config::{CheapModelSection, ProjectConfig};
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
 use kimetsu_core::paths::{ProjectPaths, user_brain_enabled, user_kimetsu_dir};
@@ -271,101 +271,122 @@ fn resolve_distiller_with(
     workspace: &Path,
     global_dir: Option<std::path::PathBuf>,
 ) -> Option<ResolvedDistiller> {
-    // 1. Workspace distiller (Project scope).
+    // 1. Workspace cheap model (Project scope).
+    // S1.2: use config.cheap_model() which resolves [cheap_model] → [learning.distiller]
+    // in priority order, providing back-compat for existing configs.
     if let Ok(paths) = ProjectPaths::discover(workspace)
         && let Ok(config) = project::load_config(&paths)
     {
-        let d = &config.learning.distiller;
-        if d.enabled
-            && let Some(provider) = normalize_distiller_provider(&d.provider)
-        {
-            if provider == "bedrock" {
-                // Bedrock: needs access key, secret key, and region; no api_key_env.
-                let access_key = resolve_env_value(&paths.repo_root, "AWS_ACCESS_KEY_ID");
-                let secret_key = resolve_env_value(&paths.repo_root, "AWS_SECRET_ACCESS_KEY");
-                let session_token = resolve_env_value(&paths.repo_root, "AWS_SESSION_TOKEN");
-                let region = d.region.clone().or_else(|| {
-                    resolve_env_value(&paths.repo_root, &d.region_env)
-                        .or_else(|| resolve_env_value(&paths.repo_root, "AWS_DEFAULT_REGION"))
-                });
-                if let (Some(ak), Some(sk), Some(rg)) = (access_key, secret_key, region) {
-                    return Some(ResolvedDistiller {
-                        provider: provider.to_string(),
-                        model: d.model.clone(),
-                        key: ak,
-                        base_url: None,
-                        timeout_secs: config.model.request_timeout_secs,
-                        scope: MemoryScope::Project,
-                        record_start: paths.repo_root.clone(),
-                        secret_key: Some(sk),
-                        session_token,
-                        region: Some(rg),
-                    });
-                }
-            } else if let Some(key) = resolve_env_value(&paths.repo_root, &d.api_key_env) {
-                return Some(ResolvedDistiller {
-                    provider: provider.to_string(),
-                    model: d.model.clone(),
-                    key,
-                    base_url: resolve_env_value(&paths.repo_root, &d.base_url_env),
-                    timeout_secs: config.model.request_timeout_secs,
-                    scope: MemoryScope::Project,
-                    record_start: paths.repo_root.clone(),
-                    secret_key: None,
-                    session_token: None,
-                    region: None,
-                });
+        if let Some(cm) = config.cheap_model() {
+            if let Some(resolved) = resolve_from_cheap_model(
+                &cm,
+                &paths.repo_root,
+                config.model.request_timeout_secs,
+                MemoryScope::Project,
+                paths.repo_root.clone(),
+            ) {
+                return Some(resolved);
             }
         }
     }
-    // 2. Global distiller (GlobalUser scope).
+    // 2. Global cheap model (GlobalUser scope).
     if let Some(dir) = global_dir
         && let Ok(text) = std::fs::read_to_string(dir.join("project.toml"))
         && let Ok(config) = ProjectConfig::from_toml(&text)
     {
-        let d = &config.learning.distiller;
-        if d.enabled
-            && let Some(provider) = normalize_distiller_provider(&d.provider)
-        {
-            if provider == "bedrock" {
-                let access_key = resolve_env_value(&dir, "AWS_ACCESS_KEY_ID");
-                let secret_key = resolve_env_value(&dir, "AWS_SECRET_ACCESS_KEY");
-                let session_token = resolve_env_value(&dir, "AWS_SESSION_TOKEN");
-                let region = d.region.clone().or_else(|| {
-                    resolve_env_value(&dir, &d.region_env)
-                        .or_else(|| resolve_env_value(&dir, "AWS_DEFAULT_REGION"))
-                });
-                if let (Some(ak), Some(sk), Some(rg)) = (access_key, secret_key, region) {
-                    return Some(ResolvedDistiller {
-                        provider: provider.to_string(),
-                        model: d.model.clone(),
-                        key: ak,
-                        base_url: None,
-                        timeout_secs: config.model.request_timeout_secs,
-                        scope: MemoryScope::GlobalUser,
-                        record_start: workspace.to_path_buf(),
-                        secret_key: Some(sk),
-                        session_token,
-                        region: Some(rg),
-                    });
-                }
-            } else if let Some(key) = resolve_env_value(&dir, &d.api_key_env) {
-                return Some(ResolvedDistiller {
-                    provider: provider.to_string(),
-                    model: d.model.clone(),
-                    key,
-                    base_url: resolve_env_value(&dir, &d.base_url_env),
-                    timeout_secs: config.model.request_timeout_secs,
-                    scope: MemoryScope::GlobalUser,
-                    record_start: workspace.to_path_buf(),
-                    secret_key: None,
-                    session_token: None,
-                    region: None,
-                });
+        if let Some(cm) = config.cheap_model() {
+            if let Some(resolved) = resolve_from_cheap_model(
+                &cm,
+                &dir,
+                config.model.request_timeout_secs,
+                MemoryScope::GlobalUser,
+                workspace.to_path_buf(),
+            ) {
+                return Some(resolved);
             }
         }
     }
     None
+}
+
+/// Attempt to build a `ResolvedDistiller` from a `CheapModelSection`.
+/// Returns `None` when credentials are missing (e.g. the required env var
+/// is not set) — callers try the next tier or return `None` (graceful
+/// degradation, no panic).
+fn resolve_from_cheap_model(
+    cm: &CheapModelSection,
+    env_root: &Path,
+    timeout_secs: u64,
+    scope: MemoryScope,
+    record_start: std::path::PathBuf,
+) -> Option<ResolvedDistiller> {
+    let provider = normalize_distiller_provider(&cm.provider)?;
+    match provider {
+        "bedrock" => {
+            let access_key = resolve_env_value(env_root, "AWS_ACCESS_KEY_ID");
+            let secret_key = resolve_env_value(env_root, "AWS_SECRET_ACCESS_KEY");
+            let session_token = resolve_env_value(env_root, "AWS_SESSION_TOKEN");
+            let region = cm.region.clone().or_else(|| {
+                resolve_env_value(env_root, &cm.region_env)
+                    .or_else(|| resolve_env_value(env_root, "AWS_DEFAULT_REGION"))
+            });
+            if let (Some(ak), Some(sk), Some(rg)) = (access_key, secret_key, region) {
+                Some(ResolvedDistiller {
+                    provider: provider.to_string(),
+                    model: cm.model.clone(),
+                    key: ak,
+                    base_url: None,
+                    timeout_secs,
+                    scope,
+                    record_start,
+                    secret_key: Some(sk),
+                    session_token,
+                    region: Some(rg),
+                })
+            } else {
+                None
+            }
+        }
+        // S1.1: Ollama uses the OpenAI-compatible request path; API key is
+        // optional (empty string is fine). Base URL defaults to
+        // http://localhost:11434/v1 when no env override is present.
+        "ollama" => {
+            let base_url = resolve_env_value(env_root, &cm.base_url_env)
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| CheapModelSection::OLLAMA_DEFAULT_BASE_URL.to_string());
+            // API key optional for Ollama — use an empty placeholder so the
+            // OpenAI-compatible client path doesn't reject a missing key.
+            let key = resolve_env_value(env_root, &cm.api_key_env).unwrap_or_default();
+            Some(ResolvedDistiller {
+                provider: provider.to_string(),
+                model: cm.model.clone(),
+                key,
+                base_url: Some(base_url),
+                timeout_secs,
+                scope,
+                record_start,
+                secret_key: None,
+                session_token: None,
+                region: None,
+            })
+        }
+        // anthropic / openai: require an API key from env.
+        _ => {
+            let key = resolve_env_value(env_root, &cm.api_key_env)?;
+            Some(ResolvedDistiller {
+                provider: provider.to_string(),
+                model: cm.model.clone(),
+                key,
+                base_url: resolve_env_value(env_root, &cm.base_url_env),
+                timeout_secs,
+                scope,
+                record_start,
+                secret_key: None,
+                session_token: None,
+                region: None,
+            })
+        }
+    }
 }
 
 fn normalize_distiller_provider(provider: &str) -> Option<&'static str> {
@@ -373,6 +394,9 @@ fn normalize_distiller_provider(provider: &str) -> Option<&'static str> {
         "anthropic" | "claude" => Some("anthropic"),
         "openai" | "oai" | "gpt" => Some("openai"),
         "bedrock" | "aws" => Some("bedrock"),
+        // S1.1: Ollama exposes an OpenAI-compatible API at localhost:11434/v1;
+        // no API key required.
+        "ollama" => Some("ollama"),
         _ => None,
     }
 }
@@ -409,7 +433,9 @@ pub fn make_provider_for_resolved(resolved: &ResolvedDistiller) -> Option<Box<dy
         )
         .ok()
         .map(|p| Box::new(p) as Box<dyn ModelProvider>),
-        "openai" => OpenAiProvider::for_distiller(
+        // S1.1: ollama reuses the OpenAI-compatible path; base_url is
+        // always set (defaults to http://localhost:11434/v1).
+        "openai" | "ollama" => OpenAiProvider::for_distiller(
             &resolved.model,
             resolved.key.clone(),
             resolved.base_url.clone(),
@@ -456,7 +482,9 @@ pub fn run_distiller_for_transcript(workspace: &Path, transcript_path: &str) -> 
             Ok(provider) => Box::new(provider),
             Err(_) => return None,
         },
-        "openai" => match OpenAiProvider::for_distiller(
+        // S1.1: ollama reuses the OpenAI-compatible path; base_url is always
+        // set (defaults to http://localhost:11434/v1 at resolve time).
+        "openai" | "ollama" => match OpenAiProvider::for_distiller(
             &resolved.model,
             resolved.key,
             resolved.base_url,
@@ -527,6 +555,14 @@ mod tests {
         assert_eq!(normalize_distiller_provider("oai"), Some("openai"));
         assert_eq!(normalize_distiller_provider("gpt"), Some("openai"));
         assert_eq!(normalize_distiller_provider("unknown"), None);
+    }
+
+    // S1.1: ollama provider
+    #[test]
+    fn normalize_distiller_provider_ollama() {
+        assert_eq!(normalize_distiller_provider("ollama"), Some("ollama"));
+        assert_eq!(normalize_distiller_provider("Ollama"), Some("ollama"));
+        assert_eq!(normalize_distiller_provider("OLLAMA"), Some("ollama"));
     }
 
     fn text_response(text: &str) -> ModelResponse {

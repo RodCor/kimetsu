@@ -52,20 +52,27 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
         "  brain — so good memories get captured without you recording them by hand."
     )?;
     writeln!(writer)?;
-    writeln!(writer, "  Before enabling, know that it:")?;
+    writeln!(writer, "  Providers:")?;
     writeln!(
         writer,
-        "    - costs a little: one short call to a cheap model (e.g. Claude Haiku) per"
+        "    - anthropic (default): Claude Haiku, billed to your Anthropic key;"
     )?;
-    writeln!(writer, "      session, billed to the API key you provide;")?;
     writeln!(
         writer,
-        "    - sends that session's transcript to the provider you pick (Anthropic or"
+        "    - openai: GPT-mini or any OpenAI-compatible endpoint;"
     )?;
-    writeln!(writer, "      OpenAI / a compatible endpoint);")?;
     writeln!(
         writer,
-        "    - stores your API key in a gitignored .env file, in plain text."
+        "    - ollama: fully local, zero cost, zero external calls (needs `ollama serve`)."
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "  For cloud providers: transcript is sent to the provider you pick and"
+    )?;
+    writeln!(
+        writer,
+        "  your API key is stored in a gitignored .env file (plain text)."
     )?;
     writeln!(writer)?;
     writeln!(writer, "  Fully optional — turn it off any time with")?;
@@ -105,7 +112,7 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
 
     write!(
         writer,
-        "Which model should run the harvester? [anthropic/openai] [anthropic]: "
+        "Which model should run the harvester? [anthropic/openai/ollama] [anthropic]: "
     )?;
     writer.flush()?;
     let provider_input = read_line(reader)?.trim().to_string();
@@ -121,7 +128,8 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     write!(writer, "{}", choice.key_prompt)?;
     writer.flush()?;
     let key = read_line(reader)?.trim().to_string();
-    if key.is_empty() {
+    // Ollama does not require an API key — an empty key is fine.
+    if key.is_empty() && choice.provider != "ollama" {
         writeln!(
             writer,
             "Skipped — you can enable auto-harvest later by re-running \
@@ -150,19 +158,31 @@ pub fn run_harvest_setup<R: BufRead, W: Write>(
     )?;
     // Gitignore `.env` BEFORE writing the secret into it.
     ensure_gitignored(&target.gitignore_dir, ".env")?;
-    upsert_env_var(&target.env_path, choice.api_key_env, &key)?;
+    // For ollama the API key is optional — don't write an empty-value line.
+    if !key.is_empty() {
+        upsert_env_var(&target.env_path, choice.api_key_env, &key)?;
+    }
     if !base_url.is_empty() {
         upsert_env_var(&target.env_path, choice.base_url_env, &base_url)?;
     }
 
     let pretty_env = kimetsu_core::paths::display_path(&target.env_path);
-    writeln!(
-        writer,
-        "\u{2713} Auto-harvest enabled for {scope_label} — {} model {model}. \
-         Key saved to {pretty_env} (gitignored). \
-         Turn it off any time with `kimetsu config set learning.auto_harvest false`.",
-        choice.provider,
-    )?;
+    if choice.provider == "ollama" {
+        writeln!(
+            writer,
+            "\u{2713} Auto-harvest enabled for {scope_label} — ollama model {model}. \
+             No API key needed (local inference). \
+             Turn it off any time with `kimetsu config set learning.auto_harvest false`.",
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "\u{2713} Auto-harvest enabled for {scope_label} — {} model {model}. \
+             Key saved to {pretty_env} (gitignored). \
+             Turn it off any time with `kimetsu config set learning.auto_harvest false`.",
+            choice.provider,
+        )?;
+    }
     Ok(true)
 }
 
@@ -189,6 +209,17 @@ fn resolve_distiller_provider(input: &str) -> Option<DistillerProviderChoice> {
             default_model: "gpt-5.4-mini",
             key_prompt: "OpenAI API key (saved to .env; create one at https://platform.openai.com/api-keys): ",
             base_url_prompt: "Custom endpoint URL (optional — blank for OpenAI; accepts a root or /v1 URL): ",
+        }),
+        // S1.1: Ollama — local, no API key required. The base URL defaults to
+        // http://localhost:11434/v1 when left blank. Recommended small instruct
+        // models: qwen2.5:3b, llama3.2:3b.
+        "ollama" => Some(DistillerProviderChoice {
+            provider: "ollama",
+            api_key_env: "OLLAMA_API_KEY",
+            base_url_env: "OLLAMA_BASE_URL",
+            default_model: "qwen2.5:3b",
+            key_prompt: "Ollama API key (optional — press Enter to skip; only needed for remote/authenticated Ollama deployments): ",
+            base_url_prompt: "Ollama base URL (optional — blank defaults to http://localhost:11434/v1): ",
         }),
         _ => None,
     }
