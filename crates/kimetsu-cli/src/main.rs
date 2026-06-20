@@ -3,6 +3,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod ask;
 mod distiller;
 mod doctor;
 mod embed_daemon;
@@ -808,6 +809,38 @@ enum BrainCommand {
     ///   kimetsu brain triage --score-floor 0.1 --age-days 60
     ///   kimetsu brain triage --prune-all --yes
     Triage(TriageArgs),
+    /// Ask the brain a question and receive a grounded, cited answer.
+    ///
+    /// Retrieves relevant memories, composes an answer via the configured
+    /// cheap model (local/offline preferred; see DP-B), and prints the
+    /// result. When no model is configured, returns the top capsule texts
+    /// verbatim (never hard-fails). When retrieval is empty, prints a
+    /// grounded-only refusal — the brain never halluccinates.
+    ///
+    /// Examples:
+    ///   kimetsu brain ask "how do I run the tests?"
+    ///   kimetsu brain ask "what's the cargo build command?" --json
+    ///   kimetsu brain ask "explain the broker" --helpful memory:01ABC
+    Ask(AskArgs),
+}
+
+/// Args for `kimetsu brain ask`.
+#[derive(Debug, clap::Args)]
+struct AskArgs {
+    /// The question to ask the brain.
+    question: String,
+    /// Emit machine-readable JSON (stable schema: answer, citations,
+    /// grounded, model_used, verbatim).
+    #[arg(long)]
+    json: bool,
+    /// Mark a prior answer as helpful, recording a citation for each
+    /// memory id in CITATIONS (comma-separated `memory:<id>` handles).
+    /// Example: `kimetsu brain ask --helpful memory:01ABC,memory:01DEF ""`
+    #[arg(long, value_name = "CITATIONS")]
+    helpful: Option<String>,
+    /// Override the workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3766,6 +3799,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Tune(args) => brain_tune(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Triage(args) => brain_triage(args),
+        BrainCommand::Ask(args) => brain_ask(args),
     }
 }
 
@@ -5742,6 +5776,93 @@ fn format_token_count(n: u64) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Flagship 3.1 — `kimetsu brain ask "<question>"`.
+///
+/// Retrieves brain context for the question and composes a grounded, cited
+/// answer using the configured cheap model (local preferred). Degrades
+/// gracefully: verbatim capsule dump when no model is configured, refusal
+/// when retrieval is empty. Never hard-fails.
+fn brain_ask(args: AskArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // --helpful mode: mark a prior answer helpful by citing its memories.
+    if let Some(citations_raw) = &args.helpful {
+        let handles: Vec<String> = citations_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if handles.is_empty() {
+            eprintln!("--helpful requires at least one memory handle (e.g. memory:01ABC)");
+            return Ok(());
+        }
+        ask::record_helpful_mark(&workspace, &handles);
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "marked_helpful": handles,
+                }))?
+            );
+        } else {
+            println!("Marked {} citation(s) helpful.", handles.len());
+        }
+        return Ok(());
+    }
+
+    let question = args.question.trim();
+    if question.is_empty() {
+        eprintln!("Usage: kimetsu brain ask \"<question>\"");
+        return Ok(());
+    }
+
+    let result = ask::compose_answer(&workspace, question);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "question": question,
+                "answer": result.answer,
+                "citations": result.citations,
+                "grounded": result.grounded,
+                "model_used": result.model_used,
+                "verbatim": result.verbatim,
+            }))?
+        );
+        return Ok(());
+    }
+
+    // Human-readable output.
+    println!("{}", result.answer);
+    if !result.citations.is_empty() {
+        println!();
+        println!("Sources: {}", result.citations.join(", "));
+    }
+    if !result.grounded {
+        // Already printed refusal text; nothing more to do.
+    } else if result.verbatim {
+        println!();
+        println!(
+            "Tip: configure a cheap model in project.toml \
+             ([cheap_model] provider = \"ollama\" …) for composed answers."
+        );
+    } else {
+        // Hint for the helpful-mark workflow.
+        if !result.citations.is_empty() {
+            let handles = result.citations.join(",");
+            println!();
+            println!("If this helped, run: kimetsu brain ask --helpful {handles} \"\"",);
+        }
+    }
+
+    Ok(())
 }
 
 /// v0.6: `kimetsu brain context-hook` — UserPromptSubmit hook.
