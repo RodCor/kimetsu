@@ -1579,6 +1579,12 @@ fn weights_for_stage(weights: &BrokerWeights, stage: &str) -> StageWeights {
     })
 }
 
+/// S5.2: `pub(crate)` so `backend.rs` (GraphLiteBackend) can build graph-
+/// reached candidates without duplicating the scope weight logic.
+pub(crate) fn scope_weight_pub(scope: &str) -> f32 {
+    scope_weight(scope)
+}
+
 fn scope_weight(scope: &str) -> f32 {
     match scope.parse::<MemoryScope>() {
         Ok(MemoryScope::Run) => 1.0,
@@ -1587,6 +1593,12 @@ fn scope_weight(scope: &str) -> f32 {
         Ok(MemoryScope::GlobalUser) => 0.5,
         Err(_) => 0.3,
     }
+}
+
+/// S5.2: `pub(crate)` so `backend.rs` (GraphLiteBackend) can build graph-
+/// reached candidates without duplicating the freshness logic.
+pub(crate) fn freshness_pub(created_at: &str) -> f32 {
+    freshness(created_at)
 }
 
 fn freshness(created_at: &str) -> f32 {
@@ -2184,6 +2196,12 @@ fn cap_sentences(text: &str, n: usize) -> &str {
     }
     // Fewer than n sentences — return the whole text.
     text.trim_end()
+}
+
+/// S5.2: `pub(crate)` so `backend.rs` (GraphLiteBackend) can build graph-
+/// reached candidates without duplicating the excerpt logic.
+pub(crate) fn excerpt_pub(text: &str) -> String {
+    excerpt(text)
 }
 
 fn excerpt(text: &str) -> String {

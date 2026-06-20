@@ -348,6 +348,47 @@ pub(crate) fn migrate_v2_to_v3(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// The v3→v4 migration: add the `memory_edges` typed-edge projection table.
+///
+/// This table is the storage substrate for the S5.2 `GraphLiteBackend`.
+/// It is a **projection** (derivable from the event log) — `reset_projection`
+/// clears it and `rebuild_in_place` repopulates it by replaying events.
+///
+/// Edge types:
+/// * `supersedes`         — populated NOW from `memory.superseded` events.
+///   The surviving memory acquires a directed edge toward each member it
+///   absorbed.  Edge direction: `src_id` (survivor) → `dst_id` (member).
+/// * `refines`            — reserved; populated by the live write path when
+///   a `memory.accepted` event carries `refines_id` in the payload
+///   (Flagship 1 / Story 1.7).
+/// * `dead_end_of`        — reserved; populated when an episodic resume
+///   event closes a task-dead-end chain.
+/// * `decision_touches`   — reserved; decision memory → touched file paths.
+/// * `lesson_from`        — reserved; lesson memory → source memory / run.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner.  Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v3_to_v4(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_edges (
+            src_id      TEXT NOT NULL,
+            dst_id      TEXT NOT NULL,
+            edge_type   TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (src_id, dst_id, edge_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_edges_src
+            ON memory_edges (src_id, edge_type);
+
+        CREATE INDEX IF NOT EXISTS idx_memory_edges_dst
+            ON memory_edges (dst_id, edge_type);
+        ",
+    )?;
+    Ok(())
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only
@@ -476,18 +517,19 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1. Fresh init reaches v3 with full shape
+    // 1. Fresh init reaches v4 with full shape
     // ------------------------------------------------------------------
     #[test]
-    fn fresh_init_reaches_v3_with_full_shape() {
+    fn fresh_init_reaches_v4_with_full_shape() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("initialize");
 
-        // Version must be 3.
+        // Version must be at target (currently 4).
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            3,
-            "fresh DB must be at schema version 3 after initialize"
+            KIMETSU_SCHEMA_VERSION,
+            "fresh DB must be at current schema version after initialize"
         );
 
         // Post-migration columns exist on `memories`.
@@ -510,7 +552,7 @@ mod tests {
             "memories must have `superseded_by` column after v3 migration"
         );
 
-        // Tables added by the migration exist.
+        // Tables added by the migrations exist.
         assert!(
             table_exists(&conn, "memory_citations"),
             "memory_citations table must exist"
@@ -518,6 +560,11 @@ mod tests {
         assert!(
             table_exists(&conn, "memory_conflicts"),
             "memory_conflicts table must exist"
+        );
+        // v4: typed-edge projection table
+        assert!(
+            table_exists(&conn, "memory_edges"),
+            "memory_edges table must exist after v4 migration"
         );
     }
 
@@ -552,8 +599,8 @@ mod tests {
         );
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            3,
-            "version must still be 3"
+            4,
+            "version must still be 4"
         );
 
         // Data must be intact.
@@ -568,17 +615,18 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 3. Idempotent initialize: calling initialize twice succeeds, version stays 3
+    // 3. Idempotent initialize: calling initialize twice succeeds, version stays at target
     // ------------------------------------------------------------------
     #[test]
     fn idempotent_initialize_twice() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("first initialize");
         initialize(&conn).expect("second initialize must not error");
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            3,
-            "version must still be 3 after double initialize"
+            KIMETSU_SCHEMA_VERSION,
+            "version must still be at target after double initialize"
         );
     }
 
@@ -729,5 +777,56 @@ mod tests {
             msg.contains("newer"),
             "error message must contain 'newer', got: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // S5.2-v4. v3→v4 migration adds memory_edges table + indexes
+    // ------------------------------------------------------------------
+    #[test]
+    fn v3_to_v4_migration_adds_memory_edges() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Build a v3 DB (baseline + v1→v2 + v2→v3, no v3→v4).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+        conn.execute(
+            "UPDATE schema_info SET value = 3 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v3");
+
+        // memory_edges must NOT exist yet.
+        assert!(
+            !table_exists(&conn, "memory_edges"),
+            "memory_edges must not exist before v4 migration"
+        );
+
+        // Run v3→v4.
+        migrate_v3_to_v4(&conn).expect("migrate_v3_to_v4");
+
+        // Table must now exist.
+        assert!(
+            table_exists(&conn, "memory_edges"),
+            "memory_edges must exist after v4 migration"
+        );
+
+        // Indexes must exist.
+        let src_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memory_edges_src'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_memory_edges_src");
+        assert_eq!(src_idx, 1, "idx_memory_edges_src must exist");
+
+        let dst_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memory_edges_dst'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_memory_edges_dst");
+        assert_eq!(dst_idx, 1, "idx_memory_edges_dst must exist");
     }
 }

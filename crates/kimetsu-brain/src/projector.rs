@@ -118,6 +118,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
         DELETE FROM memories_fts;
         DELETE FROM memory_citations;
         DELETE FROM memory_conflicts;
+        DELETE FROM memory_edges;
         ",
     )?;
     Ok(())
@@ -736,6 +737,41 @@ fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()
     #[cfg(feature = "embeddings")]
     crate::ann::on_supersede(conn, memory_id);
 
+    // 6. S5.2: insert a `supersedes` edge from survivor → member into the
+    //    typed-edge projection table so graph-lite traversal can follow it.
+    let edge_ts = ts_text(event)?;
+    insert_memory_edge(conn, survivor_id, memory_id, "supersedes", &edge_ts)?;
+
+    Ok(())
+}
+
+/// S5.2: insert a typed edge into `memory_edges`.
+///
+/// This is the **single canonical path** for writing to `memory_edges`.
+/// Call it from any projector that wants to populate an edge type.
+///
+/// Currently populated edge types:
+///   * `"supersedes"` — populated here by `apply_memory_superseded`.
+///
+/// Reserved edge types (populated by Flagship 1 / Story 1.7):
+///   * `"refines"`          — memory A refines / narrows memory B.
+///   * `"dead_end_of"`      — task outcome closes a dead-end chain.
+///   * `"decision_touches"` — decision memory touches a file path.
+///   * `"lesson_from"`      — lesson memory derived from a source memory.
+///
+/// The INSERT is `OR IGNORE` so replaying the same event twice is safe.
+pub(crate) fn insert_memory_edge(
+    conn: &Connection,
+    src_id: &str,
+    dst_id: &str,
+    edge_type: &str,
+    created_at: &str,
+) -> KimetsuResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_edges (src_id, dst_id, edge_type, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![src_id, dst_id, edge_type, created_at],
+    )?;
     Ok(())
 }
 
