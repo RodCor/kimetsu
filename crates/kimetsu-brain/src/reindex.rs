@@ -254,9 +254,12 @@ fn reindex_one_conn(
     opts: &ReindexOptions,
     remaining: &mut Option<usize>,
 ) -> KimetsuResult<ScopeReport> {
-    // Total active rows (for the friendly "x of y" output).
+    // S4.4a: count only truly-active memories (not invalidated, not superseded).
+    // Superseded rows are retired by consolidation — re-embedding them would
+    // waste work because they are never returned by retrieval.
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+        "SELECT COUNT(*) FROM memories \
+         WHERE invalidated_at IS NULL AND superseded_by IS NULL",
         [],
         |row| row.get(0),
     )?;
@@ -277,10 +280,12 @@ fn reindex_one_conn(
     }
 
     // Candidate predicate:
-    //   force          -> every active row
+    //   force          -> every active (non-superseded) row
     //   default        -> rows where embedding_model is NULL OR != active model
     // NULL captures both "never embedded" and "embedded with a model
     // that didn't bother to record an id".
+    // S4.4a: superseded rows are retired and never returned by retrieval, so
+    // we skip them here — no point spending embedding work on them.
     let model_id = embedder.model_id().to_string();
     let mut stmt = if opts.force {
         conn.prepare(
@@ -288,6 +293,7 @@ fn reindex_one_conn(
             SELECT memory_id, text
             FROM memories
             WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
             ORDER BY created_at ASC
             ",
         )?
@@ -297,6 +303,7 @@ fn reindex_one_conn(
             SELECT memory_id, text
             FROM memories
             WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
               AND (embedding_model IS NULL OR embedding_model != ?1)
             ORDER BY created_at ASC
             ",
@@ -780,6 +787,76 @@ mod tests {
             assert!(
                 blob.iter().any(|&b| b != 0),
                 "force should have overwritten the zero embedding"
+            );
+        });
+    }
+
+    /// S4.4a: `reindex_one_conn` must skip superseded rows — they are
+    /// retired by consolidation and never returned by retrieval, so
+    /// re-embedding them would waste work.
+    #[test]
+    fn reindex_one_conn_skips_superseded_rows() {
+        with_user_brain_disabled(|| {
+            let conn = rusqlite::Connection::open_in_memory().expect("open");
+            crate::schema::initialize(&conn).expect("init");
+
+            // Insert one active memory and one superseded memory (no embedding yet).
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at,
+                    use_count, usefulness_score
+                )
+                VALUES ('m_active', 'repo', 'fact', 'active text', 'active text', 1.0,
+                        NULL, '{}', '2026-05-01T00:00:00Z', 0, 0.0)
+                ",
+                [],
+            )
+            .expect("insert active");
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at,
+                    use_count, usefulness_score, superseded_by
+                )
+                VALUES ('m_superseded', 'repo', 'fact', 'superseded text', 'superseded text', 1.0,
+                        NULL, '{}', '2026-05-02T00:00:00Z', 0, 0.0, 'm_active')
+                ",
+                [],
+            )
+            .expect("insert superseded");
+
+            let stub = StubEmbedder::new();
+            let mut remaining = None;
+            let report = reindex_one_conn(
+                &conn,
+                "project",
+                &stub,
+                &ReindexOptions::default(),
+                &mut remaining,
+            )
+            .expect("reindex");
+
+            // total should be 1 (only the active row counts).
+            assert_eq!(report.total, 1, "total must exclude superseded rows");
+            // Only the active row should be a candidate.
+            assert_eq!(report.candidates, 1, "only active rows are candidates");
+            assert_eq!(report.updated, 1, "only active row updated");
+            assert_eq!(report.failed, 0);
+
+            // Superseded row must still have NULL embedding (was never touched).
+            let superseded_embedding: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT embedding FROM memories WHERE memory_id = 'm_superseded'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("fetch superseded");
+            assert!(
+                superseded_embedding.is_none(),
+                "superseded row must not have been embedded"
             );
         });
     }

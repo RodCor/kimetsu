@@ -281,9 +281,12 @@ fn check_project_brain_opens(workspace: &Path) -> CheckReport {
 fn check_user_brain_opens() -> CheckReport {
     match user_brain::open_user_brain_readonly() {
         Ok(Some(conn)) => {
+            // S4.1: exclude superseded rows so the active count matches
+            // retrieval (which already filters superseded_by IS NULL).
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+                    "SELECT COUNT(*) FROM memories \
+                     WHERE invalidated_at IS NULL AND superseded_by IS NULL",
                     [],
                     |row| row.get(0),
                 )
