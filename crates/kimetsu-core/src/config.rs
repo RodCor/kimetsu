@@ -30,6 +30,11 @@ pub struct ProjectConfig {
     /// keeps all existing project.toml files loading unchanged.
     #[serde(default)]
     pub cheap_model: Option<CheapModelSection>,
+    /// S5.1: storage / retrieval backend selection. `#[serde(default)]`
+    /// keeps every existing project.toml loading cleanly (they get
+    /// `backend = "flat"`, the current FTS + usearch-ANN path).
+    #[serde(default)]
+    pub storage: StorageSection,
 }
 
 impl ProjectConfig {
@@ -49,6 +54,7 @@ impl ProjectConfig {
             embedder: EmbedderSection::default(),
             learning: LearningSection::default(),
             cheap_model: None,
+            storage: StorageSection::default(),
         }
     }
 
@@ -378,6 +384,42 @@ impl CheapModelSection {
             base_url_env: d.base_url_env.clone(),
             region: d.region.clone(),
             region_env: d.region_env.clone(),
+        }
+    }
+}
+
+/// S5.1: storage / retrieval backend configuration.
+///
+/// Controls which `RetrievalBackend` implementation is used for memory
+/// candidate generation. The broker (scoring, floors, rerank, compression)
+/// is backend-agnostic and is NOT affected by this setting.
+///
+/// `#[serde(default)]` keeps every pre-S5 project.toml loading cleanly
+/// (they get `backend = "flat"`, which is exactly today's FTS + usearch-ANN
+/// behaviour).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageSection {
+    /// Which retrieval backend to use.
+    ///
+    /// | Value         | Behaviour                                             |
+    /// |---------------|-------------------------------------------------------|
+    /// | `"flat"`      | FTS + usearch HNSW ANN (current, default)             |
+    /// | `"graph-lite"`| TODO (S5.2): graph-augmented FTS + ANN               |
+    /// | `"graph"`     | TODO (future): full graph traversal                   |
+    ///
+    /// Unknown values fall back to `"flat"` with a warning.
+    #[serde(default = "default_storage_backend")]
+    pub backend: String,
+}
+
+fn default_storage_backend() -> String {
+    "flat".to_string()
+}
+
+impl Default for StorageSection {
+    fn default() -> Self {
+        Self {
+            backend: default_storage_backend(),
         }
     }
 }
@@ -886,6 +928,12 @@ max_total_cost_usd = 250.0
             config.broker.session_dedupe,
             "broker.session_dedupe must default to true"
         );
+        // S5.1: a pre-S5 project.toml without [storage] must load cleanly
+        // and default to backend = "flat" (the existing FTS + ANN path).
+        assert_eq!(
+            config.storage.backend, "flat",
+            "storage.backend must default to \"flat\" when absent"
+        );
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
@@ -1265,6 +1313,35 @@ max_total_cost_usd = 250.0
         assert!(
             config.cheap_model().is_none(),
             "cheap_model() must return None when no cheap model is configured"
+        );
+    }
+
+    // ── S5.1: StorageSection tests ────────────────────────────────────────
+
+    /// S5.1-a: `storage.backend` survives a round-trip through
+    /// serialize → deserialize for each known variant string.
+    #[test]
+    fn s5_1_storage_backend_round_trips() {
+        for variant in &["flat", "graph-lite", "graph"] {
+            let mut config = ProjectConfig::default_for_project("demo");
+            config.storage.backend = (*variant).to_string();
+            let serialized = config.to_toml().expect("serialize");
+            let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+            assert_eq!(
+                reloaded.storage.backend, *variant,
+                "storage.backend=\"{}\" must round-trip",
+                variant
+            );
+        }
+    }
+
+    /// S5.1-b: `default_for_project` uses `backend = "flat"`.
+    #[test]
+    fn s5_1_default_for_project_uses_flat_backend() {
+        let config = ProjectConfig::default_for_project("demo");
+        assert_eq!(
+            config.storage.backend, "flat",
+            "default project config must use flat backend"
         );
     }
 }

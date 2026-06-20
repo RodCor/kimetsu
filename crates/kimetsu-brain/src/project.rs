@@ -404,13 +404,15 @@ impl BrainSession {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             embeddings::open_embedder_for(self.config.embedder.enabled),
+            backend.as_ref(),
         )
     }
 
@@ -446,13 +448,15 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             &embeddings::NoopEmbedder,
+            backend.as_ref(),
         )
     }
 
@@ -476,13 +480,15 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             &embeddings::NoopEmbedder,
+            backend.as_ref(),
         )
     }
 
@@ -505,13 +511,15 @@ impl BrainSession {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             embedder,
+            backend.as_ref(),
         )
     }
 
