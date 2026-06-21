@@ -24,6 +24,7 @@ pub mod redact;
 pub mod reindex;
 pub mod roi;
 pub mod schema;
+pub mod skill_synthesis;
 pub mod trace;
 pub mod tune;
 pub mod tuneset;

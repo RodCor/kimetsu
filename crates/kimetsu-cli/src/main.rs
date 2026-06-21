@@ -10,6 +10,7 @@ mod embed_daemon;
 mod harvest_setup;
 mod proactive_state;
 mod process;
+mod skill_synth;
 mod update;
 
 use clap::{Args, Parser, Subcommand};
@@ -822,6 +823,48 @@ enum BrainCommand {
     ///   kimetsu brain ask "what's the cargo build command?" --json
     ///   kimetsu brain ask "explain the broker" --helpful memory:01ABC
     Ask(AskArgs),
+    /// Flagship 2: Memory → Skill synthesis.
+    ///
+    /// Detects memories cited ≥3 times across runs (or tight semantic
+    /// clusters) and drafts them into reusable SKILL.md skills via the
+    /// configured cheap model (grounded-only — never invents steps).
+    ///
+    /// --detect   Scan for candidates and create proposals (default when no flag given).
+    /// --review   List pending proposals and accepted skills.
+    /// --accept   Install a pending proposal into .kimetsu/skills/ (explicit only).
+    /// --reject   Reject a pending proposal.
+    /// --status   Show staleness status for accepted skills.
+    ///
+    /// Examples:
+    ///   kimetsu brain skills --detect
+    ///   kimetsu brain skills --review
+    ///   kimetsu brain skills --accept 01ABCDEF
+    ///   kimetsu brain skills --reject 01ABCDEF
+    ///   kimetsu brain skills --status
+    Skills(SkillsArgs),
+}
+
+/// Args for `kimetsu brain skills` (Flagship 2).
+#[derive(Debug, clap::Args)]
+struct SkillsArgs {
+    /// Detect synthesis candidates and create proposals (default action).
+    #[arg(long)]
+    detect: bool,
+    /// List pending proposals and accepted skills.
+    #[arg(long)]
+    review: bool,
+    /// Accept a pending proposal and install the skill (provide proposal-id).
+    #[arg(long, value_name = "PROPOSAL_ID")]
+    accept: Option<String>,
+    /// Reject a pending proposal (provide proposal-id).
+    #[arg(long, value_name = "PROPOSAL_ID")]
+    reject: Option<String>,
+    /// Show staleness status for accepted skills.
+    #[arg(long)]
+    status: bool,
+    /// Override the workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
 }
 
 /// Args for `kimetsu brain ask`.
@@ -3800,6 +3843,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Ask(args) => brain_ask(args),
+        BrainCommand::Skills(args) => brain_skills(args),
     }
 }
 
@@ -5862,6 +5906,55 @@ fn brain_ask(args: AskArgs) -> KimetsuResult<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Flagship 2: `kimetsu brain skills` — Memory → Skill synthesis.
+fn brain_skills(args: SkillsArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // --accept: install a specific pending proposal.
+    if let Some(ref proposal_id) = args.accept {
+        match skill_synth::install_skill_proposal(&workspace, proposal_id) {
+            Ok(path) => {
+                println!("Skill installed: {}", path.display());
+                println!("Run `kimetsu brain skills --status` to check for future staleness.");
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // --reject: reject a specific pending proposal.
+    if let Some(ref proposal_id) = args.reject {
+        let (_paths, _config, conn) = project::load_project(&workspace)?;
+        kimetsu_brain::skill_synthesis::reject_skill_proposal(&conn, proposal_id)?;
+        println!("Proposal {proposal_id} rejected.");
+        return Ok(());
+    }
+
+    // --status: show staleness for accepted skills.
+    if args.status {
+        let (_paths, _config, conn) = project::load_project(&workspace)?;
+        skill_synth::print_staleness_status(&conn)?;
+        return Ok(());
+    }
+
+    // --review: list proposals for review.
+    if args.review {
+        let (_paths, _config, conn) = project::load_project(&workspace)?;
+        skill_synth::print_skill_review(&conn)?;
+        return Ok(());
+    }
+
+    // Default (--detect or no flag): detect candidates + create proposals.
+    let report = skill_synth::run_skill_synthesis(&workspace)?;
+    skill_synth::print_synthesis_report(&report);
     Ok(())
 }
 
