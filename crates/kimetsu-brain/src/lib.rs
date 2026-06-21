@@ -25,6 +25,8 @@ pub mod reindex;
 pub mod roi;
 pub mod schema;
 pub mod skill_synthesis;
+/// Epic S3: personal brain sync — event-log replication.
+pub mod sync;
 pub mod trace;
 pub mod tune;
 pub mod tuneset;

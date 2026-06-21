@@ -842,6 +842,65 @@ enum BrainCommand {
     ///   kimetsu brain skills --reject 01ABCDEF
     ///   kimetsu brain skills --status
     Skills(SkillsArgs),
+    /// Epic S3: sync the brain across machines via event-log replication.
+    ///
+    /// Sync = event-log replication (NOT SQLite file copying).  Only durable
+    /// memory-lifecycle events are replicated:
+    ///   memory.accepted, memory.proposed, memory.rejected, memory.invalidated,
+    ///   memory.cited, memory.superseded
+    ///
+    /// Excluded (local/telemetry): work.episode, context.served,
+    ///   retrieval.regret, run.* and everything else.
+    ///
+    /// Subcommands:
+    ///
+    ///   kimetsu brain sync export [--since <rowid>] [--out <file>] [--dry-run]
+    ///     Export durable events since a rowid cursor to a JSONL batch.
+    ///     Defaults to stdout.
+    ///
+    ///   kimetsu brain sync import <batch> [--dry-run]
+    ///     Import a JSONL batch (per-event idempotent via event_id).
+    ///     Reports applied/skipped counts.
+    ///
+    ///   kimetsu brain sync [--status] [--dry-run]
+    ///     Full directory-protocol sync: push new events, pull from peers.
+    ///     Requires [sync] dir + machine_id in project.toml.
+    ///
+    /// Examples:
+    ///   kimetsu brain sync export --out /tmp/batch.jsonl
+    ///   kimetsu brain sync export --since 42 --out /tmp/delta.jsonl
+    ///   kimetsu brain sync import /tmp/batch.jsonl
+    ///   kimetsu brain sync import /tmp/batch.jsonl --dry-run
+    ///   kimetsu brain sync               # full dir-protocol cycle
+    ///   kimetsu brain sync --status      # show configured dir, machine_id, cursors
+    ///   kimetsu brain sync --dry-run     # report what would happen
+    Sync(SyncArgs),
+}
+
+/// Args for `kimetsu brain sync` (Epic S3).
+#[derive(Debug, clap::Args)]
+struct SyncArgs {
+    /// Subcommand: `export` | `import` | (empty for full dir-protocol sync).
+    #[arg(value_name = "SUBCOMMAND")]
+    subcommand: Option<String>,
+    /// For `export`: export events after this rowid (exclusive).  Default 0 (all).
+    #[arg(long, value_name = "ROWID", default_value_t = 0)]
+    since: i64,
+    /// For `export`: write the batch to this file instead of stdout.
+    #[arg(long, value_name = "FILE")]
+    out: Option<String>,
+    /// For `import`: path to a JSONL batch file (required when subcommand=import).
+    #[arg(value_name = "BATCH_FILE")]
+    batch: Option<String>,
+    /// Report what WOULD happen without actually writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Show configured sync dir, machine_id, per-source cursors, pending counts.
+    #[arg(long)]
+    status: bool,
+    /// Override the workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
 }
 
 /// Args for `kimetsu brain skills` (Flagship 2).
@@ -3857,6 +3916,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Ask(args) => brain_ask(args),
         BrainCommand::Skills(args) => brain_skills(args),
+        BrainCommand::Sync(args) => brain_sync(args),
     }
 }
 
@@ -4397,6 +4457,158 @@ fn brain_backup(args: BrainBackupArgs) -> KimetsuResult<()> {
         dest_path.display()
     );
     Ok(())
+}
+
+// ── S3: brain sync ────────────────────────────────────────────────────────────
+
+/// `kimetsu brain sync [subcommand] [flags]`
+///
+/// Dispatches to export / import / full-cycle / status based on `args.subcommand`
+/// and flag combination.
+fn brain_sync(args: SyncArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::sync as brain_sync_mod;
+    use kimetsu_core::paths::ProjectPaths;
+
+    let workspace = args
+        .workspace
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = ProjectPaths::discover(&workspace)?;
+
+    // Open brain.db (read-write for import/sync; read-only for export/status).
+    let (_paths, config, conn) = project::load_project(&workspace)?;
+
+    let sub = args.subcommand.as_deref().unwrap_or("");
+
+    match sub {
+        "export" => {
+            // kimetsu brain sync export [--since <rowid>] [--out <file>] [--dry-run]
+            let out_path = args.out.as_deref().map(std::path::Path::new);
+            let (summary, content) =
+                brain_sync_mod::export_events(&conn, args.since, out_path, args.dry_run)?;
+            if let Some(jsonl) = content {
+                println!("{jsonl}");
+            } else if args.dry_run {
+                println!(
+                    "dry-run: would export {} events (next cursor: {})",
+                    summary.exported, summary.next_cursor
+                );
+            } else {
+                println!(
+                    "exported {} events → {} (next cursor: {})",
+                    summary.exported,
+                    args.out.as_deref().unwrap_or("<stdout>"),
+                    summary.next_cursor
+                );
+            }
+        }
+        "import" => {
+            // kimetsu brain sync import <batch> [--dry-run]
+            let batch_file = args.batch.as_deref().ok_or_else(|| {
+                "kimetsu brain sync import: missing <batch> file argument".to_string()
+            })?;
+            let path = std::path::Path::new(batch_file);
+            let summary = brain_sync_mod::import_events_from_file(&conn, path, args.dry_run)?;
+            if args.dry_run {
+                println!(
+                    "dry-run: would apply {} events, skip {} (already present)",
+                    summary.applied, summary.skipped
+                );
+            } else {
+                println!(
+                    "applied {} events, skipped {}",
+                    summary.applied, summary.skipped
+                );
+            }
+        }
+        "" => {
+            // Full directory-protocol sync, or --status.
+            if args.status {
+                // 3.3 doctor: show sync state.
+                let sync_cfg = &config.sync;
+                let sync_dir_opt = sync_cfg.dir.as_deref().map(std::path::Path::new);
+                let machine_id = resolve_machine_id(&sync_cfg.machine_id);
+                let cursors_path = paths.kimetsu_dir.join("sync-cursors.json");
+                let status =
+                    brain_sync_mod::sync_status(&conn, sync_dir_opt, &machine_id, &cursors_path)?;
+                println!("sync status:");
+                println!(
+                    "  dir:        {}",
+                    status
+                        .sync_dir
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(not configured)".to_string())
+                );
+                println!("  machine_id: {machine_id}");
+                println!("  local pending (unpushed): {}", status.local_pending);
+                if status.sources.is_empty() {
+                    println!("  peers: (none seen yet)");
+                } else {
+                    println!("  peers:");
+                    for (mid, cursor, pending) in &status.sources {
+                        println!("    {mid}: cursor={cursor}, pending_pull={pending}");
+                    }
+                }
+            } else {
+                // Full sync cycle.
+                let sync_cfg = &config.sync;
+                let sync_dir = match sync_cfg.dir.as_deref() {
+                    Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+                    _ => {
+                        return Err(
+                            "kimetsu brain sync: `[sync] dir` is not configured in project.toml.\n\
+                             Set it with: kimetsu config set sync.dir /path/to/shared/dir"
+                                .to_string()
+                                .into(),
+                        );
+                    }
+                };
+                let machine_id = resolve_machine_id(&sync_cfg.machine_id);
+                let cursors_path = paths.kimetsu_dir.join("sync-cursors.json");
+                let report = brain_sync_mod::sync_dir(
+                    &conn,
+                    &sync_dir,
+                    &machine_id,
+                    &cursors_path,
+                    args.dry_run,
+                )?;
+                let prefix = if report.dry_run { "dry-run: " } else { "" };
+                println!(
+                    "{prefix}pushed {pushed}, pulled {applied} (skipped {skipped}) from {n} peer(s)",
+                    pushed = report.pushed,
+                    applied = report.pulled_applied,
+                    skipped = report.pulled_skipped,
+                    n = report.machines_pulled.len(),
+                    prefix = prefix,
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "kimetsu brain sync: unknown subcommand `{other}`; \
+                 expected `export`, `import`, or omit for full sync"
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve the effective machine_id: use the configured value if non-empty,
+/// otherwise generate a stable ULID-based id.  The generated id is NOT
+/// persisted here — the user should run `kimetsu config set sync.machine_id
+/// <id>` to make it durable.
+fn resolve_machine_id(configured: &str) -> String {
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    // Stable fallback: use hostname or a generated ULID.
+    std::env::var("KIMETSU_SYNC_MACHINE_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ulid::Ulid::new().to_string())
 }
 
 // ── embed-daemon / warm / daemon subcommand handlers ─────────────────────────

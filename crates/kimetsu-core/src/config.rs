@@ -35,6 +35,11 @@ pub struct ProjectConfig {
     /// `backend = "flat"`, the current FTS + usearch-ANN path).
     #[serde(default)]
     pub storage: StorageSection,
+    /// Epic S3: personal brain sync via event-log replication.
+    /// `#[serde(default)]` keeps every pre-S3 project.toml loading cleanly
+    /// (they get no sync dir and a freshly-generated machine_id).
+    #[serde(default)]
+    pub sync: SyncSection,
 }
 
 impl ProjectConfig {
@@ -55,6 +60,7 @@ impl ProjectConfig {
             learning: LearningSection::default(),
             cheap_model: None,
             storage: StorageSection::default(),
+            sync: SyncSection::default(),
         }
     }
 
@@ -861,6 +867,31 @@ impl Default for RunSection {
     }
 }
 
+/// Epic S3: personal brain sync configuration.
+///
+/// Controls the event-log replication directory protocol.  When `dir` is
+/// absent, the sync subcommand is unconfigured and prints a setup hint.
+///
+/// `machine_id` is a stable opaque identifier for this machine.  It defaults
+/// to a freshly-generated ULID that is persisted in project.toml on first
+/// use (written by `kimetsu brain sync --setup`).  Operators can set it
+/// manually to a meaningful name (hostname, username, etc.) — just keep it
+/// unique within the sync directory.
+///
+/// `#[serde(default)]` keeps every pre-S3 project.toml loading cleanly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncSection {
+    /// Absolute (or home-relative) path to the shared sync directory.
+    /// Each machine writes its batches under `<dir>/<machine_id>/`.
+    /// When `None`, syncing is unconfigured.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Stable machine identifier.  Defaults to an empty string (= not yet
+    /// set; the CLI generates one on first use).
+    #[serde(default)]
+    pub machine_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1046,16 @@ max_total_cost_usd = 250.0
         assert!(
             !config.broker.proactive_prefetch,
             "broker.proactive_prefetch must default to false (opt-in)"
+        );
+        // S3: a pre-S3 project.toml without [sync] must load cleanly and
+        // default to no sync dir and empty machine_id.
+        assert!(
+            config.sync.dir.is_none(),
+            "sync.dir must default to None when absent"
+        );
+        assert!(
+            config.sync.machine_id.is_empty(),
+            "sync.machine_id must default to empty string when absent"
         );
     }
 
@@ -1474,6 +1515,91 @@ max_total_cost_usd = 250.0
         assert!(
             !config.broker.proactive_prefetch,
             "default proactive_prefetch must be false"
+        );
+    }
+
+    // ── S3: SyncSection tests ──────────────────────────────────────────────
+
+    /// S3-cfg-1: a pre-S3 project.toml (no `[sync]` section) loads cleanly
+    /// and defaults to no sync dir and empty machine_id.
+    #[test]
+    fn s3_pre_s3_config_without_sync_loads_cleanly() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-S3 toml must load");
+        assert!(
+            config.sync.dir.is_none(),
+            "sync.dir must default to None when absent"
+        );
+        assert!(
+            config.sync.machine_id.is_empty(),
+            "sync.machine_id must default to empty string when absent"
+        );
+    }
+
+    /// S3-cfg-2: a `[sync]` section with dir + machine_id round-trips cleanly.
+    #[test]
+    fn s3_sync_section_round_trips() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.sync.dir = Some("/tmp/kimetsu-sync".to_string());
+        config.sync.machine_id = "my-laptop-01".to_string();
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert_eq!(
+            reloaded.sync.dir,
+            Some("/tmp/kimetsu-sync".to_string()),
+            "sync.dir must round-trip"
+        );
+        assert_eq!(
+            reloaded.sync.machine_id, "my-laptop-01",
+            "sync.machine_id must round-trip"
+        );
+    }
+
+    /// S3-cfg-3: default_for_project gives an unconfigured sync section.
+    #[test]
+    fn s3_default_for_project_sync_unconfigured() {
+        let config = ProjectConfig::default_for_project("demo");
+        assert!(config.sync.dir.is_none(), "default sync.dir must be None");
+        assert!(
+            config.sync.machine_id.is_empty(),
+            "default sync.machine_id must be empty"
         );
     }
 }
