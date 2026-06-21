@@ -4,6 +4,8 @@ pub mod analytics;
 pub mod ann;
 /// S5.1: retrieval backend trait + FlatBackend implementation.
 pub(crate) mod backend;
+/// S5.4: cross-backend benchmark harness (flat / graph-lite / petgraph).
+pub mod backend_bench;
 pub mod benchmark;
 pub mod conflict;
 pub mod consolidate;

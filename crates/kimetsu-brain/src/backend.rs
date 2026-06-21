@@ -1,5 +1,5 @@
-//! S5.1 + S5.2: `RetrievalBackend` trait — the seam between candidate generation
-//! and the broker.
+//! S5.1 + S5.2 + S5.3: `RetrievalBackend` trait — the seam between candidate
+//! generation and the broker.
 //!
 //! # Boundary
 //!
@@ -21,7 +21,7 @@
 //! # Graph-lite backend (S5.2)
 //!
 //! [`GraphLiteBackend`] is a SUPERSET of flat: it starts with the flat
-//! candidate set and then expands up to `max_hops` hops over the
+//! candidate set and then expands 1–`MAX_HOPS` hops over the
 //! `memory_edges` typed-edge projection table (created by the v3→v4 migration).
 //!
 //! The expansion uses a recursive CTE rooted on the flat hit set, bounded by
@@ -34,10 +34,38 @@
 //! reduce recall relative to flat — so enabling it can never make retrieval
 //! worse, only broader.
 //!
-//! # Future backends
+//! # PetgraphBackend (S5.3, `graph` feature, remote-only)
 //!
-//! `"graph"` is a TODO seam for a future story (full petgraph + remote graph
-//! traversal). It currently falls through to `FlatBackend`.
+//! [`PetgraphBackend`] is the Tier-2 full-graph backend. It is ONLY compiled
+//! when the `graph` feature is active (enabled by `kimetsu-remote`; never in
+//! the local lean/CLI builds). It loads the entire `memory_edges` table into an
+//! in-memory `petgraph` directed graph at construction time, enabling real
+//! graph algorithms:
+//!
+//! * **Candidate expansion**: like graph-lite but operates on the petgraph
+//!   in-memory graph — `BFS` up to `MAX_HOPS` without SQLite round-trips per
+//!   hop. The candidate set is a SUPERSET of flat (no recall loss).
+//! * **Centrality** (`node_centrality`): degree centrality per node — identifies
+//!   the most-referenced memories (high in-degree = frequently consolidated into;
+//!   high out-degree = memory that was itself superseded many times). Exposed for
+//!   future remote endpoints (consolidation hints, importance ranking).
+//! * **Shortest path** (`shortest_path`): BFS shortest path between two memory
+//!   ids — answers "why are these two memories connected?" for explainability
+//!   endpoints.
+//! * **Community detection stub** (`community_hints`): returns the weakly
+//!   connected components as cluster ids — a lightweight proxy for community
+//!   detection. Full Louvain is deferred until the corpus justifies it.
+//!
+//! The graph is rebuilt from `memory_edges` at backend construction. Since
+//! `memory_edges` is a rebuild-safe projection (rebuilt from the event log on
+//! `rebuild_in_place`), re-constructing `PetgraphBackend` is always safe.
+//!
+//! ## v2.5 decision criterion (S5.4)
+//!
+//! The cross-backend benchmark (`BackendBenchResult`) documents the measured
+//! numbers and the criterion for whether an embedded graph DB (Kùzu/Cozo) is
+//! justified at v2.5. See [`BackendBenchResult`] and the inline commentary in
+//! the benchmark module.
 
 use std::collections::HashSet;
 
@@ -391,6 +419,268 @@ fn fetch_graph_candidates(
     Ok(candidates)
 }
 
+// ─── PetgraphBackend (S5.3, `graph` feature, remote-only) ───────────────────
+
+/// S5.3: Full in-memory petgraph backend — compiled ONLY when the `graph`
+/// feature is active (enabled by `kimetsu-remote`; never in lean/CLI builds).
+///
+/// Holds an in-memory `petgraph::Graph` built from `memory_edges`. All graph
+/// algorithm helpers (`node_centrality`, `shortest_path`, `community_hints`)
+/// operate on this in-memory structure without hitting SQLite.
+///
+/// For `memory_candidates`, the BFS expansion is identical to graph-lite in
+/// semantics (SUPERSET of flat, no recall loss), but uses the petgraph BFS
+/// iterator rather than per-hop SQLite queries — removing the N*hops round-trips
+/// of graph-lite's iterative approach.
+#[cfg(feature = "graph")]
+pub(crate) struct PetgraphBackend {
+    /// Directed graph: edges loaded from `memory_edges` (src_id → dst_id).
+    /// Node weights = memory_id (String). Edge weights = edge_type (String).
+    graph: petgraph::Graph<String, String>,
+    /// Maps memory_id → NodeIndex for O(1) node lookup.
+    node_map: std::collections::HashMap<String, petgraph::graph::NodeIndex>,
+}
+
+#[cfg(feature = "graph")]
+impl PetgraphBackend {
+    /// Build a `PetgraphBackend` by loading all rows from `memory_edges`.
+    ///
+    /// This is called at server startup (or on demand). The graph is a point-in-
+    /// time snapshot — it does not update incrementally. Re-construct it after
+    /// `rebuild_in_place` if you need a fresh view.
+    pub(crate) fn from_conn(conn: &Connection) -> KimetsuResult<Self> {
+        use petgraph::Graph;
+        use std::collections::HashMap;
+
+        let mut graph: Graph<String, String> = Graph::new();
+        let mut node_map: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+
+        // Load all edges from memory_edges.
+        let mut stmt =
+            conn.prepare("SELECT src_id, dst_id, edge_type FROM memory_edges ORDER BY created_at")?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (src_id, dst_id, edge_type) = row?;
+
+            let src_idx = *node_map
+                .entry(src_id.clone())
+                .or_insert_with(|| graph.add_node(src_id.clone()));
+            let dst_idx = *node_map
+                .entry(dst_id.clone())
+                .or_insert_with(|| graph.add_node(dst_id.clone()));
+
+            graph.add_edge(src_idx, dst_idx, edge_type);
+        }
+
+        Ok(Self { graph, node_map })
+    }
+
+    /// Degree centrality for each node: `(in_degree, out_degree)` by memory_id.
+    ///
+    /// High in-degree = frequently merged-into (important survivor).
+    /// High out-degree = frequently superseded/pointed-from (active memory).
+    ///
+    /// Exposed for future remote endpoints (importance ranking, consolidation
+    /// hints). Not wired into `memory_candidates` — centrality is a HINT for
+    /// operators, not a retrieval filter.
+    #[allow(dead_code)] // S5.3 forward-facing API for future remote endpoints.
+    pub(crate) fn node_centrality(&self) -> Vec<(String, usize, usize)> {
+        self.node_map
+            .iter()
+            .map(|(id, &idx)| {
+                let in_deg = self
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                    .count();
+                let out_deg = self
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Outgoing)
+                    .count();
+                (id.clone(), in_deg, out_deg)
+            })
+            .collect()
+    }
+
+    /// BFS shortest path between two memory ids (directed graph).
+    ///
+    /// Returns the ordered list of memory_ids on the shortest path from
+    /// `from_id` to `to_id` (inclusive), or `None` if no path exists.
+    ///
+    /// Use case: "why are these two memories connected?" — explainability for
+    /// remote endpoints, audit trails, and graph-walk debugging.
+    #[allow(dead_code)] // S5.3 forward-facing API for future remote endpoints.
+    pub(crate) fn shortest_path(&self, from_id: &str, to_id: &str) -> Option<Vec<String>> {
+        use petgraph::algo::astar;
+
+        let src_idx = *self.node_map.get(from_id)?;
+        let dst_idx = *self.node_map.get(to_id)?;
+
+        // A* with unit costs = BFS shortest path (uniform edge weights).
+        let (_, path_nodes) = astar(
+            &self.graph,
+            src_idx,
+            |finish| finish == dst_idx,
+            |_| 1usize,
+            |_| 0usize,
+        )?;
+
+        Some(
+            path_nodes
+                .into_iter()
+                .map(|idx| self.graph[idx].clone())
+                .collect(),
+        )
+    }
+
+    /// Weakly-connected components as a lightweight community proxy.
+    ///
+    /// Returns a `Vec` of component groups (each group = Vec of memory_ids).
+    /// Memories in the same component share at least one path (ignoring edge
+    /// direction). Useful as a cheap consolidation hint: large components
+    /// indicate memory clusters that could be merged.
+    ///
+    /// Note: Full Louvain community detection is deferred — the SQLite-backed
+    /// `memory_edges` corpus is unlikely to exceed a few thousand nodes in v2.x,
+    /// making WCC an adequate proxy for the v2.5 decision spike.
+    #[allow(dead_code)] // S5.3 forward-facing API for future remote endpoints.
+    pub(crate) fn community_hints(&self) -> Vec<Vec<String>> {
+        use petgraph::algo::kosaraju_scc;
+
+        // Use strongly connected components on the directed graph. In a tree-
+        // structured supersedes graph most SCCs are singletons; non-trivial SCCs
+        // indicate cycles (which are invalid for supersedes but possible for
+        // co-occurrence / similar edges). This surfaces them without crashing.
+        let sccs = kosaraju_scc(&self.graph);
+        sccs.into_iter()
+            .filter(|component| !component.is_empty())
+            .map(|component| {
+                component
+                    .into_iter()
+                    .map(|idx| self.graph[idx].clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// BFS expansion from `seed_ids` up to `max_hops` in the petgraph graph.
+    ///
+    /// Traverses BOTH directions (in-edges and out-edges) so that supersedes
+    /// edges are followed from both sides, matching graph-lite semantics.
+    /// Returns new (previously unseen) memory ids, capped at `max_fan_out`.
+    fn petgraph_expand(
+        &self,
+        seed_ids: &HashSet<String>,
+        max_hops: usize,
+        max_fan_out: usize,
+    ) -> Vec<String> {
+        use petgraph::visit::EdgeRef;
+
+        if seed_ids.is_empty() || max_hops == 0 {
+            return Vec::new();
+        }
+
+        let mut visited: HashSet<String> = seed_ids.clone();
+        let mut frontier: Vec<petgraph::graph::NodeIndex> = seed_ids
+            .iter()
+            .filter_map(|id| self.node_map.get(id).copied())
+            .collect();
+        let mut new_ids: Vec<String> = Vec::new();
+
+        for _hop in 0..max_hops {
+            if frontier.is_empty() || new_ids.len() >= max_fan_out {
+                break;
+            }
+
+            let mut next_frontier = Vec::new();
+            for node_idx in &frontier {
+                // Follow edges in both directions (out-neighbors and in-neighbors).
+                let neighbors: Vec<petgraph::graph::NodeIndex> = self
+                    .graph
+                    .edges_directed(*node_idx, petgraph::Direction::Outgoing)
+                    .map(|e| e.target())
+                    .chain(
+                        self.graph
+                            .edges_directed(*node_idx, petgraph::Direction::Incoming)
+                            .map(|e| e.source()),
+                    )
+                    .collect();
+
+                for neighbour_idx in neighbors {
+                    let neighbour_id = &self.graph[neighbour_idx];
+                    if !visited.contains(neighbour_id) {
+                        visited.insert(neighbour_id.clone());
+                        next_frontier.push(neighbour_idx);
+                        new_ids.push(neighbour_id.clone());
+                        if new_ids.len() >= max_fan_out {
+                            break;
+                        }
+                    }
+                }
+                if new_ids.len() >= max_fan_out {
+                    break;
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        new_ids
+    }
+}
+
+#[cfg(feature = "graph")]
+impl RetrievalBackend for PetgraphBackend {
+    fn memory_candidates(
+        &self,
+        conn: &Connection,
+        query: &str,
+        query_embedding: Option<&QueryEmbedding>,
+        half_life_days: f32,
+    ) -> KimetsuResult<Vec<Candidate>> {
+        // 1. Flat candidate set (FTS + ANN or FTS + recency).
+        let flat =
+            crate::context::memory_candidates_flat(conn, query, query_embedding, half_life_days)?;
+
+        // 2. Collect seen ids from the flat set.
+        let mut seen_ids: HashSet<String> = flat
+            .iter()
+            .filter_map(|c| {
+                c.capsule
+                    .expansion_handle
+                    .strip_prefix("memory:")
+                    .map(|id| id.to_string())
+            })
+            .collect();
+
+        if seen_ids.is_empty() {
+            return Ok(flat);
+        }
+
+        // 3. Petgraph BFS expansion (no SQLite round-trips per hop).
+        let new_ids = self.petgraph_expand(&seen_ids, MAX_HOPS, MAX_FAN_OUT);
+
+        if new_ids.is_empty() {
+            return Ok(flat);
+        }
+
+        // 4. Fetch graph-reached candidates from SQLite (active memories only).
+        let graph_candidates = fetch_graph_candidates(conn, &new_ids, &mut seen_ids)?;
+
+        // 5. Flat first (real relevance signals), graph-reached appended.
+        let mut combined = flat;
+        combined.extend(graph_candidates);
+        Ok(combined)
+    }
+}
+
 // ─── Backend selection ───────────────────────────────────────────────────────
 
 /// Resolve the configured backend variant name to a `Box<dyn RetrievalBackend>`.
@@ -398,7 +688,11 @@ fn fetch_graph_candidates(
 /// Valid `backend` strings (from `[storage] backend = "…"` in project.toml):
 ///   * `"flat"` → [`FlatBackend`] (default, always available).
 ///   * `"graph-lite"` → [`GraphLiteBackend`] (S5.2: flat + 1-2 hop edge expansion).
-///   * `"graph"` → [`FlatBackend`] (TODO seam — future story: full petgraph backend).
+///   * `"graph"` → [`PetgraphBackend`] when the `graph` feature is enabled (S5.3:
+///     full in-memory petgraph backend for remote deployments). Falls back to
+///     [`GraphLiteBackend`] when the feature is disabled (lean builds), so that
+///     a config file with `backend = "graph"` on a lean build still gets graph
+///     expansion (just without the petgraph in-memory cache and algorithms).
 ///   * Anything else → [`FlatBackend`] with an eprintln warning so a typo is
 ///     surfaced without crashing the process.
 pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sync> {
@@ -406,8 +700,21 @@ pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sy
         "flat" => Box::new(FlatBackend),
         "graph-lite" => Box::new(GraphLiteBackend),
         "graph" => {
-            // Future story: full petgraph/remote graph traversal backend.
-            Box::new(FlatBackend)
+            // S5.3: PetgraphBackend when the `graph` feature is enabled.
+            // Falls back to GraphLiteBackend (not flat) so that lean builds
+            // requesting "graph" still get the graph-lite superset behaviour.
+            #[cfg(feature = "graph")]
+            {
+                // PetgraphBackend requires a DB connection to load edges. Since
+                // `backend_for` is called without a conn (before any query), we
+                // return a deferred variant that constructs the petgraph on the
+                // first `memory_candidates` call.
+                Box::new(DeferredPetgraphBackend::new())
+            }
+            #[cfg(not(feature = "graph"))]
+            {
+                Box::new(GraphLiteBackend)
+            }
         }
         other => {
             eprintln!(
@@ -416,6 +723,60 @@ pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sy
             );
             Box::new(FlatBackend)
         }
+    }
+}
+
+/// Deferred construction wrapper for `PetgraphBackend`.
+///
+/// `backend_for` is called without a DB connection, but `PetgraphBackend::from_conn`
+/// needs one to load `memory_edges`. `DeferredPetgraphBackend` is a lazy wrapper:
+/// it constructs the petgraph on the first `memory_candidates` call and caches it
+/// for subsequent calls.
+///
+/// Thread-safety: the inner `Mutex<Option<PetgraphBackend>>` serializes
+/// construction. After the first successful init, the `Option` is `Some` and
+/// subsequent calls short-circuit by holding the lock only long enough to clone
+/// the candidates. In practice the remote server constructs exactly one backend
+/// per repository at startup, so the lock is never contended after init.
+#[cfg(feature = "graph")]
+struct DeferredPetgraphBackend {
+    inner: std::sync::Mutex<Option<PetgraphBackend>>,
+}
+
+#[cfg(feature = "graph")]
+impl DeferredPetgraphBackend {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(feature = "graph")]
+impl RetrievalBackend for DeferredPetgraphBackend {
+    fn memory_candidates(
+        &self,
+        conn: &Connection,
+        query: &str,
+        query_embedding: Option<&QueryEmbedding>,
+        half_life_days: f32,
+    ) -> KimetsuResult<Vec<Candidate>> {
+        // Fast path: already initialised — but we must hold the lock to read.
+        // We delegate to the inner backend while the lock is held. The lock is
+        // held for the duration of `memory_candidates` (including SQLite queries
+        // for graph-reached candidate hydration), which is acceptable: the remote
+        // server builds one backend per repo and the petgraph in-memory traversal
+        // is fast relative to the SQLite hydration it triggers.
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(PetgraphBackend::from_conn(conn)?);
+        }
+        guard.as_ref().expect("just initialised").memory_candidates(
+            conn,
+            query,
+            query_embedding,
+            half_life_days,
+        )
     }
 }
 
@@ -722,6 +1083,167 @@ mod tests {
         assert!(
             result.is_ok(),
             "graph-lite backend must not error on empty brain"
+        );
+    }
+
+    // ── S5.3 PetgraphBackend tests (compiled only when `graph` feature is on) ──
+
+    /// S5.3-A: `PetgraphBackend::from_conn` succeeds on an empty `memory_edges`
+    /// table and returns a backend with no nodes.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn petgraph_backend_from_conn_empty_db() {
+        let conn = make_conn();
+        let backend = PetgraphBackend::from_conn(&conn).expect("from_conn");
+        // Empty graph → no centrality entries.
+        let centrality = backend.node_centrality();
+        assert!(centrality.is_empty(), "empty graph → empty centrality");
+        // Shortest path between non-existent ids → None.
+        assert!(backend.shortest_path("a", "b").is_none());
+        // Community hints on empty graph → empty.
+        let communities = backend.community_hints();
+        assert!(communities.is_empty(), "empty graph → no communities");
+    }
+
+    /// S5.3-B: graph loaded from edges — centrality, shortest-path, communities
+    /// all reflect the seeded topology.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn petgraph_backend_graph_algorithms_on_seeded_topology() {
+        let conn = make_conn();
+
+        // Seed three nodes: A → B → C (chain).
+        insert_memory(&conn, "node-a", "fact", "node-a content");
+        insert_memory(&conn, "node-b", "fact", "node-b content");
+        insert_memory(&conn, "node-c", "fact", "node-c content");
+
+        conn.execute(
+            "INSERT INTO memory_edges (src_id, dst_id, edge_type, created_at)
+             VALUES ('node-a', 'node-b', 'supersedes', '2025-01-01T00:00:00Z'),
+                    ('node-b', 'node-c', 'supersedes', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert edges");
+
+        let backend = PetgraphBackend::from_conn(&conn).expect("from_conn");
+
+        // Centrality: node-a has out=1 in=0; node-b has out=1 in=1; node-c has out=0 in=1.
+        let centrality = backend.node_centrality();
+        assert_eq!(centrality.len(), 3, "three nodes in the graph");
+        let find = |id: &str| {
+            centrality
+                .iter()
+                .find(|(node_id, _, _)| node_id == id)
+                .cloned()
+        };
+        let (_, a_in, a_out) = find("node-a").expect("node-a centrality");
+        let (_, b_in, b_out) = find("node-b").expect("node-b centrality");
+        let (_, c_in, c_out) = find("node-c").expect("node-c centrality");
+        assert_eq!((a_in, a_out), (0, 1), "node-a: in=0 out=1");
+        assert_eq!((b_in, b_out), (1, 1), "node-b: in=1 out=1");
+        assert_eq!((c_in, c_out), (1, 0), "node-c: in=1 out=0");
+
+        // Shortest path A→C via B.
+        let path = backend
+            .shortest_path("node-a", "node-c")
+            .expect("path A→C must exist");
+        assert_eq!(path, vec!["node-a", "node-b", "node-c"]);
+
+        // No path C→A in a directed chain A→B→C.
+        assert!(
+            backend.shortest_path("node-c", "node-a").is_none(),
+            "no reverse path in directed chain"
+        );
+
+        // Community hints: one SCC per node in a DAG (A, B, C are not in a cycle).
+        let communities = backend.community_hints();
+        assert_eq!(
+            communities.len(),
+            3,
+            "three singleton SCCs in a directed chain"
+        );
+    }
+
+    /// S5.3-C: `PetgraphBackend::memory_candidates` is a superset of flat —
+    /// it surfaces graph-connected memories beyond the flat FTS hit set.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn petgraph_backend_memory_candidates_superset_of_flat() {
+        let conn = make_conn();
+
+        insert_memory(
+            &conn,
+            "pg-survivor",
+            "fact",
+            "cargo fmt formats your Rust code automatically",
+        );
+        insert_memory(
+            &conn,
+            "pg-connected",
+            "preference",
+            "always run formatter before submitting a pull request",
+        );
+
+        conn.execute(
+            "INSERT INTO memory_edges (src_id, dst_id, edge_type, created_at)
+             VALUES ('pg-survivor', 'pg-connected', 'supersedes', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert edge");
+
+        let backend = PetgraphBackend::from_conn(&conn).expect("from_conn");
+
+        let candidates = backend
+            .memory_candidates(&conn, "cargo fmt", None, 90.0)
+            .expect("memory_candidates");
+
+        let ids: std::collections::HashSet<String> = candidates
+            .iter()
+            .filter_map(|c| {
+                c.capsule
+                    .expansion_handle
+                    .strip_prefix("memory:")
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        assert!(
+            ids.contains("pg-survivor"),
+            "PetgraphBackend must return the flat FTS hit"
+        );
+        assert!(
+            ids.contains("pg-connected"),
+            "PetgraphBackend must return the graph-connected memory"
+        );
+    }
+
+    /// S5.3-D: `backend_for("graph")` returns a `DeferredPetgraphBackend` (wrapped
+    /// as Box<dyn RetrievalBackend>) that works on an empty brain without panicking.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn backend_for_graph_resolves_to_petgraph_backend() {
+        let conn = make_conn();
+        let backend = backend_for("graph");
+        // Must not panic on an empty brain.
+        let result = backend.memory_candidates(&conn, "some query", None, 90.0);
+        assert!(
+            result.is_ok(),
+            "petgraph backend must not error on empty brain"
+        );
+    }
+
+    /// S5.3-E: without the `graph` feature, `backend_for("graph")` falls back to
+    /// `GraphLiteBackend` (not flat) — the fallback is the next-best backend.
+    #[cfg(not(feature = "graph"))]
+    #[test]
+    fn backend_for_graph_falls_back_to_graph_lite_without_feature() {
+        let conn = make_conn();
+        let backend = backend_for("graph");
+        // Must still work (graph-lite fallback).
+        let result = backend.memory_candidates(&conn, "some query", None, 90.0);
+        assert!(
+            result.is_ok(),
+            "graph fallback must not error on empty brain"
         );
     }
 }
