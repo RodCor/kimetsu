@@ -18,6 +18,57 @@ use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
+// S2.4(b): Output-token accounting
+// ---------------------------------------------------------------------------
+
+/// Conservative ratio of output tokens to input tokens for a typical coding
+/// assistant response.  Calibration: real Claude Code sessions show ~30–40 %
+/// of the context going to output.  We use 0.25 as a deliberate under-claim
+/// to match the project's "never inflate" policy.
+///
+/// **Audited limitation**: this is a ratio-based *estimate* because Claude Code
+/// does not expose per-session output token counts to the Stop hook.  The
+/// estimate will be off for short responses (low ratio) and long code-gen runs
+/// (higher ratio).  We document this in the `--json` `output_token_estimate`
+/// field with an `"estimate_method": "ratio_0.25"` annotation.
+pub const OUTPUT_TOKEN_INPUT_RATIO: f64 = 0.25;
+
+/// Estimate output tokens from the brain-injected input token count.
+///
+/// This is a conservative proxy for sessions where the model is guided by
+/// brain context — more relevant context → fewer wasted generation tokens.
+/// See [`OUTPUT_TOKEN_INPUT_RATIO`] for calibration notes.
+pub fn estimate_output_tokens(input_tokens: u64) -> u64 {
+    (input_tokens as f64 * OUTPUT_TOKEN_INPUT_RATIO).round() as u64
+}
+
+// ---------------------------------------------------------------------------
+// S2.4(c): New event kind savings constants
+// ---------------------------------------------------------------------------
+
+/// Conservative token savings per `digest_served` event.
+///
+/// Calibration: a digest saves the model from re-reading the CLAUDE.md +
+/// searching for the top conventions at session start.  Estimated equivalent:
+/// ~2 search calls × 600 tokens/call = ~1 200 tokens.  We claim 800 as a
+/// conservative lower bound.
+pub const SAVED_TOKENS_PER_DIGEST_SERVED: u64 = 800;
+
+/// Conservative token savings per `resume_served` event.
+///
+/// Calibration: an episodic resume avoids the model asking "what were you
+/// working on?" + 1–2 file reads to reconstruct context.  Estimated
+/// equivalent: ~2 tool calls × 400 tokens/call = ~800 tokens.  We claim 500.
+pub const SAVED_TOKENS_PER_RESUME_SERVED: u64 = 500;
+
+/// Conservative token savings per `skill.served` event (future-proof).
+///
+/// Calibration: a synthesized skill file avoids the model re-deriving the
+/// composite procedure from individual memories.  We claim 300 as a
+/// conservative lower bound.
+pub const SAVED_TOKENS_PER_SKILL_SERVED: u64 = 300;
+
+// ---------------------------------------------------------------------------
 // Per-kind calibrated constants
 // ---------------------------------------------------------------------------
 
@@ -150,8 +201,20 @@ pub struct RoiReport {
     /// Total tokens injected by the brain (sum of `used_tokens` from
     /// `context.injected` events in the window).
     pub injected_tokens: u64,
+    /// S2.4(b): Estimated output tokens generated in the window.
+    ///
+    /// Computed as `injected_tokens × OUTPUT_TOKEN_INPUT_RATIO`.
+    /// **Audited limitation**: ratio-based estimate; Claude Code does not
+    /// expose per-session output token counts.
+    pub estimated_output_tokens: u64,
     /// Number of `context.served` events in the window.
     pub served_events: u64,
+    /// S2.4(c): Number of `digest_served` events in the window.
+    pub digest_served_events: u64,
+    /// S2.4(c): Number of `resume_served` events in the window.
+    pub resume_served_events: u64,
+    /// S2.4(c): Tokens saved from warm-start digests and resumes.
+    pub warmstart_saved_tokens: u64,
     /// Total citation count (rows in `memory_citations` for runs in the
     /// window).
     pub citations: u64,
@@ -161,6 +224,115 @@ pub struct RoiReport {
     pub net_tokens: i64,
     /// USD sub-report; `None` when price is unknown.
     pub usd: Option<RoiUsd>,
+}
+
+// ---------------------------------------------------------------------------
+// S2.4(a): Per-memory ROI
+// ---------------------------------------------------------------------------
+
+/// Per-memory ROI entry for `kimetsu brain roi --top`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRoiEntry {
+    pub memory_id: String,
+    pub kind: String,
+    /// First ~80 chars of the memory text (for human readability).
+    pub text_head: String,
+    /// Total number of times this memory has been cited in the window.
+    pub citation_count: u64,
+    /// Estimated tokens saved by this memory's citations.
+    pub estimated_saved_tokens: u64,
+}
+
+/// Compute per-memory ROI for the top `limit` memories by estimated savings.
+///
+/// Only memories with ≥1 citation in the window are returned.
+pub fn per_memory_roi(
+    conn: &rusqlite::Connection,
+    window: RoiWindow,
+    limit: usize,
+) -> KimetsuResult<Vec<MemoryRoiEntry>> {
+    let window_since: Option<String> = match window {
+        RoiWindow::All => None,
+        RoiWindow::Days(days) => {
+            let secs = days as i64 * 86_400;
+            let now = time::OffsetDateTime::now_utc();
+            let cutoff = now - time::Duration::seconds(secs);
+            let fmt = time::format_description::well_known::Rfc3339;
+            Some(cutoff.format(&fmt).unwrap_or_default())
+        }
+    };
+
+    // Collect (memory_id, citation_count) pairs.
+    struct Row {
+        memory_id: String,
+        count: u64,
+    }
+    let rows: Vec<Row> = match &window_since {
+        Some(ts) => {
+            let mut stmt = conn.prepare(
+                "SELECT mc.memory_id, COUNT(*) \
+                 FROM memory_citations mc \
+                 LEFT JOIN runs r ON mc.run_id = r.run_id \
+                 WHERE r.started_at >= ?1 \
+                    OR (r.run_id IS NULL AND mc.cited_at >= ?1) \
+                 GROUP BY mc.memory_id \
+                 ORDER BY COUNT(*) DESC",
+            )?;
+            let rows = stmt.query_map(params![ts], |r| {
+                Ok(Row {
+                    memory_id: r.get(0)?,
+                    count: r.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT memory_id, COUNT(*) FROM memory_citations \
+                 GROUP BY memory_id ORDER BY COUNT(*) DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(Row {
+                    memory_id: r.get(0)?,
+                    count: r.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        }
+    };
+
+    let mut entries: Vec<MemoryRoiEntry> = Vec::new();
+    for row in rows.into_iter().take(limit) {
+        // Resolve kind and text from the memories table.
+        let memory_row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT kind, text FROM memories WHERE memory_id = ?1",
+                params![row.memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (kind_str, text) = memory_row.unwrap_or_else(|| ("fact".to_string(), String::new()));
+        let mk = kind_str.parse::<MemoryKind>().unwrap_or(MemoryKind::Fact);
+        let per_cite = SAVED_TOKENS_PER_CITATION
+            .iter()
+            .find(|(k, _)| k == &mk)
+            .map(|(_, v)| *v as u64)
+            .unwrap_or(0);
+        let estimated_saved = per_cite * row.count;
+        let text_head: String = text.chars().take(80).collect();
+
+        entries.push(MemoryRoiEntry {
+            memory_id: row.memory_id,
+            kind: kind_str,
+            text_head,
+            citation_count: row.count,
+            estimated_saved_tokens: estimated_saved,
+        });
+    }
+
+    // Sort descending by estimated_saved_tokens.
+    entries.sort_by_key(|e| std::cmp::Reverse(e.estimated_saved_tokens));
+    Ok(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +417,34 @@ pub fn roi_report(
             |r| r.get(0),
         )?,
     };
+
+    // S2.4(c): digest_served and resume_served event counts.
+    let digest_served_events: u64 = match &window_since {
+        Some(ts) => conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'digest_served' AND ts >= ?1",
+            params![ts],
+            |r| r.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'digest_served'",
+            [],
+            |r| r.get(0),
+        )?,
+    };
+    let resume_served_events: u64 = match &window_since {
+        Some(ts) => conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'resume_served' AND ts >= ?1",
+            params![ts],
+            |r| r.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'resume_served'",
+            [],
+            |r| r.get(0),
+        )?,
+    };
+    let warmstart_saved_tokens = digest_served_events * SAVED_TOKENS_PER_DIGEST_SERVED
+        + resume_served_events * SAVED_TOKENS_PER_RESUME_SERVED;
 
     // --- injected_tokens (sum of used_tokens across context.injected events) ---
     let injected_tokens: u64 = {
@@ -342,8 +542,12 @@ pub fn roi_report(
     };
 
     let total_citations: u64 = citations_by_kind.iter().map(|(_, c)| *c as u64).sum();
-    let estimated_saved_tokens = estimate_savings(&citations_by_kind);
+    let citation_saved_tokens = estimate_savings(&citations_by_kind);
+    // S2.4(c): include warm-start savings in the total estimate.
+    let estimated_saved_tokens = citation_saved_tokens + warmstart_saved_tokens;
     let net_tokens = estimated_saved_tokens as i64 - injected_tokens as i64;
+    // S2.4(b): output token estimate.
+    let estimated_output_tokens = estimate_output_tokens(injected_tokens);
 
     // --- USD ---
     let price = resolve_price_per_mtok(model_name, price_per_mtok_override);
@@ -360,7 +564,11 @@ pub fn roi_report(
     Ok(RoiReport {
         window_days: window.days(),
         injected_tokens,
+        estimated_output_tokens,
         served_events,
+        digest_served_events,
+        resume_served_events,
+        warmstart_saved_tokens,
         citations: total_citations,
         estimated_saved_tokens,
         net_tokens,
@@ -883,6 +1091,132 @@ mod tests {
                 .expect("roi_report");
             assert!(report.usd.is_none(), "usd must be None for unknown model");
         });
+    }
+
+    // ── S2.4 tests ────────────────────────────────────────────────────────────
+
+    fn seed_event(conn: &rusqlite::Connection, kind: &str, payload: serde_json::Value) {
+        let ev = Event::new(RunId::new(), kind, payload);
+        projector::apply_events(conn, &[ev]).expect("seed event");
+    }
+
+    #[test]
+    fn roi_report_output_token_estimate_is_quarter_of_input() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let run_id = RunId::new();
+            seed_injected_event(&conn, run_id, 4_000);
+
+            let report =
+                roi_report(&conn, RoiWindow::All, "claude-sonnet-4", None).expect("roi_report");
+            // 4000 * 0.25 = 1000
+            assert_eq!(
+                report.estimated_output_tokens, 1_000,
+                "output token estimate must be 0.25 × input"
+            );
+        });
+    }
+
+    #[test]
+    fn roi_report_digest_served_adds_savings() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+
+            seed_event(
+                &conn,
+                "digest_served",
+                serde_json::json!({"digest_chars": 800, "approx_tokens": 200}),
+            );
+            seed_event(
+                &conn,
+                "resume_served",
+                serde_json::json!({"resume_chars": 400, "approx_tokens": 100}),
+            );
+
+            let report =
+                roi_report(&conn, RoiWindow::All, "unknown-model", None).expect("roi_report");
+            assert_eq!(report.digest_served_events, 1);
+            assert_eq!(report.resume_served_events, 1);
+            let expected_warmstart =
+                SAVED_TOKENS_PER_DIGEST_SERVED + SAVED_TOKENS_PER_RESUME_SERVED;
+            assert_eq!(
+                report.warmstart_saved_tokens, expected_warmstart,
+                "warmstart_saved_tokens must sum digest+resume"
+            );
+            assert_eq!(
+                report.estimated_saved_tokens, expected_warmstart,
+                "total savings must include warmstart (no citations here)"
+            );
+        });
+    }
+
+    #[test]
+    fn per_memory_roi_top_entries_sorted_by_savings() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            // Add two memories of different kinds.
+            let fp_id = seed_memory(&root, MemoryKind::FailurePattern, "fp roi test");
+            let cmd_id = seed_memory(&root, MemoryKind::Command, "cmd roi test");
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+
+            let run_id = RunId::new();
+            // 1 failure_pattern cite (1500 saved) + 3 command cites (3×400=1200).
+            seed_citation(&conn, run_id, &fp_id, 1);
+            seed_citation(&conn, run_id, &cmd_id, 2);
+            seed_citation(&conn, run_id, &cmd_id, 3);
+            seed_citation(&conn, run_id, &cmd_id, 4);
+
+            let entries = per_memory_roi(&conn, RoiWindow::All, 10).expect("per_memory_roi");
+            assert!(!entries.is_empty(), "must have entries");
+            // FailurePattern (1500) > Command×3 (1200) → fp must come first.
+            assert_eq!(
+                entries[0].memory_id, fp_id,
+                "failure_pattern cite must rank first by savings"
+            );
+            assert_eq!(entries[0].estimated_saved_tokens, 1500);
+            assert_eq!(entries[0].citation_count, 1);
+
+            let cmd_entry = entries
+                .iter()
+                .find(|e| e.memory_id == cmd_id)
+                .expect("cmd entry");
+            assert_eq!(cmd_entry.citation_count, 3);
+            assert_eq!(cmd_entry.estimated_saved_tokens, 1200);
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    #[test]
+    fn per_memory_roi_respects_top_limit() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+            let m1 = seed_memory(&root, MemoryKind::Fact, "fact1");
+            let m2 = seed_memory(&root, MemoryKind::Fact, "fact2");
+            let m3 = seed_memory(&root, MemoryKind::Fact, "fact3");
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let run_id = RunId::new();
+            seed_citation(&conn, run_id, &m1, 1);
+            seed_citation(&conn, run_id, &m2, 2);
+            seed_citation(&conn, run_id, &m3, 3);
+
+            let entries = per_memory_roi(&conn, RoiWindow::All, 2).expect("per_memory_roi limit");
+            assert_eq!(entries.len(), 2, "must respect top limit");
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    #[test]
+    fn estimate_output_tokens_quarter_ratio() {
+        assert_eq!(estimate_output_tokens(4_000), 1_000);
+        assert_eq!(estimate_output_tokens(0), 0);
+        assert_eq!(estimate_output_tokens(1_000), 250);
     }
 
     #[test]
