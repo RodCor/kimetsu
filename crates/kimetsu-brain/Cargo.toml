@@ -21,6 +21,14 @@ categories = ["database", "development-tools"]
 # without --features embeddings never downloads a model.
 default = []
 embeddings = ["dep:fastembed", "dep:usearch", "dep:hf-hub"]
+# S5.3 (remote-only): full petgraph Tier-2 backend — centrality,
+# shortest-path, community detection for candidate expansion.
+# NEVER in default. Enabled by kimetsu-remote so the local CLI never
+# pulls in petgraph. During workspace builds, feature unification
+# turns this ON for kimetsu-brain via kimetsu-remote, which is
+# intentional: the petgraph code compiles but default config still
+# selects "flat", so no behaviour changes for lean/CLI consumers.
+graph = ["dep:petgraph"]
 
 [dependencies]
 blake3.workspace = true
@@ -29,6 +37,9 @@ blake3.workspace = true
 # stays dep-light (and so the Windows ort C++ runtime isn't
 # required to build kimetsu). Pinned to 5.* — that's the line that
 # supports BGE-M3 + Jina-v2-base-code alongside BGE-small.
+# S5.3: petgraph powers the Tier-2 full-graph backend (remote-only).
+# Optional so the lean/CLI build never links it. `graph` feature gate.
+petgraph = { version = "0.6", optional = true }
 fastembed = { version = "5", optional = true }
 # v1.0.0 reranker bench: user-defined ONNX model download via HuggingFace Hub.
 # Mirrors fastembed's own hf-hub usage (ureq sync API, no tokio).
