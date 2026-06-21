@@ -5989,14 +5989,20 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         return Ok(()); // Nothing relevant — zero output
     }
 
-    // v1.5: load broker.compress_capsules + broker.session_dedupe best-effort.
-    // The hook must never fail on config errors — fallback to defaults (both ON).
-    let (compress_capsules, session_dedupe) =
+    // v1.5 / F3 Pass B: load broker render-flags best-effort.
+    // The hook must never fail on config errors — fallback to safe defaults.
+    let (compress_capsules, session_dedupe, answer_grade_min_score) =
         kimetsu_core::paths::ProjectPaths::discover(&workspace)
             .ok()
             .and_then(|paths| project::load_config(&paths).ok())
-            .map(|cfg| (cfg.broker.compress_capsules, cfg.broker.session_dedupe))
-            .unwrap_or((true, true));
+            .map(|cfg| {
+                (
+                    cfg.broker.compress_capsules,
+                    cfg.broker.session_dedupe,
+                    cfg.broker.answer_grade_min_score,
+                )
+            })
+            .unwrap_or((true, true, 0.92));
 
     // v1.5 (Story 2.3): session-scoped cross-turn dedupe.
     // Load the proactive-state sidecar (already used by proactive hooks) to
@@ -6028,8 +6034,57 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         bundle.capsules.iter().collect()
     };
 
+    // F3 Pass B (3.3): pre-compute the answer-grade marker for the top capsule
+    // (the first capsule in capsules_to_render after dedupe). The marker signals
+    // to the model that it can act in one turn rather than re-verifying.
+    //
+    // STRICTLY ADDITIVE: this only changes the rendered prefix of the already-
+    // top capsule. Ranking, floors, and which capsules were selected are never
+    // touched. Suppressed (guard = None) when:
+    //   a) the top capsule's score is below answer_grade_min_score (conservative
+    //      default 0.92 — roughly the top 10% of scores on a well-populated brain),
+    //   b) answer_grade_min_score > 1.0 (operator disabled the feature), or
+    //   c) REGRET GUARD: the capsule's memory_id appears in the recent dropped
+    //      sidecar — meaning the same memory was excluded by floors in a different
+    //      recent retrieval context, indicating inconsistent scoring that makes
+    //      the "verified answer" label overconfident. Read-only peek (best-effort).
+    //
+    // Note: the dropped sidecar tracks EXCLUDED capsules (those that did not
+    // make the bundle). A capsule in bundle.capsules cannot be in the sidecar
+    // for THIS retrieval pass, but it might appear there from a PRIOR retrieval
+    // within the 2-hour window — that is the overconfidence signal we guard.
+    let answer_grade_handle: Option<&str> = capsules_to_render
+        .first()
+        .filter(|top| top.score >= answer_grade_min_score && answer_grade_min_score <= 1.0)
+        .and_then(|top| {
+            // Regret guard: read-only peek at the dropped sidecar.
+            // If the memory was recently dropped by floors (in any prior retrieval
+            // this session window), do NOT label it answer-grade — the floors
+            // gave conflicting signals, which means the confidence marker would
+            // be misleading. Best-effort: any I/O error skips the guard (allows
+            // the label) rather than breaking the hook.
+            let memory_id = top.expansion_handle.strip_prefix("memory:").unwrap_or("");
+            if memory_id.is_empty() {
+                return None; // Non-memory capsules (repo_file, manifest) — skip guard
+            }
+            let in_dropped_sidecar = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+                .ok()
+                .map(|paths| {
+                    let cache_dir = kimetsu_core::paths::user_cache_dir_for(&paths.repo_root);
+                    let sidecar_path = kimetsu_brain::dropped_capsule::sidecar_path(&cache_dir);
+                    let state = kimetsu_brain::dropped_capsule::load(&sidecar_path);
+                    state.entries.iter().any(|e| e.memory_id == memory_id)
+                })
+                .unwrap_or(false);
+            if in_dropped_sidecar {
+                None // Regret guard suppresses the answer-grade label
+            } else {
+                Some(top.expansion_handle.as_str())
+            }
+        });
+
     let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
-    for capsule in &capsules_to_render {
+    for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
         let rendered: String = if compress_capsules {
@@ -6044,6 +6099,13 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             .map(str::to_string)
             .unwrap_or(rendered);
         additional_context.push('\n');
+        // F3 Pass B (3.3): prepend the answer-grade marker to the first capsule
+        // when it cleared the high-confidence threshold AND passed the regret
+        // guard. Only the first rendered capsule (idx == 0) can be answer-grade
+        // (it's the top-ranked capsule); subsequent capsules are never marked.
+        if idx == 0 && answer_grade_handle.is_some() {
+            additional_context.push_str("Verified answer from project memory: ");
+        }
         additional_context.push_str(&text);
     }
 
@@ -6450,6 +6512,11 @@ struct HookToolInput {
     tool_name: Option<String>,
     command: Option<String>,
     tool_response: Option<String>,
+    /// F3 Pass B (3.5): file path from `tool_input.file_path` (ReadFile,
+    /// EditFile, etc.). Absent for Bash and other non-file tools. Used by
+    /// the proactive pre-fetch path when `broker.proactive_prefetch = true`
+    /// to augment the retrieval query with the file being operated on.
+    tool_file_path: Option<String>,
 }
 
 fn parse_hook_tool_input(raw: &str) -> HookToolInput {
@@ -6466,6 +6533,15 @@ fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty());
+    // F3 Pass B (3.5): extract file_path from tool_input for pre-fetch query
+    // augmentation. Covers ReadFile, EditFile, WriteFile, and similar tools
+    // whose Claude Code / Codex tool_input carries a `file_path` field.
+    let tool_file_path = v
+        .get("tool_input")
+        .and_then(|ti| ti.get("file_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
     // tool_response may be a string or a structured object; stringify
     // objects so failure detection still has something to scan.
     let tool_response = match v.get("tool_response") {
@@ -6478,6 +6554,7 @@ fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         tool_name: str_field("tool_name"),
         command,
         tool_response,
+        tool_file_path,
     }
 }
 
@@ -6500,16 +6577,18 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     };
     // Honor the configured embedder id for consistency (proactive
     // retrieval is lexical-only, but this keeps labels coherent). Also
-    // capture the auto-harvest toggle and render flags.
-    let (auto_harvest, compress_capsules) = match project::load_config(&paths) {
+    // capture the auto-harvest toggle, render flags, and F3 Pass B toggles.
+    let (auto_harvest, compress_capsules, proactive_prefetch) = match project::load_config(&paths) {
         Ok(config) => {
             kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
             (
                 config.learning.auto_harvest,
                 config.broker.compress_capsules,
+                config.broker.proactive_prefetch,
             )
         }
-        Err(_) => (true, true),
+        // Fallback: safe defaults — proactive_prefetch OFF (zero behaviour change)
+        Err(_) => (true, true, false),
     };
 
     let mut input = String::new();
@@ -6521,9 +6600,20 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
 
     // Defensive tool-name gate (the hook matcher should already scope
     // to Bash, but be safe across harness quirks).
-    if let Some(name) = hook.tool_name.as_deref()
-        && !name.eq_ignore_ascii_case("bash")
-    {
+    //
+    // F3 Pass B (3.5): when proactive_prefetch is ON, relax the Bash-only gate
+    // so file-tool PreToolUse calls (ReadFile, EditFile, WriteFile, …) can also
+    // trigger a lightweight file-path-based pre-fetch. The PostToolUse path is
+    // unchanged (still Bash-only — file tools don't produce failure output).
+    // When proactive_prefetch is OFF (default), the gate is unchanged: only
+    // Bash tool calls are processed (zero behaviour change).
+    let is_bash = hook
+        .tool_name
+        .as_deref()
+        .map(|n| n.eq_ignore_ascii_case("bash"))
+        .unwrap_or(true); // no tool_name → assume Bash (old harness compat)
+    let allow_non_bash = proactive_prefetch && matches!(event, ProactiveEvent::PreTool);
+    if !is_bash && !allow_non_bash {
         return Ok(());
     }
 
@@ -6564,12 +6654,43 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     }
 
     // Build the retrieval query + actionable kinds per event.
+    //
+    // F3 Pass B (3.5): when `broker.proactive_prefetch = true`, the PreToolUse
+    // query is augmented with the tool's `file_path` (e.g. the file being read
+    // or edited). This lightweight warm surfaces memories relevant to the file
+    // BEFORE the agent operates on it, rather than waiting for a failure.
+    //
+    // When `proactive_prefetch = false` (default), no augmentation happens and
+    // PreToolUse behaviour is identical to before this flag existed. The same
+    // floors (min_score, refractory, dedupe) gate the result — this is strictly
+    // additive. Default-on graduation waits for regret data (Epic S2).
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
         ProactiveEvent::PreTool => {
-            let Some(cmd) = hook.command.as_deref() else {
-                return Ok(());
+            // F3 Pass B (3.5): build the PreToolUse query from command and/or
+            // file_path depending on the proactive_prefetch flag.
+            //
+            // proactive_prefetch OFF (default):
+            //   - No command → silent exit (identical to pre-F3 behaviour).
+            //   - Command present → use command as query (identical to pre-F3).
+            //   - file_path is NEVER consulted (zero behaviour change).
+            //
+            // proactive_prefetch ON:
+            //   - No command AND no file_path → silent exit.
+            //   - No command but file_path present → file_path-only query.
+            //   - Command present → command + file_path (if any) concatenated.
+            let cmd_opt = hook.command.as_deref();
+            let fp_opt = if proactive_prefetch {
+                hook.tool_file_path.as_deref().filter(|s| s.len() > 4)
+            } else {
+                None
             };
-            (cmd.to_string(), &["failure_pattern", "convention"], None)
+            let query = match (cmd_opt, fp_opt) {
+                (Some(cmd), Some(fp)) => format!("{cmd} {fp}"),
+                (Some(cmd), None) => cmd.to_string(),
+                (None, Some(fp)) => fp.to_string(),
+                (None, None) => return Ok(()), // nothing to query on
+            };
+            (query, &["failure_pattern", "convention"], None)
         }
         ProactiveEvent::PostTool => {
             let resp = hook.tool_response.as_deref().unwrap_or("");
