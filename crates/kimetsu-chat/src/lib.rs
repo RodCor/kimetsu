@@ -22,6 +22,7 @@
 //! REPL loop is a minimal echo placeholder. Implementation lands in
 //! subsequent commits as the v0.3 sprint progresses.
 
+pub mod ask;
 pub mod bridge;
 pub mod commands;
 pub mod cost;
@@ -30,6 +31,9 @@ pub mod repl;
 pub mod skills;
 pub mod ui;
 
+pub use ask::{
+    AskAnswer, compose_answer, is_command_query, record_helpful_mark, reorder_for_command_fastpath,
+};
 pub use bridge::{
     BridgeTarget, InstallScope, PluginInstallReport, PluginMode, PluginScopeStatus,
     PluginUninstallReport, RemoteInstall, WiringState, bridge_export_skill, bridge_import_skill,

@@ -589,6 +589,46 @@ pub struct BrokerSection {
     /// and defaults to enabled so fresh installs get it immediately).
     #[serde(default = "default_true")]
     pub warm_start: bool,
+    /// Flagship 3 / Pass B (3.3): minimum composite broker score for a capsule
+    /// to receive the "Verified answer from project memory:" prefix at render
+    /// time. This prefix signals to the model that it can act in one turn
+    /// rather than re-verifying the information.
+    ///
+    /// STRICTLY ADDITIVE: only changes the rendered prefix of an already-top
+    /// capsule. Ranking, floors, and capsule selection are NEVER affected.
+    ///
+    /// The threshold is deliberately conservative (0.92 default) so the marker
+    /// is rare and only fires on genuinely unambiguous matches. Tune with
+    /// `kimetsu brain bench` data (Epic S2) before lowering. Set to 1.1 (above
+    /// the maximum achievable score) to disable entirely, or 0.0 to always
+    /// mark any top capsule (not recommended — wait for regret data first).
+    ///
+    /// Regret guard: if the capsule's memory was recently dropped by floors in
+    /// another retrieval context (appears in the dropped sidecar), the prefix
+    /// is suppressed regardless of this threshold, preventing overconfident
+    /// labelling of inconsistently-scored memories.
+    ///
+    /// `#[serde(default = …)]` keeps all pre-F3 project.toml files loading
+    /// unchanged (they get the conservative default).
+    #[serde(default = "default_answer_grade_min_score")]
+    pub answer_grade_min_score: f32,
+    /// Flagship 3 / Pass B (3.5): opt-in proactive pre-fetch at PreToolUse.
+    ///
+    /// When true, the PreToolUse hook does a LIGHTWEIGHT relevance warm based
+    /// on the current tool's file path (in addition to the command text),
+    /// surfacing a relevant memory before the agent edits or reads a file.
+    /// The existing floors (min_score, max_capsules, session dedupe, refractory
+    /// throttle) all apply — this is additive only.
+    ///
+    /// Default false (OFF): the PreToolUse hook behaviour is identical to
+    /// before this flag existed. Graduating to default-on waits for regret
+    /// data (Epic S2) to confirm that file-path-augmented queries don't
+    /// increase noise. Enable per-project in project.toml once comfortable.
+    ///
+    /// `#[serde(default)]` keeps all pre-F3 project.toml files loading with
+    /// the feature OFF (zero behaviour change for existing users).
+    #[serde(default)]
+    pub proactive_prefetch: bool,
 }
 
 fn default_max_capsules() -> usize {
@@ -611,6 +651,15 @@ fn default_budget_run_cap_tokens() -> u32 {
     8000
 }
 
+/// F3 / Pass B (3.3): conservative answer-grade threshold. At 0.92 the marker
+/// fires only when the retrieval pipeline (embedder + reranker) places the top
+/// capsule in the very top of its score range — roughly 1-in-10 retrievals on
+/// a well-populated brain. Lowering requires regret data from Epic S2 to
+/// confirm precision stays high.
+fn default_answer_grade_min_score() -> f32 {
+    0.92
+}
+
 impl Default for BrokerSection {
     fn default() -> Self {
         Self {
@@ -625,6 +674,8 @@ impl Default for BrokerSection {
             compress_capsules: default_true(),
             session_dedupe: default_true(),
             warm_start: default_true(),
+            answer_grade_min_score: default_answer_grade_min_score(),
+            proactive_prefetch: false,
         }
     }
 }
@@ -952,6 +1003,18 @@ max_total_cost_usd = 250.0
         assert_eq!(
             config.storage.backend, "flat",
             "storage.backend must default to \"flat\" when absent"
+        );
+        // F3 Pass B (3.3): a pre-F3 project.toml without broker.answer_grade_min_score
+        // must load cleanly and receive the conservative default (0.92).
+        assert!(
+            (config.broker.answer_grade_min_score - 0.92).abs() < f32::EPSILON,
+            "broker.answer_grade_min_score must default to 0.92"
+        );
+        // F3 Pass B (3.5): a pre-F3 project.toml without broker.proactive_prefetch
+        // must load cleanly and default to false (opt-in, OFF by default).
+        assert!(
+            !config.broker.proactive_prefetch,
+            "broker.proactive_prefetch must default to false (opt-in)"
         );
     }
 
@@ -1361,6 +1424,56 @@ max_total_cost_usd = 250.0
         assert_eq!(
             config.storage.backend, "flat",
             "default project config must use flat backend"
+        );
+    }
+
+    // ── F3 Pass B: answer_grade_min_score + proactive_prefetch tests ─────────
+
+    /// F3-B-1: new fields survive a round-trip through serialize → deserialize
+    /// with non-default values.
+    #[test]
+    fn f3b_new_broker_fields_round_trip() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.broker.answer_grade_min_score = 0.85;
+        config.broker.proactive_prefetch = true;
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            (reloaded.broker.answer_grade_min_score - 0.85).abs() < f32::EPSILON,
+            "answer_grade_min_score must round-trip"
+        );
+        assert!(
+            reloaded.broker.proactive_prefetch,
+            "proactive_prefetch must round-trip as true"
+        );
+    }
+
+    /// F3-B-2: proactive_prefetch = false (default) survives round-trip.
+    #[test]
+    fn f3b_proactive_prefetch_default_false_round_trips() {
+        let config = ProjectConfig::default_for_project("demo");
+        assert!(!config.broker.proactive_prefetch, "default must be false");
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            !reloaded.broker.proactive_prefetch,
+            "default false must survive round-trip"
+        );
+    }
+
+    /// F3-B-3: default_for_project uses conservative defaults for both fields.
+    #[test]
+    fn f3b_default_for_project_uses_conservative_defaults() {
+        let config = ProjectConfig::default_for_project("demo");
+        // answer_grade_min_score: 0.92 (rare, only very high-confidence capsules)
+        assert!(
+            (config.broker.answer_grade_min_score - 0.92).abs() < f32::EPSILON,
+            "default answer_grade_min_score must be 0.92"
+        );
+        // proactive_prefetch: false (opt-in — never changes default behaviour)
+        assert!(
+            !config.broker.proactive_prefetch,
+            "default proactive_prefetch must be false"
         );
     }
 }
