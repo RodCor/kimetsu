@@ -1097,6 +1097,14 @@ struct TuneArgs {
     /// Revert the most recent tune-history entry.
     #[arg(long)]
     revert: bool,
+    /// S2.1: Show re-tune trigger state (corpus growth + drift signal).
+    /// Included automatically in --status; use alone for a cheap check.
+    #[arg(long)]
+    triggers: bool,
+    /// S2.2: Show the model re-selection advisor (embedder×reranker grid
+    /// recommendation with download+reindex cost).
+    #[arg(long)]
+    models: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<std::path::PathBuf>,
@@ -1154,6 +1162,11 @@ struct RoiArgs {
     /// Emit machine-readable JSON (stable RoiReport schema).
     #[arg(long)]
     json: bool,
+    /// S2.4(a): Show the top N memories by estimated token savings
+    /// (citation-weighted, pairs with consolidate/triage).
+    /// Default: show top 10 when flag is present with no value.
+    #[arg(long, value_name = "N")]
+    top: Option<usize>,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -4876,9 +4889,9 @@ fn brain_insights(
     Ok(())
 }
 
-/// v1.5: `kimetsu brain roi` — ROI ledger.
+/// v1.5 / S2.4: `kimetsu brain roi` — ROI ledger.
 fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
-    use kimetsu_brain::roi::{RoiWindow, roi_report};
+    use kimetsu_brain::roi::{RoiWindow, per_memory_roi, roi_report};
 
     let workspace = args
         .workspace
@@ -4895,6 +4908,44 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         config.model.price_per_mtok,
     )?;
 
+    // S2.4(a): --top mode.
+    if let Some(top_n) = args.top {
+        let limit = if top_n == 0 { 10 } else { top_n };
+        let entries = per_memory_roi(&conn, window, limit)?;
+
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            return Ok(());
+        }
+
+        let window_label = match report.window_days {
+            Some(d) => format!("last {d} days"),
+            None => "all time".to_string(),
+        };
+        println!("── ROI Top Memories ({window_label}, top {limit}) ─────");
+        if entries.is_empty() {
+            println!("  No citations recorded yet.");
+        } else {
+            for (i, e) in entries.iter().enumerate() {
+                println!(
+                    "  #{:>2}  [{:>15}]  cites={:>3}  saved={:>6} tok  {}",
+                    i + 1,
+                    e.kind,
+                    e.citation_count,
+                    format_token_count(e.estimated_saved_tokens),
+                    if e.text_head.len() >= 60 {
+                        format!("{}…", &e.text_head[..60])
+                    } else {
+                        e.text_head.clone()
+                    },
+                );
+            }
+        }
+        println!("──────────────────────────────────────────────");
+        println!("  (Use without --top for the full ROI summary)");
+        return Ok(());
+    }
+
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -4907,10 +4958,24 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     };
     println!("── ROI Ledger ({window_label}) ────────────────────────");
     println!("  served events:        {}", report.served_events);
+    // S2.4(c): show warm-start events.
+    if report.digest_served_events > 0 || report.resume_served_events > 0 {
+        println!("  digest_served:        {}", report.digest_served_events);
+        println!("  resume_served:        {}", report.resume_served_events);
+        println!(
+            "  warmstart saved tok:  {}",
+            format_token_count(report.warmstart_saved_tokens)
+        );
+    }
     println!("  citations:            {}", report.citations);
     println!(
         "  injected tokens:      {}",
         format_token_count(report.injected_tokens)
+    );
+    // S2.4(b): output token estimate.
+    println!(
+        "  est. output tokens:   {} (ratio est.)",
+        format_token_count(report.estimated_output_tokens)
     );
     println!(
         "  est. saved tokens:    {}",
@@ -4940,7 +5005,7 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
 
     // Verdict line.
     println!("──────────────────────────────────────────────");
-    if report.citations == 0 {
+    if report.citations == 0 && report.warmstart_saved_tokens == 0 {
         println!(
             "  No retrieval activity recorded yet — the ledger starts \
              counting as you work."
@@ -4983,8 +5048,9 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v1.5: `kimetsu brain tune` — personal eval readiness + optional sweep.
+/// v1.5 / S2: `kimetsu brain tune` — personal eval readiness + optional sweep.
 fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::tune::{compute_model_advisor, compute_retune_trigger};
     use kimetsu_brain::tuneset::build_personal_eval;
 
     let workspace = args
@@ -4992,10 +5058,19 @@ fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
-    let (_paths2, _config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+    let (_paths2, config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
 
     if args.revert {
         return brain_tune_revert(&workspace);
+    }
+
+    // S2.2: --models only (no sweep).
+    if args.models && !args.status {
+        let trigger = compute_retune_trigger(&conn, &paths.kimetsu_dir)
+            .map_err(|e| format!("compute_retune_trigger: {e}"))?;
+        let advisor = compute_model_advisor(&config.embedder.model, &trigger);
+        print_model_advisor(&advisor);
+        return Ok(());
     }
 
     let eval = build_personal_eval(&conn, 1800).map_err(|e| format!("build_personal_eval: {e}"))?;
@@ -5029,8 +5104,23 @@ fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
     println!();
     println!("Readiness: {readiness}");
 
-    if args.status {
-        return Ok(());
+    // S2.1: always show trigger state in --status, or when --triggers flag used.
+    if args.status || args.triggers {
+        println!();
+        let trigger = compute_retune_trigger(&conn, &paths.kimetsu_dir)
+            .map_err(|e| format!("compute_retune_trigger: {e}"))?;
+        print_retune_trigger_state(&trigger);
+
+        // S2.2: show model advisor when --models is also set with --status.
+        if args.models {
+            println!();
+            let advisor = compute_model_advisor(&config.embedder.model, &trigger);
+            print_model_advisor(&advisor);
+        }
+
+        if args.status {
+            return Ok(());
+        }
     }
 
     // Sweep (or dry-run report).
@@ -5061,6 +5151,87 @@ fn kind_coverage_from_eval(
     vec
 }
 
+/// S2.1: Print the re-tune trigger state in a human-readable format.
+fn print_retune_trigger_state(trigger: &kimetsu_brain::tune::RetuneTriggerState) {
+    println!("=== S2.1 Re-tune Triggers ===");
+    if let Some(ts) = &trigger.last_tuned_at {
+        println!("  Last tuned at:           {ts}");
+        println!(
+            "  Memory count at tune:    {}",
+            trigger.memory_count_at_last_tune
+        );
+    } else {
+        println!("  Last tuned at:           (never)");
+    }
+    println!(
+        "  Current memory count:    {}",
+        trigger.current_memory_count
+    );
+    println!(
+        "  Added since last tune:   {}",
+        trigger.memories_added_since_tune
+    );
+    println!(
+        "  Corpus milestone (≥{}): {}",
+        kimetsu_brain::tune::RETUNE_CORPUS_MILESTONE,
+        if trigger.corpus_milestone_triggered {
+            "TRIGGERED"
+        } else {
+            "not reached"
+        }
+    );
+    println!(
+        "  Regret rate (24h):       {:.1}% ({}/{} events)",
+        trigger.regret_rate * 100.0,
+        trigger.recent_regret_count,
+        trigger.recent_served_count
+    );
+    println!(
+        "  Drift threshold (≥{:.0}%): {}",
+        kimetsu_brain::tune::RETUNE_REGRET_RATE_THRESHOLD * 100.0,
+        if trigger.drift_triggered {
+            "TRIGGERED"
+        } else {
+            "within normal"
+        }
+    );
+    println!();
+    if trigger.should_retune {
+        println!("  → Re-tune PROPOSED: run `kimetsu brain tune` to run the sweep.");
+    } else {
+        println!("  → No re-tune needed at this time.");
+    }
+}
+
+/// S2.2: Print the model re-selection advisor report.
+fn print_model_advisor(advisor: &kimetsu_brain::tune::ModelAdvisorReport) {
+    println!("=== S2.2 Model Re-selection Advisor ===");
+    println!("  Current embedder:  {}", advisor.current_embedder);
+    println!("  Memories to reindex: {}", advisor.memories_to_reindex);
+    println!(
+        "  Est. reindex cost:   ~{} tokens (conservative lower-bound)",
+        format_token_count(advisor.estimated_reindex_tokens)
+    );
+    println!();
+    println!("  {}", advisor.reason);
+    println!();
+    println!("  Candidate models (for grid sweep):");
+    for m in &advisor.candidate_models {
+        println!(
+            "    {:<40} ~{} MiB download",
+            m.model_id, m.approx_download_mib
+        );
+        println!("      {}", m.description);
+    }
+    println!();
+    if advisor.recommend_grid_run {
+        println!("  → Grid run RECOMMENDED. Re-run with the full sweep after downloading models.");
+        println!("    NOTE: This advisor NEVER auto-switches the model. Apply changes manually.");
+    } else {
+        println!("  → Grid run optional. Current model appears sufficient.");
+    }
+}
+
 fn brain_tune_sweep(
     workspace: &std::path::Path,
     paths: &kimetsu_core::paths::ProjectPaths,
@@ -5072,8 +5243,8 @@ fn brain_tune_sweep(
     use kimetsu_brain::eval::{mean, mrr};
     use kimetsu_brain::project::BrainSession;
     use kimetsu_brain::tune::{
-        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history, compute_objective,
-        select_winner, train_holdout_split,
+        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history,
+        compute_objective_with_regret, count_regret_events, select_winner, train_holdout_split,
     };
     use std::collections::HashMap;
     use time::format_description::well_known::Rfc3339;
@@ -5243,13 +5414,48 @@ fn brain_tune_sweep(
             (mean(&mrr_vals), mean(&token_vals))
         };
 
+    // S2.3: Compute global regret rate from the DB for the objective penalty.
+    // We use the ALL-TIME regret / served ratio here (the sweep window is the
+    // full personal eval set, which spans all time).
+    // Best-effort: if the DB cannot be opened, regret_rate and memory_count
+    // degrade gracefully to 0 (objective falls back to v1.5 formula).
+    let (global_regret_rate, current_memory_count) = {
+        match kimetsu_brain::project::load_project_readonly(workspace) {
+            Ok((_paths_ro, _cfg_ro, conn_ro)) => {
+                let total_regrets = count_regret_events(&conn_ro, None, None).unwrap_or(0);
+                let total_served: u64 = conn_ro
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE kind = 'context.served'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let regret_rate = if total_served > 0 {
+                    total_regrets as f64 / total_served as f64
+                } else {
+                    0.0
+                };
+                let mem_count: u64 = conn_ro
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                (regret_rate, mem_count)
+            }
+            Err(_) => (0.0_f64, 0_u64),
+        }
+    };
+
     // Evaluate current config on holdout for baseline.
     let (baseline_holdout_mrr, baseline_holdout_tokens) =
         evaluate_cases(&current_combo, &holdout_cases);
-    let baseline_holdout_obj = compute_objective(
+    let baseline_holdout_obj = compute_objective_with_regret(
         baseline_holdout_mrr,
         baseline_holdout_tokens,
         args.cost_weight,
+        global_regret_rate,
     );
 
     // Sweep all combos on TRAIN set.
@@ -5263,7 +5469,8 @@ fn brain_tune_sweep(
             let _ = std::io::stdout().flush();
         }
         let (mmrr, mtok) = evaluate_cases(combo, &train_cases);
-        let obj = compute_objective(mmrr, mtok, args.cost_weight);
+        // S2.3: include regret penalty in the objective.
+        let obj = compute_objective_with_regret(mmrr, mtok, args.cost_weight, global_regret_rate);
         combo_results.push(ComboResult {
             combo: combo.clone(),
             mean_mrr: mmrr,
@@ -5281,9 +5488,14 @@ fn brain_tune_sweep(
         }
     };
 
-    // Evaluate winner on HOLDOUT.
+    // Evaluate winner on HOLDOUT (with regret penalty for consistency).
     let (holdout_mrr, holdout_tokens) = evaluate_cases(&winner.combo, &holdout_cases);
-    let holdout_obj = compute_objective(holdout_mrr, holdout_tokens, args.cost_weight);
+    let holdout_obj = compute_objective_with_regret(
+        holdout_mrr,
+        holdout_tokens,
+        args.cost_weight,
+        global_regret_rate,
+    );
     let improvement = holdout_obj - baseline_holdout_obj;
 
     println!();
@@ -5378,6 +5590,8 @@ fn brain_tune_sweep(
         holdout_objective: holdout_obj,
         holdout_mrr,
         baseline_holdout_objective: baseline_holdout_obj,
+        // S2.1: record corpus size so re-tune trigger can detect growth.
+        memory_count_at_tune: Some(current_memory_count),
     };
     append_tune_history(&paths.kimetsu_dir, history_entry)?;
 
@@ -6346,11 +6560,14 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     // v1.5: compute per-session ROI (best-effort; errors are silently ignored).
     let sid = session.get("session_id").and_then(|v| v.as_str());
     let session_savings = compute_stop_hook_savings(&workspace, sid);
+    // S2.1: compute re-tune trigger cue (best-effort; never blocks the hook).
+    let retune_cue = compute_stop_hook_retune_cue(&workspace);
 
     if recorded > 0 {
-        return emit_stop_hook_json(stop_lessons_recorded_json_with_savings(
+        return emit_stop_hook_json(stop_lessons_recorded_json_with_savings_and_tune(
             recorded,
             session_savings.as_deref(),
+            retune_cue.as_deref(),
         ));
     }
     // Short sessions exit silently — no nagging for quick lookups. The
@@ -6418,8 +6635,9 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    emit_stop_hook_json(stop_no_lessons_json_with_savings(
+    emit_stop_hook_json(stop_no_lessons_json_with_savings_and_tune(
         session_savings.as_deref(),
+        retune_cue.as_deref(),
     ))
 }
 
@@ -6442,6 +6660,33 @@ fn compute_stop_hook_savings(workspace: &Path, session_id: Option<&str>) -> Opti
         config.model.price_per_mtok,
     )?;
     Some(sr.savings_sentence())
+}
+
+/// S2.1: Compute a re-tune proposal one-liner for the Stop hook.
+///
+/// Returns `Some(line)` when a re-tune is proposed (corpus milestone or drift
+/// trigger), `None` otherwise.  Best-effort — any error returns `None` so the
+/// stop hook is never disrupted.
+fn compute_stop_hook_retune_cue(workspace: &Path) -> Option<String> {
+    use kimetsu_brain::tune::compute_retune_trigger;
+
+    let (paths, _, conn) = kimetsu_brain::project::load_project_readonly(workspace).ok()?;
+    let trigger = compute_retune_trigger(&conn, &paths.kimetsu_dir).ok()?;
+    if !trigger.should_retune {
+        return None;
+    }
+    let reason = if trigger.corpus_milestone_triggered {
+        format!(
+            "Brain grew +{} memories since last tune — run `kimetsu brain tune`",
+            trigger.memories_added_since_tune
+        )
+    } else {
+        format!(
+            "Retrieval regret rate {:.0}% (24 h) — run `kimetsu brain tune`",
+            trigger.regret_rate * 100.0
+        )
+    };
+    Some(reason)
 }
 
 /// Emit a Claude Code `Stop`-hook result on stdout. Claude Code validates a
@@ -6471,15 +6716,7 @@ fn stop_lessons_recorded_json_with_savings(
     recorded: usize,
     savings: Option<&str>,
 ) -> serde_json::Value {
-    let base = format!(
-        "[Kimetsu] {recorded} lesson{} recorded this session.",
-        if recorded == 1 { "" } else { "s" }
-    );
-    let msg = match savings {
-        Some(s) => format!("{base} {s}"),
-        None => base,
-    };
-    serde_json::json!({ "systemMessage": msg })
+    stop_lessons_recorded_json_with_savings_and_tune(recorded, savings, None)
 }
 
 /// The end-of-session harvest cue. Uses `decision: "block"` so the cue text
@@ -6506,12 +6743,49 @@ fn stop_no_lessons_json() -> serde_json::Value {
 
 /// v1.5: no-lessons nudge with optional savings sentence appended.
 fn stop_no_lessons_json_with_savings(savings: Option<&str>) -> serde_json::Value {
+    stop_no_lessons_json_with_savings_and_tune(savings, None)
+}
+
+/// S2.1: no-lessons nudge with optional savings + re-tune cue.
+fn stop_no_lessons_json_with_savings_and_tune(
+    savings: Option<&str>,
+    retune_cue: Option<&str>,
+) -> serde_json::Value {
     let base =
         "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.";
-    let msg = match savings {
-        Some(s) => format!("{base} {s}"),
-        None => base.to_string(),
-    };
+    let mut parts: Vec<&str> = vec![base];
+    if let Some(s) = savings {
+        parts.push(s);
+    }
+    // S2.1: append re-tune cue if triggered.
+    let retune_owned;
+    if let Some(cue) = retune_cue {
+        retune_owned = format!("[Tune] {cue}.");
+        parts.push(&retune_owned);
+    }
+    let msg = parts.join(" ");
+    serde_json::json!({ "systemMessage": msg })
+}
+
+/// S2.1: lessons-recorded banner with optional savings + re-tune cue.
+fn stop_lessons_recorded_json_with_savings_and_tune(
+    recorded: usize,
+    savings: Option<&str>,
+    retune_cue: Option<&str>,
+) -> serde_json::Value {
+    let base = format!(
+        "[Kimetsu] {} lesson{} recorded.",
+        recorded,
+        if recorded == 1 { "" } else { "s" }
+    );
+    let mut parts: Vec<String> = vec![base];
+    if let Some(s) = savings {
+        parts.push(s.to_string());
+    }
+    if let Some(cue) = retune_cue {
+        parts.push(format!("[Tune] {cue}."));
+    }
+    let msg = parts.join(" ");
     serde_json::json!({ "systemMessage": msg })
 }
 
@@ -11805,6 +12079,8 @@ mod tune_tests {
                 cost_weight: 0.005,
                 apply: false, // DRY RUN
                 revert: false,
+                triggers: false,
+                models: false,
                 workspace: Some(root.clone()),
             };
 
@@ -11837,6 +12113,8 @@ mod tune_tests {
                 cost_weight: 0.005,
                 apply: false,
                 revert: false,
+                triggers: false,
+                models: false,
                 workspace: Some(root.clone()),
             };
             // Should not panic; prints 0 cases.
@@ -11878,6 +12156,8 @@ mod tune_tests {
                 cost_weight: 0.005,
                 apply: true, // --apply with < 30 personal cases → fixture mode
                 revert: false,
+                triggers: false,
+                models: false,
                 workspace: Some(root.clone()),
             };
             brain_tune(args).expect("brain_tune must not error in fixture mode");
