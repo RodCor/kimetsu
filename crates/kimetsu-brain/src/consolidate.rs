@@ -1004,11 +1004,15 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v2→v3 migration test (integration)
+    // v2→target migration test (integration)
+    //
+    // Originally tested v2→v3; updated for S5.2 which added v3→v4 so
+    // a v2 brain now migrates all the way to the current target version.
     // ------------------------------------------------------------------
     #[test]
     fn v2_brain_migrates_to_v3_with_backup_and_superseded_by_column() {
         use crate::migrate;
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
 
         let tmp_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1037,27 +1041,45 @@ mod tests {
             ).expect("insert memory");
         }
 
-        // Now open read-write → should trigger migration v2→v3 + backup.
+        // Now open read-write → should trigger all pending migrations + backup.
         {
             let conn = rusqlite::Connection::open(&db_path).expect("reopen");
             let outcome = migrate::run_migrations(&conn).expect("run_migrations");
             assert_eq!(outcome.from, 2);
-            assert_eq!(outcome.to, 3);
-            assert_eq!(outcome.applied, vec![3]);
+            assert_eq!(outcome.to, KIMETSU_SCHEMA_VERSION);
+            // v3 and v4 (and any future steps) must all be in `applied`.
+            assert!(
+                outcome.applied.contains(&3),
+                "v3 must be in applied list, got: {:?}",
+                outcome.applied
+            );
             // Backup created (non-empty brain).
             assert!(
                 outcome.backup_path.is_some(),
-                "backup must be created for non-empty brain during v2→v3"
+                "backup must be created for non-empty brain during migration"
             );
-            // Column exists.
-            let has_col: bool = conn.query_row(
+            // v3 column: superseded_by exists.
+            let has_superseded_by: bool = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'superseded_by'",
                 [],
                 |r| r.get::<_, i64>(0),
             ).map(|n| n > 0).unwrap_or(false);
             assert!(
-                has_col,
+                has_superseded_by,
                 "superseded_by column must exist after v3 migration"
+            );
+            // v4 table: memory_edges exists.
+            let has_edges: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_edges'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            assert!(
+                has_edges,
+                "memory_edges table must exist after v4 migration"
             );
         }
 

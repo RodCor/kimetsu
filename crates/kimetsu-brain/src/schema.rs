@@ -348,6 +348,102 @@ pub(crate) fn migrate_v2_to_v3(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// The v3→v4 migration: add the `memory_edges` typed-edge projection table.
+///
+/// This table is the storage substrate for the S5.2 `GraphLiteBackend`.
+/// It is a **projection** (derivable from the event log) — `reset_projection`
+/// clears it and `rebuild_in_place` repopulates it by replaying events.
+///
+/// Edge types:
+/// * `supersedes`         — populated NOW from `memory.superseded` events.
+///   The surviving memory acquires a directed edge toward each member it
+///   absorbed.  Edge direction: `src_id` (survivor) → `dst_id` (member).
+/// * `refines`            — reserved; populated by the live write path when
+///   a `memory.accepted` event carries `refines_id` in the payload
+///   (Flagship 1 / Story 1.7).
+/// * `dead_end_of`        — reserved; populated when an episodic resume
+///   event closes a task-dead-end chain.
+/// * `decision_touches`   — reserved; decision memory → touched file paths.
+/// * `lesson_from`        — reserved; lesson memory → source memory / run.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner.  Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v3_to_v4(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_edges (
+            src_id      TEXT NOT NULL,
+            dst_id      TEXT NOT NULL,
+            edge_type   TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (src_id, dst_id, edge_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_edges_src
+            ON memory_edges (src_id, edge_type);
+
+        CREATE INDEX IF NOT EXISTS idx_memory_edges_dst
+            ON memory_edges (dst_id, edge_type);
+        ",
+    )?;
+    Ok(())
+}
+
+/// The v4→v5 migration: add the `work_episodes` per-repo episodic-resume
+/// projection table (Flagship 1, Story 1.3).
+///
+/// `work_episodes` is a **projection** derivable from `work.episode` events:
+/// `reset_projection` clears it and `rebuild_in_place` repopulates it.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner.  Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v4_to_v5(conn: &Connection) -> KimetsuResult<()> {
+    crate::episode::create_work_episodes_table(conn)
+}
+
+/// The v5→v6 migration: add the `skill_proposals` table for Flagship 2
+/// Memory → Skill synthesis.
+///
+/// `skill_proposals` stores skill drafts (or candidate reports) produced
+/// by the skill-synthesis engine. Each row records:
+///   - a unique proposal id (ULID)
+///   - the draft SKILL.md content (NULL = report-only mode, no draft)
+///   - the suggested skill name / description
+///   - a JSON array of the source memory ids used to ground the draft
+///   - the trigger kind (`citations` or `cluster`)
+///   - citation count / cluster size that triggered synthesis
+///   - status: `pending` | `accepted` | `rejected`
+///   - when it was accepted and where the installed skill ended up
+///
+/// This table is a projection (not event-sourced) — proposals are created
+/// by the synthesis engine and consumed interactively; they are not
+/// replayed by `rebuild_in_place`.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner. Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v5_to_v6(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS skill_proposals (
+            proposal_id   TEXT PRIMARY KEY,
+            skill_name    TEXT NOT NULL,
+            description   TEXT NOT NULL,
+            draft_content TEXT,
+            source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+            trigger_kind  TEXT NOT NULL,
+            trigger_count INTEGER NOT NULL DEFAULT 0,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            decided_at    TEXT,
+            installed_path TEXT,
+            created_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_proposals_status
+            ON skill_proposals (status, created_at);
+        ",
+    )?;
+    Ok(())
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only
@@ -476,18 +572,19 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1. Fresh init reaches v3 with full shape
+    // 1. Fresh init reaches current schema version with full shape
     // ------------------------------------------------------------------
     #[test]
-    fn fresh_init_reaches_v3_with_full_shape() {
+    fn fresh_init_reaches_v5_with_full_shape() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("initialize");
 
-        // Version must be 3.
+        // Version must be at target.
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            3,
-            "fresh DB must be at schema version 3 after initialize"
+            KIMETSU_SCHEMA_VERSION,
+            "fresh DB must be at current schema version after initialize"
         );
 
         // Post-migration columns exist on `memories`.
@@ -510,7 +607,7 @@ mod tests {
             "memories must have `superseded_by` column after v3 migration"
         );
 
-        // Tables added by the migration exist.
+        // Tables added by the migrations exist.
         assert!(
             table_exists(&conn, "memory_citations"),
             "memory_citations table must exist"
@@ -518,6 +615,21 @@ mod tests {
         assert!(
             table_exists(&conn, "memory_conflicts"),
             "memory_conflicts table must exist"
+        );
+        // v4: typed-edge projection table
+        assert!(
+            table_exists(&conn, "memory_edges"),
+            "memory_edges table must exist after v4 migration"
+        );
+        // v5: episodic resume table
+        assert!(
+            table_exists(&conn, "work_episodes"),
+            "work_episodes table must exist after v5 migration"
+        );
+        // v6: skill proposals table (Flagship 2 Memory → Skill synthesis)
+        assert!(
+            table_exists(&conn, "skill_proposals"),
+            "skill_proposals table must exist after v6 migration"
         );
     }
 
@@ -552,8 +664,8 @@ mod tests {
         );
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            3,
-            "version must still be 3"
+            kimetsu_core::KIMETSU_SCHEMA_VERSION,
+            "version must still be at target"
         );
 
         // Data must be intact.
@@ -568,17 +680,18 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 3. Idempotent initialize: calling initialize twice succeeds, version stays 3
+    // 3. Idempotent initialize: calling initialize twice succeeds, version stays at target
     // ------------------------------------------------------------------
     #[test]
     fn idempotent_initialize_twice() {
+        use kimetsu_core::KIMETSU_SCHEMA_VERSION;
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("first initialize");
         initialize(&conn).expect("second initialize must not error");
         assert_eq!(
             migrate::current_version(&conn).expect("current_version"),
-            3,
-            "version must still be 3 after double initialize"
+            KIMETSU_SCHEMA_VERSION,
+            "version must still be at target after double initialize"
         );
     }
 
@@ -728,6 +841,147 @@ mod tests {
         assert!(
             msg.contains("newer"),
             "error message must contain 'newer', got: {msg}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // S5.2-v4. v3→v4 migration adds memory_edges table + indexes
+    // ------------------------------------------------------------------
+    #[test]
+    fn v3_to_v4_migration_adds_memory_edges() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Build a v3 DB (baseline + v1→v2 + v2→v3, no v3→v4).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+        conn.execute(
+            "UPDATE schema_info SET value = 3 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v3");
+
+        // memory_edges must NOT exist yet.
+        assert!(
+            !table_exists(&conn, "memory_edges"),
+            "memory_edges must not exist before v4 migration"
+        );
+
+        // Run v3→v4.
+        migrate_v3_to_v4(&conn).expect("migrate_v3_to_v4");
+
+        // Table must now exist.
+        assert!(
+            table_exists(&conn, "memory_edges"),
+            "memory_edges must exist after v4 migration"
+        );
+
+        // Indexes must exist.
+        let src_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memory_edges_src'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_memory_edges_src");
+        assert_eq!(src_idx, 1, "idx_memory_edges_src must exist");
+
+        let dst_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memory_edges_dst'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_memory_edges_dst");
+        assert_eq!(dst_idx, 1, "idx_memory_edges_dst must exist");
+    }
+
+    // ------------------------------------------------------------------
+    // F1-v5. v4→v5 migration adds work_episodes table + indexes
+    // ------------------------------------------------------------------
+    #[test]
+    fn v4_to_v5_migration_adds_work_episodes() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Build a v4 DB (baseline + v1→v2 + v2→v3 + v3→v4, no v4→v5).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+        migrate_v3_to_v4(&conn).expect("migrate_v3_to_v4");
+        conn.execute(
+            "UPDATE schema_info SET value = 4 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v4");
+
+        // work_episodes must NOT exist yet.
+        assert!(
+            !table_exists(&conn, "work_episodes"),
+            "work_episodes must not exist before v5 migration"
+        );
+
+        // Run v4→v5.
+        migrate_v4_to_v5(&conn).expect("migrate_v4_to_v5");
+
+        // Table must now exist.
+        assert!(
+            table_exists(&conn, "work_episodes"),
+            "work_episodes must exist after v5 migration"
+        );
+
+        // Repo-live index must exist.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_episodes_repo_live'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_episodes_repo_live");
+        assert_eq!(idx, 1, "idx_episodes_repo_live must exist");
+    }
+
+    // ------------------------------------------------------------------
+    // F2-v6. v5→v6 migration adds skill_proposals table + index
+    // ------------------------------------------------------------------
+    #[test]
+    fn v5_to_v6_migration_adds_skill_proposals() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Build a v5 DB (all prior migrations, no v5→v6).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+        migrate_v3_to_v4(&conn).expect("migrate_v3_to_v4");
+        migrate_v4_to_v5(&conn).expect("migrate_v4_to_v5");
+        conn.execute(
+            "UPDATE schema_info SET value = 5 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v5");
+
+        // skill_proposals must NOT exist yet.
+        assert!(
+            !table_exists(&conn, "skill_proposals"),
+            "skill_proposals must not exist before v6 migration"
+        );
+
+        // Run v5→v6.
+        migrate_v5_to_v6(&conn).expect("migrate_v5_to_v6");
+
+        // Table must now exist.
+        assert!(
+            table_exists(&conn, "skill_proposals"),
+            "skill_proposals must exist after v6 migration"
+        );
+
+        // Status index must exist.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_skill_proposals_status'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_skill_proposals_status");
+        assert_eq!(
+            idx, 1,
+            "idx_skill_proposals_status must exist after v6 migration"
         );
     }
 }

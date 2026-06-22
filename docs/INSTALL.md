@@ -118,11 +118,12 @@ kimetsu plugin install pi                     # wire the new one
 **Cursor and Gemini CLI:** neither host has a `UserPromptSubmit`-style hook
 system, so MCP + an always-on guidance file are the complete integration
 surface for those hosts (no automatic prompt-time context injection; the
-model must call `kimetsu_brain_context` manually). **The config schemas for
-Cursor (`.cursor/mcp.json`) and Gemini CLI (`.gemini/settings.json`) were
-inferred from their public documentation as of June 2026 and have not been
-verified against live host builds — review the generated files before
-committing them.**
+model must call `kimetsu_brain_context` manually). The config schemas for
+Cursor (`.cursor/mcp.json`) and Gemini CLI (`.gemini/settings.json`) match each
+host's current official MCP documentation (re-verified June 2026): Cursor uses
+`mcpServers` with `type: "stdio"`, `command`, and `args`; Gemini CLI uses
+`mcpServers` with `command` and `args` (transport inferred — no `type` field).
+The installer merges non-destructively, so any existing servers are preserved.
 
 `--scope` defaults to `workspace`. The installer **merges** into existing
 config: if you already have hooks — even on the same events Kimetsu uses

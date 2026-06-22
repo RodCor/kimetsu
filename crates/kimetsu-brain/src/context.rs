@@ -203,10 +203,13 @@ use crate::embeddings::{
 /// model's id. Threaded down into [`memory_candidates`] so each row
 /// can decide whether to contribute a cosine term (only when the
 /// row's `embedding_model` matches the active query's `model_id`).
+///
+/// S5.1: `pub(crate)` so `backend.rs` can name the type in the
+/// `RetrievalBackend` trait signature without exposing it outside the crate.
 #[derive(Debug, Clone)]
-struct QueryEmbedding {
-    vector: Vec<f32>,
-    model_id: String,
+pub(crate) struct QueryEmbedding {
+    pub(crate) vector: Vec<f32>,
+    pub(crate) model_id: String,
 }
 
 impl QueryEmbedding {
@@ -340,20 +343,25 @@ pub struct ContextBundle {
     pub top_score: f32,
 }
 
+/// S5.1: a single memory candidate produced by candidate generation and
+/// consumed by the broker (scoring, floors, rerank).
+///
+/// `pub(crate)` so `backend.rs` can name the type in the `RetrievalBackend`
+/// trait signature without exposing it outside the crate.
 #[derive(Debug, Clone)]
-struct Candidate {
-    capsule: ContextCapsule,
-    raw_relevance: f32,
+pub(crate) struct Candidate {
+    pub(crate) capsule: ContextCapsule,
+    pub(crate) raw_relevance: f32,
     /// D1e: the row's embedding vector, present when the row's
     /// `embedding_model` matches the active query embedder's id.
     /// `None` for repo-file/manifest candidates and for memory rows
     /// whose model differs from the active embedder (cross-model
     /// rows). Used by the candidate-stage embedding-MMR pass.
-    embedding: Option<Vec<f32>>,
+    pub(crate) embedding: Option<Vec<f32>>,
     /// D1e: raw cosine similarity between this candidate and the
     /// query embedding. Present when `embedding` is `Some`. Used for
     /// the absolute semantic relevance floor (min_semantic_score).
-    cosine: Option<f32>,
+    pub(crate) cosine: Option<f32>,
 }
 
 pub fn retrieve_context(
@@ -405,6 +413,11 @@ pub fn retrieve_context_multi(
 /// MCP server) can also use this directly to hold one embedder
 /// instance for the lifetime of a session instead of paying the
 /// model-load cost on every retrieval.
+///
+/// S5.1: delegates to [`retrieve_context_with_embedder_and_backend`] with
+/// the default [`crate::backend::FlatBackend`]. All existing call sites
+/// (including the full test suite) are unchanged and continue to get exactly
+/// the pre-S5.1 FTS + ANN behaviour.
 pub fn retrieve_context_with_embedder(
     conn: &Connection,
     repo_root: &str,
@@ -413,17 +426,49 @@ pub fn retrieve_context_with_embedder(
     extra_memory_conns: &[&Connection],
     embedder: &dyn Embedder,
 ) -> KimetsuResult<ContextBundle> {
+    retrieve_context_with_embedder_and_backend(
+        conn,
+        repo_root,
+        weights,
+        request,
+        extra_memory_conns,
+        embedder,
+        &crate::backend::FlatBackend,
+    )
+}
+
+/// S5.1: backend-aware variant of [`retrieve_context_with_embedder`].
+///
+/// Identical to `retrieve_context_with_embedder` except that the memory
+/// candidate step is delegated to `backend.memory_candidates()` instead of
+/// the hard-coded [`memory_candidates`] call. The broker (lexical/semantic
+/// floors, scoring, MMR, compression, budgeting) runs ABOVE the backend and
+/// is backend-agnostic.
+///
+/// [`BrainSession`] methods call this variant so the `[storage] backend`
+/// config field takes effect. Tests that call `retrieve_context_with_embedder`
+/// directly still use [`crate::backend::FlatBackend`] implicitly — zero
+/// behaviour change.
+pub(crate) fn retrieve_context_with_embedder_and_backend(
+    conn: &Connection,
+    repo_root: &str,
+    weights: &BrokerWeights,
+    request: ContextRequest,
+    extra_memory_conns: &[&Connection],
+    embedder: &dyn Embedder,
+    backend: &dyn crate::backend::RetrievalBackend,
+) -> KimetsuResult<ContextBundle> {
     let query_embedding = QueryEmbedding::from_embedder(embedder, &request.query);
     let half_life_days = weights.decay_half_life_days;
     let mut candidates = Vec::new();
-    candidates.extend(memory_candidates(
+    candidates.extend(backend.memory_candidates(
         conn,
         &request.query,
         query_embedding.as_ref(),
         half_life_days,
     )?);
     for extra in extra_memory_conns {
-        candidates.extend(memory_candidates(
+        candidates.extend(backend.memory_candidates(
             extra,
             &request.query,
             query_embedding.as_ref(),
@@ -829,6 +874,20 @@ fn memory_ann_candidates(
         }
     }
     Ok(candidates)
+}
+
+/// S5.1: the flat memory candidate function exposed as `pub(crate)` so
+/// [`crate::backend::FlatBackend`] can delegate to it without copying logic.
+///
+/// Runs the FTS + usearch-ANN (embeddings) or FTS + recency (lean) candidate
+/// pipeline — identical behaviour to pre-S5.1.
+pub(crate) fn memory_candidates_flat(
+    conn: &Connection,
+    query: &str,
+    query_embedding: Option<&QueryEmbedding>,
+    half_life_days: f32,
+) -> KimetsuResult<Vec<Candidate>> {
+    memory_candidates(conn, query, query_embedding, half_life_days)
 }
 
 fn memory_candidates(
@@ -1520,6 +1579,12 @@ fn weights_for_stage(weights: &BrokerWeights, stage: &str) -> StageWeights {
     })
 }
 
+/// S5.2: `pub(crate)` so `backend.rs` (GraphLiteBackend) can build graph-
+/// reached candidates without duplicating the scope weight logic.
+pub(crate) fn scope_weight_pub(scope: &str) -> f32 {
+    scope_weight(scope)
+}
+
 fn scope_weight(scope: &str) -> f32 {
     match scope.parse::<MemoryScope>() {
         Ok(MemoryScope::Run) => 1.0,
@@ -1528,6 +1593,12 @@ fn scope_weight(scope: &str) -> f32 {
         Ok(MemoryScope::GlobalUser) => 0.5,
         Err(_) => 0.3,
     }
+}
+
+/// S5.2: `pub(crate)` so `backend.rs` (GraphLiteBackend) can build graph-
+/// reached candidates without duplicating the freshness logic.
+pub(crate) fn freshness_pub(created_at: &str) -> f32 {
+    freshness(created_at)
 }
 
 fn freshness(created_at: &str) -> f32 {
@@ -2125,6 +2196,12 @@ fn cap_sentences(text: &str, n: usize) -> &str {
     }
     // Fewer than n sentences — return the whole text.
     text.trim_end()
+}
+
+/// S5.2: `pub(crate)` so `backend.rs` (GraphLiteBackend) can build graph-
+/// reached candidates without duplicating the excerpt logic.
+pub(crate) fn excerpt_pub(text: &str) -> String {
+    excerpt(text)
 }
 
 fn excerpt(text: &str) -> String {

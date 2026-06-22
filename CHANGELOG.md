@@ -7,6 +7,136 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v2.0.0 — Never explore twice
+
+The biggest token sink is RE-EXPLORATION — the agent re-deriving what the brain
+(or the repo) already knows. v2.0 attacks it from three flagship directions and
+adds a pluggable storage tier. Backward-compatible: existing `project.toml` and
+`brain.db` files upgrade in place (schema v3 → v6, automatic on open).
+
+### Flagship — Session warm-start (never re-establish your work)
+
+ADDED
+  * **Episodic work-resume.** A new `work_episode` record (event-sourced,
+    schema v5) captures your working state at SessionEnd — the task, what you
+    did, what FAILED and why (dead-ends), open threads, and the working
+    hypothesis — scoped per-repo (one live episode per repo). `kimetsu resume`
+    prints it; `kimetsu checkpoint [note]` saves one manually. Distilled via
+    the cheap model when configured, else a rule-based summary (never blocks).
+    Episodes are LOCAL-ONLY and never sync/export.
+  * **Project digest.** `kimetsu brain digest [--refresh]` assembles a compact
+    (~400-token) digest — repo manifest + top-usefulness memories + current
+    focus — cached at `.kimetsu/digest.md` by content hash, refreshed on git/
+    corpus drift. (The digest is currently rule-based; a cheap-model
+    distillation hook-point is present but not yet wired.)
+  * **SessionStart injection.** A new `kimetsu brain session-start-hook` emits
+    the digest + resume as `additionalContext`, gated by `[broker] warm_start`
+    (default on). Wired for Claude Code; other hosts' SessionStart context
+    surface is not yet verified and is intentionally left unwired.
+
+### Flagship — The active brain (never wait on the brain)
+
+ADDED
+  * **`kimetsu brain ask "<question>"`.** Terminal Q&A answered entirely from
+    the brain — full retrieval + a grounded answer composed by a LOCAL/cheap
+    model, with memory-id citations. Zero frontier tokens; works offline. Falls
+    back to distiller credentials, then to verbatim top-capsules when no model
+    is configured. Grounded-only: refuses rather than hallucinating when memory
+    has no answer. `--json`; an answer marked helpful counts like a citation.
+  * **`kimetsu_brain_answer` MCP tool.** A read-only synthesis tool the host
+    agent can call mid-task ("what do we know about X?") for a grounded, cited
+    brief instead of re-discovering.
+  * **Command recall fast-path.** "How do I…" queries surface matching
+    `command`-kind memories runnable-line-first.
+  * **Answer-grade injection.** Very-high-confidence capsules (score ≥
+    `[broker] answer_grade_min_score`, default 0.92) are prefixed "Verified
+    answer from project memory:" so the model can act in one turn. Render-time
+    only — ranking is untouched — and suppressed when the memory was recently a
+    floor-drop regret.
+  * **Proactive pre-fetch.** Opt-in `[broker] proactive_prefetch` (default off)
+    warms trajectory-relevant memories at PreToolUse.
+
+### Flagship — Memory → skill synthesis (never re-derive a solution)
+
+ADDED
+  * **Skill synthesis.** A memory cited ≥3 times (or a tight cluster) becomes a
+    synthesis candidate; `kimetsu brain skills [--review]` drafts an executable
+    skill from it — grounded strictly in the cited memories — and, on explicit
+    accept, installs it into the host-native skill dir with provenance back to
+    the source memory ids. Propose-only (never auto-installed); flagged stale
+    when a source memory is superseded. Schema v6 (`skill_proposals`).
+
+### Local-model independence
+
+ADDED
+  * **Ollama as a first-class provider** (`provider = "ollama"` — OpenAI-compat,
+    `localhost:11434/v1` default, no key) and a single optional `[cheap_model]`
+    config that all cheap-model consumers resolve (distiller, consolidation,
+    digest, resume, skill draft, `ask`). Back-compatible with
+    `[learning.distiller]`; OPTIONAL everywhere — every consumer degrades
+    gracefully when no model is configured. `kimetsu doctor` probes the local
+    endpoint. New guide: `docs/LOCAL-MODELS.md` (fully-local = zero external
+    calls).
+
+### Pluggable storage backends
+
+ADDED
+  * **`RetrievalBackend` trait** with `[storage] backend = "flat" | "graph-lite"
+    | "graph"` (default `flat`). The broker stays backend-agnostic; switching
+    backends re-projects from the event log.
+  * **Graph-lite (Tier 1)** — a typed-edge projection (`memory_edges`, schema
+    v4) with 1–2 hop expansion blended as graph-provenance candidates (a strict
+    superset of flat — no recall loss; the broker still filters). `supersedes`
+    edges populate now; episode-sourced edge types are reserved.
+  * **Petgraph (Tier 2, remote-only)** behind the `graph` feature (off in local
+    lean/embeddings builds — petgraph is never compiled there). In-memory graph
+    with centrality / shortest-path / community-detection helpers, plus a
+    cross-backend benchmark harness. Spike verdict: an embedded graph DB
+    (Kùzu/Cozo) is not justified through ~100k memories.
+
+### Continuous self-tuning + ROI v2
+
+ADDED
+  * **Re-tune triggers** (≥50 new memories since last tune, or elevated regret
+    rate) surfaced via `kimetsu brain tune --status` + a Stop-hook one-liner —
+    proposed, never auto-applied. **Model re-selection advisor**
+    (`tune --models`) with reindex/download cost stated. **Regret-driven
+    objective**: the tune objective now penalizes floor configs that produced
+    regrets. **ROI v2**: per-memory ROI (`roi --top`), output-token accounting,
+    and warm-start (`digest_served`/`resume_served`) savings attribution.
+
+### Personal brain sync
+
+ADDED
+  * **Event-log replication** (not file copying). `kimetsu brain sync export
+    --since <cursor>` / `import` move durable memory-lifecycle events as
+    portable JSONL with per-event idempotency; telemetry, raw queries, and
+    local-only episodes are excluded by an allowlist; redaction is respected.
+    `[sync] dir` drives a server-less directory protocol (Dropbox/Syncthing/NAS)
+    with per-machine batches and per-source cursors; `--dry-run` and
+    `--status` throughout. Object-storage backends (e.g. S3) are deferred.
+
+### Hardening & release
+
+FIXED
+  * Analytics/doctor active counts, reindex, peek/undo, and `memory list` now
+    consistently exclude superseded rows; `config set`/`tune --apply` preserve
+    toml comments + unknown keys (`toml_edit`); dropped-capsule + proactive-state
+    sidecars write atomically. Cursor/Gemini MCP schemas verified against live
+    docs.
+  * **Release pipeline**: a `version-guard` job fails in seconds on a
+    tag/workspace-version mismatch (and the built binary must self-report the
+    tag) — closing the gap that produced the v1.5.0 botch; core GitHub Actions
+    bumped to Node-24-ready versions; `scripts/bump-version.sh` codifies the
+    one-step version bump.
+
+KNOWN LIMITATIONS
+  * SessionStart warm-start is wired for Claude Code only; the digest is
+    rule-based pending the cheap-model distillation wiring; full retrieval-
+    quality and first-turn-token benchmarks require the embeddings + Docker
+    environment and were not run in CI; remote-bench process isolation (#23)
+    remains open.
+
 ## v1.5.1 — version-stamp re-release
 
 Identical feature set to v1.5.0. The v1.5.0 artifacts were built before the
@@ -96,10 +226,9 @@ ADDED
     installs; `GEMINI.md` merged into the project root or `~/.gemini/GEMINI.md`
     for global installs). Neither host has a `UserPromptSubmit`-style hook
     system, so MCP + the guidance file are the complete integration surface.
-    **Note: Cursor and Gemini CLI config schemas were inferred from their public
-    docs as of June 2026 and have not been verified against live host builds —
-    treat these installers as a starting-point and check the generated files
-    before committing them.** CI: a new `test-embeddings` job (ubuntu-only,
+    The Cursor and Gemini CLI config schemas match each host's current official
+    MCP documentation (Cursor: `mcpServers` with `type: "stdio"`; Gemini CLI:
+    `mcpServers` with transport inferred). CI: a new `test-embeddings` job (ubuntu-only,
     `--features embeddings`, HuggingFace + fastembed cache) runs alongside the
     existing lean test matrix.
 

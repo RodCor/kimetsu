@@ -22,6 +22,24 @@ pub struct ProjectConfig {
     /// auto-harvest on).
     #[serde(default)]
     pub learning: LearningSection,
+    /// S1.2: top-level cheap-model override. When present, takes
+    /// precedence over `[learning.distiller]` as the resolved cheap
+    /// model for all consumers (distiller, consolidation, future
+    /// digest/ask). Entirely optional — when absent the resolver falls
+    /// back to `[learning.distiller]` for back-compat. `#[serde(default)]`
+    /// keeps all existing project.toml files loading unchanged.
+    #[serde(default)]
+    pub cheap_model: Option<CheapModelSection>,
+    /// S5.1: storage / retrieval backend selection. `#[serde(default)]`
+    /// keeps every existing project.toml loading cleanly (they get
+    /// `backend = "flat"`, the current FTS + usearch-ANN path).
+    #[serde(default)]
+    pub storage: StorageSection,
+    /// Epic S3: personal brain sync via event-log replication.
+    /// `#[serde(default)]` keeps every pre-S3 project.toml loading cleanly
+    /// (they get no sync dir and a freshly-generated machine_id).
+    #[serde(default)]
+    pub sync: SyncSection,
 }
 
 impl ProjectConfig {
@@ -40,7 +58,37 @@ impl ProjectConfig {
             run: RunSection::default(),
             embedder: EmbedderSection::default(),
             learning: LearningSection::default(),
+            cheap_model: None,
+            storage: StorageSection::default(),
+            sync: SyncSection::default(),
         }
+    }
+
+    /// S1.2: resolve the effective cheap-model config.
+    ///
+    /// Resolution order (first wins):
+    ///   1. `[cheap_model]` if present AND `enabled = true` — explicit top-level
+    ///      section introduced in S1.2.
+    ///   2. `[learning.distiller]` if `enabled = true` — back-compat alias so
+    ///      any existing config with `[learning.distiller]` keeps working with
+    ///      zero changes.
+    ///   3. `None` — no cheap model configured; consumers degrade gracefully
+    ///      (no panic, feature just does not run — same as distiller-absent
+    ///      behaviour before S1.2).
+    ///
+    /// FUTURE consumers (digest/resume/skill/ask) must call this resolver so
+    /// resolution stays in ONE place.
+    pub fn cheap_model(&self) -> Option<CheapModelSection> {
+        if let Some(ref cm) = self.cheap_model {
+            if cm.enabled {
+                return Some(cm.clone());
+            }
+        }
+        // Back-compat: treat an enabled [learning.distiller] as the cheap model.
+        if self.learning.distiller.enabled {
+            return Some(CheapModelSection::from_distiller(&self.learning.distiller));
+        }
+        None
     }
 
     pub fn from_toml(value: &str) -> KimetsuResult<Self> {
@@ -257,6 +305,131 @@ impl Default for DistillerSection {
     }
 }
 
+/// S1.2: top-level cheap-model config. Same shape as `DistillerSection`
+/// (provider / model / api_key_env / base_url_env / region / region_env) but
+/// with `provider` now including `"ollama"` (S1.1).
+///
+/// Providers:
+///   - `"anthropic"` / `"claude"` — Anthropic API.
+///   - `"openai"` / `"gpt"` / `"oai"` — OpenAI-compatible API.
+///   - `"ollama"` — local Ollama server (OpenAI-compatible at
+///     `http://localhost:11434/v1`). No API key required. Recommended
+///     small instruct models: `qwen2.5:3b`, `llama3.2:3b`.
+///     Override the endpoint with `base_url_env` (default env var
+///     `OLLAMA_BASE_URL`).
+///   - `"bedrock"` / `"aws"` — AWS Bedrock.
+///
+/// `#[serde(default)]` on the `ProjectConfig` field keeps all existing
+/// project.toml files loading unchanged (`cheap_model = None`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheapModelSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cheap_model_provider")]
+    pub provider: String,
+    #[serde(default = "default_cheap_model_model")]
+    pub model: String,
+    /// Env-var name that holds the API key (not required for `ollama`).
+    #[serde(default = "default_cheap_model_api_key_env")]
+    pub api_key_env: String,
+    /// Env-var name that holds the base URL override. For `ollama` the
+    /// default resolved URL is `http://localhost:11434/v1` when this env
+    /// var is absent or empty.
+    #[serde(default = "default_cheap_model_base_url_env")]
+    pub base_url_env: String,
+    /// AWS Bedrock: literal region. Takes precedence over `region_env`.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS Bedrock: env-var name that holds the region (default `"AWS_REGION"`).
+    #[serde(default = "default_cheap_model_region_env")]
+    pub region_env: String,
+}
+
+fn default_cheap_model_provider() -> String {
+    "anthropic".to_string()
+}
+fn default_cheap_model_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+fn default_cheap_model_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+fn default_cheap_model_base_url_env() -> String {
+    "ANTHROPIC_BASE_URL".to_string()
+}
+fn default_cheap_model_region_env() -> String {
+    "AWS_REGION".to_string()
+}
+
+impl Default for CheapModelSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_cheap_model_provider(),
+            model: default_cheap_model_model(),
+            api_key_env: default_cheap_model_api_key_env(),
+            base_url_env: default_cheap_model_base_url_env(),
+            region: None,
+            region_env: default_cheap_model_region_env(),
+        }
+    }
+}
+
+impl CheapModelSection {
+    /// S1.1: for `provider = "ollama"`, return the default base URL
+    /// (`http://localhost:11434/v1`) when no override is configured.
+    pub const OLLAMA_DEFAULT_BASE_URL: &'static str = "http://localhost:11434/v1";
+
+    /// Construct from a `DistillerSection` for back-compat resolution.
+    pub fn from_distiller(d: &DistillerSection) -> Self {
+        Self {
+            enabled: d.enabled,
+            provider: d.provider.clone(),
+            model: d.model.clone(),
+            api_key_env: d.api_key_env.clone(),
+            base_url_env: d.base_url_env.clone(),
+            region: d.region.clone(),
+            region_env: d.region_env.clone(),
+        }
+    }
+}
+
+/// S5.1: storage / retrieval backend configuration.
+///
+/// Controls which `RetrievalBackend` implementation is used for memory
+/// candidate generation. The broker (scoring, floors, rerank, compression)
+/// is backend-agnostic and is NOT affected by this setting.
+///
+/// `#[serde(default)]` keeps every pre-S5 project.toml loading cleanly
+/// (they get `backend = "flat"`, which is exactly today's FTS + usearch-ANN
+/// behaviour).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageSection {
+    /// Which retrieval backend to use.
+    ///
+    /// | Value         | Behaviour                                             |
+    /// |---------------|-------------------------------------------------------|
+    /// | `"flat"`      | FTS + usearch HNSW ANN (current, default)             |
+    /// | `"graph-lite"`| TODO (S5.2): graph-augmented FTS + ANN               |
+    /// | `"graph"`     | TODO (future): full graph traversal                   |
+    ///
+    /// Unknown values fall back to `"flat"` with a warning.
+    #[serde(default = "default_storage_backend")]
+    pub backend: String,
+}
+
+fn default_storage_backend() -> String {
+    "flat".to_string()
+}
+
+impl Default for StorageSection {
+    fn default() -> Self {
+        Self {
+            backend: default_storage_backend(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSection {
     pub provider: String,
@@ -410,6 +583,58 @@ pub struct BrokerSection {
     /// loading cleanly (they get session dedupe ON).
     #[serde(default = "default_true")]
     pub session_dedupe: bool,
+    /// Flagship 1 / Pass B: inject the repo digest + work-resume context at
+    /// SessionStart. When true (default), `kimetsu brain session-start-hook`
+    /// prints `additionalContext` JSON combining the ~400-token repo digest
+    /// (1.1) and the episodic resume (Pass A).  Set false to suppress the
+    /// warm-start injection entirely — useful when the host already provides
+    /// repo context or the digest is not yet built.
+    ///
+    /// `#[serde(default = "default_true")]` keeps pre-Flagship-1 project.toml
+    /// files loading cleanly (they get warm_start ON — the feature is additive
+    /// and defaults to enabled so fresh installs get it immediately).
+    #[serde(default = "default_true")]
+    pub warm_start: bool,
+    /// Flagship 3 / Pass B (3.3): minimum composite broker score for a capsule
+    /// to receive the "Verified answer from project memory:" prefix at render
+    /// time. This prefix signals to the model that it can act in one turn
+    /// rather than re-verifying the information.
+    ///
+    /// STRICTLY ADDITIVE: only changes the rendered prefix of an already-top
+    /// capsule. Ranking, floors, and capsule selection are NEVER affected.
+    ///
+    /// The threshold is deliberately conservative (0.92 default) so the marker
+    /// is rare and only fires on genuinely unambiguous matches. Tune with
+    /// `kimetsu brain bench` data (Epic S2) before lowering. Set to 1.1 (above
+    /// the maximum achievable score) to disable entirely, or 0.0 to always
+    /// mark any top capsule (not recommended — wait for regret data first).
+    ///
+    /// Regret guard: if the capsule's memory was recently dropped by floors in
+    /// another retrieval context (appears in the dropped sidecar), the prefix
+    /// is suppressed regardless of this threshold, preventing overconfident
+    /// labelling of inconsistently-scored memories.
+    ///
+    /// `#[serde(default = …)]` keeps all pre-F3 project.toml files loading
+    /// unchanged (they get the conservative default).
+    #[serde(default = "default_answer_grade_min_score")]
+    pub answer_grade_min_score: f32,
+    /// Flagship 3 / Pass B (3.5): opt-in proactive pre-fetch at PreToolUse.
+    ///
+    /// When true, the PreToolUse hook does a LIGHTWEIGHT relevance warm based
+    /// on the current tool's file path (in addition to the command text),
+    /// surfacing a relevant memory before the agent edits or reads a file.
+    /// The existing floors (min_score, max_capsules, session dedupe, refractory
+    /// throttle) all apply — this is additive only.
+    ///
+    /// Default false (OFF): the PreToolUse hook behaviour is identical to
+    /// before this flag existed. Graduating to default-on waits for regret
+    /// data (Epic S2) to confirm that file-path-augmented queries don't
+    /// increase noise. Enable per-project in project.toml once comfortable.
+    ///
+    /// `#[serde(default)]` keeps all pre-F3 project.toml files loading with
+    /// the feature OFF (zero behaviour change for existing users).
+    #[serde(default)]
+    pub proactive_prefetch: bool,
 }
 
 fn default_max_capsules() -> usize {
@@ -432,6 +657,15 @@ fn default_budget_run_cap_tokens() -> u32 {
     8000
 }
 
+/// F3 / Pass B (3.3): conservative answer-grade threshold. At 0.92 the marker
+/// fires only when the retrieval pipeline (embedder + reranker) places the top
+/// capsule in the very top of its score range — roughly 1-in-10 retrievals on
+/// a well-populated brain. Lowering requires regret data from Epic S2 to
+/// confirm precision stays high.
+fn default_answer_grade_min_score() -> f32 {
+    0.92
+}
+
 impl Default for BrokerSection {
     fn default() -> Self {
         Self {
@@ -445,6 +679,9 @@ impl Default for BrokerSection {
             ambient: default_true(),
             compress_capsules: default_true(),
             session_dedupe: default_true(),
+            warm_start: default_true(),
+            answer_grade_min_score: default_answer_grade_min_score(),
+            proactive_prefetch: false,
         }
     }
 }
@@ -630,6 +867,31 @@ impl Default for RunSection {
     }
 }
 
+/// Epic S3: personal brain sync configuration.
+///
+/// Controls the event-log replication directory protocol.  When `dir` is
+/// absent, the sync subcommand is unconfigured and prints a setup hint.
+///
+/// `machine_id` is a stable opaque identifier for this machine.  It defaults
+/// to a freshly-generated ULID that is persisted in project.toml on first
+/// use (written by `kimetsu brain sync --setup`).  Operators can set it
+/// manually to a meaningful name (hostname, username, etc.) — just keep it
+/// unique within the sync directory.
+///
+/// `#[serde(default)]` keeps every pre-S3 project.toml loading cleanly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncSection {
+    /// Absolute (or home-relative) path to the shared sync directory.
+    /// Each machine writes its batches under `<dir>/<machine_id>/`.
+    /// When `None`, syncing is unconfigured.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Stable machine identifier.  Defaults to an empty string (= not yet
+    /// set; the CLI generates one on first use).
+    #[serde(default)]
+    pub machine_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +1022,40 @@ max_total_cost_usd = 250.0
         assert!(
             config.broker.session_dedupe,
             "broker.session_dedupe must default to true"
+        );
+        // Flagship 1 Pass B: a pre-Flagship-1 project.toml without
+        // broker.warm_start must load cleanly and default to true (warm-start ON).
+        assert!(
+            config.broker.warm_start,
+            "broker.warm_start must default to true"
+        );
+        // S5.1: a pre-S5 project.toml without [storage] must load cleanly
+        // and default to backend = "flat" (the existing FTS + ANN path).
+        assert_eq!(
+            config.storage.backend, "flat",
+            "storage.backend must default to \"flat\" when absent"
+        );
+        // F3 Pass B (3.3): a pre-F3 project.toml without broker.answer_grade_min_score
+        // must load cleanly and receive the conservative default (0.92).
+        assert!(
+            (config.broker.answer_grade_min_score - 0.92).abs() < f32::EPSILON,
+            "broker.answer_grade_min_score must default to 0.92"
+        );
+        // F3 Pass B (3.5): a pre-F3 project.toml without broker.proactive_prefetch
+        // must load cleanly and default to false (opt-in, OFF by default).
+        assert!(
+            !config.broker.proactive_prefetch,
+            "broker.proactive_prefetch must default to false (opt-in)"
+        );
+        // S3: a pre-S3 project.toml without [sync] must load cleanly and
+        // default to no sync dir and empty machine_id.
+        assert!(
+            config.sync.dir.is_none(),
+            "sync.dir must default to None when absent"
+        );
+        assert!(
+            config.sync.machine_id.is_empty(),
+            "sync.machine_id must default to empty string when absent"
         );
     }
 
@@ -983,6 +1279,327 @@ max_total_cost_usd = 250.0
             reloaded.model.price_per_mtok,
             Some(7.5),
             "price_per_mtok must round-trip"
+        );
+    }
+
+    // ── S1.2: cheap_model() resolver tests ───────────────────────────────
+
+    /// S1.2-a: a toml with only `[learning.distiller]` (no `[cheap_model]`)
+    /// resolves via back-compat and returns the distiller's settings.
+    #[test]
+    fn s1_2_a_learning_distiller_back_compat() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.learning.distiller.enabled = true;
+        config.learning.distiller.provider = "openai".to_string();
+        config.learning.distiller.model = "gpt-5.4-mini".to_string();
+        config.cheap_model = None;
+
+        let resolved = config.cheap_model().expect("back-compat must resolve");
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.model, "gpt-5.4-mini");
+        assert!(resolved.enabled);
+    }
+
+    /// S1.2-b: `[cheap_model]` takes precedence over `[learning.distiller]`
+    /// when both are present and enabled.
+    #[test]
+    fn s1_2_b_cheap_model_takes_precedence() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.learning.distiller.enabled = true;
+        config.learning.distiller.provider = "anthropic".to_string();
+        config.learning.distiller.model = "claude-haiku-4-5".to_string();
+        config.cheap_model = Some(super::CheapModelSection {
+            enabled: true,
+            provider: "ollama".to_string(),
+            model: "qwen2.5:3b".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url_env: "OLLAMA_BASE_URL".to_string(),
+            region: None,
+            region_env: "AWS_REGION".to_string(),
+        });
+
+        let resolved = config.cheap_model().expect("cheap_model must resolve");
+        assert_eq!(
+            resolved.provider, "ollama",
+            "[cheap_model] must win over [learning.distiller]"
+        );
+        assert_eq!(resolved.model, "qwen2.5:3b");
+    }
+
+    /// S1.2-c: provider=ollama round-trips and the OLLAMA_DEFAULT_BASE_URL
+    /// constant has the expected value.
+    #[test]
+    fn s1_2_c_ollama_default_base_url() {
+        assert_eq!(
+            super::CheapModelSection::OLLAMA_DEFAULT_BASE_URL,
+            "http://localhost:11434/v1",
+            "ollama default base URL must point to localhost:11434/v1"
+        );
+
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.cheap_model = Some(super::CheapModelSection {
+            enabled: true,
+            provider: "ollama".to_string(),
+            model: "llama3.2:3b".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url_env: "OLLAMA_BASE_URL".to_string(),
+            region: None,
+            region_env: "AWS_REGION".to_string(),
+        });
+
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        let cm = reloaded.cheap_model().expect("ollama section must resolve");
+        assert_eq!(cm.provider, "ollama");
+        assert_eq!(cm.model, "llama3.2:3b");
+    }
+
+    /// S1.2-d: absent/disabled cheap model → resolver returns None;
+    /// consumers that call `.cheap_model()` degrade gracefully (no panic).
+    #[test]
+    fn s1_2_d_absent_disabled_returns_none() {
+        // (i) Neither section present/enabled.
+        let config = ProjectConfig::default_for_project("demo");
+        assert!(
+            config.cheap_model().is_none(),
+            "no cheap model configured: must return None"
+        );
+
+        // (ii) [cheap_model] present but disabled.
+        let mut config2 = ProjectConfig::default_for_project("demo");
+        config2.cheap_model = Some(super::CheapModelSection {
+            enabled: false,
+            ..super::CheapModelSection::default()
+        });
+        assert!(
+            config2.cheap_model().is_none(),
+            "disabled cheap_model must return None"
+        );
+
+        // (iii) [learning.distiller] present but disabled → back-compat returns None.
+        let mut config3 = ProjectConfig::default_for_project("demo");
+        config3.learning.distiller.enabled = false;
+        assert!(
+            config3.cheap_model().is_none(),
+            "disabled learning.distiller must return None via back-compat"
+        );
+    }
+
+    /// S1.2: a pre-S1.2 project.toml (no `[cheap_model]` section) must load
+    /// cleanly with `cheap_model = None`.
+    #[test]
+    fn pre_s1_2_config_without_cheap_model_loads_cleanly() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-S1.2 toml must load");
+        assert!(
+            config.cheap_model.is_none(),
+            "cheap_model field must be None when absent from project.toml"
+        );
+        // And the resolver must return None (no distiller enabled either).
+        assert!(
+            config.cheap_model().is_none(),
+            "cheap_model() must return None when no cheap model is configured"
+        );
+    }
+
+    // ── S5.1: StorageSection tests ────────────────────────────────────────
+
+    /// S5.1-a: `storage.backend` survives a round-trip through
+    /// serialize → deserialize for each known variant string.
+    #[test]
+    fn s5_1_storage_backend_round_trips() {
+        for variant in &["flat", "graph-lite", "graph"] {
+            let mut config = ProjectConfig::default_for_project("demo");
+            config.storage.backend = (*variant).to_string();
+            let serialized = config.to_toml().expect("serialize");
+            let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+            assert_eq!(
+                reloaded.storage.backend, *variant,
+                "storage.backend=\"{}\" must round-trip",
+                variant
+            );
+        }
+    }
+
+    /// S5.1-b: `default_for_project` uses `backend = "flat"`.
+    #[test]
+    fn s5_1_default_for_project_uses_flat_backend() {
+        let config = ProjectConfig::default_for_project("demo");
+        assert_eq!(
+            config.storage.backend, "flat",
+            "default project config must use flat backend"
+        );
+    }
+
+    // ── F3 Pass B: answer_grade_min_score + proactive_prefetch tests ─────────
+
+    /// F3-B-1: new fields survive a round-trip through serialize → deserialize
+    /// with non-default values.
+    #[test]
+    fn f3b_new_broker_fields_round_trip() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.broker.answer_grade_min_score = 0.85;
+        config.broker.proactive_prefetch = true;
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            (reloaded.broker.answer_grade_min_score - 0.85).abs() < f32::EPSILON,
+            "answer_grade_min_score must round-trip"
+        );
+        assert!(
+            reloaded.broker.proactive_prefetch,
+            "proactive_prefetch must round-trip as true"
+        );
+    }
+
+    /// F3-B-2: proactive_prefetch = false (default) survives round-trip.
+    #[test]
+    fn f3b_proactive_prefetch_default_false_round_trips() {
+        let config = ProjectConfig::default_for_project("demo");
+        assert!(!config.broker.proactive_prefetch, "default must be false");
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert!(
+            !reloaded.broker.proactive_prefetch,
+            "default false must survive round-trip"
+        );
+    }
+
+    /// F3-B-3: default_for_project uses conservative defaults for both fields.
+    #[test]
+    fn f3b_default_for_project_uses_conservative_defaults() {
+        let config = ProjectConfig::default_for_project("demo");
+        // answer_grade_min_score: 0.92 (rare, only very high-confidence capsules)
+        assert!(
+            (config.broker.answer_grade_min_score - 0.92).abs() < f32::EPSILON,
+            "default answer_grade_min_score must be 0.92"
+        );
+        // proactive_prefetch: false (opt-in — never changes default behaviour)
+        assert!(
+            !config.broker.proactive_prefetch,
+            "default proactive_prefetch must be false"
+        );
+    }
+
+    // ── S3: SyncSection tests ──────────────────────────────────────────────
+
+    /// S3-cfg-1: a pre-S3 project.toml (no `[sync]` section) loads cleanly
+    /// and defaults to no sync dir and empty machine_id.
+    #[test]
+    fn s3_pre_s3_config_without_sync_loads_cleanly() {
+        let toml = r#"
+[kimetsu]
+project_id = "demo"
+schema_version = 7
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+max_output_tokens = 8192
+temperature = 0.2
+request_timeout_secs = 120
+
+[broker]
+default_budget_tokens = 6000
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+
+[shell]
+default_timeout_secs = 60
+max_timeout_secs = 600
+env_allowlist_extra = []
+redact_secrets = true
+
+[ingestion]
+max_file_bytes = 524288
+extra_skip_dirs = []
+max_total_files = 50000
+
+[run]
+max_total_tool_calls = 60
+max_total_model_turns = 30
+max_total_cost_usd = 250.0
+"#;
+        let config = ProjectConfig::from_toml(toml).expect("pre-S3 toml must load");
+        assert!(
+            config.sync.dir.is_none(),
+            "sync.dir must default to None when absent"
+        );
+        assert!(
+            config.sync.machine_id.is_empty(),
+            "sync.machine_id must default to empty string when absent"
+        );
+    }
+
+    /// S3-cfg-2: a `[sync]` section with dir + machine_id round-trips cleanly.
+    #[test]
+    fn s3_sync_section_round_trips() {
+        let mut config = ProjectConfig::default_for_project("demo");
+        config.sync.dir = Some("/tmp/kimetsu-sync".to_string());
+        config.sync.machine_id = "my-laptop-01".to_string();
+        let serialized = config.to_toml().expect("serialize");
+        let reloaded = ProjectConfig::from_toml(&serialized).expect("reload");
+        assert_eq!(
+            reloaded.sync.dir,
+            Some("/tmp/kimetsu-sync".to_string()),
+            "sync.dir must round-trip"
+        );
+        assert_eq!(
+            reloaded.sync.machine_id, "my-laptop-01",
+            "sync.machine_id must round-trip"
+        );
+    }
+
+    /// S3-cfg-3: default_for_project gives an unconfigured sync section.
+    #[test]
+    fn s3_default_for_project_sync_unconfigured() {
+        let config = ProjectConfig::default_for_project("demo");
+        assert!(config.sync.dir.is_none(), "default sync.dir must be None");
+        assert!(
+            config.sync.machine_id.is_empty(),
+            "default sync.machine_id must be empty"
         );
     }
 }

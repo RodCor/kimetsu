@@ -404,13 +404,15 @@ impl BrainSession {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             embeddings::open_embedder_for(self.config.embedder.enabled),
+            backend.as_ref(),
         )
     }
 
@@ -446,13 +448,15 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             &embeddings::NoopEmbedder,
+            backend.as_ref(),
         )
     }
 
@@ -476,13 +480,15 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             &embeddings::NoopEmbedder,
+            backend.as_ref(),
         )
     }
 
@@ -505,13 +511,15 @@ impl BrainSession {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        context::retrieve_context_with_embedder(
+        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
             request,
             &extras,
             embedder,
+            backend.as_ref(),
         )
     }
 
@@ -1161,6 +1169,12 @@ fn text_preview(text: &str, max_chars: usize) -> String {
 }
 
 fn list_memories_from_conn(conn: &Connection, opts: &ListOptions) -> KimetsuResult<Vec<MemoryRow>> {
+    // S4.4 list-asymmetry fix: apply the same active-only filters that
+    // `list_user_memories` uses (invalidated_at IS NULL AND superseded_by IS
+    // NULL) so that `memory list` on a project brain behaves symmetrically
+    // with the user-brain listing — both surfaces show only memories that
+    // retrieval would actually return.  Invalidated or superseded memories are
+    // still inspectable via the raw DB or the event log.
     let limit = if opts.limit == 0 { 100 } else { opts.limit } as i64;
     let offset = opts.offset as i64;
 
@@ -1169,7 +1183,9 @@ fn list_memories_from_conn(conn: &Connection, opts: &ListOptions) -> KimetsuResu
             "
             SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
             FROM memories
-            WHERE lower(scope) = lower(?1)
+            WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
+              AND lower(scope) = lower(?1)
             ORDER BY created_at DESC
             LIMIT ?2 OFFSET ?3
             ",
@@ -1180,6 +1196,8 @@ fn list_memories_from_conn(conn: &Connection, opts: &ListOptions) -> KimetsuResu
             "
             SELECT memory_id, scope, kind, text, confidence, use_count, usefulness_score
             FROM memories
+            WHERE invalidated_at IS NULL
+              AND superseded_by IS NULL
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
             ",
@@ -2078,10 +2096,13 @@ pub fn edit_memory(
 /// asking for confirmation. Returns `Ok(None)` if there are no active memories.
 pub fn peek_last_memory(start: &Path) -> KimetsuResult<Option<UndoneMemory>> {
     let (_paths, _config, conn) = load_project(start)?;
+    // S4.4b: exclude superseded rows — a retired/merged memory is not a
+    // sensible "last" memory to surface to the user.
     let row: Option<(String, String, String, String)> = conn
         .query_row(
             "SELECT memory_id, text, scope, kind FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
              ORDER BY created_at DESC, memory_id DESC
              LIMIT 1",
             [],
@@ -2115,10 +2136,13 @@ pub fn peek_last_memory(start: &Path) -> KimetsuResult<Option<UndoneMemory>> {
 pub fn undo_last_memory(start: &Path) -> KimetsuResult<Option<UndoneMemory>> {
     let (paths, _config, conn) = load_project(start)?;
 
+    // S4.4b: exclude superseded rows — undoing a retired/merged memory would
+    // confuse the user; they should undo the survivor instead.
     let row: Option<(String, String, String, String)> = conn
         .query_row(
             "SELECT memory_id, text, scope, kind FROM memories
              WHERE invalidated_at IS NULL
+               AND superseded_by IS NULL
              ORDER BY created_at DESC, memory_id DESC
              LIMIT 1",
             [],
@@ -3943,9 +3967,26 @@ mod tests {
                 post.capsules
             );
 
-            // The row itself still exists in brain.db.
-            let memories = list_memories(&root).expect("list");
-            assert!(memories.iter().any(|m| m.memory_id == memory_id));
+            // The row itself still exists in brain.db (S4.4: list_memories now
+            // filters invalidated rows, matching user-brain behaviour, so we
+            // verify persistence via a direct DB query instead).
+            {
+                let (_paths2, _config2, conn2) = load_project(&root).expect("load for check");
+                let still_there: i64 = conn2
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE memory_id = ?1",
+                        rusqlite::params![&memory_id],
+                        |row| row.get(0),
+                    )
+                    .expect("db query");
+                assert_eq!(still_there, 1, "invalidated row must persist in brain.db");
+            } // conn2 / _paths2 dropped here — Windows file lock released
+            // But list_memories must NOT surface it (active-only since S4.4).
+            let active = list_memories(&root).expect("list after invalidation");
+            assert!(
+                active.iter().all(|m| m.memory_id != memory_id),
+                "invalidated memory must not appear in list_memories"
+            );
 
             fs::remove_dir_all(root).expect("remove temp project");
         });

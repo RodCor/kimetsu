@@ -318,9 +318,13 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
     // C2 — CorpusHealth
     // -----------------------------------------------------------------------
     let corpus = {
-        // active vs invalidated
+        // active vs invalidated.
+        // "Active" = not invalidated AND not superseded (superseded rows are
+        // retired by consolidation and excluded from retrieval, so including
+        // them in health counts would disagree with what users actually see).
         let active: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+            "SELECT COUNT(*) FROM memories \
+             WHERE invalidated_at IS NULL AND superseded_by IS NULL",
             [],
             |row| row.get(0),
         )?;
@@ -330,10 +334,12 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             |row| row.get(0),
         )?;
 
-        // by_scope
+        // by_scope — active only (same superseded_by filter)
         let by_scope: Vec<(String, u64)> = {
             let mut stmt = conn.prepare(
-                "SELECT scope, COUNT(*) FROM memories WHERE invalidated_at IS NULL GROUP BY scope ORDER BY COUNT(*) DESC",
+                "SELECT scope, COUNT(*) FROM memories \
+                 WHERE invalidated_at IS NULL AND superseded_by IS NULL \
+                 GROUP BY scope ORDER BY COUNT(*) DESC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
@@ -341,10 +347,12 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
-        // by_kind
+        // by_kind — active only
         let by_kind: Vec<(String, u64)> = {
             let mut stmt = conn.prepare(
-                "SELECT kind, COUNT(*) FROM memories WHERE invalidated_at IS NULL GROUP BY kind ORDER BY COUNT(*) DESC",
+                "SELECT kind, COUNT(*) FROM memories \
+                 WHERE invalidated_at IS NULL AND superseded_by IS NULL \
+                 GROUP BY kind ORDER BY COUNT(*) DESC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
@@ -505,8 +513,11 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
     // C3 — UsefulnessTrend
     // -----------------------------------------------------------------------
     let usefulness = {
+        // S4.1: exclude superseded rows from usefulness aggregates so that
+        // the numbers align with what retrieval actually surfaces.
         let sum_usefulness: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(usefulness_score), 0.0) FROM memories WHERE invalidated_at IS NULL",
+            "SELECT COALESCE(SUM(usefulness_score), 0.0) FROM memories \
+             WHERE invalidated_at IS NULL AND superseded_by IS NULL",
             [],
             |row| row.get(0),
         )?;
@@ -515,7 +526,7 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             .query_row(
                 "SELECT AVG(usefulness_score / CAST(use_count AS REAL)) \
                  FROM memories \
-                 WHERE invalidated_at IS NULL AND use_count > 0",
+                 WHERE invalidated_at IS NULL AND superseded_by IS NULL AND use_count > 0",
                 [],
                 |row| row.get::<_, Option<f64>>(0),
             )
@@ -1345,6 +1356,73 @@ mod tests {
             assert!(
                 (rs.hit_rate.unwrap() - 0.0).abs() < 1e-9,
                 "0 hits / 1 served = 0.0"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // S4.1 — superseded memories must be excluded from active counts
+    // -----------------------------------------------------------------------
+
+    /// A memory that has been superseded (its `superseded_by` column is set to
+    /// a survivor memory_id) is RETIRED by consolidation — retrieval already
+    /// excludes it.  The analytics `active` count, `by_scope`, `by_kind`, and
+    /// `UsefulnessTrend` aggregates must agree with retrieval and exclude
+    /// superseded rows, so the health dashboard shows the same corpus the user
+    /// actually gets back when they run a query.
+    #[test]
+    fn superseded_memory_excluded_from_active_count() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            // Add two memories.
+            let _m1 = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "active fact stays",
+            )
+            .expect("m1");
+            let m2 = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "superseded fact goes",
+            )
+            .expect("m2");
+
+            // Mark m2 as superseded by m1 (simulates what the consolidation
+            // projector does when it merges two contradicting memories).
+            let (_paths, _config, conn) = crate::project::load_project(&root).expect("load");
+            conn.execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE memory_id = ?2",
+                rusqlite::params![_m1, m2],
+            )
+            .expect("stamp superseded_by");
+
+            let report = compute_insights(&root, InsightsOptions::default()).expect("insights");
+            let ch = &report.corpus;
+
+            // Only the non-superseded memory must count as active.
+            assert_eq!(
+                ch.active, 1,
+                "active count must exclude superseded memories; got {}",
+                ch.active
+            );
+            // by_scope must also reflect only 1 active project-scope memory.
+            let project_scope = ch.by_scope.iter().find(|(s, _)| s == "project");
+            assert_eq!(
+                project_scope.map(|(_, n)| *n),
+                Some(1),
+                "by_scope[project] must be 1 (superseded excluded)"
+            );
+            // by_kind must reflect only 1 active fact.
+            let fact_kind = ch.by_kind.iter().find(|(k, _)| k == "fact");
+            assert_eq!(
+                fact_kind.map(|(_, n)| *n),
+                Some(1),
+                "by_kind[fact] must be 1 (superseded excluded)"
             );
         });
     }

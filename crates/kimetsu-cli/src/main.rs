@@ -3,12 +3,14 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod ask;
 mod distiller;
 mod doctor;
 mod embed_daemon;
 mod harvest_setup;
 mod proactive_state;
 mod process;
+mod skill_synth;
 mod update;
 
 use clap::{Args, Parser, Subcommand};
@@ -154,6 +156,31 @@ enum Command {
     /// Takes a new user from zero to a verified working brain in ONE command,
     /// instead of running `init` + `plugin install` + `doctor --selftest` separately.
     Setup(SetupArgs),
+    /// Save a mid-session work checkpoint now.
+    ///
+    /// Captures the current work episode (task, open threads, dead-ends,
+    /// hypothesis) into the brain so the next session can resume from here.
+    /// Optionally accepts a short note to add context.
+    ///
+    /// The episode is per-repo: one live episode per git repo at a time.
+    /// A new checkpoint supersedes the previous one.
+    ///
+    /// Examples:
+    ///   kimetsu checkpoint
+    ///   kimetsu checkpoint "about to try the new approach"
+    ///   kimetsu checkpoint --workspace /path/to/repo "switching branches"
+    Checkpoint(CheckpointArgs),
+    /// Print the last saved work episode for the current repo.
+    ///
+    /// Shows what you were working on, what's open, what failed, and the
+    /// current working hypothesis — so you can pick up exactly where you
+    /// left off.  Prints a friendly message when no episode has been saved
+    /// yet.
+    ///
+    /// Examples:
+    ///   kimetsu resume
+    ///   kimetsu resume --workspace /path/to/repo
+    Resume(ResumeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -636,6 +663,26 @@ enum BrainCommand {
     /// Host SessionEnd hook — runs the credentialed distiller.
     #[command(name = "session-end-hook")]
     SessionEndHook(SessionEndHookArgs),
+    /// Host SessionStart hook — injects the repo digest + episodic resume as
+    /// `additionalContext` so the agent's FIRST turn already knows the repo
+    /// and the current task without an exploratory ls/cat/grep tour.
+    ///
+    /// Output is JSON in the Claude Code `additionalContext` hook format.
+    /// Silent when: `[broker] warm_start = false`, no digest exists, AND
+    /// no live episode exists (pure optional feature).
+    ///
+    /// Gated by `[broker] warm_start` (default true).
+    #[command(name = "session-start-hook")]
+    SessionStartHook(SessionStartHookArgs),
+    /// Build (or rebuild) the repo digest and write it to `.kimetsu/digest.md`.
+    ///
+    /// The digest is a ~400-token summary of the repo: top-usefulness
+    /// memories, manifest (Cargo.toml/package.json/…) summary, and recent
+    /// work focus.  It is cached by a content hash and reused at SessionStart.
+    ///
+    /// Pass `--refresh` to force a rebuild even when the cache is fresh.
+    #[command(name = "digest")]
+    Digest(DigestArgs),
     /// Reclaim dead disk space in brain.db.
     ///
     /// Without flags this is a safe, read-only-equivalent operation: SQLite
@@ -763,6 +810,139 @@ enum BrainCommand {
     ///   kimetsu brain triage --score-floor 0.1 --age-days 60
     ///   kimetsu brain triage --prune-all --yes
     Triage(TriageArgs),
+    /// Ask the brain a question and receive a grounded, cited answer.
+    ///
+    /// Retrieves relevant memories, composes an answer via the configured
+    /// cheap model (local/offline preferred; see DP-B), and prints the
+    /// result. When no model is configured, returns the top capsule texts
+    /// verbatim (never hard-fails). When retrieval is empty, prints a
+    /// grounded-only refusal — the brain never halluccinates.
+    ///
+    /// Examples:
+    ///   kimetsu brain ask "how do I run the tests?"
+    ///   kimetsu brain ask "what's the cargo build command?" --json
+    ///   kimetsu brain ask "explain the broker" --helpful memory:01ABC
+    Ask(AskArgs),
+    /// Flagship 2: Memory → Skill synthesis.
+    ///
+    /// Detects memories cited ≥3 times across runs (or tight semantic
+    /// clusters) and drafts them into reusable SKILL.md skills via the
+    /// configured cheap model (grounded-only — never invents steps).
+    ///
+    /// --detect   Scan for candidates and create proposals (default when no flag given).
+    /// --review   List pending proposals and accepted skills.
+    /// --accept   Install a pending proposal into .kimetsu/skills/ (explicit only).
+    /// --reject   Reject a pending proposal.
+    /// --status   Show staleness status for accepted skills.
+    ///
+    /// Examples:
+    ///   kimetsu brain skills --detect
+    ///   kimetsu brain skills --review
+    ///   kimetsu brain skills --accept 01ABCDEF
+    ///   kimetsu brain skills --reject 01ABCDEF
+    ///   kimetsu brain skills --status
+    Skills(SkillsArgs),
+    /// Epic S3: sync the brain across machines via event-log replication.
+    ///
+    /// Sync = event-log replication (NOT SQLite file copying).  Only durable
+    /// memory-lifecycle events are replicated:
+    ///   memory.accepted, memory.proposed, memory.rejected, memory.invalidated,
+    ///   memory.cited, memory.superseded
+    ///
+    /// Excluded (local/telemetry): work.episode, context.served,
+    ///   retrieval.regret, run.* and everything else.
+    ///
+    /// Subcommands:
+    ///
+    ///   kimetsu brain sync export [--since <rowid>] [--out <file>] [--dry-run]
+    ///     Export durable events since a rowid cursor to a JSONL batch.
+    ///     Defaults to stdout.
+    ///
+    ///   kimetsu brain sync import <batch> [--dry-run]
+    ///     Import a JSONL batch (per-event idempotent via event_id).
+    ///     Reports applied/skipped counts.
+    ///
+    ///   kimetsu brain sync [--status] [--dry-run]
+    ///     Full directory-protocol sync: push new events, pull from peers.
+    ///     Requires [sync] dir + machine_id in project.toml.
+    ///
+    /// Examples:
+    ///   kimetsu brain sync export --out /tmp/batch.jsonl
+    ///   kimetsu brain sync export --since 42 --out /tmp/delta.jsonl
+    ///   kimetsu brain sync import /tmp/batch.jsonl
+    ///   kimetsu brain sync import /tmp/batch.jsonl --dry-run
+    ///   kimetsu brain sync               # full dir-protocol cycle
+    ///   kimetsu brain sync --status      # show configured dir, machine_id, cursors
+    ///   kimetsu brain sync --dry-run     # report what would happen
+    Sync(SyncArgs),
+}
+
+/// Args for `kimetsu brain sync` (Epic S3).
+#[derive(Debug, clap::Args)]
+struct SyncArgs {
+    /// Subcommand: `export` | `import` | (empty for full dir-protocol sync).
+    #[arg(value_name = "SUBCOMMAND")]
+    subcommand: Option<String>,
+    /// For `export`: export events after this rowid (exclusive).  Default 0 (all).
+    #[arg(long, value_name = "ROWID", default_value_t = 0)]
+    since: i64,
+    /// For `export`: write the batch to this file instead of stdout.
+    #[arg(long, value_name = "FILE")]
+    out: Option<String>,
+    /// For `import`: path to a JSONL batch file (required when subcommand=import).
+    #[arg(value_name = "BATCH_FILE")]
+    batch: Option<String>,
+    /// Report what WOULD happen without actually writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Show configured sync dir, machine_id, per-source cursors, pending counts.
+    #[arg(long)]
+    status: bool,
+    /// Override the workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
+}
+
+/// Args for `kimetsu brain skills` (Flagship 2).
+#[derive(Debug, clap::Args)]
+struct SkillsArgs {
+    /// Detect synthesis candidates and create proposals (default action).
+    #[arg(long)]
+    detect: bool,
+    /// List pending proposals and accepted skills.
+    #[arg(long)]
+    review: bool,
+    /// Accept a pending proposal and install the skill (provide proposal-id).
+    #[arg(long, value_name = "PROPOSAL_ID")]
+    accept: Option<String>,
+    /// Reject a pending proposal (provide proposal-id).
+    #[arg(long, value_name = "PROPOSAL_ID")]
+    reject: Option<String>,
+    /// Show staleness status for accepted skills.
+    #[arg(long)]
+    status: bool,
+    /// Override the workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
+}
+
+/// Args for `kimetsu brain ask`.
+#[derive(Debug, clap::Args)]
+struct AskArgs {
+    /// The question to ask the brain.
+    question: String,
+    /// Emit machine-readable JSON (stable schema: answer, citations,
+    /// grounded, model_used, verbatim).
+    #[arg(long)]
+    json: bool,
+    /// Mark a prior answer as helpful, recording a citation for each
+    /// memory id in CITATIONS (comma-separated `memory:<id>` handles).
+    /// Example: `kimetsu brain ask --helpful memory:01ABC,memory:01DEF ""`
+    #[arg(long, value_name = "CITATIONS")]
+    helpful: Option<String>,
+    /// Override the workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -924,6 +1104,42 @@ struct SessionEndHookArgs {
     workspace: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct SessionStartHookArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DigestArgs {
+    /// Force a rebuild even when the cached digest is fresh.
+    #[arg(long)]
+    refresh: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu checkpoint`.
+#[derive(Debug, Args)]
+struct CheckpointArgs {
+    /// Optional note to attach to this checkpoint.
+    #[arg(value_name = "NOTE")]
+    note: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu resume`.
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 /// Args for `kimetsu brain tune`.
 #[derive(Debug, Args)]
 struct TuneArgs {
@@ -940,6 +1156,14 @@ struct TuneArgs {
     /// Revert the most recent tune-history entry.
     #[arg(long)]
     revert: bool,
+    /// S2.1: Show re-tune trigger state (corpus growth + drift signal).
+    /// Included automatically in --status; use alone for a cheap check.
+    #[arg(long)]
+    triggers: bool,
+    /// S2.2: Show the model re-selection advisor (embedder×reranker grid
+    /// recommendation with download+reindex cost).
+    #[arg(long)]
+    models: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<std::path::PathBuf>,
@@ -997,6 +1221,11 @@ struct RoiArgs {
     /// Emit machine-readable JSON (stable RoiReport schema).
     #[arg(long)]
     json: bool,
+    /// S2.4(a): Show the top N memories by estimated token savings
+    /// (citation-weighted, pairs with consolidate/triage).
+    /// Default: show top 10 when flag is present with no value.
+    #[arg(long, value_name = "N")]
+    top: Option<usize>,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1556,6 +1785,8 @@ fn run() -> KimetsuResult<()> {
         Command::Stop(args) => stop_cmd(args),
         Command::Restart(args) => restart_cmd(args),
         Command::Setup(args) => setup_cmd(args),
+        Command::Checkpoint(args) => checkpoint_cmd(args),
+        Command::Resume(args) => resume_cmd(args),
     }
 }
 
@@ -1576,6 +1807,83 @@ fn uninstall_cmd(args: UninstallArgs) -> KimetsuResult<()> {
         keep_plugins: args.keep_plugins,
         delete_user_data: args.delete_user_data,
     })
+}
+
+// ── kimetsu checkpoint ────────────────────────────────────────────────────────
+
+/// `kimetsu checkpoint [note]` — manually save a mid-session work episode.
+fn checkpoint_cmd(args: CheckpointArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let note = args.note.as_deref().unwrap_or("");
+
+    // Use capture_episode_now with an empty transcript (manual save does not
+    // require a transcript — the note itself is sufficient context).
+    let ok = distiller::capture_episode_now(&workspace, "", note);
+
+    if ok {
+        println!("[Kimetsu] Work checkpoint saved.");
+        if !note.is_empty() {
+            println!("  Note: {note}");
+        }
+    } else {
+        // Could not write — likely no project initialised here.
+        eprintln!(
+            "[Kimetsu] Could not save checkpoint: no Kimetsu project found at {}.\n\
+             Run `kimetsu init` to initialise one.",
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+// ── kimetsu resume ────────────────────────────────────────────────────────────
+
+/// `kimetsu resume` — print the last saved work episode.
+fn resume_cmd(args: ResumeArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    match kimetsu_brain::episode::load_live_episode_for_workspace(&workspace) {
+        Ok(Some(ep)) => {
+            println!("── Resume: last session ──────────────────────────────");
+            if !ep.task.is_empty() {
+                println!("Task:       {}", ep.task);
+            }
+            if !ep.summary.is_empty() {
+                println!("Summary:    {}", ep.summary);
+            }
+            if !ep.open_threads.is_empty() {
+                println!("Open:       {}", ep.open_threads.join("; "));
+            }
+            if !ep.dead_ends.is_empty() {
+                println!("Avoid:      {}", ep.dead_ends.join("; "));
+            }
+            if !ep.hypothesis.is_empty() {
+                println!("Hypothesis: {}", ep.hypothesis);
+            }
+            if !ep.note.is_empty() {
+                println!("Note:       {}", ep.note);
+            }
+            println!("Saved:      {}", ep.created_at);
+            println!("─────────────────────────────────────────────────────");
+        }
+        Ok(None) => {
+            println!("[Kimetsu] No work episode saved for this repo yet.");
+            println!("  Episodes are captured automatically at session end.");
+            println!("  You can save one now with: kimetsu checkpoint");
+        }
+        Err(e) => {
+            eprintln!("[Kimetsu] Could not load episode: {e}");
+            eprintln!(
+                "  Make sure a Kimetsu project is initialised at {}.",
+                workspace.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ── kimetsu ps ───────────────────────────────────────────────────────────────
@@ -3175,35 +3483,40 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
             Ok(())
         }
         ConfigCommand::Set { key, value } => {
-            eprintln!(
-                "note: `config set` re-serialises the file — TOML comments are not preserved. \
-                 Use `config edit` to hand-edit with comments."
-            );
             let cwd = env::current_dir()?;
             let paths = kimetsu_core::paths::ProjectPaths::discover(&cwd)?;
 
-            // 1. Read the on-disk file into a toml::Value so we preserve all
-            //    existing keys and detect the existing type for coercion.
+            // S4.2: use toml_edit for a surgical, comment-preserving write.
+            // The previous approach serialized through toml::Value which
+            // drops all TOML comments and reformats the file.  toml_edit
+            // parses into a `DocumentMut` that preserves comments, whitespace,
+            // and unknown keys — only the touched leaf changes.
             let disk_text = std::fs::read_to_string(&paths.project_toml).map_err(|e| {
                 format!(
                     "config set: could not read {}: {e}",
                     paths.project_toml.display()
                 )
             })?;
-            let mut root: toml::Value = toml::from_str(&disk_text)
-                .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
 
-            // 2. Determine the existing type at this key (for coercion).
-            let existing = get_toml_path(&root, &key).cloned();
+            // 1. Use the plain toml::Value tree to resolve the existing type
+            //    (for coercion) and to validate the result — both remain cheap.
+            let root_val: toml::Value = toml::from_str(&disk_text)
+                .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
+            let existing = get_toml_path(&root_val, &key).cloned();
             let typed_value =
                 parse_scalar(&value, existing.as_ref()).map_err(|e| format!("config set: {e}"))?;
 
-            // 3. Navigate/create the path and set the leaf.
-            set_toml_path(&mut root, &key, typed_value).map_err(|e| format!("config set: {e}"))?;
+            // 2. Parse into toml_edit document (preserves comments/formatting).
+            let mut doc: toml_edit::DocumentMut = disk_text
+                .parse()
+                .map_err(|e| format!("config set: project.toml is invalid TOML (edit): {e}"))?;
 
-            // 4. Serialise back to text and validate through ProjectConfig.
-            let new_text = toml::to_string_pretty(&root)
-                .map_err(|e| format!("config set: failed to serialise: {e}"))?;
+            // 3. Navigate/set the leaf surgically in the edit document.
+            set_toml_edit_path(&mut doc, &key, &typed_value)
+                .map_err(|e| format!("config set: {e}"))?;
+
+            // 4. Render and validate through ProjectConfig before writing.
+            let new_text = doc.to_string();
             project::load_config_from_text(&new_text).map_err(|e| {
                 format!("config set: result is not a valid config — {e}. File NOT written.")
             })?;
@@ -3260,6 +3573,10 @@ fn get_toml_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value
 /// Navigate/create a dotted key path (`a.b.c`) in `root` (a `toml::Value::Table`)
 /// and set the leaf to `value`. Intermediate segments are created as empty tables
 /// when absent. Returns `Err` if an intermediate segment exists but is not a table.
+///
+/// NOTE: this function is kept for unit tests only.  Production config writes use
+/// `set_toml_edit_path` which preserves TOML comments.
+#[cfg(test)]
 fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<(), String> {
     let segments: Vec<&str> = key.split('.').collect();
     let (leaf_key, parents) = segments
@@ -3294,6 +3611,69 @@ fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) -> Resul
         .as_table_mut()
         .unwrap()
         .insert(leaf_key.to_string(), value);
+    Ok(())
+}
+
+/// S4.2 — Surgical, comment-preserving write via `toml_edit`.
+///
+/// Navigate/create a dotted key path (`a.b.c`) inside a `toml_edit::DocumentMut`
+/// and overwrite the leaf with `value` (a `toml::Value` for type information).
+/// Intermediate tables are created when absent. Returns `Err` when an
+/// intermediate segment is not a table.
+///
+/// This preserves all TOML comments, whitespace, and unknown keys because
+/// `toml_edit` operates on the concrete syntax tree rather than a typed struct.
+fn set_toml_edit_path(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: &toml::Value,
+) -> Result<(), String> {
+    let segments: Vec<&str> = key.split('.').collect();
+    let (leaf_key, parents) = segments
+        .split_last()
+        .ok_or_else(|| "key must not be empty".to_string())?;
+
+    // Navigate into parent tables, creating inline tables when absent.
+    let mut current: &mut toml_edit::Item = doc.as_item_mut();
+    for seg in parents {
+        // If the segment doesn't exist yet, insert an empty table.
+        if current.get(seg).is_none() {
+            if let Some(tbl) = current.as_table_mut() {
+                tbl.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
+            } else {
+                return Err(format!("cannot set `{key}`: `{seg}` is not a table"));
+            }
+        }
+        current = current
+            .get_mut(seg)
+            .ok_or_else(|| format!("cannot set `{key}`: `{seg}` not found after insert"))?;
+        if !current.is_table() && !current.is_inline_table() {
+            return Err(format!("cannot set `{key}`: `{seg}` is not a table"));
+        }
+    }
+
+    // Convert the toml::Value leaf into a toml_edit::Value.
+    let edit_val: toml_edit::Value = match value {
+        toml::Value::Boolean(b) => toml_edit::Value::from(*b),
+        toml::Value::Integer(n) => toml_edit::Value::from(*n),
+        toml::Value::Float(f) => toml_edit::Value::from(*f),
+        toml::Value::String(s) => toml_edit::Value::from(s.as_str()),
+        other => {
+            // Fallback: round-trip through TOML text for complex types.
+            let text = toml::to_string(other)
+                .map_err(|e| format!("cannot serialise value for `{key}`: {e}"))?;
+            text.trim()
+                .parse::<toml_edit::Value>()
+                .map_err(|e| format!("cannot parse serialised value for `{key}`: {e}"))?
+        }
+    };
+
+    if let Some(tbl) = current.as_table_mut() {
+        tbl.insert(leaf_key, toml_edit::Item::Value(edit_val));
+    } else {
+        return Err(format!("cannot set `{key}`: parent segment is not a table"));
+    }
+
     Ok(())
 }
 
@@ -3509,6 +3889,18 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             distiller::run_session_end_hook(&workspace);
             Ok(())
         }
+        BrainCommand::SessionStartHook(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            brain_session_start_hook(&workspace)
+        }
+        BrainCommand::Digest(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            brain_digest_cmd(&workspace, args.refresh)
+        }
         BrainCommand::Compact(args) => brain_compact(args),
         BrainCommand::Export(args) => brain_export(args),
         BrainCommand::Import(args) => brain_import(args),
@@ -3522,6 +3914,9 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Tune(args) => brain_tune(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Triage(args) => brain_triage(args),
+        BrainCommand::Ask(args) => brain_ask(args),
+        BrainCommand::Skills(args) => brain_skills(args),
+        BrainCommand::Sync(args) => brain_sync(args),
     }
 }
 
@@ -3793,6 +4188,83 @@ fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 
 // ── Q8: brain compact ────────────────────────────────────────────────────────
 
+// ── Flagship 1 Pass B: session-start-hook + digest command ───────────────────
+
+/// `kimetsu brain session-start-hook`
+///
+/// Flagship 1 / Pass B / Story 1.5: SessionStart hook that injects the
+/// repo digest (1.1) + episodic resume (Pass A) as `additionalContext` so
+/// the agent's first turn knows the repo and task without exploratory I/O.
+///
+/// Output format: Claude Code `additionalContext` JSON.
+/// Gated by `[broker] warm_start` (default true).
+/// Silent when no digest AND no live episode.
+fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
+    // Gate: load warm_start from config (best-effort; default ON).
+    let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| kimetsu_brain::project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.warm_start)
+        .unwrap_or(true);
+
+    if !warm_start_enabled {
+        return Ok(());
+    }
+
+    // 1. Repo digest (story 1.1).
+    let digest = kimetsu_brain::digest::build_or_load_digest(workspace, false);
+
+    // 2. Episodic resume (Pass A, story 1.4).
+    let resume = kimetsu_brain::episode::render_resume_context(workspace);
+
+    // Silent when neither has content.
+    if digest.is_none() && resume.is_none() {
+        return Ok(());
+    }
+
+    // Assemble additionalContext.
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &digest {
+        parts.push(format!("## Repo context\n{d}"));
+    }
+    if let Some(r) = &resume {
+        parts.push(format!("## Your prior session\n{r}"));
+    }
+    let additional_context = parts.join("\n\n");
+
+    // ROI attribution (best-effort).
+    let digest_chars = digest.as_ref().map(|d| d.len()).unwrap_or(0);
+    let resume_chars = resume.as_ref().map(|r| r.len()).unwrap_or(0);
+    kimetsu_brain::digest::record_warmstart_served(workspace, digest_chars, resume_chars);
+
+    // Emit Claude Code SessionStart additionalContext JSON.
+    let output = serde_json::json!({
+        "continue": true,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": additional_context,
+        },
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// `kimetsu brain digest [--refresh]`
+///
+/// Flagship 1 / Pass B / Story 1.1: build (or rebuild) the repo digest.
+/// Prints the digest to stdout and writes `.kimetsu/digest.md`.
+fn brain_digest_cmd(workspace: &Path, refresh: bool) -> KimetsuResult<()> {
+    match kimetsu_brain::digest::build_or_load_digest(workspace, refresh) {
+        Some(digest) => {
+            println!("{digest}");
+        }
+        None => {
+            eprintln!("[Kimetsu] No digest content: brain may not be initialized or empty.");
+        }
+    }
+    Ok(())
+}
+
 /// `kimetsu brain compact [--purge-invalidated] [--trim-events-older-than <dur>] [--json]`
 ///
 /// Reclaims dead space in brain.db via SQLite VACUUM. Optional flags allow
@@ -3985,6 +4457,158 @@ fn brain_backup(args: BrainBackupArgs) -> KimetsuResult<()> {
         dest_path.display()
     );
     Ok(())
+}
+
+// ── S3: brain sync ────────────────────────────────────────────────────────────
+
+/// `kimetsu brain sync [subcommand] [flags]`
+///
+/// Dispatches to export / import / full-cycle / status based on `args.subcommand`
+/// and flag combination.
+fn brain_sync(args: SyncArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::sync as brain_sync_mod;
+    use kimetsu_core::paths::ProjectPaths;
+
+    let workspace = args
+        .workspace
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = ProjectPaths::discover(&workspace)?;
+
+    // Open brain.db (read-write for import/sync; read-only for export/status).
+    let (_paths, config, conn) = project::load_project(&workspace)?;
+
+    let sub = args.subcommand.as_deref().unwrap_or("");
+
+    match sub {
+        "export" => {
+            // kimetsu brain sync export [--since <rowid>] [--out <file>] [--dry-run]
+            let out_path = args.out.as_deref().map(std::path::Path::new);
+            let (summary, content) =
+                brain_sync_mod::export_events(&conn, args.since, out_path, args.dry_run)?;
+            if let Some(jsonl) = content {
+                println!("{jsonl}");
+            } else if args.dry_run {
+                println!(
+                    "dry-run: would export {} events (next cursor: {})",
+                    summary.exported, summary.next_cursor
+                );
+            } else {
+                println!(
+                    "exported {} events → {} (next cursor: {})",
+                    summary.exported,
+                    args.out.as_deref().unwrap_or("<stdout>"),
+                    summary.next_cursor
+                );
+            }
+        }
+        "import" => {
+            // kimetsu brain sync import <batch> [--dry-run]
+            let batch_file = args.batch.as_deref().ok_or_else(|| {
+                "kimetsu brain sync import: missing <batch> file argument".to_string()
+            })?;
+            let path = std::path::Path::new(batch_file);
+            let summary = brain_sync_mod::import_events_from_file(&conn, path, args.dry_run)?;
+            if args.dry_run {
+                println!(
+                    "dry-run: would apply {} events, skip {} (already present)",
+                    summary.applied, summary.skipped
+                );
+            } else {
+                println!(
+                    "applied {} events, skipped {}",
+                    summary.applied, summary.skipped
+                );
+            }
+        }
+        "" => {
+            // Full directory-protocol sync, or --status.
+            if args.status {
+                // 3.3 doctor: show sync state.
+                let sync_cfg = &config.sync;
+                let sync_dir_opt = sync_cfg.dir.as_deref().map(std::path::Path::new);
+                let machine_id = resolve_machine_id(&sync_cfg.machine_id);
+                let cursors_path = paths.kimetsu_dir.join("sync-cursors.json");
+                let status =
+                    brain_sync_mod::sync_status(&conn, sync_dir_opt, &machine_id, &cursors_path)?;
+                println!("sync status:");
+                println!(
+                    "  dir:        {}",
+                    status
+                        .sync_dir
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(not configured)".to_string())
+                );
+                println!("  machine_id: {machine_id}");
+                println!("  local pending (unpushed): {}", status.local_pending);
+                if status.sources.is_empty() {
+                    println!("  peers: (none seen yet)");
+                } else {
+                    println!("  peers:");
+                    for (mid, cursor, pending) in &status.sources {
+                        println!("    {mid}: cursor={cursor}, pending_pull={pending}");
+                    }
+                }
+            } else {
+                // Full sync cycle.
+                let sync_cfg = &config.sync;
+                let sync_dir = match sync_cfg.dir.as_deref() {
+                    Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+                    _ => {
+                        return Err(
+                            "kimetsu brain sync: `[sync] dir` is not configured in project.toml.\n\
+                             Set it with: kimetsu config set sync.dir /path/to/shared/dir"
+                                .to_string()
+                                .into(),
+                        );
+                    }
+                };
+                let machine_id = resolve_machine_id(&sync_cfg.machine_id);
+                let cursors_path = paths.kimetsu_dir.join("sync-cursors.json");
+                let report = brain_sync_mod::sync_dir(
+                    &conn,
+                    &sync_dir,
+                    &machine_id,
+                    &cursors_path,
+                    args.dry_run,
+                )?;
+                let prefix = if report.dry_run { "dry-run: " } else { "" };
+                println!(
+                    "{prefix}pushed {pushed}, pulled {applied} (skipped {skipped}) from {n} peer(s)",
+                    pushed = report.pushed,
+                    applied = report.pulled_applied,
+                    skipped = report.pulled_skipped,
+                    n = report.machines_pulled.len(),
+                    prefix = prefix,
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "kimetsu brain sync: unknown subcommand `{other}`; \
+                 expected `export`, `import`, or omit for full sync"
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve the effective machine_id: use the configured value if non-empty,
+/// otherwise generate a stable ULID-based id.  The generated id is NOT
+/// persisted here — the user should run `kimetsu config set sync.machine_id
+/// <id>` to make it durable.
+fn resolve_machine_id(configured: &str) -> String {
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    // Stable fallback: use hostname or a generated ULID.
+    std::env::var("KIMETSU_SYNC_MACHINE_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ulid::Ulid::new().to_string())
 }
 
 // ── embed-daemon / warm / daemon subcommand handlers ─────────────────────────
@@ -4477,9 +5101,9 @@ fn brain_insights(
     Ok(())
 }
 
-/// v1.5: `kimetsu brain roi` — ROI ledger.
+/// v1.5 / S2.4: `kimetsu brain roi` — ROI ledger.
 fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
-    use kimetsu_brain::roi::{RoiWindow, roi_report};
+    use kimetsu_brain::roi::{RoiWindow, per_memory_roi, roi_report};
 
     let workspace = args
         .workspace
@@ -4496,6 +5120,44 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         config.model.price_per_mtok,
     )?;
 
+    // S2.4(a): --top mode.
+    if let Some(top_n) = args.top {
+        let limit = if top_n == 0 { 10 } else { top_n };
+        let entries = per_memory_roi(&conn, window, limit)?;
+
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            return Ok(());
+        }
+
+        let window_label = match report.window_days {
+            Some(d) => format!("last {d} days"),
+            None => "all time".to_string(),
+        };
+        println!("── ROI Top Memories ({window_label}, top {limit}) ─────");
+        if entries.is_empty() {
+            println!("  No citations recorded yet.");
+        } else {
+            for (i, e) in entries.iter().enumerate() {
+                println!(
+                    "  #{:>2}  [{:>15}]  cites={:>3}  saved={:>6} tok  {}",
+                    i + 1,
+                    e.kind,
+                    e.citation_count,
+                    format_token_count(e.estimated_saved_tokens),
+                    if e.text_head.len() >= 60 {
+                        format!("{}…", &e.text_head[..60])
+                    } else {
+                        e.text_head.clone()
+                    },
+                );
+            }
+        }
+        println!("──────────────────────────────────────────────");
+        println!("  (Use without --top for the full ROI summary)");
+        return Ok(());
+    }
+
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -4508,10 +5170,24 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     };
     println!("── ROI Ledger ({window_label}) ────────────────────────");
     println!("  served events:        {}", report.served_events);
+    // S2.4(c): show warm-start events.
+    if report.digest_served_events > 0 || report.resume_served_events > 0 {
+        println!("  digest_served:        {}", report.digest_served_events);
+        println!("  resume_served:        {}", report.resume_served_events);
+        println!(
+            "  warmstart saved tok:  {}",
+            format_token_count(report.warmstart_saved_tokens)
+        );
+    }
     println!("  citations:            {}", report.citations);
     println!(
         "  injected tokens:      {}",
         format_token_count(report.injected_tokens)
+    );
+    // S2.4(b): output token estimate.
+    println!(
+        "  est. output tokens:   {} (ratio est.)",
+        format_token_count(report.estimated_output_tokens)
     );
     println!(
         "  est. saved tokens:    {}",
@@ -4541,7 +5217,7 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
 
     // Verdict line.
     println!("──────────────────────────────────────────────");
-    if report.citations == 0 {
+    if report.citations == 0 && report.warmstart_saved_tokens == 0 {
         println!(
             "  No retrieval activity recorded yet — the ledger starts \
              counting as you work."
@@ -4584,8 +5260,9 @@ fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v1.5: `kimetsu brain tune` — personal eval readiness + optional sweep.
+/// v1.5 / S2: `kimetsu brain tune` — personal eval readiness + optional sweep.
 fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::tune::{compute_model_advisor, compute_retune_trigger};
     use kimetsu_brain::tuneset::build_personal_eval;
 
     let workspace = args
@@ -4593,10 +5270,19 @@ fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
-    let (_paths2, _config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+    let (_paths2, config, conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
 
     if args.revert {
         return brain_tune_revert(&workspace);
+    }
+
+    // S2.2: --models only (no sweep).
+    if args.models && !args.status {
+        let trigger = compute_retune_trigger(&conn, &paths.kimetsu_dir)
+            .map_err(|e| format!("compute_retune_trigger: {e}"))?;
+        let advisor = compute_model_advisor(&config.embedder.model, &trigger);
+        print_model_advisor(&advisor);
+        return Ok(());
     }
 
     let eval = build_personal_eval(&conn, 1800).map_err(|e| format!("build_personal_eval: {e}"))?;
@@ -4630,8 +5316,23 @@ fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
     println!();
     println!("Readiness: {readiness}");
 
-    if args.status {
-        return Ok(());
+    // S2.1: always show trigger state in --status, or when --triggers flag used.
+    if args.status || args.triggers {
+        println!();
+        let trigger = compute_retune_trigger(&conn, &paths.kimetsu_dir)
+            .map_err(|e| format!("compute_retune_trigger: {e}"))?;
+        print_retune_trigger_state(&trigger);
+
+        // S2.2: show model advisor when --models is also set with --status.
+        if args.models {
+            println!();
+            let advisor = compute_model_advisor(&config.embedder.model, &trigger);
+            print_model_advisor(&advisor);
+        }
+
+        if args.status {
+            return Ok(());
+        }
     }
 
     // Sweep (or dry-run report).
@@ -4662,6 +5363,87 @@ fn kind_coverage_from_eval(
     vec
 }
 
+/// S2.1: Print the re-tune trigger state in a human-readable format.
+fn print_retune_trigger_state(trigger: &kimetsu_brain::tune::RetuneTriggerState) {
+    println!("=== S2.1 Re-tune Triggers ===");
+    if let Some(ts) = &trigger.last_tuned_at {
+        println!("  Last tuned at:           {ts}");
+        println!(
+            "  Memory count at tune:    {}",
+            trigger.memory_count_at_last_tune
+        );
+    } else {
+        println!("  Last tuned at:           (never)");
+    }
+    println!(
+        "  Current memory count:    {}",
+        trigger.current_memory_count
+    );
+    println!(
+        "  Added since last tune:   {}",
+        trigger.memories_added_since_tune
+    );
+    println!(
+        "  Corpus milestone (≥{}): {}",
+        kimetsu_brain::tune::RETUNE_CORPUS_MILESTONE,
+        if trigger.corpus_milestone_triggered {
+            "TRIGGERED"
+        } else {
+            "not reached"
+        }
+    );
+    println!(
+        "  Regret rate (24h):       {:.1}% ({}/{} events)",
+        trigger.regret_rate * 100.0,
+        trigger.recent_regret_count,
+        trigger.recent_served_count
+    );
+    println!(
+        "  Drift threshold (≥{:.0}%): {}",
+        kimetsu_brain::tune::RETUNE_REGRET_RATE_THRESHOLD * 100.0,
+        if trigger.drift_triggered {
+            "TRIGGERED"
+        } else {
+            "within normal"
+        }
+    );
+    println!();
+    if trigger.should_retune {
+        println!("  → Re-tune PROPOSED: run `kimetsu brain tune` to run the sweep.");
+    } else {
+        println!("  → No re-tune needed at this time.");
+    }
+}
+
+/// S2.2: Print the model re-selection advisor report.
+fn print_model_advisor(advisor: &kimetsu_brain::tune::ModelAdvisorReport) {
+    println!("=== S2.2 Model Re-selection Advisor ===");
+    println!("  Current embedder:  {}", advisor.current_embedder);
+    println!("  Memories to reindex: {}", advisor.memories_to_reindex);
+    println!(
+        "  Est. reindex cost:   ~{} tokens (conservative lower-bound)",
+        format_token_count(advisor.estimated_reindex_tokens)
+    );
+    println!();
+    println!("  {}", advisor.reason);
+    println!();
+    println!("  Candidate models (for grid sweep):");
+    for m in &advisor.candidate_models {
+        println!(
+            "    {:<40} ~{} MiB download",
+            m.model_id, m.approx_download_mib
+        );
+        println!("      {}", m.description);
+    }
+    println!();
+    if advisor.recommend_grid_run {
+        println!("  → Grid run RECOMMENDED. Re-run with the full sweep after downloading models.");
+        println!("    NOTE: This advisor NEVER auto-switches the model. Apply changes manually.");
+    } else {
+        println!("  → Grid run optional. Current model appears sufficient.");
+    }
+}
+
 fn brain_tune_sweep(
     workspace: &std::path::Path,
     paths: &kimetsu_core::paths::ProjectPaths,
@@ -4673,8 +5455,8 @@ fn brain_tune_sweep(
     use kimetsu_brain::eval::{mean, mrr};
     use kimetsu_brain::project::BrainSession;
     use kimetsu_brain::tune::{
-        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history, compute_objective,
-        select_winner, train_holdout_split,
+        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history,
+        compute_objective_with_regret, count_regret_events, select_winner, train_holdout_split,
     };
     use std::collections::HashMap;
     use time::format_description::well_known::Rfc3339;
@@ -4844,13 +5626,48 @@ fn brain_tune_sweep(
             (mean(&mrr_vals), mean(&token_vals))
         };
 
+    // S2.3: Compute global regret rate from the DB for the objective penalty.
+    // We use the ALL-TIME regret / served ratio here (the sweep window is the
+    // full personal eval set, which spans all time).
+    // Best-effort: if the DB cannot be opened, regret_rate and memory_count
+    // degrade gracefully to 0 (objective falls back to v1.5 formula).
+    let (global_regret_rate, current_memory_count) = {
+        match kimetsu_brain::project::load_project_readonly(workspace) {
+            Ok((_paths_ro, _cfg_ro, conn_ro)) => {
+                let total_regrets = count_regret_events(&conn_ro, None, None).unwrap_or(0);
+                let total_served: u64 = conn_ro
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE kind = 'context.served'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let regret_rate = if total_served > 0 {
+                    total_regrets as f64 / total_served as f64
+                } else {
+                    0.0
+                };
+                let mem_count: u64 = conn_ro
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                (regret_rate, mem_count)
+            }
+            Err(_) => (0.0_f64, 0_u64),
+        }
+    };
+
     // Evaluate current config on holdout for baseline.
     let (baseline_holdout_mrr, baseline_holdout_tokens) =
         evaluate_cases(&current_combo, &holdout_cases);
-    let baseline_holdout_obj = compute_objective(
+    let baseline_holdout_obj = compute_objective_with_regret(
         baseline_holdout_mrr,
         baseline_holdout_tokens,
         args.cost_weight,
+        global_regret_rate,
     );
 
     // Sweep all combos on TRAIN set.
@@ -4864,7 +5681,8 @@ fn brain_tune_sweep(
             let _ = std::io::stdout().flush();
         }
         let (mmrr, mtok) = evaluate_cases(combo, &train_cases);
-        let obj = compute_objective(mmrr, mtok, args.cost_weight);
+        // S2.3: include regret penalty in the objective.
+        let obj = compute_objective_with_regret(mmrr, mtok, args.cost_weight, global_regret_rate);
         combo_results.push(ComboResult {
             combo: combo.clone(),
             mean_mrr: mmrr,
@@ -4882,9 +5700,14 @@ fn brain_tune_sweep(
         }
     };
 
-    // Evaluate winner on HOLDOUT.
+    // Evaluate winner on HOLDOUT (with regret penalty for consistency).
     let (holdout_mrr, holdout_tokens) = evaluate_cases(&winner.combo, &holdout_cases);
-    let holdout_obj = compute_objective(holdout_mrr, holdout_tokens, args.cost_weight);
+    let holdout_obj = compute_objective_with_regret(
+        holdout_mrr,
+        holdout_tokens,
+        args.cost_weight,
+        global_regret_rate,
+    );
     let improvement = holdout_obj - baseline_holdout_obj;
 
     println!();
@@ -4946,11 +5769,26 @@ fn brain_tune_sweep(
         return Ok(());
     }
 
-    // --apply: write floors to project.toml (reranker change only recommended).
-    let mut new_config = project::load_config(paths)?;
-    new_config.broker.min_lexical_coverage = winner.combo.min_lexical_coverage;
-    new_config.broker.min_semantic_score = winner.combo.min_semantic_score;
-    std::fs::write(&paths.project_toml, new_config.to_toml()?)?;
+    // --apply: write floors to project.toml using surgical toml_edit so that
+    // user comments and unknown keys are preserved (S4.2).
+    let disk_text = std::fs::read_to_string(&paths.project_toml)
+        .map_err(|e| format!("tune --apply: could not read project.toml: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = disk_text
+        .parse()
+        .map_err(|e| format!("tune --apply: project.toml is invalid TOML: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_lexical_coverage",
+        &toml::Value::Float(winner.combo.min_lexical_coverage as f64),
+    )
+    .map_err(|e| format!("tune --apply: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_semantic_score",
+        &toml::Value::Float(winner.combo.min_semantic_score as f64),
+    )
+    .map_err(|e| format!("tune --apply: {e}"))?;
+    std::fs::write(&paths.project_toml, doc.to_string())?;
 
     // Snapshot to tune-history.
     let now_str = time::OffsetDateTime::now_utc()
@@ -4964,6 +5802,8 @@ fn brain_tune_sweep(
         holdout_objective: holdout_obj,
         holdout_mrr,
         baseline_holdout_objective: baseline_holdout_obj,
+        // S2.1: record corpus size so re-tune trigger can detect growth.
+        memory_count_at_tune: Some(current_memory_count),
     };
     append_tune_history(&paths.kimetsu_dir, history_entry)?;
 
@@ -4985,10 +5825,25 @@ fn brain_tune_revert(workspace: &std::path::Path) -> KimetsuResult<()> {
         return Ok(());
     };
 
-    let mut config = project::load_config(&paths)?;
-    config.broker.min_lexical_coverage = entry.before.min_lexical_coverage;
-    config.broker.min_semantic_score = entry.before.min_semantic_score;
-    std::fs::write(&paths.project_toml, config.to_toml()?)?;
+    // S4.2: surgical write via toml_edit preserves user comments.
+    let disk_text = std::fs::read_to_string(&paths.project_toml)
+        .map_err(|e| format!("tune revert: could not read project.toml: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = disk_text
+        .parse()
+        .map_err(|e| format!("tune revert: project.toml is invalid TOML: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_lexical_coverage",
+        &toml::Value::Float(entry.before.min_lexical_coverage as f64),
+    )
+    .map_err(|e| format!("tune revert: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.min_semantic_score",
+        &toml::Value::Float(entry.before.min_semantic_score as f64),
+    )
+    .map_err(|e| format!("tune revert: {e}"))?;
+    std::fs::write(&paths.project_toml, doc.to_string())?;
 
     println!(
         "Reverted: lex_coverage={:.2}, sem_score={:.3} (from tune at {})",
@@ -5393,6 +6248,142 @@ fn format_token_count(n: u64) -> String {
     out
 }
 
+/// Flagship 3.1 — `kimetsu brain ask "<question>"`.
+///
+/// Retrieves brain context for the question and composes a grounded, cited
+/// answer using the configured cheap model (local preferred). Degrades
+/// gracefully: verbatim capsule dump when no model is configured, refusal
+/// when retrieval is empty. Never hard-fails.
+fn brain_ask(args: AskArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // --helpful mode: mark a prior answer helpful by citing its memories.
+    if let Some(citations_raw) = &args.helpful {
+        let handles: Vec<String> = citations_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if handles.is_empty() {
+            eprintln!("--helpful requires at least one memory handle (e.g. memory:01ABC)");
+            return Ok(());
+        }
+        ask::record_helpful_mark(&workspace, &handles);
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "marked_helpful": handles,
+                }))?
+            );
+        } else {
+            println!("Marked {} citation(s) helpful.", handles.len());
+        }
+        return Ok(());
+    }
+
+    let question = args.question.trim();
+    if question.is_empty() {
+        eprintln!("Usage: kimetsu brain ask \"<question>\"");
+        return Ok(());
+    }
+
+    let result = ask::compose_answer(&workspace, question);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "question": question,
+                "answer": result.answer,
+                "citations": result.citations,
+                "grounded": result.grounded,
+                "model_used": result.model_used,
+                "verbatim": result.verbatim,
+            }))?
+        );
+        return Ok(());
+    }
+
+    // Human-readable output.
+    println!("{}", result.answer);
+    if !result.citations.is_empty() {
+        println!();
+        println!("Sources: {}", result.citations.join(", "));
+    }
+    if !result.grounded {
+        // Already printed refusal text; nothing more to do.
+    } else if result.verbatim {
+        println!();
+        println!(
+            "Tip: configure a cheap model in project.toml \
+             ([cheap_model] provider = \"ollama\" …) for composed answers."
+        );
+    } else {
+        // Hint for the helpful-mark workflow.
+        if !result.citations.is_empty() {
+            let handles = result.citations.join(",");
+            println!();
+            println!("If this helped, run: kimetsu brain ask --helpful {handles} \"\"",);
+        }
+    }
+
+    Ok(())
+}
+
+/// Flagship 2: `kimetsu brain skills` — Memory → Skill synthesis.
+fn brain_skills(args: SkillsArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // --accept: install a specific pending proposal.
+    if let Some(ref proposal_id) = args.accept {
+        match skill_synth::install_skill_proposal(&workspace, proposal_id) {
+            Ok(path) => {
+                println!("Skill installed: {}", path.display());
+                println!("Run `kimetsu brain skills --status` to check for future staleness.");
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // --reject: reject a specific pending proposal.
+    if let Some(ref proposal_id) = args.reject {
+        let (_paths, _config, conn) = project::load_project(&workspace)?;
+        kimetsu_brain::skill_synthesis::reject_skill_proposal(&conn, proposal_id)?;
+        println!("Proposal {proposal_id} rejected.");
+        return Ok(());
+    }
+
+    // --status: show staleness for accepted skills.
+    if args.status {
+        let (_paths, _config, conn) = project::load_project(&workspace)?;
+        skill_synth::print_staleness_status(&conn)?;
+        return Ok(());
+    }
+
+    // --review: list proposals for review.
+    if args.review {
+        let (_paths, _config, conn) = project::load_project(&workspace)?;
+        skill_synth::print_skill_review(&conn)?;
+        return Ok(());
+    }
+
+    // Default (--detect or no flag): detect candidates + create proposals.
+    let report = skill_synth::run_skill_synthesis(&workspace)?;
+    skill_synth::print_synthesis_report(&report);
+    Ok(())
+}
+
 /// v0.6: `kimetsu brain context-hook` — UserPromptSubmit hook.
 /// Reads `{"prompt":"..."}` JSON from stdin, retrieves relevant capsules,
 /// prints Codex/Claude-compatible hook JSON to stdout for injection.
@@ -5517,14 +6508,20 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         return Ok(()); // Nothing relevant — zero output
     }
 
-    // v1.5: load broker.compress_capsules + broker.session_dedupe best-effort.
-    // The hook must never fail on config errors — fallback to defaults (both ON).
-    let (compress_capsules, session_dedupe) =
+    // v1.5 / F3 Pass B: load broker render-flags best-effort.
+    // The hook must never fail on config errors — fallback to safe defaults.
+    let (compress_capsules, session_dedupe, answer_grade_min_score) =
         kimetsu_core::paths::ProjectPaths::discover(&workspace)
             .ok()
             .and_then(|paths| project::load_config(&paths).ok())
-            .map(|cfg| (cfg.broker.compress_capsules, cfg.broker.session_dedupe))
-            .unwrap_or((true, true));
+            .map(|cfg| {
+                (
+                    cfg.broker.compress_capsules,
+                    cfg.broker.session_dedupe,
+                    cfg.broker.answer_grade_min_score,
+                )
+            })
+            .unwrap_or((true, true, 0.92));
 
     // v1.5 (Story 2.3): session-scoped cross-turn dedupe.
     // Load the proactive-state sidecar (already used by proactive hooks) to
@@ -5556,8 +6553,57 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         bundle.capsules.iter().collect()
     };
 
+    // F3 Pass B (3.3): pre-compute the answer-grade marker for the top capsule
+    // (the first capsule in capsules_to_render after dedupe). The marker signals
+    // to the model that it can act in one turn rather than re-verifying.
+    //
+    // STRICTLY ADDITIVE: this only changes the rendered prefix of the already-
+    // top capsule. Ranking, floors, and which capsules were selected are never
+    // touched. Suppressed (guard = None) when:
+    //   a) the top capsule's score is below answer_grade_min_score (conservative
+    //      default 0.92 — roughly the top 10% of scores on a well-populated brain),
+    //   b) answer_grade_min_score > 1.0 (operator disabled the feature), or
+    //   c) REGRET GUARD: the capsule's memory_id appears in the recent dropped
+    //      sidecar — meaning the same memory was excluded by floors in a different
+    //      recent retrieval context, indicating inconsistent scoring that makes
+    //      the "verified answer" label overconfident. Read-only peek (best-effort).
+    //
+    // Note: the dropped sidecar tracks EXCLUDED capsules (those that did not
+    // make the bundle). A capsule in bundle.capsules cannot be in the sidecar
+    // for THIS retrieval pass, but it might appear there from a PRIOR retrieval
+    // within the 2-hour window — that is the overconfidence signal we guard.
+    let answer_grade_handle: Option<&str> = capsules_to_render
+        .first()
+        .filter(|top| top.score >= answer_grade_min_score && answer_grade_min_score <= 1.0)
+        .and_then(|top| {
+            // Regret guard: read-only peek at the dropped sidecar.
+            // If the memory was recently dropped by floors (in any prior retrieval
+            // this session window), do NOT label it answer-grade — the floors
+            // gave conflicting signals, which means the confidence marker would
+            // be misleading. Best-effort: any I/O error skips the guard (allows
+            // the label) rather than breaking the hook.
+            let memory_id = top.expansion_handle.strip_prefix("memory:").unwrap_or("");
+            if memory_id.is_empty() {
+                return None; // Non-memory capsules (repo_file, manifest) — skip guard
+            }
+            let in_dropped_sidecar = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+                .ok()
+                .map(|paths| {
+                    let cache_dir = kimetsu_core::paths::user_cache_dir_for(&paths.repo_root);
+                    let sidecar_path = kimetsu_brain::dropped_capsule::sidecar_path(&cache_dir);
+                    let state = kimetsu_brain::dropped_capsule::load(&sidecar_path);
+                    state.entries.iter().any(|e| e.memory_id == memory_id)
+                })
+                .unwrap_or(false);
+            if in_dropped_sidecar {
+                None // Regret guard suppresses the answer-grade label
+            } else {
+                Some(top.expansion_handle.as_str())
+            }
+        });
+
     let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
-    for capsule in &capsules_to_render {
+    for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
         let rendered: String = if compress_capsules {
@@ -5572,6 +6618,13 @@ fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             .map(str::to_string)
             .unwrap_or(rendered);
         additional_context.push('\n');
+        // F3 Pass B (3.3): prepend the answer-grade marker to the first capsule
+        // when it cleared the high-confidence threshold AND passed the regret
+        // guard. Only the first rendered capsule (idx == 0) can be answer-grade
+        // (it's the top-ranked capsule); subsequent capsules are never marked.
+        if idx == 0 && answer_grade_handle.is_some() {
+            additional_context.push_str("Verified answer from project memory: ");
+        }
         additional_context.push_str(&text);
     }
 
@@ -5719,11 +6772,14 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
     // v1.5: compute per-session ROI (best-effort; errors are silently ignored).
     let sid = session.get("session_id").and_then(|v| v.as_str());
     let session_savings = compute_stop_hook_savings(&workspace, sid);
+    // S2.1: compute re-tune trigger cue (best-effort; never blocks the hook).
+    let retune_cue = compute_stop_hook_retune_cue(&workspace);
 
     if recorded > 0 {
-        return emit_stop_hook_json(stop_lessons_recorded_json_with_savings(
+        return emit_stop_hook_json(stop_lessons_recorded_json_with_savings_and_tune(
             recorded,
             session_savings.as_deref(),
+            retune_cue.as_deref(),
         ));
     }
     // Short sessions exit silently — no nagging for quick lookups. The
@@ -5791,8 +6847,9 @@ fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    emit_stop_hook_json(stop_no_lessons_json_with_savings(
+    emit_stop_hook_json(stop_no_lessons_json_with_savings_and_tune(
         session_savings.as_deref(),
+        retune_cue.as_deref(),
     ))
 }
 
@@ -5815,6 +6872,33 @@ fn compute_stop_hook_savings(workspace: &Path, session_id: Option<&str>) -> Opti
         config.model.price_per_mtok,
     )?;
     Some(sr.savings_sentence())
+}
+
+/// S2.1: Compute a re-tune proposal one-liner for the Stop hook.
+///
+/// Returns `Some(line)` when a re-tune is proposed (corpus milestone or drift
+/// trigger), `None` otherwise.  Best-effort — any error returns `None` so the
+/// stop hook is never disrupted.
+fn compute_stop_hook_retune_cue(workspace: &Path) -> Option<String> {
+    use kimetsu_brain::tune::compute_retune_trigger;
+
+    let (paths, _, conn) = kimetsu_brain::project::load_project_readonly(workspace).ok()?;
+    let trigger = compute_retune_trigger(&conn, &paths.kimetsu_dir).ok()?;
+    if !trigger.should_retune {
+        return None;
+    }
+    let reason = if trigger.corpus_milestone_triggered {
+        format!(
+            "Brain grew +{} memories since last tune — run `kimetsu brain tune`",
+            trigger.memories_added_since_tune
+        )
+    } else {
+        format!(
+            "Retrieval regret rate {:.0}% (24 h) — run `kimetsu brain tune`",
+            trigger.regret_rate * 100.0
+        )
+    };
+    Some(reason)
 }
 
 /// Emit a Claude Code `Stop`-hook result on stdout. Claude Code validates a
@@ -5844,15 +6928,7 @@ fn stop_lessons_recorded_json_with_savings(
     recorded: usize,
     savings: Option<&str>,
 ) -> serde_json::Value {
-    let base = format!(
-        "[Kimetsu] {recorded} lesson{} recorded this session.",
-        if recorded == 1 { "" } else { "s" }
-    );
-    let msg = match savings {
-        Some(s) => format!("{base} {s}"),
-        None => base,
-    };
-    serde_json::json!({ "systemMessage": msg })
+    stop_lessons_recorded_json_with_savings_and_tune(recorded, savings, None)
 }
 
 /// The end-of-session harvest cue. Uses `decision: "block"` so the cue text
@@ -5879,12 +6955,49 @@ fn stop_no_lessons_json() -> serde_json::Value {
 
 /// v1.5: no-lessons nudge with optional savings sentence appended.
 fn stop_no_lessons_json_with_savings(savings: Option<&str>) -> serde_json::Value {
+    stop_no_lessons_json_with_savings_and_tune(savings, None)
+}
+
+/// S2.1: no-lessons nudge with optional savings + re-tune cue.
+fn stop_no_lessons_json_with_savings_and_tune(
+    savings: Option<&str>,
+    retune_cue: Option<&str>,
+) -> serde_json::Value {
     let base =
         "[Kimetsu] No lessons recorded. After non-trivial solutions, call kimetsu_brain_record.";
-    let msg = match savings {
-        Some(s) => format!("{base} {s}"),
-        None => base.to_string(),
-    };
+    let mut parts: Vec<&str> = vec![base];
+    if let Some(s) = savings {
+        parts.push(s);
+    }
+    // S2.1: append re-tune cue if triggered.
+    let retune_owned;
+    if let Some(cue) = retune_cue {
+        retune_owned = format!("[Tune] {cue}.");
+        parts.push(&retune_owned);
+    }
+    let msg = parts.join(" ");
+    serde_json::json!({ "systemMessage": msg })
+}
+
+/// S2.1: lessons-recorded banner with optional savings + re-tune cue.
+fn stop_lessons_recorded_json_with_savings_and_tune(
+    recorded: usize,
+    savings: Option<&str>,
+    retune_cue: Option<&str>,
+) -> serde_json::Value {
+    let base = format!(
+        "[Kimetsu] {} lesson{} recorded.",
+        recorded,
+        if recorded == 1 { "" } else { "s" }
+    );
+    let mut parts: Vec<String> = vec![base];
+    if let Some(s) = savings {
+        parts.push(s.to_string());
+    }
+    if let Some(cue) = retune_cue {
+        parts.push(format!("[Tune] {cue}."));
+    }
+    let msg = parts.join(" ");
     serde_json::json!({ "systemMessage": msg })
 }
 
@@ -5978,6 +7091,11 @@ struct HookToolInput {
     tool_name: Option<String>,
     command: Option<String>,
     tool_response: Option<String>,
+    /// F3 Pass B (3.5): file path from `tool_input.file_path` (ReadFile,
+    /// EditFile, etc.). Absent for Bash and other non-file tools. Used by
+    /// the proactive pre-fetch path when `broker.proactive_prefetch = true`
+    /// to augment the retrieval query with the file being operated on.
+    tool_file_path: Option<String>,
 }
 
 fn parse_hook_tool_input(raw: &str) -> HookToolInput {
@@ -5994,6 +7112,15 @@ fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty());
+    // F3 Pass B (3.5): extract file_path from tool_input for pre-fetch query
+    // augmentation. Covers ReadFile, EditFile, WriteFile, and similar tools
+    // whose Claude Code / Codex tool_input carries a `file_path` field.
+    let tool_file_path = v
+        .get("tool_input")
+        .and_then(|ti| ti.get("file_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
     // tool_response may be a string or a structured object; stringify
     // objects so failure detection still has something to scan.
     let tool_response = match v.get("tool_response") {
@@ -6006,6 +7133,7 @@ fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         tool_name: str_field("tool_name"),
         command,
         tool_response,
+        tool_file_path,
     }
 }
 
@@ -6028,16 +7156,18 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     };
     // Honor the configured embedder id for consistency (proactive
     // retrieval is lexical-only, but this keeps labels coherent). Also
-    // capture the auto-harvest toggle and render flags.
-    let (auto_harvest, compress_capsules) = match project::load_config(&paths) {
+    // capture the auto-harvest toggle, render flags, and F3 Pass B toggles.
+    let (auto_harvest, compress_capsules, proactive_prefetch) = match project::load_config(&paths) {
         Ok(config) => {
             kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
             (
                 config.learning.auto_harvest,
                 config.broker.compress_capsules,
+                config.broker.proactive_prefetch,
             )
         }
-        Err(_) => (true, true),
+        // Fallback: safe defaults — proactive_prefetch OFF (zero behaviour change)
+        Err(_) => (true, true, false),
     };
 
     let mut input = String::new();
@@ -6049,9 +7179,20 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
 
     // Defensive tool-name gate (the hook matcher should already scope
     // to Bash, but be safe across harness quirks).
-    if let Some(name) = hook.tool_name.as_deref()
-        && !name.eq_ignore_ascii_case("bash")
-    {
+    //
+    // F3 Pass B (3.5): when proactive_prefetch is ON, relax the Bash-only gate
+    // so file-tool PreToolUse calls (ReadFile, EditFile, WriteFile, …) can also
+    // trigger a lightweight file-path-based pre-fetch. The PostToolUse path is
+    // unchanged (still Bash-only — file tools don't produce failure output).
+    // When proactive_prefetch is OFF (default), the gate is unchanged: only
+    // Bash tool calls are processed (zero behaviour change).
+    let is_bash = hook
+        .tool_name
+        .as_deref()
+        .map(|n| n.eq_ignore_ascii_case("bash"))
+        .unwrap_or(true); // no tool_name → assume Bash (old harness compat)
+    let allow_non_bash = proactive_prefetch && matches!(event, ProactiveEvent::PreTool);
+    if !is_bash && !allow_non_bash {
         return Ok(());
     }
 
@@ -6092,12 +7233,43 @@ fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> KimetsuResu
     }
 
     // Build the retrieval query + actionable kinds per event.
+    //
+    // F3 Pass B (3.5): when `broker.proactive_prefetch = true`, the PreToolUse
+    // query is augmented with the tool's `file_path` (e.g. the file being read
+    // or edited). This lightweight warm surfaces memories relevant to the file
+    // BEFORE the agent operates on it, rather than waiting for a failure.
+    //
+    // When `proactive_prefetch = false` (default), no augmentation happens and
+    // PreToolUse behaviour is identical to before this flag existed. The same
+    // floors (min_score, refractory, dedupe) gate the result — this is strictly
+    // additive. Default-on graduation waits for regret data (Epic S2).
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
         ProactiveEvent::PreTool => {
-            let Some(cmd) = hook.command.as_deref() else {
-                return Ok(());
+            // F3 Pass B (3.5): build the PreToolUse query from command and/or
+            // file_path depending on the proactive_prefetch flag.
+            //
+            // proactive_prefetch OFF (default):
+            //   - No command → silent exit (identical to pre-F3 behaviour).
+            //   - Command present → use command as query (identical to pre-F3).
+            //   - file_path is NEVER consulted (zero behaviour change).
+            //
+            // proactive_prefetch ON:
+            //   - No command AND no file_path → silent exit.
+            //   - No command but file_path present → file_path-only query.
+            //   - Command present → command + file_path (if any) concatenated.
+            let cmd_opt = hook.command.as_deref();
+            let fp_opt = if proactive_prefetch {
+                hook.tool_file_path.as_deref().filter(|s| s.len() > 4)
+            } else {
+                None
             };
-            (cmd.to_string(), &["failure_pattern", "convention"], None)
+            let query = match (cmd_opt, fp_opt) {
+                (Some(cmd), Some(fp)) => format!("{cmd} {fp}"),
+                (Some(cmd), None) => cmd.to_string(),
+                (None, Some(fp)) => fp.to_string(),
+                (None, None) => return Ok(()), // nothing to query on
+            };
+            (query, &["failure_pattern", "convention"], None)
         }
         ProactiveEvent::PostTool => {
             let resp = hook.tool_response.as_deref().unwrap_or("");
@@ -9933,13 +11105,16 @@ ambient = false
 
             let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
 
-            // --- set embedder.enabled = false ---
+            // --- set embedder.enabled = false via toml_edit (S4.2 path) ---
             let disk_text = std::fs::read_to_string(&paths.project_toml).expect("read toml");
-            let mut root_val: toml::Value = toml::from_str(&disk_text).expect("parse");
+            // Resolve existing type via toml::Value (used for coercion).
+            let root_val: toml::Value = toml::from_str(&disk_text).expect("parse");
             let existing = get_toml_path(&root_val, "embedder.enabled").cloned();
             let typed = parse_scalar("false", existing.as_ref()).expect("parse false as bool");
-            set_toml_path(&mut root_val, "embedder.enabled", typed).expect("set");
-            let new_text = toml::to_string_pretty(&root_val).expect("serialise");
+            // Surgical write preserves comments.
+            let mut doc: toml_edit::DocumentMut = disk_text.parse().expect("parse edit doc");
+            set_toml_edit_path(&mut doc, "embedder.enabled", &typed).expect("set");
+            let new_text = doc.to_string();
             project::load_config_from_text(&new_text).expect("validate");
             std::fs::write(&paths.project_toml, &new_text).expect("write");
 
@@ -9957,6 +11132,73 @@ ambient = false
 
             fs::remove_dir_all(root).ok();
         });
+    }
+
+    // ── S4.2: set_toml_edit_path (comment-preservation) ──────────────────────
+
+    /// S4.2: `set_toml_edit_path` must update only the touched key while
+    /// leaving comments and unknown keys intact in the serialised output.
+    #[test]
+    fn set_toml_edit_path_preserves_comments_and_unknown_keys() {
+        // A minimal project.toml snippet with a comment AND a non-schema key
+        // ("custom_key") that serde would drop on a full round-trip.
+        let original = r#"
+# This is a user comment that must survive a config set.
+[kimetsu]
+project_id = "demo"
+schema_version = 10
+
+[broker]
+default_budget_tokens = 6000
+min_lexical_coverage = 0.5
+# A per-section comment.
+custom_key = "preserved"
+
+[broker.weights]
+relevance = 0.5
+confidence = 0.2
+freshness = 0.2
+scope = 0.1
+"#;
+        let mut doc: toml_edit::DocumentMut = original.parse().expect("parse toml_edit");
+
+        set_toml_edit_path(
+            &mut doc,
+            "broker.min_lexical_coverage",
+            &toml::Value::Float(0.4),
+        )
+        .expect("set must succeed");
+
+        let result = doc.to_string();
+
+        // The comment must survive.
+        assert!(
+            result.contains("user comment that must survive"),
+            "top-level comment must be preserved; got:\n{result}"
+        );
+        assert!(
+            result.contains("A per-section comment"),
+            "section comment must be preserved; got:\n{result}"
+        );
+
+        // The unknown key must survive.
+        assert!(
+            result.contains("custom_key"),
+            "unknown key must be preserved; got:\n{result}"
+        );
+
+        // The updated value must be present on the min_lexical_coverage line.
+        assert!(
+            result.contains("min_lexical_coverage = 0.4"),
+            "updated value must appear on the key line; got:\n{result}"
+        );
+
+        // The old value must NOT remain on the min_lexical_coverage key
+        // (note: 0.5 may appear on other lines like broker.weights.relevance).
+        assert!(
+            !result.contains("min_lexical_coverage = 0.5"),
+            "old min_lexical_coverage = 0.5 must be replaced; got:\n{result}"
+        );
     }
 
     // ── Q7: runs prune helpers ────────────────────────────────────────────────
@@ -11049,6 +12291,8 @@ mod tune_tests {
                 cost_weight: 0.005,
                 apply: false, // DRY RUN
                 revert: false,
+                triggers: false,
+                models: false,
                 workspace: Some(root.clone()),
             };
 
@@ -11081,6 +12325,8 @@ mod tune_tests {
                 cost_weight: 0.005,
                 apply: false,
                 revert: false,
+                triggers: false,
+                models: false,
                 workspace: Some(root.clone()),
             };
             // Should not panic; prints 0 cases.
@@ -11122,6 +12368,8 @@ mod tune_tests {
                 cost_weight: 0.005,
                 apply: true, // --apply with < 30 personal cases → fixture mode
                 revert: false,
+                triggers: false,
+                models: false,
                 workspace: Some(root.clone()),
             };
             brain_tune(args).expect("brain_tune must not error in fixture mode");

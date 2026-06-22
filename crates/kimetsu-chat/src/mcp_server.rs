@@ -442,6 +442,7 @@ fn call_tool(
         "kimetsu_brain_conflict_resolve" => kimetsu_brain_conflict_resolve(workspace, &arguments),
         "kimetsu_brain_prune" => kimetsu_brain_prune(workspace, &arguments),
         "kimetsu_brain_config_show" => kimetsu_brain_config_show(workspace),
+        "kimetsu_brain_answer" => kimetsu_brain_answer(workspace, &arguments),
         other => Err(format!("unknown Kimetsu MCP tool `{other}`")),
     }
 }
@@ -1581,6 +1582,52 @@ fn kimetsu_brain_prune(workspace: &Path, arguments: &Value) -> Result<Value, Str
     }))
 }
 
+/// Flagship 3.2 — `kimetsu_brain_answer` MCP tool.
+///
+/// Synthesises a grounded, cited answer from retrieved project memories.
+/// GROUNDED-ONLY: never adds training-knowledge hallucinations.
+/// Degrades gracefully: verbatim capsules when no model is configured,
+/// "Nothing in memory" when retrieval is empty.
+///
+/// When `mark_helpful: true`, records a citation for every returned memory
+/// (closes the self-tuning ground-truth loop, same as kimetsu_brain_cite).
+fn kimetsu_brain_answer(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let question = match arguments.get("question").and_then(Value::as_str) {
+        Some(q) if !q.trim().is_empty() => q.trim(),
+        _ => {
+            return Ok(json!({
+                "ok": false,
+                "error": "missing `question`",
+                "usage": "Pass the question to answer, e.g. {\"question\":\"how do I run the tests?\"}."
+            }));
+        }
+    };
+    let mark_helpful = arguments
+        .get("mark_helpful")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let result = crate::ask::compose_answer(workspace, question);
+
+    // Helpful-mark wiring (3.1 / tuning) — best-effort, never fails the tool.
+    if mark_helpful && result.grounded && !result.citations.is_empty() {
+        crate::ask::record_helpful_mark(workspace, &result.citations);
+    }
+
+    Ok(json!({
+        "ok": true,
+        "question": question,
+        "answer": result.answer,
+        "citations": result.citations,
+        "grounded": result.grounded,
+        "model_used": result.model_used,
+        "verbatim": result.verbatim,
+        "usage": {
+            "how_to_use": "The answer is grounded in project memories only. If it helped, pass mark_helpful:true on a follow-up call or call kimetsu_brain_cite with the relevant memory ids from citations[]."
+        }
+    }))
+}
+
 /// v0.8: read-only view of the project.toml config.
 fn kimetsu_brain_config_show(workspace: &Path) -> Result<Value, String> {
     let raw = project::config_text(workspace)
@@ -2181,6 +2228,18 @@ fn tool_definitions() -> Value {
                     "since": { "type": "string", "description": "ISO-8601 lower bound on run timestamps. When set, overrides last_n_runs." },
                     "top": { "type": "integer", "minimum": 1, "description": "How many items to include in ranked lists (top-useful, prune-candidates). Default 10." }
                 }
+            }
+        },
+        {
+            "name": "kimetsu_brain_answer",
+            "description": "Flagship 3.2 — mid-task grounded answer synthesis. Ask the brain a factual question and receive a composed, cited answer drawn ONLY from retrieved project memories (GROUNDED-ONLY: never hallucinates). Prefer a locally-configured cheap model (zero frontier tokens, offline). Degrades gracefully to verbatim capsule text when no model is configured. Returns nothing-in-memory when retrieval is empty.\n\nUse mid-task when you need to know what the project brain remembers about a topic instead of re-discovering it from scratch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question to answer from project memory (e.g. 'how do I run the tests?' or 'what does the broker do?')." },
+                    "mark_helpful": { "type": "boolean", "description": "When true, record a citation for every memory in the returned answer, closing the self-tuning ground-truth loop. Default false." }
+                },
+                "required": ["question"]
             }
         }
     ])
