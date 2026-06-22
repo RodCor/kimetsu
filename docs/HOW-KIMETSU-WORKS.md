@@ -648,7 +648,11 @@ per embedder × reranker combo (floors off — raw ranking quality):
 | jina-v2-base-code | minilm-l-4   | 0.949    | 0.959    | 0.927 | 372     | 2.3 GB   |
 | **jina-v2-base-code** | **tinybert-l-2** | 0.914 | 0.949 | 0.914 | **132** | 1.5 GB |
 | jina-v2-base-code | off          | 0.929    | 0.939    | 0.915 | 106     | 1.5 GB   |
-| bge-small-en-v1.5 | off          | 0.919    | 0.934    | 0.905 | 446     | 359 MB   |
+| bge-small-en-v1.5 | off          | 0.931    | 0.966    | 0.911 | 446     | 359 MB   |
+
+*(Re-confirmed on v2.0 with `kimetsu brain bench --dataset bench/dataset-100.json`:
+the jina-v2 quality numbers are unchanged — retrieval ranking is deterministic on
+a fixed corpus. Latencies are machine-dependent.)*
 
 The default (**jina-v2-base-code + ms-marco-tinybert-l-2-v2**) is the
 fastest reranked combo, within ~2% MRR of the grid best, and its rerank
@@ -759,6 +763,31 @@ budget_run_cap_tokens = 8000  # per-run ceiling on brain-injected tokens
 compress_capsules = true      # v1.5: compress rendered capsule text (strips tags/context
                               # annotations, caps at 3 sentences); ranking unaffected
 session_dedupe = true         # v1.5: skip capsules already injected this session
+warm_start = true             # v2.0: SessionStart injects the project digest + episodic
+                              # resume (kimetsu brain session-start-hook)
+answer_grade_min_score = 0.92 # v2.0: a top capsule scoring >= this gets a "Verified answer
+                              # from project memory:" prefix; >1.0 disables. Ranking untouched.
+proactive_prefetch = false    # v2.0: opt-in trajectory-based pre-fetch at PreToolUse
+
+[storage]
+backend = "flat"              # v2.0: "flat" (FTS5 + usearch ANN, default) |
+                              # "graph-lite" (+ typed-edge 1-2 hop expansion over memory_edges) |
+                              # "graph" (in-memory petgraph; kimetsu-remote only). Switching
+                              # re-projects from the event log — no data migration.
+
+[cheap_model]                 # v2.0: ONE optional model for digest / resume / skill-draft /
+                              # `kimetsu ask` / distiller / consolidation. Absent = every
+                              # consumer degrades gracefully (rule-based / FTS-only / refuse).
+enabled = false
+provider = "ollama"           # "ollama" (local, no key) | "anthropic" | "openai" | "bedrock"
+model = "qwen2.5:3b"          # ollama recs: qwen2.5:3b, llama3.2:3b. anthropic: claude-haiku-4-5
+api_key_env = "ANTHROPIC_API_KEY"   # NAME of the env var; not required for ollama
+base_url_env = "OLLAMA_BASE_URL"    # ollama default: http://localhost:11434/v1
+# Back-compat: if [cheap_model] is absent, an existing [learning.distiller] is used.
+
+[sync]                        # v2.0: server-less multi-machine sync (event-log replication)
+dir = ""                      # a shared folder (Dropbox/Syncthing/NAS); empty = off
+machine_id = ""               # stable per-machine id; empty = generated
 
 [broker.weights]
 relevance = 0.50
@@ -819,6 +848,13 @@ partial `project.toml` loads cleanly — older files gain the new defaults on
 upgrade. The toggles: `[embedder] enabled`, `[broker] ambient`,
 `[kimetsu] use_user_brain`, plus the already-bidirectional `[learning]
 auto_harvest`, `[learning.distiller] enabled`, and `[shell] redact_secrets`.
+v2.0 adds `[broker] warm_start`, `[broker] proactive_prefetch`,
+`[broker] answer_grade_min_score`, `[storage] backend`, `[cheap_model] enabled`,
+and `[sync] dir` — all default to the pre-v2.0 behavior (warm-start on but
+no-op without memories/episodes; backend `flat`; cheap-model off → graceful
+degradation). One honest caveat: the warm-start **digest is currently
+rule-based** — the `[cheap_model]` distillation hook-point exists but does not
+yet call the model; `kimetsu ask`, resume, and skill-draft do use it.
 Flip any of them with **`kimetsu config edit`** (opens `$EDITOR` on
 `project.toml` and re-validates on save); a re-install *merges*, so your toggles
 survive.
