@@ -30,6 +30,13 @@
     "@docusaurus/module-type-aliases": "3.10.1",
     "@docusaurus/types": "3.10.1"
   },
+  "comments": {
+    "overrides": "Force patched versions of transitive build-time deps flagged by Dependabot. These are dev/build-only (Docusaurus toolchain), never shipped in the static site. js-yaml is intentionally NOT overridden: the only patched release (4.2.0) breaks gray-matter front-matter parsing, and the advisory is a DoS that only ever parses our own trusted doc front-matter at build time, so it carries no real risk. Revisit when Docusaurus/gray-matter update js-yaml upstream."
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.5",
+    "uuid": "^11.1.1"
+  },
   "browserslist": {
     "production": [
       ">0.5%",
