@@ -44,13 +44,20 @@ pub fn rebuild_in_place(conn: &Connection) -> KimetsuResult<usize> {
 }
 
 /// Read all stored events from the durable `events` table, ordered by
-/// (ts, event_id) so replay is deterministic and causal.
+/// (ts, rowid) so replay is deterministic AND causal.
+///
+/// `rowid` is the implicit, insertion-monotonic key, so within an equal `ts`
+/// it preserves append order — the true causal order (e.g. a `memory.cited`
+/// appended before the `memory.superseded` that reassigns it). The previous
+/// `event_id` tiebreak was NOT causal: event ids are ULIDs whose ordering is
+/// only random-tail-stable within the same millisecond, so equal-`ts` events
+/// replayed in a platform-dependent order — non-deterministic rebuilds.
 fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
     let mut stmt = conn.prepare(
         "
         SELECT event_id, run_id, ts, kind, schema_version, payload_json
         FROM events
-        ORDER BY ts, event_id
+        ORDER BY ts, rowid
         ",
     )?;
     let rows = stmt.query_map([], |row| {
