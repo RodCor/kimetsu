@@ -85,3 +85,35 @@ code {
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
 }
+
+/* Denser documentation typography (scoped to doc pages; landing is unaffected).
+   Body text and headings reduced for a tighter, less shouty docs read. */
+.theme-doc-markdown {
+  font-size: 0.875rem; /* ~14px paragraphs, lists, tables */
+  line-height: 1.6;
+}
+.theme-doc-markdown h1,
+.theme-doc-markdown .markdown > h1:first-child {
+  font-size: 1.5rem;
+  line-height: 1.2;
+}
+.theme-doc-markdown h2 {
+  font-size: 1.2rem;
+}
+.theme-doc-markdown h3 {
+  font-size: 1.02rem;
+}
+.theme-doc-markdown h4 {
+  font-size: 0.92rem;
+}
+.theme-doc-markdown code {
+  font-size: 0.84em;
+}
+
+/* Match the sidebar + table of contents to the denser body */
+.menu {
+  font-size: 0.84rem;
+}
+.table-of-contents {
+  font-size: 0.78rem;
+}
