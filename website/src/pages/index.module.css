@@ -1,23 +1,193 @@
-/**
- * CSS files with the .module.css suffix will be treated as CSS modules
- * and scoped locally.
- */
+/* Kimetsu landing. Dark, calm, red accent. Type kept deliberately small. */
 
-.heroBanner {
-  padding: 4rem 0;
+.hero {
+  background:
+    radial-gradient(900px 420px at 50% -10%, rgba(239, 91, 96, 0.10), transparent 60%),
+    var(--ifm-background-color);
+  border-bottom: 1px solid var(--k-border);
+  padding: 5rem 1rem 4rem;
   text-align: center;
-  position: relative;
-  overflow: hidden;
 }
 
-@media screen and (max-width: 996px) {
-  .heroBanner {
-    padding: 2rem;
+.heroInner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 760px;
+}
+
+.heroLogo {
+  width: 64px;
+  height: 64px;
+  margin-bottom: 1.5rem;
+}
+
+.heroTitle {
+  font-size: 2.6rem;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-weight: 700;
+  margin: 0 0 1rem;
+}
+
+.accent {
+  color: var(--ifm-color-primary);
+}
+
+.heroSubtitle {
+  font-size: 1.1rem;
+  line-height: 1.6;
+  color: var(--k-text-muted);
+  max-width: 560px;
+  margin: 0 0 2rem;
+}
+
+.install {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.95rem;
+  background: var(--k-surface);
+  border: 1px solid var(--k-border);
+  border-radius: 8px;
+  padding: 0.7rem 1.1rem;
+  margin-bottom: 2rem;
+  user-select: all;
+}
+
+.prompt {
+  color: var(--ifm-color-primary);
+  margin-right: 0.6rem;
+  user-select: none;
+}
+
+.heroButtons {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.cta {
+  --ifm-button-color: #fff;
+}
+
+.ctaGhost {
+  background: transparent;
+  border: 1px solid var(--k-border);
+  color: var(--ifm-color-content);
+}
+.ctaGhost:hover {
+  background: var(--k-surface);
+  color: var(--ifm-color-content);
+  border-color: var(--ifm-color-primary);
+}
+
+/* ---- Metrics strip ---------------------------------------------------- */
+.metrics {
+  border-bottom: 1px solid var(--k-border);
+  padding: 2.5rem 1rem;
+}
+
+.metricsGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1.5rem;
+}
+
+.metric {
+  text-align: center;
+}
+
+.metricValue {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 1.9rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ifm-color-primary);
+  line-height: 1.1;
+}
+
+.metricLabel {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-top: 0.25rem;
+}
+
+.metricDetail {
+  font-size: 0.8rem;
+  color: var(--k-text-muted);
+  margin-top: 0.15rem;
+}
+
+/* ---- Features --------------------------------------------------------- */
+.features {
+  padding: 4rem 1rem 5rem;
+}
+
+.featuresGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.25rem;
+}
+
+.card {
+  background: var(--k-surface);
+  border: 1px solid var(--k-border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  transition: border-color 160ms ease, transform 160ms ease;
+}
+.card:hover {
+  border-color: var(--ifm-color-primary);
+  transform: translateY(-2px);
+}
+
+.cardTitle {
+  font-size: 1.05rem;
+  font-weight: 650;
+  margin: 0 0 0.5rem;
+}
+
+.cardBody {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--k-text-muted);
+  margin: 0;
+}
+
+/* ---- Responsive ------------------------------------------------------- */
+@media (max-width: 996px) {
+  .featuresGrid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .metricsGrid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 2rem 1.5rem;
   }
 }
 
-.buttons {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+@media (max-width: 600px) {
+  .hero {
+    padding: 3.5rem 1rem 3rem;
+  }
+  .heroTitle {
+    font-size: 2rem;
+  }
+  .heroSubtitle {
+    font-size: 1rem;
+  }
+  .featuresGrid {
+    grid-template-columns: 1fr;
+  }
+  .install {
+    font-size: 0.85rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    transition: none;
+  }
+  .card:hover {
+    transform: none;
+  }
 }
