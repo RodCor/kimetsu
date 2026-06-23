@@ -73,7 +73,7 @@ actually used to win, and lets that knowledge compound across runs.
    half-life curve, and non-trivial sessions auto-harvest their lessons.
 
 Full mechanics, scoring, citations, decay, conflict detection, and the daemon
-are in **[How Kimetsu Works](docs/HOW-KIMETSU-WORKS.md)**.
+are in **[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**.
 
 ---
 
@@ -95,7 +95,7 @@ real exported memories. The latency-optimized default (ms-marco-tinybert-l-2-v2)
 lands recall@4 0.949, MRR 0.914 at ~138 ms; the quality-best rerankers reach
 recall@4 0.975, MRR 0.933. Swap embedder and reranker with one config key each
 and re-judge on your own corpus. Full grid in
-**[How Kimetsu Works](docs/HOW-KIMETSU-WORKS.md)**.
+**[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**.
 
 ---
 
@@ -110,7 +110,7 @@ kimetsu doctor --selftest            # records a memory and retrieves it
 ```
 
 Other install paths (cargo, prebuilt archives) and host-wiring details are in
-**[docs/INSTALL.md](docs/INSTALL.md)**.
+**[the install guide](https://rodcor.github.io/kimetsu/docs/install)**.
 
 ---
 
@@ -131,8 +131,8 @@ Other install paths (cargo, prebuilt archives) and host-wiring details are in
 | `kimetsu brain bench` | Benchmark retrieval on your own corpus |
 
 The full command surface, configuration keys, and maintenance commands are in
-**[How Kimetsu Works](docs/HOW-KIMETSU-WORKS.md)** and
-**[docs/INSTALL.md](docs/INSTALL.md)**.
+**[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)** and
+**[the install guide](https://rodcor.github.io/kimetsu/docs/install)**.
 
 ---
 
@@ -150,7 +150,7 @@ kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
 
 Bearer auth, per-repo brains, an optional shared org-brain, server-side repo
 ingest, TLS, Prometheus metrics, and a server-side reranker. Full setup in
-**[docs/REMOTE.md](docs/REMOTE.md)**.
+**[the Kimetsu Remote guide](https://rodcor.github.io/kimetsu/docs/remote)**.
 
 ---
 
@@ -170,14 +170,14 @@ Built as a small Rust workspace. Lint and tests run clean on every change.
 
 ## Docs
 
-- **[Install & host wiring](docs/INSTALL.md)**: every install path, host
+- **[Install & host wiring](https://rodcor.github.io/kimetsu/docs/install)**: every install path, host
   wiring, auto-harvest and distiller setup, maintenance commands.
-- **[How Kimetsu Works](docs/HOW-KIMETSU-WORKS.md)**: the brain, the broker,
+- **[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**: the brain, the broker,
   citations, decay, conflict detection, the MCP surface, retrieval models and
   benchmarking, configuration, the bridge, and doctor.
-- **[Local models](docs/LOCAL-MODELS.md)**: run fully local with Ollama.
-- **[Kimetsu Remote](docs/REMOTE.md)**: server setup, org brain, TLS, clients.
-- **[CHANGELOG](CHANGELOG.md)**: what shipped in each release.
+- **[Local models](https://rodcor.github.io/kimetsu/docs/local-models)**: run fully local with Ollama.
+- **[Kimetsu Remote](https://rodcor.github.io/kimetsu/docs/remote)**: server setup, org brain, TLS, clients.
+- **[CHANGELOG](https://rodcor.github.io/kimetsu/docs/changelog)**: what shipped in each release.
 
 ---
 

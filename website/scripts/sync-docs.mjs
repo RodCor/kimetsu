@@ -34,9 +34,20 @@ const DOCS = [
 
 const stripBom = (s) => s.replace(/^﻿/, '');
 
+const SITE = 'https://rodcor.github.io/kimetsu/docs/';
+
 function transformLinks(s) {
   return (
     s
+      // README links to this very site -> internal slugs, so the generated
+      // intro page navigates in-site (SPA) instead of doing a full reload to
+      // its own absolute URLs. The README keeps the absolute URLs for GitHub.
+      .replaceAll(`${SITE}how-kimetsu-works`, 'how-kimetsu-works')
+      .replaceAll(`${SITE}install`, 'install')
+      .replaceAll(`${SITE}local-models`, 'local-models')
+      .replaceAll(`${SITE}remote`, 'remote')
+      .replaceAll(`${SITE}roi-methodology`, 'roi-methodology')
+      .replaceAll(`${SITE}changelog`, 'changelog')
       // README images -> Docusaurus static assets (raw <img> tags need the baseUrl)
       .replaceAll('docs/assets/kimetsu-logo.png', '/kimetsu/img/kimetsu-logo.png')
       .replaceAll('docs/assets/demo.gif', '/kimetsu/img/demo.gif')
