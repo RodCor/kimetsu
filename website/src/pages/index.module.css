@@ -17,8 +17,8 @@
 }
 
 .heroLogo {
-  width: 64px;
-  height: 64px;
+  width: 128px;
+  height: 128px;
   margin-bottom: 1.5rem;
 }
 
@@ -168,6 +168,10 @@
 @media (max-width: 600px) {
   .hero {
     padding: 3.5rem 1rem 3rem;
+  }
+  .heroLogo {
+    width: 96px;
+    height: 96px;
   }
   .heroTitle {
     font-size: 2rem;
