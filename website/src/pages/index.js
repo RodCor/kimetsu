@@ -90,7 +90,7 @@ function FeatureList() {
     },
     {
       title: 'Works with your agent',
-      description: 'Claude Code, Codex, Pi, OpenClaw, Cursor, Gemini CLI — one command to wire any supported host. Or use kimetsu chat as a standalone assistant.',
+      description: 'Claude Code, Codex, Pi, OpenClaw, Cursor, Gemini CLI. One command to wire any supported host, or use kimetsu chat as a standalone assistant.',
     },
     {
       title: 'Semantic retrieval',
