@@ -117,3 +117,9 @@ code {
 .table-of-contents {
   font-size: 0.78rem;
 }
+
+/* Footer: warm near-black instead of the default slate-blue (footer--dark) */
+.footer {
+  background-color: #100d0b;
+  border-top: 1px solid var(--k-border);
+}
