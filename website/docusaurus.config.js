@@ -57,7 +57,8 @@ const config = {
     ({
       image: 'img/kimetsu-logo.png',
       colorMode: {
-        respectPrefersColorScheme: true,
+        defaultMode: 'dark',
+        respectPrefersColorScheme: false,
       },
       navbar: {
         title: 'Kimetsu',

@@ -1,30 +1,87 @@
 /**
- * Any CSS included here will be global. The classic template
- * bundles Infima by default. Infima is a CSS framework designed to
- * work well for content-centric websites.
+ * Kimetsu docs theme. Warm near-black "dark compass" aesthetic (Claude Code
+ * style) with a red accent instead of orange. Dark is the default mode.
  */
 
-/* You can override the default Infima variables here. */
+/* ---- Light mode (secondary; the toggle still works) ------------------- */
 :root {
-  --ifm-color-primary: #2e8555;
-  --ifm-color-primary-dark: #29784c;
-  --ifm-color-primary-darker: #277148;
-  --ifm-color-primary-darkest: #205d3b;
-  --ifm-color-primary-light: #33925d;
-  --ifm-color-primary-lighter: #359962;
-  --ifm-color-primary-lightest: #3cad6e;
-  --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --ifm-color-primary: #cf3a40;
+  --ifm-color-primary-dark: #c0343a;
+  --ifm-color-primary-darker: #b22f34;
+  --ifm-color-primary-darkest: #93262b;
+  --ifm-color-primary-light: #d8565b;
+  --ifm-color-primary-lighter: #df6f73;
+  --ifm-color-primary-lightest: #ea9b9e;
+
+  --ifm-code-font-size: 92%;
+  --ifm-global-radius: 8px;
+
+  /* Tightened type scale (fixes the oversized headings) */
+  --ifm-font-family-base: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --ifm-font-family-monospace: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+  --ifm-font-size-base: 16px;
+  --ifm-line-height-base: 1.65;
+  --ifm-heading-font-weight: 650;
+  --ifm-h1-font-size: 2rem;
+  --ifm-h2-font-size: 1.5rem;
+  --ifm-h3-font-size: 1.2rem;
+  --ifm-h4-font-size: 1rem;
+
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.08);
+
+  /* Local semantic tokens used by the landing page */
+  --k-surface: #ffffff;
+  --k-surface-2: #faf9f7;
+  --k-border: #e7e3de;
+  --k-text-muted: #6b645c;
 }
 
-/* For readability concerns, you should choose a lighter palette in dark mode. */
+/* ---- Dark mode (default; the star of the show) ------------------------ */
 [data-theme='dark'] {
-  --ifm-color-primary: #25c2a0;
-  --ifm-color-primary-dark: #21af90;
-  --ifm-color-primary-darker: #1fa588;
-  --ifm-color-primary-darkest: #1a8870;
-  --ifm-color-primary-light: #29d5b0;
-  --ifm-color-primary-lighter: #32d8b4;
-  --ifm-color-primary-lightest: #4fddbf;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  --ifm-color-primary: #ef5b60;
+  --ifm-color-primary-dark: #ec474d;
+  --ifm-color-primary-darker: #e93b41;
+  --ifm-color-primary-darkest: #c92a30;
+  --ifm-color-primary-light: #f26f73;
+  --ifm-color-primary-lighter: #f58387;
+  --ifm-color-primary-lightest: #f8a9ab;
+
+  /* Warm near-black surface stack */
+  --ifm-background-color: #1a1714;
+  --ifm-background-surface-color: #221e1a;
+  --ifm-navbar-background-color: rgba(26, 23, 20, 0.85);
+  --ifm-footer-background-color: #15120f;
+  --ifm-color-content: #ece9e4;
+  --ifm-color-content-secondary: #a59d92;
+  --ifm-toc-border-color: #322d27;
+  --ifm-hr-border-color: #322d27;
+
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.35);
+
+  --k-surface: #221e1a;
+  --k-surface-2: #1f1b18;
+  --k-border: #322d27;
+  --k-text-muted: #a59d92;
+}
+
+/* Subtle, single-weight borders/dividers; calmer navbar */
+.navbar {
+  border-bottom: 1px solid var(--k-border);
+  backdrop-filter: saturate(120%) blur(8px);
+}
+
+.navbar__title {
+  font-weight: 650;
+}
+
+/* Code/inline mono reads as a tactile accent */
+code {
+  border: 1px solid var(--k-border);
+  border-radius: 6px;
+}
+
+/* Calmer link underlines in body content */
+.markdown a {
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
