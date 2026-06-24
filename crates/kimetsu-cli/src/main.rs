@@ -5510,6 +5510,8 @@ fn brain_tune_sweep(
             .map(|c| kimetsu_brain::eval::EvalCase {
                 query: c.query,
                 relevant: c.relevant,
+                kind: Default::default(),
+                stale: Vec::new(),
             })
             .collect();
         (eval_cases, false)
@@ -9131,6 +9133,15 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
         /// v1.5 (Story 2.1): mean raw (uncompressed) tokens per capsule.
         #[serde(default)]
         raw_tokens_mean: f64,
+        /// P0.1: mean stale-hit rate (lower is better; 0.0 = no stale in any case).
+        #[serde(default)]
+        stale_hit_rate: f64,
+        /// P0.1: fraction of correctness cases resolved correctly (-1.0 = N/A).
+        #[serde(default = "default_resolution_accuracy")]
+        resolution_accuracy: f64,
+    }
+    fn default_resolution_accuracy() -> f64 {
+        -1.0
     }
     #[derive(serde::Deserialize)]
     struct ComboResult {
@@ -9169,7 +9180,7 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     // Build summary table.
     let header = format!(
-        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} | {:>12} | {:>14} |",
+        "| {:<25} | {:<35} | {:>8} | {:>8} | {:>7} | {:>8} | {:>7} | {:>10} | {:>15} | {:>11} | {:>12} | {:>14} | {:>14} | {:>19} |",
         "embedder",
         "reranker",
         "recall@2",
@@ -9182,10 +9193,12 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
         "peak RSS MB",
         "raw_tok_mean",
         "rend_tok_mean",
+        "stale_hit_rate",
+        "resolution_accuracy",
     );
     let sep = format!(
-        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} | {:-<12} | {:-<14} |",
-        "", "", "", "", "", "", "", "", "", "", "", ""
+        "| {:-<25} | {:-<35} | {:-<8} | {:-<8} | {:-<7} | {:-<8} | {:-<7} | {:-<10} | {:-<15} | {:-<11} | {:-<12} | {:-<14} | {:-<14} | {:-<19} |",
+        "", "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
 
     let mut table_lines: Vec<String> = vec![header, sep];
@@ -9195,8 +9208,13 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
             .peak_rss_mb
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "n/a".to_string());
+        let res_acc_str = if row.summary.resolution_accuracy < 0.0 {
+            "N/A".to_string()
+        } else {
+            format!("{:.3}", row.summary.resolution_accuracy)
+        };
         table_lines.push(format!(
-            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} | {:>12.1} | {:>14.1} |",
+            "| {:<25} | {:<35} | {:>8.3} | {:>8.3} | {:>7.3} | {:>8.1} | {:>7.1} | {:>10.1} | {:>15} | {:>11} | {:>12.1} | {:>14.1} | {:>14.3} | {:>19} |",
             row.embedder,
             row.reranker,
             row.summary.recall_at_2,
@@ -9209,6 +9227,8 @@ fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()> {
             rss_str,
             row.summary.raw_tokens_mean,
             row.summary.rendered_tokens_mean,
+            row.summary.stale_hit_rate,
+            res_acc_str,
         ));
     }
 
@@ -9312,8 +9332,17 @@ fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         for rel in &case.relevant {
             if !all_keys.contains(rel.as_str()) {
                 return Err(format!(
-                    "dataset validation: key {:?} in query {:?} not in memories",
+                    "dataset validation: relevant key {:?} in query {:?} not in memories",
                     rel, case.query
+                )
+                .into());
+            }
+        }
+        for stale in &case.stale {
+            if !all_keys.contains(stale.as_str()) {
+                return Err(format!(
+                    "dataset validation: stale key {:?} in query {:?} not in memories",
+                    stale, case.query
                 )
                 .into());
             }
@@ -9975,8 +10004,17 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         for rel in &case.relevant {
             if !all_keys.contains(rel.as_str()) {
                 return Err(format!(
-                    "dataset validation: key {:?} in query {:?} not in memories",
+                    "dataset validation: relevant key {:?} in query {:?} not in memories",
                     rel, case.query
+                )
+                .into());
+            }
+        }
+        for stale in &case.stale {
+            if !all_keys.contains(stale.as_str()) {
+                return Err(format!(
+                    "dataset validation: stale key {:?} in query {:?} not in memories",
+                    stale, case.query
                 )
                 .into());
             }
@@ -10054,6 +10092,10 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         /// after compress_for_render(3) vs raw token estimates.
         raw_tokens_mean: f64,
         rendered_tokens_mean: f64,
+        /// P0.1: 1.0 if any stale key is in the top-k window, else 0.0.
+        stale_hit: f64,
+        /// P0.1: true if relevant outranks every stale key in ranked list.
+        resolution_correct: bool,
     }
 
     let mut case_results: Vec<CaseResult> = Vec::new();
@@ -10125,6 +10167,11 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
         let mrr_val = kimetsu_brain::eval::mrr(&obtained_keys, &case.relevant);
 
+        // P0.1: correctness metrics.
+        let stale_hit = kimetsu_brain::eval::stale_hit_rate(&obtained_keys, &case.stale, args.cap);
+        let resolution_ok =
+            kimetsu_brain::eval::resolution_correct(&obtained_keys, &case.relevant, &case.stale);
+
         // v1.5 (Story 2.1): token estimates — raw vs compressed — for the
         // rendered capsule set. Computed per-case, averaged in the summary.
         let (raw_tokens_mean, rendered_tokens_mean) = {
@@ -10157,6 +10204,8 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             latency_ms,
             raw_tokens_mean,
             rendered_tokens_mean,
+            stale_hit,
+            resolution_correct: resolution_ok,
         });
     }
 
@@ -10224,6 +10273,33 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     let peak = peak_rss_mb();
 
+    // P0.1: correctness aggregates.
+    // stale_hit_rate: mean over ALL cases (cases with no stale keys contribute 0).
+    let agg_stale_hit_rate = if case_results.is_empty() {
+        0.0
+    } else {
+        case_results.iter().map(|r| r.stale_hit).sum::<f64>() / case_results.len() as f64
+    };
+
+    // resolution_accuracy: mean over cases that ARE correctness cases
+    // (knowledge_update, contradiction, temporal, multi_session — i.e. have stale keys).
+    let correctness_cases: Vec<_> = fixture
+        .cases
+        .iter()
+        .zip(&case_results)
+        .filter(|(c, _)| !c.stale.is_empty())
+        .collect();
+    let resolution_accuracy = if correctness_cases.is_empty() {
+        // No correctness cases → N/A, report as -1.0 sentinel (JSON null-ish).
+        -1.0_f64
+    } else {
+        correctness_cases
+            .iter()
+            .map(|(_, r)| if r.resolution_correct { 1.0f64 } else { 0.0 })
+            .sum::<f64>()
+            / correctness_cases.len() as f64
+    };
+
     // v1.5 (Story 2.1): aggregate rendered-token means across all cases.
     let (agg_raw_tokens_mean, agg_rendered_tokens_mean) = {
         let n = case_results.len();
@@ -10259,6 +10335,10 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             // v1.5 (Story 2.1): token-budget intelligence
             "raw_tokens_mean": agg_raw_tokens_mean,
             "rendered_tokens_mean": agg_rendered_tokens_mean,
+            // P0.1: correctness metrics
+            "stale_hit_rate": agg_stale_hit_rate,
+            // -1.0 = no correctness cases in this fixture (N/A)
+            "resolution_accuracy": resolution_accuracy,
         }
     });
 
