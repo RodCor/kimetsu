@@ -810,6 +810,19 @@ enum BrainCommand {
     ///   kimetsu brain triage --score-floor 0.1 --age-days 60
     ///   kimetsu brain triage --prune-all --yes
     Triage(TriageArgs),
+    /// Flagship 2 / Story 2.3: Reflect related memories into higher-order
+    /// principles.
+    ///
+    /// Clusters related episodic/lesson memories (loose cosine band, 0.75–0.85)
+    /// and synthesizes a higher-order principle via the configured cheap model.
+    /// Result lands as a memory.proposed event for human review.
+    ///
+    /// When no cheap model is configured, prints clusters and exits 0.
+    ///
+    /// Examples:
+    ///   kimetsu brain reflect
+    ///   kimetsu brain reflect --dry-run
+    Reflect(ReflectArgs),
     /// Ask the brain a question and receive a grounded, cited answer.
     ///
     /// Retrieves relevant memories, composes an answer via the configured
@@ -1207,6 +1220,17 @@ struct TriageArgs {
     /// Skip the confirmation prompt for --prune-all.
     #[arg(long)]
     yes: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain reflect` (Flagship 2 / Story 2.3).
+#[derive(Debug, Args)]
+struct ReflectArgs {
+    /// Print what would be proposed without writing to the DB.
+    #[arg(long)]
+    dry_run: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -3913,6 +3937,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Roi(args) => brain_roi(args),
         BrainCommand::Tune(args) => brain_tune(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
+        BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Ask(args) => brain_ask(args),
         BrainCommand::Skills(args) => brain_skills(args),
@@ -6003,6 +6028,85 @@ fn brain_consolidate(args: ConsolidateArgs) -> KimetsuResult<()> {
             "\nCreated {proposals_created} distillation proposal(s). Review with: kimetsu brain memory proposals"
         )?;
         drop(paths);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Flagship 2 / Story 2.3: kimetsu brain reflect
+// ---------------------------------------------------------------------------
+
+/// Adapter: wraps a `kimetsu_agent` `ModelProvider` so it can be used as the
+/// `kimetsu_brain::consolidate::ModelProvider` the `run_reflection` function
+/// expects.
+struct ReflectionModelAdapter<'a> {
+    inner: &'a mut dyn kimetsu_agent::model::ModelProvider,
+}
+
+impl<'a> kimetsu_brain::consolidate::ModelProvider for ReflectionModelAdapter<'a> {
+    fn complete_text(&mut self, prompt: &str) -> Option<String> {
+        use kimetsu_agent::model::{ModelMessage, ModelRequest, ToolChoice};
+        let req = ModelRequest {
+            messages: vec![ModelMessage::user_text(prompt)],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: 512,
+            temperature: 0.2,
+            metadata: serde_json::Value::Null,
+        };
+        self.inner.complete(req).ok()?.text
+    }
+}
+
+fn brain_reflect(args: ReflectArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::consolidate::{ReflectionOptions, run_reflection};
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let (_paths, _config, conn) = kimetsu_brain::project::load_project(&workspace)?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let opts = ReflectionOptions {
+        dry_run: args.dry_run,
+        ..Default::default()
+    };
+
+    // Try to resolve a cheap model.
+    let resolved = distiller::resolve_distiller(&workspace);
+
+    if resolved.is_none() || args.dry_run {
+        run_reflection(&conn, &opts, None, &mut out)?;
+        if resolved.is_none() && !args.dry_run {
+            writeln!(
+                out,
+                "\nNo cheap model configured — printed clusters above.\n\
+                 Configure [cheap_model] in project.toml to auto-synthesize principles."
+            )?;
+        }
+        return Ok(());
+    }
+
+    // Build the model provider from the resolved distiller.
+    let distiller_resolved = resolved.unwrap();
+    let mut provider_box = distiller::make_provider_for_resolved(&distiller_resolved);
+    let summary = if let Some(ref mut p) = provider_box {
+        let mut adapter = ReflectionModelAdapter { inner: p.as_mut() };
+        run_reflection(&conn, &opts, Some(&mut adapter), &mut out)?
+    } else {
+        run_reflection(&conn, &opts, None, &mut out)?
+    };
+
+    if summary.proposals_created > 0 {
+        writeln!(
+            out,
+            "\nCreated {} reflection proposal(s). Review with: kimetsu brain memory proposals",
+            summary.proposals_created
+        )?;
     }
 
     Ok(())
