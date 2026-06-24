@@ -32,6 +32,7 @@ use kimetsu_core::KimetsuResult;
 use rusqlite::Connection;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use ulid::Ulid;
 
 use crate::embeddings::decode_embedding;
 
@@ -596,6 +597,227 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…", chars[..max].iter().collect::<String>())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flagship 2 / Story 2.3: Reflection / synthesis
+// ---------------------------------------------------------------------------
+
+/// Options for `run_reflection`.
+#[derive(Debug, Clone, Default)]
+pub struct ReflectionOptions {
+    /// Options for the underlying distillation clustering step.
+    pub distill_opts: DistillOptions,
+    /// When true: print what would be proposed without writing to the DB.
+    pub dry_run: bool,
+}
+
+/// Summary returned by `run_reflection`.
+#[derive(Debug, Default)]
+pub struct ReflectionSummary {
+    pub clusters_found: usize,
+    pub proposals_created: usize,
+}
+
+/// `ModelProvider` trait alias for the reflection step.  We accept an
+/// `Option<&mut dyn ModelProvider>` — when `None`, reflection prints a
+/// report (dry-run behaviour) for each cluster and returns.
+pub trait ModelProvider {
+    fn complete_text(&mut self, prompt: &str) -> Option<String>;
+}
+
+/// Prompt template for the reflection model call.
+const REFLECTION_SYSTEM: &str = "You are a memory synthesizer. Given these related lessons/memories, \
+synthesize ONE higher-order principle that generalizes them (2-4 sentences, \
+imperative, actionable). Reply with ONLY a JSON object: \
+{\"principle\": \"...\", \"tags\": [\"tag1\", \"tag2\"], \"confidence\": 0.0-1.0}";
+
+/// Run the reflection pipeline.
+///
+/// 1. Load all embeddable rows.
+/// 2. Find distillation clusters (loose cosine band) using `DistillOptions`.
+/// 3. For each cluster:
+///    - If `model` is `Some`, call the model to synthesize a principle and
+///      emit a `memory.proposed` event via `apply_events`.
+///    - If `model` is `None` or `dry_run`, print the cluster to `writer`.
+///
+/// Returns a `ReflectionSummary` with cluster and proposal counts.
+pub fn run_reflection(
+    conn: &Connection,
+    opts: &ReflectionOptions,
+    model: Option<&mut dyn ModelProvider>,
+    writer: &mut impl std::io::Write,
+) -> KimetsuResult<ReflectionSummary> {
+    let by_model = load_embeddable_rows(conn)?;
+    let mut all_rows: Vec<ConsolidateRow> = by_model.into_values().flatten().collect();
+    all_rows.sort_by(|a, b| a.memory_id.cmp(&b.memory_id));
+
+    let clusters = find_distill_clusters(&all_rows, &opts.distill_opts);
+
+    let mut summary = ReflectionSummary {
+        clusters_found: clusters.len(),
+        ..Default::default()
+    };
+
+    if clusters.is_empty() {
+        writeln!(writer, "No reflection clusters found.")?;
+        return Ok(summary);
+    }
+
+    // dry_run OR no model → print clusters and return.
+    if opts.dry_run || model.is_none() {
+        writeln!(writer, "{} reflection cluster(s) found:", clusters.len())?;
+        for (i, cluster) in clusters.iter().enumerate() {
+            writeln!(
+                writer,
+                "\nCluster {} [tags: {}]:",
+                i + 1,
+                cluster.shared_tags.join(", ")
+            )?;
+            for row in &cluster.memories {
+                writeln!(writer, "  • {}", truncate(&row.text, 80))?;
+            }
+            writeln!(
+                writer,
+                "  → These {} memories could be reflected into a principle.",
+                cluster.memories.len()
+            )?;
+        }
+        return Ok(summary);
+    }
+
+    let model = model.unwrap(); // safe: checked above
+    let run_id = kimetsu_core::ids::RunId::new();
+
+    for cluster in &clusters {
+        // Build the model prompt.
+        let memory_texts: Vec<String> = cluster
+            .memories
+            .iter()
+            .map(|r| format!("- {}", r.text))
+            .collect();
+        let user_msg = memory_texts.join("\n");
+        let prompt = format!("{REFLECTION_SYSTEM}\n\nMemories:\n{user_msg}");
+
+        let Some(response_text) = model.complete_text(&prompt) else {
+            writeln!(
+                writer,
+                "warn: model call failed for cluster [{}]",
+                cluster.shared_tags.join(", ")
+            )?;
+            continue;
+        };
+
+        // Parse the JSON response.
+        let Some(principle_json) = parse_reflection_json(&response_text) else {
+            writeln!(
+                writer,
+                "warn: could not parse reflection JSON for cluster [{}]: {response_text}",
+                cluster.shared_tags.join(", ")
+            )?;
+            continue;
+        };
+
+        let principle = principle_json
+            .get("principle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if principle.is_empty() {
+            continue;
+        }
+        let tags = principle_json
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let confidence = principle_json
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.7)
+            .clamp(0.0, 1.0);
+
+        let proposal_id = Ulid::new().to_string();
+        let source_ids: Vec<&str> = cluster
+            .memories
+            .iter()
+            .map(|r| r.memory_id.as_str())
+            .collect();
+
+        let event = kimetsu_core::event::Event::new(
+            run_id,
+            "memory.proposed",
+            serde_json::json!({
+                "proposal_id": proposal_id,
+                "scope": "project",
+                "kind": "fact",
+                "text": principle,
+                "tags": tags,
+                "rationale": format!(
+                    "Reflection synthesis from {} related memories [tags: {}]",
+                    cluster.memories.len(),
+                    cluster.shared_tags.join(", ")
+                ),
+                "proposed_confidence": confidence,
+                "source_event_ids": source_ids,
+            }),
+        );
+
+        match crate::projector::apply_events(conn, &[event]) {
+            Ok(()) => {
+                summary.proposals_created += 1;
+                writeln!(writer, "Proposed: {principle}")?;
+            }
+            Err(e) => {
+                writeln!(writer, "warn: failed to store reflection proposal: {e}")?;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Parse the first JSON object from a model response into a
+/// `serde_json::Value`.  Returns `None` on any parse error.
+fn parse_reflection_json(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let json_str = &text[start..=end?];
+    serde_json::from_str(json_str).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,5 +1502,151 @@ mod tests {
             pre_score >= 2.0,
             "pre-rebuild: survivor score must include member delta ≥2.0 (got {pre_score})"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Flagship 2 / Story 2.3: reflection / synthesis
+    // ------------------------------------------------------------------
+
+    /// A one-shot mock model returning a canned reflection JSON.
+    struct MockReflector {
+        response: Option<String>,
+    }
+    impl ModelProvider for MockReflector {
+        fn complete_text(&mut self, _prompt: &str) -> Option<String> {
+            self.response.take()
+        }
+    }
+
+    /// Insert an embedded memory row (StubEmbedder) carrying a `[tags: ...]`
+    /// block so it participates in distill clustering.
+    fn insert_reflectable(conn: &rusqlite::Connection, id: &str, text: &str) {
+        use crate::embeddings::{Embedder, StubEmbedder, encode_embedding};
+        let stub = StubEmbedder::new();
+        let vec = stub.embed(text).expect("embed");
+        let blob = encode_embedding(&vec);
+        conn.execute(
+            "INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text, confidence,
+                source_event_id, provenance_snapshot_json, created_at,
+                use_count, usefulness_score, embedding, embedding_model
+            ) VALUES (?1, 'project', 'fact', ?2, ?2, 1.0, NULL, '{}',
+                      '2026-01-01T00:00:00Z', 0, 0.0, ?3, ?4)",
+            params![id, text, blob, stub.model_id()],
+        )
+        .expect("insert reflectable");
+    }
+
+    /// Story 2.3 (headline): a cluster of related memories produces a
+    /// reflection PROPOSAL via the mock model, landing in memory_proposals
+    /// (pending), not directly accepted.
+    #[test]
+    fn run_reflection_creates_proposal_from_cluster() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("init");
+
+        // Three near-identical, same-tag memories → one loose cluster.
+        insert_reflectable(
+            &conn,
+            "a",
+            "always run cargo fmt before commit [tags: rust, ci]",
+        );
+        insert_reflectable(
+            &conn,
+            "b",
+            "always run cargo fmt before push [tags: rust, ci]",
+        );
+        insert_reflectable(&conn, "c", "always run cargo fmt on save [tags: rust, ci]");
+
+        let mut model = MockReflector {
+            response: Some(
+                r#"{"principle": "Always format Rust code with cargo fmt before sharing.", "tags": ["rust", "ci"], "confidence": 0.85}"#
+                    .to_string(),
+            ),
+        };
+        let opts = ReflectionOptions {
+            distill_opts: DistillOptions {
+                lo: 0.0,
+                hi: 1.0,
+                min_cluster_size: 3,
+            },
+            dry_run: false,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let summary =
+            run_reflection(&conn, &opts, Some(&mut model), &mut out).expect("run_reflection");
+
+        assert!(
+            summary.clusters_found >= 1,
+            "must find at least one cluster"
+        );
+        assert_eq!(
+            summary.proposals_created, 1,
+            "model-backed reflection must create exactly one proposal"
+        );
+
+        // The proposal landed as PENDING in memory_proposals (review flow).
+        let (text, status): (String, String) = conn
+            .query_row(
+                "SELECT text, status FROM memory_proposals LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("proposal row exists");
+        assert!(text.contains("cargo fmt"), "proposal carries the principle");
+        assert_eq!(
+            status, "pending",
+            "reflection proposal must be pending review"
+        );
+    }
+
+    /// Story 2.3: cheap-model-OPTIONAL — with no model, reflection emits a
+    /// "could be reflected" report and creates NO proposals.
+    #[test]
+    fn run_reflection_without_model_reports_only() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("init");
+
+        insert_reflectable(
+            &conn,
+            "a",
+            "prefer thiserror in libraries [tags: rust, errors]",
+        );
+        insert_reflectable(
+            &conn,
+            "b",
+            "prefer thiserror for library crates [tags: rust, errors]",
+        );
+        insert_reflectable(
+            &conn,
+            "c",
+            "use thiserror not anyhow in libs [tags: rust, errors]",
+        );
+
+        let opts = ReflectionOptions {
+            distill_opts: DistillOptions {
+                lo: 0.0,
+                hi: 1.0,
+                min_cluster_size: 3,
+            },
+            dry_run: false,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let summary = run_reflection(&conn, &opts, None, &mut out).expect("run_reflection");
+
+        assert!(summary.clusters_found >= 1);
+        assert_eq!(
+            summary.proposals_created, 0,
+            "no model → no proposals (graceful degradation)"
+        );
+        let report = String::from_utf8(out).unwrap();
+        assert!(
+            report.contains("could be reflected"),
+            "report must describe reflectable clusters, got: {report}"
+        );
+        let proposal_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_proposals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(proposal_count, 0, "no proposals written without a model");
     }
 }
