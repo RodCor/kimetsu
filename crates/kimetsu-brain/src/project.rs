@@ -23,6 +23,55 @@ use crate::schema;
 use crate::trace::{self, TraceWriter};
 use crate::user_brain;
 
+// ---------------------------------------------------------------------------
+// Flagship 2 / Story 2.1: rule-based initial importance estimator
+// ---------------------------------------------------------------------------
+
+/// Scan the corpus for the highest cosine similarity to `query_vec`.
+/// Returns 0.0 when there are no embeddings or any error occurs.
+fn max_corpus_cosine(conn: &Connection, query_vec: &[f32]) -> f32 {
+    let mut stmt = match conn.prepare(
+        "SELECT embedding FROM memories
+         WHERE invalidated_at IS NULL
+           AND superseded_by IS NULL
+           AND embedding IS NOT NULL
+         ORDER BY created_at DESC
+         LIMIT 200",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0.0,
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)) {
+        Ok(r) => r,
+        Err(_) => return 0.0,
+    };
+    let mut max_cos: f32 = 0.0;
+    for row in rows.flatten() {
+        if let Ok(vec) = embeddings::decode_embedding(&row, None) {
+            if vec.len() == query_vec.len() {
+                let cos = cosine_sim(query_vec, &vec);
+                if cos > max_cos {
+                    max_cos = cos;
+                }
+            }
+        }
+    }
+    max_cos
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na < f32::EPSILON || nb < f32::EPSILON {
+        return 0.0;
+    }
+    (dot / (na * nb)).clamp(-1.0, 1.0)
+}
+
 #[derive(Debug, Clone)]
 pub struct InitSummary {
     pub project_id: String,
@@ -690,6 +739,24 @@ pub fn add_memory(
         return Ok(existing_id);
     }
 
+    // Flagship 2 / Story 2.1: compute kind-weight portion of initial
+    // usefulness BEFORE writing the event so the value is in the event
+    // payload (rebuild-safe).  Rarity bonus (requires embedding) is applied
+    // as a follow-up UPDATE after embed_and_persist — not in the event, so it
+    // degrades to 0 on rebuild, but that is acceptable for a bootstrap seed.
+    let importance_enabled = config.ingestion.initial_importance_scoring;
+    let initial_kind_weight = if importance_enabled {
+        match &kind {
+            MemoryKind::FailurePattern => 0.3_f32,
+            MemoryKind::Command => 0.2,
+            MemoryKind::Convention => 0.15,
+            MemoryKind::Fact => 0.1,
+            MemoryKind::Preference => 0.05,
+        }
+    } else {
+        0.0
+    };
+
     let started = Event::new(
         run_id,
         "run.started",
@@ -715,6 +782,7 @@ pub fn add_memory(
             "text": text,
             "normalized_text": normalized,
             "confidence": 1.0,
+            "initial_usefulness": initial_kind_weight,
             "provenance_snapshot": {
                 "source": "manual_cli",
                 "run_id": run_id.to_string(),
@@ -749,6 +817,29 @@ pub fn add_memory(
     // embed_and_persist returns the computed vector so we can reuse it for
     // conflict detection without re-embedding (Fix 4c — halves embedding cost).
     let embedding_vec = embeddings::embed_and_persist(&conn, &memory_id, text, embedder)?;
+
+    // Flagship 2 / Story 2.1: apply rarity bonus (requires embedding).
+    // The kind-weight was already stored in the event; now compute the rarity
+    // bonus (if embedder is active and we got a vector) and UPDATE the row.
+    // This is NOT rebuild-safe (rarity depends on the corpus snapshot at write
+    // time), which is acceptable: on rebuild, the kind-weight from the event
+    // is used and the rarity bonus is 0.
+    if importance_enabled && !embedder.is_noop() {
+        if let Some(vec) = embedding_vec.as_deref() {
+            let rarity_bonus = {
+                let max_cos = max_corpus_cosine(&conn, vec);
+                if max_cos < 0.5 { 0.1_f32 } else { 0.0 }
+            };
+            if rarity_bonus > 0.0 {
+                let full_score = (initial_kind_weight + rarity_bonus).min(0.5);
+                conn.execute(
+                    "UPDATE memories SET usefulness_score = ?2 WHERE memory_id = ?1",
+                    rusqlite::params![memory_id, full_score],
+                )
+                .ok(); // best-effort
+            }
+        }
+    }
 
     // v0.5.2 / v1.0: conflict detection at ingest. Scans for high-cosine,
     // different-text neighbors in the same scope and logs each pair
@@ -3469,9 +3560,12 @@ mod tests {
             let memories = list_memories(&root).expect("list memories");
             let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
             assert_eq!(m.use_count, 1, "per-run counting: 2 stages count once");
+            // Flagship 2 / Story 2.1: memory starts with initial_kind_weight = 0.05
+            // (Preference) and earns +1.0 strong delta on run.finished → 1.05.
+            let expected = 1.0 + 0.05; // 1.0 strong delta + Preference kind weight
             assert!(
-                (m.usefulness_score - 1.0).abs() < f32::EPSILON,
-                "expected strong-signal usefulness_score = 1.0, got {}",
+                (m.usefulness_score - expected).abs() < 1e-4,
+                "expected strong-signal usefulness_score = {expected}, got {}",
                 m.usefulness_score
             );
 
@@ -3533,9 +3627,12 @@ mod tests {
             let memories = list_memories(&root).expect("list memories");
             let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
             assert_eq!(m.use_count, 1);
+            // Flagship 2 / Story 2.1: memory starts with initial_kind_weight = 0.05
+            // (Preference) and earns +0.1 weak delta on run.finished → 0.15.
+            let expected = 0.1 + 0.05; // 0.1 weak delta + Preference kind weight
             assert!(
-                (m.usefulness_score - 0.1).abs() < 1e-5,
-                "silent passenger should get +0.1, got {}",
+                (m.usefulness_score - expected).abs() < 1e-4,
+                "silent passenger should get +0.1 on top of seed, got {}",
                 m.usefulness_score
             );
         });
@@ -3732,9 +3829,12 @@ mod tests {
         let memories = list_memories(&root).expect("list memories");
         let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
         assert_eq!(m.use_count, 1, "only the non-Gate failure counts as a use");
+        // Flagship 2 / Story 2.1: memory starts with initial_kind_weight = 0.15
+        // (Convention) and earns -1.0 strong delta on run.failed → -0.85.
+        let expected = 0.15 - 1.0; // -1.0 strong delta + Convention kind weight
         assert!(
-            (m.usefulness_score - (-1.0)).abs() < f32::EPSILON,
-            "expected usefulness_score = -1.0, got {}",
+            (m.usefulness_score - expected).abs() < 1e-4,
+            "expected usefulness_score = {expected}, got {}",
             m.usefulness_score
         );
 
@@ -3790,9 +3890,12 @@ mod tests {
         let memories = list_memories(&root).expect("list memories");
         let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
         assert_eq!(m.use_count, 0, "aborted runs must not update use_count");
+        // Flagship 2 / Story 2.1: memory starts with initial_kind_weight = 0.15
+        // (Convention). run.aborted must NOT change usefulness — only the seed remains.
+        let expected_seed = 0.15_f32; // Convention kind weight
         assert!(
-            m.usefulness_score.abs() < f32::EPSILON,
-            "expected usefulness_score = 0.0, got {}",
+            (m.usefulness_score - expected_seed).abs() < 1e-4,
+            "expected usefulness_score = {expected_seed} (initial seed only), got {}",
             m.usefulness_score
         );
 

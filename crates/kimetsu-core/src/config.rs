@@ -846,6 +846,51 @@ pub struct IngestionSection {
     /// Resolution only runs when `detect_conflicts` is also enabled.
     #[serde(default = "default_true")]
     pub resolve_conflicts: bool,
+
+    /// Flagship 2 / Story 2.1: seed a non-zero initial usefulness_score for
+    /// new memories at write time.
+    ///
+    /// Uses a rule-based estimator (kind weight + rarity bonus) — no model
+    /// required.  The value is stored in the `memory.accepted` event payload
+    /// (`initial_usefulness`) and applied by the projector (rebuild-safe).
+    /// Set false to keep the v0 default of 0.0 for all new memories.
+    /// `#[serde(default = "default_true")]` keeps pre-Flagship-2 project.toml
+    /// files loading cleanly (they get the feature ON).
+    #[serde(default = "default_true")]
+    pub initial_importance_scoring: bool,
+
+    /// Flagship 2 / Story 2.2: quality-control filter in the distiller.
+    /// Drop lessons that are near-duplicates (cosine ≥ threshold), too long,
+    /// too short, or contain transience markers.  Default true.
+    /// `#[serde(default = "default_true")]` keeps older configs loading cleanly.
+    #[serde(default = "default_true")]
+    pub quality_filter_enabled: bool,
+
+    /// Flagship 2 / Story 2.2: novelty threshold — cosine ≥ this value → DROP.
+    /// Default 0.9.  `#[serde(default)]` keeps older configs loading cleanly
+    /// (they get the default via the `Default` impl).
+    #[serde(default = "default_quality_filter_novelty_threshold")]
+    pub quality_filter_novelty_threshold: f32,
+
+    /// Flagship 2 / Story 2.2: minimum lesson length in chars (after trim).
+    /// Lessons shorter than this are dropped.  Default 10.
+    #[serde(default = "default_quality_filter_min_len")]
+    pub quality_filter_min_len: usize,
+
+    /// Flagship 2 / Story 2.2: maximum lesson length in chars (after trim).
+    /// Lessons longer than this are dropped.  Default 500.
+    #[serde(default = "default_quality_filter_max_len")]
+    pub quality_filter_max_len: usize,
+}
+
+fn default_quality_filter_novelty_threshold() -> f32 {
+    0.9
+}
+fn default_quality_filter_min_len() -> usize {
+    10
+}
+fn default_quality_filter_max_len() -> usize {
+    500
 }
 
 impl Default for IngestionSection {
@@ -856,6 +901,11 @@ impl Default for IngestionSection {
             max_total_files: 50_000,
             detect_conflicts: true,
             resolve_conflicts: true,
+            initial_importance_scoring: true,
+            quality_filter_enabled: true,
+            quality_filter_novelty_threshold: default_quality_filter_novelty_threshold(),
+            quality_filter_min_len: default_quality_filter_min_len(),
+            quality_filter_max_len: default_quality_filter_max_len(),
         }
     }
 }

@@ -405,6 +405,16 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
     // model). Silent passengers never bump regardless of outcome.
     let bump_last_useful = event.kind == "run.finished";
 
+    // Flagship 2 / Story 2.4: confidence calibration target.
+    // run.finished → target 1.0 (success), run.failed → target 0.0 (failure).
+    // alpha = 0.05: conservative Bayesian-ish smoothing.
+    let conf_target: Option<f64> = match event.kind.as_str() {
+        "run.finished" => Some(1.0),
+        "run.failed" => Some(0.0),
+        _ => None,
+    };
+    const CONF_ALPHA: f64 = 0.05;
+
     for memory_id in &retrieved {
         let is_cited = cited.contains(memory_id);
         let delta = if is_cited { strong } else { weak };
@@ -428,6 +438,26 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
                 "UPDATE memories SET last_useful_at = ?2 WHERE memory_id = ?1",
                 params![memory_id, ts],
             )?;
+        }
+        // Flagship 2 / Story 2.4: update confidence only for cited memories.
+        // Silent passengers do not get a confidence update — only explicitly
+        // cited memories affect the calibration.
+        if is_cited {
+            if let Some(target) = conf_target {
+                // Read current confidence, apply Bayesian-ish posterior, clamp.
+                let old_conf: f64 = conn
+                    .query_row(
+                        "SELECT confidence FROM memories WHERE memory_id = ?1",
+                        params![memory_id],
+                        |row| row.get::<_, f64>(0),
+                    )
+                    .unwrap_or(1.0);
+                let new_conf = (old_conf + CONF_ALPHA * (target - old_conf)).clamp(0.1, 0.99);
+                conn.execute(
+                    "UPDATE memories SET confidence = ?2 WHERE memory_id = ?1",
+                    params![memory_id, new_conf],
+                )?;
+            }
         }
     }
     Ok(())
@@ -520,6 +550,13 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         .get("confidence")
         .and_then(|value| value.as_f64())
         .unwrap_or(1.0);
+    // Flagship 2 / Story 2.1: initial usefulness seed.
+    // Pre-Flagship-2 events don't carry this field → default 0.0 (backward compat).
+    let initial_usefulness = event
+        .payload
+        .get("initial_usefulness")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0) as f32;
     let provenance_snapshot = event
         .payload
         .get("provenance_snapshot")
@@ -532,9 +569,10 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         "
         INSERT OR REPLACE INTO memories (
             memory_id, scope, kind, text, normalized_text, confidence,
-            source_event_id, provenance_snapshot_json, created_at, use_count
+            source_event_id, provenance_snapshot_json, created_at, use_count,
+            usefulness_score
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)
         ",
         params![
             memory_id,
@@ -545,7 +583,8 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
             confidence,
             event.event_id.to_string(),
             serde_json::to_string(&provenance_snapshot)?,
-            ts_text(event)?
+            ts_text(event)?,
+            initial_usefulness
         ],
     )?;
 
@@ -1532,5 +1571,177 @@ mod tests {
             "scope must round-trip through rebuild"
         );
         assert_eq!(row.2, expected_kind, "kind must round-trip through rebuild");
+    }
+
+    // ------------------------------------------------------------------
+    // Flagship 2 / Story 2.1: importance scoring at write time
+    // ------------------------------------------------------------------
+
+    /// Story 2.1: a memory.accepted event carrying `initial_usefulness` seeds
+    /// the memory's usefulness_score (rebuild-safe), so a salient new memory
+    /// outranks a freshly-added neutral one with score 0.
+    #[test]
+    fn initial_usefulness_seeds_score_and_survives_rebuild() {
+        use super::rebuild_in_place;
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+
+        let events = vec![
+            // Salient: failure_pattern seeded at 0.3.
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": "salient",
+                    "text": "rm -rf node_modules then reinstall fixes the EBUSY lock",
+                    "scope": "project",
+                    "kind": "failure_pattern",
+                    "confidence": 1.0,
+                    "initial_usefulness": 0.3
+                }),
+            ),
+            // Neutral: no initial_usefulness field → default 0.0 (back-compat).
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": "neutral",
+                    "text": "the readme mentions a port number",
+                    "scope": "project",
+                    "kind": "fact",
+                    "confidence": 1.0
+                }),
+            ),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        let read = |id: &str| -> f64 {
+            conn.query_row(
+                "SELECT usefulness_score FROM memories WHERE memory_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            (read("salient") - 0.3).abs() < 1e-6,
+            "salient memory must be seeded to 0.3"
+        );
+        assert!(
+            read("neutral").abs() < 1e-6,
+            "memory without initial_usefulness must default to 0.0"
+        );
+        assert!(
+            read("salient") > read("neutral"),
+            "salient new memory must outrank a neutral one from day one"
+        );
+
+        // Rebuild-safe: the seed is in the event payload, so it survives replay.
+        conn.execute_batch("DELETE FROM memories; DELETE FROM memories_fts;")
+            .unwrap();
+        rebuild_in_place(&conn).expect("rebuild_in_place");
+        assert!(
+            (read("salient") - 0.3).abs() < 1e-6,
+            "initial_usefulness seed must survive rebuild"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Flagship 2 / Story 2.4: confidence calibration from outcomes
+    // ------------------------------------------------------------------
+
+    /// Run a full cycle that injects + cites `mem_id`, then terminates with
+    /// `terminal_kind` ("run.finished" or "run.failed"). Returns the memory's
+    /// confidence afterward.
+    fn cite_and_terminate_confidence(terminal_kind: &str) -> (Connection, f64) {
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let mem_id = "cal-mem";
+
+        let events = vec![
+            make_event(
+                run_id,
+                "run.started",
+                json!({"project_id": "p", "task": "t"}),
+            ),
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({
+                    "memory_id": mem_id,
+                    "text": "use lld linker on windows",
+                    "scope": "project",
+                    "kind": "convention",
+                    "confidence": 0.7
+                }),
+            ),
+            // Mark it as retrieved so usefulness/confidence attribution fires.
+            make_event(
+                run_id,
+                "context.injected",
+                json!({"stage": "loc", "memory_ids": [mem_id], "used_tokens": 100}),
+            ),
+            // Explicitly cited so it earns the strong (cited) confidence update.
+            make_event(
+                run_id,
+                "memory.cited",
+                json!({"memory_id": mem_id, "turn": 1}),
+            ),
+            make_event(run_id, terminal_kind, json!({"total_cost_usd": 0.0})),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        let conf: f64 = conn
+            .query_row(
+                "SELECT confidence FROM memories WHERE memory_id = ?1",
+                [mem_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (conn, conf)
+    }
+
+    /// Story 2.4 (headline): a cited memory in a successful run ends with
+    /// HIGHER confidence than one in a failed run, and the calibrated value
+    /// is reproduced exactly after rebuild_in_place.
+    #[test]
+    fn confidence_calibration_rewards_success_and_survives_rebuild() {
+        use super::rebuild_in_place;
+
+        let (success_conn, success_conf) = cite_and_terminate_confidence("run.finished");
+        let (_fail_conn, fail_conf) = cite_and_terminate_confidence("run.failed");
+
+        // Started at 0.7. Success nudges toward 1.0; failure toward 0.0.
+        assert!(
+            success_conf > 0.7,
+            "successful citation must raise confidence above 0.7, got {success_conf}"
+        );
+        assert!(
+            fail_conf < 0.7,
+            "failed citation must lower confidence below 0.7, got {fail_conf}"
+        );
+        assert!(
+            success_conf > fail_conf,
+            "cited-in-success must beat cited-in-failure: {success_conf} vs {fail_conf}"
+        );
+
+        // Rebuild-safe: the calibration is derived purely from replayed events.
+        let mem_id = "cal-mem";
+        success_conn
+            .execute_batch("DELETE FROM memories; DELETE FROM memories_fts;")
+            .unwrap();
+        rebuild_in_place(&success_conn).expect("rebuild_in_place");
+        let post: f64 = success_conn
+            .query_row(
+                "SELECT confidence FROM memories WHERE memory_id = ?1",
+                [mem_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (post - success_conf).abs() < 1e-9,
+            "calibrated confidence must reproduce after rebuild: {post} vs {success_conf}"
+        );
     }
 }
