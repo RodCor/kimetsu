@@ -79,6 +79,11 @@ fn migrations() -> &'static [Migration] {
             description: "add skill_proposals table (Flagship 2 Memory → Skill synthesis)",
             up: crate::schema::migrate_v5_to_v6,
         },
+        Migration {
+            version: 7,
+            description: "add valid_from + valid_to columns for temporal validity (Flagship 1 Pass A)",
+            up: crate::schema::migrate_v6_to_v7,
+        },
     ]
 }
 
@@ -495,19 +500,19 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn noop_when_at_target() {
-        let conn = make_db(6);
-        let outcome = run_with(&conn, &[], 6).expect("run_with");
+        let conn = make_db(7);
+        let outcome = run_with(&conn, &[], 7).expect("run_with");
         assert_eq!(
             outcome,
             MigrationOutcome {
-                from: 6,
-                to: 6,
+                from: 7,
+                to: 7,
                 applied: vec![],
                 backup_path: None,
             }
         );
         // Version unchanged.
-        assert_eq!(current_version(&conn).unwrap(), 6);
+        assert_eq!(current_version(&conn).unwrap(), 7);
     }
 
     // ------------------------------------------------------------------

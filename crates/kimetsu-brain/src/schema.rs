@@ -444,6 +444,39 @@ pub(crate) fn migrate_v5_to_v6(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// The v6→v7 migration: add `valid_from` and `valid_to` columns to `memories`
+/// for temporal validity modelling (Flagship 1 Pass A).
+///
+/// A memory with `valid_to` set to an ISO-8601 timestamp in the PAST is
+/// considered **expired** and is excluded from retrieval by default. Together
+/// with the existing `superseded_by IS NULL` guard this gives the retrieval
+/// pipeline a complete "is this fact still true?" filter.
+///
+/// Both columns are TEXT (ISO-8601 / RFC 3339) and nullable:
+///   * NULL `valid_from` → "valid since the memory was created" (no past-only guard).
+///   * NULL `valid_to`   → "valid indefinitely" (never expires).
+///   * Non-NULL `valid_to` with a value in the past → expired, excluded by default.
+///
+/// Populated by the `memory.temporal` event (projector: `apply_memory_temporal`).
+/// The columns survive a `reset_projection` + `rebuild_in_place` replay because
+/// the projector re-stamps them from the event log.
+///
+/// An index on `valid_to` is added so the retrieval WHERE clause
+///   `(valid_to IS NULL OR valid_to > <now>)`
+/// can use an index scan on the small subset of rows that are NOT NULL.
+///
+/// NOTE: this function runs INSIDE a transaction owned by the migration
+/// runner. Do NOT issue BEGIN/COMMIT here.
+pub(crate) fn migrate_v6_to_v7(conn: &Connection) -> KimetsuResult<()> {
+    add_column_if_missing(conn, "memories", "valid_from TEXT")?;
+    add_column_if_missing(conn, "memories", "valid_to TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_valid_to
+             ON memories (valid_to);",
+    )?;
+    Ok(())
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only
@@ -575,7 +608,7 @@ mod tests {
     // 1. Fresh init reaches current schema version with full shape
     // ------------------------------------------------------------------
     #[test]
-    fn fresh_init_reaches_v5_with_full_shape() {
+    fn fresh_init_reaches_current_version_with_full_shape() {
         use kimetsu_core::KIMETSU_SCHEMA_VERSION;
         let conn = Connection::open_in_memory().expect("open_in_memory");
         initialize(&conn).expect("initialize");
@@ -605,6 +638,15 @@ mod tests {
         assert!(
             mem_cols.contains(&"superseded_by".to_string()),
             "memories must have `superseded_by` column after v3 migration"
+        );
+        // v7: temporal validity columns (Flagship 1 Pass A)
+        assert!(
+            mem_cols.contains(&"valid_from".to_string()),
+            "memories must have `valid_from` column after v7 migration"
+        );
+        assert!(
+            mem_cols.contains(&"valid_to".to_string()),
+            "memories must have `valid_to` column after v7 migration"
         );
 
         // Tables added by the migrations exist.
@@ -982,6 +1024,64 @@ mod tests {
         assert_eq!(
             idx, 1,
             "idx_skill_proposals_status must exist after v6 migration"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // F1A-v7. v6→v7 migration adds valid_from + valid_to columns + index
+    // ------------------------------------------------------------------
+    #[test]
+    fn v6_to_v7_migration_adds_temporal_validity_columns() {
+        let conn = Connection::open_in_memory().expect("open_in_memory");
+        // Build a v6 DB (all prior migrations, no v6→v7).
+        create_baseline(&conn).expect("create_baseline");
+        migrate_v1_to_v2(&conn).expect("migrate_v1_to_v2");
+        migrate_v2_to_v3(&conn).expect("migrate_v2_to_v3");
+        migrate_v3_to_v4(&conn).expect("migrate_v3_to_v4");
+        migrate_v4_to_v5(&conn).expect("migrate_v4_to_v5");
+        migrate_v5_to_v6(&conn).expect("migrate_v5_to_v6");
+        conn.execute(
+            "UPDATE schema_info SET value = 6 WHERE key = 'kimetsu_schema_version'",
+            [],
+        )
+        .expect("set v6");
+
+        // valid_from and valid_to must NOT exist yet.
+        let cols_before = column_names(&conn, "memories");
+        assert!(
+            !cols_before.contains(&"valid_from".to_string()),
+            "valid_from must not exist before v7 migration"
+        );
+        assert!(
+            !cols_before.contains(&"valid_to".to_string()),
+            "valid_to must not exist before v7 migration"
+        );
+
+        // Run v6→v7.
+        migrate_v6_to_v7(&conn).expect("migrate_v6_to_v7");
+
+        // Columns must now exist.
+        let cols_after = column_names(&conn, "memories");
+        assert!(
+            cols_after.contains(&"valid_from".to_string()),
+            "valid_from must exist after v7 migration"
+        );
+        assert!(
+            cols_after.contains(&"valid_to".to_string()),
+            "valid_to must exist after v7 migration"
+        );
+
+        // Index on valid_to must exist.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_valid_to'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query idx_memories_valid_to");
+        assert_eq!(
+            idx, 1,
+            "idx_memories_valid_to must exist after v7 migration"
         );
     }
 }

@@ -14,6 +14,19 @@ pub struct EvalMemory {
     pub key: String,
     /// Full text of the memory to add to the corpus.
     pub text: String,
+    /// Flagship 1 Pass A: optional RFC 3339 timestamp. When present and in the
+    /// PAST, the bench seeder stamps this memory with `valid_to` (expired) so
+    /// validity-aware retrieval excludes it. Omitting this field leaves the
+    /// memory valid indefinitely — existing fixtures are unchanged.
+    #[serde(default)]
+    pub valid_to: Option<String>,
+    /// Flagship 1 Pass A: optional key of another `EvalMemory` that supersedes
+    /// this one. When present, the bench seeder stamps `superseded_by` on this
+    /// memory (pointing to the survivor's DB id) so retrieval excludes it via
+    /// the existing `superseded_by IS NULL` guard.
+    /// Omitting this field leaves the memory active — existing fixtures unchanged.
+    #[serde(default)]
+    pub superseded_by_key: Option<String>,
 }
 
 /// Classification of an eval case for correctness measurement.

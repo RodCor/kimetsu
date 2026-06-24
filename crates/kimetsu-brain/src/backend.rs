@@ -361,6 +361,7 @@ fn fetch_graph_candidates(
          FROM memories
          WHERE invalidated_at IS NULL
            AND superseded_by IS NULL
+           AND (valid_to IS NULL OR valid_to > datetime('now'))
            AND memory_id IN ({placeholders})"
     );
 
