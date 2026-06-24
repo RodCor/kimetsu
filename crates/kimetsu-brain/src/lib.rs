@@ -18,6 +18,8 @@ pub mod embeddings;
 pub mod episode;
 pub mod eval;
 pub mod ingest;
+/// F3 Flagship 3: Lifecycle & forgetting — Stories 3.1–3.4.
+pub mod lifecycle;
 pub mod lock;
 pub mod migrate;
 pub mod project;

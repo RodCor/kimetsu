@@ -810,6 +810,23 @@ enum BrainCommand {
     ///   kimetsu brain triage --score-floor 0.1 --age-days 60
     ///   kimetsu brain triage --prune-all --yes
     Triage(TriageArgs),
+    /// F3 Story 3.1: Forget low-signal memories that haven't been useful for
+    /// a configurable number of months.
+    ///
+    /// Memories are archived via invalidation events (event-sourced, rebuild-safe).
+    /// Nothing is hard-deleted from the event log.  Forgetting is opt-in:
+    /// `[lifecycle] forget_enabled = true` must be set in `project.toml` (or
+    /// use --force-enabled to override once without changing the config file).
+    ///
+    /// After the forget pass, pending proposals older than
+    /// `proposal_expiry_days` are also expired (Story 3.3 hygiene pass).
+    ///
+    /// Examples:
+    ///   kimetsu brain forget --dry-run
+    ///   kimetsu brain forget --dry-run --min-age-days 60
+    ///   kimetsu brain forget --yes
+    ///   kimetsu brain forget --yes --force-enabled
+    Forget(ForgetArgs),
     /// Flagship 2 / Story 2.3: Reflect related memories into higher-order
     /// principles.
     ///
@@ -1220,6 +1237,35 @@ struct TriageArgs {
     /// Skip the confirmation prompt for --prune-all.
     #[arg(long)]
     yes: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain forget` (F3 Story 3.1 + 3.3).
+#[derive(Debug, Args)]
+struct ForgetArgs {
+    /// Report which memories would be forgotten without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip the confirmation prompt and apply immediately.
+    #[arg(long)]
+    yes: bool,
+    /// Override the usefulness-score floor (default comes from project.toml lifecycle section).
+    #[arg(long)]
+    usefulness_floor: Option<f32>,
+    /// Minimum age in days since last useful (overrides project.toml default).
+    #[arg(long)]
+    min_age_days: Option<u32>,
+    /// Protect memories with use_count >= this value (overrides project.toml default).
+    #[arg(long)]
+    protect_use_count: Option<u32>,
+    /// Apply even if forget_enabled = false in project.toml (one-shot override).
+    #[arg(long)]
+    force_enabled: bool,
+    /// Skip the proposal-queue GC hygiene pass after forgetting.
+    #[arg(long)]
+    no_proposal_gc: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -3939,6 +3985,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
+        BrainCommand::Forget(args) => brain_forget(args),
         BrainCommand::Ask(args) => brain_ask(args),
         BrainCommand::Skills(args) => brain_skills(args),
         BrainCommand::Sync(args) => brain_sync(args),
@@ -4917,7 +4964,25 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
         .map(|(d, n)| format!("{} ({})", d, n))
         .collect();
 
+    // F3 Stories 3.2 & 3.4: regret-flagged memories + invalidations by reason.
+    let (regret_flagged, inv_by_reason) = match project::load_project(&cwd) {
+        Ok((_paths, config, conn)) => {
+            let threshold = config.lifecycle.regret_flag_threshold;
+            let regret = kimetsu_brain::lifecycle::regret_flagged_memories(&conn, threshold)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let inv = kimetsu_brain::lifecycle::invalidations_by_reason(&conn).unwrap_or_default();
+            (regret, inv)
+        }
+        Err(_) => (0, vec![]),
+    };
+
     if json {
+        let inv_json: serde_json::Value = inv_by_reason
+            .iter()
+            .map(|r| (r.reason.clone(), serde_json::json!(r.count)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -4929,6 +4994,8 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
                 "fading": fading.len(),
                 "stale": stale.len(),
                 "top_domains": top_domains,
+                "regret_flagged": regret_flagged,
+                "invalidations_by_reason": inv_json,
             }))?
         );
     } else {
@@ -4950,6 +5017,21 @@ fn brain_status(json: bool) -> KimetsuResult<()> {
         );
         if stale.len() > 3 {
             println!("hint: run `kimetsu brain memory prune` to clean stale entries");
+        }
+        if regret_flagged > 0 {
+            println!(
+                "regret:  {} memor{} flagged for review (cited despite being dropped)",
+                regret_flagged,
+                if regret_flagged == 1 { "y" } else { "ies" }
+            );
+            println!("hint: run `kimetsu brain forget --dry-run` to review lifecycle candidates");
+        }
+        if !inv_by_reason.is_empty() {
+            let parts: Vec<String> = inv_by_reason
+                .iter()
+                .map(|r| format!("{}: {}", r.reason, r.count))
+                .collect();
+            println!("invalidations by reason: {}", parts.join(", "));
         }
     }
     Ok(())
@@ -6206,6 +6288,162 @@ fn brain_triage(args: TriageArgs) -> KimetsuResult<()> {
     }
 
     triage_interactive_loop(&workspace, &candidates, &mut sin, &mut out)
+}
+
+// ---------------------------------------------------------------------------
+// F3 Story 3.1 + 3.3: brain forget
+// ---------------------------------------------------------------------------
+
+fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::lifecycle::{ForgetOptions, ProposalGcOptions, forget_brain, gc_proposals};
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Load config to read lifecycle defaults.
+    let (_paths, config, _conn) = kimetsu_brain::project::load_project_readonly(&workspace)?;
+    let lc = &config.lifecycle;
+
+    // Respect the opt-in gate unless --force-enabled or --dry-run.
+    if !args.dry_run && !args.force_enabled && !lc.forget_enabled {
+        eprintln!(
+            "Forgetting is disabled in project.toml (lifecycle.forget_enabled = false).\n\
+             Pass --force-enabled to override for this run, or set it in project.toml."
+        );
+        return Ok(());
+    }
+
+    let opts = ForgetOptions {
+        dry_run: args.dry_run,
+        usefulness_floor: args.usefulness_floor.unwrap_or(lc.forget_usefulness_floor),
+        min_age_days: args.min_age_days.unwrap_or(lc.forget_min_age_days),
+        protect_use_count: args
+            .protect_use_count
+            .unwrap_or(lc.forget_protect_use_count),
+    };
+
+    // -- Forget pass --
+    let summary = forget_brain(&workspace, opts)?;
+
+    if args.dry_run {
+        if summary.candidates.is_empty() {
+            println!("dry-run: no memories matched the forget criteria.");
+        } else {
+            println!(
+                "dry-run: {} memor{} would be forgotten:",
+                summary.candidates.len(),
+                if summary.candidates.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            );
+            for c in &summary.candidates {
+                println!(
+                    "  [{}] {}/{} use_count={} usefulness={:.3} age={:.0}d — {}",
+                    &c.memory_id[..c.memory_id.len().min(12)],
+                    c.scope,
+                    c.kind,
+                    c.use_count,
+                    c.usefulness_score,
+                    c.age_days,
+                    &c.text_preview
+                );
+            }
+        }
+    } else {
+        // Confirm unless --yes.
+        if !args.yes && !summary.candidates.is_empty() {
+            if !io::stdin().is_terminal() {
+                return Err(
+                    "stdin is not a TTY; pass --yes to confirm forgetting non-interactively".into(),
+                );
+            }
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            let stdin = io::stdin();
+            let mut sin = stdin.lock();
+            write!(
+                out,
+                "Forget {} memor{}? [y/N] ",
+                summary.candidates.len(),
+                if summary.candidates.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )?;
+            out.flush()?;
+            let mut line = String::new();
+            sin.read_line(&mut line)?;
+            let answer = line.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+
+        if summary.archived == 0 {
+            println!("No memories matched the forget criteria. Brain is already lean.");
+        } else {
+            println!(
+                "Forgot {} memor{} (archived via invalidation events).",
+                summary.archived,
+                if summary.archived == 1 { "y" } else { "ies" }
+            );
+        }
+        if summary.failed > 0 {
+            eprintln!(
+                "Warning: {} memor{} could not be archived (check logs).",
+                summary.failed,
+                if summary.failed == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+
+    // -- Proposal GC hygiene pass (Story 3.3) --
+    if !args.no_proposal_gc {
+        let gc_opts = ProposalGcOptions {
+            dry_run: args.dry_run,
+            expiry_days: lc.proposal_expiry_days,
+            auto_accept_confidence: lc.proposal_auto_accept_confidence,
+        };
+        match gc_proposals(&workspace, gc_opts) {
+            Ok(gc) => {
+                if gc.expired > 0 {
+                    let verb = if args.dry_run {
+                        "would expire"
+                    } else {
+                        "expired"
+                    };
+                    println!(
+                        "Proposal GC: {verb} {} stale proposal{}.",
+                        gc.expired,
+                        if gc.expired == 1 { "" } else { "s" }
+                    );
+                }
+                if gc.auto_accepted > 0 {
+                    let verb = if args.dry_run {
+                        "would auto-accept"
+                    } else {
+                        "auto-accepted"
+                    };
+                    println!(
+                        "Proposal GC: {verb} {} high-confidence proposal{}.",
+                        gc.auto_accepted,
+                        if gc.auto_accepted == 1 { "" } else { "s" }
+                    );
+                }
+            }
+            Err(e) => {
+                // Non-fatal — just warn.
+                eprintln!("Warning: proposal GC encountered an error: {e}");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// A fading memory candidate for triage.

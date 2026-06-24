@@ -138,6 +138,12 @@ pub struct CorpusHealth {
     pub prune_candidates: Vec<MemoryRef>,
     pub open_conflicts: u64,
     pub pending_proposals: u64,
+    /// F3 Story 3.4: invalidations grouped by structured reason.
+    /// Empty when no memories have been invalidated.
+    pub invalidations_by_reason: Vec<(String, u64)>,
+    /// F3 Story 3.2: memories flagged for review due to repeated retrieval regrets.
+    /// Only populated when there are memories above the regret threshold.
+    pub regret_flagged_count: u64,
 }
 
 /// C4 — token economy from `context.injected` events.
@@ -435,6 +441,23 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             |row| row.get(0),
         )?;
 
+        // F3 Story 3.4: invalidations by structured reason.
+        let invalidations_by_reason: Vec<(String, u64)> =
+            crate::lifecycle::invalidations_by_reason(&conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.reason, r.count))
+                .collect();
+
+        // F3 Story 3.2: count regret-flagged memories.
+        // Use the default threshold from config (5); analytics always uses the
+        // default since it reads from DB and doesn't take a lifecycle config arg.
+        let regret_flag_threshold = 5u64;
+        let regret_flagged_count =
+            crate::lifecycle::regret_flagged_memories(&conn, regret_flag_threshold)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+
         CorpusHealth {
             active,
             invalidated,
@@ -444,6 +467,8 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
             prune_candidates,
             open_conflicts,
             pending_proposals,
+            invalidations_by_reason,
+            regret_flagged_count,
         }
     };
 
