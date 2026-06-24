@@ -20,9 +20,9 @@ publish = false
 # Real (non-dev) deps so the test fixtures + scripted provider can be
 # re-exported from `kimetsu_e2e::prelude` to the integration tests in
 # `tests/`. Integration tests treat this crate as a normal library.
-kimetsu-agent = { path = "../kimetsu-agent", version = "2.0.0" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "2.0.0" }
-kimetsu-core = { path = "../kimetsu-core", version = "2.0.0" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "2.5.0" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.5.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.5.0" }
 rusqlite.workspace = true
 serde_json.workspace = true
 time.workspace = true
