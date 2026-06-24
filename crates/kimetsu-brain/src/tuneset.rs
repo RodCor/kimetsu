@@ -90,6 +90,8 @@ pub fn build_personal_eval(conn: &Connection, window_secs: i64) -> KimetsuResult
             cases.push(EvalCase {
                 query: query.clone(),
                 relevant,
+                kind: Default::default(),
+                stale: Vec::new(),
             });
         }
     }
