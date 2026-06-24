@@ -40,6 +40,12 @@ pub struct ProjectConfig {
     /// (they get no sync dir and a freshly-generated machine_id).
     #[serde(default)]
     pub sync: SyncSection,
+    /// F3 Flagship 3 / Lifecycle & forgetting policy.
+    /// `#[serde(default)]` keeps all existing project.toml files loading
+    /// cleanly (they get forgetting disabled, sane defaults for all thresholds,
+    /// regret threshold 5, proposal expiry 30d, auto-accept disabled).
+    #[serde(default)]
+    pub lifecycle: LifecycleSection,
 }
 
 impl ProjectConfig {
@@ -61,6 +67,7 @@ impl ProjectConfig {
             cheap_model: None,
             storage: StorageSection::default(),
             sync: SyncSection::default(),
+            lifecycle: LifecycleSection::default(),
         }
     }
 
@@ -956,6 +963,93 @@ pub struct SyncSection {
     /// set; the CLI generates one on first use).
     #[serde(default)]
     pub machine_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// F3 Flagship 3 / Lifecycle & forgetting configuration
+// ---------------------------------------------------------------------------
+
+/// F3 lifecycle / forgetting policy configuration.
+///
+/// All settings are gated behind `forget_enabled = false` by default so
+/// existing installs are completely unaffected until an operator opts in.
+///
+/// `#[serde(default)]` keeps all existing project.toml files loading cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleSection {
+    // ---- Story 3.1: Active forgetting ----
+    /// Master opt-in switch. Default false — forgetting is NEVER triggered
+    /// without the operator explicitly enabling it.
+    #[serde(default)]
+    pub forget_enabled: bool,
+
+    /// Minimum age (days) before a memory is eligible for archival.
+    /// Only memories whose `last_useful_at` (or `created_at` when never cited)
+    /// is older than this many days are considered. Default 90.
+    #[serde(default = "default_forget_min_age_days")]
+    pub forget_min_age_days: u32,
+
+    /// Usefulness floor: memories with `usefulness_score / max(use_count, 1)
+    /// <= this` value are candidates. Default -0.1 (net-negative).
+    #[serde(default = "default_forget_usefulness_floor")]
+    pub forget_usefulness_floor: f32,
+
+    /// Evergreen protection threshold. Memories with
+    /// `use_count >= forget_protect_use_count` are NEVER archived regardless
+    /// of their usefulness ratio. Default 10.
+    #[serde(default = "default_forget_protect_use_count")]
+    pub forget_protect_use_count: u32,
+
+    // ---- Story 3.2: Regret-driven review ----
+    /// Number of `retrieval.regret` events a memory must accumulate before
+    /// it appears in the review list. Default 5.
+    #[serde(default = "default_regret_flag_threshold")]
+    pub regret_flag_threshold: u64,
+
+    // ---- Story 3.3: Proposal-queue hygiene ----
+    /// Number of days before a pending proposal is auto-expired (rejected with
+    /// reason "expired"). Default 30. 0 disables expiry.
+    #[serde(default = "default_proposal_expiry_days")]
+    pub proposal_expiry_days: u32,
+
+    /// Proposals with `proposed_confidence >= this` value are auto-accepted
+    /// during the hygiene pass. Default 1.1 (disabled — threshold above the
+    /// maximum possible confidence of 1.0).
+    #[serde(default = "default_proposal_auto_accept_confidence")]
+    pub proposal_auto_accept_confidence: f32,
+}
+
+fn default_forget_min_age_days() -> u32 {
+    90
+}
+fn default_forget_usefulness_floor() -> f32 {
+    -0.1
+}
+fn default_forget_protect_use_count() -> u32 {
+    10
+}
+fn default_regret_flag_threshold() -> u64 {
+    5
+}
+fn default_proposal_expiry_days() -> u32 {
+    30
+}
+fn default_proposal_auto_accept_confidence() -> f32 {
+    1.1 // disabled: above max confidence
+}
+
+impl Default for LifecycleSection {
+    fn default() -> Self {
+        Self {
+            forget_enabled: false,
+            forget_min_age_days: default_forget_min_age_days(),
+            forget_usefulness_floor: default_forget_usefulness_floor(),
+            forget_protect_use_count: default_forget_protect_use_count(),
+            regret_flag_threshold: default_regret_flag_threshold(),
+            proposal_expiry_days: default_proposal_expiry_days(),
+            proposal_auto_accept_confidence: default_proposal_auto_accept_confidence(),
+        }
+    }
 }
 
 #[cfg(test)]
