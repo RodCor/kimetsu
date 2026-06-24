@@ -831,6 +831,21 @@ pub struct IngestionSection {
     /// Precedence: `KIMETSU_DETECT_CONFLICTS` env > this field > default.
     #[serde(default = "default_true")]
     pub detect_conflicts: bool,
+    /// v2.5 Pass B (Story 1.3): enable automatic contradiction resolution.
+    ///
+    /// When true (default), conflicting memory pairs are scored by
+    /// `confidence × recency`.  Clear winners (score gap ≥ 0.15) have the
+    /// loser's `valid_to` stamped to now via `mark_memory_temporal`
+    /// (event-sourced, rebuild-safe).  Near-ties are queued in
+    /// `memory_conflicts` for operator review, same as the v0.5.2 behavior.
+    ///
+    /// Set to false (or set env `KIMETSU_RESOLVE_CONFLICTS=0`) to revert to
+    /// detect-only mode: all conflicts are queued for the operator.
+    ///
+    /// Precedence: `KIMETSU_RESOLVE_CONFLICTS` env > this field > default.
+    /// Resolution only runs when `detect_conflicts` is also enabled.
+    #[serde(default = "default_true")]
+    pub resolve_conflicts: bool,
 }
 
 impl Default for IngestionSection {
@@ -840,6 +855,7 @@ impl Default for IngestionSection {
             extra_skip_dirs: Vec::new(),
             max_total_files: 50_000,
             detect_conflicts: true,
+            resolve_conflicts: true,
         }
     }
 }

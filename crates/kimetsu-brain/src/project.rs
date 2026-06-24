@@ -760,21 +760,69 @@ pub fn add_memory(
     // v1.0: honor the [ingestion] detect_conflicts config field and the
     // KIMETSU_DETECT_CONFLICTS env override so bulk-seeding can skip the
     // O(N²) conflict scan.
+    //
+    // v2.5 Pass B (Story 1.3): when resolve_conflicts is also enabled, run
+    // auto-resolution: clear winners (confidence×recency gap ≥ 0.15) have
+    // the loser's valid_to stamped; near-ties go to the queue.
     if conflict::conflict_detection_enabled(config.ingestion.detect_conflicts) {
-        let conflicts = conflict::detect_and_record_with_vec(
-            &conn,
-            &memory_id,
-            &scope,
-            &kind.to_string(),
-            text,
-            embedding_vec.as_deref(),
-            embedder,
-        );
-        if conflicts > 0 {
-            eprintln!(
-                "kimetsu-brain: memory {memory_id} conflicts with {conflicts} existing memor{} (run `kimetsu brain memory conflicts` to review)",
-                if conflicts == 1 { "y" } else { "ies" }
+        // Fetch the created_at timestamp of the newly-written memory for
+        // scoring (needed by resolve_conflicts).  We read it back from the DB
+        // because the event timestamp is the canonical value.
+        let new_created_at: String = conn
+            .query_row(
+                "SELECT created_at FROM memories WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| {
+                // Fallback: use "now" so recency scoring is still valid.
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            });
+
+        if conflict::resolve_conflicts_enabled(config.ingestion.resolve_conflicts) {
+            // Pass B: detect + auto-resolve.
+            let (auto_resolved, queued) = conflict::detect_record_and_resolve_with_vec(
+                &conn,
+                &memory_id,
+                &scope,
+                &kind.to_string(),
+                text,
+                embedding_vec.as_deref(),
+                embedder,
+                1.0, // add_memory always writes with confidence = 1.0
+                &new_created_at,
             );
+            if auto_resolved > 0 {
+                eprintln!(
+                    "kimetsu-brain: memory {memory_id} auto-resolved {auto_resolved} contradiction{} (loser valid_to stamped)",
+                    if auto_resolved == 1 { "" } else { "s" }
+                );
+            }
+            if queued > 0 {
+                eprintln!(
+                    "kimetsu-brain: memory {memory_id} has {queued} near-tie conflict{} queued for review (run `kimetsu brain memory conflicts`)",
+                    if queued == 1 { "" } else { "s" }
+                );
+            }
+        } else {
+            // Detect-only (Pass A / disabled-resolution) path.
+            let conflicts = conflict::detect_and_record_with_vec(
+                &conn,
+                &memory_id,
+                &scope,
+                &kind.to_string(),
+                text,
+                embedding_vec.as_deref(),
+                embedder,
+            );
+            if conflicts > 0 {
+                eprintln!(
+                    "kimetsu-brain: memory {memory_id} conflicts with {conflicts} existing memor{} (run `kimetsu brain memory conflicts` to review)",
+                    if conflicts == 1 { "y" } else { "ies" }
+                );
+            }
         }
     }
 

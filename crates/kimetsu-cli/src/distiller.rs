@@ -29,8 +29,12 @@ commands/tools that failed and were resolved, hard-won environment quirks, and c
 anti-patterns. Ignore trivia, one-liners, and anything specific to a single throwaway value.\n\n\
 Reply with ONLY a JSON array (no prose, no markdown) of at most 3 objects:\n\
 [{\"lesson\": \"concrete, actionable, generalized\", \"tags\": [\"2-5\", \"domain\", \"tags\"], \
-\"kind\": \"semantic_operator|anti_pattern|convention\", \"confidence\": 0.0-1.0}]\n\
-Use confidence 0.8 when you're sure it generalizes, lower when unsure. If nothing qualifies, reply [].";
+\"kind\": \"semantic_operator|anti_pattern|convention\", \"confidence\": 0.0-1.0, \
+\"valid_from\": \"YYYY-MM-DDThh:mm:ssZ or null\", \"valid_to\": \"YYYY-MM-DDThh:mm:ssZ or null\"}]\n\
+Use confidence 0.8 when you're sure it generalizes, lower when unsure. \
+For valid_from/valid_to: only include these when the lesson has an EXPLICIT temporal scope \
+(e.g. \"works on Python 3.11\", \"as of kimetsu v2.0\", \"deprecated in X\"). \
+For timeless lessons omit them or use null. If nothing qualifies, reply [].";
 
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Lesson {
@@ -41,6 +45,18 @@ pub struct Lesson {
     pub kind: String,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// Story 1.2 / Pass B: optional temporal lower bound for this lesson.
+    /// When the model detects an explicit "as of X" / "works on Y version Z"
+    /// scope, it emits an ISO-8601 / RFC 3339 timestamp here.
+    /// Timeless lessons omit this field (serde default = None).
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    /// Story 1.2 / Pass B: optional temporal upper bound for this lesson.
+    /// When the model detects "deprecated in X" / "only until Y" scopes,
+    /// it emits an ISO-8601 / RFC 3339 timestamp here.
+    /// Timeless lessons omit this field (serde default = None).
+    #[serde(default)]
+    pub valid_to: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -199,6 +215,12 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// uses `add_memory`, which routes to `~/.kimetsu/brain.db` (the user brain
 /// has no proposal queue, so this is add-or-dedup). Returns the count recorded.
 /// For `GlobalUser`, `start` is ignored (the user brain is global).
+///
+/// Story 1.2 / Pass B: when a lesson carries `valid_from`/`valid_to` fields
+/// (model-detected temporal scope), the written memory is immediately stamped
+/// via `mark_memory_temporal` (event-sourced, rebuild-safe).  This is optional
+/// and cheap-model-gated — without a cheap model there are no temporal tags
+/// (graceful: most memories have no bound).
 pub fn distill_and_record(
     start: &Path,
     view: &str,
@@ -214,9 +236,13 @@ pub fn distill_and_record(
             _ => MemoryKind::Fact,
         };
         let text = lesson.lesson.trim();
-        let ok = match scope {
+        // Capture temporal fields before moving `lesson`.
+        let valid_from = lesson.valid_from.clone();
+        let valid_to = lesson.valid_to.clone();
+
+        let memory_id_opt: Option<String> = match scope {
             MemoryScope::GlobalUser => {
-                project::add_memory(start, MemoryScope::GlobalUser, kind, text).is_ok()
+                project::add_memory(start, MemoryScope::GlobalUser, kind, text).ok()
             }
             _ => project::propose_or_merge_memory(
                 start,
@@ -226,9 +252,54 @@ pub fn distill_and_record(
                 lesson.confidence.clamp(0.0, 1.0),
                 "auto-harvested at session end",
             )
-            .is_ok(),
+            .ok()
+            .and_then(|r| match r {
+                project::ProposeResult::Added(id) | project::ProposeResult::Merged(id) => Some(id),
+                project::ProposeResult::Duplicate(id) => Some(id),
+                project::ProposeResult::Proposed(_) => None,
+            }),
         };
-        if ok {
+
+        if let Some(memory_id) = memory_id_opt {
+            // Story 1.2 / Pass B: stamp temporal bounds when the model emitted them.
+            // Only valid_from / valid_to that look like ISO-8601 dates are stamped;
+            // we skip the stamp when both are None (the common case) to avoid the
+            // round-trip cost. Best-effort: a stamp failure never blocks recording.
+            let has_temporal = valid_from.is_some() || valid_to.is_some();
+            if has_temporal {
+                // Load the project connection to stamp the memory.
+                // For GlobalUser scope the memory lives in the user brain DB;
+                // use the user-brain open path.
+                let stamp_result = if scope == MemoryScope::GlobalUser {
+                    kimetsu_brain::user_brain::open_user_brain()
+                        .ok()
+                        .flatten()
+                        .map(|conn| {
+                            kimetsu_brain::projector::mark_memory_temporal(
+                                &conn,
+                                &memory_id,
+                                valid_from.as_deref(),
+                                valid_to.as_deref(),
+                            )
+                        })
+                } else {
+                    // Project scope: load the project DB.
+                    kimetsu_core::paths::ProjectPaths::discover(start)
+                        .ok()
+                        .and_then(|paths| rusqlite::Connection::open(&paths.brain_db).ok())
+                        .map(|conn| {
+                            kimetsu_brain::projector::mark_memory_temporal(
+                                &conn,
+                                &memory_id,
+                                valid_from.as_deref(),
+                                valid_to.as_deref(),
+                            )
+                        })
+                };
+                if let Some(Err(e)) = stamp_result {
+                    eprintln!("kimetsu-distiller: temporal stamp failed for {memory_id}: {e}");
+                }
+            }
             recorded += 1;
         }
     }
@@ -795,6 +866,69 @@ mod tests {
         let lessons = parse_lessons("[{\"lesson\":\"use arr[0] not arr.first\"}]");
         assert_eq!(lessons.len(), 1);
         assert_eq!(lessons[0].lesson, "use arr[0] not arr.first");
+    }
+
+    // ── Story 1.2 / Pass B: temporal-tagged lesson parsing ───────────────
+
+    /// Pass B: the distiller's Lesson struct accepts and surfaces optional
+    /// valid_from / valid_to fields without rejecting timeless lessons.
+    #[test]
+    fn parse_lessons_with_temporal_tags() {
+        let json = r#"[
+            {"lesson": "works on Python 3.11", "tags": ["python"], "kind": "convention",
+             "confidence": 0.9, "valid_from": "2023-04-05T00:00:00Z", "valid_to": null},
+            {"lesson": "deprecated in v3.0", "tags": ["api"], "kind": "semantic_operator",
+             "confidence": 0.8, "valid_from": null, "valid_to": "2025-01-01T00:00:00Z"},
+            {"lesson": "timeless fact", "tags": ["rust"], "confidence": 0.85}
+        ]"#;
+        let lessons = parse_lessons(json);
+        assert_eq!(lessons.len(), 3, "all 3 lessons must parse");
+
+        // Lesson 0: has valid_from only.
+        assert_eq!(
+            lessons[0].valid_from.as_deref(),
+            Some("2023-04-05T00:00:00Z"),
+            "valid_from must be parsed"
+        );
+        assert!(
+            lessons[0].valid_to.is_none(),
+            "null valid_to must deserialize to None"
+        );
+
+        // Lesson 1: has valid_to only.
+        assert!(
+            lessons[1].valid_from.is_none(),
+            "null valid_from must deserialize to None"
+        );
+        assert_eq!(
+            lessons[1].valid_to.as_deref(),
+            Some("2025-01-01T00:00:00Z"),
+            "valid_to must be parsed"
+        );
+
+        // Lesson 2: timeless — both fields absent → None.
+        assert!(
+            lessons[2].valid_from.is_none(),
+            "absent valid_from must default to None"
+        );
+        assert!(
+            lessons[2].valid_to.is_none(),
+            "absent valid_to must default to None"
+        );
+    }
+
+    /// Pass B: temporal fields do not affect the 3-lesson cap or empty-lesson
+    /// filter — those rules operate on `lesson` text, not temporal fields.
+    #[test]
+    fn parse_lessons_temporal_does_not_break_caps() {
+        let json = r#"[
+            {"lesson": "a", "valid_from": "2023-01-01T00:00:00Z"},
+            {"lesson": "b", "valid_to": "2024-01-01T00:00:00Z"},
+            {"lesson": "c"},
+            {"lesson": "d"}
+        ]"#;
+        let lessons = parse_lessons(json);
+        assert_eq!(lessons.len(), 3, "cap at 3 must still apply");
     }
 
     #[test]
