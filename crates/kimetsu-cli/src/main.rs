@@ -10064,6 +10064,75 @@ fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
         key_to_id.insert(mem.key.clone(), id);
     }
+
+    // ── 4b. Apply temporal validity state ────────────────────────────────────
+    // Flagship 1 Pass A: for memories with `valid_to` or `superseded_by_key`,
+    // stamp the temporal state so validity-aware retrieval can exclude them.
+    // Memories without these fields are unchanged — existing fixtures are safe.
+    {
+        use kimetsu_brain::projector::mark_memory_temporal;
+        use kimetsu_core::paths::ProjectPaths;
+
+        let needs_temporal = fixture
+            .memories
+            .iter()
+            .any(|m| m.valid_to.is_some() || m.superseded_by_key.is_some());
+
+        if needs_temporal {
+            let paths = ProjectPaths::discover(&tmp_root)
+                .map_err(|e| format!("discover paths for temporal seeding: {e}"))?;
+            let conn = rusqlite::Connection::open(&paths.brain_db)
+                .map_err(|e| format!("open brain_db for temporal seeding: {e}"))?;
+            kimetsu_brain::schema::initialize(&conn)
+                .map_err(|e| format!("initialize brain for temporal seeding: {e}"))?;
+
+            for mem in &fixture.memories {
+                if mem.valid_to.is_none() && mem.superseded_by_key.is_none() {
+                    continue;
+                }
+                let memory_id = match key_to_id.get(&mem.key) {
+                    Some(id) => id.clone(),
+                    None => continue,
+                };
+
+                // Stamp valid_to (expiry) via the memory.temporal event so the
+                // action is event-sourced and rebuild-safe.
+                if let Some(ref vt) = mem.valid_to {
+                    mark_memory_temporal(&conn, &memory_id, None, Some(vt.as_str()))
+                        .map_err(|e| format!("mark_memory_temporal valid_to {:?}: {e}", mem.key))?;
+                }
+
+                // Stamp superseded_by via a direct SQL update.
+                // We use a direct UPDATE rather than a full memory.superseded event
+                // because the bench seeder just needs the retrieval exclusion; it
+                // doesn't need the full edge + citation reassignment that the
+                // consolidation path does.
+                if let Some(ref survivor_key) = mem.superseded_by_key {
+                    if let Some(survivor_id) = key_to_id.get(survivor_key) {
+                        conn.execute(
+                            "UPDATE memories SET superseded_by = ?2 WHERE memory_id = ?1",
+                            rusqlite::params![&memory_id, survivor_id],
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "stamp superseded_by {:?} → {:?}: {e}",
+                                mem.key, survivor_key
+                            )
+                        })?;
+                        // Also remove from FTS so FTS path doesn't surface it.
+                        conn.execute(
+                            "DELETE FROM memories_fts WHERE memory_id = ?1",
+                            rusqlite::params![&memory_id],
+                        )
+                        .map_err(|e| {
+                            format!("delete memories_fts for superseded {:?}: {e}", mem.key)
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+
     let seed_ms = t_seed.elapsed().as_millis();
     let id_to_key: HashMap<String, String> = key_to_id
         .iter()

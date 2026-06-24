@@ -167,6 +167,8 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // Story 3.1: near-duplicate merge — stamp superseded_by on merged members,
         // remove their FTS rows, and drop them from the ANN index.
         "memory.superseded" => apply_memory_superseded(conn, event),
+        // Flagship 1 / Story 1.4: temporal validity — stamp valid_from / valid_to.
+        "memory.temporal" => apply_memory_temporal(conn, event),
         // Flagship 1 / Story 1.3: episodic work-resume.
         "work.episode" => crate::episode::project_work_episode(conn, event),
         _ => Ok(()),
@@ -755,6 +757,94 @@ fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()
     Ok(())
 }
 
+/// Flagship 1 / Story 1.4: project a `memory.temporal` event.
+///
+/// Payload fields:
+///   `memory_id`  — the memory whose validity window is being stamped.
+///   `valid_from` — optional RFC 3339 lower bound (inclusive). NULL = "since creation".
+///   `valid_to`   — optional RFC 3339 upper bound (exclusive). NULL = "never expires".
+///                  When set to a past timestamp the memory is "expired" and the
+///                  default retrieval path (`valid_to IS NULL OR valid_to > now`)
+///                  will exclude it.
+///
+/// The update is additive: only the fields present in the payload are written.
+/// A `memory.temporal` event with only `valid_to` leaves `valid_from` unchanged.
+fn apply_memory_temporal(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let valid_from = event
+        .payload
+        .get("valid_from")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let valid_to = event
+        .payload
+        .get("valid_to")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Build a partial update: only stamp the fields that are present in the payload.
+    // Both absent → no-op (caller sent an empty event — treat gracefully).
+    match (valid_from, valid_to) {
+        (Some(vf), Some(vt)) => {
+            conn.execute(
+                "UPDATE memories SET valid_from = ?2, valid_to = ?3 WHERE memory_id = ?1",
+                params![memory_id, vf, vt],
+            )?;
+        }
+        (Some(vf), None) => {
+            conn.execute(
+                "UPDATE memories SET valid_from = ?2 WHERE memory_id = ?1",
+                params![memory_id, vf],
+            )?;
+        }
+        (None, Some(vt)) => {
+            conn.execute(
+                "UPDATE memories SET valid_to = ?2 WHERE memory_id = ?1",
+                params![memory_id, vt],
+            )?;
+        }
+        (None, None) => {} // no-op
+    }
+    Ok(())
+}
+
+/// Flagship 1 / Story 1.4: programmatic API for stamping a memory's temporal
+/// validity window.
+///
+/// Emits a `memory.temporal` event into the event log (so the action is
+/// rebuild-safe and replay-correct) and applies it immediately by projecting
+/// it into the `memories` table.
+///
+/// Used by the bench seeder (`brain_bench_single`) and will be used by
+/// Flagship 1 Pass B (resolution) once it is implemented.
+///
+/// `valid_from` and `valid_to` are RFC 3339 / ISO-8601 strings. Pass `None`
+/// to leave a bound unchanged.
+pub fn mark_memory_temporal(
+    conn: &Connection,
+    memory_id: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<()> {
+    // Build a synthetic event to go through the standard projection path.
+    // We use a throwaway RunId (zero ULID) since this is an out-of-band
+    // operation (not part of a live agent run).
+    use kimetsu_core::ids::RunId;
+    let run_id = RunId::new();
+    let mut payload = serde_json::json!({ "memory_id": memory_id });
+    if let Some(vf) = valid_from {
+        payload["valid_from"] = serde_json::Value::String(vf.to_string());
+    }
+    if let Some(vt) = valid_to {
+        payload["valid_to"] = serde_json::Value::String(vt.to_string());
+    }
+    let event = kimetsu_core::event::Event::new(run_id, "memory.temporal", payload);
+    // Use apply_event so the event is persisted AND projected in one step.
+    apply_event(conn, &event)
+}
+
 /// S5.2: insert a typed edge into `memory_edges`.
 ///
 /// This is the **single canonical path** for writing to `memory_edges`.
@@ -958,6 +1048,12 @@ mod tests {
     #[test]
     fn empty_payload_work_episode() {
         assert_empty_payload_ok("work.episode");
+    }
+
+    // F1A: empty payload memory.temporal must not panic/error.
+    #[test]
+    fn empty_payload_memory_temporal() {
+        assert_empty_payload_ok("memory.temporal");
     }
 
     // ------------------------------------------------------------------
@@ -1308,6 +1404,81 @@ mod tests {
             "citation rationale leaked: {rationale}"
         );
         assert!(rationale.contains("[REDACTED:anthropic_oauth]"));
+    }
+
+    // ------------------------------------------------------------------
+    // F1A: memory.temporal event stamps valid_from/valid_to and survives
+    // rebuild_in_place (rebuild-safe).
+    // ------------------------------------------------------------------
+    #[test]
+    fn memory_temporal_stamps_validity_and_survives_rebuild() {
+        use super::{mark_memory_temporal, rebuild_in_place};
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let mem_id = "mem-temporal-test";
+
+        let events = vec![make_event(
+            run_id,
+            "memory.accepted",
+            json!({
+                "memory_id": mem_id,
+                "text": "old fact that expired",
+                "scope": "project",
+                "kind": "fact",
+                "confidence": 0.9
+            }),
+        )];
+        apply_events(&conn, &events).expect("apply_events");
+
+        // Stamp valid_to to a past timestamp (expired).
+        mark_memory_temporal(
+            &conn,
+            mem_id,
+            Some("2020-01-01T00:00:00Z"),
+            Some("2025-01-01T00:00:00Z"),
+        )
+        .expect("mark_memory_temporal");
+
+        // Verify both columns are set.
+        let (vf, vt): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT valid_from, valid_to FROM memories WHERE memory_id = ?1",
+                [mem_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query valid_from/valid_to");
+        assert_eq!(
+            vf.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "valid_from must be set"
+        );
+        assert_eq!(
+            vt.as_deref(),
+            Some("2025-01-01T00:00:00Z"),
+            "valid_to must be set"
+        );
+
+        // Rebuild in-place: temporal state must be restored from the event log.
+        rebuild_in_place(&conn).expect("rebuild_in_place");
+
+        let (vf2, vt2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT valid_from, valid_to FROM memories WHERE memory_id = ?1",
+                [mem_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query valid_from/valid_to after rebuild");
+        assert_eq!(
+            vf2.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "valid_from must survive rebuild_in_place"
+        );
+        assert_eq!(
+            vt2.as_deref(),
+            Some("2025-01-01T00:00:00Z"),
+            "valid_to must survive rebuild_in_place"
+        );
     }
 
     #[test]

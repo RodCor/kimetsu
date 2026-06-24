@@ -739,6 +739,97 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
     })
 }
 
+/// History/lineage path: search memories including expired ones (valid_to in the past).
+///
+/// This is the companion to `retrieve_context` for cases where you WANT to see
+/// superseded, expired, or historically-valid memories — e.g. `kimetsu brain memory list`,
+/// blame attribution, and lineage inspection.  The default retrieval path
+/// (`retrieve_context` / `memory_candidates`) always excludes expired memories.
+///
+/// Returns the most recent `limit` active memories (invalidated_at IS NULL,
+/// superseded_by IS NULL) including those whose `valid_to` has passed.
+/// Superseded and invalidated rows are excluded (those are never valid for injection;
+/// the `blame` path has its own direct SQL for those).
+pub fn search_memories_including_expired(
+    conn: &Connection,
+    limit: u32,
+) -> KimetsuResult<Vec<ContextCapsule>> {
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT memory_id, scope, kind, text, confidence, created_at,
+               use_count, usefulness_score, valid_from, valid_to
+        FROM memories
+        WHERE invalidated_at IS NULL
+          AND superseded_by IS NULL
+        ORDER BY created_at DESC
+        LIMIT ?1
+        ",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f32>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, f64>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+        ))
+    })?;
+    let now_utc = OffsetDateTime::now_utc();
+    let now_rfc3339 = now_utc
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let mut capsules = Vec::new();
+    for row in rows {
+        let (
+            memory_id,
+            scope,
+            kind,
+            text,
+            confidence,
+            created_at,
+            _use_count,
+            _usefulness,
+            _valid_from,
+            valid_to,
+        ) = row?;
+        let freshness = freshness(&created_at);
+        let scope_weight = scope_weight(&scope);
+        // Annotate expired memories so callers can identify them in history output.
+        let suffix = if let Some(ref vt) = valid_to {
+            if vt.as_str() < now_rfc3339.as_str() {
+                format!(" [expired valid_to={vt}]")
+            } else {
+                format!(" [valid_to={vt}]")
+            }
+        } else {
+            String::new()
+        };
+        capsules.push(ContextCapsule {
+            id: new_id().to_string(),
+            kind: "memory".to_string(),
+            summary: format!("{scope}:{kind} - {text}{suffix}"),
+            token_estimate: estimate_tokens(&text) + 8,
+            expansion_handle: format!("memory:{memory_id}"),
+            provenance: vec![ProvenanceRef {
+                source: "Memory".to_string(),
+                id: memory_id,
+                excerpt: Some(excerpt(&text)),
+            }],
+            confidence,
+            freshness,
+            relevance: 0.0,
+            scope_weight,
+            score: 0.0,
+        });
+    }
+    Ok(capsules)
+}
+
 pub fn search_repo_files(
     conn: &Connection,
     repo_root: &str,
@@ -811,6 +902,7 @@ fn memory_ann_candidates(
          FROM   memories
          WHERE  invalidated_at IS NULL
            AND  superseded_by IS NULL
+           AND  (valid_to IS NULL OR valid_to > datetime('now'))
            AND  embedding_model = ?{model_param}
            AND  rowid IN ({placeholders})",
         model_param = knn_rowids.len() + 1
@@ -993,6 +1085,7 @@ fn latest_memory_candidates(
         FROM memories
         WHERE invalidated_at IS NULL
           AND superseded_by IS NULL
+          AND (valid_to IS NULL OR valid_to > datetime('now'))
         ORDER BY created_at DESC
         LIMIT ?1
         ",
@@ -1074,6 +1167,7 @@ fn memory_fts_candidates(
           ON m.memory_id = memories_fts.memory_id
         WHERE m.invalidated_at IS NULL
           AND m.superseded_by IS NULL
+          AND (m.valid_to IS NULL OR m.valid_to > datetime('now'))
           AND memories_fts MATCH ?1
         ORDER BY rank
         LIMIT ?2
