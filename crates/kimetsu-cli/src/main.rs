@@ -1423,6 +1423,19 @@ struct ContextArgs {
 enum MemoryCommand {
     /// Add a durable memory directly.
     Add(MemoryAddArgs),
+    /// Add many memories at once from a JSONL file, JSON array, or stdin.
+    ///
+    /// Each JSONL line or array element must be a JSON object with at least a
+    /// `"text"` field.  Optional fields: `"scope"` (default: project),
+    /// `"kind"` (default: fact), `"valid_from"` (RFC 3339), `"valid_to"` (RFC 3339).
+    ///
+    /// Pass `-` as FILE to read from stdin.
+    ///
+    /// Example (JSONL):
+    ///   {"text": "Use cargo fmt --all before committing", "kind": "convention"}
+    ///   {"text": "Prefer explicit error types", "scope": "repo", "kind": "convention"}
+    #[command(name = "add-batch")]
+    AddBatch(MemoryAddBatchArgs),
     /// List active memories with usefulness stats.
     List,
     /// List pending proposals awaiting review.
@@ -1507,6 +1520,25 @@ struct MemoryAddArgs {
     kind: String,
     /// The memory text to store.
     text: String,
+}
+
+/// Args for `kimetsu brain memory add-batch`.
+#[derive(Debug, Args)]
+struct MemoryAddBatchArgs {
+    /// Path to a JSONL file (one JSON object per line) or a JSON array file.
+    /// Use `-` to read from stdin.
+    file: String,
+    /// Default scope applied to entries that omit `"scope"`.
+    /// Overridden per-entry by the entry's own `"scope"` field.
+    #[arg(long, default_value = "project")]
+    scope: String,
+    /// Default kind applied to entries that omit `"kind"`.
+    /// Overridden per-entry by the entry's own `"kind"` field.
+    #[arg(long, default_value = "fact")]
+    kind: String,
+    /// Emit a JSON report: `{"added": N, "ids": [...]}` instead of plain text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -7744,6 +7776,7 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
             println!("memory_id: {id}");
             Ok(())
         }
+        MemoryCommand::AddBatch(args) => memory_add_batch(args),
         MemoryCommand::List => {
             let memories = project::list_memories(&env::current_dir()?)?;
             if memories.is_empty() {
@@ -8105,6 +8138,134 @@ fn memory_undo(args: MemoryUndoArgs) -> KimetsuResult<()> {
             // Edge case: someone invalidated the memory between our peek and
             // the undo call (concurrent write). Report gracefully.
             println!("no active memories to undo");
+        }
+    }
+
+    Ok(())
+}
+
+/// `kimetsu brain memory add-batch` — ingest many memories in one process.
+///
+/// Reads a JSONL file (one JSON object per line) or a JSON array from FILE
+/// (or stdin when FILE is `-`).  Processes all entries with the project and
+/// embedder opened exactly once — far cheaper than spawning one
+/// `memory add` subprocess per entry.
+///
+/// Each JSON object must have a `"text"` field.  Optional fields:
+///   `"scope"` — overrides --scope for this entry
+///   `"kind"`  — overrides --kind for this entry
+///   `"valid_from"` / `"valid_to"` — RFC 3339 temporal bounds (Flagship 1)
+fn memory_add_batch(args: MemoryAddBatchArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::project::BatchMemoryEntry;
+
+    let default_scope = MemoryScope::from_str(&args.scope)?;
+    let default_kind = MemoryKind::from_str(&args.kind)?;
+
+    // Read raw bytes from file or stdin.
+    let raw: String = if args.file == "-" {
+        let stdin = io::stdin();
+        let mut s = String::new();
+        for line in stdin.lock().lines() {
+            let line = line.map_err(|e| format!("stdin read error: {e}"))?;
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s
+    } else {
+        std::fs::read_to_string(&args.file)
+            .map_err(|e| format!("cannot read '{}': {e}", args.file))?
+    };
+
+    // Parse as JSON array first; fall back to JSONL (one object per line).
+    // This handles both `[{...},{...}]` and `{...}\n{...}` formats.
+    #[derive(serde::Deserialize)]
+    struct RawEntry {
+        text: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        valid_from: Option<String>,
+        #[serde(default)]
+        valid_to: Option<String>,
+    }
+
+    let raw_entries: Vec<RawEntry> = {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') {
+            // JSON array format.
+            serde_json::from_str(trimmed).map_err(|e| format!("failed to parse JSON array: {e}"))?
+        } else {
+            // JSONL format: parse each non-empty line.
+            let mut entries = Vec::new();
+            for (line_no, line) in trimmed.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let entry: RawEntry = serde_json::from_str(line)
+                    .map_err(|e| format!("failed to parse JSONL line {}: {e}", line_no + 1))?;
+                entries.push(entry);
+            }
+            entries
+        }
+    };
+
+    if raw_entries.is_empty() {
+        if args.json {
+            println!("{{\"added\":0,\"ids\":[]}}");
+        } else {
+            println!("added 0 memories");
+        }
+        return Ok(());
+    }
+
+    // Convert to BatchMemoryEntry, resolving scope/kind per entry.
+    let mut entries: Vec<BatchMemoryEntry> = Vec::with_capacity(raw_entries.len());
+    for (i, re) in raw_entries.into_iter().enumerate() {
+        let scope = match re.scope.as_deref() {
+            Some(s) => {
+                MemoryScope::from_str(s).map_err(|e| format!("entry {i}: invalid scope: {e}"))?
+            }
+            None => default_scope,
+        };
+        let kind = match re.kind.as_deref() {
+            Some(k) => {
+                MemoryKind::from_str(k).map_err(|e| format!("entry {i}: invalid kind: {e}"))?
+            }
+            None => default_kind,
+        };
+        entries.push(BatchMemoryEntry {
+            text: re.text,
+            scope,
+            kind,
+            valid_from: re.valid_from,
+            valid_to: re.valid_to,
+        });
+    }
+
+    let n = entries.len();
+    let ids = project::add_memories_batch(&env::current_dir()?, entries)?;
+
+    if args.json {
+        let out = serde_json::json!({"added": ids.len(), "ids": ids});
+        println!("{}", serde_json::to_string(&out)?);
+    } else {
+        println!(
+            "added {} memor{}",
+            ids.len(),
+            if ids.len() == 1 { "y" } else { "ies" }
+        );
+        if ids.len() < n {
+            // Some were deduped — note the difference.
+            let deduped = n - ids.len();
+            // Actually ids.len() == n always; deduped entries still return an id.
+            // This branch is unreachable but kept for clarity.
+            eprintln!(
+                "kimetsu-brain: {deduped} entr{} were duplicates (existing id returned)",
+                if deduped == 1 { "y" } else { "ies" }
+            );
         }
     }
 
