@@ -656,6 +656,26 @@ pub fn show_run(start: &Path, run_id: &str) -> KimetsuResult<Option<RunSummary>>
     }
 }
 
+/// One entry in a [`add_memories_batch`] call.
+///
+/// `text` is required; all other fields are optional and fall back to
+/// the defaults documented on each field.
+#[derive(Debug, Clone)]
+pub struct BatchMemoryEntry {
+    /// The memory text to store.
+    pub text: String,
+    /// Scope to store under.  Defaults to `MemoryScope::Project`.
+    pub scope: MemoryScope,
+    /// Memory kind.  Defaults to `MemoryKind::Fact`.
+    pub kind: MemoryKind,
+    /// Flagship 1 / temporal: optional RFC 3339 valid-from bound.
+    /// `None` leaves the column NULL (valid forever from creation).
+    pub valid_from: Option<String>,
+    /// Flagship 1 / temporal: optional RFC 3339 valid-to bound.
+    /// `None` leaves the column NULL (no expiry).
+    pub valid_to: Option<String>,
+}
+
 pub fn add_memory(
     start: &Path,
     scope: MemoryScope,
@@ -714,6 +734,34 @@ pub fn add_memory(
     let (paths, config, conn) = load_project(start)?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory add", Some(run_id))?;
+
+    let embedder = embeddings::open_embedder_for(config.embedder.enabled);
+    add_memory_inner(
+        &conn, &paths, &config, scope, kind, text, None, None, embedder,
+    )
+}
+
+/// Per-entry core shared by [`add_memory`] and [`add_memories_batch`].
+///
+/// Takes an already-open connection + loaded config + resolved embedder so
+/// neither the project nor the embedder is re-initialized per call.
+/// The single-add path acquires the project lock once before calling this;
+/// the batch path acquires it once for the whole batch.
+///
+/// Returns the `memory_id` of the written (or deduped) memory.
+#[allow(clippy::too_many_arguments)]
+fn add_memory_inner(
+    conn: &Connection,
+    paths: &ProjectPaths,
+    config: &kimetsu_core::config::ProjectConfig,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+    embedder: &dyn embeddings::Embedder,
+) -> KimetsuResult<String> {
+    let run_id = RunId::new();
     let memory_id = Ulid::new().to_string();
     let normalized = normalize_memory_text(text);
 
@@ -802,7 +850,13 @@ pub fn add_memory(
         }),
     );
 
-    projector::apply_events(&conn, &[started, accepted, finished])?;
+    projector::apply_events(conn, &[started, accepted, finished])?;
+
+    // Flagship 1 / temporal: stamp valid_from / valid_to when requested.
+    // This is event-sourced (rebuild-safe) via mark_memory_temporal.
+    if valid_from.is_some() || valid_to.is_some() {
+        projector::mark_memory_temporal(conn, &memory_id, valid_from, valid_to)?;
+    }
 
     // v0.4.2: post-projection embedding write. v0.4.3 wired the
     // default embedder behind a feature flag — see
@@ -813,10 +867,10 @@ pub fn add_memory(
     // process-static OnceLock so we only pay model-load cost once.
     // W3.1: route through open_embedder_for so `[embedder] enabled = false`
     // in project.toml durably disables vector writes (FTS-only).
-    let embedder = embeddings::open_embedder_for(config.embedder.enabled);
+    //
     // embed_and_persist returns the computed vector so we can reuse it for
     // conflict detection without re-embedding (Fix 4c — halves embedding cost).
-    let embedding_vec = embeddings::embed_and_persist(&conn, &memory_id, text, embedder)?;
+    let embedding_vec = embeddings::embed_and_persist(conn, &memory_id, text, embedder)?;
 
     // Flagship 2 / Story 2.1: apply rarity bonus (requires embedding).
     // The kind-weight was already stored in the event; now compute the rarity
@@ -827,7 +881,7 @@ pub fn add_memory(
     if importance_enabled && !embedder.is_noop() {
         if let Some(vec) = embedding_vec.as_deref() {
             let rarity_bonus = {
-                let max_cos = max_corpus_cosine(&conn, vec);
+                let max_cos = max_corpus_cosine(conn, vec);
                 if max_cos < 0.5 { 0.1_f32 } else { 0.0 }
             };
             if rarity_bonus > 0.0 {
@@ -875,7 +929,7 @@ pub fn add_memory(
         if conflict::resolve_conflicts_enabled(config.ingestion.resolve_conflicts) {
             // Pass B: detect + auto-resolve.
             let (auto_resolved, queued) = conflict::detect_record_and_resolve_with_vec(
-                &conn,
+                conn,
                 &memory_id,
                 &scope,
                 &kind.to_string(),
@@ -900,7 +954,7 @@ pub fn add_memory(
         } else {
             // Detect-only (Pass A / disabled-resolution) path.
             let conflicts = conflict::detect_and_record_with_vec(
-                &conn,
+                conn,
                 &memory_id,
                 &scope,
                 &kind.to_string(),
@@ -918,6 +972,122 @@ pub fn add_memory(
     }
 
     Ok(memory_id)
+}
+
+/// Add many memories in one process: the project is opened and the embedder
+/// is initialized ONCE, then every entry is processed by [`add_memory_inner`].
+///
+/// This is the efficient ingest path for benchmarks (LongMemEval etc.) and
+/// bulk imports: the per-call overhead of `load_project` + embedder init is
+/// paid exactly once regardless of how many entries are in `entries`.
+///
+/// # Behaviour
+/// * Entries whose `scope` is `GlobalUser` are silently routed to the user
+///   brain (when enabled), exactly as the single-add path does.
+/// * Dedup, redaction, conflict detection, rarity scoring, and temporal
+///   stamping all apply per-entry — identical to the single-add path.
+/// * Returns `Vec<String>` of memory IDs in the same order as `entries`.
+///   Deduped entries return the existing memory ID (not an error).
+///
+/// # Errors
+/// The function opens the project once; if `load_project` fails the error is
+/// returned before any entries are processed. Per-entry failures propagate
+/// immediately (fail-fast), leaving already-written entries in the DB.
+pub fn add_memories_batch(
+    start: &Path,
+    entries: Vec<BatchMemoryEntry>,
+) -> KimetsuResult<Vec<String>> {
+    if entries.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Determine user-brain config (needed for GlobalUser routing) without
+    // requiring a valid project — same best-effort approach as single-add.
+    let use_user_brain = ProjectPaths::discover(start)
+        .ok()
+        .and_then(|paths| load_config(&paths).ok())
+        .map(|cfg| cfg.kimetsu.use_user_brain)
+        .unwrap_or(true);
+
+    // Open user brain once (if available) so GlobalUser entries share it.
+    let user_conn_opt = user_brain::open_user_brain_for_config(use_user_brain)?;
+
+    // Check whether any non-GlobalUser entries exist; only open the project
+    // if needed (avoids failing on user-only batches in non-project dirs).
+    let has_project_entries = entries.iter().any(|e| e.scope != MemoryScope::GlobalUser);
+
+    // Open project + embedder ONCE for all project-scoped entries.
+    let project_state: Option<(
+        ProjectPaths,
+        kimetsu_core::config::ProjectConfig,
+        Connection,
+    )> = if has_project_entries {
+        let state = load_project(start)?;
+        Some(state)
+    } else {
+        None
+    };
+
+    // Acquire project lock once for the whole batch (if we have a project).
+    let run_id_for_lock = RunId::new();
+    let _lock = if let Some((ref paths, _, _)) = project_state {
+        Some(ProjectLock::acquire(
+            paths,
+            "brain memory add-batch",
+            Some(run_id_for_lock),
+        )?)
+    } else {
+        None
+    };
+
+    // Resolve embedder once — the key perf benefit: model loaded once,
+    // not once per entry.
+    let embedder: &dyn embeddings::Embedder = if let Some((_, ref config, _)) = project_state {
+        embeddings::open_embedder_for(config.embedder.enabled)
+    } else {
+        &embeddings::NoopEmbedder
+    };
+
+    let mut ids = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        // Redact at the ingest boundary (same as single-add).
+        let redaction = redact::redact_secrets(&entry.text);
+        if redaction.was_redacted() {
+            eprintln!("kimetsu-brain: {}", redaction.summary());
+        }
+        let text = redaction.text.as_str();
+
+        if entry.scope == MemoryScope::GlobalUser {
+            // Route to user brain when available; otherwise fall through to
+            // project DB — same behaviour as the single-add path.
+            if let Some(ref uc) = user_conn_opt {
+                let id = user_brain::add_user_memory(uc, entry.kind, text, 1.0)?;
+                ids.push(id);
+                continue;
+            }
+            // Fall through: user brain disabled/unreachable, write to project.
+        }
+
+        let (paths, config, conn) = project_state
+            .as_ref()
+            .expect("project must be open when non-GlobalUser entries are present");
+
+        let id = add_memory_inner(
+            conn,
+            paths,
+            config,
+            entry.scope,
+            entry.kind,
+            text,
+            entry.valid_from.as_deref(),
+            entry.valid_to.as_deref(),
+            embedder,
+        )?;
+        ids.push(id);
+    }
+
+    Ok(ids)
 }
 
 /// v0.6: write a `memory.proposed` event (pending proposal) without
@@ -7069,6 +7239,284 @@ max_total_cost_usd = 250.0
             );
 
             std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // ── add_memories_batch ────────────────────────────────────────────────────
+
+    /// Core correctness: N memories added via add_memories_batch must be
+    /// present, retrievable, and survive rebuild_in_place — byte-identical to
+    /// memories written by individual add_memory calls.
+    ///
+    /// Embedding check: in the lean build the active embedder is NoopEmbedder
+    /// (embedding IS NULL), exactly the same as for single-add. In the
+    /// `--features embeddings` build a real model is loaded once and all
+    /// entries get non-NULL embeddings. The test asserts consistency: every
+    /// batch-added memory has the same embedding_model value as a single-added
+    /// memory written in the same process.
+    #[test]
+    fn add_memories_batch_present_retrievable_rebuild_safe() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            // --- Build 5 distinct batch entries ----------------------------
+            let entries: Vec<BatchMemoryEntry> = (1..=5)
+                .map(|i| BatchMemoryEntry {
+                    text: format!(
+                        "batch memory entry number {i} unique text for semantic distance"
+                    ),
+                    scope: kimetsu_core::memory::MemoryScope::Project,
+                    kind: kimetsu_core::memory::MemoryKind::Fact,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect();
+
+            let ids = add_memories_batch(&root, entries).expect("add_memories_batch");
+
+            // Correct count returned.
+            assert_eq!(ids.len(), 5, "expected 5 ids back; got {:?}", ids);
+            // All ids must be non-empty strings (valid ULIDs).
+            for id in &ids {
+                assert!(!id.is_empty(), "id must not be empty");
+            }
+
+            // --- All memories visible in list --------------------------------
+            let memories = list_memories(&root).expect("list_memories after batch");
+            assert_eq!(
+                memories.len(),
+                5,
+                "list_memories should return 5; got {:?}",
+                memories.iter().map(|m| &m.memory_id).collect::<Vec<_>>()
+            );
+            let stored_ids: Vec<_> = memories.iter().map(|m| m.memory_id.clone()).collect();
+            for id in &ids {
+                assert!(stored_ids.contains(id), "id {id} must be in list_memories");
+            }
+
+            // --- Embedding consistency: batch == single-add for this build ---
+            // Both paths call open_embedder_for once. In lean builds both
+            // produce NULL (Noop). In the embeddings build both produce a real
+            // model string. Confirm all batch rows share the same model as the
+            // reference single-add row.
+            let ref_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "single-add reference for embedding consistency check",
+            )
+            .expect("single add ref");
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load project");
+                let ref_model: Option<String> = conn
+                    .query_row(
+                        "SELECT embedding_model FROM memories WHERE memory_id = ?1",
+                        rusqlite::params![ref_id],
+                        |r| r.get(0),
+                    )
+                    .expect("query ref embedding_model");
+
+                // All batch-added memories must have the same embedding_model.
+                for id in &ids {
+                    let bm: Option<String> = conn
+                        .query_row(
+                            "SELECT embedding_model FROM memories WHERE memory_id = ?1",
+                            rusqlite::params![id],
+                            |r| r.get(0),
+                        )
+                        .expect("query batch embedding_model");
+                    assert_eq!(
+                        bm, ref_model,
+                        "batch memory {id} embedding_model ({bm:?}) must match single-add ref ({ref_model:?})"
+                    );
+                }
+            }
+
+            // --- Survive rebuild_in_place ------------------------------------
+            // After rebuild: 5 batch + 1 single-add = 6 active memories.
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load for rebuild");
+                crate::projector::rebuild_in_place(&conn).expect("rebuild_in_place");
+                let after_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories \
+                         WHERE invalidated_at IS NULL AND superseded_by IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("count after rebuild");
+                assert_eq!(
+                    after_count, 6,
+                    "all 6 memories (5 batch + 1 single) must survive rebuild_in_place; got {after_count}"
+                );
+                let rebuilt_ids: Vec<String> = {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT memory_id FROM memories \
+                             WHERE invalidated_at IS NULL AND superseded_by IS NULL",
+                        )
+                        .expect("prepare");
+                    stmt.query_map([], |r| r.get(0))
+                        .expect("query")
+                        .map(|r| r.expect("row"))
+                        .collect()
+                };
+                for id in &ids {
+                    assert!(
+                        rebuilt_ids.contains(id),
+                        "id {id} must survive rebuild_in_place"
+                    );
+                }
+            }
+
+            // --- Temporal fields (valid_from / valid_to) survive rebuild -----
+            let temporal_entries = vec![BatchMemoryEntry {
+                text: "batch temporal test this fact expires soon".to_string(),
+                scope: kimetsu_core::memory::MemoryScope::Project,
+                kind: kimetsu_core::memory::MemoryKind::Fact,
+                valid_from: Some("2025-01-01T00:00:00Z".to_string()),
+                valid_to: Some("2099-12-31T00:00:00Z".to_string()),
+            }];
+            let temporal_ids =
+                add_memories_batch(&root, temporal_entries).expect("add_memories_batch temporal");
+            assert_eq!(temporal_ids.len(), 1);
+            let temporal_id = &temporal_ids[0];
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load for temporal check");
+                let (vf, vt): (Option<String>, Option<String>) = conn
+                    .query_row(
+                        "SELECT valid_from, valid_to FROM memories WHERE memory_id = ?1",
+                        rusqlite::params![temporal_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .expect("query valid_from/valid_to");
+                assert!(
+                    vf.is_some(),
+                    "valid_from must be set for temporal batch entry"
+                );
+                assert!(
+                    vt.is_some(),
+                    "valid_to must be set for temporal batch entry"
+                );
+                // Survive rebuild.
+                crate::projector::rebuild_in_place(&conn).expect("rebuild temporal");
+                let (vf2, vt2): (Option<String>, Option<String>) = conn
+                    .query_row(
+                        "SELECT valid_from, valid_to FROM memories WHERE memory_id = ?1",
+                        rusqlite::params![temporal_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .expect("query after rebuild");
+                assert_eq!(vf, vf2, "valid_from must survive rebuild");
+                assert_eq!(vt, vt2, "valid_to must survive rebuild");
+            }
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    /// Dedup: calling add_memories_batch with the same text twice must return
+    /// the same memory_id both times without writing a duplicate row.
+    #[test]
+    fn add_memories_batch_deduplicates() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let text = "batch dedup test unique entry";
+            let entries = vec![
+                BatchMemoryEntry {
+                    text: text.to_string(),
+                    scope: kimetsu_core::memory::MemoryScope::Project,
+                    kind: kimetsu_core::memory::MemoryKind::Fact,
+                    valid_from: None,
+                    valid_to: None,
+                },
+                BatchMemoryEntry {
+                    text: text.to_string(),
+                    scope: kimetsu_core::memory::MemoryScope::Project,
+                    kind: kimetsu_core::memory::MemoryKind::Fact,
+                    valid_from: None,
+                    valid_to: None,
+                },
+            ];
+
+            let ids = add_memories_batch(&root, entries).expect("add_memories_batch dedup");
+            assert_eq!(ids.len(), 2);
+            assert_eq!(
+                ids[0], ids[1],
+                "duplicate text must return the same memory_id"
+            );
+
+            // Only one row in the DB.
+            let memories = list_memories(&root).expect("list");
+            assert_eq!(
+                memories.len(),
+                1,
+                "deduped batch must produce exactly 1 DB row; got {}",
+                memories.len()
+            );
+
+            fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    /// Embedder-loaded-once structural check: add_memories_batch calls
+    /// open_embedder_for exactly once before the loop. This test confirms that
+    /// all batch-added memories have the same embedding_model value — a
+    /// necessary condition for single-load: if the embedder were re-initialized
+    /// per entry, different initializations could produce different model ids.
+    ///
+    /// In the lean build all entries have NULL embedding_model (Noop).
+    /// In the embeddings build all entries share the same real model id.
+    /// Either way: all N values are identical.
+    #[test]
+    fn add_memories_batch_all_entries_same_embedding_model() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            fs::create_dir_all(&root).expect("create temp project");
+            init_project(&root, false).expect("init project");
+
+            let n = 8_usize;
+            let entries: Vec<BatchMemoryEntry> = (0..n)
+                .map(|i| BatchMemoryEntry {
+                    text: format!(
+                        "embedding model consistency test memory {i} distinct content here"
+                    ),
+                    scope: kimetsu_core::memory::MemoryScope::Project,
+                    kind: kimetsu_core::memory::MemoryKind::Convention,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect();
+
+            let ids = add_memories_batch(&root, entries).expect("add_memories_batch");
+            assert_eq!(ids.len(), n);
+
+            let (_paths, _config, conn) = load_project(&root).expect("load project");
+            let model_id_rows: Vec<Option<String>> = {
+                let mut stmt = conn
+                    .prepare("SELECT embedding_model FROM memories ORDER BY created_at")
+                    .expect("prepare");
+                stmt.query_map([], |r| r.get(0))
+                    .expect("query")
+                    .map(|r| r.expect("row"))
+                    .collect()
+            };
+            assert_eq!(model_id_rows.len(), n, "expected {n} rows");
+            // All entries must share the same embedding_model value (even if NULL).
+            let first = &model_id_rows[0];
+            for (i, model_id) in model_id_rows.iter().enumerate() {
+                assert_eq!(
+                    model_id, first,
+                    "memory {i} embedding_model ({model_id:?}) must match first ({first:?})"
+                );
+            }
+
+            fs::remove_dir_all(&root).ok();
         });
     }
 }
