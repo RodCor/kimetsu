@@ -97,6 +97,11 @@ recall@4 0.975, MRR 0.933. Swap embedder and reranker with one config key each
 and re-judge on your own corpus. Full grid in
 **[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**.
 
+Beyond recall, Kimetsu measures memory *correctness* — whether stale facts stay
+out of retrieval and contradictions resolve to the current answer. Full
+methodology and results in
+**[the memory benchmark](https://rodcor.github.io/kimetsu/docs/memory-benchmark)**.
+
 ---
 
 ## Quickstart
