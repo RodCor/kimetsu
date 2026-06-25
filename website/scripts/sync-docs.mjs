@@ -26,10 +26,11 @@ const DOCS = [
   { src: 'docs/INSTALL.md',          out: 'install.md',           title: 'Install & Host Wiring', pos: 3 },
   { src: 'docs/LOCAL-MODELS.md',     out: 'local-models.md',      title: 'Local Models',          pos: 4 },
   { src: 'docs/REMOTE.md',           out: 'remote.md',            title: 'Kimetsu Remote',        pos: 5 },
-  { src: 'docs/ROI-METHODOLOGY.md',  out: 'roi-methodology.md',   title: 'ROI Methodology',       pos: 6 },
-  { src: 'docs/CONTRIBUTING.md',     out: 'contributing.md',      title: 'Contributing',          pos: 7 },
-  { src: 'docs/CODE_OF_CONDUCT.md',  out: 'code-of-conduct.md',   title: 'Code of Conduct',       pos: 8 },
-  { src: 'CHANGELOG.md',             out: 'changelog.md',         title: 'Changelog',             pos: 9 },
+  { src: 'docs/MEMORY-BENCHMARK.md', out: 'memory-benchmark.md',  title: 'Memory Benchmark',      pos: 6 },
+  { src: 'docs/ROI-METHODOLOGY.md',  out: 'roi-methodology.md',   title: 'ROI Methodology',       pos: 7 },
+  { src: 'docs/CONTRIBUTING.md',     out: 'contributing.md',      title: 'Contributing',          pos: 8 },
+  { src: 'docs/CODE_OF_CONDUCT.md',  out: 'code-of-conduct.md',   title: 'Code of Conduct',       pos: 9 },
+  { src: 'CHANGELOG.md',             out: 'changelog.md',         title: 'Changelog',             pos: 10 },
 ];
 
 const stripBom = (s) => s.replace(/^﻿/, '');
