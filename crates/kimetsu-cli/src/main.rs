@@ -1474,11 +1474,27 @@ struct BrainExportArgs {
     /// lesson body with no metadata.
     #[arg(long)]
     redact_tags: bool,
+    /// v3.0 #4: pack name. Setting any manifest flag (--name/--version/
+    /// --description) writes a self-describing shareable PACK envelope; without
+    /// them, the bare memory array (back-compat). Output is ALWAYS gzip-compressed.
+    #[arg(long)]
+    name: Option<String>,
+    /// Pack version (e.g. 1.0.0).
+    #[arg(long)]
+    version: Option<String>,
+    /// Pack description.
+    #[arg(long)]
+    description: Option<String>,
+    /// Abort the export if the security scrub finds ANY credential or PII
+    /// (instead of redacting + reporting). Use when publishing to fail loudly.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Args)]
 struct BrainImportArgs {
-    /// Input file path. Use `-` to read from stdin.
+    /// Input pack file path, `-` for stdin, or an http(s):// URL (installs from
+    /// the marketplace). Gzip-compressed OR plain JSON is auto-detected.
     file: String,
     /// Override the scope for every imported entry (global_user|project|repo|run).
     #[arg(long)]
@@ -1486,6 +1502,15 @@ struct BrainImportArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// v3.0 #4: install mode. `merge` (default) adds the pack additively, dedups
+    /// against what you have. `replace` supersedes your current memories in the
+    /// pack's scope(s) first (reversible — invalidated, not deleted), then loads
+    /// the pack; requires --yes.
+    #[arg(long, default_value = "merge")]
+    mode: String,
+    /// Confirm a destructive `--mode replace`.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -4682,20 +4707,88 @@ fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
         })
         .transpose()?;
 
-    let memories =
+    let (memories, scrub) =
         project::export_memories(&workspace, scope, kind, args.redact, args.redact_tags)?;
-    let json = serde_json::to_string_pretty(&memories)
-        .map_err(|e| format!("brain export: failed to serialize: {e}"))?;
+
+    // Security scrub report (always runs). --strict refuses to ship a finding.
+    if !scrub.is_clean() {
+        if args.strict {
+            return Err(format!(
+                "brain export --strict: {} — fix the source memories or drop --strict",
+                scrub.summary()
+            )
+            .into());
+        }
+        eprintln!("kimetsu: export security scrub — {}", scrub.summary());
+    }
+
+    let count = memories.len();
+    // Pack envelope when any manifest flag is set; else the bare array.
+    let is_pack = args.name.is_some() || args.version.is_some() || args.description.is_some();
+    let json = if is_pack {
+        let pack = project::Pack {
+            kimetsu_pack: 1,
+            name: args.name.clone(),
+            version: args.version.clone(),
+            description: args.description.clone(),
+            exported_at: Some(
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            ),
+            memory_count: memories.len(),
+            memories,
+        };
+        serde_json::to_string_pretty(&pack)
+    } else {
+        serde_json::to_string_pretty(&memories)
+    }
+    .map_err(|e| format!("brain export: failed to serialize: {e}"))?;
 
     if args.file == "-" {
+        // stdout: emit plain JSON (piping a gzip stream to a terminal is useless).
         println!("{json}");
     } else {
-        std::fs::write(&args.file, &json)
+        // Packs are ALWAYS gzip-compressed on disk (JSON can get large).
+        let gz =
+            gzip_bytes(json.as_bytes()).map_err(|e| format!("brain export: gzip failed: {e}"))?;
+        std::fs::write(&args.file, &gz)
             .map_err(|e| format!("brain export: could not write `{}`: {e}", args.file))?;
-        println!("exported {} memories to {}", memories.len(), args.file);
+        println!(
+            "exported {count} memories to {} ({} bytes, gzip{})",
+            args.file,
+            gz.len(),
+            if is_pack { ", pack" } else { "" }
+        );
     }
 
     Ok(())
+}
+
+/// gzip-compress `data` (flate2, default compression).
+fn gzip_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data)?;
+    enc.finish()
+}
+
+/// gunzip `data` when it carries the gzip magic (`1f 8b`); else return it as-is
+/// (back-compat with old plain-JSON exports). Returns the decoded UTF-8 string.
+fn maybe_gunzip_to_string(data: &[u8]) -> KimetsuResult<String> {
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut out = String::new();
+        GzDecoder::new(data)
+            .read_to_string(&mut out)
+            .map_err(|e| format!("gunzip failed: {e}"))?;
+        Ok(out)
+    } else {
+        String::from_utf8(data.to_vec()).map_err(|e| format!("pack is not UTF-8: {e}").into())
+    }
 }
 
 /// `kimetsu brain import <file> [--scope-override]`
@@ -4719,31 +4812,80 @@ fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         })
         .transpose()?;
 
-    // Read JSON.
-    let json = if args.file == "-" {
+    // Mode.
+    let replace = match args.mode.as_str() {
+        "merge" => false,
+        "replace" => {
+            if !args.yes {
+                return Err(
+                    "brain import --mode replace will SUPERSEDE your current memories \
+                            in the pack's scope(s) (reversible) — re-run with --yes to confirm"
+                        .into(),
+                );
+            }
+            true
+        }
+        other => {
+            return Err(format!("brain import: unknown --mode `{other}` (merge|replace)").into());
+        }
+    };
+
+    // Read raw bytes from a path, stdin (`-`), or an http(s):// URL.
+    let bytes: Vec<u8> = if args.file == "-" {
         use std::io::Read;
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         std::io::stdin()
-            .read_to_string(&mut buf)
+            .read_to_end(&mut buf)
             .map_err(|e| format!("brain import: failed to read stdin: {e}"))?;
         buf
+    } else if args.file.starts_with("http://") || args.file.starts_with("https://") {
+        let resp = reqwest::blocking::get(&args.file)
+            .map_err(|e| format!("brain import: fetch {} failed: {e}", args.file))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "brain import: {} returned HTTP {}",
+                args.file,
+                resp.status()
+            )
+            .into());
+        }
+        resp.bytes()
+            .map_err(|e| format!("brain import: read body failed: {e}"))?
+            .to_vec()
     } else {
-        std::fs::read_to_string(&args.file)
+        std::fs::read(&args.file)
             .map_err(|e| format!("brain import: could not read `{}`: {e}", args.file))?
     };
 
-    let entries: Vec<project::MemoryExport> = serde_json::from_str(&json).map_err(|e| {
-        format!(
-            "brain import: `{}` is not valid JSON — expected an array of memory export records: {e}",
-            args.file
-        )
-    })?;
+    // Decompress if gzip; then parse a Pack envelope OR a bare array (back-compat).
+    let json = maybe_gunzip_to_string(&bytes)?;
+    let (pack_ref, entries) = project::parse_pack_or_array(&json)
+        .map_err(|e| format!("brain import: `{}`: {e}", args.file))?;
 
-    let summary = project::import_memories(&workspace, &entries, scope_override)?;
-    println!(
-        "imported {} (deduped {})",
-        summary.imported, summary.deduped
-    );
+    let summary = project::import_pack(
+        &workspace,
+        &entries,
+        scope_override,
+        replace,
+        Some(&pack_ref),
+    )?;
+
+    let label = match (&pack_ref.name, &pack_ref.version) {
+        (Some(n), Some(v)) => format!(" (pack {n}@{v})"),
+        (Some(n), None) => format!(" (pack {n})"),
+        _ => String::new(),
+    };
+    if summary.superseded > 0 {
+        println!(
+            "installed {}, deduped {}, superseded {}{label}",
+            summary.imported, summary.deduped, summary.superseded
+        );
+    } else {
+        println!(
+            "installed {}, deduped {}{label}",
+            summary.imported, summary.deduped
+        );
+    }
 
     Ok(())
 }

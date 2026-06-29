@@ -49,6 +49,7 @@ kimetsu-chat = { path = "../kimetsu-chat", version = "2.5.0" }
 kimetsu-core = { path = "../kimetsu-core", version = "2.5.0" }
 # v0.4.6: `kimetsu doctor` serializes its report struct so --json
 # output can be piped into CI / hooks.
+flate2 = "1"
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
