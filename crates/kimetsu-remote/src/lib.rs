@@ -34,6 +34,18 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     let auth = config::build_auth(&args)?;
     let data_dir = prepare_data_dir(&args.data)?;
 
+    // Slice C: this server's node id (HLC node + origin machine). Set the clock
+    // node ONCE so server-written events sort/attribute as this server, distinct
+    // from teammates' local brains when this brain syncs out.
+    let server_node = args
+        .node
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "remote".to_string());
+    kimetsu_core::clock::set_node(server_node.clone());
+
     // Cross-project brain: off by default (standalone repos). With --org-brain,
     // point the user brain at that shared dir and force it on, so global_user
     // memories are shared + merged into every repo's retrieval.
@@ -87,8 +99,9 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     #[cfg(not(feature = "embeddings"))]
     let reranker: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = None;
 
-    let mut state =
-        AppState::with_rate_limit(data_dir, auth, args.rate_limit).with_reranker(reranker);
+    let mut state = AppState::with_rate_limit(data_dir, auth, args.rate_limit)
+        .with_reranker(reranker)
+        .with_node(server_node);
     if let Some(ing) = ingest {
         state = state.with_ingest(std::sync::Arc::new(ing));
     }

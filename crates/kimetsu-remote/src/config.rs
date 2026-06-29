@@ -77,6 +77,13 @@ pub struct ServeArgs {
     #[arg(long, default_value = "jina-reranker-v1-tiny-en")]
     pub reranker: String,
 
+    /// v3.0 #3 Slice C: this server's node id — the HLC node and the machine part
+    /// of each write's `origin` (`<node>/user:<name>`). Defaults to the hostname,
+    /// else "remote". Keep it stable + unique per server so a synced team brain can
+    /// attribute and order server-written events.
+    #[arg(long)]
+    pub node: Option<String>,
+
     /// Tracing filter (else `RUST_LOG` / `KIMETSU_LOG`).
     #[arg(long)]
     pub log: Option<String>,
@@ -88,6 +95,10 @@ struct TokensFile {
     global: Vec<String>,
     #[serde(default)]
     per_repo: HashMap<String, Vec<String>>,
+    /// v3.0 #3 Slice C: token → display name for per-user write attribution.
+    /// Optional `[names]` table; absent in pre-Slice-C tokens files.
+    #[serde(default)]
+    names: HashMap<String, String>,
 }
 
 /// Assemble the auth config from `--token`, `KIMETSU_REMOTE_TOKEN`, and an
@@ -123,6 +134,8 @@ pub fn build_auth(args: &ServeArgs) -> Result<AuthConfig, String> {
             }
             auth.per_repo.insert(canonical, toks);
         }
+        // Slice C: token → display name for write attribution.
+        auth.token_names.extend(parsed.names);
     }
 
     auth.global.retain(|t| !t.trim().is_empty());
@@ -159,6 +172,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             reranker: "jina-reranker-v1-tiny-en".to_string(),
+            node: None,
             log: None,
         }
     }

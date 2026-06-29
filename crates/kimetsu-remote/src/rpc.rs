@@ -277,13 +277,32 @@ async fn dispatch_request(
     let skills = state.skills.clone();
     let method = req.method.clone();
     let params = req.params.clone();
+    // Slice C: attribute this request's writes to the authenticated user. Each
+    // request runs on ONE blocking thread, so an OriginScope set inside the
+    // closure is visible to Event::new during the write and cleared on return
+    // (tokio reuses blocking threads, so the RAII restore is essential).
+    let origin = format!(
+        "{}/user:{}",
+        state.server_node,
+        crate::auth::user_for_token(&state.auth, bearer)
+    );
+    let tool_name = tool_name_of(&req.method, &req.params);
     let res = tokio::task::spawn_blocking(move || {
+        let _scope = kimetsu_core::event::OriginScope::new(origin);
         kimetsu_chat::dispatch(&method, params, &root, skills.as_ref(), Some(allow))
     })
     .await;
 
     match res {
-        Ok(Ok(value)) => (Outcome::Ok, jsonrpc_ok(id, value, session)),
+        Ok(Ok(value)) => {
+            // Slice C: count successful memory-write tool calls (aggregate).
+            if let Some(name) = &tool_name {
+                if crate::metrics::is_write_tool(name) {
+                    state.metrics.record_write();
+                }
+            }
+            (Outcome::Ok, jsonrpc_ok(id, value, session))
+        }
         // App-level tool errors ride the body with HTTP 200 — the request was
         // served, so it counts as `ok` for metrics.
         Ok(Err(msg)) => (
@@ -301,6 +320,18 @@ async fn dispatch_request(
             ),
         ),
     }
+}
+
+/// The tool name of a `tools/call` request, if any (Slice C: used to count
+/// successful writes).
+fn tool_name_of(method: &str, params: &Value) -> Option<String> {
+    if method != "tools/call" {
+        return None;
+    }
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn requires_global_memory_grant(method: &str, params: &Value) -> bool {

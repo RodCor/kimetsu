@@ -34,6 +34,7 @@ fn state(dir: &std::path::Path) -> AppState {
     let auth = AuthConfig {
         global: vec!["T".to_string()],
         per_repo: Default::default(),
+        ..Default::default()
     };
     AppState::new(dir.to_path_buf(), auth)
 }
@@ -42,6 +43,7 @@ fn state_with_reranker(dir: &std::path::Path) -> AppState {
     let auth = AuthConfig {
         global: vec!["T".to_string()],
         per_repo: Default::default(),
+        ..Default::default()
     };
     let rr: Box<dyn kimetsu_brain::embeddings::Reranker> = Box::new(StubReranker);
     AppState::new(dir.to_path_buf(), auth).with_reranker(Some(rr))
