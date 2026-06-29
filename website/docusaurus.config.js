@@ -5,7 +5,8 @@ import {themes as prismThemes} from 'prism-react-renderer';
 const config = {
   title: 'Kimetsu',
   tagline: 'Proactive memory for AI coding agents',
-  favicon: 'img/favicon.ico',
+  // Kimetsu-branded square SVG favicon (replaces the Docusaurus default .ico).
+  favicon: 'img/logo.svg',
 
   future: {
     v4: true,
