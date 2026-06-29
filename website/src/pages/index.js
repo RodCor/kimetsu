@@ -60,6 +60,32 @@ function Metrics() {
   );
 }
 
+function Benchmark() {
+  return (
+    <section className={styles.benchmark}>
+      <div className={clsx('container', styles.benchmarkInner)}>
+        <div className={styles.benchmarkCard}>
+          <div className={styles.benchmarkValue}>86.7%</div>
+          <div className={styles.benchmarkText}>
+            <Heading as="h3" className={styles.benchmarkTitle}>
+              At or above SOTA on LongMemEval, and not even our best measure
+            </Heading>
+            <p className={styles.benchmarkBody}>
+              On the public long-term-memory benchmark, Kimetsu scores <strong>86.7%</strong>,
+              at or above the field's published band. And that <em>understates</em> the brain:
+              the benchmark bypasses Kimetsu's write path and runs in the chat domain, not the
+              coding domain we build for.
+            </p>
+            <Link className={styles.benchmarkLink} to="/docs/memory-benchmark">
+              Read the benchmark →
+            </Link>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function Features() {
   const features = [
     {
@@ -80,7 +106,7 @@ function Features() {
     },
     {
       title: 'Works with your agent',
-      body: 'Claude Code, Codex, Pi, OpenClaw, Cursor, Gemini CLI. One command to wire any supported host, or use kimetsu chat standalone.',
+      body: 'Claude Code, Codex, Pi, OpenClaw, Cursor. One command to wire any supported host, or use kimetsu chat standalone.',
     },
     {
       title: 'Configurable',
@@ -111,6 +137,7 @@ export default function Home() {
       description="Proactive, local memory for AI coding agents. Kimetsu is a sidecar brain that learns which memories help and compounds knowledge across sessions.">
       <Hero />
       <Metrics />
+      <Benchmark />
       <Features />
     </Layout>
   );

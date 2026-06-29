@@ -6,8 +6,8 @@ every commit, and in CI on every pull request.
 
 ## Branches
 
-- **`main`** — released, stable. Protected; changes land via PR.
-- **`develop`** — integration branch for in-flight work. Branch your
+- **`main`**: released, stable. Protected; changes land via PR.
+- **`develop`**: integration branch for in-flight work. Branch your
   feature work off `develop` and open PRs back into it.
 - Release tags (`vX.Y.Z`) are cut from `main` and drive the publish
   pipeline (`.github/workflows/release.yml`).
@@ -28,8 +28,8 @@ The hook enforces `cargo fmt --all --check` (blocking) and runs
 `cargo clippy --workspace` in advisory mode (prints findings, does not
 block) on staged Rust changes. Escape hatches when you need them:
 
-- `SKIP_CLIPPY=1 git commit …` — formatting only (faster).
-- `git commit --no-verify …` — skip the hook (discouraged; CI will still
+- `SKIP_CLIPPY=1 git commit …`: formatting only (faster).
+- `git commit --no-verify …`: skip the hook (discouraged; CI will still
   catch issues).
 
 ## The checks
@@ -41,9 +41,9 @@ local commit means a green PR.
 |-------|:------------------:|:------------------------------:|:---------:|
 | `cargo fmt --all --check` | ✅ | ✅ | yes |
 | `cargo clippy --workspace` | ✅ (advisory) | ✅ | advisory* |
-| `cargo test --workspace` | — | ✅ (ubuntu + macOS) | yes |
-| `cargo-audit` (RUSTSEC advisories) | — | ✅ | yes |
-| `cargo-deny` (licenses + bans) | — | ✅ | advisory* |
+| `cargo test --workspace` | n/a | ✅ (ubuntu + macOS) | yes |
+| `cargo-audit` (RUSTSEC advisories) | n/a | ✅ | yes |
+| `cargo-deny` (licenses + bans) | n/a | ✅ | advisory* |
 
 \* clippy and cargo-deny run on every PR but do not block merges yet
 (`continue-on-error` in `ci.yml`). main carries a small pre-existing

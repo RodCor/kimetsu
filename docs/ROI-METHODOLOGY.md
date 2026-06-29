@@ -1,7 +1,7 @@
-# ROI Methodology — `kimetsu brain roi`
+# ROI Methodology: `kimetsu brain roi`
 
 > **Source of truth for the per-kind constants:**
-> `crates/kimetsu-brain/src/roi.rs` — `SAVED_TOKENS_PER_CITATION`
+> `crates/kimetsu-brain/src/roi.rs`, `SAVED_TOKENS_PER_CITATION`
 
 ---
 
@@ -17,7 +17,7 @@ net_usd                = net_tokens / 1_000_000 × price_per_mtok
   to runs via `runs.started_at` or to the hook sentinel via `memory_citations.cited_at`).
 - **`injected_tokens`**: sum of the `used_tokens` field across `context.injected`
   events in the window.  This is the actual token cost the brain added to each
-  prompt — the "spent" side of the ledger.
+  prompt: the "spent" side of the ledger.
 - **`price_per_mtok`**: resolved from `[model] price_per_mtok` in `project.toml`
   (user override), falling back to the built-in approximate table in `roi.rs`.
   Unknown models produce `usd: null` in the JSON output rather than a
@@ -31,8 +31,8 @@ net_usd                = net_tokens / 1_000_000 × price_per_mtok
 |-------------------|------------------------:|-----------|
 | `failure_pattern` |                   1 500 | Avoids the "try → fail → diagnose → fix" loop. Estimated at ~3 tool calls × ~500 tokens/call. |
 | `fact`            |                     500 | Avoids a docs lookup or user question. ~1 exchange. |
-| `command`         |                     400 | Avoids a `--help` trial or web search. ~1–2 tool calls. |
-| `convention`      |                     300 | Avoids a code-search to find the project pattern. ~1–2 searches. |
+| `command`         |                     400 | Avoids a `--help` trial or web search. ~1-2 tool calls. |
+| `convention`      |                     300 | Avoids a code-search to find the project pattern. ~1-2 searches. |
 | `preference`      |                     200 | Avoids one clarifying question. ~1 exchange. |
 
 **These are deliberate under-estimates.**  The goal is for every "net positive"
@@ -45,13 +45,13 @@ number should be able to believe it.
 
 Kimetsu's ROI story is built on honesty:
 
-1. **Net CAN be negative** — and is shown as such.  If the brain injected more
+1. **Net CAN be negative**, and is shown as such.  If the brain injected more
    tokens than it saved (e.g. every retrieved memory was a silent passenger), the
    ledger says so.
-2. **Constants are calibrated low** — the actual avoided cost of re-discovering
+2. **Constants are calibrated low**: the actual avoided cost of re-discovering
    a `failure_pattern` is often much higher (the model might run the same broken
    command five times before giving up).  We use a conservative floor.
-3. **Citations are sparse in MCP hosts** — Claude Code currently has no
+3. **Citations are sparse in MCP hosts**: Claude Code currently has no
    `kimetsu_brain_cite` tool, so the `memory_citations` table is populated only
    when the pipeline (`run coding`) is in use.  The ledger will under-count
    savings in pure MCP-host sessions until the cite tool ships.  That's fine:
@@ -73,7 +73,7 @@ The per-kind constants were back-derived from this data: if a typical winning
 run uses ~2 citations of mixed kinds, the implied saving is roughly
 ($2.47 − $0.19) / 2 ≈ $1.14/citation at Claude Sonnet 3.5 pricing
 (≈$3/MTok → ~380k tokens / citation).  Our constants sum to far less than
-that for a 2-citation session — confirming that we are well inside the
+that for a 2-citation session, confirming that we are well inside the
 conservative zone.
 
 ---
@@ -99,7 +99,7 @@ conservative zone.
 ## Config reference
 
 ```toml
-# project.toml — override the built-in price table for this project
+# project.toml: override the built-in price table for this project
 [model]
 model = "claude-sonnet-4-7"
 price_per_mtok = 3.0   # optional; defaults to built-in table

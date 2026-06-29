@@ -592,7 +592,14 @@ pub fn load_config(paths: &ProjectPaths) -> KimetsuResult<ProjectConfig> {
             paths.project_toml.display()
         )
     })?;
-    ProjectConfig::from_toml(&content)
+    let mut config = ProjectConfig::from_toml(&content)?;
+    // Resolve the [retrieval] level preset into [embedder].enabled +
+    // [embedder].reranker BEFORE returning, so every retrieval consumer
+    // (the config.embedder.enabled sites + the daemon reranker resolution)
+    // sees the resolved values automatically. "custom" (the default) is a
+    // no-op, so configs without [retrieval] are byte-identical in behaviour.
+    config.apply_retrieval_level();
+    Ok(config)
 }
 
 /// D2: Parse a project config from raw TOML text. Used by `config edit`
@@ -675,6 +682,18 @@ pub struct BatchMemoryEntry {
     /// `None` leaves the column NULL (no expiry).
     pub valid_to: Option<String>,
 }
+
+/// Initial confidence for a directly-added memory (`memory add` / `add-batch`).
+///
+/// Story 2.4 follow-up: a freshly written memory is asserted but UNPROVEN, so it
+/// must not start at the 1.0 ceiling. The outcome-update path nudges confidence
+/// toward 1.0 on citation (asymptoting to the 0.99 clamp) and toward 0.0 on
+/// regret, so a default below the clamp leaves headroom for a proven memory to
+/// outrank a never-evaluated one — instead of every fresh memory pinning at the
+/// top. All directly-added memories share this value, so retrieval ranking and
+/// contradiction resolution (which compare confidence) are unchanged for the
+/// uniform case; the value only matters once outcomes differentiate memories.
+const DIRECT_ADD_CONFIDENCE: f32 = 0.85;
 
 pub fn add_memory(
     start: &Path,
@@ -829,7 +848,7 @@ fn add_memory_inner(
             "kind": kind.to_string(),
             "text": text,
             "normalized_text": normalized,
-            "confidence": 1.0,
+            "confidence": DIRECT_ADD_CONFIDENCE,
             "initial_usefulness": initial_kind_weight,
             "provenance_snapshot": {
                 "source": "manual_cli",
@@ -936,7 +955,7 @@ fn add_memory_inner(
                 text,
                 embedding_vec.as_deref(),
                 embedder,
-                1.0, // add_memory always writes with confidence = 1.0
+                DIRECT_ADD_CONFIDENCE, // matches the memory.accepted event above
                 &new_created_at,
             );
             if auto_resolved > 0 {
@@ -2878,6 +2897,54 @@ pub fn record_mcp_citation(start: &Path, memory_id: &str, note: Option<&str>) ->
     // Best-effort regret check.
     emit_regret_for_cited_memories(start, std::slice::from_ref(&event));
 
+    Ok(())
+}
+
+/// Inject a `retrieval.regret` telemetry event for a memory.
+///
+/// The auto-path ([`emit_regret_for_cited_memories`]) only fires when a memory
+/// was dropped by a retrieval floor and then cited anyway. This is the explicit
+/// path (the `kimetsu brain regret` CLI / benchmarks): it records the negative
+/// signal directly so lifecycle review and calibration can be exercised without
+/// reproducing the full drop-then-cite dance.
+pub fn record_regret(start: &Path, memory_id: &str) -> KimetsuResult<()> {
+    let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+
+    // Use the sentinel run id (no active run) and PROJECT the event so the
+    // outcome handler (`apply_retrieval_regret`) runs live, not just on rebuild.
+    let sentinel_run_id = RunId(ulid::Ulid::nil());
+    let event = kimetsu_core::event::Event::new(
+        sentinel_run_id,
+        "retrieval.regret",
+        serde_json::json!({ "memory_id": memory_id, "source": "manual" }),
+    );
+    projector::apply_events(&conn, std::slice::from_ref(&event))?;
+    Ok(())
+}
+
+/// Backdate a memory's `created_at` / `last_useful_at` by `days_ago` days via a
+/// `memory.aged` event. A testing/benchmark affordance for exercising
+/// age-sensitive policies (forgetting). The absolute target timestamp is stored
+/// in the event payload, so replay on rebuild is deterministic.
+pub fn record_set_age(start: &Path, memory_id: &str, days_ago: u32) -> KimetsuResult<()> {
+    use time::format_description::well_known::Rfc3339;
+
+    let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
+    let conn = Connection::open(&paths.brain_db)?;
+    schema::initialize(&conn)?;
+
+    let target = time::OffsetDateTime::now_utc() - time::Duration::days(days_ago as i64);
+    let ts = target.format(&Rfc3339).unwrap_or_default();
+
+    let sentinel_run_id = RunId(ulid::Ulid::nil());
+    let event = kimetsu_core::event::Event::new(
+        sentinel_run_id,
+        "memory.aged",
+        serde_json::json!({ "memory_id": memory_id, "created_at": ts, "last_useful_at": ts }),
+    );
+    projector::apply_events(&conn, std::slice::from_ref(&event))?;
     Ok(())
 }
 
@@ -7049,6 +7116,234 @@ max_total_cost_usd = 250.0
             assert_eq!(
                 row_count, 1,
                 "memory_citations row must exist after MCP cite"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // Phase 2 keyless: record_regret injects a retrieval.regret event.
+    #[test]
+    fn record_regret_writes_retrieval_regret_event() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "record_regret test fixture",
+            )
+            .expect("add memory");
+
+            record_regret(&root, &memory_id).expect("record_regret");
+
+            let (_paths, _config, conn) = load_project(&root).expect("load");
+            let event_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE kind = 'retrieval.regret'
+                       AND json_extract(payload_json, '$.memory_id') = ?1",
+                    rusqlite::params![&memory_id],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                event_count, 1,
+                "a retrieval.regret event must exist for the memory after record_regret"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // Story 2.4: read (use_count, usefulness_score, confidence) for a memory.
+    #[cfg(test)]
+    fn read_outcome_stats(root: &std::path::Path, memory_id: &str) -> (i64, f64, f64) {
+        let (_paths, _config, conn) = load_project(root).expect("load");
+        conn.query_row(
+            "SELECT use_count, usefulness_score, confidence FROM memories WHERE memory_id = ?1",
+            rusqlite::params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("stats")
+    }
+
+    // Story 2.4: a standalone citation raises use_count + usefulness (outcome
+    // signal applied because the run_id is the sentinel).
+    #[test]
+    fn standalone_cite_raises_usefulness() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "standalone cite outcome fixture",
+            )
+            .expect("add memory");
+
+            let (uc0, us0, cf0) = read_outcome_stats(&root, &memory_id);
+            record_mcp_citation(&root, &memory_id, None).expect("cite");
+            let (uc1, us1, cf1) = read_outcome_stats(&root, &memory_id);
+
+            assert_eq!(uc1, uc0 + 1, "use_count must increment on standalone cite");
+            assert!(us1 > us0, "usefulness must rise: {us0} -> {us1}");
+            // A fresh memory starts below the ceiling (DIRECT_ADD_CONFIDENCE), so a
+            // positive outcome nudges confidence UP toward 1.0 — letting a proven
+            // memory outrank a never-evaluated one.
+            assert!(
+                cf1 > cf0,
+                "confidence must rise toward 1.0 on a positive outcome: {cf0} -> {cf1}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // Story 2.4: a manual regret lowers usefulness AND confidence.
+    #[test]
+    fn manual_regret_lowers_usefulness_and_confidence() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "manual regret outcome fixture",
+            )
+            .expect("add memory");
+
+            let (_uc0, us0, cf0) = read_outcome_stats(&root, &memory_id);
+            record_regret(&root, &memory_id).expect("regret");
+            let (_uc1, us1, cf1) = read_outcome_stats(&root, &memory_id);
+
+            assert!(us1 < us0, "usefulness must drop on regret: {us0} -> {us1}");
+            assert!(cf1 < cf0, "confidence must drop on regret: {cf0} -> {cf1}");
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // Story 2.4 safety: a citation tied to a REAL run does NOT bump stats in
+    // apply_memory_cited (the run-finalization path owns that) — no double-count.
+    #[test]
+    fn real_run_cite_does_not_bump_in_apply_memory_cited() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "real run cite fixture",
+            )
+            .expect("add memory");
+
+            let (uc0, us0, _cf0) = read_outcome_stats(&root, &memory_id);
+
+            // A memory.cited event with a NON-nil (real) run_id.
+            let real_run = kimetsu_core::ids::RunId::new();
+            let event = kimetsu_core::event::Event::new(
+                real_run,
+                "memory.cited",
+                serde_json::json!({ "memory_id": memory_id, "turn": 0 }),
+            );
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                crate::projector::apply_events(&conn, std::slice::from_ref(&event)).expect("apply");
+            }
+
+            let (uc1, us1, _cf1) = read_outcome_stats(&root, &memory_id);
+            assert_eq!(uc1, uc0, "real-run cite must NOT increment use_count here");
+            assert!(
+                (us1 - us0).abs() < 1e-9,
+                "real-run cite must NOT change usefulness here"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // Story 2.4: outcome stats are event-sourced — a full rebuild replays the
+    // cite/regret events and reproduces the same use_count/usefulness/confidence.
+    #[test]
+    fn cite_outcome_survives_rebuild() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "rebuild outcome fixture",
+            )
+            .expect("add memory");
+            record_mcp_citation(&root, &memory_id, None).expect("cite");
+
+            let before = read_outcome_stats(&root, &memory_id);
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                crate::projector::rebuild_in_place(&conn).expect("rebuild");
+            }
+            let after = read_outcome_stats(&root, &memory_id);
+            assert_eq!(before.0, after.0, "use_count must survive rebuild");
+            assert!(
+                (before.1 - after.1).abs() < 1e-9,
+                "usefulness must survive rebuild"
+            );
+            assert!(
+                (before.2 - after.2).abs() < 1e-9,
+                "confidence must survive rebuild"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // Age injection: set-age backdates created_at (and survives rebuild).
+    #[test]
+    fn set_age_backdates_created_at_and_survives_rebuild() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            std::fs::create_dir_all(&root).expect("create root");
+            init_project(&root, false).expect("init");
+            let memory_id = add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "age injection fixture",
+            )
+            .expect("add memory");
+
+            let read_created = |root: &std::path::Path| -> String {
+                let (_paths, _config, conn) = load_project(root).expect("load");
+                conn.query_row(
+                    "SELECT created_at FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![&memory_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .expect("created_at")
+            };
+
+            let created0 = read_created(&root);
+            record_set_age(&root, &memory_id, 90).expect("set-age");
+            let created1 = read_created(&root);
+            // RFC3339 strings sort chronologically; 90 days ago < now.
+            assert!(
+                created1 < created0,
+                "created_at must move into the past: {created0} -> {created1}"
+            );
+
+            {
+                let (_paths, _config, conn) = load_project(&root).expect("load");
+                crate::projector::rebuild_in_place(&conn).expect("rebuild");
+            }
+            assert_eq!(
+                read_created(&root),
+                created1,
+                "aged created_at survives rebuild"
             );
             std::fs::remove_dir_all(&root).ok();
         });

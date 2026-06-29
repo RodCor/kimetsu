@@ -118,6 +118,60 @@
   margin-top: 0.15rem;
 }
 
+/* ---- Benchmark banner ------------------------------------------------- */
+.benchmark {
+  padding: 3.5rem 1rem;
+  border-bottom: 1px solid var(--k-border);
+}
+
+.benchmarkInner {
+  display: flex;
+  justify-content: center;
+}
+
+.benchmarkCard {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  max-width: 820px;
+  background: var(--k-surface);
+  border: 1px solid var(--k-border);
+  border-radius: 14px;
+  padding: 2rem 2.25rem;
+  transition: border-color 160ms ease;
+}
+.benchmarkCard:hover {
+  border-color: var(--ifm-color-primary);
+}
+
+.benchmarkValue {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 3.2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ifm-color-primary);
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.benchmarkTitle {
+  font-size: 1.2rem;
+  font-weight: 650;
+  margin: 0 0 0.5rem;
+}
+
+.benchmarkBody {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--k-text-muted);
+  margin: 0 0 0.75rem;
+}
+
+.benchmarkLink {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
 /* ---- Features --------------------------------------------------------- */
 .features {
   padding: 4rem 1rem 5rem;
@@ -185,10 +239,20 @@
   .install {
     font-size: 0.85rem;
   }
+  .benchmarkCard {
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1.5rem;
+    text-align: center;
+  }
+  .benchmarkValue {
+    font-size: 2.6rem;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card {
+  .card,
+  .benchmarkCard {
     transition: none;
   }
   .card:hover {

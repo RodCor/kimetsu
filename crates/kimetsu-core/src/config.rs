@@ -46,6 +46,16 @@ pub struct ProjectConfig {
     /// regret threshold 5, proposal expiry 30d, auto-accept disabled).
     #[serde(default)]
     pub lifecycle: LifecycleSection,
+    /// Retrieval pipeline preset. A single knob that bundles the retrieval
+    /// stack (embedder.enabled + embedder.reranker + HyDE) so users pick one
+    /// `level` instead of tuning each piece by hand. `#[serde(default)]`
+    /// keeps every existing project.toml loading cleanly: absent ⇒
+    /// `level = "custom"`, which is a no-op and leaves `[embedder]` exactly
+    /// as configured (byte-identical behaviour to before this field existed).
+    /// Resolved into `[embedder]` at config-load time by
+    /// [`ProjectConfig::apply_retrieval_level`].
+    #[serde(default)]
+    pub retrieval: RetrievalSection,
 }
 
 impl ProjectConfig {
@@ -68,7 +78,54 @@ impl ProjectConfig {
             storage: StorageSection::default(),
             sync: SyncSection::default(),
             lifecycle: LifecycleSection::default(),
+            // NEW projects ship on "deep" (semantic + rerank), the
+            // recommended default. Existing project.toml files that omit
+            // [retrieval] get "custom" via #[serde(default)] and so behave
+            // exactly as before.
+            retrieval: RetrievalSection {
+                level: "deep".to_string(),
+            },
         }
+    }
+
+    /// Apply the retrieval-level preset, mutating `embedder.enabled` +
+    /// `embedder.reranker` to match the configured `[retrieval] level`.
+    ///
+    /// Resolution:
+    ///   - `basic`    ⇒ embedder off, reranker off (FTS lexical only).
+    ///   - `flexible` ⇒ embedder on,  reranker off (semantic, no rerank).
+    ///   - `deep`     ⇒ embedder on,  reranker `ms-marco-tinybert-l-2-v2`.
+    ///   - `advanced` ⇒ same as `deep`, plus HyDE (see [`Self::hyde_from_level`]).
+    ///   - `custom`/unknown ⇒ no-op: use the configured `[embedder]` values
+    ///     as-is (the escape hatch for manual tuning).
+    ///
+    /// Called once at the load chokepoint (`load_config`) so every retrieval
+    /// consumer sees the resolved `[embedder]` values automatically.
+    pub fn apply_retrieval_level(&mut self) {
+        match self.retrieval.level.as_str() {
+            "basic" => {
+                self.embedder.enabled = false;
+                self.embedder.reranker = "off".to_string();
+            }
+            "flexible" => {
+                self.embedder.enabled = true;
+                self.embedder.reranker = "off".to_string();
+            }
+            "deep" => {
+                self.embedder.enabled = true;
+                self.embedder.reranker = "ms-marco-tinybert-l-2-v2".to_string();
+            }
+            "advanced" => {
+                self.embedder.enabled = true;
+                self.embedder.reranker = "ms-marco-tinybert-l-2-v2".to_string();
+            }
+            _ => {} // "custom" or unknown: leave as configured
+        }
+    }
+
+    /// True when the configured level enables HyDE query expansion.
+    pub fn hyde_from_level(&self) -> bool {
+        self.retrieval.level == "advanced"
     }
 
     /// S1.2: resolve the effective cheap-model config.
@@ -212,6 +269,30 @@ impl Default for EmbedderSection {
             reranker: default_reranker_id(),
         }
     }
+}
+
+/// Retrieval pipeline preset. A single `level` knob bundles the retrieval
+/// stack so users do not have to tune the embedder, reranker, and HyDE
+/// individually. Resolved into `[embedder]` (+ a HyDE flag) at config-load
+/// time by [`ProjectConfig::apply_retrieval_level`] /
+/// [`ProjectConfig::hyde_from_level`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalSection {
+    /// Retrieval pipeline preset: "basic" | "flexible" | "deep" | "advanced" | "custom".
+    #[serde(default = "default_retrieval_level")]
+    pub level: String,
+}
+
+impl Default for RetrievalSection {
+    fn default() -> Self {
+        Self {
+            level: default_retrieval_level(),
+        }
+    }
+}
+
+fn default_retrieval_level() -> String {
+    "custom".to_string()
 }
 
 /// v0.8.5: automatic memory harvesting. When `auto_harvest` is on, the
@@ -1217,6 +1298,76 @@ max_total_cost_usd = 250.0
             config.sync.machine_id.is_empty(),
             "sync.machine_id must default to empty string when absent"
         );
+        // Retrieval levels: a project.toml without [retrieval] must load
+        // cleanly and default to level = "custom", which is a no-op so the
+        // [embedder] values above are used exactly as configured.
+        assert_eq!(
+            config.retrieval.level, "custom",
+            "retrieval.level must default to \"custom\" when absent"
+        );
+    }
+
+    /// Each retrieval level must resolve into the documented
+    /// `embedder.enabled` + `embedder.reranker` (+ HyDE) preset.
+    #[test]
+    fn retrieval_level_resolves_embedder_and_reranker() {
+        // basic: lexical only — embedder off, reranker off.
+        let mut basic = ProjectConfig::default_for_project("p");
+        basic.retrieval.level = "basic".to_string();
+        basic.apply_retrieval_level();
+        assert!(!basic.embedder.enabled);
+        assert_eq!(basic.embedder.reranker, "off");
+        assert!(!basic.hyde_from_level());
+
+        // flexible: semantic, no rerank — embedder on, reranker off.
+        let mut flexible = ProjectConfig::default_for_project("p");
+        flexible.retrieval.level = "flexible".to_string();
+        flexible.apply_retrieval_level();
+        assert!(flexible.embedder.enabled);
+        assert_eq!(flexible.embedder.reranker, "off");
+        assert!(!flexible.hyde_from_level());
+
+        // deep: semantic + rerank — embedder on, reranker tinybert.
+        let mut deep = ProjectConfig::default_for_project("p");
+        deep.retrieval.level = "deep".to_string();
+        deep.apply_retrieval_level();
+        assert!(deep.embedder.enabled);
+        assert_eq!(deep.embedder.reranker, "ms-marco-tinybert-l-2-v2");
+        assert!(!deep.hyde_from_level());
+
+        // advanced: semantic + rerank + HyDE.
+        let mut advanced = ProjectConfig::default_for_project("p");
+        advanced.retrieval.level = "advanced".to_string();
+        advanced.apply_retrieval_level();
+        assert!(advanced.embedder.enabled);
+        assert_eq!(advanced.embedder.reranker, "ms-marco-tinybert-l-2-v2");
+        assert!(
+            advanced.hyde_from_level(),
+            "advanced level must enable HyDE"
+        );
+
+        // custom: no-op — hand-set [embedder] values are left untouched.
+        let mut custom = ProjectConfig::default_for_project("p");
+        custom.retrieval.level = "custom".to_string();
+        custom.embedder.enabled = false;
+        custom.embedder.reranker = "bge-reranker-base".to_string();
+        custom.apply_retrieval_level();
+        assert!(
+            !custom.embedder.enabled,
+            "custom must not touch embedder.enabled"
+        );
+        assert_eq!(
+            custom.embedder.reranker, "bge-reranker-base",
+            "custom must not touch embedder.reranker"
+        );
+        assert!(!custom.hyde_from_level());
+
+        // unknown level behaves like custom (no-op).
+        let mut unknown = ProjectConfig::default_for_project("p");
+        unknown.retrieval.level = "bogus".to_string();
+        unknown.embedder.enabled = false;
+        unknown.apply_retrieval_level();
+        assert!(!unknown.embedder.enabled, "unknown level must be a no-op");
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the

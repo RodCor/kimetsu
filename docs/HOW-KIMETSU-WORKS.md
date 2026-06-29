@@ -6,6 +6,7 @@ chat REPL. It watches what the model does, learns which memories actually
 help, and feeds higher-signal context into future runs. This document explains
 the moving parts, in the order you'll encounter them.
 
+
 ## 1. Ways to use it
 
 **As a sidecar via MCP.** Run `kimetsu mcp serve` directly, or let
@@ -15,11 +16,11 @@ add/list/blame/conflicts, repo ingest, the bridge to other supported hosts).
 Memories carry across sessions; learning compounds.
 
 The intended loop is two calls: **`kimetsu_brain_context`** early on a
-non-trivial task (zero overhead when the brain has nothing — it returns
+non-trivial task (zero overhead when the brain has nothing, since it returns
 `skipped: true`), then **`kimetsu_brain_record`** after solving a
 non-obvious problem worth remembering. `kimetsu plugin install <host>` wires the
 context step automatically for **Claude Code**, **Codex**, **Pi**, and
-**OpenClaw** — writing each host's native config (hooks + MCP for Claude/Codex/
+**OpenClaw**, writing each host's native config (hooks + MCP for Claude/Codex/
 OpenClaw; a TypeScript extension for Pi, which has no MCP). They wire
 `UserPromptSubmit` to `kimetsu brain context-hook`; hosts with a supported stop
 event also wire `kimetsu brain stop-hook` to summarize what was captured (see
@@ -27,16 +28,16 @@ section 7). Pi and OpenClaw are opt-in Cargo features, bundled in the official
 prebuilt/npm binaries.
 
 **As a standalone REPL.** Run `kimetsu chat`. Same brain, same
-tools, just without a host harness. Useful for debugging a brain or
+tools, only without a host harness. Useful for debugging a brain or
 running short tasks where you don't want a second agent in the loop.
 
 **As a shared server (Kimetsu Remote, beta).** Run the brain on a server and
-connect over HTTP MCP — one brain per *repository*, shared across machines or a
+connect over HTTP MCP: one brain per *repository*, shared across machines or a
 team, with no local checkout. See §7a.
 
 The CLI also has admin commands (`kimetsu brain ...`,
 `kimetsu doctor`, `kimetsu bridge ...`) that you'll use for
-maintenance — described below.
+maintenance, described below.
 
 ---
 
@@ -50,34 +51,34 @@ follow you across projects (set `KIMETSU_USER_BRAIN=0`, or
 
 `.kimetsu/` is deliberately **lean**: a brain-only install holds just
 `brain.db` (plus its `-wal` / `-shm` and any `brain.db.bak-*` migration
-sidecars) and `project.toml`. Memory writes persist straight to brain.db —
+sidecars) and `project.toml`. Memory writes persist straight to brain.db;
 they do **not** create a per-write `runs/<id>/` directory. Only a real agent
 run still writes a `runs/<id>/` dir with its artifacts. The transient
 non-brain working dirs (`proactive/`, `chat/`, `bench/`) live OUT of the repo,
 under `~/.kimetsu/cache/<project-hash>/`, so they never clutter your tree.
 
 The brain is event-sourced, and the **`events` table inside brain.db is the
-durable event log** — not a loose pile of JSONL files. A **projector** replays
+durable event log**, not a loose pile of JSONL files. A **projector** replays
 those events into materialized tables the broker can query fast.
 `kimetsu brain rebuild` re-derives every projection from the `events` table
 (pass `--from-traces` to re-import from legacy on-disk `trace.jsonl` files for
 recovery). The materialized tables:
 
-- `runs` — one row per agent run (started_at, terminal_kind, cost).
-- `events` — every event ever written, raw; the durable source for rebuild.
-- `memories` — the durable knowledge. Each row carries scope
+- `runs`: one row per agent run (started_at, terminal_kind, cost).
+- `events`: every event ever written, raw; the durable source for rebuild.
+- `memories`: the durable knowledge. Each row carries scope
   (`global_user`, `project`, `repo`, `run`), kind (`preference`,
   `convention`, `command`, `failure_pattern`, `fact`), text, confidence,
   use_count, usefulness_score, and last_useful_at.
-- `memory_proposals` — pending suggestions awaiting human review.
-- `memory_citations` — which memories the model cited during which
+- `memory_proposals`: pending suggestions awaiting human review.
+- `memory_citations`: which memories the model cited during which
   run, on which turn.
-- `memory_conflicts` — ingest-time hits where a new memory's
+- `memory_conflicts`: ingest-time hits where a new memory's
   embedding was too close to an existing one with contradictory text.
 - `repo_files`, `repo_files_fts`, `repo_manifests`,
-  `repo_manifests_fts` — file-level indexes built by
+  `repo_manifests_fts`: file-level indexes built by
   `kimetsu brain ingest repo`.
-- `memories_fts` — FTS5 index of memory text for lexical retrieval.
+- `memories_fts`: FTS5 index of memory text for lexical retrieval.
 
 ### Durable upgrades: schema migrations
 
@@ -89,16 +90,16 @@ together), so a crash mid-upgrade leaves the DB cleanly stamped at an
 intermediate version rather than half-applied. Before any version-advancing
 migration the runner takes an online-backup snapshot to a
 `brain.db.bak-<from>-<to>-<ts>` sidecar next to the DB (skipped for empty
-brains — a fresh install has nothing to protect; the three newest backups are
-kept). A read-only open of an un-migrated brain degrades gracefully — it reports
+brains, since a fresh install has nothing to protect; the three newest backups are
+kept). A read-only open of an un-migrated brain degrades gracefully: it reports
 "needs migration" and the next read-write open performs it.
 
 This DB schema version is **decoupled from the `project.toml` config version**
 (`KIMETSU_CONFIG_VERSION`, still `1`). So `[kimetsu] schema_version = 1` in
-`project.toml` is the *config-format* version, not the DB schema — the database
+`project.toml` is the *config-format* version, not the DB schema: the database
 can evolve (and migrate) without forcing every project.toml to be rewritten.
 The old "forward-additive `add_column_if_missing`, no rebuild" patches from
-v0.1–v0.5 are now folded into the single v1→v2 migration.
+v0.1-v0.5 are now folded into the single v1→v2 migration.
 
 ### Memory kinds
 
@@ -108,13 +109,13 @@ v0.1–v0.5 are now folded into the single v1→v2 migration.
 | `convention` | Repo conventions ("always run cargo fmt") |
 | `command` | Useful shell incantations ("regen with `cargo xtask gen`") |
 | `failure_pattern` | "Don't do X, it caused Y last time" |
-| `fact` | Domain knowledge — APIs, gotchas, architectural notes |
+| `fact` | Domain knowledge: APIs, gotchas, architectural notes |
 
 ### Memory scopes
 
 | Scope | Lives | Use |
 |-------|-------|-----|
-| `run` | This run only | Ephemeral notes — discarded at end |
+| `run` | This run only | Ephemeral notes, discarded at end |
 | `repo` | This repo | Project conventions, code-specific facts |
 | `project` | This project (== repo today) | Synonym for repo |
 | `global_user` | User-wide brain | Personal preferences, cross-project knowledge |
@@ -132,7 +133,7 @@ the top-N inside a token budget.
 embeddings build the broker *also* runs an approximate-nearest-neighbour query
 against a **usearch HNSW** index (persisted as a `brain.usearch` sidecar next to
 brain.db, f16-quantized by default, O(log N) per query) and **unions** those hits with the FTS
-set — so a memory whose *meaning* matches the query can surface even when it
+set, so a memory whose *meaning* matches the query can surface even when it
 shares no words with it. Lean builds use the FTS candidate set alone.
 
 The score is a weighted sum of four signals, plus two multipliers:
@@ -152,14 +153,14 @@ decay          = exp(-ln 2 · age_days / half_life_days)   ∈ [0, 1]
 
 effective      = 1.0 + (multiplier - 1.0) · decay
                  (decay attenuates the *deviation* from neutral, not
-                  the multiplier itself — a year-old +1.5 memory
+                  the multiplier itself; a year-old +1.5 memory
                   slides toward 1.0, NOT toward 0)
 
 final_score    = weights.relevance   · raw_relevance
                + weights.confidence  · confidence
                + weights.freshness   · freshness
                + weights.scope       · scope_weight
-                 — all per-stage tunable via [broker.weights.<stage>]
+                 (all per-stage tunable via [broker.weights.<stage>])
 ```
 
 Stages: `localization`, `patch_plan`, `verification`, `review`. Each
@@ -170,18 +171,18 @@ has its own weight profile in `project.toml`.
 collapses true paraphrase near-duplicates that share no surface words (with
 Jaccard token overlap as the lean-build / fallback path). An **absolute
 semantic-relevance floor** (`min_semantic_score`, embeddings-only) then drops
-candidates whose cosine to the query is below the threshold *before* budgeting —
+candidates whose cosine to the query is below the threshold *before* budgeting,
 so a genuinely off-topic query hits the zero-capsule "skipped" path and returns
 nothing rather than padding the prompt with weak hits. Lean (FTS-only)
 selection is unchanged.
 
 Tunable knobs in `[broker]`:
 
-- `max_capsules` (default **8**) — hard cap on capsules rendered into a prompt.
-- `min_semantic_score` (default `-1.0` = AUTO: 0.35 on bge-family, off otherwise) — the embeddings-only relevance
+- `max_capsules` (default **8**): hard cap on capsules rendered into a prompt.
+- `min_semantic_score` (default `-1.0` = AUTO: 0.35 on bge-family, off otherwise): the embeddings-only relevance
   floor described above.
 - `budget_floor_tokens` (default `1500`) and `budget_run_cap_tokens`
-  (default `8000`) — bounds for the adaptive per-run budget (see the agent
+  (default `8000`): bounds for the adaptive per-run budget (see the agent
   brain section below).
 
 ### Embeddings vs lean builds
@@ -216,7 +217,7 @@ Tunable knobs in `[broker]`:
 ## 3a. The agent brain (proactive + cost-shrinking)
 
 The broker above describes *retrieval*. For the autonomous agent pipeline,
-v1.0 layers an adaptive, task-aware recall strategy on top — so the brain is
+v1.0 layers an adaptive, task-aware recall strategy on top, so the brain is
 proactive, and its token overhead grows far slower than the task does.
 
 - **Task-kind routing.** Each task is classified once by a cheap deterministic
@@ -225,16 +226,16 @@ proactive, and its token overhead grows far slower than the task does.
   Docs > Feature). A task-kind weight layer composes over the per-stage weights
   (then renormalizes) to bias which *kinds* of memory get recalled: Debug leans
   on recent `failure_pattern`s, Refactor on `convention`/scope, Investigation
-  on broad `fact`/`preference` recall. `Feature` is the neutral default — it
+  on broad `fact`/`preference` recall. `Feature` is the neutral default: it
   leaves the stage weights untouched.
 - **Proactive "Known pitfalls".** Before the first implementation attempt, a
-  tight `failure_pattern`/`convention` retrieval surfaces known pitfalls —
+  tight `failure_pattern`/`convention` retrieval surfaces known pitfalls,
   proactively, not only after a failure. It costs ~zero tokens when nothing
   matches, and a per-run recall ledger stops it re-surfacing the same pitfall
   on retries.
 - **Cross-stage capsule dedup.** A capsule rendered in an earlier stage is
   back-referenced (not re-rendered) in later stages and counted once via the
-  run's recall ledger — so brain overhead *shrinks* in relative terms as a
+  run's recall ledger, so brain overhead *shrinks* in relative terms as a
   task spans more stages.
 - **Lazy capsule expansion.** Top-confidence capsules are injected in full; the
   long tail is injected as ~1-line headlines that the agent expands on demand
@@ -271,7 +272,7 @@ The flow:
      `last_useful_at` to "now" on success.
    - **Silent passengers**: ±0.1 (weak signal). Outcome-correlated,
      but small.
-   - `run.failed` with `category = "Gate"` is treated as no signal —
+   - `run.failed` with `category = "Gate"` is treated as no signal:
      the agent's verifier failing isn't the memory's fault.
 
 The split keeps the strong signal aimed at memories that actually
@@ -320,10 +321,10 @@ When a new capsule arrives via `kimetsu_brain_record` (the capture
 tool host agents call after solving something), kimetsu first runs
 **semantic dedup** through `propose_or_merge_memory`:
 
-1. **Exact dup** — identical normalized text in the same scope/kind
+1. **Exact dup**: identical normalized text in the same scope/kind
    short-circuits; the existing memory's use_count bumps, nothing new
    is written.
-2. **Near dup** — if an existing memory in scope is within cosine
+2. **Near dup**: if an existing memory in scope is within cosine
    ≥ 0.85, the new text is *merged into* it (appended as "Also: …")
    rather than creating a near-twin. This is what stops a brain from
    filling with ten rephrasings of the same lesson over a gauntlet.
@@ -338,8 +339,8 @@ active brain for nearby *contradictions*: existing memories in the
 same scope whose embedding is close (cosine ≥ 0.8 by default) but
 whose normalized text differs.
 
-Hits land in `memory_conflicts`. The write itself is **not blocked**
-— surfacing > blocking, because a blocked write loses user intent.
+Hits land in `memory_conflicts`. The write itself is **not blocked**:
+surfacing > blocking, because a blocked write loses user intent.
 Instead the operator reviews via:
 
 ```bash
@@ -352,42 +353,42 @@ kimetsu brain memory conflicts --resolve <id> kept_both
 `kept_new` invalidates the existing memory. `kept_existing`
 invalidates the new one. `kept_both` is the legitimate case where
 both apply (e.g., "use anyhow in CLI binaries" + "use thiserror in
-library crates" — same shape, different scope semantically).
+library crates", same shape, different scope semantically).
 
 Conflict detection is **embedder-gated**. The lean build silently
 skips it; build with `--features embeddings` to enable.
 
 The MCP surface (`kimetsu_brain_memory_conflicts`) is read-only by
-design. Resolution is CLI-only to keep the audit trail centralized —
+design. Resolution is CLI-only to keep the audit trail centralized:
 an agent shouldn't silently "resolve" a real contradiction it
 should have surfaced.
 
 ---
 
-## 6a. Analytics — is the brain actually helping?
+## 6a. Analytics: is the brain actually helping?
 
 A brain you can't measure is a brain you can't trust. `kimetsu brain insights`
 (and the `kimetsu_brain_insights` MCP tool) compute proof-of-value metrics
-over a recent-runs window — default the last 50 runs, override with
+over a recent-runs window (default the last 50 runs), override with
 `--last-n-runs N` or an ISO-8601 `--since`, and `--top N` sizes the ranked
 lists. `--json` emits the full report for CI/dashboards. The metrics:
 
-- **Retrieval hit-rate & skip-rate** — of the retrievals served, how many
+- **Retrieval hit-rate & skip-rate**: of the retrievals served, how many
   returned at least one capsule vs. hit the zero-capsule skipped path.
-- **Citation rate** — what fraction of retrieved memories the model actually
+- **Citation rate**: what fraction of retrieved memories the model actually
   cited.
-- **Proposal acceptance rate** — accepted / (accepted + rejected).
-- **Usefulness trend** — summed usefulness, average usefulness ratio, and the
+- **Proposal acceptance rate**: accepted / (accepted + rejected).
+- **Usefulness trend**: summed usefulness, average usefulness ratio, and the
   net `run.finished − run.failed(non-Gate)` outcome over the window.
-- **Harvest yield** — memories created in the window, broken down by source,
+- **Harvest yield**: memories created in the window, broken down by source,
   and per-run yield.
-- **Corpus health** — active vs. invalidated counts, breakdowns by scope/kind,
+- **Corpus health**: active vs. invalidated counts, breakdowns by scope/kind,
   top-useful memories, prune candidates, open conflicts, pending proposals.
-- **Token economy** — average injected tokens and capsule count per retrieval.
+- **Token economy**: average injected tokens and capsule count per retrieval.
 
 These are backed by two event additions: a **`context.served`** event logs
 *every* retrieval (hit or miss), and **`context.injected`** now carries the
-injected-token count — so the hit-rate and token-economy numbers are real
+injected-token count, so the hit-rate and token-economy numbers are real
 counts, not estimates.
 
 ### ROI ledger
@@ -408,7 +409,7 @@ different phrasings of the same lesson. Default threshold: cosine ≥ 0.92
 within the same embedding model. The survivor keeps its id and text; members
 get `superseded_by` set (schema v3) and a `memory.superseded` event so
 `brain rebuild` reproduces the merge. Citations are reassigned to the survivor.
-`--distill` adds a second pass: loose clusters (0.75–0.85 cosine, ≥3 memories,
+`--distill` adds a second pass: loose clusters (0.75-0.85 cosine, ≥3 memories,
 ≥1 shared tag) are fed to the configured distiller and the result lands as a
 memory proposal for review. `--dry-run` prints the plan without writing.
 
@@ -436,10 +437,10 @@ Run `kimetsu mcp serve` and the host harness gets ~28
 
 | Tool | What it does |
 |------|--------------|
-| `kimetsu_brain_context` | Retrieve a context bundle for a query/stage (returns `skipped: true` when nothing relevant — zero overhead) |
+| `kimetsu_brain_context` | Retrieve a context bundle for a query/stage (returns `skipped: true` when nothing relevant, at zero overhead) |
 | `kimetsu_brain_record` | Capture a lesson after a non-obvious solve; runs semantic dedup (§6) |
 | `kimetsu_brain_status` | Brain health + memory counts at a glance |
-| `kimetsu_brain_insights` | Effectiveness analytics over a recent-runs window (hit-rate, citation rate, acceptance, token economy — §6a) |
+| `kimetsu_brain_insights` | Effectiveness analytics over a recent-runs window (hit-rate, citation rate, acceptance, token economy; §6a) |
 | `kimetsu_brain_memory_add` | Persist a new memory directly |
 | `kimetsu_brain_memory_list` | List memories in scope, sorted by relevance |
 | `kimetsu_brain_memory_top` | Top memories by usefulness ratio |
@@ -458,7 +459,7 @@ Run `kimetsu mcp serve` and the host harness gets ~28
 | `kimetsu_benchmark_record_outcome` | Record run outcome → proposal |
 | `kimetsu_bridge_status` / `_export` / `_import` / `_sync` | Cross-harness skill registry + install/sync |
 | `kimetsu_skills_search` / `kimetsu_skill` | Find / invoke a portable skill |
-| `kimetsu_brain_cite` | (write-gated) Record that a retrieved memory materially helped — closes the ground-truth loop for self-tuning |
+| `kimetsu_brain_cite` | (write-gated) Record that a retrieved memory materially helped, closing the ground-truth loop for self-tuning |
 | `cite_memory` | (in-run) Mark a memory as cited |
 | `expand_capsule` | (in-run) Expand a lazily-injected capsule headline to full detail by resolving its `memory:` / `file:` handle (§3a) |
 
@@ -483,7 +484,7 @@ The core hook pattern is the same across MCP hosts:
 
 - **`UserPromptSubmit` → `kimetsu brain context-hook`** fires before
   each turn. It reads the prompt from stdin, retrieves a context
-  bundle, and injects it — so the model sees relevant memories without
+  bundle, and injects it, so the model sees relevant memories without
   having to remember to ask. Zero-overhead: when the brain has nothing,
   the hook emits nothing. On `embeddings` builds the hook first asks a
   **warm embedder daemon** (`kimetsu brain embed-daemon`, one per user,
@@ -494,13 +495,13 @@ The core hook pattern is the same across MCP hosts:
   daemon holds the ONNX model in memory once (no per-prompt cold load) and
   serves hybrid semantic retrieval with an absolute cosine floor, finished
   by a cross-encoder rerank of a 6-capsule pool (`ms-marco-tinybert-l-2-v2`
-  by default, paired with the `jina-v2-base-code` embedder — both chosen by
+  by default, paired with the `jina-v2-base-code` embedder, both chosen by
   benchmark; see "Retrieval models & benchmarking" below). Toggles:
   `[embedder] daemon` / `warm_on_start` / `reranker`, or
   `KIMETSU_EMBED_DAEMON=0`.
 - **`Stop` → `kimetsu brain stop-hook`** fires when the host supports a
   stop event. It walks the transcript, counts `kimetsu_brain_record`
-  calls, and prints a one-line post-turn banner — either confirming how
+  calls, and prints a one-line post-turn banner, either confirming how
   many lessons were captured or nudging the model to record one after a
   non-trivial, un-captured session.
 - **`SessionEnd` → `kimetsu brain session-end-hook`** runs the optional
@@ -518,7 +519,7 @@ the same flow through `.claude/settings.json` and its subagent file.
 ### Proactive recall (mid-work)
 
 `UserPromptSubmit` only fires between turns. v0.8 adds two **tool-level**
-hooks so the brain can surface a memory *while* the agent works — the
+hooks so the brain can surface a memory *while* the agent works, the
 way a memory "comes to you" rather than you going to fetch it. Both use
 a `matcher: "Bash"` so they only fire on shell commands (most tool calls
 spawn nothing), and both emit `hookSpecificOutput.additionalContext`
@@ -526,7 +527,7 @@ without ever blocking:
 
 - **`PreToolUse` → `kimetsu brain pretool-hook`** runs *before* a Bash
   command; if the command strongly matches a stored `failure_pattern` /
-  `convention`, it warns first — heading off a known mistake.
+  `convention`, it warns first, heading off a known mistake.
 - **`PostToolUse` → `kimetsu brain posttool-hook`** runs *after* a Bash
   command; when the output looks like a failure, it surfaces a matching
   `failure_pattern` / `command` fix.
@@ -537,10 +538,10 @@ stays low), gated by a **high score floor** (0.45; 0.35 once a
 **repeated** failing command is detected), capped at **one capsule**,
 **deduped per session** (a memory surfaces at most once), and
 **throttled** by a refractory window between injections. When nothing
-clears the bar the hook prints nothing — zero tokens. Per-session state
+clears the bar the hook prints nothing, at zero tokens. Per-session state
 (surfaced ids, last injection, recent commands) lives OUT of the repo, under
 `~/.kimetsu/cache/<project-hash>/proactive/<session_id>.json`, and is GC'd
-after 7 days — keeping `.kimetsu/` itself lean (just `brain.db` + `project.toml`).
+after 7 days, keeping `.kimetsu/` itself lean (just `brain.db` + `project.toml`).
 
 Proactive hooks install by default with `kimetsu plugin install`; pass
 `--no-proactive` (or `proactive:false` to `kimetsu_plugin_install`) to
@@ -551,13 +552,13 @@ supported stop hook.
 
 ## 7a. Kimetsu Remote (beta)
 
-Everything above assumes a **local** brain — one `.kimetsu/brain.db` next to your
+Everything above assumes a **local** brain, one `.kimetsu/brain.db` next to your
 checkout, reached over stdio MCP. Kimetsu Remote runs the brain on a **server**
 and exposes it over **HTTP MCP**, so the identity is the **repository**, not a
-local directory: any checkout of the same repo — on any machine, or a teammate's
-— hits the same brain, with no local files required.
+local directory: any checkout of the same repo (on any machine, or a teammate's)
+hits the same brain, with no local files required.
 
-> **Beta** — under active testing; the `kimetsu-remote` server is a **separate
+> **Beta**, under active testing; the `kimetsu-remote` server is a **separate
 > package** (`npm i -g kimetsu-remote` or `cargo install kimetsu-remote
 > --features embeddings`), not installed with the `kimetsu` CLI.
 
@@ -565,13 +566,13 @@ local directory: any checkout of the same repo — on any machine, or a teammate
 brain per repo under `<dir>/<repo-id>/`, keyed by a sanitized id the client sends
 in the URL (`POST /mcp/<repo-id>`). It reuses the same transport-agnostic tool
 dispatch as the stdio server, filtered to the **pure-DB, agent-facing subset**
-(context, record, search, insights, curation) — the tools that need no checkout.
+(context, record, search, insights, curation): the tools that need no checkout.
 Per-repo SQLite + WAL gives concurrent reads; writes serialize through each
 repo's lock; cross-repo is fully parallel.
 
 **Auth + hardening.** Bearer tokens (global or per-repo, constant-time compared);
 optional per-token rate limiting (`--rate-limit <req/min>` → `429`); a structured
-per-request log and an aggregate Prometheus `GET /metrics` (no repo labels — it's
+per-request log and an aggregate Prometheus `GET /metrics` (no repo labels, since it's
 unauthenticated); plain HTTP by default (terminate TLS at a reverse proxy) or
 in-process HTTPS with `--features tls` + `--tls-cert`/`--tls-key`.
 
@@ -593,7 +594,7 @@ stdio command, deriving the repo id from your git remote and referencing
 ### Retrieval models on the server
 
 The remote server runs a **cross-encoder reranker** stage on every
-`kimetsu_brain_context` call — the same stage the local daemon uses, but
+`kimetsu_brain_context` call, the same stage the local daemon uses, but
 operator-configured rather than per-repo.
 
 **`--reranker <model>`** (default `jina-reranker-v1-tiny-en`, operator-level):
@@ -601,7 +602,7 @@ over-fetches a candidate pool of 6 capsules, runs the cross-encoder, drops noise
 capsules below sigmoid score 0.30, and truncates to the caller's `max_capsules`.
 `"off"` disables reranking. Any curated id or HuggingFace ONNX path is accepted
 (same model registry as the local daemon).  The default was chosen by the 100-memory
-benchmark — jina-tiny MRR 0.931 vs 0.914 for TinyBERT on the local bench; remote
+benchmark: jina-tiny MRR 0.931 vs 0.914 for TinyBERT on the local bench; remote
 has no hook-latency budget so the lightest reranker wins.
 
 The **embedder** comes from per-repo config or `KIMETSU_BRAIN_EMBEDDER` (set before
@@ -624,7 +625,7 @@ kimetsu brain bench --remote --embedders jina-v2-base-code --dataset bench/datas
 kimetsu brain bench --remote --embedders bge-small-en-v1.5 --dataset bench/dataset-100.json --out bench/results-100
 ```
 
-> **One embedder per invocation** — multi-embedder `--remote` runs seed later combos with the
+> **One embedder per invocation**: multi-embedder `--remote` runs seed later combos with the
 > first embedder's vectors (process-global singleton). Kill stray `kimetsu-remote` processes
 > between runs.
 
@@ -635,11 +636,11 @@ kimetsu brain bench --remote --embedders bge-small-en-v1.5 --dataset bench/datas
 
 The local retrieval stack is **embedder + cross-encoder reranker**, both
 running warm inside the embed daemon. Defaults were chosen with
-`kimetsu brain bench` — a benchmark seeded from REAL exported memories
+`kimetsu brain bench`, a benchmark seeded from REAL exported memories
 (`bench/dataset-100.json`: 100 memories in confusable topic clusters, 210
-cases — keyword, paraphrase, oblique, confusable, in-domain no-answer, open
+cases: keyword, paraphrase, oblique, confusable, in-domain no-answer, open
 multi-answer) that records expected-vs-obtained per case, latency, and RAM
-per embedder × reranker combo (floors off — raw ranking quality):
+per embedder × reranker combo (floors off, for raw ranking quality):
 
 | embedder          | reranker     | recall@2 | recall@4 |  MRR  | mean ms | peak RSS |
 |-------------------|--------------|----------|----------|-------|---------|----------|
@@ -651,7 +652,7 @@ per embedder × reranker combo (floors off — raw ranking quality):
 | bge-small-en-v1.5 | off          | 0.931    | 0.966    | 0.911 | 446     | 359 MB   |
 
 *(Re-confirmed on v2.0 with `kimetsu brain bench --dataset bench/dataset-100.json`:
-the jina-v2 quality numbers are unchanged — retrieval ranking is deterministic on
+the jina-v2 quality numbers are unchanged, since retrieval ranking is deterministic on
 a fixed corpus. Latencies are machine-dependent.)*
 
 The default (**jina-v2-base-code + ms-marco-tinybert-l-2-v2**) is the
@@ -675,7 +676,7 @@ kimetsu brain daemon stop      # next prompt/warm spawns a daemon with the new m
 `KIMETSU_BRAIN_EMBEDDER` overrides the config per-process. Non-curated
 rerankers load as user-defined ONNX from any HuggingFace repo.
 
-**Re-judging as your brain grows** — the benchmark's value compounds:
+**Re-judging as your brain grows**: the benchmark's value compounds:
 
 ```bash
 kimetsu brain export bench/memories-export.json   # refresh the dataset source
@@ -717,13 +718,13 @@ subsystem actually works against the current workspace + user state:
 - MCP server can spawn (skipped with `--skip-mcp` for sandboxes).
 - Bridge can scan host harnesses.
 
-Hermetic by default — safe in CI. JSON output (`--json`) for
+Hermetic by default, safe in CI. JSON output (`--json`) for
 hooks. Run after upgrading kimetsu or whenever something looks off.
 
 **`kimetsu doctor --selftest`** is the one-shot end-to-end proof: in a
 throw-away temp project (it never touches your real workspace or user brain) it
-records a sample memory and retrieves it back, printing
-`✓ recorded a memory and retrieved it — the brain works` and exiting non-zero
+records a sample memory and retrieves it back, printing a
+`✓ recorded a memory and retrieved it` success line and exiting non-zero
 if any step fails. Use it to confirm a fresh install actually works.
 
 ---
@@ -773,7 +774,7 @@ proactive_prefetch = false    # v2.0: opt-in trajectory-based pre-fetch at PreTo
 backend = "flat"              # v2.0: "flat" (FTS5 + usearch ANN, default) |
                               # "graph-lite" (+ typed-edge 1-2 hop expansion over memory_edges) |
                               # "graph" (in-memory petgraph; kimetsu-remote only). Switching
-                              # re-projects from the event log — no data migration.
+                              # re-projects from the event log, no data migration.
 
 [cheap_model]                 # v2.0: ONE optional model for digest / resume / skill-draft /
                               # `kimetsu ask` / distiller / consolidation. Absent = every
@@ -836,7 +837,7 @@ base_url_env = "ANTHROPIC_BASE_URL" # or "OPENAI_BASE_URL"
 ```
 
 The agent model and the distiller are configured **independently**, so the
-provider can differ — e.g. run the agent on **AWS Bedrock** (Anthropic models via
+provider can differ. For example, run the agent on **AWS Bedrock** (Anthropic models via
 the InvokeModel API, SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
 (+ optional `AWS_SESSION_TOKEN`) and `AWS_REGION`) while the harvester stays on
 direct Claude or OpenAI.
@@ -844,16 +845,16 @@ direct Claude or OpenAI.
 **Bidirectional config (off-switches).** Every optional feature is turn-off-able
 in `project.toml` and honored at runtime with precedence
 **env override > config > default**. Every field is `#[serde(default)]`, so a
-partial `project.toml` loads cleanly — older files gain the new defaults on
+partial `project.toml` loads cleanly: older files gain the new defaults on
 upgrade. The toggles: `[embedder] enabled`, `[broker] ambient`,
 `[kimetsu] use_user_brain`, plus the already-bidirectional `[learning]
 auto_harvest`, `[learning.distiller] enabled`, and `[shell] redact_secrets`.
 v2.0 adds `[broker] warm_start`, `[broker] proactive_prefetch`,
 `[broker] answer_grade_min_score`, `[storage] backend`, `[cheap_model] enabled`,
-and `[sync] dir` — all default to the pre-v2.0 behavior (warm-start on but
+and `[sync] dir`, all defaulting to the pre-v2.0 behavior (warm-start on but
 no-op without memories/episodes; backend `flat`; cheap-model off → graceful
 degradation). One honest caveat: the warm-start **digest is currently
-rule-based** — the `[cheap_model]` distillation hook-point exists but does not
+rule-based**: the `[cheap_model]` distillation hook-point exists but does not
 yet call the model; `kimetsu ask`, resume, and skill-draft do use it.
 Flip any of them with **`kimetsu config edit`** (opens `$EDITOR` on
 `project.toml` and re-validates on save); a re-install *merges*, so your toggles
@@ -878,7 +879,7 @@ Environment variables that override the matching config field at runtime
 - It's not a sandbox. Tools run on the host machine.
 - It's not an external vector DB. The brain is still a single SQLite file per
   project (FTS5 + optional cosine). On the embeddings build the semantic index
-  is a usearch HNSW sidecar (`brain.usearch`) next to brain.db — no separate vector store,
+  is a usearch HNSW sidecar (`brain.usearch`) next to brain.db: no separate vector store,
   no service to run. Backups are still `cp brain.db` (and the brain also
   auto-backs-up to a `brain.db.bak-*` sidecar before any schema migration).
 
@@ -887,12 +888,12 @@ Environment variables that override the matching config field at runtime
 ## 12. Where to go next
 
 - Run `kimetsu doctor` to verify your install.
-- Read the **CHANGELOG** for the per-version history — this doc
+- Read the **CHANGELOG** for the per-version history. This doc
   describes how kimetsu works today; the CHANGELOG tells you when each
   piece landed.
 - Look at the per-crate `src/lib.rs` doc comments for module-level
   detail (`kimetsu-brain`, `kimetsu-agent`, `kimetsu-chat`,
   `kimetsu-cli`, `kimetsu-core`).
 - For anything benchmark / impact-measurement related, the bench
-  surface lives in a separate internal repo — that's by design
+  surface lives in a separate internal repo, which is by design
   (see "Embeddings vs lean builds" above).

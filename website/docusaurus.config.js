@@ -99,6 +99,7 @@ const config = {
               {label: 'Introduction', to: '/docs/intro'},
               {label: 'Install', to: '/docs/install'},
               {label: 'How it works', to: '/docs/how-kimetsu-works'},
+              {label: 'Benchmark', to: '/docs/memory-benchmark'},
               {label: 'Changelog', to: '/docs/changelog'},
             ],
           },
