@@ -17,6 +17,7 @@ fn state(dir: &std::path::Path) -> AppState {
     let auth = AuthConfig {
         global: vec!["T".to_string()],
         per_repo: Default::default(),
+        ..Default::default()
     };
     AppState::new(dir.to_path_buf(), auth)
 }

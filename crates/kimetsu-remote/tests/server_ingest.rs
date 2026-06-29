@@ -28,6 +28,7 @@ fn state(data: &std::path::Path, ingest: IngestState) -> AppState {
     let auth = AuthConfig {
         global: vec!["T".to_string()],
         per_repo: Default::default(),
+        ..Default::default()
     };
     AppState::new(data.to_path_buf(), auth).with_ingest(Arc::new(ingest))
 }

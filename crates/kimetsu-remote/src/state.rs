@@ -23,6 +23,9 @@ pub struct AppState {
     /// `None` on lean builds or when `--reranker off` is passed.
     /// Wrapped in `Arc` so `AppState` stays cheaply `Clone`.
     pub reranker: Option<Arc<dyn kimetsu_brain::embeddings::Reranker>>,
+    /// v3.0 #3 Slice C: this server's node id (the HLC node + the machine part of
+    /// each write's `origin`, `<server_node>/user:<name>`). Set from `--node`.
+    pub server_node: Arc<String>,
 }
 
 impl AppState {
@@ -45,11 +48,23 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             ingest: None,
             reranker: None,
+            server_node: Arc::new("remote".to_string()),
         }
     }
 
     pub fn with_ingest(mut self, ingest: Arc<IngestState>) -> Self {
         self.ingest = Some(ingest);
+        self
+    }
+
+    /// Set this server's node id (Slice C write attribution). Empty → "remote".
+    pub fn with_node(mut self, node: impl Into<String>) -> Self {
+        let n = node.into();
+        self.server_node = Arc::new(if n.trim().is_empty() {
+            "remote".to_string()
+        } else {
+            n
+        });
         self
     }
 

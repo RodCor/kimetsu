@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,15 @@ use crate::ids::{EventId, RunId};
 /// it. Imported events keep their REMOTE origin (set explicitly), never this one.
 static PROCESS_ORIGIN: OnceLock<Option<String>> = OnceLock::new();
 
+thread_local! {
+    /// Per-thread write origin override. Takes precedence over [`PROCESS_ORIGIN`]
+    /// when set. The multi-user remote server (kimetsu-remote) runs each request
+    /// on one `spawn_blocking` thread and uses [`OriginScope`] to attribute that
+    /// request's writes to the authenticated USER — something the process-global
+    /// (a write-once `OnceLock`) cannot do. Unset for normal CLI/agent processes.
+    static THREAD_ORIGIN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 /// Set the process write origin. First call wins (idempotent thereafter), so
 /// call it once during startup before any brain write. A blank/empty value is
 /// normalized to `None` (unconfigured).
@@ -23,9 +33,39 @@ pub fn set_process_origin(origin: impl Into<String>) {
     let _ = PROCESS_ORIGIN.set(value);
 }
 
-/// The configured process write origin, or `None` if unset.
+/// The effective write origin for the current thread: the thread-local override
+/// ([`OriginScope`]) if set, else the process-global, else `None`.
 pub fn process_origin() -> Option<String> {
+    if let Some(o) = THREAD_ORIGIN.with(|c| c.borrow().clone()) {
+        return Some(o);
+    }
     PROCESS_ORIGIN.get().cloned().flatten()
+}
+
+/// RAII guard that overrides the write origin for the current thread for its
+/// lifetime, restoring the previous value on drop. Required for the remote
+/// server: tokio reuses blocking threads, so a bare set would leak one request's
+/// user into the next request on the same thread. Empty input is treated as "no
+/// override" (the guard still restores the prior value on drop).
+#[must_use]
+pub struct OriginScope {
+    prev: Option<String>,
+}
+
+impl OriginScope {
+    pub fn new(origin: impl Into<String>) -> Self {
+        let s = origin.into();
+        let value = if s.trim().is_empty() { None } else { Some(s) };
+        let prev = THREAD_ORIGIN.with(|c| c.replace(value));
+        OriginScope { prev }
+    }
+}
+
+impl Drop for OriginScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        THREAD_ORIGIN.with(|c| *c.borrow_mut() = prev);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,5 +125,40 @@ impl Event {
     pub fn with_hlc(mut self, hlc: Option<String>) -> Self {
         self.hlc = hlc;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_scope_overrides_and_restores() {
+        // No override → falls through to the process-global (None here in tests).
+        assert_eq!(process_origin(), None);
+
+        {
+            let _s = OriginScope::new("srv1/user:alice");
+            assert_eq!(process_origin().as_deref(), Some("srv1/user:alice"));
+            // A fresh event picks up the thread origin.
+            let e = Event::new(RunId::new(), "memory.cited", serde_json::json!({}));
+            assert_eq!(e.origin.as_deref(), Some("srv1/user:alice"));
+
+            // Nesting restores the previous override on inner drop.
+            {
+                let _inner = OriginScope::new("srv1/user:bob");
+                assert_eq!(process_origin().as_deref(), Some("srv1/user:bob"));
+            }
+            assert_eq!(process_origin().as_deref(), Some("srv1/user:alice"));
+        }
+
+        // Outer guard dropped → cleared (no leak to the next request on this thread).
+        assert_eq!(process_origin(), None);
+    }
+
+    #[test]
+    fn origin_scope_empty_is_no_override() {
+        let _s = OriginScope::new("");
+        assert_eq!(process_origin(), None);
     }
 }

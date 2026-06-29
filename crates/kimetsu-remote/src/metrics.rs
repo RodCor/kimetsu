@@ -35,9 +35,17 @@ pub struct Metrics {
     rate_limited: AtomicU64,
     bad_request: AtomicU64,
     error: AtomicU64,
+    /// v3.0 #3 Slice C: successful memory-write tool calls (aggregate, no repo
+    /// label — `/metrics` is unauthenticated and must not leak repo ids).
+    writes: AtomicU64,
 }
 
 impl Metrics {
+    /// Count one successful write-tool call.
+    pub fn record_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record(&self, outcome: Outcome) {
         let counter = match outcome {
             Outcome::Ok => &self.ok,
@@ -80,8 +88,32 @@ impl Metrics {
                 self.get(o)
             ));
         }
+        out.push_str(
+            "# HELP kimetsu_remote_memory_writes_total Successful memory-write tool calls.\n",
+        );
+        out.push_str("# TYPE kimetsu_remote_memory_writes_total counter\n");
+        out.push_str(&format!(
+            "kimetsu_remote_memory_writes_total {}\n",
+            self.writes.load(Ordering::Relaxed)
+        ));
         out
     }
+}
+
+/// v3.0 #3 Slice C: tool names that MUTATE the brain (used to count writes +,
+/// in rpc, to know a request did a write). Reads are excluded.
+pub fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "kimetsu_brain_memory_add"
+            | "kimetsu_brain_record"
+            | "kimetsu_brain_memory_accept"
+            | "kimetsu_brain_memory_reject"
+            | "kimetsu_brain_memory_invalidate"
+            | "kimetsu_brain_cite"
+            | "kimetsu_benchmark_record_outcome"
+            | "kimetsu_brain_conflict_resolve"
+    )
 }
 
 #[cfg(test)]

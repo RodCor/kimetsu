@@ -10,6 +10,7 @@ mod embed_daemon;
 mod harvest_setup;
 mod proactive_state;
 mod process;
+mod remote_client;
 mod skill_synth;
 mod update;
 
@@ -1655,6 +1656,24 @@ struct MemoryAddArgs {
     kind: String,
     /// The memory text to store.
     text: String,
+    #[command(flatten)]
+    remote: RemoteWriteArgs,
+}
+
+/// v3.0 #3 Slice C: target a `kimetsu-remote` server for a CLI write instead of
+/// the local brain. Shared (clap `flatten`) by remote-capable write commands.
+#[derive(Debug, Args, Clone)]
+struct RemoteWriteArgs {
+    /// Write to a kimetsu-remote server at this base URL (e.g.
+    /// `https://kimetsu.example.com:8787`) instead of the local brain.
+    #[arg(long)]
+    remote: Option<String>,
+    /// Repo id for the remote brain (required with --remote).
+    #[arg(long)]
+    repo: Option<String>,
+    /// Bearer token for the remote server (else `KIMETSU_REMOTE_TOKEN`).
+    #[arg(long)]
+    token: Option<String>,
 }
 
 /// Args for `kimetsu brain memory add-batch`.
@@ -8295,11 +8314,33 @@ fn stats() -> KimetsuResult<()> {
 fn memory(command: MemoryCommand) -> KimetsuResult<()> {
     match command {
         MemoryCommand::Add(args) => {
+            // Validate scope/kind locally regardless of target.
             let scope = MemoryScope::from_str(&args.scope)?;
             let kind = MemoryKind::from_str(&args.kind)?;
-            let id = project::add_memory(&env::current_dir()?, scope, kind, &args.text)?;
-            println!("memory_id: {id}");
-            Ok(())
+            if let Some(base_url) = args.remote.remote.as_deref() {
+                // Slice C: write to a remote team brain over HTTP MCP.
+                let repo = args.remote.repo.as_deref().ok_or_else(|| {
+                    "kimetsu brain memory add --remote requires --repo <id>".to_string()
+                })?;
+                let token = remote_client::resolve_token(args.remote.token.as_deref())?;
+                let result = remote_client::remote_call(
+                    base_url,
+                    repo,
+                    &token,
+                    "kimetsu_brain_memory_add",
+                    serde_json::json!({
+                        "scope": args.scope,
+                        "kind": args.kind,
+                        "text": args.text,
+                    }),
+                )?;
+                println!("{}", remote_client::render_result(&result));
+                Ok(())
+            } else {
+                let id = project::add_memory(&env::current_dir()?, scope, kind, &args.text)?;
+                println!("memory_id: {id}");
+                Ok(())
+            }
         }
         MemoryCommand::AddBatch(args) => memory_add_batch(args),
         MemoryCommand::List { json } => {

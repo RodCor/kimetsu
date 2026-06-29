@@ -46,9 +46,12 @@ mod tests {
     fn state_with(dir: &std::path::Path) -> AppState {
         let mut per_repo = HashMap::new();
         per_repo.insert("web".to_string(), vec!["tok_web".to_string()]);
+        let mut token_names = HashMap::new();
+        token_names.insert("tok_web".to_string(), "webuser".to_string());
         let auth = AuthConfig {
             global: vec!["tok_admin".to_string()],
             per_repo,
+            token_names,
         };
         AppState::new(dir.to_path_buf(), auth)
     }
@@ -212,11 +215,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_write_is_attributed_to_the_token_user() {
+        // Slice C: a write through the remote server stamps the event origin with
+        // `<server_node>/user:<name>` resolved from the bearer token.
+        // Remote writes are operator-gated behind this env (set by `serve`).
+        // SAFETY: tests run single-threaded; no other thread reads env concurrently.
+        unsafe { std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1") };
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state_with(tmp.path())); // server_node defaults to "remote"
+        let resp = app
+            .oneshot(post(
+                "web",
+                Some("tok_web"),
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"kimetsu_brain_memory_add","arguments":{
+                    "scope":"project","kind":"fact","text":"attributed remote write"
+                }}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v.get("error").is_none(), "write should succeed: {v}");
+
+        // The persisted event carries the per-user origin.
+        let db = tmp.path().join("web").join(".kimetsu").join("brain.db");
+        let conn = rusqlite::Connection::open(&db).expect("open repo brain");
+        let origin: Option<String> = conn
+            .query_row(
+                "SELECT origin FROM events WHERE kind='memory.accepted' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read accepted event origin");
+        assert_eq!(
+            origin.as_deref(),
+            Some("remote/user:webuser"),
+            "remote write must be attributed to the token's user"
+        );
+    }
+
+    #[tokio::test]
     async fn rate_limit_returns_429() {
         let tmp = tempfile::tempdir().unwrap();
         let auth = AuthConfig {
             global: vec!["tok_admin".to_string()],
             per_repo: HashMap::new(),
+            ..Default::default()
         };
         let app = build_router(AppState::with_rate_limit(tmp.path().to_path_buf(), auth, 1));
         let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});

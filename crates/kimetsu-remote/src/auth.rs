@@ -13,6 +13,10 @@ pub struct AuthConfig {
     pub global: Vec<String>,
     /// repo-id → tokens valid only for that repo.
     pub per_repo: HashMap<String, Vec<String>>,
+    /// v3.0 #3 Slice C: token → display name, for per-user write attribution
+    /// (`<server-node>/user:<name>`). Optional; tokens without a name attribute
+    /// to a stable, non-secret `anon-<fingerprint>` (see [`user_for_token`]).
+    pub token_names: HashMap<String, String>,
 }
 
 impl fmt::Debug for AuthConfig {
@@ -22,6 +26,7 @@ impl fmt::Debug for AuthConfig {
             .field("global_token_count", &self.global.len())
             .field("per_repo_count", &self.per_repo.len())
             .field("per_repo_token_count", &per_repo_token_count)
+            .field("named_token_count", &self.token_names.len())
             .finish()
     }
 }
@@ -91,6 +96,28 @@ pub fn check(auth: &AuthConfig, repo: &str, bearer: Option<&str>) -> AuthOutcome
     }
 }
 
+/// v3.0 #3 Slice C: resolve a stable, non-secret USER label for the presented
+/// bearer token, used to attribute writes (`<server-node>/user:<label>`).
+/// Returns the configured display name from `token_names` if present, else a
+/// one-way fingerprint `anon-<8 hex>` derived from the token — distinct per token
+/// so unnamed users are still distinguishable, without ever exposing the secret.
+/// An absent/blank token yields `"anon"` (auth has already accepted the request).
+pub fn user_for_token(auth: &AuthConfig, bearer: Option<&str>) -> String {
+    let Some(tok) = bearer.map(str::trim).filter(|t| !t.is_empty()) else {
+        return "anon".to_string();
+    };
+    if let Some(name) = auth.token_names.get(tok) {
+        let n = name.trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tok.hash(&mut h);
+    format!("anon-{:08x}", (h.finish() & 0xffff_ffff) as u32)
+}
+
 /// True when the presented bearer token is one of the global/server-admin
 /// tokens. Use this for operations that affect shared org/user memory rather
 /// than a single repo brain.
@@ -109,9 +136,12 @@ mod tests {
         let mut per_repo = HashMap::new();
         per_repo.insert("acme-api".to_string(), vec!["tok_api".to_string()]);
         per_repo.insert("acme-web".to_string(), vec!["tok_web".to_string()]);
+        let mut token_names = HashMap::new();
+        token_names.insert("tok_api".to_string(), "alice".to_string());
         AuthConfig {
             global: vec!["tok_admin".to_string()],
             per_repo,
+            token_names,
         }
     }
 
@@ -161,8 +191,33 @@ mod tests {
     fn debug_does_not_expose_tokens() {
         let text = format!("{:?}", cfg());
         assert!(text.contains("global_token_count"));
+        assert!(text.contains("named_token_count"));
         assert!(!text.contains("tok_admin"));
         assert!(!text.contains("tok_api"));
         assert!(!text.contains("tok_web"));
+        // Names are not secrets, but the Debug summary must not dump them either.
+        assert!(!text.contains("alice"));
+    }
+
+    #[test]
+    fn user_for_token_uses_name_then_stable_anon_fingerprint() {
+        let c = cfg();
+        // Named token → display name.
+        assert_eq!(user_for_token(&c, Some("tok_api")), "alice");
+        // Unnamed token → stable anon fingerprint, distinct per token.
+        let admin = user_for_token(&c, Some("tok_admin"));
+        let web = user_for_token(&c, Some("tok_web"));
+        assert!(admin.starts_with("anon-"), "got {admin}");
+        assert_ne!(admin, web, "distinct tokens get distinct fingerprints");
+        assert_eq!(
+            admin,
+            user_for_token(&c, Some("tok_admin")),
+            "fingerprint is stable"
+        );
+        // The fingerprint never contains the raw token.
+        assert!(!admin.contains("tok_admin"));
+        // Missing/blank token → "anon".
+        assert_eq!(user_for_token(&c, None), "anon");
+        assert_eq!(user_for_token(&c, Some("  ")), "anon");
     }
 }
