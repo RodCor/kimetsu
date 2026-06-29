@@ -25,8 +25,8 @@ the same wrong turns, the same re-explaining of your conventions, the same
 expensive exploration you already paid for last week.
 
 Kimetsu fixes the forgetting. It's a sidecar brain, a single Rust binary that
-runs next to your host agent over MCP (Claude Code, Codex, Pi, OpenClaw, Cursor,
-Gemini CLI) or as its own terminal chat. It learns which memories the model
+runs next to your host agent over MCP (Claude Code, Codex, Pi, OpenClaw, Cursor)
+or as its own terminal chat. It learns which memories the model
 actually used to win, and lets that knowledge compound across runs.
 
 - **It remembers.** Project conventions, failure patterns, the exact command
@@ -97,7 +97,7 @@ recall@4 0.975, MRR 0.933. Swap embedder and reranker with one config key each
 and re-judge on your own corpus. Full grid in
 **[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**.
 
-Beyond recall, Kimetsu measures memory *correctness* — whether stale facts stay
+Beyond recall, Kimetsu measures memory *correctness*: whether stale facts stay
 out of retrieval and contradictions resolve to the current answer. Full
 methodology and results in
 **[the memory benchmark](https://rodcor.github.io/kimetsu/docs/memory-benchmark)**.

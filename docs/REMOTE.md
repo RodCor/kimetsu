@@ -1,11 +1,11 @@
 # Kimetsu Remote (beta)
 
-Run the brain on a server and connect over **HTTP MCP**, so a team — or you
-across machines — shares one brain per repository, with no local checkout.
+Run the brain on a server and connect over **HTTP MCP**, so a team (or you
+across machines) shares one brain per repository, with no local checkout.
 
 > **Beta.** Kimetsu Remote is under active testing and may have rough edges or
 > breaking changes before the stable release. The `kimetsu-remote` **server is a
-> separate package** — `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` do
+> separate package**: `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` do
 > **not** install it. Install it on the server when you want it:
 >
 > ```bash
@@ -15,7 +15,7 @@ across machines — shares one brain per repository, with no local checkout.
 >
 > (or grab the standalone `kimetsu-remote` archive from a GitHub Release). The
 > `kimetsu plugin install --remote` *client* wiring is part of the normal
-> `kimetsu` binary — no separate install needed to point a host at a server.
+> `kimetsu` binary, so no separate install is needed to point a host at a server.
 
 ## Server + client setup
 
@@ -23,7 +23,7 @@ across machines — shares one brain per repository, with no local checkout.
 # On the server (build with --features embeddings for semantic retrieval):
 kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains \
   --token <secret> --rate-limit 120        # 120 req/min per token (0 = off)
-#   one brain per repo under <data>/<repo-id>/; bearer-auth; plain HTTP — put a
+#   one brain per repo under <data>/<repo-id>/; bearer-auth; plain HTTP. Put a
 #   TLS proxy (nginx/Caddy) in front, or build `--features tls` and pass
 #   --tls-cert/--tls-key for in-process HTTPS. `GET /healthz` and `GET /metrics`
 #   (Prometheus text, aggregate-only) are unauthenticated. Prebuilt
@@ -36,7 +36,7 @@ kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains \
 #   Add --repos-file repos.toml --checkout-dir /srv/checkouts to let the server
 #   clone registered repos and ingest their files (remote file-capsule retrieval).
 
-# On each client — wire a host at the remote instead of the local stdio command:
+# On each client, wire a host at the remote instead of the local stdio command:
 kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
 kimetsu plugin install openclaw    --remote https://kimetsu.example.com:8787
 ```
@@ -44,13 +44,13 @@ kimetsu plugin install openclaw    --remote https://kimetsu.example.com:8787
 The repo id is derived from your git remote (`--repo <id>` to override), so the
 endpoint becomes `https://…/mcp/<repo-id>`. By default the host config
 references `${KIMETSU_REMOTE_TOKEN}` (set that env var where your agent runs)
-rather than writing the token to disk; pass `--token <t>` to embed a literal.
+rather than writing the token to disk. Pass `--token <t>` to embed a literal.
 The remote surfaces the memory/retrieval/curation tools by default.
 
 ## Retrieval quality
 
 The server reranks `kimetsu_brain_context` results with a
-cross-encoder (`--reranker`, default `jina-reranker-v1-tiny-en`, operator-level —
+cross-encoder (`--reranker`, default `jina-reranker-v1-tiny-en`, operator-level:
 `"off"` disables, any curated/HF id accepted). Benchmark results on the 100-memory
 dataset (production floors active, jina-tiny reranker):
 

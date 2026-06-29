@@ -14,7 +14,6 @@ pub enum BridgeTarget {
     Codex,
     Kimetsu,
     Cursor,
-    GeminiCli,
     #[cfg(feature = "openclaw")]
     OpenClaw,
     #[cfg(feature = "pi")]
@@ -28,7 +27,6 @@ impl BridgeTarget {
             "codex" => Ok(Self::Codex),
             "kimetsu" => Ok(Self::Kimetsu),
             "cursor" => Ok(Self::Cursor),
-            "gemini" | "gemini-cli" => Ok(Self::GeminiCli),
             #[cfg(feature = "openclaw")]
             "openclaw" | "claw" => Ok(Self::OpenClaw),
             #[cfg(not(feature = "openclaw"))]
@@ -53,7 +51,6 @@ impl BridgeTarget {
             Self::Codex => "codex",
             Self::Kimetsu => "kimetsu",
             Self::Cursor => "cursor",
-            Self::GeminiCli => "gemini-cli",
             #[cfg(feature = "openclaw")]
             Self::OpenClaw => "openclaw",
             #[cfg(feature = "pi")]
@@ -502,34 +499,6 @@ Do not call either tool on simple/one-liner tasks. The brain is for things that 
 effort or that you would want to remember next session.
 "#;
 
-/// GEMINI.md guidance installed in the project root (workspace install) or
-/// `~/.gemini/GEMINI.md` (global install).
-///
-/// Gemini CLI discovers GEMINI.md files from the project root and parent dirs
-/// up to the git root, as well as `~/.gemini/GEMINI.md` for global context.
-/// All discovered files are concatenated and sent with every prompt.
-///
-/// Gemini CLI has no hook system — MCP + GEMINI.md is the complete integration
-/// surface.
-///
-/// Source: https://google-gemini.github.io/gemini-cli/docs/cli/gemini-md.html
-const GEMINI_MD_CONTENT: &str = r#"# Kimetsu brain
-
-You have a persistent memory brain attached via MCP (tools prefixed `kimetsu_`).
-
-- **Before non-trivial tasks**: call `kimetsu_brain_context` with a short query. If the brain
-  has relevant prior knowledge it will return it. If not (`skipped: true`), proceed as normal —
-  this is zero overhead.
-- **After solving a non-obvious problem**: call `kimetsu_brain_record` with what you learned
-  and 2-5 domain tags. Keep lessons concrete and actionable, not platitudes.
-
-Do not call either tool on simple/one-liner tasks. The brain is for things that required real
-effort or that you would want to remember next session.
-"#;
-
-const GEMINI_MD_BEGIN: &str = "<!-- kimetsu:begin -->";
-const GEMINI_MD_END: &str = "<!-- kimetsu:end -->";
-
 pub fn bridge_scan(workspace: &Path, config: &SkillConfig) -> Result<BridgeScan, String> {
     let workspace = normalize_path(workspace);
     let registry = SkillRegistry::discover(&workspace, config)?;
@@ -639,7 +608,6 @@ pub fn bridge_export_skill(
         BridgeTarget::Codex => workspace.join(".codex").join("skills").join(&name),
         BridgeTarget::Kimetsu => workspace.join(".kimetsu").join("skills").join(&name),
         BridgeTarget::Cursor => workspace.join(".cursor").join("skills").join(&name),
-        BridgeTarget::GeminiCli => workspace.join(".gemini").join("skills").join(&name),
         #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => workspace
             .join(".openclaw")
@@ -1006,34 +974,6 @@ fn plugin_install_inner(
             }
         }
 
-        BridgeTarget::GeminiCli => {
-            // Gemini CLI: MCP config in .gemini/settings.json (workspace) or
-            // ~/.gemini/settings.json (global), key `mcpServers`.
-            // No hook system — wire MCP + GEMINI.md context file only.
-            //
-            // Config schema verified from google-gemini/gemini-cli docs (June 2026):
-            //   mcpServers.<name>.command = "kimetsu"
-            //   mcpServers.<name>.args = ["mcp", "serve", "--workspace", "."]
-            // GEMINI.md: project root (workspace) or ~/.gemini/GEMINI.md (global)
-            let gemini_dir = match home {
-                Some(h) => h.join(".gemini"),
-                None => workspace.join(".gemini"),
-            };
-            fs::create_dir_all(&gemini_dir)
-                .map_err(|err| format!("create {}: {err}", gemini_dir.display()))?;
-            let settings = gemini_dir.join("settings.json");
-            write_gemini_settings(&settings)?;
-            files.push(normalize_path(&settings));
-
-            // GEMINI.md: merge into project root (workspace) or ~/.gemini/GEMINI.md (global)
-            let gemini_md_path = match home {
-                Some(h) => h.join(".gemini").join("GEMINI.md"),
-                None => workspace.join("GEMINI.md"),
-            };
-            merge_gemini_md(&gemini_md_path)?;
-            files.push(normalize_path(&gemini_md_path));
-        }
-
         #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => {
             // OpenClaw supports MCP natively.
@@ -1306,48 +1246,6 @@ fn detect_cursor_rules(workspace: &Path) -> bool {
         .is_dir()
 }
 
-/// Returns true if `.gemini/settings.json` has `mcpServers.kimetsu`.
-fn detect_gemini_mcp(gemini_dir: &Path) -> bool {
-    let settings = gemini_dir.join("settings.json");
-    if !settings.is_file() {
-        return false;
-    }
-    let Ok(text) = fs::read_to_string(&settings) else {
-        return false;
-    };
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(strip_bom(&text)) else {
-        return false;
-    };
-    root.get("mcpServers")
-        .and_then(|v| v.as_object())
-        .map(|m| m.contains_key("kimetsu"))
-        .unwrap_or(false)
-}
-
-/// Returns true if `GEMINI.md` in the workspace root has the Kimetsu begin marker.
-fn detect_gemini_md(workspace: &Path) -> bool {
-    let md = workspace.join("GEMINI.md");
-    if !md.is_file() {
-        return false;
-    }
-    let Ok(text) = fs::read_to_string(&md) else {
-        return false;
-    };
-    text.contains(GEMINI_MD_BEGIN)
-}
-
-/// Returns true if `~/.gemini/GEMINI.md` (global) has the Kimetsu begin marker.
-fn detect_gemini_global_md(gemini_dir: &Path) -> bool {
-    let md = gemini_dir.join("GEMINI.md");
-    if !md.is_file() {
-        return false;
-    }
-    let Ok(text) = fs::read_to_string(&md) else {
-        return false;
-    };
-    text.contains(GEMINI_MD_BEGIN)
-}
-
 #[cfg(feature = "pi")]
 /// Returns true if Pi's `settings.json` registers the kimetsu extension AND
 /// `extensions/kimetsu.ts` exists in `pi_dir`.
@@ -1462,7 +1360,6 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
         BridgeTarget::ClaudeCode,
         BridgeTarget::Codex,
         BridgeTarget::Cursor,
-        BridgeTarget::GeminiCli,
     ];
     #[cfg(feature = "openclaw")]
     scan_targets.push(BridgeTarget::OpenClaw);
@@ -1629,45 +1526,6 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
                         present,
                         missing,
                         config_path: cursor_dir.to_string_lossy().to_string(),
-                    });
-                }
-
-                BridgeTarget::GeminiCli => {
-                    let gemini_dir = match home {
-                        Some(h) => h.join(".gemini"),
-                        None => workspace.join(".gemini"),
-                    };
-
-                    let mcp_ok = detect_gemini_mcp(&gemini_dir);
-                    let gemini_md_ok = if home.is_none() {
-                        detect_gemini_md(&workspace)
-                    } else {
-                        detect_gemini_global_md(&gemini_dir)
-                    };
-
-                    let mut present = Vec::new();
-                    let mut missing = Vec::new();
-
-                    for (name, ok) in [("mcp", mcp_ok), ("GEMINI.md", gemini_md_ok)] {
-                        if ok {
-                            present.push(name.to_string());
-                        } else {
-                            missing.push(name.to_string());
-                        }
-                    }
-
-                    let state = aggregate_state(
-                        &present.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                        &missing.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                    );
-
-                    results.push(PluginScopeStatus {
-                        host: target.as_str().to_string(),
-                        scope: scope.as_str().to_string(),
-                        state,
-                        present,
-                        missing,
-                        config_path: gemini_dir.to_string_lossy().to_string(),
                     });
                 }
 
@@ -1897,29 +1755,6 @@ fn plugin_uninstall_inner(
                 if remove_path_if_exists(&rules_dir)? {
                     report.removed.push(normalize_path(&rules_dir));
                 }
-            }
-        }
-
-        BridgeTarget::GeminiCli => {
-            let gemini_dir = match home {
-                Some(h) => h.join(".gemini"),
-                None => workspace.join(".gemini"),
-            };
-
-            // settings.json — remove mcpServers.kimetsu.
-            let settings = gemini_dir.join("settings.json");
-            if uninstall_gemini_settings(&settings)? {
-                report.modified.push(normalize_path(&settings));
-            }
-
-            // GEMINI.md — remove the kimetsu block (workspace = project root;
-            // global = ~/.gemini/GEMINI.md).
-            let gemini_md = match home {
-                Some(h) => h.join(".gemini").join("GEMINI.md"),
-                None => workspace.join("GEMINI.md"),
-            };
-            if uninstall_gemini_md(&gemini_md)? {
-                report.modified.push(normalize_path(&gemini_md));
             }
         }
 
@@ -2242,150 +2077,6 @@ fn uninstall_cursor_mcp(path: &Path) -> Result<bool, String> {
     let out = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("serialize {}: {err}", path.display()))?;
     write_text_file(path, &out, true)?;
-    Ok(true)
-}
-
-/// Upsert `mcpServers.kimetsu` into Gemini CLI's `settings.json`.
-///
-/// Schema verified from google-gemini/gemini-cli docs (June 2026):
-/// - STDIO server uses `command` + `args` fields under the `mcpServers` key.
-/// - Both workspace (`.gemini/settings.json`) and global (`~/.gemini/settings.json`)
-///   use `mcpServers` — same as Gemini's own documented examples.
-fn write_gemini_settings(path: &Path) -> Result<(), String> {
-    let mut root = if path.is_file() {
-        let text =
-            fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        serde_json::from_str::<serde_json::Value>(strip_bom(&text))
-            .map_err(|err| format!("parse {}: {err}", path.display()))?
-    } else {
-        serde_json::json!({})
-    };
-    let root_obj = root
-        .as_object_mut()
-        .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
-    let servers = root_obj
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let servers_obj = servers
-        .as_object_mut()
-        .ok_or_else(|| format!("{} `mcpServers` must be a JSON object", path.display()))?;
-    servers_obj.insert(
-        "kimetsu".to_string(),
-        serde_json::json!({
-            "command": "kimetsu",
-            "args": ["mcp", "serve", "--workspace", "."]
-        }),
-    );
-    let text = serde_json::to_string_pretty(&root)
-        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
-    write_text_file(path, &text, true)
-}
-
-/// Remove `mcpServers.kimetsu` from Gemini CLI's `settings.json`.
-/// Returns `true` if the file was changed.
-fn uninstall_gemini_settings(path: &Path) -> Result<bool, String> {
-    if !path.is_file() {
-        return Ok(false);
-    }
-    let text = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    let mut root: serde_json::Value = serde_json::from_str(strip_bom(&text))
-        .map_err(|err| format!("parse {}: {err}", path.display()))?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Ok(false);
-    };
-    let Some(servers) = root_obj
-        .get_mut("mcpServers")
-        .and_then(|v| v.as_object_mut())
-    else {
-        return Ok(false);
-    };
-    if servers.remove("kimetsu").is_none() {
-        return Ok(false);
-    }
-    let out = serde_json::to_string_pretty(&root)
-        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
-    write_text_file(path, &out, true)?;
-    Ok(true)
-}
-
-/// Merge the Kimetsu brain guidance block into a `GEMINI.md` file.
-///
-/// Uses the same `<!-- kimetsu:begin/end -->` marker idiom as `merge_claude_md`
-/// so the block can be found and updated idempotently. Missing file → create.
-/// Existing user content is never clobbered.
-fn merge_gemini_md(path: &Path) -> Result<(), String> {
-    let block = format!("{GEMINI_MD_BEGIN}\n{GEMINI_MD_CONTENT}{GEMINI_MD_END}\n");
-    let raw = if path.is_file() {
-        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?
-    } else {
-        String::new()
-    };
-    let existing = strip_bom(&raw);
-    let merged = match (existing.find(GEMINI_MD_BEGIN), existing.find(GEMINI_MD_END)) {
-        (Some(start), Some(end_start)) if end_start >= start => {
-            let end = end_start + GEMINI_MD_END.len();
-            let after = existing[end..]
-                .strip_prefix('\n')
-                .unwrap_or(&existing[end..]);
-            format!("{}{block}{after}", &existing[..start])
-        }
-        (Some(start), _) => {
-            // BEGIN present but END missing — corrupt; replace from BEGIN onward.
-            let before = existing[..start].trim_end_matches('\n');
-            if before.is_empty() {
-                block
-            } else {
-                format!("{before}\n\n{block}")
-            }
-        }
-        _ => {
-            let mut out = existing.to_string();
-            if !out.is_empty() {
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push('\n');
-            }
-            out.push_str(&block);
-            out
-        }
-    };
-    write_text_file(path, &merged, true)
-}
-
-/// Remove the `<!-- kimetsu:begin --> … <!-- kimetsu:end -->` block from
-/// `GEMINI.md`. Returns `true` if the file was changed.
-fn uninstall_gemini_md(path: &Path) -> Result<bool, String> {
-    if !path.is_file() {
-        return Ok(false);
-    }
-    let raw = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    let text = strip_bom(&raw);
-
-    let (begin_pos, end_pos) = match (text.find(GEMINI_MD_BEGIN), text.find(GEMINI_MD_END)) {
-        (Some(b), Some(e)) if e >= b => (b, e),
-        _ => return Ok(false),
-    };
-
-    let end_of_block = end_pos + GEMINI_MD_END.len();
-    let after_start = if text[end_of_block..].starts_with('\n') {
-        end_of_block + 1
-    } else {
-        end_of_block
-    };
-
-    let before = &text[..begin_pos];
-    let after = &text[after_start..];
-    let before_trimmed = before.trim_end_matches('\n');
-    let merged = if before_trimmed.is_empty() {
-        after.to_string()
-    } else if after.is_empty() || after.trim().is_empty() {
-        format!("{before_trimmed}\n")
-    } else {
-        format!("{before_trimmed}\n\n{after}")
-    };
-
-    write_text_file(path, &merged, true)?;
     Ok(true)
 }
 
@@ -3095,7 +2786,7 @@ fn write_claude_hooks(path: &Path, proactive: bool) -> Result<(), String> {
     //      SessionStart additionalContext injection (verified against live docs).
     //
     // Hosts that have NOT been verified to support additionalContext in
-    // SessionStart (Codex, Cursor, GeminiCli, Pi, OpenClaw) do NOT get the
+    // SessionStart (Codex, Cursor, Pi, OpenClaw) do NOT get the
     // session-start-hook wired here.  Only Claude Code is wired.
     // Add wiring for each host once verified against live docs/schema.
     upsert_kimetsu_hook(
@@ -6666,361 +6357,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Gemini CLI — workspace + global install/uninstall/status tests
-    // -------------------------------------------------------------------------
-
-    /// Gemini CLI workspace install writes `.gemini/settings.json` (mcpServers)
-    /// and merges a `GEMINI.md` block at the project root.
-    #[test]
-    fn gemini_workspace_install_writes_settings_and_md() {
-        let ws = temp_root("gemini_ws_install");
-
-        plugin_install_inner(
-            &ws,
-            BridgeTarget::GeminiCli,
-            InstallScope::Workspace,
-            PluginMode::Optional,
-            false,
-            false,
-            None,
-        )
-        .expect("Gemini CLI workspace install");
-
-        let settings_path = ws.join(".gemini/settings.json");
-        assert!(settings_path.is_file(), ".gemini/settings.json must exist");
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["kimetsu"]["command"], "kimetsu");
-        let args = v["mcpServers"]["kimetsu"]["args"].as_array().unwrap();
-        assert!(
-            args.iter().any(|a| a == "serve"),
-            "args must include 'serve'"
-        );
-
-        let gemini_md_path = ws.join("GEMINI.md");
-        assert!(
-            gemini_md_path.is_file(),
-            "GEMINI.md must exist at workspace root"
-        );
-        let md_text = fs::read_to_string(&gemini_md_path).unwrap();
-        assert!(
-            md_text.contains(GEMINI_MD_BEGIN),
-            "GEMINI.md must have begin marker"
-        );
-        assert!(
-            md_text.contains("Kimetsu"),
-            "GEMINI.md must mention Kimetsu"
-        );
-
-        fs::remove_dir_all(ws).ok();
-    }
-
-    /// Gemini CLI workspace install is idempotent.
-    #[test]
-    fn gemini_workspace_install_is_idempotent() {
-        let ws = temp_root("gemini_ws_idem");
-
-        for _ in 0..2 {
-            plugin_install_inner(
-                &ws,
-                BridgeTarget::GeminiCli,
-                InstallScope::Workspace,
-                PluginMode::Optional,
-                false,
-                false,
-                None,
-            )
-            .expect("Gemini install must be idempotent");
-        }
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(ws.join(".gemini/settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            v["mcpServers"].as_object().unwrap().len(),
-            1,
-            "exactly one entry in mcpServers"
-        );
-
-        let md_text = fs::read_to_string(ws.join("GEMINI.md")).unwrap();
-        assert_eq!(
-            md_text.matches(GEMINI_MD_BEGIN).count(),
-            1,
-            "GEMINI.md must have exactly one Kimetsu block after two installs"
-        );
-
-        fs::remove_dir_all(ws).ok();
-    }
-
-    /// Gemini CLI workspace install preserves a pre-existing user MCP server.
-    #[test]
-    fn gemini_workspace_install_preserves_user_server() {
-        let ws = temp_root("gemini_ws_preserve");
-        let gemini_dir = ws.join(".gemini");
-        fs::create_dir_all(&gemini_dir).unwrap();
-        fs::write(
-            gemini_dir.join("settings.json"),
-            serde_json::to_string_pretty(&json!({
-                "mcpServers": {
-                    "my-tool": { "command": "my-tool-cmd", "args": [] }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        plugin_install_inner(
-            &ws,
-            BridgeTarget::GeminiCli,
-            InstallScope::Workspace,
-            PluginMode::Optional,
-            false,
-            false,
-            None,
-        )
-        .expect("Gemini install with pre-seeded settings.json");
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(gemini_dir.join("settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            v["mcpServers"]["my-tool"]["command"], "my-tool-cmd",
-            "user tool must survive"
-        );
-        assert_eq!(v["mcpServers"]["kimetsu"]["command"], "kimetsu");
-
-        fs::remove_dir_all(ws).ok();
-    }
-
-    /// Gemini CLI workspace install preserves pre-existing user content in GEMINI.md.
-    #[test]
-    fn gemini_workspace_install_preserves_gemini_md_user_content() {
-        let ws = temp_root("gemini_ws_md_preserve");
-        // Pre-seed a GEMINI.md with user instructions.
-        fs::write(ws.join("GEMINI.md"), "# Project rules\nAlways test.\n").unwrap();
-
-        plugin_install_inner(
-            &ws,
-            BridgeTarget::GeminiCli,
-            InstallScope::Workspace,
-            PluginMode::Optional,
-            false,
-            false,
-            None,
-        )
-        .expect("Gemini install with pre-seeded GEMINI.md");
-
-        let text = fs::read_to_string(ws.join("GEMINI.md")).unwrap();
-        assert!(
-            text.contains("# Project rules"),
-            "user content must survive"
-        );
-        assert!(text.contains("Always test."), "user detail must survive");
-        assert!(text.contains("Kimetsu"), "kimetsu block appended");
-        assert!(
-            text.find("# Project rules").unwrap() < text.find(GEMINI_MD_BEGIN).unwrap(),
-            "user content must precede kimetsu block"
-        );
-
-        fs::remove_dir_all(ws).ok();
-    }
-
-    /// Gemini CLI global install writes to `~/.gemini/settings.json` and
-    /// `~/.gemini/GEMINI.md` (injected home).
-    #[test]
-    fn gemini_global_install_writes_to_home() {
-        let ws = temp_root("gemini_global_ws");
-        let home = temp_root("gemini_global_home");
-
-        plugin_install_inner(
-            &ws,
-            BridgeTarget::GeminiCli,
-            InstallScope::Global,
-            PluginMode::Optional,
-            false,
-            false,
-            Some(home.as_path()),
-        )
-        .expect("Gemini CLI global install");
-
-        let settings_path = home.join(".gemini/settings.json");
-        assert!(
-            settings_path.is_file(),
-            "~/.gemini/settings.json must exist"
-        );
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["kimetsu"]["command"], "kimetsu");
-
-        let gemini_md_path = home.join(".gemini/GEMINI.md");
-        assert!(
-            gemini_md_path.is_file(),
-            "~/.gemini/GEMINI.md must exist for global install"
-        );
-        let md_text = fs::read_to_string(&gemini_md_path).unwrap();
-        assert!(md_text.contains(GEMINI_MD_BEGIN));
-
-        // Workspace directory must remain untouched.
-        assert!(
-            !ws.join(".gemini").exists(),
-            "workspace .gemini must not exist for global install"
-        );
-        assert!(
-            !ws.join("GEMINI.md").exists(),
-            "workspace GEMINI.md must not exist for global install"
-        );
-
-        fs::remove_dir_all(ws).ok();
-        fs::remove_dir_all(home).ok();
-    }
-
-    /// Gemini CLI uninstall removes `mcpServers.kimetsu` from
-    /// `.gemini/settings.json` and strips the kimetsu block from `GEMINI.md`.
-    #[test]
-    fn gemini_uninstall_removes_settings_and_md() {
-        let ws = temp_root("gemini_uninstall");
-
-        // Install first.
-        plugin_install_inner(
-            &ws,
-            BridgeTarget::GeminiCli,
-            InstallScope::Workspace,
-            PluginMode::Optional,
-            false,
-            false,
-            None,
-        )
-        .expect("install");
-
-        assert!(detect_gemini_mcp(&ws.join(".gemini")));
-        assert!(detect_gemini_md(&ws));
-
-        // Uninstall.
-        let report = plugin_uninstall(&ws, BridgeTarget::GeminiCli, InstallScope::Workspace)
-            .expect("Gemini CLI uninstall");
-
-        assert!(
-            !detect_gemini_mcp(&ws.join(".gemini")),
-            "mcp entry must be gone after uninstall"
-        );
-        assert!(
-            !detect_gemini_md(&ws),
-            "GEMINI.md block must be gone after uninstall"
-        );
-        assert!(
-            !report.modified.is_empty(),
-            "report must list modified files"
-        );
-
-        fs::remove_dir_all(ws).ok();
-    }
-
-    /// `plugin_status` detects an installed Gemini CLI workspace entry.
-    #[test]
-    fn gemini_status_detects_installed_workspace() {
-        let ws = temp_root("gemini_status_ws");
-
-        plugin_install_inner(
-            &ws,
-            BridgeTarget::GeminiCli,
-            InstallScope::Workspace,
-            PluginMode::Optional,
-            false,
-            false,
-            None,
-        )
-        .expect("install");
-
-        let statuses = plugin_status_inner(&ws);
-        let entry = statuses
-            .iter()
-            .find(|s| s.host == "gemini-cli" && s.scope == "workspace");
-        assert!(
-            entry.is_some(),
-            "gemini-cli/workspace status entry must exist"
-        );
-        let entry = entry.unwrap();
-        assert!(
-            matches!(entry.state, WiringState::Installed),
-            "state must be Installed, got {:?}",
-            entry.state
-        );
-
-        fs::remove_dir_all(ws).ok();
-    }
-
-    // -------------------------------------------------------------------------
-    // merge_gemini_md — unit tests (mirrors merge_claude_md suite)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn merge_gemini_md_fresh_file() {
-        let root = temp_root("gemini_md_fresh");
-        let p = root.join("GEMINI.md");
-        merge_gemini_md(&p).unwrap();
-        let text = fs::read_to_string(&p).unwrap();
-        assert!(text.contains(GEMINI_MD_BEGIN));
-        assert!(text.contains("Kimetsu"));
-        assert!(text.contains(GEMINI_MD_END));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn merge_gemini_md_preserves_user_content() {
-        let root = temp_root("gemini_md_preserve");
-        let p = root.join("GEMINI.md");
-        fs::write(&p, "# My rules\nAlways use tabs.\n").unwrap();
-        merge_gemini_md(&p).unwrap();
-        let text = fs::read_to_string(&p).unwrap();
-        assert!(text.contains("# My rules"));
-        assert!(text.contains("Always use tabs."));
-        assert!(text.contains("Kimetsu"));
-        assert!(
-            text.find("My rules").unwrap() < text.find(GEMINI_MD_BEGIN).unwrap(),
-            "user content precedes the kimetsu block"
-        );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn merge_gemini_md_idempotent() {
-        let root = temp_root("gemini_md_idem");
-        let p = root.join("GEMINI.md");
-        fs::write(&p, "# Mine\n").unwrap();
-        merge_gemini_md(&p).unwrap();
-        merge_gemini_md(&p).unwrap();
-        let text = fs::read_to_string(&p).unwrap();
-        assert_eq!(
-            text.matches(GEMINI_MD_BEGIN).count(),
-            1,
-            "no duplicate block"
-        );
-        assert_eq!(text.matches(GEMINI_MD_END).count(), 1);
-        assert!(text.contains("# Mine"));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn merge_gemini_md_upgrades_in_place() {
-        let root = temp_root("gemini_md_upgrade");
-        let p = root.join("GEMINI.md");
-        fs::write(
-            &p,
-            format!("# Top\n\n{GEMINI_MD_BEGIN}\nOLD STALE\n{GEMINI_MD_END}\n\n# Bottom\n"),
-        )
-        .unwrap();
-        merge_gemini_md(&p).unwrap();
-        let text = fs::read_to_string(&p).unwrap();
-        assert!(!text.contains("OLD STALE"), "stale block replaced");
-        assert!(text.contains("Kimetsu"));
-        assert!(text.contains("# Top"));
-        assert!(text.contains("# Bottom"));
-        assert_eq!(text.matches(GEMINI_MD_BEGIN).count(), 1);
-        fs::remove_dir_all(root).ok();
-    }
-
-    // -------------------------------------------------------------------------
-    // write_cursor_mcp_config / write_gemini_settings — unit tests
+    // write_cursor_mcp_config — unit tests
     // -------------------------------------------------------------------------
 
     #[test]
@@ -7037,28 +6374,6 @@ mod tests {
             v["mcpServers"].as_object().unwrap().len(),
             1,
             "no duplicate entries"
-        );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn write_gemini_settings_fresh_and_idempotent() {
-        let root = temp_root("gemini_settings_unit");
-        let path = root.join("settings.json");
-        write_gemini_settings(&path).unwrap();
-        write_gemini_settings(&path).unwrap(); // idempotent
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["kimetsu"]["command"], "kimetsu");
-        assert_eq!(
-            v["mcpServers"].as_object().unwrap().len(),
-            1,
-            "no duplicate entries"
-        );
-        // Gemini CLI does NOT use `type: "stdio"` — just command + args.
-        assert!(
-            v["mcpServers"]["kimetsu"].get("type").is_none(),
-            "Gemini CLI settings must not have a 'type' field"
         );
         fs::remove_dir_all(root).ok();
     }

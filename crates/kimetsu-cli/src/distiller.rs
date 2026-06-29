@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 /// Max characters of transcript view fed to the distiller (keeps the
 /// model call cheap and bounded).
-const MAX_VIEW_CHARS: usize = 12_000;
+pub const MAX_VIEW_CHARS: usize = 12_000;
 
 const DISTILL_SYSTEM: &str = "You are Kimetsu's memory distiller. From the session transcript, extract durable, \
 generalizable lessons worth remembering across future sessions — favoring non-obvious fixes for \
@@ -302,6 +302,45 @@ pub fn distill_lessons(transcript_view: &str, provider: &mut dyn ModelProvider) 
     match provider.complete(request) {
         Ok(response) => parse_lessons(response.text.as_deref().unwrap_or("")),
         Err(_) => Vec::new(),
+    }
+}
+
+/// System prompt for HyDE (Hypothetical Document Embeddings) query expansion.
+const HYDE_SYSTEM: &str = "You help a code-memory search system. Given a developer's \
+question, write a brief, specific hypothetical passage (2 to 4 sentences) that would \
+appear in a project note or stored memory and that directly answers the question. Write \
+it as a confident factual statement, in the project's own terms. Do not restate the \
+question, do not hedge, do not say you are unsure. Output only the passage.";
+
+/// HyDE query expansion: generate a hypothetical answer passage for `query` using
+/// the cheap model. The caller embeds this passage (instead of, or alongside, the
+/// raw query) so semantic retrieval matches the *answer's* vector rather than the
+/// question's — which lifts recall on oblique queries that don't lexically or
+/// semantically resemble the stored memory. Returns None on any model error
+/// (caller falls back to the raw query).
+pub fn hyde_expand(query: &str, provider: &mut dyn ModelProvider) -> Option<String> {
+    let request = ModelRequest {
+        messages: vec![
+            ModelMessage {
+                role: MessageRole::System,
+                content: vec![MessageContent::Text {
+                    text: HYDE_SYSTEM.to_string(),
+                }],
+            },
+            ModelMessage::user_text(query),
+        ],
+        tools: Vec::new(),
+        tool_choice: ToolChoice::None,
+        max_output_tokens: 256,
+        temperature: 0.3,
+        metadata: serde_json::Value::Null,
+    };
+    match provider.complete(request) {
+        Ok(response) => {
+            let text = response.text.as_deref().unwrap_or("").trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        Err(_) => None,
     }
 }
 

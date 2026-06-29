@@ -445,7 +445,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let paths = target_at(&root);
-        let mut input = Cursor::new(b"y\ngemini\n".to_vec());
+        let mut input = Cursor::new(b"y\nnonsense\n".to_vec());
         let mut output = Vec::new();
         assert!(!run_harvest_setup(&mut input, &mut output, &paths, "this workspace").unwrap());
         assert!(!root.join(".env").exists());
@@ -463,7 +463,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let paths = target_at(&root);
-        let mut input = Cursor::new(b"y\nclaude\ngemini\n".to_vec());
+        let mut input = Cursor::new(b"y\nclaude\nnonsense\n".to_vec());
         let mut output = Vec::new();
         assert!(!run_harvest_setup(&mut input, &mut output, &paths, "this workspace").unwrap());
         assert!(!root.join(".env").exists());

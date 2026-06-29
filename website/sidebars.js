@@ -8,6 +8,7 @@ const sidebars = {
     'install',
     'local-models',
     'remote',
+    'memory-benchmark',
     'roi-methodology',
     'contributing',
     'code-of-conduct',

@@ -164,6 +164,13 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // a retrieved capsule. Best-effort — a missing or
         // malformed payload just no-ops.
         "memory.cited" => apply_memory_cited(conn, event),
+        // Story 2.4: explicit regret (negative outcome) on a memory. Only
+        // manual regrets mutate stats (see apply_retrieval_regret); auto
+        // telemetry regrets are projected as no-ops.
+        "retrieval.regret" => apply_retrieval_regret(conn, event),
+        // Testing/benchmark affordance: backdate created_at / last_useful_at so
+        // age-sensitive policies (forgetting) can be exercised.
+        "memory.aged" => apply_memory_aged(conn, event),
         // Story 3.1: near-duplicate merge — stamp superseded_by on merged members,
         // remove their FTS rows, and drop them from the ANN index.
         "memory.superseded" => apply_memory_superseded(conn, event),
@@ -263,6 +270,106 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
             cited_at,
             rationale,
         ],
+    )?;
+
+    // Flagship 2 / Story 2.4: a STANDALONE citation (sentinel/nil run_id, i.e.
+    // the `record_mcp_citation` / `brain cite` path) is an explicit outcome
+    // signal with no run finalization behind it, so apply the cited-memory
+    // delta here. Citations tied to a REAL run keep metadata-only here and are
+    // bumped by `apply_memory_usefulness_for_run` on the terminal run event —
+    // gating on the sentinel avoids double-counting.
+    if event.run_id.0 == ulid::Ulid::nil() {
+        apply_cited_outcome(conn, memory_id, 1.0, 1.0, &cited_at, true)?;
+    }
+    Ok(())
+}
+
+/// Story 2.4: a memory the model flagged as unhelpful/misleading. Mirrors the
+/// `run.failed` cited delta. Only EXPLICIT manual regrets (`payload.source ==
+/// "manual"`, set by `record_regret` / `brain regret`) mutate stats; the
+/// auto-emitted regret telemetry (no `source`) stays a no-op so existing
+/// behavior is unchanged.
+fn apply_retrieval_regret(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let is_manual = event
+        .payload
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "manual")
+        .unwrap_or(false);
+    if !is_manual {
+        return Ok(());
+    }
+    let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let ts = ts_text(event)?;
+    apply_cited_outcome(conn, memory_id, -1.0, 0.0, &ts, false)?;
+    Ok(())
+}
+
+/// Backdate a memory's `created_at` / `last_useful_at` from a `memory.aged`
+/// event (absolute timestamps in the payload → rebuild-deterministic).
+fn apply_memory_aged(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(memory_id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    if let Some(created) = event.payload.get("created_at").and_then(|v| v.as_str()) {
+        conn.execute(
+            "UPDATE memories SET created_at = ?2 WHERE memory_id = ?1",
+            params![memory_id, created],
+        )?;
+    }
+    if let Some(last_useful) = event.payload.get("last_useful_at").and_then(|v| v.as_str()) {
+        conn.execute(
+            "UPDATE memories SET last_useful_at = ?2 WHERE memory_id = ?1",
+            params![memory_id, last_useful],
+        )?;
+    }
+    Ok(())
+}
+
+/// Confidence calibration smoothing factor (Bayesian-ish nudge per outcome).
+const CONF_ALPHA: f64 = 0.05;
+
+/// Apply a single cited-memory OUTCOME to one memory row, shared by the run
+/// attribution path and the standalone cite/regret path: bump `use_count`,
+/// add `usefulness_delta`, stamp `last_used_at` (and `last_useful_at` when
+/// `bump_last_useful`), and nudge `confidence` toward `conf_target`
+/// (`new = old + 0.05*(target-old)`, clamped to [0.1, 0.99]). Read-modify-write
+/// on the deterministic event order → rebuild-safe.
+fn apply_cited_outcome(
+    conn: &Connection,
+    memory_id: &str,
+    usefulness_delta: f64,
+    conf_target: f64,
+    ts: &str,
+    bump_last_useful: bool,
+) -> KimetsuResult<()> {
+    conn.execute(
+        "UPDATE memories
+         SET use_count = use_count + 1,
+             usefulness_score = usefulness_score + ?2,
+             last_used_at = ?3
+         WHERE memory_id = ?1",
+        params![memory_id, usefulness_delta, ts],
+    )?;
+    if bump_last_useful {
+        conn.execute(
+            "UPDATE memories SET last_useful_at = ?2 WHERE memory_id = ?1",
+            params![memory_id, ts],
+        )?;
+    }
+    let old_conf: f64 = conn
+        .query_row(
+            "SELECT confidence FROM memories WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get::<_, f64>(0),
+        )
+        .unwrap_or(1.0);
+    let new_conf = (old_conf + CONF_ALPHA * (conf_target - old_conf)).clamp(0.1, 0.99);
+    conn.execute(
+        "UPDATE memories SET confidence = ?2 WHERE memory_id = ?1",
+        params![memory_id, new_conf],
     )?;
     Ok(())
 }
@@ -413,7 +520,6 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
         "run.failed" => Some(0.0),
         _ => None,
     };
-    const CONF_ALPHA: f64 = 0.05;
 
     for memory_id in &retrieved {
         let is_cited = cited.contains(memory_id);

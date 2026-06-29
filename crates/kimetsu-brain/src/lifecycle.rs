@@ -240,16 +240,22 @@ fn query_forget_candidates(
     //   - active (not invalidated, not superseded)
     //   - use_count < protect_use_count
     //   - usefulness is low: score / max(use_count,1) <= floor
-    //   - stale: COALESCE(last_useful_at, created_at) <= cutoff
+    //   - stale: it has not been RETRIEVED, proven useful, or created within the
+    //     age window. The staleness reference is the most recent of
+    //     `last_used_at` (bumped on every retrieval), `last_useful_at` (bumped on
+    //     a successful citation), and `created_at`. Including `last_used_at` is
+    //     the v3.0 fix for recall-preservation: a memory that is still being
+    //     surfaced is in active use, so it must not be forgotten just because it
+    //     has a low usefulness score and was never explicitly cited.
     let mut stmt = conn.prepare(
         "SELECT memory_id, scope, kind, text, use_count, usefulness_score,
-                COALESCE(last_useful_at, created_at) AS ref_ts
+                COALESCE(last_used_at, last_useful_at, created_at) AS ref_ts
          FROM memories
          WHERE invalidated_at IS NULL
            AND superseded_by IS NULL
            AND use_count < ?1
            AND (CAST(usefulness_score AS REAL) / MAX(CAST(use_count AS REAL), 1.0)) <= ?2
-           AND COALESCE(last_useful_at, created_at) <= ?3
+           AND COALESCE(last_used_at, last_useful_at, created_at) <= ?3
          ORDER BY (CAST(usefulness_score AS REAL) / MAX(CAST(use_count AS REAL), 1.0)) ASC",
     )?;
 
@@ -747,6 +753,79 @@ mod tests {
             assert!(
                 !ids.contains(&signal.as_str()),
                 "signal (use_count=15) must be protected"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    // v3.0 recall-preservation fix: a memory that was RETRIEVED recently
+    // (`last_used_at` set, e.g. injected into a recent run) is in active use and
+    // must NOT be forgotten just because it has low usefulness and was never
+    // explicitly cited — even when its `created_at` is old.
+    #[test]
+    fn forget_protects_recently_retrieved_via_last_used_at() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).expect("init");
+
+            let retrieved = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "old low-usefulness memory that is still being retrieved",
+            )
+            .expect("retrieved");
+            let stale = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "old low-usefulness memory never retrieved again",
+            )
+            .expect("stale");
+
+            let (_paths, _config, conn) = crate::project::load_project(&root).expect("load");
+            let old_ts = (OffsetDateTime::now_utc() - time::Duration::seconds(200 * 86_400))
+                .format(&Rfc3339)
+                .unwrap();
+            let recent_ts = (OffsetDateTime::now_utc() - time::Duration::seconds(2 * 86_400))
+                .format(&Rfc3339)
+                .unwrap();
+            // Both: old created_at, low usefulness, use_count 0, never cited.
+            // `retrieved` was surfaced 2 days ago (last_used_at recent).
+            conn.execute(
+                "UPDATE memories SET created_at = ?2, usefulness_score = 0.0, use_count = 0,
+                     last_useful_at = NULL, last_used_at = ?3 WHERE memory_id = ?1",
+                rusqlite::params![retrieved, old_ts, recent_ts],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?2, usefulness_score = 0.0, use_count = 0,
+                     last_useful_at = NULL, last_used_at = NULL WHERE memory_id = ?1",
+                rusqlite::params![stale, old_ts],
+            )
+            .unwrap();
+            drop(conn);
+
+            let opts = ForgetOptions {
+                dry_run: true,
+                usefulness_floor: 0.1,
+                min_age_days: 90,
+                protect_use_count: 10,
+            };
+            let summary = forget_brain(&root, opts).expect("forget dry-run");
+            let ids: Vec<&str> = summary
+                .candidates
+                .iter()
+                .map(|c| c.memory_id.as_str())
+                .collect();
+            assert!(
+                ids.contains(&stale.as_str()),
+                "a stale, never-retrieved memory must be a forget candidate"
+            );
+            assert!(
+                !ids.contains(&retrieved.as_str()),
+                "a recently-retrieved (in-use) memory must be protected from forgetting"
             );
 
             std::fs::remove_dir_all(&root).ok();

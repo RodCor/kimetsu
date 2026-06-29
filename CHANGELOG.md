@@ -7,26 +7,26 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
-## v2.0.0 — Never explore twice
+## v2.0.0: Never explore twice
 
-The biggest token sink is RE-EXPLORATION — the agent re-deriving what the brain
+The biggest token sink is RE-EXPLORATION: the agent re-deriving what the brain
 (or the repo) already knows. v2.0 attacks it from three flagship directions and
 adds a pluggable storage tier. Backward-compatible: existing `project.toml` and
 `brain.db` files upgrade in place (schema v3 → v6, automatic on open).
 
-### Flagship — Session warm-start (never re-establish your work)
+### Flagship: Session warm-start (never re-establish your work)
 
 ADDED
   * **Episodic work-resume.** A new `work_episode` record (event-sourced,
-    schema v5) captures your working state at SessionEnd — the task, what you
+    schema v5) captures your working state at SessionEnd: the task, what you
     did, what FAILED and why (dead-ends), open threads, and the working
-    hypothesis — scoped per-repo (one live episode per repo). `kimetsu resume`
+    hypothesis, scoped per-repo (one live episode per repo). `kimetsu resume`
     prints it; `kimetsu checkpoint [note]` saves one manually. Distilled via
     the cheap model when configured, else a rule-based summary (never blocks).
     Episodes are LOCAL-ONLY and never sync/export.
   * **Project digest.** `kimetsu brain digest [--refresh]` assembles a compact
-    (~400-token) digest — repo manifest + top-usefulness memories + current
-    focus — cached at `.kimetsu/digest.md` by content hash, refreshed on git/
+    (~400-token) digest: repo manifest + top-usefulness memories + current
+    focus, cached at `.kimetsu/digest.md` by content hash, refreshed on git/
     corpus drift. (The digest is currently rule-based; a cheap-model
     distillation hook-point is present but not yet wired.)
   * **SessionStart injection.** A new `kimetsu brain session-start-hook` emits
@@ -34,11 +34,11 @@ ADDED
     (default on). Wired for Claude Code; other hosts' SessionStart context
     surface is not yet verified and is intentionally left unwired.
 
-### Flagship — The active brain (never wait on the brain)
+### Flagship: The active brain (never wait on the brain)
 
 ADDED
   * **`kimetsu brain ask "<question>"`.** Terminal Q&A answered entirely from
-    the brain — full retrieval + a grounded answer composed by a LOCAL/cheap
+    the brain: full retrieval + a grounded answer composed by a LOCAL/cheap
     model, with memory-id citations. Zero frontier tokens; works offline. Falls
     back to distiller credentials, then to verbatim top-capsules when no model
     is configured. Grounded-only: refuses rather than hallucinating when memory
@@ -51,17 +51,17 @@ ADDED
   * **Answer-grade injection.** Very-high-confidence capsules (score ≥
     `[broker] answer_grade_min_score`, default 0.92) are prefixed "Verified
     answer from project memory:" so the model can act in one turn. Render-time
-    only — ranking is untouched — and suppressed when the memory was recently a
+    only (ranking is untouched) and suppressed when the memory was recently a
     floor-drop regret.
   * **Proactive pre-fetch.** Opt-in `[broker] proactive_prefetch` (default off)
     warms trajectory-relevant memories at PreToolUse.
 
-### Flagship — Memory → skill synthesis (never re-derive a solution)
+### Flagship: Memory → skill synthesis (never re-derive a solution)
 
 ADDED
   * **Skill synthesis.** A memory cited ≥3 times (or a tight cluster) becomes a
     synthesis candidate; `kimetsu brain skills [--review]` drafts an executable
-    skill from it — grounded strictly in the cited memories — and, on explicit
+    skill from it (grounded strictly in the cited memories) and, on explicit
     accept, installs it into the host-native skill dir with provenance back to
     the source memory ids. Propose-only (never auto-installed); flagged stale
     when a source memory is superseded. Schema v6 (`skill_proposals`).
@@ -69,11 +69,11 @@ ADDED
 ### Local-model independence
 
 ADDED
-  * **Ollama as a first-class provider** (`provider = "ollama"` — OpenAI-compat,
+  * **Ollama as a first-class provider** (`provider = "ollama"`, OpenAI-compat,
     `localhost:11434/v1` default, no key) and a single optional `[cheap_model]`
     config that all cheap-model consumers resolve (distiller, consolidation,
     digest, resume, skill draft, `ask`). Back-compatible with
-    `[learning.distiller]`; OPTIONAL everywhere — every consumer degrades
+    `[learning.distiller]`; OPTIONAL everywhere: every consumer degrades
     gracefully when no model is configured. `kimetsu doctor` probes the local
     endpoint. New guide: `docs/LOCAL-MODELS.md` (fully-local = zero external
     calls).
@@ -84,12 +84,12 @@ ADDED
   * **`RetrievalBackend` trait** with `[storage] backend = "flat" | "graph-lite"
     | "graph"` (default `flat`). The broker stays backend-agnostic; switching
     backends re-projects from the event log.
-  * **Graph-lite (Tier 1)** — a typed-edge projection (`memory_edges`, schema
-    v4) with 1–2 hop expansion blended as graph-provenance candidates (a strict
-    superset of flat — no recall loss; the broker still filters). `supersedes`
+  * **Graph-lite (Tier 1)**: a typed-edge projection (`memory_edges`, schema
+    v4) with 1-2 hop expansion blended as graph-provenance candidates (a strict
+    superset of flat, no recall loss; the broker still filters). `supersedes`
     edges populate now; episode-sourced edge types are reserved.
   * **Petgraph (Tier 2, remote-only)** behind the `graph` feature (off in local
-    lean/embeddings builds — petgraph is never compiled there). In-memory graph
+    lean/embeddings builds, petgraph is never compiled there). In-memory graph
     with centrality / shortest-path / community-detection helpers, plus a
     cross-backend benchmark harness. Spike verdict: an embedded graph DB
     (Kùzu/Cozo) is not justified through ~100k memories.
@@ -98,7 +98,7 @@ ADDED
 
 ADDED
   * **Re-tune triggers** (≥50 new memories since last tune, or elevated regret
-    rate) surfaced via `kimetsu brain tune --status` + a Stop-hook one-liner —
+    rate) surfaced via `kimetsu brain tune --status` + a Stop-hook one-liner,
     proposed, never auto-applied. **Model re-selection advisor**
     (`tune --models`) with reindex/download cost stated. **Regret-driven
     objective**: the tune objective now penalizes floor configs that produced
@@ -126,7 +126,7 @@ FIXED
     docs.
   * **Release pipeline**: a `version-guard` job fails in seconds on a
     tag/workspace-version mismatch (and the built binary must self-report the
-    tag) — closing the gap that produced the v1.5.0 botch; core GitHub Actions
+    tag): closing the gap that produced the v1.5.0 botch; core GitHub Actions
     bumped to Node-24-ready versions; `scripts/bump-version.sh` codifies the
     one-step version bump.
 
@@ -137,11 +137,11 @@ KNOWN LIMITATIONS
     environment and were not run in CI; remote-bench process isolation (#23)
     remains open.
 
-## v1.5.1 — version-stamp re-release
+## v1.5.1: version-stamp re-release
 
 Identical feature set to v1.5.0. The v1.5.0 artifacts were built before the
 workspace version bump, so their binaries self-report `1.0.0` (which also
-broke the crates.io publish — `kimetsu-core@1.0.0` already existed). npm
+broke the crates.io publish: `kimetsu-core@1.0.0` already existed). npm
 forbids reusing a published version, so the corrected release ships as
 v1.5.1. If you installed v1.5.0 from npm or the GitHub release, update.
 
@@ -149,7 +149,7 @@ FIXED
   * Workspace and inter-crate versions stamped correctly (`kimetsu --version`
     now reports the release version; crates.io publish unblocked).
 
-## v1.5.0 — pays for itself
+## v1.5.0: pays for itself
 
 ADDED
   * **Telemetry capture.** Raw query text is now stored in `context.served`
@@ -162,7 +162,7 @@ ADDED
     `retrieval.regret` event, feeding the self-tuning loop. All telemetry
     stays on-machine; nothing is exported.
 
-  * **ROI ledger — `kimetsu brain roi`.** Conservative per-kind token-savings
+  * **ROI ledger (`kimetsu brain roi`).** Conservative per-kind token-savings
     estimates (failure_pattern=1500, command=400, convention=300, fact=500,
     preference=200 tokens per citation) minus brain-injection overhead give a
     net-positive / net-negative verdict. Dollar estimates are shown when the
@@ -173,11 +173,11 @@ ADDED
     zero-citation sessions are silent. Calibration methodology and honest
     limitations: `docs/ROI-METHODOLOGY.md`.
 
-  * **Token budget — render-time capsule compression and session dedupe.**
+  * **Token budget: render-time capsule compression and session dedupe.**
     Two `[broker]` toggles, both default `true`:
     - `compress_capsules`: capsule summaries are compressed at render time
       (strips `[tags: ...]` / `(context: ...)` annotations, caps at 3
-      sentences). Ranking is never affected — this runs only after retrieval
+      sentences). Ranking is never affected: this runs only after retrieval
       and reranking. Set `false` to inject full memory text.
     - `session_dedupe`: the `UserPromptSubmit` hook skips capsules whose
       handle was already injected earlier in the same session (tracked via
@@ -186,7 +186,7 @@ ADDED
       pre-v1.5 behavior where the main hook re-injected the same top capsule
       on every prompt of a long session.
 
-  * **Self-Tuning Brain — `kimetsu_brain_cite` MCP tool + `kimetsu brain tune`.**
+  * **Self-Tuning Brain: `kimetsu_brain_cite` MCP tool + `kimetsu brain tune`.**
     `kimetsu_brain_cite` is a new write-gated MCP tool that records a
     `memory.cited` event from inside an MCP session, closing the ground-truth
     gap when the model leans on a memory but doesn't explicitly call
@@ -196,26 +196,26 @@ ADDED
     coverage. `kimetsu brain tune` (dry-run by default) sweeps `broker.min_lexical_coverage`
     ∈ {0.3, 0.4, 0.5, 0.6} × `broker.min_semantic_score` ∈ {-1.0(AUTO), 0.0, 0.25,
     0.35, 0.45} against the production embedder; `--apply` writes only the
-    floor parameters (not the reranker — that change is recommended separately);
+    floor parameters (not the reranker; that change is recommended separately);
     `--revert` restores the previous tune-history entry. A holdout guardrail
     (deterministic 20% split) prevents writing a config that regresses the
     holdout objective.
 
-  * **Consolidation — `kimetsu brain consolidate` + `kimetsu brain triage`.**
+  * **Consolidation: `kimetsu brain consolidate` + `kimetsu brain triage`.**
     Schema migrated to **v3** (`superseded_by` column + index on `memories`).
     `brain consolidate` (Story 3.1, default): brute-force cosine scan within the
     same embedding model; clusters at ≥ 0.92 cosine (configurable with
-    `--threshold`) are merged — survivor keeps its id and text, members get
+    `--threshold`) are merged: survivor keeps its id and text, members get
     `superseded_by` set and a `memory.superseded` event written (rebuild-safe);
     citations are reassigned to the survivor. `--distill` (Story 3.2): looser
-    clusters (0.75–0.85 cosine band, ≥3 memories, ≥1 shared tag) are fed to
+    clusters (0.75-0.85 cosine band, ≥3 memories, ≥1 shared tag) are fed to
     the configured distiller; result lands as a memory proposal for human
     review; prints clusters and exits 0 when no distiller is configured.
     `brain triage` (Story 3.3): interactive per-item keep / prune / skip of
     memories below a usefulness and age threshold (`--score-floor 0.2`,
     `--age-days 30`); `--prune-all --yes` for batch non-interactive pruning.
 
-  * **Reach — export redact, Cursor + Gemini CLI installers, CI embeddings job.**
+  * **Reach: export redact, Cursor + Gemini CLI installers, CI embeddings job.**
     `kimetsu brain export --redact` strips the `(context: …)` segment from
     exported memory text; `--redact-tags` (requires `--redact`) additionally
     strips the `[tags: …]` prefix. Both flags are useful for sharing brains
@@ -247,7 +247,7 @@ FIXED
   * Tune sweep now runs against the production embedder (not the Noop embedder
     used in tests), so floor calibration is on real vectors.
 
-## v1.0.0 — durable migrations, analytics, semantic retrieval, proactive recall
+## v1.0.0: durable migrations, analytics, semantic retrieval, proactive recall
 
 ADDED
   * **Remote cross-encoder rerank stage.** `kimetsu-remote serve` now applies a
@@ -282,12 +282,12 @@ ADDED
     The brain's own workflow tells the agent to record lessons
     (`kimetsu_brain_record`, the Stop-hook harvest cue), but the privileged-
     write gate default-denied unless `KIMETSU_MCP_ENABLE_WRITE_TOOLS=1` was
-    in the MCP server's env — so every session ended with the agent goaded
+    in the MCP server's env, so every session ended with the agent goaded
     into a blocked call. The gate is now config-driven for the LOCAL stdio
     server: `kimetsu.mcp_write_tools` (default true), personalizable via
     `kimetsu config set kimetsu.mcp_write_tools false`. Precedence: the env
     var when set always wins (both directions) > config > default. The
-    REMOTE server is unchanged — env-only, default-deny — because a cloned
+    REMOTE server is unchanged (env-only, default-deny) because a cloned
     repo's project.toml is untrusted input and must never enable writes.
   * **Cross-encoder reranking (opt-in) + retrieval eval harness + 300ms
     hook budget.** The warm daemon can apply a final cross-encoder rerank
@@ -298,7 +298,7 @@ ADDED
     (default) beat the larger turbo model on both quality and speed in the
     head-to-head benchmark, a pool of 6 matches pool-12 quality exactly at
     half the latency, and summaries must stay FULL (snippet truncation
-    cratered recall@4 from 0.83 to 0.66 — worse than FTS). With those
+    cratered recall@4 from 0.83 to 0.66, worse than FTS). With those
     settings a warm rerank answers inside the 300ms hook budget on a real
     brain (~265ms measured); slower machines degrade gracefully to
     floored-FTS for that turn, or set `reranker = "off"`. Backing the
@@ -323,7 +323,7 @@ ADDED
     at ~44ms per query (pool 6) vs turbo 0.833 / 0.875 at ~137ms (pool 12);
     ms-marco TinyBERT-L-2 is ~5× faster still (8.5ms) but its quality
     (0.715) merely matches FTS.
-  * **Warm embedder daemon — semantic recall at hook time.** The
+  * **Warm embedder daemon: semantic recall at hook time.** The
     `UserPromptSubmit` context-hook can now match memories by *meaning*, not
     just lexically. A single per-user daemon (`kimetsu brain embed-daemon`,
     keyed by embedder model) loads the ONNX model once and serves full
@@ -349,13 +349,13 @@ ADDED
   * **Proof-of-value analytics.** New `kimetsu brain insights` command
     and `kimetsu_brain_insights` MCP tool: retrieval hit-rate &
     skip-rate, citation rate, proposal acceptance rate, usefulness
-    trend, harvest yield, corpus health, and token economy — computed
+    trend, harvest yield, corpus health, and token economy, computed
     over a configurable recent-runs window. A new `context.served`
     event records every retrieval (hit or miss); `context.injected`
     now carries injected-token counts.
   * **Semantic retrieval (usearch HNSW ANN).** On the embeddings build, an
     approximate-nearest-neighbour index (usearch HNSW) finds memories whose
-    *meaning* matches the query even with no shared words — **O(log N) per
+    *meaning* matches the query even with no shared words: **O(log N) per
     query**, so retrieval stays fast as the corpus grows. The index is
     candidate generation only; final ranking is an exact cosine rerank over the
     stored f32 vectors, so the index can be quantized (**f16 by default**,
@@ -368,20 +368,20 @@ ADDED
   * **Scales to ~1M memories.** A million-memory corpus runs on modest
     hardware: **~1.8 s p99 semantic retrieval and ~3 GB RAM at 1M** (f16
     default; ~2.8 GB with `KIMETSU_ANN_QUANTIZATION=i8`). Both retrieval *and*
-    conflict-detection-on-write are O(log N) via the HNSW index — no
+    conflict-detection-on-write are O(log N) via the HNSW index, no
     brute-force vector scan. Bulk ingest batches embedding; the index builds in
     parallel across cores, maintains itself incrementally, persists a sidecar
     so a restarted server loads instead of rebuilding, and Kimetsu Remote
     pre-warms each repo's index on startup.
   * **Proactive & cost-shrinking recall (the agent brain).** Before the
     first implementation attempt, a tight retrieval surfaces a "Known
-    pitfalls" block (failure patterns / conventions) — proactive, not
+    pitfalls" block (failure patterns / conventions), proactive, not
     just post-failure. Tasks are classified (Debug / Feature / Refactor /
     Docs / Investigation) to route recall by kind. A per-run recall
     ledger deduplicates capsules across stages (rendered once,
     back-referenced after), and the long tail is injected as one-line
     headlines the agent expands on demand via a new `expand_capsule`
-    tool — so brain overhead shrinks in relative terms as tasks grow
+    tool, so brain overhead shrinks in relative terms as tasks grow
     (an adaptive sublinear, per-run-capped budget).
   * **`kimetsu config edit` and `kimetsu run abort`** are now fully
     implemented: `config edit` opens `$EDITOR` on project.toml and
@@ -398,22 +398,22 @@ ADDED
     edit` / `undo` fix a bad recording in place; `kimetsu runs prune`
     and `kimetsu brain compact` (VACUUM, optional event-trim) keep the
     install lean.
-  * **Kimetsu Remote (beta) — the brain over HTTP MCP.** Under active testing;
+  * **Kimetsu Remote (beta): the brain over HTTP MCP.** Under active testing;
     the `kimetsu-remote` **server is a separate package** and is NOT installed by
-    `cargo install kimetsu-cli` / `npm i -g kimetsu-ai` — install it on the
+    `cargo install kimetsu-cli` / `npm i -g kimetsu-ai`: install it on the
     server with `npm install -g kimetsu-remote` or `cargo install kimetsu-remote
     --features embeddings` (or its standalone GitHub-Release archive). A new
     standalone `kimetsu-remote` server hosts one brain per repository under a
     data dir and exposes the memory/retrieval/curation tools over remote MCP
-    (`POST /mcp/{repo}`), so a team — or you across machines — can share one
+    (`POST /mcp/{repo}`), so a team (or you across machines) can share one
     brain with no local checkout. Bearer-token auth (global or per-repo);
     repo-keyed (the client supplies the id, derivable from the git remote);
     the agent-facing pure-DB tool subset only (workdir/host-local tools are
     excluded). Each repo brain is standalone (user-brain merge off). Plain
-    HTTP — terminate TLS at a reverse proxy. `kimetsu-remote serve --addr
+    HTTP: terminate TLS at a reverse proxy. `kimetsu-remote serve --addr
     0.0.0.0:8787 --data <dir> --token <t>` (build with `--features embeddings`
     for semantic retrieval). Wire a host with `kimetsu plugin install
-    <claude-code|openclaw> --remote <url> [--repo <id>] [--token <t>]` — it
+    <claude-code|openclaw> --remote <url> [--repo <id>] [--token <t>]`: it
     writes a `url`+`Authorization` MCP entry (no local hooks), deriving the repo
     id from your git remote and referencing `${KIMETSU_REMOTE_TOKEN}` by default
     so the secret isn't written to disk. The server ships as a separate package
@@ -422,13 +422,13 @@ ADDED
     rate limiting
     (`--rate-limit <req/min>` → 429 when exceeded), a structured per-request log
     + an unauthenticated `GET /metrics` (Prometheus text, aggregate counts by
-    outcome — no repo labels), and optional in-process HTTPS (build
+    outcome, no repo labels), and optional in-process HTTPS (build
     `--features tls`, pass `--tls-cert`/`--tls-key`; rustls/ring, off by default
-    — a reverse proxy is still the recommended terminator). Optional shared
+    a reverse proxy is still the recommended terminator). Optional shared
     **org brain** (`--org-brain <dir>`, outside `--data`): `global_user`-scoped
     memories are stored there and merged into every repo's retrieval
     (cross-project team memory), while `project`-scoped memories stay per-repo.
-    Off by default — each repo brain is standalone. Optional **server-side
+    Off by default: each repo brain is standalone. Optional **server-side
     ingest** (`--repos-file` + `--checkout-dir`): the operator pre-registers
     repo-id → git URL, the server clones/refreshes a managed checkout, and
     `kimetsu_brain_ingest_repo` indexes its files into the repo's brain so
@@ -437,7 +437,7 @@ ADDED
   * **AWS Bedrock provider.** The agent *and* the auto-harvester can run
     on Anthropic models served through Amazon Bedrock (InvokeModel,
     SigV4-signed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-    (+ optional `AWS_SESSION_TOKEN`) and `AWS_REGION` — no AWS SDK). Set
+    (+ optional `AWS_SESSION_TOKEN`) and `AWS_REGION`, no AWS SDK). Set
     `[model] provider = "bedrock"` and/or `[learning.distiller]`; the two
     are configured independently, so you can run the agent on Bedrock and
     harvest on Bedrock or direct Claude/OpenAI.
@@ -445,8 +445,8 @@ ADDED
     pi` wires a TypeScript extension (Pi has no MCP) plus a `kimetsu-brain`
     skill; `kimetsu plugin install openclaw` registers the MCP server, a
     hooks plugin, and a `kimetsu-context` skill. Both join Claude Code and
-    Codex across `plugin status`, `plugin uninstall`, and `setup` —
-    *which* hosts you wire is a runtime choice you change anytime, no
+    Codex across `plugin status`, `plugin uninstall`, and `setup`.
+    *Which* hosts you wire is a runtime choice you change anytime, no
     reinstall. **Every official prebuilt + npm binary (lean and embeddings)
     includes all four host integrations;** they're opt-in Cargo features only
     for a minimal source build, added with `--features pi,openclaw`. Every
@@ -462,11 +462,11 @@ ADDED
 
 CHANGED
   * **Lean `.kimetsu/`.** The `brain.db` events table is now the
-    durable log — memory writes no longer create per-write `runs/<id>/`
+    durable log: memory writes no longer create per-write `runs/<id>/`
     directories, so a brain-only `.kimetsu/` holds just `brain.db` +
     `project.toml`. Transient proactive / chat / bench output moved to
     `~/.kimetsu/cache/`.
-  * **Bidirectional config — every optional feature is turn-off-able.**
+  * **Bidirectional config: every optional feature is turn-off-able.**
     `[embedder] enabled`, `[broker] ambient`, `[kimetsu] use_user_brain`
     (plus the existing `[learning] auto_harvest` / distiller and
     `[shell] redact_secrets`) are honored at runtime with the precedence
@@ -474,8 +474,8 @@ CHANGED
     read and flip them from the CLI.
   * **Tiered, non-orphaning uninstall.** `kimetsu uninstall` now removes
     the host plugin wiring (Claude Code & Codex hooks / MCP / skills /
-    agents, workspace + global) via a 3-tier prompt — binary only /
-    + plugins (default) / + brains (typed confirm) — so it no longer
+    agents, workspace + global) via a 3-tier prompt (binary only /
+    + plugins (default) / + brains (typed confirm)) so it no longer
     leaves hosts pointing at a missing binary. A binary locked by a
     running kimetsu process is handled (offer to stop it / deferred
     delete) instead of a misleading "needs admin".
@@ -485,16 +485,16 @@ CHANGED
     byte-idempotent). Windows now runs the full test suite in PR CI.
   * **Clippy is a hard CI gate** (`-D warnings`) on both the lean and
     embeddings builds.
-  * **Retrieval ordering is fully deterministic** — a stable tiebreak
+  * **Retrieval ordering is fully deterministic:** a stable tiebreak
     eliminates non-reproducible ranking across runs.
   * **Terser `--help` menu + flavored `--version`.** Top-level commands
     show short imperative labels (full detail stays in
     `kimetsu <cmd> --help`), and `kimetsu --version` reports the build
-    flavor — `1.0.0 (embeddings)` vs `(lean)` — so semantic-search
+    flavor (`1.0.0 (embeddings)` vs `(lean)`) so semantic-search
     availability is obvious at a glance.
   * **Run dirs self-prune.** New agent runs opportunistically GC run dirs
     older than 30 days (keeping the newest 20; `KIMETSU_RUNS_GC=0` to
-    disable) — only at run creation, never on the hot brain-open path.
+    disable), only at run creation, never on the hot brain-open path.
   * **One-command npm semantic build.** `kimetsu npm-flavor embeddings`
     fetches the semantic build once and persists the choice (in
     `<cache>/kimetsu/npm/flavor`), so npm users no longer keep
@@ -509,7 +509,7 @@ FIXED
     token "kimetsu". Root cause: on the FTS-only `UserPromptSubmit` hook path
     there was no relevance floor (the cosine-based `min_semantic_score` is
     inert without an embedding), and `normalize_and_score` divides relevance
-    by the *per-kind* max — so the best memory of each kind became
+    by the *per-kind* max, so the best memory of each kind became
     `relevance = 1.0` no matter how weak the actual match, easily clearing
     the `min_score` gate on freshness + confidence alone. New
     `broker.min_lexical_coverage` floor (default 0.5): query tokens are
@@ -525,7 +525,7 @@ FIXED
   * **`Stop` hook no longer trips "invalid stop hook JSON output".**
     `kimetsu brain stop-hook` printed a bare-text banner on stdout, but
     Claude Code validates a Stop hook's stdout as the advanced JSON
-    control object — so the banner was rejected. The hook now emits a
+    control object, so the banner was rejected. The hook now emits a
     well-formed JSON object: informational banners via `systemMessage`,
     and the end-of-session harvest cue via `decision: "block"` so the
     cue text actually re-enters the model (plain stdout never reached it
@@ -534,21 +534,21 @@ FIXED
   * **MSRV portability.** A 1.87-only API that violated the declared
     `rust-version = "1.85"` MSRV was replaced with the compatible
     1.85 equivalent.
-  * **GlobalUser memory writes work from any directory again** — a
+  * **GlobalUser memory writes work from any directory again:** a
     regression where recording a global-user memory required a loadable
     project is fixed.
   * **`UserPromptSubmit` context-hook no longer risks the host's 30s
     timeout.** The per-prompt hook runs in a throwaway process that
     can't reuse the long-lived MCP server's warm model cache, so in the
     embeddings build it was paying a cold fastembed/ONNX model load on
-    every prompt — fast on a warm OS file cache but able to exceed 30s
+    every prompt, fast on a warm OS file cache but able to exceed 30s
     on a cold first prompt (worst under disk contention / AV scanning),
     which fails the hook. The hook is now FTS-only (lexical retrieval,
     no embedding model loaded); semantic ANN recall stays with the warm
     MCP `kimetsu_brain_context` tool the agent calls. Steady-state hook
     latency drops to ~300 ms regardless of build flavor.
 
-## v0.9.0 — auto-harvested memories + SessionEnd distiller
+## v0.9.0: auto-harvested memories + SessionEnd distiller
 
 ADDED
   * **Credentialed SessionEnd distiller (opt-in).** A second, deterministic
@@ -579,9 +579,9 @@ ADDED
     recorded (Stop), Kimetsu emits a `[kimetsu-harvest]` cue telling the agent to
     dispatch a new background **`kimetsu-memory-harvester`** subagent (installed
     at `.claude/agents/` for Claude Code and `.codex/agents/` for Codex, pinned
-    to a cheap model). The subagent distills 0–3
+    to a cheap model). The subagent distills 0-3
     generalizable lessons and records them through the confidence-gated
-    `kimetsu_brain_record` path — no separate API key or kimetsu-side model
+    `kimetsu_brain_record` path: no separate API key or kimetsu-side model
     credentials, billed in-agent at the cheap model's rate, non-blocking. Cues
     are throttled (at most ~once per resolved failure / once per session) and can
     be disabled with `[learning] auto_harvest = false` in `project.toml`.
@@ -607,8 +607,8 @@ FIXED
     (e.g. older Windows Notepad) no longer fails with "expected value at line 1
     column 1".
   * **Install polish.** The installer now **merges** Kimetsu's guidance into an
-    existing `CLAUDE.md` — workspace `.claude/CLAUDE.md` or the global
-    `~/.claude/CLAUDE.md` — inside `<!-- kimetsu:begin -->`/`<!-- kimetsu:end -->`
+    existing `CLAUDE.md` (workspace `.claude/CLAUDE.md` or the global
+    `~/.claude/CLAUDE.md`) inside `<!-- kimetsu:begin -->`/`<!-- kimetsu:end -->`
     markers, appending and upgrading in place, never overwriting the user's
     content. `--force` no longer overwrites `CLAUDE.md` (the whole install is
     idempotent and non-destructive; the flag is retained only for compatibility).
@@ -616,29 +616,29 @@ FIXED
     silently doing nothing; `--workspace` is canonicalized leniently so a global
     install doesn't fail on a missing workspace path.
 
-## v0.8.4 — non-destructive plugin install + global scope
+## v0.8.4: non-destructive plugin install + global scope
 
 ADDED
   * **Global plugin install.** `kimetsu plugin install <target> --scope global`
-    installs the Kimetsu surface into the user's home for every session —
-    `~/.claude/` + `~/.claude.json` (`mcpServers`) for Claude Code, and
-    `~/.codex/` for Codex — instead of the workspace. `--scope` defaults to
+    installs the Kimetsu surface into the user's home for every session
+    (`~/.claude/` + `~/.claude.json` (`mcpServers`) for Claude Code, and
+    `~/.codex/` for Codex) instead of the workspace. `--scope` defaults to
     `workspace` (the prior behavior). Also exposed as the `scope` argument on
     the `kimetsu_plugin_install` MCP tool.
 
 FIXED
   * **Hook install no longer clobbers existing hooks.** `kimetsu plugin install`
     now *merges* its hooks into existing Claude `settings.json` / Codex
-    `hooks.json` instead of replacing them. Hooks you already have — even on the
-    same events Kimetsu uses (`UserPromptSubmit`, `PreToolUse`, …) — are
+    `hooks.json` instead of replacing them. Hooks you already have, even on the
+    same events Kimetsu uses (`UserPromptSubmit`, `PreToolUse`, …), are
     preserved, with Kimetsu's group added alongside. Re-running install is
     idempotent (no duplicate groups) and the MCP config + generated docs refresh
     without requiring `--force`.
 
-## v0.8.3 — npm distribution
+## v0.8.3: npm distribution
 
 ADDED
-  * **npm distribution.** Kimetsu now publishes to npm — `npm install -g kimetsu-ai`
+  * **npm distribution.** Kimetsu now publishes to npm: `npm install -g kimetsu-ai`
     installs the prebuilt native binary for your platform, no Rust toolchain
     required. Uses the esbuild/turbo model: per-platform packages
     (`@kimetsu-ai/linux-x64`, `@kimetsu-ai/darwin-x64`, `@kimetsu-ai/darwin-arm64`,
@@ -663,9 +663,9 @@ FIXED
 Release-engineering releases on the road to the npm channel. crates.io and the
 prebuilt binaries shipped as usual in both. npm naming settled on the
 `@kimetsu-ai` scope / `kimetsu-ai` package (v0.8.1), and the complete, working
-npm packages — including Windows — ship in v0.8.3.
+npm packages (including Windows) ship in v0.8.3.
 
-## v0.8.0 — proactive recall, selectable embedding model, full MCP control
+## v0.8.0: proactive recall, selectable embedding model, full MCP control
 
 The release that makes the brain **proactive** and gives the agent (and user)
 full control over it from inside Claude Code / Codex.
@@ -712,13 +712,13 @@ FIXED
     `project.lock`. Each test root now gets its own git boundary, so plain
     `cargo test` is hermetic.
 
-## v0.7.2 — remove kimetsu-harbor-rs; first crates.io publish of the v0.7 line
+## v0.7.2: remove kimetsu-harbor-rs; first crates.io publish of the v0.7 line
 
 Maintenance + distribution release, layered on top of the v0.7.1 security
 hardening (path-traversal guards + URL-credential redaction).
 
 REMOVED
-  * **`kimetsu-harbor-rs`** — the Terminal-Bench JSON-RPC transport adapter
+  * **`kimetsu-harbor-rs`**: the Terminal-Bench JSON-RPC transport adapter
     and its `kimetsu-harbor-agent` binary. The benchmark harness drives
     Harbor's built-in `claude-code` agent via `--mcp-config` (since the
     v0.5.5 refactor), so the custom transport binary was dead code. No
@@ -731,7 +731,7 @@ CHANGED
   * First crates.io publish of the v0.7 series (v0.6.0 / v0.7.0 / v0.7.1
     shipped binaries + GitHub Releases only).
 
-## v0.7.0 — semantic dedup, embeddings by default, session hooks
+## v0.7.0: semantic dedup, embeddings by default, session hooks
 
 The release that makes knowledge transfer reliable end-to-end:
 capture without duplication, retrieve without asking, and surface
@@ -751,17 +751,17 @@ ADDED
     Cosine retrieval, semantic dedup, and conflict detection all light up
     out of the box. Build lean with `--no-default-features`. Library crates
     (`kimetsu-brain`, `kimetsu-chat`) stay lean by default so downstream
-    consumers don't inherit the ONNX runtime — only the binary opts in.
+    consumers don't inherit the ONNX runtime; only the binary opts in.
   * **`Stop` hook for session summary.** `kimetsu brain stop-hook` walks
     the transcript, counts `kimetsu_brain_record` calls, and prints a
-    post-turn banner — confirming captures or nudging when a non-trivial
+    post-turn banner, confirming captures or nudging when a non-trivial
     session recorded nothing. `kimetsu init` now writes both the
     `UserPromptSubmit` and `Stop` hooks into `.claude/settings.json`.
 
 CHANGED
   * `kimetsu_benchmark_context` shares argument parsing with
     `kimetsu_brain_context` via an extracted `parse_retrieval_args`
-    helper — ~50 lines of duplicated stage/budget/ambient handling
+    helper: ~50 lines of duplicated stage/budget/ambient handling
     removed. No behavior change for bench callers.
 
 NOTE
@@ -769,14 +769,14 @@ NOTE
     (ort prebuilts). The default model (~24 MB) downloads to
     `~/.cache/huggingface/` on first embed call, then caches.
 
-## v0.6.0 — zero-overhead knowledge transfer
+## v0.6.0: zero-overhead knowledge transfer
 
 Retrieval and capture become silent by default and only speak up when
 they have something worth saying.
 
 ADDED
   * **`kimetsu_brain_context` zero-overhead contract.** When the brain
-    has nothing relevant it returns `skipped: true` and injects nothing —
+    has nothing relevant it returns `skipped: true` and injects nothing,
     so a host agent can call it on every non-trivial task without paying
     a context tax on cold brains.
   * **`kimetsu_brain_record` capture tool.** The host agent's path to
@@ -788,7 +788,7 @@ ADDED
     Claude Code turn, so retrieval happens whether or not the model
     remembers to ask.
 
-## v0.5.5 — delete kimetsu_harbor/: harbor refactor arc complete
+## v0.5.5: delete kimetsu_harbor/: harbor refactor arc complete
 
 Final commit of the v0.5.3-v0.5.5 harbor refactor arc. The Python
 Harbor adapter + benchmark glue moved to the internal kimetsu-bench
@@ -797,12 +797,12 @@ directory from kimetsu and finishes the cleanup.
 
 DELETED FROM THIS REPO
   kimetsu_harbor/                          (entire directory)
-    ├── codex_kimetsu_agent.py            (311 LOC — Codex variant
+    ├── codex_kimetsu_agent.py            (311 LOC, Codex variant
     │                                      that diverged from the
     │                                      canonical adapter)
-    ├── kimetsu_agent.py                   (459 LOC — moved to
+    ├── kimetsu_agent.py                   (459 LOC, moved to
     │                                      kimetsu-bench/python/)
-    ├── smoke_test.py                      (145 LOC — replaced by
+    ├── smoke_test.py                      (145 LOC, replaced by
     │                                      crates/kimetsu-e2e in
     │                                      v0.5.3)
     ├── kimetsu-mcp-stdio.sh               (1-line shim)
@@ -817,7 +817,7 @@ DELETED FROM THIS REPO
 
 Net: ~900 LOC of glue + ~10 setup docs removed from the user-facing
 repo. The functional pieces (kimetsu_agent.py) survive in
-kimetsu-bench/python/ where they belong — they're benchmark infra,
+kimetsu-bench/python/ where they belong; they're benchmark infra,
 not product code.
 
 ALSO REMOVED
@@ -829,7 +829,7 @@ ALSO REMOVED
   now explains the legacy historical reason).
 
 WHAT SURVIVES IN KIMETSU REPO (unchanged)
-  * crates/kimetsu-harbor-rs/ — JSON-RPC transport + the
+  * crates/kimetsu-harbor-rs/: JSON-RPC transport + the
     `kimetsu-harbor-agent` binary. publish = false. The bench
     consumes it as a normal cargo path dep.
   * CI release matrix still builds `kimetsu-harbor-agent` for
@@ -838,12 +838,12 @@ WHAT SURVIVES IN KIMETSU REPO (unchanged)
     GH release archive instead of building from source.
 
 THE HARBOR REFACTOR ARC IS COMPLETE
-  v0.5.3 — Layer 1: in-process e2e suite + CLI smoke (+13 tests,
+  v0.5.3: Layer 1: in-process e2e suite + CLI smoke (+13 tests,
            all under 1s, no API keys / no Docker).
-  v0.5.4 — Doc consolidation: HOW-KIMETSU-WORKS.md replaces the
+  v0.5.4: Doc consolidation: HOW-KIMETSU-WORKS.md replaces the
            22-file docs/ sprawl; historical planning + ship docs
            moved to internal kimetsu-bench repo.
-  v0.5.5 — kimetsu_harbor/ deleted; the Python Harbor adapter is
+  v0.5.5: kimetsu_harbor/ deleted; the Python Harbor adapter is
            now in the internal kimetsu-bench repo alongside the
            Layer 2 orchestrator + driver trait.
 
@@ -873,10 +873,10 @@ UPGRADE NOTES
     is unchanged. Its source still lives at
     `crates/kimetsu-harbor-rs/src/bin/kimetsu-harbor-agent.rs`.
 
-## v0.5.4 — doc consolidation: HOW-KIMETSU-WORKS.md replaces the docs/ sprawl
+## v0.5.4: doc consolidation: HOW-KIMETSU-WORKS.md replaces the docs/ sprawl
 
 Second commit of the v0.5.3-v0.5.5 harbor refactor arc. Cleans up
-`kimetsu/docs/` so users see exactly one conceptual reference — not
+`kimetsu/docs/` so users see exactly one conceptual reference, not
 22 files of planning, postmortems, and historical roadmaps.
 
 WHAT v0.5.4 ADDS
@@ -891,9 +891,9 @@ WHAT v0.5.4 ADDS
 
 WHAT v0.5.4 DELETES FROM THIS REPO
   * `docs/V0.3.4-SHIP.md`, `docs/V0.3.5-PERF.md`, `docs/V0.4-ROADMAP.md`,
-    `docs/V0.5-PLAN.md`, `docs/SWEBENCH.md` — historical planning + ship docs.
+    `docs/V0.5-PLAN.md`, `docs/SWEBENCH.md`: historical planning + ship docs.
   * `docs/KIMETSU-CHAT.md`, `docs/MEMORY-PROPOSALS.md`,
-    `docs/MEMORY-USEFULNESS.md`, `docs/DEPENDENCIES.md` — content
+    `docs/MEMORY-USEFULNESS.md`, `docs/DEPENDENCIES.md`: content
     folded into HOW-KIMETSU-WORKS.md.
   * `docs/archive/` entire subtree (14 files: MP-4 through MP-15
     results, MVP, V0.2 plan/ship, V0.3 plan).
@@ -928,16 +928,16 @@ UPGRADE NOTES
         DEPENDENCIES content? It's all in
         `docs/HOW-KIMETSU-WORKS.md` now (sections 1, 4, 4, 10).
   * Pre-v0.5.4 commit hashes still reference the files in their
-    original locations — `git log` + `git show` work normally on
+    original locations; `git log` + `git show` work normally on
     history.
 
 NEXT (in flight)
-  * v0.5.5 — Layer 2 driver implementation lands in kimetsu-bench
+  * v0.5.5: Layer 2 driver implementation lands in kimetsu-bench
     (Python Harbor shim + BenchmarkDriver trait + Terminal-Bench
     impl + kbench CLI). The kimetsu_harbor/ directory in this repo
     gets deleted in the same release pass.
 
-## v0.5.3 — Layer 1 of the harbor refactor: in-process e2e suite + CLI smoke
+## v0.5.3: Layer 1 of the harbor refactor: in-process e2e suite + CLI smoke
 
 First commit of the v0.5.3 harbor refactor arc. v0.5.0-v0.5.2 made
 the brain learn from outcomes; v0.5.3 makes it possible to verify the
@@ -957,7 +957,7 @@ WHAT v0.5.3 ADDS
       decay.rs         half-life ranking flip via the broker
       conflicts.rs     list_conflicts + resolve_conflict wrappers
     8 tests total. Runs in well under a second.
-  * `crates/kimetsu-cli/tests/cli_smoke.rs` — 5 subprocess smoke
+  * `crates/kimetsu-cli/tests/cli_smoke.rs`: 5 subprocess smoke
     tests that catch CLI argparse / subcommand / --help drift
     (no model calls, no network).
   * `KimetsuAgentOpts::for_tests()` is now `pub` (was `#[cfg(test)]`)
@@ -991,19 +991,19 @@ UPGRADE NOTES
   * No user-visible API changes. Pre-push gate gets stronger.
 
 NEXT (in flight)
-  * v0.5.4 — consolidate docs into a single HOW-KIMETSU-WORKS.md;
+  * v0.5.4: consolidate docs into a single HOW-KIMETSU-WORKS.md;
     historical planning + ship docs migrate to the internal
     kimetsu-bench repo.
-  * v0.5.5 — delete kimetsu_harbor/ from this repo (Python Harbor
+  * v0.5.5: delete kimetsu_harbor/ from this repo (Python Harbor
     shim moved to kimetsu-bench in v0.5.4).
 
-## v0.5.2 — conflict detection at ingest: contradictions surface, don't silently compete
+## v0.5.2: conflict detection at ingest: contradictions surface, don't silently compete
 
 Third and final beat of the v0.5 arc. v0.5.0 attributed which memories
 helped; v0.5.1 made stale boosters age out; v0.5.2 stops contradictory
 memories from accumulating in the first place. "Use anyhow" and "use
 thiserror" no longer both live in the brain quietly competing for
-retrieval slots — the second write surfaces the conflict at ingest
+retrieval slots: the second write surfaces the conflict at ingest
 time so the operator can decide which to keep.
 
 WHAT v0.5.2 ADDS
@@ -1015,7 +1015,7 @@ WHAT v0.5.2 ADDS
   * Embedder gating. `embedder.is_noop()` short-circuits to zero
     hits, so lean builds keep exact pre-v0.5.2 behavior. Cross-model
     rows (embedding_model != active embedder id) are silently
-    skipped — cosine across models is meaningless. A subsequent
+    skipped: cosine across models is meaningless. A subsequent
     `kimetsu brain reindex` rehydrates them and the next ingest
     catches the conflict.
   * New schema: `memory_conflicts` table linking
@@ -1026,7 +1026,7 @@ WHAT v0.5.2 ADDS
     files pick it up on first open.
   * Wiring: both `project::add_memory` and `user_brain::add_user_memory`
     call `conflict::detect_and_record` after the post-insert
-    embedding write. On a hit, one line to stderr — never blocks
+    embedding write. On a hit, one line to stderr; never blocks
     the write (surfacing > blocking; a blocked write loses user
     intent, a logged write loses nothing).
 
@@ -1041,7 +1041,7 @@ USER SURFACE: conflicts
     `kept_new` the existing memory is invalidated; with
     `kept_existing` the new memory is invalidated; with
     `kept_both` neither is touched (legit case where both apply
-    in different contexts). Idempotent — a second resolve on the
+    in different contexts). Idempotent: a second resolve on the
     same id returns false without rewriting `invalidated_at`.
   * `kimetsu_brain_memory_conflicts` MCP tool (read-only): same
     backend, JSON-shaped for Claude Code / Codex. Resolution is
@@ -1049,22 +1049,22 @@ USER SURFACE: conflicts
     Brings the kimetsu_* MCP catalog to 18 tools.
 
 NEW BRAIN API
-  * `conflict::find_potential_conflicts(...)` — pure detection.
-  * `conflict::record_conflict(...)` — idempotent insert keyed on
+  * `conflict::find_potential_conflicts(...)`: pure detection.
+  * `conflict::record_conflict(...)`: idempotent insert keyed on
     the memory pair.
-  * `conflict::detect_and_record(...)` — convenience wrapper used
+  * `conflict::detect_and_record(...)`: convenience wrapper used
     by the ingest path, returns the count of newly-recorded hits.
-  * `conflict::list_unresolved_conflicts(conn, limit)` — joined
+  * `conflict::list_unresolved_conflicts(conn, limit)`: joined
     with both memories' text for rich display.
-  * `conflict::resolve_conflict(conn, conflict_id, resolution)` —
+  * `conflict::resolve_conflict(conn, conflict_id, resolution)`:
     settles a row, invalidates the losing side, returns true if
     something changed.
   * `project::list_conflicts(start, limit) -> Vec<ScopedConflict>`
     merges project + user brain rows with a `source` label.
-  * `project::resolve_conflict(start, id, resolution)` — project
+  * `project::resolve_conflict(start, id, resolution)`: project
     DB first, user brain fallback. Acquires the project lock.
 
-TESTS (12 new in brain — 10 conflict module + 1 project integration + 1 wrapper)
+TESTS (12 new in brain: 10 conflict module + 1 project integration + 1 wrapper)
   conflict::tests (10)
     noop_embedder_returns_no_conflicts
     cross_model_rows_are_skipped
@@ -1091,7 +1091,7 @@ VERIFIED
 UPGRADE NOTES
   * Existing brain.db files: `memory_conflicts` table created
     idempotently on first open with the v0.5.2 binary. No
-    backfill — conflicts are only detected at fresh ingest.
+    backfill; conflicts are only detected at fresh ingest.
   * Lean (default) builds: conflict detection is a silent no-op.
     Build with `--features embeddings` to enable. (Same gate as
     semantic retrieval.)
@@ -1099,7 +1099,7 @@ UPGRADE NOTES
     "same concept" floor. If you see false positives in
     `kimetsu brain memory conflicts`, the surfaced pairs are
     similar-but-correct (e.g. two legit preferences for different
-    contexts) — resolve as `kept_both` to silence them. If you see
+    contexts): resolve as `kept_both` to silence them. If you see
     false negatives (a real contradiction sneaking through),
     raise the threshold via a future config knob (deferred until
     real data justifies the surface).
@@ -1110,25 +1110,25 @@ UPGRADE NOTES
     "resolving" a real contradiction it should have surfaced.
 
 THE v0.5 ARC IS COMPLETE
-  v0.5.0 — citations: the brain knows *which* memories helped.
-  v0.5.1 — decay:     stale "useful" boosters age toward neutral.
-  v0.5.2 — conflicts: contradictory writes surface, don't compete.
+  v0.5.0: citations: the brain knows *which* memories helped.
+  v0.5.1: decay:     stale "useful" boosters age toward neutral.
+  v0.5.2: conflicts: contradictory writes surface, don't compete.
   Together: the brain learns from outcomes, ages out stale signal,
   and stops accumulating noise. Pitch sharpens from "memory that
   follows you" to "memory that follows you AND improves on its own."
 
-## v0.5.1 — usefulness decay: recency-weighted memory ranking
+## v0.5.1: usefulness decay: recency-weighted memory ranking
 
 Second beat of the v0.5 arc. v0.5.0 gave us *which* memories
 helped; v0.5.1 makes "helped" age out. A memory that proved
 useful 6 months ago shouldn't outrank one that proved useful
-yesterday — yet under the v0.5.0 multiplier they tied, because
+yesterday, yet under the v0.5.0 multiplier they tied, because
 the boost was permanent. Long-running repos accumulated stale
 boosters that crowded out fresh signal.
 
 WHAT v0.5.1 ADDS
   * New column `memories.last_useful_at TEXT NULL`. Bumped by
-    the projector ONLY on `(memory cited) AND (run.finished)` —
+    the projector ONLY on `(memory cited) AND (run.finished)`:
     cited + run.failed doesn't count (the memory misled the
     model), silent passengers never bump regardless of outcome.
     Distinct from `last_used_at` which still bumps on every
@@ -1149,7 +1149,7 @@ THE DECAY SHAPE
   multiplier itself:
     effective = 1.0 + (raw_multiplier - 1.0) * decay
   At decay=1.0 a memory with the max +1.5 boost stays at +1.5.
-  At decay=0.0 (very old) it slides back to 1.0 (neutral) —
+  At decay=0.0 (very old) it slides back to 1.0 (neutral),
   same as a brand-new memory with zero history. Critically NOT
   zero: losing confidence in old signal shouldn't penalize a
   memory *below* a fresh one. Symmetric for the penalty side
@@ -1178,7 +1178,7 @@ TESTS (7 new in brain, all in context.rs)
       not from a hard 1.0 floor.
     aged_cited_memory_ranks_below_recently_cited_memory
       End-to-end: two FTS-tied memories, one cited yesterday and
-      one cited a year ago — recent must rank first under the
+      one cited a year ago: recent must rank first under the
       default 30-day half-life.
     aged_cited_memory_does_not_decay_when_half_life_is_zero
       Companion regression: with decay off, the same two
@@ -1206,13 +1206,13 @@ UPGRADE NOTES
     still apply.
 
 NEXT (in flight)
-  * v0.5.2 — conflict detection at ingest. (Shipped above.)
+  * v0.5.2: conflict detection at ingest. (Shipped above.)
 
-## v0.5.0 — the brain learns from outcomes: citations + blame
+## v0.5.0: the brain learns from outcomes: citations + blame
 
 v0.5's north star: make the brain *get smarter over time* from
-real run data. v0.5.0 ships the foundation — per-memory
-attribution — that v0.5.1 (decay) and v0.5.2 (conflict detection)
+real run data. v0.5.0 ships the foundation (per-memory
+attribution) that v0.5.1 (decay) and v0.5.2 (conflict detection)
 build on. The arc is summarized in `docs/HOW-KIMETSU-WORKS.md`
 sections 4-6; per-release detail is in the entries below.
 
@@ -1221,14 +1221,14 @@ PROBLEM
   nothing: every memory in a run's `context.injected` event got
   +1 on `run.finished` or -1 on `run.failed`. A run that
   succeeded thanks to 1 of 10 retrieved memories rewarded all
-  10 equally. Noise compounded over time — retrieved-and-ignored
+  10 equally. Noise compounded over time: retrieved-and-ignored
   memories accumulated the same usefulness score as
   retrieved-and-pivotal ones.
 
 WHAT v0.5.0 ADDS
   * New tool `cite_memory(memory_id, rationale?)`. The model
-    calls it during a turn when it consciously leveraged a
-    retrieved capsule. Best-effort metadata — forgetting to cite
+    calls it during a turn when it consciously used a
+    retrieved capsule. Best-effort metadata: forgetting to cite
     doesn't fail the turn. Multiple citations per turn are fine.
   * New `memory.cited` event kind. The agent loop accumulates
     `cite_memory` calls into `recorded_citations` (annotated with
@@ -1242,7 +1242,7 @@ WHAT v0.5.0 ADDS
     open with the new binary.
   * Projector handler `apply_memory_cited` mirrors each event
     into the new table.
-  * Usefulness scoring split — cited memories get the strong
+  * Usefulness scoring split: cited memories get the strong
     ±1.0 delta, silent passengers (retrieved-but-not-cited)
     get the weak ±0.1 delta. Encourages models to actually use
     `cite_memory` and keeps the strong signal aimed at memories
@@ -1271,7 +1271,7 @@ TESTS (3 new in brain, 1 net new since v0.4.11)
       Updated: now emits `memory.cited` so the test demonstrates
       the strong +1.0 signal path.
     run_failed_decrements_usefulness_unless_gate
-      Updated: same — adds a citation so the failure penalty
+      Updated: same, adds a citation so the failure penalty
       hits at strong -1.0.
     run_finished_gives_weak_signal_to_silent_passenger_memories  (NEW)
       Asserts: retrieved + uncited memory ends up at +0.1, not
@@ -1287,31 +1287,31 @@ VERIFIED
   cargo metadata --no-deps      clean at 0.5.0
 
 UPGRADE NOTES
-  * Pre-v0.5.0 chat / harbor runs continue to work — they just
+  * Pre-v0.5.0 chat / harbor runs continue to work; they just
     won't emit `memory.cited` events, so all their retrieved
     memories will be treated as silent passengers (±0.1 each).
     If you want the old "everything in context gets ±1" behavior
     back, the rule lives in
     `kimetsu_brain::projector::apply_memory_usefulness_for_run`.
   * Existing brain.db files don't need migration beyond opening
-    them with the v0.5.0 binary — the `memory_citations` table
+    them with the v0.5.0 binary: the `memory_citations` table
     is created on first open.
   * `kimetsu brain memory blame` on a pre-v0.5.0 run will
     typically show 0 cited + all retrieved as silent passengers
     (since no `memory.cited` events fired).
 
 NEXT (shipped)
-  * v0.5.1 — usefulness decay. (Shipped above.)
-  * v0.5.2 — conflict detection at ingest. (Shipped above.)
+  * v0.5.1: usefulness decay. (Shipped above.)
+  * v0.5.2: conflict detection at ingest. (Shipped above.)
 
-## v0.4.11 — drop x86_64-apple-darwin from the release matrix
+## v0.4.11: drop x86_64-apple-darwin from the release matrix
 
 The v0.4.10 release pipeline got stuck because two GitHub Actions
 matrix jobs queued indefinitely:
 
 ```
-build x86_64-apple-darwin (lean)        — queued, never started
-build x86_64-apple-darwin (embeddings)  — queued, never started
+build x86_64-apple-darwin (lean)        : queued, never started
+build x86_64-apple-darwin (embeddings)  : queued, never started
 ```
 
 As of late 2026, `macos-13` (Intel) runners are deprecated on the
@@ -1330,11 +1330,11 @@ Fix in v0.4.11:
     * aarch64-apple-darwin       (lean + embeddings)  ← Apple Silicon
     * x86_64-pc-windows-msvc     (lean + embeddings)
 * Users on Intel Macs can still `cargo install kimetsu-cli`
-  (with or without `--features embeddings`) — the source build
+  (with or without `--features embeddings`): the source build
   is target-portable. They just don't get a pre-built binary.
 * If GitHub re-provisions `macos-13` capacity in the future, we
   add it back; if x86_64 mac demand spikes, we can also cross-
-  compile from `macos-14` (arm64 host) — a v0.5 follow-up.
+  compile from `macos-14` (arm64 host): a v0.5 follow-up.
 
 No code changes. v0.4.9's SecretString + v0.4.10's harbor-rs
 publish exclusion both carry forward.
@@ -1347,7 +1347,7 @@ OPERATOR ACTION
 
   Then v0.4.11's tag push fires a fresh, clean run.
 
-## v0.4.10 — kimetsu-harbor-rs stays out of crates.io
+## v0.4.10: kimetsu-harbor-rs stays out of crates.io
 
 The v0.4.9 publish pipeline included `kimetsu-harbor-rs` in the
 registry rollout. Reviewing pre-flight, that was wrong:
@@ -1376,20 +1376,20 @@ Fixes in v0.4.10:
 No code changes. No new tests. v0.4.9's SecretString + automated
 publish work all carries forward.
 
-## v0.4.9 — SecretString for provider tokens + automated crates.io publish
+## v0.4.9: SecretString for provider tokens + automated crates.io publish
 
 SECURITY
   Both `ClaudeCodeProvider` and `AnthropicProvider` previously held
   `api_key: String` and derived `#[derive(Debug)]`. Any `{:?}`
-  print of either struct — panic backtrace, `dbg!` left in a debug
+  print of either struct (panic backtrace, `dbg!` left in a debug
   session, `tracing::debug!(?provider)` from a future telemetry
-  pass — would have written the raw OAuth token / API key to
+  pass) would have written the raw OAuth token / API key to
   stderr or the log sink.
 
   v0.4.9 introduces `kimetsu_core::secret::SecretString` whose
   `Debug` / `Display` / `serde::Serialize` impls all emit
   `"[REDACTED; len=N]"`. Cleartext is only reachable via
-  `expose_secret()` — every caller is now greppable in code
+  `expose_secret()`: every caller is now greppable in code
   review.
 
   Provider fields converted:
@@ -1451,7 +1451,7 @@ NEXT
   `cargo install kimetsu-cli` to confirm the registry flow works
   end-to-end. If anything breaks per-platform, cut v0.4.9.1.
 
-## v0.4.8 — release-pipeline patch
+## v0.4.8: release-pipeline patch
 
 The v0.4.7 release workflow failed across every platform with:
 
@@ -1460,13 +1460,13 @@ error: the package 'kimetsu-cli' does not contain this feature: embeddings
 help: package with the missing feature: kimetsu-brain
 ```
 
-Cargo doesn't auto-forward features across workspace dep chains —
+Cargo doesn't auto-forward features across workspace dep chains:
 the `embeddings` feature lived on `kimetsu-brain` but the release
 matrix called `cargo build -p kimetsu-cli --features embeddings`,
 which can't propagate down to a dep.
 
 v0.4.8 adds a passthrough `embeddings` feature on every crate
-that depends on `kimetsu-brain` — `kimetsu-cli`,
+that depends on `kimetsu-brain`: `kimetsu-cli`,
 `kimetsu-chat`, `kimetsu-agent`, `kimetsu-harbor-rs`. Each one
 declares:
 
@@ -1484,13 +1484,13 @@ No behavior change beyond unblocking the release pipeline. The
 v0.4.7 tag stays in git history but its corresponding GitHub
 Release was never published (the pipeline failed before upload).
 
-## v0.4.7 — distribution path
+## v0.4.7: distribution path
 
 - **Per-crate `Cargo.toml` metadata** filled in for crates.io
   publish: `description`, `repository`, `homepage`,
   `documentation`, `readme`, `rust-version`, `keywords`,
   `categories`. Workspace `license` flipped from `UNLICENSED`
-  (which crates.io rejects) to dual `MIT OR Apache-2.0` —
+  (which crates.io rejects) to dual `MIT OR Apache-2.0`,
   matches the Rust ecosystem norm.
 - **`LICENSE-MIT` + `LICENSE-APACHE`** files added at repo root.
 - **`.github/workflows/release.yml`** ships tag-driven release
@@ -1502,7 +1502,7 @@ Release was never published (the pipeline failed before upload).
 - **`kimetsu doctor` runs as a release gate** before any artifact
   uploads, so a broken build can never become a published release.
 
-## v0.4.6 — `kimetsu doctor` (automated wire-health)
+## v0.4.6: `kimetsu doctor` (automated wire-health)
 
 - New `kimetsu doctor [--json] [--workspace PATH] [--skip-mcp]`
   CLI subcommand. Runs 8 hermetic checks (workspace, brain,
@@ -1513,7 +1513,7 @@ Release was never published (the pipeline failed before upload).
   v0.4.5 (redact) are all wired correctly end-to-end.
 - `kimetsu-cli` test count: 2 → 6 (+4 doctor tests).
 
-## v0.4.5 — secret redaction at ingest
+## v0.4.5: secret redaction at ingest
 
 - New `kimetsu_brain::redact` module: `redact_secrets(text) ->
   RedactionResult` with non-overlapping greedy coverage across
@@ -1523,28 +1523,28 @@ Release was never published (the pipeline failed before upload).
   generic_api_key, generic_token, generic_password).
 - Wired at every memory write boundary: `project::add_memory`,
   `user_brain::add_user_memory`, `propose_benchmark_memory`.
-  Redaction is idempotent — double-call is safe.
+  Redaction is idempotent; double-call is safe.
 - On a hit, prints a one-liner to stderr (`kimetsu-brain:
   redacted 1 secret: anthropic_oauth`). Write proceeds with the
   redacted text; the surrounding context is preserved.
 - 12 unit tests + 1 end-to-end test proving `sk-ant-...` never
   reaches brain.db.
 
-## v0.4.4 — ambient pre-turn context
+## v0.4.4: ambient pre-turn context
 
 - New `kimetsu_brain::ambient` module: collects git branch,
   `git status --short` top entries, top-5 mtime-ordered recent
   files (via the `ignore` crate, `.kimetsu/` filtered).
 - `render_as_query_suffix(&ctx)` appends a short suffix like
   `\n[workspace: branch=X | recent: a.rs, b.rs | dirty: M ...]`
-  to the explicit `query` before retrieval — so terse queries
+  to the explicit `query` before retrieval, so terse queries
   ("fix it", "continue") still surface useful capsules.
 - Wired into `kimetsu brain context [--no-ambient]` CLI and into
   the MCP `kimetsu_brain_context` + `kimetsu_benchmark_context`
   tools (per-call `include_ambient` parameter, default true;
   global kill-switch `KIMETSU_BRAIN_AMBIENT=off`).
 
-## v0.4.3 — fastembed-rs backend + `kimetsu brain reindex`
+## v0.4.3: fastembed-rs backend + `kimetsu brain reindex`
 
 - `fastembed = "5"` added as an OPTIONAL dependency behind the
   `embeddings` Cargo feature. Default build stays dep-light;
@@ -1553,13 +1553,13 @@ Release was never published (the pipeline failed before upload).
   `bge-small-en-v1.5` (default, 384 dim), `bge-m3` (1024 dim,
   multilingual), `jina-v2-base-code` (768 dim, code-tuned).
 - `open_default_embedder()` returns a cached embedder via
-  process-static `OnceLock` — model loads once per process.
+  process-static `OnceLock`: model loads once per process.
 - New `kimetsu brain reindex [--scope project|user|all]
   [--dry-run] [--force] [--limit N]` CLI subcommand backfills
   NULL embeddings AND rows whose `embedding_model` doesn't
   match the active embedder.
 
-## v0.4.2 — embeddings + hybrid retrieval scaffolding
+## v0.4.2: embeddings + hybrid retrieval scaffolding
 
 - New `kimetsu_brain::embeddings` module: `Embedder` trait,
   `NoopEmbedder` (production default through v0.4.2),
@@ -1572,7 +1572,7 @@ Release was never published (the pipeline failed before upload).
   `final = (1 - α) * lex + α * normalized_cos` with `α = 0.5`.
   Cross-model rows skip the cosine term safely.
 
-## v0.4.1 — user-scope brain at `~/.kimetsu/brain.db`
+## v0.4.1: user-scope brain at `~/.kimetsu/brain.db`
 
 - New `kimetsu_brain::user_brain` module. `MemoryScope::GlobalUser`
   writes now route to `~/.kimetsu/brain.db` (or
@@ -1583,7 +1583,7 @@ Release was never published (the pipeline failed before upload).
 - Kill-switch: `KIMETSU_USER_BRAIN=0` falls back to v0.3.5
   behavior.
 
-## v0.3 — chat client + bridge plugin + prompt-cache visibility
+## v0.3: chat client + bridge plugin + prompt-cache visibility
 
 The v0.3 line introduced the chat client, the bridge plugin
 mode (MCP sidecar for Claude Code and Codex), and Anthropic
@@ -1591,14 +1591,14 @@ prompt-cache visibility + the persistent claude subprocess
 that makes cache_read actually land. v0.3.5 flipped the
 persistent path to default-on for chat.
 
-## v0.2 — Terminal-Bench validation
+## v0.2: Terminal-Bench validation
 
 The v0.2 line ran the MP gauntlet from MP-4 through MP-18:
 broker design + retrieval scoring, the 20-tool surface,
 auto-orient pre-shell, parallel `tool_calls` envelope,
 record_deviation + iterative verify.
 
-## v0.1 — initial scaffold
+## v0.1: initial scaffold
 
 Brain + agent + pipeline foundations.
 

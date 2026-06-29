@@ -827,6 +827,24 @@ enum BrainCommand {
     ///   kimetsu brain forget --yes
     ///   kimetsu brain forget --yes --force-enabled
     Forget(ForgetArgs),
+    /// Record a ground-truth citation: mark that a memory materially helped.
+    ///
+    /// Writes a `memory.cited` event (raising use_count / usefulness), the same
+    /// signal the MCP `kimetsu_brain_cite` tool records — exposed on the CLI so
+    /// outcomes can be injected without a host. Example:
+    ///   kimetsu brain cite --memory-id 01K… --note "fixed the build"
+    Cite(CiteArgs),
+    /// Record a regret: mark that a surfaced memory was unhelpful/misleading.
+    ///
+    /// Writes a `retrieval.regret` telemetry event for the memory — the negative
+    /// signal lifecycle review and calibration consume. Example:
+    ///   kimetsu brain regret --memory-id 01K…
+    Regret(RegretArgs),
+    /// Run the distiller on a transcript and print the lessons it would extract,
+    /// WITHOUT recording them. Uses the configured cheap model ([cheap_model] in
+    /// project.toml). For inspection and benchmarking the write path. Example:
+    ///   kimetsu brain distill session.jsonl --json
+    Distill(DistillArgs),
     /// Flagship 2 / Story 2.3: Reflect related memories into higher-order
     /// principles.
     ///
@@ -1032,6 +1050,10 @@ struct EvalArgs {
     /// cap (mirrors the daemon's RERANK_POOL; 12 is the production value).
     #[arg(long, default_value_t = 12)]
     pool: usize,
+    /// HyDE: expand each case query with a hypothetical answer from the cheap
+    /// model before retrieval, to measure the recall lift on oblique queries.
+    #[arg(long)]
+    hyde: bool,
 }
 
 /// Args for `kimetsu brain bench`.
@@ -1248,6 +1270,10 @@ struct ForgetArgs {
     /// Report which memories would be forgotten without writing anything.
     #[arg(long)]
     dry_run: bool,
+    /// Emit the forget summary as machine-readable JSON. Implies report-only
+    /// (never writes), so it composes with --dry-run and is safe for harnesses.
+    #[arg(long)]
+    json: bool,
     /// Skip the confirmation prompt and apply immediately.
     #[arg(long)]
     yes: bool,
@@ -1266,6 +1292,44 @@ struct ForgetArgs {
     /// Skip the proposal-queue GC hygiene pass after forgetting.
     #[arg(long)]
     no_proposal_gc: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain cite`.
+#[derive(Debug, Args)]
+struct CiteArgs {
+    /// The memory id to credit.
+    #[arg(long)]
+    memory_id: String,
+    /// Optional rationale recorded with the citation.
+    #[arg(long)]
+    note: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain regret`.
+#[derive(Debug, Args)]
+struct RegretArgs {
+    /// The memory id to flag as regretted.
+    #[arg(long)]
+    memory_id: String,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain distill`.
+#[derive(Debug, Args)]
+struct DistillArgs {
+    /// Path to a transcript JSONL file (one message object per line).
+    transcript: PathBuf,
+    /// Emit the extracted lessons as machine-readable JSON.
+    #[arg(long)]
+    json: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1417,6 +1481,10 @@ struct ContextArgs {
     /// like "continue" or "fix it" still surface useful capsules.
     #[arg(long)]
     no_ambient: bool,
+    /// HyDE: expand the query with a hypothetical answer from the cheap model
+    /// before retrieval (lifts recall on oblique queries; needs [cheap_model]).
+    #[arg(long)]
+    hyde: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1437,7 +1505,12 @@ enum MemoryCommand {
     #[command(name = "add-batch")]
     AddBatch(MemoryAddBatchArgs),
     /// List active memories with usefulness stats.
-    List,
+    List {
+        /// Emit memories as machine-readable JSON (id, scope, kind, confidence,
+        /// use_count, usefulness_score, text) for harnesses and benchmarks.
+        #[arg(long)]
+        json: bool,
+    },
     /// List pending proposals awaiting review.
     Proposals(ProposalsArgs),
     /// Promote a proposal into an active memory.
@@ -1471,6 +1544,24 @@ enum MemoryCommand {
     /// brain (the "agent saved junk" case). The row is kept for audit;
     /// it simply stops being retrieved.
     Undo(MemoryUndoArgs),
+    /// Backdate a memory's age (created_at / last_useful_at) by N days. A
+    /// testing/benchmark affordance for exercising age-sensitive policies like
+    /// forgetting. Event-sourced (`memory.aged`), so it survives a rebuild.
+    #[command(name = "set-age")]
+    SetAge(MemorySetAgeArgs),
+}
+
+#[derive(Debug, Args)]
+struct MemorySetAgeArgs {
+    /// The memory id to backdate.
+    #[arg(long)]
+    memory_id: String,
+    /// How many days into the past to set created_at / last_useful_at.
+    #[arg(long)]
+    days_ago: u32,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -2191,7 +2282,6 @@ pub fn resolve_setup_hosts(
     present_claude: bool,
     present_codex: bool,
     present_cursor: bool,
-    present_gemini: bool,
     present_openclaw: bool,
     present_pi: bool,
     is_tty: bool,
@@ -2217,9 +2307,6 @@ pub fn resolve_setup_hosts(
     }
     if present_cursor {
         detected.push(BridgeTarget::Cursor);
-    }
-    if present_gemini {
-        detected.push(BridgeTarget::GeminiCli);
     }
     #[cfg(feature = "openclaw")]
     if present_openclaw {
@@ -2247,15 +2334,13 @@ pub fn resolve_setup_hosts(
         Ok(vec![BridgeTarget::ClaudeCode])
     } else {
         #[cfg(all(feature = "pi", feature = "openclaw"))]
-        let prompt =
-            "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/openclaw/pi/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/openclaw/pi/both]: ";
         #[cfg(all(feature = "pi", not(feature = "openclaw")))]
-        let prompt = "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/pi/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/pi/both]: ";
         #[cfg(all(not(feature = "pi"), feature = "openclaw"))]
-        let prompt =
-            "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/openclaw/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/openclaw/both]: ";
         #[cfg(all(not(feature = "pi"), not(feature = "openclaw")))]
-        let prompt = "Which host agent do you use? [claude-code/codex/cursor/gemini-cli/both]: ";
+        let prompt = "Which host agent do you use? [claude-code/codex/cursor/both]: ";
         print!("{prompt}");
         io::stdout().flush().ok();
         let mut line = String::new();
@@ -2275,10 +2360,10 @@ pub fn resolve_setup_hosts(
     }
 }
 
-/// Detect whether the home config directories for Claude Code, Codex, Cursor, Gemini CLI,
+/// Detect whether the home config directories for Claude Code, Codex, Cursor,
 /// OpenClaw, and Pi exist.
-/// Returns `(claude_present, codex_present, cursor_present, gemini_present, openclaw_present, pi_present)`.
-fn detect_present_hosts() -> (bool, bool, bool, bool, bool, bool) {
+/// Returns `(claude_present, codex_present, cursor_present, openclaw_present, pi_present)`.
+fn detect_present_hosts() -> (bool, bool, bool, bool, bool) {
     let home = std::env::var_os("USERPROFILE")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
@@ -2286,15 +2371,13 @@ fn detect_present_hosts() -> (bool, bool, bool, bool, bool, bool) {
 
     let home = match home {
         Some(h) => h,
-        None => return (false, false, false, false, false, false),
+        None => return (false, false, false, false, false),
     };
 
     let claude_present = home.join(".claude").is_dir();
     let codex_present = home.join(".codex").is_dir();
     // Cursor: global config lives in ~/.cursor
     let cursor_present = home.join(".cursor").is_dir();
-    // Gemini CLI: global config lives in ~/.gemini
-    let gemini_present = home.join(".gemini").is_dir();
     #[cfg(feature = "openclaw")]
     let openclaw_present = home.join(".openclaw").is_dir();
     #[cfg(not(feature = "openclaw"))]
@@ -2307,7 +2390,6 @@ fn detect_present_hosts() -> (bool, bool, bool, bool, bool, bool) {
         claude_present,
         codex_present,
         cursor_present,
-        gemini_present,
         openclaw_present,
         pi_present,
     )
@@ -2364,14 +2446,8 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
     // ── Step 2: Choose host(s) ────────────────────────────────────────────────
     println!();
     println!("[2/4] Selecting host(s)...");
-    let (
-        present_claude,
-        present_codex,
-        present_cursor,
-        present_gemini,
-        present_openclaw,
-        present_pi,
-    ) = detect_present_hosts();
+    let (present_claude, present_codex, present_cursor, present_openclaw, present_pi) =
+        detect_present_hosts();
     let is_tty = io::stdin().is_terminal();
     let stdin = io::stdin();
     let hosts = resolve_setup_hosts(
@@ -2379,7 +2455,6 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
         present_claude,
         present_codex,
         present_cursor,
-        present_gemini,
         present_openclaw,
         present_pi,
         is_tty,
@@ -2422,7 +2497,6 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
             BridgeTarget::Cursor => "Cursor",
-            BridgeTarget::GeminiCli => "Gemini CLI",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -2581,7 +2655,6 @@ fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
             BridgeTarget::Cursor => "Cursor",
-            BridgeTarget::GeminiCli => "Gemini CLI",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -2977,7 +3050,6 @@ fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 BridgeTarget::Codex => "Codex",
                 BridgeTarget::Kimetsu => "Kimetsu",
                 BridgeTarget::Cursor => "Cursor",
-                BridgeTarget::GeminiCli => "Gemini CLI",
                 #[cfg(feature = "openclaw")]
                 BridgeTarget::OpenClaw => "OpenClaw",
                 #[cfg(feature = "pi")]
@@ -3905,9 +3977,14 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
             // to the query before retrieval — see
             // `kimetsu_brain::ambient::augment_query`.
             // W3.2: load broker.ambient from project config (env still wins).
-            let config_ambient = kimetsu_core::paths::ProjectPaths::discover(&cwd)
+            // Load the resolved config once here and reuse it below for the
+            // retrieval-level HyDE decision (load_config has already applied
+            // the [retrieval] level preset).
+            let context_config = kimetsu_core::paths::ProjectPaths::discover(&cwd)
                 .ok()
-                .and_then(|paths| project::load_config(&paths).ok())
+                .and_then(|paths| project::load_config(&paths).ok());
+            let config_ambient = context_config
+                .as_ref()
                 .map(|cfg| cfg.broker.ambient)
                 .unwrap_or(true);
             let (effective_query, ambient_payload) = if !args.no_ambient
@@ -3918,6 +3995,26 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
                 (augmented, Some(ctx))
             } else {
                 (args.query.clone(), None)
+            };
+            // #1a HyDE: expand the (ambient-augmented) query with a hypothetical
+            // answer before retrieval. HyDE is on when explicitly requested
+            // (--hyde) OR when the configured retrieval level is "advanced".
+            let hyde_from_level = context_config
+                .as_ref()
+                .map(|cfg| cfg.hyde_from_level())
+                .unwrap_or(false);
+            let hyde_enabled = args.hyde || hyde_from_level;
+            // Advanced level leans on a capable cheap model; nudge the user if
+            // none is configured (non-fatal; the raw query is still used).
+            if hyde_from_level && distiller::resolve_distiller(&cwd).is_none() {
+                eprintln!(
+                    "kimetsu: retrieval level 'advanced' works best with a capable cheap model (OpenAI/Anthropic or a larger local model like qwen2.5:14b); set [cheap_model] in project.toml."
+                );
+            }
+            let effective_query = if hyde_enabled {
+                hyde_augment_query(&cwd, &effective_query)
+            } else {
+                effective_query
             };
             let bundle =
                 project::retrieve_context(&cwd, &args.stage, &effective_query, args.budget_tokens)?;
@@ -4018,6 +4115,9 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Forget(args) => brain_forget(args),
+        BrainCommand::Cite(args) => brain_cite(args),
+        BrainCommand::Regret(args) => brain_regret(args),
+        BrainCommand::Distill(args) => brain_distill(args),
         BrainCommand::Ask(args) => brain_ask(args),
         BrainCommand::Skills(args) => brain_skills(args),
         BrainCommand::Sync(args) => brain_sync(args),
@@ -6346,8 +6446,11 @@ fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
         return Ok(());
     }
 
+    // --json is report-only: never write, so it composes safely with harnesses.
+    let report_only = args.dry_run || args.json;
+
     let opts = ForgetOptions {
-        dry_run: args.dry_run,
+        dry_run: report_only,
         usefulness_floor: args.usefulness_floor.unwrap_or(lc.forget_usefulness_floor),
         min_age_days: args.min_age_days.unwrap_or(lc.forget_min_age_days),
         protect_use_count: args
@@ -6358,7 +6461,12 @@ fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
     // -- Forget pass --
     let summary = forget_brain(&workspace, opts)?;
 
-    if args.dry_run {
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    if report_only {
         if summary.candidates.is_empty() {
             println!("dry-run: no memories matched the forget criteria.");
         } else {
@@ -6476,6 +6584,113 @@ fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
     }
 
     Ok(())
+}
+
+fn brain_cite(args: CiteArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    project::record_mcp_citation(&workspace, &args.memory_id, args.note.as_deref())?;
+    println!("Cited memory {} (memory.cited recorded).", args.memory_id);
+    Ok(())
+}
+
+fn brain_regret(args: RegretArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    project::record_regret(&workspace, &args.memory_id)?;
+    println!(
+        "Flagged memory {} as regretted (retrieval.regret recorded).",
+        args.memory_id
+    );
+    Ok(())
+}
+
+fn brain_distill(args: DistillArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    let resolved = distiller::resolve_distiller(&workspace).ok_or_else(|| {
+        "no cheap model configured: set [cheap_model] provider + model in \
+         .kimetsu/project.toml (e.g. provider = \"ollama\", model = \"qwen2.5:3b\")"
+            .to_string()
+    })?;
+    let mut provider = distiller::make_provider_for_resolved(&resolved).ok_or_else(|| {
+        format!(
+            "could not construct the '{}' model provider for distillation",
+            resolved.provider
+        )
+    })?;
+
+    let transcript = args.transcript.to_string_lossy();
+    let view = distiller::build_transcript_view(&transcript, distiller::MAX_VIEW_CHARS);
+    if view.trim().is_empty() {
+        if args.json {
+            println!("[]");
+        } else {
+            eprintln!("transcript is empty or unreadable: {transcript}");
+        }
+        return Ok(());
+    }
+
+    let lessons = distiller::distill_lessons(&view, provider.as_mut());
+
+    if args.json {
+        let rows: Vec<serde_json::Value> = lessons
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "lesson": l.lesson,
+                    "tags": l.tags,
+                    "kind": l.kind,
+                    "confidence": l.confidence,
+                    "valid_from": l.valid_from,
+                    "valid_to": l.valid_to,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if lessons.is_empty() {
+        println!("no lessons distilled from this transcript.");
+    } else {
+        println!(
+            "distilled {} lesson{} (not recorded):",
+            lessons.len(),
+            if lessons.len() == 1 { "" } else { "s" }
+        );
+        for l in &lessons {
+            println!(
+                "  [{}] {} (confidence {:.2}; tags: {})",
+                l.kind,
+                l.lesson,
+                l.confidence,
+                l.tags.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// HyDE query expansion: append a hypothetical answer passage (from the cheap
+/// model) to `query`, so semantic retrieval matches the answer's vector rather
+/// than the question's. Falls back to the raw query when no cheap model is
+/// configured or the model call fails (graceful, never errors retrieval).
+fn hyde_augment_query(workspace: &Path, query: &str) -> String {
+    let Some(resolved) = distiller::resolve_distiller(workspace) else {
+        eprintln!(
+            "kimetsu: --hyde requested but no [cheap_model] configured; using the raw query."
+        );
+        return query.to_string();
+    };
+    let Some(mut provider) = distiller::make_provider_for_resolved(&resolved) else {
+        return query.to_string();
+    };
+    match distiller::hyde_expand(query, provider.as_mut()) {
+        Some(hyp) => format!("{query}\n{hyp}"),
+        None => query.to_string(),
+    }
 }
 
 /// A fading memory candidate for triage.
@@ -7777,8 +7992,26 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
             Ok(())
         }
         MemoryCommand::AddBatch(args) => memory_add_batch(args),
-        MemoryCommand::List => {
+        MemoryCommand::List { json } => {
             let memories = project::list_memories(&env::current_dir()?)?;
+            if json {
+                let rows: Vec<serde_json::Value> = memories
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "memory_id": m.memory_id,
+                            "scope": m.scope,
+                            "kind": m.kind,
+                            "confidence": m.confidence,
+                            "use_count": m.use_count,
+                            "usefulness_score": m.usefulness_score,
+                            "text": m.text,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
             if memories.is_empty() {
                 println!("no memories");
                 return Ok(());
@@ -7892,6 +8125,17 @@ fn memory(command: MemoryCommand) -> KimetsuResult<()> {
         MemoryCommand::Conflicts(args) => memory_conflicts(args),
         MemoryCommand::Edit(args) => memory_edit(args),
         MemoryCommand::Undo(args) => memory_undo(args),
+        MemoryCommand::SetAge(args) => {
+            let workspace = args
+                .workspace
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+            project::record_set_age(&workspace, &args.memory_id, args.days_ago)?;
+            println!(
+                "Backdated memory {} by {} days.",
+                args.memory_id, args.days_ago
+            );
+            Ok(())
+        }
     }
 }
 
@@ -9097,6 +9341,32 @@ fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         .map(|(k, v)| (v.clone(), k.clone()))
         .collect();
 
+    // #1a HyDE: pre-expand each case query ONCE (shared across all retrieval
+    // modes) so the embedding matches a hypothetical answer rather than the
+    // question. Reranking still uses the original query. The semantic query
+    // used for retrieval is `original + hypothetical`.
+    let retrieval_queries: Vec<String> = if args.hyde {
+        let cfg = tmp_root.join(".kimetsu").join("project.toml");
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&cfg) {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "\n[cheap_model]\nenabled = true\nprovider = \"ollama\"\nmodel = \"qwen2.5:3b\""
+            );
+        }
+        println!(
+            "HyDE: expanding {} queries via the cheap model (one model call each)...",
+            fixture.cases.len()
+        );
+        fixture
+            .cases
+            .iter()
+            .map(|c| hyde_augment_query(&tmp_root, &c.query))
+            .collect()
+    } else {
+        fixture.cases.iter().map(|c| c.query.clone()).collect()
+    };
+
     // ── 3. Helper: run one mode, return ranked key list per case ─────────────
     let run_mode = |mode_label: &str,
                     embedder: &dyn kimetsu_brain::embeddings::Embedder,
@@ -9111,11 +9381,11 @@ fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         let t0 = Instant::now();
         let mut per_case_ranked: Vec<Vec<String>> = Vec::new();
 
-        for case in &fixture.cases {
+        for (ci, case) in fixture.cases.iter().enumerate() {
             let fetch_cap = pool;
             let request = ContextRequest {
                 stage: "localization".to_string(),
-                query: case.query.clone(),
+                query: retrieval_queries[ci].clone(),
                 budget_tokens: 6000,
                 max_capsules: fetch_cap,
                 min_semantic_score: 0.0,   // disable floor for eval recall
@@ -12301,7 +12571,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -12313,7 +12582,6 @@ scope = 0.1
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("both"),
-            false,
             false,
             false,
             false,
@@ -12338,7 +12606,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -12352,7 +12619,6 @@ scope = 0.1
             None,
             false,
             true,
-            false,
             false,
             false,
             false,
@@ -12374,7 +12640,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -12386,7 +12651,6 @@ scope = 0.1
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             None,
-            false,
             false,
             false,
             false,
@@ -12410,7 +12674,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             true,
             Cursor::new(b"codex\n"),
         )
@@ -12422,7 +12685,6 @@ scope = 0.1
     fn resolve_setup_hosts_bad_host_arg_returns_error() {
         let result = resolve_setup_hosts(
             Some("not-a-host"),
-            false,
             false,
             false,
             false,
@@ -12478,7 +12740,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             true,
             Cursor::new(b"both\n"),
         )
@@ -12492,7 +12753,6 @@ scope = 0.1
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             None,
-            false,
             false,
             false,
             false,
@@ -12517,7 +12777,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -12530,7 +12789,6 @@ scope = 0.1
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             None,
-            false,
             false,
             false,
             false,
@@ -12550,7 +12808,6 @@ scope = 0.1
         // Only OpenClaw present → OpenClaw detected.
         let hosts = resolve_setup_hosts(
             None,
-            false,
             false,
             false,
             false,
@@ -12575,7 +12832,6 @@ scope = 0.1
             false,
             false,
             false,
-            false,
             Cursor::new(b""),
         )
         .unwrap();
@@ -12588,7 +12844,6 @@ scope = 0.1
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             Some("claw"),
-            false,
             false,
             false,
             false,
@@ -12626,7 +12881,6 @@ scope = 0.1
         use kimetsu_chat::BridgeTarget;
         let hosts = resolve_setup_hosts(
             None,
-            false,
             false,
             false,
             false,
