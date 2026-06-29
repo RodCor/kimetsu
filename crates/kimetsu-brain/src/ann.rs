@@ -484,6 +484,15 @@ impl AnnIndex {
         PathBuf::from(s)
     }
 
+    /// A process-unique sibling temp path (`<name>.<pid>.tmp`) for an atomic
+    /// write-then-rename. The pid suffix prevents two concurrent fleet processes
+    /// from colliding on the same temp file.
+    fn tmp_sibling(path: &Path) -> PathBuf {
+        let mut name = path.file_name().map(|n| n.to_owned()).unwrap_or_default();
+        name.push(format!(".{}.tmp", std::process::id()));
+        path.with_file_name(name)
+    }
+
     fn manifest(&self) -> Manifest {
         Manifest {
             schema_version: SCHEMA_VERSION,
@@ -496,17 +505,39 @@ impl AnnIndex {
     }
 
     /// Serialize the index + manifest to the sidecar (no-op for in-memory DBs).
+    ///
+    /// Concurrency-safe for fleet writers: each file is written to a
+    /// process-unique temp path and atomically `rename`d into place, so a
+    /// concurrent reader (another process opening the same brain) never observes
+    /// a torn `.usearch`. The manifest is renamed LAST — a reader that sees the
+    /// new manifest is guaranteed to also see the new index, and the reverse
+    /// (new index + old manifest) is caught by the `size != count` check on load
+    /// and degrades to a rebuild rather than serving stale hits.
     pub fn save(&self) -> KimetsuResult<()> {
         let Some(sidecar) = &self.sidecar else {
             return Ok(());
         };
+
+        // 1. Index → temp → atomic rename.
+        let index_tmp = Self::tmp_sibling(sidecar);
         self.index
-            .save(sidecar.to_string_lossy().as_ref())
+            .save(index_tmp.to_string_lossy().as_ref())
             .map_err(|e| format!("usearch save: {e}"))?;
+        std::fs::rename(&index_tmp, sidecar).map_err(|e| {
+            let _ = std::fs::remove_file(&index_tmp);
+            format!("usearch rename: {e}")
+        })?;
+
+        // 2. Manifest LAST → temp → atomic rename.
+        let manifest_path = Self::manifest_path(sidecar);
+        let manifest_tmp = Self::tmp_sibling(&manifest_path);
         let manifest =
             serde_json::to_vec(&self.manifest()).map_err(|e| format!("manifest serialize: {e}"))?;
-        std::fs::write(Self::manifest_path(sidecar), manifest)
-            .map_err(|e| format!("manifest write: {e}"))?;
+        std::fs::write(&manifest_tmp, manifest).map_err(|e| format!("manifest write: {e}"))?;
+        std::fs::rename(&manifest_tmp, &manifest_path).map_err(|e| {
+            let _ = std::fs::remove_file(&manifest_tmp);
+            format!("manifest rename: {e}")
+        })?;
         Ok(())
     }
 

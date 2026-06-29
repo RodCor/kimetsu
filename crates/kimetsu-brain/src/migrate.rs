@@ -84,6 +84,16 @@ fn migrations() -> &'static [Migration] {
             description: "add valid_from + valid_to columns for temporal validity (Flagship 1 Pass A)",
             up: crate::schema::migrate_v6_to_v7,
         },
+        Migration {
+            version: 8,
+            description: "add per-event origin column (v3.0 #3 fleet write-safety / provenance)",
+            up: crate::schema::migrate_v7_to_v8,
+        },
+        Migration {
+            version: 9,
+            description: "add per-event HLC column + backfill (v3.0 #3 Slice B convergent team sync)",
+            up: crate::schema::migrate_v8_to_v9,
+        },
     ]
 }
 
@@ -295,23 +305,33 @@ pub(crate) fn run_with(
         .iter()
         .filter(|m| m.version > current && m.version <= target)
     {
-        // Run the migration DDL and the version bump inside one transaction so
-        // a crash mid-step is fully rolled back on the next open.
-        conn.execute_batch("BEGIN")?;
+        // Run the migration DDL and the version bump inside one IMMEDIATE
+        // transaction: the write lock is taken at BEGIN so a crash mid-step is
+        // fully rolled back, AND two processes opening the same stale brain.db
+        // at once cannot double-apply a step (the second waits, then the
+        // under-lock re-check below sees the bumped version and skips).
+        conn.execute_batch("BEGIN IMMEDIATE")?;
 
-        let result = (|| -> KimetsuResult<()> {
+        let result = (|| -> KimetsuResult<bool> {
+            // Re-check under the write lock — a concurrent migrator may have
+            // already applied this step while we waited for the lock.
+            if m.version <= current_version(conn)? {
+                return Ok(false); // already applied; skip
+            }
             (m.up)(conn)?;
             conn.execute(
                 "UPDATE schema_info SET value = ?1 WHERE key = 'kimetsu_schema_version'",
                 [m.version],
             )?;
-            Ok(())
+            Ok(true)
         })();
 
         match result {
-            Ok(()) => {
+            Ok(did_apply) => {
                 conn.execute_batch("COMMIT")?;
-                applied.push(m.version);
+                if did_apply {
+                    applied.push(m.version);
+                }
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -454,6 +474,69 @@ mod tests {
         )
         .expect("seed memories table");
         conn
+    }
+
+    /// v3.0 #3: migrating a v7 brain forward adds a nullable `events.origin`
+    /// (v8) and an `events.hlc` (v9) column. Pre-existing event rows read back
+    /// with `origin = NULL` and an `hlc` backfilled from rowid so they keep their
+    /// original order (and sort before any new HLC event).
+    #[test]
+    fn migrate_v7_forward_adds_origin_and_hlc() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO schema_info VALUES ('kimetsu_schema_version', 7);
+             CREATE TABLE events (
+                 event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, ts TEXT NOT NULL,
+                 kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload_json TEXT NOT NULL);
+             INSERT INTO events VALUES
+                 ('e1','r1','2024-01-01T00:00:00Z','memory.accepted',1,'{}'),
+                 ('e2','r1','2024-01-02T00:00:00Z','memory.cited',1,'{}');",
+        )
+        .expect("seed v7 events");
+
+        let target = target_version();
+        let outcome = run_with(&conn, migrations(), target).expect("migrate v7->current");
+        assert!(outcome.applied.contains(&8), "v8 migration must apply");
+        assert!(outcome.applied.contains(&9), "v9 migration must apply");
+
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(events)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(
+            cols.iter().any(|c| c == "origin"),
+            "events.origin must exist"
+        );
+        assert!(cols.iter().any(|c| c == "hlc"), "events.hlc must exist");
+
+        // Pre-v8 rows read origin = NULL.
+        let origin: Option<String> = conn
+            .query_row("SELECT origin FROM events WHERE event_id='e1'", [], |r| {
+                r.get(0)
+            })
+            .expect("read origin");
+        assert_eq!(origin, None, "old event rows must read origin = NULL");
+
+        // HLC backfilled (wall=0 prefix) and preserves rowid order (e1 < e2).
+        let hlc1: String = conn
+            .query_row("SELECT hlc FROM events WHERE event_id='e1'", [], |r| {
+                r.get(0)
+            })
+            .expect("read hlc1");
+        let hlc2: String = conn
+            .query_row("SELECT hlc FROM events WHERE event_id='e2'", [], |r| {
+                r.get(0)
+            })
+            .expect("read hlc2");
+        assert!(
+            hlc1.starts_with("0000000000000."),
+            "backfilled wall=0: {hlc1}"
+        );
+        assert!(hlc1 < hlc2, "backfilled HLC preserves insertion order");
     }
 
     /// Check whether a table exists in `sqlite_master`.

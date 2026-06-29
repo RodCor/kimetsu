@@ -220,6 +220,8 @@ mod tests {
             kind: "context.served".to_string(),
             schema_version: 1,
             payload,
+            origin: None,
+            hlc: None,
         };
         projector::apply_events(conn, &[event]).expect("seed served");
         ts
@@ -239,6 +241,8 @@ mod tests {
                 "memory_id": memory_id,
                 "turn": 1,
             }),
+            origin: None,
+            hlc: None,
         };
         projector::apply_events(conn, &[event]).expect("seed cited");
     }

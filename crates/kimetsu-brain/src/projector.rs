@@ -1,15 +1,74 @@
 use std::borrow::Cow;
 use std::str::FromStr;
+use std::time::Duration;
 
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::event::Event;
 use kimetsu_core::ids::{EventId, RunId};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::redact;
 use crate::schema;
+
+/// Max attempts for a write transaction that loses the race to `SQLITE_BUSY`
+/// after the 15s busy_timeout (rare; a fleet burst). The whole transaction is
+/// retried from a clean state — safe because BUSY can only surface at `BEGIN`
+/// (the IMMEDIATE write lock is held for the entire body once acquired).
+const WRITE_TXN_MAX_ATTEMPTS: u32 = 5;
+
+/// True when `err` is a SQLite busy/locked condition (downcastable through the
+/// boxed `KimetsuResult` error, since `?` preserves the concrete type).
+fn is_sqlite_busy(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<rusqlite::Error>()
+        .and_then(|e| e.sqlite_error_code())
+        .is_some_and(|code| {
+            matches!(
+                code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+        })
+}
+
+/// Run `body` inside a single `BEGIN IMMEDIATE` transaction (concurrent-write
+/// safe): the write lock is taken at `BEGIN`, so two processes writing the same
+/// brain.db serialize cleanly and read-modify-write projections (use_count,
+/// confidence) never interleave across writers. Retries the whole transaction on
+/// `SQLITE_BUSY`/`LOCKED` (which can only occur at `BEGIN`). `&Connection` can't
+/// use `transaction_with_behavior`, so the transaction is driven manually.
+fn with_write_txn<F>(conn: &Connection, mut body: F) -> KimetsuResult<()>
+where
+    F: FnMut(&Connection) -> KimetsuResult<()>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        // BEGIN IMMEDIATE — acquires the write lock now. BUSY surfaces here.
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            let boxed: Box<dyn std::error::Error + Send + Sync> = e.into();
+            if is_sqlite_busy(boxed.as_ref()) && attempt < WRITE_TXN_MAX_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(20 * attempt as u64));
+                continue;
+            }
+            return Err(boxed);
+        }
+        // Lock held — run the body, then COMMIT (or ROLLBACK on any error).
+        match body(conn) {
+            Ok(()) => match conn.execute_batch("COMMIT") {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e.into());
+                }
+            },
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+    }
+}
 
 /// Event-schema durability seam. Normalizes an event written under an older
 /// `EVENT_SCHEMA_VERSION` to the current payload shape *before projection*,
@@ -34,12 +93,13 @@ pub fn rebuild(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
 /// replayed.
 pub fn rebuild_in_place(conn: &Connection) -> KimetsuResult<usize> {
     let events = read_events_ordered(conn)?;
-    let tx = conn.unchecked_transaction()?;
-    reset_projection(&tx)?;
-    for event in &events {
-        project_event(&tx, event)?;
-    }
-    tx.commit()?;
+    with_write_txn(conn, |c| {
+        reset_projection(c)?;
+        for event in &events {
+            project_event(c, event)?;
+        }
+        Ok(())
+    })?;
     Ok(events.len())
 }
 
@@ -53,11 +113,15 @@ pub fn rebuild_in_place(conn: &Connection) -> KimetsuResult<usize> {
 /// only random-tail-stable within the same millisecond, so equal-`ts` events
 /// replayed in a platform-dependent order — non-deterministic rebuilds.
 fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
+    // Order by HLC (Hybrid Logical Clock): a globally-deterministic, causal total
+    // order. On a single brain this generalizes the old (ts, rowid) order; across
+    // synced brains it makes the merged-log replay converge (same projection on
+    // every brain regardless of import order). `rowid` is a stable final tiebreak.
     let mut stmt = conn.prepare(
         "
-        SELECT event_id, run_id, ts, kind, schema_version, payload_json
+        SELECT event_id, run_id, ts, kind, schema_version, payload_json, origin, hlc
         FROM events
-        ORDER BY ts, rowid
+        ORDER BY hlc, rowid
         ",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -67,6 +131,8 @@ fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
         let kind: String = row.get(3)?;
         let schema_version: u32 = row.get(4)?;
         let payload_json: String = row.get(5)?;
+        let origin: Option<String> = row.get(6)?;
+        let hlc: Option<String> = row.get(7)?;
         Ok((
             event_id_str,
             run_id_str,
@@ -74,12 +140,15 @@ fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
             kind,
             schema_version,
             payload_json,
+            origin,
+            hlc,
         ))
     })?;
 
     let mut events = Vec::new();
     for row in rows {
-        let (event_id_str, run_id_str, ts_str, kind, schema_version, payload_json) = row?;
+        let (event_id_str, run_id_str, ts_str, kind, schema_version, payload_json, origin, hlc) =
+            row?;
         let event_id = EventId(
             ulid::Ulid::from_str(&event_id_str)
                 .map_err(|e| format!("invalid event_id {event_id_str:?}: {e}"))?,
@@ -99,18 +168,20 @@ fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
             kind,
             schema_version,
             payload,
+            origin, // preserved across rebuild (NULL for pre-v8 events)
+            hlc,    // preserved across rebuild (backfilled for pre-v9 events)
         });
     }
     Ok(events)
 }
 
 pub fn apply_events(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
-    let tx = conn.unchecked_transaction()?;
-    for event in events {
-        apply_event(&tx, event)?;
-    }
-    tx.commit()?;
-    Ok(())
+    with_write_txn(conn, |c| {
+        for event in events {
+            apply_event(c, event)?;
+        }
+        Ok(())
+    })
 }
 
 fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
@@ -125,6 +196,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
         DELETE FROM memories_fts;
         DELETE FROM memory_citations;
         DELETE FROM memory_conflicts;
+        DELETE FROM sync_conflicts;
         DELETE FROM memory_edges;
         DELETE FROM work_episodes;
         ",
@@ -384,9 +456,9 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()
     conn.execute(
         "
         INSERT OR IGNORE INTO events (
-            event_id, run_id, ts, kind, schema_version, payload_json
+            event_id, run_id, ts, kind, schema_version, payload_json, origin, hlc
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ",
         params![
             event.event_id.to_string(),
@@ -394,7 +466,9 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> KimetsuResult<()
             ts_text(event)?,
             event.kind,
             event.schema_version,
-            payload
+            payload,
+            event.origin,
+            event.hlc,
         ],
     )?;
     Ok(())
@@ -869,7 +943,40 @@ fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
-    // 1. Stamp superseded_by on the member.
+    // Slice B: detect a concurrent-supersede conflict. If this member is already
+    // superseded by a DIFFERENT survivor, two edits (typically from different
+    // brains' consolidations) disagree. HLC-order replay still picks a
+    // deterministic winner (the supersede applied last in HLC order — see below),
+    // so brains converge; we record the collision for human review. Replay-safe:
+    // sync_conflicts is a projection cleared by reset_projection and the pair is
+    // canonicalized + INSERT OR IGNORE, so it records once.
+    let prior_survivor: Option<String> = conn
+        .query_row(
+            "SELECT superseded_by FROM memories WHERE memory_id = ?1",
+            params![memory_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(prev) = prior_survivor {
+        if prev != survivor_id {
+            let (a, b) = if prev.as_str() < survivor_id {
+                (prev.as_str(), survivor_id)
+            } else {
+                (survivor_id, prev.as_str())
+            };
+            let detected_at = ts_text(event)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_conflicts
+                     (member_id, survivor_a, survivor_b, detected_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![memory_id, a, b, detected_at],
+            )?;
+        }
+    }
+
+    // 1. Stamp superseded_by on the member (last supersede in HLC replay order
+    //    wins → deterministic survivor on every brain).
     conn.execute(
         "UPDATE memories SET superseded_by = ?2 WHERE memory_id = ?1",
         params![memory_id, survivor_id],
@@ -1153,7 +1260,7 @@ mod tests {
     use rusqlite::{Connection, params};
     use serde_json::json;
 
-    use super::{apply_events, upcast_event};
+    use super::{apply_events, rebuild_in_place, upcast_event};
     use crate::schema;
 
     fn make_conn() -> Connection {
@@ -1164,6 +1271,145 @@ mod tests {
 
     fn make_event(run_id: RunId, kind: &str, payload: serde_json::Value) -> Event {
         Event::new(run_id, kind, payload)
+    }
+
+    /// The nil-ULID sentinel run id: a STANDALONE `memory.cited` (this run id)
+    /// applies a real outcome delta (+use_count) via `apply_cited_outcome`.
+    fn sentinel_run() -> RunId {
+        RunId(ulid::Ulid::nil())
+    }
+
+    // ------------------------------------------------------------------
+    // v3.0 #3: concurrent writers to ONE on-disk brain.db must not lose
+    // updates. Independent Connections behave like independent processes for
+    // SQLite locking, so this exercises the IMMEDIATE-transaction + busy-retry
+    // write path under real contention.
+    // ------------------------------------------------------------------
+    #[test]
+    fn concurrent_cites_lose_no_updates() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let db_path =
+            std::env::temp_dir().join(format!("kimetsu-concurrency-{}-{n}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+
+        // Seed one accepted memory (use_count starts at 0).
+        let mem_id = "mem-concurrency";
+        {
+            let conn = Connection::open(&db_path).expect("open seed");
+            schema::initialize(&conn).expect("init seed");
+            let accepted = Event::new(
+                sentinel_run(),
+                "memory.accepted",
+                json!({
+                    "memory_id": mem_id,
+                    "text": "hammer me",
+                    "scope": "global_user",
+                    "kind": "fact"
+                }),
+            );
+            apply_events(&conn, std::slice::from_ref(&accepted)).expect("seed accepted");
+        }
+
+        const THREADS: usize = 6;
+        const CITES_PER_THREAD: usize = 25;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let path = Arc::new(db_path.clone());
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let b = Arc::clone(&barrier);
+            let p = Arc::clone(&path);
+            handles.push(std::thread::spawn(move || {
+                // Each thread = its own connection (≈ its own process).
+                let conn = Connection::open(&*p).expect("open writer");
+                schema::initialize(&conn).expect("init writer");
+                b.wait(); // maximize contention
+                for _ in 0..CITES_PER_THREAD {
+                    let cited = Event::new(
+                        sentinel_run(),
+                        "memory.cited",
+                        json!({ "memory_id": mem_id, "turn": 0 }),
+                    );
+                    // Must not error under contention (busy-retry + IMMEDIATE).
+                    apply_events(&conn, std::slice::from_ref(&cited))
+                        .expect("concurrent cite must succeed");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let expected = (THREADS * CITES_PER_THREAD) as i64;
+
+        let conn = Connection::open(&db_path).expect("open verify");
+        schema::initialize(&conn).expect("init verify");
+
+        // No lost increments: every concurrent cite landed.
+        let use_count: i64 = conn
+            .query_row(
+                "SELECT use_count FROM memories WHERE memory_id = ?1",
+                params![mem_id],
+                |r| r.get(0),
+            )
+            .expect("read use_count");
+        assert_eq!(
+            use_count, expected,
+            "lost updates under concurrency: got {use_count}, expected {expected}"
+        );
+
+        // All events durably appended (1 accepted + N*M cited).
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .expect("count events");
+        assert_eq!(event_count, expected + 1, "missing durable events");
+
+        // Rebuild is deterministic: replay reproduces the same use_count.
+        rebuild_in_place(&conn).expect("rebuild");
+        let after: i64 = conn
+            .query_row(
+                "SELECT use_count FROM memories WHERE memory_id = ?1",
+                params![mem_id],
+                |r| r.get(0),
+            )
+            .expect("read use_count after rebuild");
+        assert_eq!(after, expected, "rebuild changed the projected use_count");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&db_path);
+        // WAL sidecars.
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn event_carries_and_roundtrips_origin() {
+        use super::{insert_event, read_events_ordered};
+
+        let conn = make_conn();
+        kimetsu_core::event::set_process_origin("test-machine/unit");
+
+        let ev = Event::new(
+            sentinel_run(),
+            "memory.accepted",
+            json!({
+                "memory_id": "m-origin",
+                "text": "with origin",
+                "scope": "global_user",
+                "kind": "fact"
+            }),
+        );
+        // process_origin() is a OnceLock — first setter wins; assert the event
+        // carries SOME origin and that it round-trips through the events table.
+        let stamped = ev.origin.clone();
+        insert_event(&conn, &ev).expect("insert");
+        let read_back = read_events_ordered(&conn).expect("read");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].origin, stamped, "origin must round-trip");
     }
 
     // ------------------------------------------------------------------

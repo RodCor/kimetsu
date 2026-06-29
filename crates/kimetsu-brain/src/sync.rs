@@ -97,6 +97,16 @@ pub struct SyncEvent {
     pub kind: String,
     pub schema_version: u32,
     pub payload: serde_json::Value,
+    /// v3.0 #3: who/where wrote this event (`<machine_id>/<agent>`). Carried so a
+    /// replicated/team brain can attribute each event. `#[serde(default)]` keeps
+    /// pre-v8 sync batches (no `origin`) importable.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// v3.0 #3 Slice B: the event's HLC (canonical string) for convergent
+    /// total-order replay. `#[serde(default)]` keeps pre-v9 batches importable
+    /// (the importer synthesizes a local HLC for those).
+    #[serde(default)]
+    pub hlc: Option<String>,
 }
 
 impl From<&Event> for SyncEvent {
@@ -111,6 +121,8 @@ impl From<&Event> for SyncEvent {
             kind: e.kind.clone(),
             schema_version: e.schema_version,
             payload,
+            origin: e.origin.clone(),
+            hlc: e.hlc.clone(),
         }
     }
 }
@@ -127,6 +139,18 @@ impl TryFrom<SyncEvent> for Event {
             Ulid::from_string(&s.run_id)
                 .map_err(|e| format!("invalid run_id {:?}: {e}", s.run_id))?,
         );
+        // Preserve the REMOTE HLC; advance the local clock past it so subsequent
+        // LOCAL events sort after everything imported (causality). A pre-v9 peer
+        // sends no HLC → synthesize a current local one so the event still sorts.
+        let hlc = match s.hlc {
+            Some(h) => {
+                if let Some(parsed) = kimetsu_core::clock::Hlc::parse(&h) {
+                    kimetsu_core::clock::observe(&parsed);
+                }
+                Some(h)
+            }
+            None => Some(kimetsu_core::clock::now().to_canonical()),
+        };
         Ok(Event {
             event_id,
             run_id,
@@ -135,6 +159,9 @@ impl TryFrom<SyncEvent> for Event {
             kind: s.kind,
             schema_version: s.schema_version,
             payload: s.payload,
+            // Preserve the REMOTE origin — do NOT stamp the local process origin.
+            origin: s.origin,
+            hlc,
         })
     }
 }
@@ -234,7 +261,7 @@ pub fn export_events(
 /// Read all (rowid, Event) pairs from the `events` table with rowid > `after`.
 fn read_durable_events_after(conn: &Connection, after: i64) -> KimetsuResult<Vec<(i64, Event)>> {
     let mut stmt = conn.prepare(
-        "SELECT rowid, event_id, run_id, ts, kind, schema_version, payload_json
+        "SELECT rowid, event_id, run_id, ts, kind, schema_version, payload_json, origin, hlc
          FROM events
          WHERE rowid > ?1
          ORDER BY rowid",
@@ -247,6 +274,8 @@ fn read_durable_events_after(conn: &Connection, after: i64) -> KimetsuResult<Vec
         let kind: String = row.get(4)?;
         let schema_version: u32 = row.get(5)?;
         let payload_json: String = row.get(6)?;
+        let origin: Option<String> = row.get(7)?;
+        let hlc: Option<String> = row.get(8)?;
         Ok((
             rowid,
             event_id_str,
@@ -255,12 +284,24 @@ fn read_durable_events_after(conn: &Connection, after: i64) -> KimetsuResult<Vec
             kind,
             schema_version,
             payload_json,
+            origin,
+            hlc,
         ))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (rowid, event_id_str, run_id_str, ts_str, kind, schema_version, payload_json) = row?;
+        let (
+            rowid,
+            event_id_str,
+            run_id_str,
+            ts_str,
+            kind,
+            schema_version,
+            payload_json,
+            origin,
+            hlc,
+        ) = row?;
         let event_id = EventId(
             Ulid::from_string(&event_id_str)
                 .map_err(|e| format!("invalid event_id {event_id_str:?}: {e}"))?,
@@ -282,6 +323,8 @@ fn read_durable_events_after(conn: &Connection, after: i64) -> KimetsuResult<Vec
                 kind,
                 schema_version,
                 payload,
+                origin,
+                hlc,
             },
         ));
     }
@@ -362,6 +405,14 @@ pub fn import_events(
         summary.applied += 1;
     }
     Ok(summary)
+}
+
+/// Slice B: count unresolved concurrent-supersede conflicts surfaced by team
+/// sync (a member superseded to two different survivors). Deterministic across
+/// brains; shown by `kimetsu brain sync --status`.
+pub fn sync_conflict_count(conn: &Connection) -> KimetsuResult<i64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM sync_conflicts", [], |r| r.get(0))?;
+    Ok(n)
 }
 
 /// Read a JSONL batch file and import it.
@@ -604,6 +655,14 @@ pub fn sync_dir(
         }
     }
 
+    // Slice B: total-order replay. After importing peer events (which were
+    // applied incrementally in arrival order), re-project the merged log in HLC
+    // order so this brain converges to the SAME state every peer reaches,
+    // independent of import order. Skipped when nothing was pulled.
+    if !dry_run && total_applied > 0 {
+        projector::rebuild_in_place(conn)?;
+    }
+
     Ok(SyncReport {
         pushed: push_summary.exported,
         pulled_applied: total_applied,
@@ -803,6 +862,120 @@ mod tests {
         )
         .expect("seed events");
         (run_id, mem_id_a, mem_id_b)
+    }
+
+    // Slice B headline: two brains that exchange the same events CONVERGE to an
+    // identical projection regardless of the order edits were made/imported —
+    // including the one genuinely-divergent op (memory.superseded), which an HLC
+    // replay resolves last-writer-wins, plus a surfaced conflict.
+    #[test]
+    fn two_brains_converge_after_exchange() {
+        use kimetsu_core::event::Event;
+        let a = make_conn();
+        let b = make_conn();
+        let run = RunId(ulid::Ulid::nil()); // sentinel → standalone cite outcome
+        let (m1, s1, s2) = ("mem-m1", "mem-s1", "mem-s2");
+
+        // Shared base: identical accepted events on both brains.
+        let base = vec![
+            Event::new(
+                run,
+                "memory.accepted",
+                json!({"memory_id": m1, "text":"alpha rule", "scope":"project","kind":"fact"}),
+            ),
+            Event::new(
+                run,
+                "memory.accepted",
+                json!({"memory_id": s1, "text":"survivor one", "scope":"project","kind":"fact"}),
+            ),
+            Event::new(
+                run,
+                "memory.accepted",
+                json!({"memory_id": s2, "text":"survivor two", "scope":"project","kind":"fact"}),
+            ),
+        ];
+        apply_events(&a, &base).unwrap();
+        apply_events(&b, &base).unwrap();
+
+        // Divergent edits, created in sequence so B's supersede has a LATER HLC.
+        let a_mut = vec![
+            Event::new(run, "memory.cited", json!({"memory_id": m1, "turn": 0})),
+            Event::new(
+                run,
+                "memory.superseded",
+                json!({"memory_id": m1, "survivor_id": s1}),
+            ),
+        ];
+        apply_events(&a, &a_mut).unwrap();
+        let b_mut = vec![
+            Event::new(run, "memory.cited", json!({"memory_id": m1, "turn": 0})),
+            Event::new(
+                run,
+                "memory.superseded",
+                json!({"memory_id": m1, "survivor_id": s2}),
+            ),
+        ];
+        apply_events(&b, &b_mut).unwrap();
+
+        // Cross-exchange the full logs, then converge (rebuild in HLC order).
+        let ax = export_events(&a, 0, None, false).unwrap().1.unwrap();
+        let bx = export_events(&b, 0, None, false).unwrap().1.unwrap();
+        import_events(&b, &ax, false).unwrap();
+        import_events(&a, &bx, false).unwrap();
+        crate::projector::rebuild_in_place(&a).unwrap();
+        crate::projector::rebuild_in_place(&b).unwrap();
+
+        // superseded_by converges to the LATER-HLC survivor (s2) on BOTH brains.
+        let superseded = |c: &Connection| -> Option<String> {
+            c.query_row(
+                "SELECT superseded_by FROM memories WHERE memory_id = ?1",
+                [m1],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            superseded(&a),
+            superseded(&b),
+            "superseded_by must converge"
+        );
+        assert_eq!(
+            superseded(&a),
+            Some(s2.to_string()),
+            "later-HLC supersede wins deterministically"
+        );
+
+        // Additive field (use_count) converges; both cites counted.
+        let use_count = |c: &Connection| -> i64 {
+            c.query_row(
+                "SELECT use_count FROM memories WHERE memory_id = ?1",
+                [m1],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(use_count(&a), use_count(&b), "use_count must converge");
+        assert_eq!(use_count(&a), 2, "both brains' cites counted");
+
+        // Even order-sensitive confidence converges (same HLC replay order).
+        let confidence = |c: &Connection| -> f64 {
+            c.query_row(
+                "SELECT confidence FROM memories WHERE memory_id = ?1",
+                [m1],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            (confidence(&a) - confidence(&b)).abs() < 1e-9,
+            "confidence must converge: {} vs {}",
+            confidence(&a),
+            confidence(&b)
+        );
+
+        // The genuine concurrent supersede is surfaced (once) on both brains.
+        assert_eq!(sync_conflict_count(&a).unwrap(), 1);
+        assert_eq!(sync_conflict_count(&b).unwrap(), 1);
     }
 
     // S3-1: Export excludes telemetry + work.episode; only memory.* kinds appear.

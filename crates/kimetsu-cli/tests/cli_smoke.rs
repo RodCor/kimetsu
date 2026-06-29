@@ -295,3 +295,107 @@ fn kimetsu_unknown_subcommand_exits_nonzero_with_helpful_message() {
         "stderr should not be empty on bad subcommand"
     );
 }
+
+/// Read the `(memory_id, use_count)` of the first memory from
+/// `brain memory list --json`.
+fn first_memory(bin: &str, root: &std::path::Path) -> Option<(String, u64)> {
+    let out = Command::new(bin)
+        .args(["brain", "memory", "list", "--json"])
+        .current_dir(root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn memory list");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let arr = v
+        .as_array()
+        .or_else(|| v.get("memories").and_then(|m| m.as_array()))?;
+    let first = arr.first()?;
+    let id = first.get("memory_id")?.as_str()?.to_string();
+    let uc = first.get("use_count").and_then(|u| u.as_u64()).unwrap_or(0);
+    Some((id, uc))
+}
+
+/// v3.0 #3 (fleet write-safety): MULTI-PROCESS concurrency proof. Spawns several
+/// `kimetsu` processes that hammer `brain cite` on the same memory in the same
+/// brain.db at once, then asserts no citation was lost (final use_count equals
+/// the total) and the projection rebuilds cleanly. `#[ignore]` because it spawns
+/// dozens of processes (slow); run explicitly with
+/// `cargo test --test cli_smoke -- --ignored concurrent_processes`.
+#[test]
+#[ignore = "spawns many processes; run on demand"]
+fn concurrent_processes_lose_no_cites() {
+    let root = temp_project_dir("fleet-concurrency");
+    let bin = kimetsu_bin();
+
+    // Seed one project-scoped memory via add-batch (stdin).
+    let mut child = Command::new(bin)
+        .args(["brain", "memory", "add-batch", "-"])
+        .current_dir(&root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn add-batch");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"text":"fleet concurrency target memory","scope":"project","kind":"fact"}"#)
+        .expect("write batch");
+    assert!(
+        child.wait().expect("wait add-batch").success(),
+        "add-batch failed"
+    );
+
+    let (mem_id, _) = first_memory(bin, &root).expect("seeded memory id");
+
+    const PROCS: usize = 4;
+    const CITES_PER_PROC: usize = 8;
+    let root = std::sync::Arc::new(root);
+    let mem_id = std::sync::Arc::new(mem_id);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(PROCS));
+
+    let mut handles = Vec::new();
+    for _ in 0..PROCS {
+        let root = std::sync::Arc::clone(&root);
+        let mem_id = std::sync::Arc::clone(&mem_id);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..CITES_PER_PROC {
+                let ok = Command::new(kimetsu_bin())
+                    .args(["brain", "cite", "--memory-id", &mem_id])
+                    .current_dir(&*root)
+                    .env("KIMETSU_USER_BRAIN", "0")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("spawn cite")
+                    .success();
+                assert!(ok, "concurrent `brain cite` process must succeed");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("join");
+    }
+
+    let expected = (PROCS * CITES_PER_PROC) as u64;
+    let (_, use_count) = first_memory(bin, &root).expect("memory after cites");
+    assert_eq!(
+        use_count, expected,
+        "multi-process lost updates: got {use_count}, expected {expected}"
+    );
+
+    // Rebuild is stable.
+    let rebuilt = Command::new(bin)
+        .args(["brain", "rebuild"])
+        .current_dir(&*root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .status()
+        .expect("spawn rebuild")
+        .success();
+    assert!(rebuilt, "rebuild should succeed");
+    let (_, after) = first_memory(bin, &root).expect("memory after rebuild");
+    assert_eq!(after, expected, "rebuild changed the use_count");
+}

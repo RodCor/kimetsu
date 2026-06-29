@@ -95,7 +95,9 @@ fn create_baseline(conn: &Connection) -> KimetsuResult<()> {
             ts TEXT NOT NULL,
             kind TEXT NOT NULL,
             schema_version INTEGER NOT NULL,
-            payload_json TEXT NOT NULL
+            payload_json TEXT NOT NULL,
+            origin TEXT,
+            hlc TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_events_run_ts ON events (run_id, ts);
@@ -312,6 +314,19 @@ pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
             ON memory_conflicts (resolved_at, detected_at);
         CREATE INDEX IF NOT EXISTS idx_conflicts_new_memory
             ON memory_conflicts (new_memory_id);
+
+        -- v3.0 #3 Slice B: concurrent-supersede conflicts surfaced during team
+        -- sync (a member superseded to two DIFFERENT survivors by concurrent
+        -- edits). HLC replay still picks a deterministic winner; this records the
+        -- collision for human review. A PROJECTION — cleared + repopulated by
+        -- rebuild. survivor_a < survivor_b (canonicalized) so it records once.
+        CREATE TABLE IF NOT EXISTS sync_conflicts (
+            member_id    TEXT NOT NULL,
+            survivor_a   TEXT NOT NULL,
+            survivor_b   TEXT NOT NULL,
+            detected_at  TEXT NOT NULL,
+            PRIMARY KEY (member_id, survivor_a, survivor_b)
+        );
         ",
     )?;
     ensure_memories_fts_shape(conn)?;
@@ -473,6 +488,32 @@ pub(crate) fn migrate_v6_to_v7(conn: &Connection) -> KimetsuResult<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_memories_valid_to
              ON memories (valid_to);",
+    )?;
+    Ok(())
+}
+
+/// v3.0 #3 (fleet write-safety): add a per-event `origin` column so every event
+/// records the device + agent that wrote it (`<machine_id>/<agent>`). Nullable;
+/// pre-v8 events read back as `origin = NULL` ("unknown"). Rebuild-safe and
+/// sync-ready (the origin is replicated verbatim).
+pub(crate) fn migrate_v7_to_v8(conn: &Connection) -> KimetsuResult<()> {
+    add_column_if_missing(conn, "events", "origin TEXT")?;
+    Ok(())
+}
+
+/// v3.0 #3 Slice B (team sync): add a per-event `hlc` column (Hybrid Logical
+/// Clock, canonical string) for globally-deterministic total-order replay.
+/// Existing rows are backfilled as `0000000000000.{rowid:010}.local` — `wall = 0`
+/// so all pre-v9 events sort BEFORE any new HLC event, ordered among themselves by
+/// `rowid` (their original insertion/causal order). This preserves a never-synced
+/// brain's projection exactly while giving every event a sortable HLC. Width (10)
+/// matches `Hlc::to_canonical` so backfilled and live HLCs compare consistently.
+pub(crate) fn migrate_v8_to_v9(conn: &Connection) -> KimetsuResult<()> {
+    add_column_if_missing(conn, "events", "hlc TEXT")?;
+    conn.execute_batch(
+        "UPDATE events
+         SET hlc = printf('%013d.%010d.local', 0, rowid)
+         WHERE hlc IS NULL;",
     )?;
     Ok(())
 }
