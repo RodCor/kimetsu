@@ -305,6 +305,41 @@ pub fn distill_lessons(transcript_view: &str, provider: &mut dyn ModelProvider) 
     }
 }
 
+/// One-shot system+user completion against the cheap model, returning the model's
+/// trimmed text (None on any error or empty output). A thin reusable wrapper over
+/// the `ModelRequest` plumbing for callers that just need a single text reply
+/// (e.g. #2 knowledge-graph enrichment). `max_output_tokens` bounds the reply.
+pub fn complete_simple(
+    system: &str,
+    user: &str,
+    max_output_tokens: u32,
+    provider: &mut dyn ModelProvider,
+) -> Option<String> {
+    let request = ModelRequest {
+        messages: vec![
+            ModelMessage {
+                role: MessageRole::System,
+                content: vec![MessageContent::Text {
+                    text: system.to_string(),
+                }],
+            },
+            ModelMessage::user_text(user),
+        ],
+        tools: Vec::new(),
+        tool_choice: ToolChoice::None,
+        max_output_tokens,
+        temperature: 0.1,
+        metadata: serde_json::Value::Null,
+    };
+    match provider.complete(request) {
+        Ok(response) => {
+            let text = response.text.as_deref().unwrap_or("").trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        Err(_) => None,
+    }
+}
+
 /// System prompt for HyDE (Hypothetical Document Embeddings) query expansion.
 const HYDE_SYSTEM: &str = "You help a code-memory search system. Given a developer's \
 question, write a brief, specific hypothetical passage (2 to 4 sentences) that would \

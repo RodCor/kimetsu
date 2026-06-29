@@ -17,6 +17,8 @@ pub mod embeddings;
 /// Flagship 1 / Story 1.3: episodic work-resume capture, storage, and surface.
 pub mod episode;
 pub mod eval;
+/// #2 knowledge graph: rule-based relation-edge extraction for `memory_edges`.
+pub mod graph;
 pub mod ingest;
 /// F3 Flagship 3: Lifecycle & forgetting — Stories 3.1–3.4.
 pub mod lifecycle;

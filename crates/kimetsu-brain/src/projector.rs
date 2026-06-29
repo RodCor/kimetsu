@@ -174,6 +174,11 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // Story 3.1: near-duplicate merge — stamp superseded_by on merged members,
         // remove their FTS rows, and drop them from the ANN index.
         "memory.superseded" => apply_memory_superseded(conn, event),
+        // #2 knowledge graph: a typed relation edge between two memories, written
+        // by `kimetsu brain graph build`. Projected into `memory_edges` so the
+        // graph-lite / petgraph retrieval backends can traverse it. Rebuild-safe:
+        // the edge is re-derived by replaying this event.
+        "memory.edge" => apply_memory_edge(conn, event),
         // Flagship 1 / Story 1.4: temporal validity — stamp valid_from / valid_to.
         "memory.temporal" => apply_memory_temporal(conn, event),
         // Flagship 1 / Story 1.3: episodic work-resume.
@@ -990,6 +995,68 @@ pub fn mark_memory_temporal(
     apply_event(conn, &event)
 }
 
+/// #2 knowledge graph: project a `memory.edge` event into `memory_edges`.
+///
+/// Payload fields:
+///   `src_id`    — source memory id.
+///   `dst_id`    — destination memory id.
+///   `edge_type` — relation kind (e.g. `"relates_to"`, `"refines"`).
+///
+/// A missing/malformed payload no-ops (best-effort, matching the other memory
+/// projectors). The `OR IGNORE` insert makes replay idempotent.
+fn apply_memory_edge(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(src_id) = event.payload.get("src_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some(dst_id) = event.payload.get("dst_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some(edge_type) = event.payload.get("edge_type").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    // Never self-loop.
+    if src_id == dst_id {
+        return Ok(());
+    }
+    let edge_ts = ts_text(event)?;
+    insert_memory_edge(conn, src_id, dst_id, edge_type, &edge_ts)
+}
+
+/// #2 knowledge graph: programmatic API for writing a batch of typed relation
+/// edges. Each `(src_id, dst_id, edge_type)` is emitted as a `memory.edge` event
+/// (so the action is rebuild-safe — replay reconstructs the edges) and projected
+/// into `memory_edges` in a single transaction via `apply_events`.
+///
+/// Self-loops (`src == dst`) are skipped. Returns the number of edges written.
+/// Used by `kimetsu brain graph build`.
+pub fn add_memory_edges(
+    conn: &Connection,
+    edges: &[(String, String, String)],
+) -> KimetsuResult<usize> {
+    use kimetsu_core::ids::RunId;
+    let run_id = RunId::new();
+    let mut events = Vec::with_capacity(edges.len());
+    let mut written = 0usize;
+    for (src_id, dst_id, edge_type) in edges {
+        if src_id == dst_id {
+            continue;
+        }
+        let payload = serde_json::json!({
+            "src_id": src_id,
+            "dst_id": dst_id,
+            "edge_type": edge_type,
+        });
+        events.push(kimetsu_core::event::Event::new(
+            run_id,
+            "memory.edge",
+            payload,
+        ));
+        written += 1;
+    }
+    apply_events(conn, &events)?;
+    Ok(written)
+}
+
 /// S5.2: insert a typed edge into `memory_edges`.
 ///
 /// This is the **single canonical path** for writing to `memory_edges`.
@@ -1083,7 +1150,7 @@ mod tests {
 
     use kimetsu_core::event::Event;
     use kimetsu_core::ids::RunId;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use serde_json::json;
 
     use super::{apply_events, upcast_event};
@@ -1460,6 +1527,68 @@ mod tests {
             citations_after, 1,
             "memory_citations must be repopulated by rebuild_in_place"
         );
+    }
+
+    #[test]
+    fn add_memory_edges_writes_and_survives_rebuild() {
+        use super::{add_memory_edges, rebuild_in_place};
+
+        let conn = make_conn();
+        let run_id = RunId::new();
+        let m1 = "mem-edge-a";
+        let m2 = "mem-edge-b";
+
+        let events = vec![
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({"memory_id": m1, "text": "alpha", "scope": "global_user", "kind": "fact"}),
+            ),
+            make_event(
+                run_id,
+                "memory.accepted",
+                json!({"memory_id": m2, "text": "beta", "scope": "global_user", "kind": "fact"}),
+            ),
+        ];
+        apply_events(&conn, &events).expect("apply_events");
+
+        // Self-loop is skipped; a real edge is written.
+        let written = add_memory_edges(
+            &conn,
+            &[
+                (m1.to_string(), m1.to_string(), "relates_to".to_string()),
+                (m1.to_string(), m2.to_string(), "relates_to".to_string()),
+            ],
+        )
+        .expect("add_memory_edges");
+        assert_eq!(
+            written, 1,
+            "self-loop must be skipped, one real edge written"
+        );
+
+        let edge_count = |c: &Connection| -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM memory_edges WHERE src_id=?1 AND dst_id=?2 AND edge_type='relates_to'",
+                params![m1, m2],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(edge_count(&conn), 1, "edge present after write");
+
+        // Rebuild from the durable log: the edge is re-derived (replayed event).
+        let total_edges_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0))
+            .unwrap();
+        rebuild_in_place(&conn).expect("rebuild_in_place");
+        let total_edges_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            total_edges_before, total_edges_after,
+            "rebuild must reproduce exactly the same edge set"
+        );
+        assert_eq!(edge_count(&conn), 1, "edge survives rebuild_in_place");
     }
 
     // ------------------------------------------------------------------

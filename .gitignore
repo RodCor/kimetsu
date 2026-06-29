@@ -41,6 +41,8 @@
 # fastembed model cache created by tests/runs
 .fastembed_cache/
 **/.fastembed_cache/
+# test-isolation TMP dir (TMP/TEMP/GIT_CEILING override target)
+/tmp-tests/
 .claude/
 .codex/
 .mcp.json
