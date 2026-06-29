@@ -1033,7 +1033,7 @@ impl Default for RunSection {
 /// unique within the sync directory.
 ///
 /// `#[serde(default)]` keeps every pre-S3 project.toml loading cleanly.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncSection {
     /// Absolute (or home-relative) path to the shared sync directory.
     /// Each machine writes its batches under `<dir>/<machine_id>/`.
@@ -1044,6 +1044,25 @@ pub struct SyncSection {
     /// set; the CLI generates one on first use).
     #[serde(default)]
     pub machine_id: String,
+    /// v3.0 #3 Slice B: when `dir` is configured, automatically run a full sync
+    /// (push + pull + converge) at session end. Defaults to `true` — set
+    /// `auto = false` to keep sync manual (`kimetsu brain sync`).
+    #[serde(default = "default_sync_auto")]
+    pub auto: bool,
+}
+
+fn default_sync_auto() -> bool {
+    true
+}
+
+impl Default for SyncSection {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            machine_id: String::new(),
+            auto: default_sync_auto(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

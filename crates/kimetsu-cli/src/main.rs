@@ -2003,6 +2003,17 @@ fn install_tracing() {
 fn run() -> KimetsuResult<()> {
     let cli = Cli::parse();
 
+    // v3.0 #3 (fleet write-safety): stamp a write origin `<machine>/<agent>` on
+    // every event this process appends, so a shared/replicated brain can
+    // attribute writes to the device + agent that made them. The machine part is
+    // also the HLC node id (Slice B), so equal-timestamp events break ties
+    // consistently across brains for convergent total-order replay.
+    if let Some(origin) = resolve_process_origin() {
+        let machine = origin.split('/').next().unwrap_or("local").to_string();
+        kimetsu_core::clock::set_node(machine);
+        kimetsu_core::event::set_process_origin(origin);
+    }
+
     match cli.command {
         Command::Init(args) => init(args),
         Command::Config { command } => config(command),
@@ -4166,6 +4177,10 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
                 .workspace
                 .unwrap_or_else(|| env::current_dir().unwrap_or_default());
             distiller::run_session_end_hook(&workspace);
+            // Slice B: hands-off team memory — auto-sync at session end when a
+            // `[sync] dir` is configured (and `auto` not disabled). Best-effort:
+            // a sync failure must never break session shutdown.
+            auto_sync_at_session_end(&workspace);
             Ok(())
         }
         BrainCommand::SessionStartHook(args) => {
@@ -4746,6 +4761,41 @@ fn brain_backup(args: BrainBackupArgs) -> KimetsuResult<()> {
 
 // ── S3: brain sync ────────────────────────────────────────────────────────────
 
+/// Slice B: best-effort full sync at session end (push + pull + converge) when a
+/// `[sync] dir` is configured and `[sync] auto` is not disabled. Never returns an
+/// error — a sync failure must not break session shutdown.
+fn auto_sync_at_session_end(workspace: &Path) {
+    use kimetsu_brain::sync as brain_sync_mod;
+    use kimetsu_core::paths::ProjectPaths;
+
+    let Ok(paths) = ProjectPaths::discover(workspace) else {
+        return;
+    };
+    let Ok((_paths, config, conn)) = project::load_project(workspace) else {
+        return;
+    };
+    let sync_cfg = &config.sync;
+    let Some(dir) = sync_cfg.dir.as_deref() else {
+        return; // not configured
+    };
+    if !sync_cfg.auto {
+        return; // explicitly disabled
+    }
+    let machine_id = resolve_machine_id(&sync_cfg.machine_id);
+    let cursors_path = paths.kimetsu_dir.join("sync-cursors.json");
+    match brain_sync_mod::sync_dir(&conn, Path::new(dir), &machine_id, &cursors_path, false) {
+        Ok(report) => {
+            if report.pushed > 0 || report.pulled_applied > 0 {
+                eprintln!(
+                    "kimetsu: auto-synced (pushed {}, pulled {})",
+                    report.pushed, report.pulled_applied
+                );
+            }
+        }
+        Err(e) => eprintln!("kimetsu: auto-sync skipped ({e})"),
+    }
+}
+
 /// `kimetsu brain sync [subcommand] [flags]`
 ///
 /// Dispatches to export / import / full-cycle / status based on `args.subcommand`
@@ -4800,6 +4850,11 @@ fn brain_sync(args: SyncArgs) -> KimetsuResult<()> {
                     summary.applied, summary.skipped
                 );
             } else {
+                // Slice B: total-order replay so the projection converges in HLC
+                // order (the import applied events incrementally in file order).
+                if summary.applied > 0 {
+                    kimetsu_brain::projector::rebuild_in_place(&conn)?;
+                }
                 println!(
                     "applied {} events, skipped {}",
                     summary.applied, summary.skipped
@@ -4827,6 +4882,13 @@ fn brain_sync(args: SyncArgs) -> KimetsuResult<()> {
                 );
                 println!("  machine_id: {machine_id}");
                 println!("  local pending (unpushed): {}", status.local_pending);
+                let conflicts = brain_sync_mod::sync_conflict_count(&conn).unwrap_or(0);
+                if conflicts > 0 {
+                    println!(
+                        "  ⚠ supersede conflicts: {conflicts} (concurrent edits chose different \
+                         survivors; review with `kimetsu brain memory conflicts`)"
+                    );
+                }
                 if status.sources.is_empty() {
                     println!("  peers: (none seen yet)");
                 } else {
@@ -4885,6 +4947,25 @@ fn brain_sync(args: SyncArgs) -> KimetsuResult<()> {
 /// otherwise generate a stable ULID-based id.  The generated id is NOT
 /// persisted here — the user should run `kimetsu config set sync.machine_id
 /// <id>` to make it durable.
+/// Resolve this process's event write origin `<machine>/<agent>` from the
+/// environment. Machine: `KIMETSU_SYNC_MACHINE_ID`, else `COMPUTERNAME`/`HOSTNAME`.
+/// Agent: `KIMETSU_AGENT_ID` (hosts/hooks set it), else the invoked subcommand,
+/// else `cli`. Returns `None` when no machine id is resolvable (origin stays
+/// unknown/NULL — best-effort, never fatal).
+fn resolve_process_origin() -> Option<String> {
+    let machine = std::env::var("KIMETSU_SYNC_MACHINE_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))?;
+    let agent = std::env::var("KIMETSU_AGENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::args().nth(1).filter(|s| !s.starts_with('-')))
+        .unwrap_or_else(|| "cli".to_string());
+    Some(format!("{machine}/{agent}"))
+}
+
 fn resolve_machine_id(configured: &str) -> String {
     if !configured.is_empty() {
         return configured.to_string();
