@@ -845,6 +845,21 @@ enum BrainCommand {
     /// project.toml). For inspection and benchmarking the write path. Example:
     ///   kimetsu brain distill session.jsonl --json
     Distill(DistillArgs),
+    /// #2 knowledge graph: build relation edges between memories so the
+    /// graph-lite / petgraph retrieval backends can traverse them (multi-hop).
+    ///
+    /// `graph build` derives deterministic `relates_to` edges from shared
+    /// entities/tags (no model). `--enrich` additionally asks the configured
+    /// cheap model for typed edges (refines / lesson_from / decision_touches);
+    /// note small local models (e.g. qwen2.5:3b) are weak at this. Edges are
+    /// event-sourced and rebuild-safe. Examples:
+    ///   kimetsu brain graph build --dry-run
+    ///   kimetsu brain graph build
+    ///   kimetsu brain graph build --enrich
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
+    },
     /// Flagship 2 / Story 2.3: Reflect related memories into higher-order
     /// principles.
     ///
@@ -1330,6 +1345,35 @@ struct DistillArgs {
     /// Emit the extracted lessons as machine-readable JSON.
     #[arg(long)]
     json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// `kimetsu brain graph <command>` (#2 knowledge graph).
+#[derive(Debug, Subcommand)]
+enum GraphCommand {
+    /// Build relation edges over the workspace brain's active memories.
+    Build(GraphBuildArgs),
+}
+
+/// Args for `kimetsu brain graph build`.
+#[derive(Debug, Args)]
+struct GraphBuildArgs {
+    /// Preview the edges that would be written without persisting anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit a machine-readable JSON summary (for the benchmark harness).
+    #[arg(long)]
+    json: bool,
+    /// Additionally ask the configured cheap model for typed edges
+    /// (refines / lesson_from / decision_touches). Opt-in; small local models
+    /// are weak at this, so it is off by default.
+    #[arg(long)]
+    enrich: bool,
+    /// Cap on rule edges originating from any single memory (0 = module default).
+    #[arg(long, default_value_t = 0)]
+    max_fan_out: usize,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -3660,11 +3704,6 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
             let cwd = env::current_dir()?;
             let paths = kimetsu_core::paths::ProjectPaths::discover(&cwd)?;
 
-            // S4.2: use toml_edit for a surgical, comment-preserving write.
-            // The previous approach serialized through toml::Value which
-            // drops all TOML comments and reformats the file.  toml_edit
-            // parses into a `DocumentMut` that preserves comments, whitespace,
-            // and unknown keys — only the touched leaf changes.
             let disk_text = std::fs::read_to_string(&paths.project_toml).map_err(|e| {
                 format!(
                     "config set: could not read {}: {e}",
@@ -3672,30 +3711,9 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
                 )
             })?;
 
-            // 1. Use the plain toml::Value tree to resolve the existing type
-            //    (for coercion) and to validate the result — both remain cheap.
-            let root_val: toml::Value = toml::from_str(&disk_text)
-                .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
-            let existing = get_toml_path(&root_val, &key).cloned();
-            let typed_value =
-                parse_scalar(&value, existing.as_ref()).map_err(|e| format!("config set: {e}"))?;
+            let (new_text, dropped_to_custom) = config_set_text(&disk_text, &key, &value)?;
 
-            // 2. Parse into toml_edit document (preserves comments/formatting).
-            let mut doc: toml_edit::DocumentMut = disk_text
-                .parse()
-                .map_err(|e| format!("config set: project.toml is invalid TOML (edit): {e}"))?;
-
-            // 3. Navigate/set the leaf surgically in the edit document.
-            set_toml_edit_path(&mut doc, &key, &typed_value)
-                .map_err(|e| format!("config set: {e}"))?;
-
-            // 4. Render and validate through ProjectConfig before writing.
-            let new_text = doc.to_string();
-            project::load_config_from_text(&new_text).map_err(|e| {
-                format!("config set: result is not a valid config — {e}. File NOT written.")
-            })?;
-
-            // 5. Write — only reached when validation passes.
+            // Write — only reached when validation inside config_set_text passes.
             std::fs::write(&paths.project_toml, &new_text).map_err(|e| {
                 format!(
                     "config set: failed to write {}: {e}",
@@ -3704,9 +3722,71 @@ fn config(command: ConfigCommand) -> KimetsuResult<()> {
             })?;
 
             println!("set {key} = {value}");
+            if dropped_to_custom {
+                println!(
+                    "note: retrieval.level set to \"custom\" so this manual value is not \
+                     overridden by a preset at load time."
+                );
+            }
             Ok(())
         }
     }
+}
+
+/// Keys whose values `ProjectConfig::apply_retrieval_level` overwrites when a
+/// non-`custom` retrieval level (`basic`/`flexible`/`deep`/`advanced`) is active.
+/// Setting one of these manually must drop the level to `custom`, otherwise the
+/// explicit value is silently clobbered at load time.
+fn is_level_managed_key(key: &str) -> bool {
+    matches!(key, "embedder.enabled" | "embedder.reranker")
+}
+
+/// Core of `config set` (extracted so the command and its integration test share
+/// one code path). Sets `key = value` in `disk_text` surgically (comments and
+/// formatting preserved via `toml_edit`). When `key` is a retrieval-level-managed
+/// field AND the current level is a managed preset, it ALSO sets
+/// `retrieval.level = "custom"` so the explicit value survives
+/// `apply_retrieval_level` at load. Validates the result through `ProjectConfig`.
+///
+/// Returns `(new_toml_text, dropped_to_custom)`. Pre-levels files (no `[retrieval]`
+/// table → default level `custom`) are never modified beyond the requested key, so
+/// existing behavior is byte-identical.
+fn config_set_text(disk_text: &str, key: &str, value: &str) -> KimetsuResult<(String, bool)> {
+    // Resolve the existing leaf type (for coercion) from a plain value tree.
+    let root_val: toml::Value = toml::from_str(disk_text)
+        .map_err(|e| format!("config set: project.toml is invalid TOML: {e}"))?;
+    let existing = get_toml_path(&root_val, key).cloned();
+    let typed_value =
+        parse_scalar(value, existing.as_ref()).map_err(|e| format!("config set: {e}"))?;
+
+    // Surgical edit on a comment-preserving document.
+    let mut doc: toml_edit::DocumentMut = disk_text
+        .parse()
+        .map_err(|e| format!("config set: project.toml is invalid TOML (edit): {e}"))?;
+    set_toml_edit_path(&mut doc, key, &typed_value).map_err(|e| format!("config set: {e}"))?;
+
+    // Auto-drop to "custom" when overriding a preset-managed field, so the
+    // explicit value is not clobbered by apply_retrieval_level on the next load.
+    let mut dropped_to_custom = false;
+    if is_level_managed_key(key) {
+        let cur_level = root_val
+            .get("retrieval")
+            .and_then(|r| r.get("level"))
+            .and_then(|l| l.as_str())
+            .unwrap_or("custom");
+        if matches!(cur_level, "basic" | "flexible" | "deep" | "advanced") {
+            let custom = toml::Value::String("custom".to_string());
+            set_toml_edit_path(&mut doc, "retrieval.level", &custom)
+                .map_err(|e| format!("config set: {e}"))?;
+            dropped_to_custom = true;
+        }
+    }
+
+    let new_text = doc.to_string();
+    project::load_config_from_text(&new_text).map_err(|e| {
+        format!("config set: result is not a valid config — {e}. File NOT written.")
+    })?;
+    Ok((new_text, dropped_to_custom))
 }
 
 /// Testable seam for `config edit`. Opens the config file at `toml_path`
@@ -4118,6 +4198,7 @@ fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Cite(args) => brain_cite(args),
         BrainCommand::Regret(args) => brain_regret(args),
         BrainCommand::Distill(args) => brain_distill(args),
+        BrainCommand::Graph { command } => brain_graph(command),
         BrainCommand::Ask(args) => brain_ask(args),
         BrainCommand::Skills(args) => brain_skills(args),
         BrainCommand::Sync(args) => brain_sync(args),
@@ -6671,6 +6752,154 @@ fn brain_distill(args: DistillArgs) -> KimetsuResult<()> {
         }
     }
     Ok(())
+}
+
+/// #2 knowledge graph dispatch.
+fn brain_graph(command: GraphCommand) -> KimetsuResult<()> {
+    match command {
+        GraphCommand::Build(args) => brain_graph_build(args),
+    }
+}
+
+/// `kimetsu brain graph build`: derive `relates_to` edges (rule layer) over the
+/// active memories and persist them as rebuild-safe `memory.edge` events. With
+/// `--enrich`, additionally ask the cheap model for typed edges. With `--dry-run`,
+/// preview counts without writing. With `--json`, emit a machine-readable summary.
+fn brain_graph_build(args: GraphBuildArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+
+    // Optional LLM enrichment: typed edges proposed by the cheap model. Best
+    // effort — a missing model or unparseable response yields zero extra edges.
+    let extra_edges: Vec<(String, String, String)> = if args.enrich {
+        match project::active_memory_texts(&workspace) {
+            Ok(mems) => enrich_typed_edges(&workspace, &mems),
+            Err(e) => {
+                eprintln!("kimetsu: graph enrich skipped (could not read memories: {e})");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let summary = project::build_graph(&workspace, &extra_edges, args.max_fan_out, args.dry_run)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    let verb = if summary.dry_run {
+        "would write"
+    } else {
+        "wrote"
+    };
+    println!(
+        "Graph build: {} active memories, {} rule + {} enrichment edges proposed; {} {} edge(s).",
+        summary.active_memories,
+        summary.rule_edges,
+        summary.enrich_edges,
+        verb,
+        if summary.dry_run {
+            summary.by_type.values().sum::<usize>()
+        } else {
+            summary.written
+        }
+    );
+    for (ty, n) in &summary.by_type {
+        println!("  {ty}: {n}");
+    }
+    if summary.dry_run {
+        println!("(dry-run: nothing persisted; re-run without --dry-run to write)");
+    }
+    Ok(())
+}
+
+/// LLM enrichment for the knowledge graph: ask the configured cheap model, for
+/// each active memory, which OTHER memory it most directly refines or derives
+/// from, and with what typed relation. Returns `(src_id, dst_id, edge_type)`
+/// tuples restricted to the reserved typed-edge vocabulary and to ids that exist
+/// in `memories`. Best-effort and bounded: returns an empty vec when no cheap
+/// model is configured. Small local models are weak at this (documented).
+fn enrich_typed_edges(
+    workspace: &Path,
+    memories: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    const ALLOWED: [&str; 3] = ["refines", "lesson_from", "decision_touches"];
+    // Bound the work: enrichment is opt-in and model-bottlenecked.
+    const MAX_MEMORIES: usize = 200;
+
+    let Some(resolved) = distiller::resolve_distiller(workspace) else {
+        eprintln!("kimetsu: --enrich requested but no [cheap_model] configured; rule edges only.");
+        return Vec::new();
+    };
+    let Some(mut provider) = distiller::make_provider_for_resolved(&resolved) else {
+        eprintln!(
+            "kimetsu: --enrich could not construct the cheap-model provider; rule edges only."
+        );
+        return Vec::new();
+    };
+
+    let ids: std::collections::HashSet<&str> = memories.iter().map(|(id, _)| id.as_str()).collect();
+    // A compact catalog the model can reference by id.
+    let catalog: String = memories
+        .iter()
+        .take(MAX_MEMORIES)
+        .map(|(id, text)| {
+            format!(
+                "{id}\t{}",
+                text.replace('\n', " ")
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    const SYSTEM: &str = "You connect software-engineering memories into a knowledge graph. \
+        Given a SOURCE memory and a CATALOG of other memories (id<TAB>text), pick AT MOST ONE \
+        catalog memory the SOURCE most directly relates to, and the relation type. Allowed types: \
+        refines (source narrows/refines target), lesson_from (source is a lesson learned from \
+        target), decision_touches (source is a decision touching target). Reply with ONE line of \
+        strict JSON: {\"dst\":\"<id or empty>\",\"type\":\"<type or empty>\"}. If nothing relates, \
+        reply {\"dst\":\"\",\"type\":\"\"}. Output only the JSON.";
+
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for (id, text) in memories.iter().take(MAX_MEMORIES) {
+        let user = format!(
+            "SOURCE ({id}): {src}\n\nCATALOG:\n{catalog}",
+            id = id,
+            src = text
+                .replace('\n', " ")
+                .chars()
+                .take(240)
+                .collect::<String>(),
+            catalog = catalog,
+        );
+        let Some(reply) = distiller::complete_simple(SYSTEM, &user, 64, provider.as_mut()) else {
+            continue;
+        };
+        let reply = reply.trim();
+        // Extract the first {...} object from the reply.
+        let (Some(s), Some(e)) = (reply.find('{'), reply.rfind('}')) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply[s..=e]) else {
+            continue;
+        };
+        let dst = v.get("dst").and_then(|x| x.as_str()).unwrap_or("").trim();
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("").trim();
+        if dst.is_empty() || ty.is_empty() || dst == id {
+            continue;
+        }
+        if ALLOWED.contains(&ty) && ids.contains(dst) {
+            out.push((id.clone(), dst.to_string(), ty.to_string()));
+        }
+    }
+    out
 }
 
 /// HyDE query expansion: append a hypothetical answer passage (from the cheap
@@ -12027,20 +12256,19 @@ ambient = false
 
             let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
 
-            // --- set embedder.enabled = false via toml_edit (S4.2 path) ---
+            // --- set embedder.enabled = false via the real `config set` core ---
             let disk_text = std::fs::read_to_string(&paths.project_toml).expect("read toml");
-            // Resolve existing type via toml::Value (used for coercion).
-            let root_val: toml::Value = toml::from_str(&disk_text).expect("parse");
-            let existing = get_toml_path(&root_val, "embedder.enabled").cloned();
-            let typed = parse_scalar("false", existing.as_ref()).expect("parse false as bool");
-            // Surgical write preserves comments.
-            let mut doc: toml_edit::DocumentMut = disk_text.parse().expect("parse edit doc");
-            set_toml_edit_path(&mut doc, "embedder.enabled", &typed).expect("set");
-            let new_text = doc.to_string();
-            project::load_config_from_text(&new_text).expect("validate");
+            let (new_text, dropped) =
+                config_set_text(&disk_text, "embedder.enabled", "false").expect("config set");
+            // A freshly-inited project ships level="deep", which manages
+            // embedder.enabled — so setting it must drop the level to "custom".
+            assert!(
+                dropped,
+                "setting a level-managed key under a preset must drop to custom"
+            );
             std::fs::write(&paths.project_toml, &new_text).expect("write");
 
-            // --- verify via load_config ---
+            // --- verify via load_config (apply_retrieval_level must NOT clobber it) ---
             let cfg = project::load_config(&paths).expect("load");
             assert!(
                 !cfg.embedder.enabled,
@@ -12054,6 +12282,40 @@ ambient = false
 
             fs::remove_dir_all(root).ok();
         });
+    }
+
+    #[test]
+    fn config_set_text_drops_to_custom_only_for_managed_keys_under_a_preset() {
+        use kimetsu_core::config::ProjectConfig;
+
+        // Build a complete, valid base config on the "deep" preset.
+        let mut base = ProjectConfig::default_for_project("demo");
+        base.retrieval.level = "deep".to_string();
+        base.embedder.enabled = true;
+        let deep = base.to_toml().expect("serialize deep base");
+
+        // Managed key under a preset → level dropped to custom, value sticks.
+        let (out, dropped) =
+            config_set_text(&deep, "embedder.enabled", "false").expect("set managed");
+        assert!(dropped, "managed key under 'deep' must drop to custom");
+        let cfg = project::load_config_from_text(&out).expect("load");
+        assert!(!cfg.embedder.enabled, "explicit false must survive load");
+        assert_eq!(cfg.retrieval.level, "custom");
+
+        // Non-managed key under a preset → level untouched.
+        let (out2, dropped2) =
+            config_set_text(&deep, "broker.ambient", "false").expect("set non-managed");
+        assert!(!dropped2, "non-managed key must not change the level");
+        let cfg2 = project::load_config_from_text(&out2).expect("load2");
+        assert_eq!(cfg2.retrieval.level, "deep", "level preserved");
+
+        // Managed key already under custom → no drop (the manual escape hatch).
+        let mut custom_cfg = ProjectConfig::default_for_project("demo");
+        custom_cfg.retrieval.level = "custom".to_string();
+        let custom = custom_cfg.to_toml().expect("serialize custom base");
+        let (_out3, dropped3) =
+            config_set_text(&custom, "embedder.reranker", "off").expect("set under custom");
+        assert!(!dropped3, "already custom → no drop");
     }
 
     // ── S4.2: set_toml_edit_path (comment-preservation) ──────────────────────
