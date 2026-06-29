@@ -86,16 +86,34 @@ impl RedactionResult {
 /// least one match is found — for the common case (clean text) the
 /// result borrows nothing and matches is empty.
 pub fn redact_secrets(text: &str) -> RedactionResult {
-    let patterns = patterns();
-    // Collect non-overlapping matches across all patterns. Each
-    // pattern walks the full text; we sort + dedupe by start, then
-    // discard overlapping later matches.
+    merge_and_redact(text, collect_spans(text, patterns()))
+}
+
+/// v3.0 #4 (knowledge packs): scrub credentials AND PII (email / phone / SSN /
+/// credit-card) from a memory before it ships in a shareable pack. A published
+/// pack must never carry secrets or personal data. Fast (regex over the text;
+/// credit-card candidates are Luhn-gated to avoid false positives), no model.
+pub fn scrub_for_export(text: &str) -> RedactionResult {
+    let mut spans = collect_spans(text, patterns());
+    spans.extend(collect_pii_spans(text));
+    merge_and_redact(text, spans)
+}
+
+/// Collect raw `(start, end, kind)` regex matches for `patterns` (no validation
+/// or overlap resolution — that's [`merge_and_redact`]).
+fn collect_spans(text: &str, patterns: &[SecretPattern]) -> Vec<(usize, usize, &'static str)> {
     let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
     for pat in patterns {
         for m in pat.regex.find_iter(text) {
             spans.push((m.start(), m.end(), pat.kind));
         }
     }
+    spans
+}
+
+/// Sort spans, drop overlaps (earliest start wins; longest on a tie), then
+/// rebuild the redacted text + per-match tally. Empty spans → text unchanged.
+fn merge_and_redact(text: &str, mut spans: Vec<(usize, usize, &'static str)>) -> RedactionResult {
     if spans.is_empty() {
         return RedactionResult {
             text: text.to_string(),
@@ -103,8 +121,6 @@ pub fn redact_secrets(text: &str) -> RedactionResult {
         };
     }
     spans.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    // Drop overlaps: keep the first span; skip any subsequent span
-    // whose start < current_end.
     let mut accepted: Vec<(usize, usize, &'static str)> = Vec::new();
     let mut cursor = 0usize;
     for (start, end, kind) in spans {
@@ -115,7 +131,6 @@ pub fn redact_secrets(text: &str) -> RedactionResult {
         cursor = end;
     }
 
-    // Rebuild the redacted text + match list.
     let mut redacted = String::with_capacity(text.len());
     let mut matches: Vec<RedactedMatch> = Vec::with_capacity(accepted.len());
     let mut last = 0usize;
@@ -134,6 +149,84 @@ pub fn redact_secrets(text: &str) -> RedactionResult {
         text: redacted,
         matches,
     }
+}
+
+/// Collect PII spans. `credit_card` candidates are kept only when they have
+/// 13–19 digits AND pass the Luhn checksum, so ordinary long digit runs (ids,
+/// timestamps) aren't scrubbed.
+fn collect_pii_spans(text: &str) -> Vec<(usize, usize, &'static str)> {
+    let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
+    for pat in pii_patterns() {
+        for m in pat.regex.find_iter(text) {
+            if pat.kind == "credit_card" {
+                let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
+                if !(13..=19).contains(&digits.len()) || !luhn_valid(&digits) {
+                    continue;
+                }
+            }
+            spans.push((m.start(), m.end(), pat.kind));
+        }
+    }
+    spans
+}
+
+/// Luhn (mod-10) checksum used to validate credit-card candidates.
+fn luhn_valid(digits: &str) -> bool {
+    if digits.is_empty() {
+        return false;
+    }
+    let mut sum = 0u32;
+    let mut double = false;
+    for c in digits.chars().rev() {
+        let mut d = match c.to_digit(10) {
+            Some(d) => d,
+            None => return false,
+        };
+        if double {
+            d *= 2;
+            if d > 9 {
+                d -= 9;
+            }
+        }
+        sum += d;
+        double = !double;
+    }
+    sum % 10 == 0
+}
+
+/// PII pattern set (kept high-precision to avoid scrubbing legit technical text).
+fn pii_patterns() -> &'static [SecretPattern] {
+    static CELL: OnceLock<Vec<SecretPattern>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        vec![
+            SecretPattern {
+                kind: "email",
+                regex: Regex::new(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b").unwrap(),
+            },
+            SecretPattern {
+                kind: "ssn",
+                // US SSN `123-45-6789` (dashed only — bare 9-digit runs are too
+                // ambiguous to scrub safely).
+                regex: Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
+            },
+            SecretPattern {
+                kind: "phone",
+                // North-American style: optional +country, area code (paren or
+                // bare), then 3-4 with a separator. Requires structure so it
+                // doesn't trip on arbitrary number runs.
+                regex: Regex::new(
+                    r"\b(?:\+?\d{1,3}[ .\-]?)?(?:\(\d{3}\)|\d{3})[ .\-]\d{3}[ .\-]\d{4}\b",
+                )
+                .unwrap(),
+            },
+            SecretPattern {
+                kind: "credit_card",
+                // Candidate 13–19 digit run (spaces/dashes allowed) — Luhn-gated
+                // in `collect_pii_spans`.
+                regex: Regex::new(r"\b\d(?:[ \-]?\d){12,18}\b").unwrap(),
+            },
+        ]
+    })
 }
 
 struct SecretPattern {
@@ -254,6 +347,54 @@ mod tests {
         assert!(!r.was_redacted());
         assert_eq!(r.text, raw);
         assert!(r.summary().is_empty());
+    }
+
+    // v3.0 #4: scrub_for_export adds PII on top of credentials.
+    #[test]
+    fn scrub_for_export_redacts_pii_and_credentials() {
+        let raw = "contact alice@example.com or 415-555-0142; ssn 123-45-6789; \
+                   key sk-ant-AbCdEfGhIjKlMnOpQrStUvWx0123456789";
+        let r = scrub_for_export(raw);
+        let kinds: std::collections::BTreeSet<&str> = r.matches.iter().map(|m| m.kind).collect();
+        assert!(kinds.contains("email"), "{r:?}");
+        assert!(kinds.contains("phone"), "{r:?}");
+        assert!(kinds.contains("ssn"), "{r:?}");
+        assert!(kinds.contains("anthropic_oauth"), "{r:?}");
+        assert!(!r.text.contains("alice@example.com"));
+        assert!(!r.text.contains("123-45-6789"));
+        assert!(!r.text.contains("sk-ant-"));
+    }
+
+    #[test]
+    fn scrub_for_export_luhn_gates_credit_cards() {
+        // 4242 4242 4242 4242 passes Luhn → scrubbed.
+        let good = scrub_for_export("card 4242 4242 4242 4242 on file");
+        assert!(
+            good.matches.iter().any(|m| m.kind == "credit_card"),
+            "valid card must scrub: {good:?}"
+        );
+        // A 16-digit run that FAILS Luhn (e.g. an id/timestamp concat) is kept.
+        let bad = scrub_for_export("trace 1234567890123456 step");
+        assert!(
+            !bad.matches.iter().any(|m| m.kind == "credit_card"),
+            "non-Luhn digit run must NOT scrub: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn scrub_for_export_leaves_technical_text_alone() {
+        // Versions, hashes, ulids, ports — must not trip PII patterns.
+        let raw = "build with cargo 1.79; commit a1b2c3d4; port 8787; ulid 01K8YMJ448514TP6CPQ";
+        let r = scrub_for_export(raw);
+        assert!(!r.was_redacted(), "false positive: {r:?}");
+        assert_eq!(r.text, raw);
+    }
+
+    #[test]
+    fn luhn_check() {
+        assert!(luhn_valid("4242424242424242"));
+        assert!(!luhn_valid("4242424242424241"));
+        assert!(!luhn_valid(""));
     }
 
     #[test]

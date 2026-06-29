@@ -850,11 +850,7 @@ fn add_memory_inner(
             "normalized_text": normalized,
             "confidence": DIRECT_ADD_CONFIDENCE,
             "initial_usefulness": initial_kind_weight,
-            "provenance_snapshot": {
-                "source": "manual_cli",
-                "run_id": run_id.to_string(),
-                "text": text,
-            }
+            "provenance_snapshot": build_provenance(run_id, text),
         }),
     );
 
@@ -3089,6 +3085,55 @@ pub struct MemoryExport {
     pub created_at: Option<String>,
 }
 
+/// v3.0 #4: a shareable brain PACK — a self-describing envelope (manifest +
+/// memories) for distribution via the marketplace. Serialized to JSON then
+/// gzip-compressed by the CLI. A bare `Vec<MemoryExport>` (the pre-pack export
+/// format) also imports, for back-compat — see [`parse_pack_or_array`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Pack {
+    /// Pack format version (currently 1).
+    pub kimetsu_pack: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_at: Option<String>,
+    #[serde(default)]
+    pub memory_count: usize,
+    pub memories: Vec<MemoryExport>,
+}
+
+/// Identity of an installed pack, stamped into each imported memory's provenance
+/// so it can later be listed / updated / uninstalled.
+#[derive(Debug, Clone, Default)]
+pub struct PackRef {
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Parse a pack file body: a [`Pack`] envelope OR a bare `Vec<MemoryExport>`
+/// (back-compat with pre-pack exports). Returns the manifest [`PackRef`] (empty
+/// for a bare array) and the memory entries.
+pub fn parse_pack_or_array(json: &str) -> KimetsuResult<(PackRef, Vec<MemoryExport>)> {
+    // A Pack is a JSON object with `kimetsu_pack` + `memories`; a bare array is
+    // a JSON array. Try the envelope first; fall back to the array.
+    if let Ok(pack) = serde_json::from_str::<Pack>(json) {
+        return Ok((
+            PackRef {
+                name: pack.name,
+                version: pack.version,
+            },
+            pack.memories,
+        ));
+    }
+    let entries: Vec<MemoryExport> = serde_json::from_str(json)
+        .map_err(|e| format!("pack: not a Pack envelope or a memory array: {e}"))?;
+    Ok((PackRef::default(), entries))
+}
+
 /// Strip the trailing `(context: …)` segment from a memory text produced by
 /// the distiller / `brain record` workflow, leaving only the lesson body.
 ///
@@ -3223,7 +3268,7 @@ fn find_trailing_context_paren(s: &str) -> Option<usize> {
     None
 }
 
-/// Summary returned by [`import_memories`].
+/// Summary returned by [`import_memories`] / [`import_pack`].
 #[derive(Debug, Clone, Default)]
 pub struct ImportSummary {
     /// Memories that were actually written (new rows).
@@ -3232,6 +3277,52 @@ pub struct ImportSummary {
     /// (detected by `add_memory`'s normalized-text dedup) or because the
     /// scope/kind was malformed.
     pub deduped: usize,
+    /// v3.0 #4: memories superseded by a `replace`-mode pack install (existing
+    /// active memories in the pack's scope(s), invalidated before the load).
+    pub superseded: usize,
+}
+
+thread_local! {
+    /// v3.0 #4: provenance source stamped onto memories written during a pack
+    /// install (e.g. `{source:"pack", pack_name, pack_version}`). When unset,
+    /// `add_memory` uses its default `manual_cli` provenance. RAII-scoped by
+    /// [`ImportProvenanceScope`] so it never leaks past the import.
+    static IMPORT_PROVENANCE: std::cell::RefCell<Option<serde_json::Value>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct ImportProvenanceScope;
+impl ImportProvenanceScope {
+    fn new(v: serde_json::Value) -> Self {
+        IMPORT_PROVENANCE.with(|c| *c.borrow_mut() = Some(v));
+        ImportProvenanceScope
+    }
+}
+impl Drop for ImportProvenanceScope {
+    fn drop(&mut self) {
+        IMPORT_PROVENANCE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Build a memory's `provenance_snapshot`. Uses the thread-local pack source
+/// (set during a pack install) when present, else the default `manual_cli`.
+fn build_provenance(run_id: RunId, text: &str) -> serde_json::Value {
+    IMPORT_PROVENANCE.with(|c| {
+        if let Some(src) = c.borrow().as_ref() {
+            let mut v = src.clone();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("run_id".into(), serde_json::json!(run_id.to_string()));
+                obj.insert("text".into(), serde_json::json!(text));
+            }
+            v
+        } else {
+            serde_json::json!({
+                "source": "manual_cli",
+                "run_id": run_id.to_string(),
+                "text": text,
+            })
+        }
+    })
 }
 
 /// Export active memories as a vec of portable records.
@@ -3239,13 +3330,35 @@ pub struct ImportSummary {
 /// `scope` and `kind` are optional filters; `None` means "all".
 /// `redact` strips the trailing `(context: …)` segment from each text.
 /// `redact_tags` additionally strips the leading `[tags: …]` prefix.
+/// Aggregate security-scrub findings across an export (no credentials / PII may
+/// ship in a shareable pack). `kinds` maps each redaction kind to its count.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScrubReport {
+    pub total: usize,
+    pub kinds: std::collections::BTreeMap<String, usize>,
+}
+
+impl ScrubReport {
+    pub fn is_clean(&self) -> bool {
+        self.total == 0
+    }
+    /// One-liner like `"scrubbed 4: email×2, anthropic_oauth×1, ssn×1"`.
+    pub fn summary(&self) -> String {
+        if self.total == 0 {
+            return "no credentials or PII found".to_string();
+        }
+        let parts: Vec<String> = self.kinds.iter().map(|(k, n)| format!("{k}×{n}")).collect();
+        format!("scrubbed {}: {}", self.total, parts.join(", "))
+    }
+}
+
 pub fn export_memories(
     start: &Path,
     scope: Option<MemoryScope>,
     kind: Option<MemoryKind>,
     redact: bool,
     redact_tags: bool,
-) -> KimetsuResult<Vec<MemoryExport>> {
+) -> KimetsuResult<(Vec<MemoryExport>, ScrubReport)> {
     // Build the SQL dynamically based on the optional filters, including
     // `created_at` so the JSON record carries the origin timestamp.
     let (sql, params_vec): (&str, Vec<String>) = match (scope.as_ref(), kind.as_ref()) {
@@ -3307,11 +3420,23 @@ pub fn export_memories(
         })
     })?;
 
+    // Security scrub (v3.0 #4): every exported memory passes through the
+    // credential + PII scrubber so a shareable pack can never ship secrets or
+    // personal data. The scrub is on the EXPORT COPY only — the source DB is
+    // untouched. Findings are tallied for the caller to report (and --strict).
     let mut out = Vec::new();
+    let mut report = ScrubReport::default();
     for row in rows {
-        out.push(apply_export_redaction(row?, redact, redact_tags));
+        let mut entry = apply_export_redaction(row?, redact, redact_tags);
+        let scrubbed = crate::redact::scrub_for_export(&entry.text);
+        for m in &scrubbed.matches {
+            *report.kinds.entry(m.kind.to_string()).or_insert(0) += 1;
+            report.total += 1;
+        }
+        entry.text = scrubbed.text;
+        out.push(entry);
     }
-    Ok(out)
+    Ok((out, report))
 }
 
 /// Import a slice of [`MemoryExport`] records into the brain at `start`.
@@ -3405,6 +3530,99 @@ pub fn import_memories(
     }
 
     Ok(summary)
+}
+
+/// v3.0 #4: install a pack's memories. `merge` adds additively (dedup against
+/// existing). `replace` first invalidates active memories in the pack's scope(s)
+/// — REVERSIBLE (events kept; rows marked invalidated) — then loads the pack.
+/// Each installed memory is stamped with the `pack` provenance.
+pub fn import_pack(
+    start: &Path,
+    entries: &[MemoryExport],
+    scope_override: Option<MemoryScope>,
+    replace: bool,
+    pack: Option<&PackRef>,
+) -> KimetsuResult<ImportSummary> {
+    let mut superseded = 0usize;
+    if replace {
+        let scopes = pack_target_scopes(entries, scope_override);
+        let reason = match pack {
+            Some(p) => format!(
+                "replaced_by_pack:{}@{}",
+                p.name.as_deref().unwrap_or("unknown"),
+                p.version.as_deref().unwrap_or("?")
+            ),
+            None => "replaced_by_import".to_string(),
+        };
+        for id in active_memory_ids_in_scopes(start, &scopes)? {
+            invalidate_memory(start, &id, Some(&reason))?;
+            superseded += 1;
+        }
+    }
+
+    // Defensive scrub: never INGEST a credential/PII from a pack, even if the
+    // author bypassed export-time scrubbing. (Export already scrubs; this is
+    // belt-and-suspenders on the receiving side.)
+    let scrubbed: Vec<MemoryExport> = entries
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e.text = crate::redact::scrub_for_export(&e.text).text;
+            e
+        })
+        .collect();
+
+    // Stamp pack provenance on each installed memory for the duration of the load.
+    let _prov = pack.map(|p| {
+        ImportProvenanceScope::new(serde_json::json!({
+            "source": "pack",
+            "pack_name": p.name,
+            "pack_version": p.version,
+        }))
+    });
+    let mut summary = import_memories(start, &scrubbed, scope_override)?;
+    summary.superseded = superseded;
+    Ok(summary)
+}
+
+/// Distinct scopes a pack will write to (override wins; else parsed per entry).
+fn pack_target_scopes(
+    entries: &[MemoryExport],
+    scope_override: Option<MemoryScope>,
+) -> Vec<MemoryScope> {
+    if let Some(ov) = scope_override {
+        return vec![ov];
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in entries {
+        if let Ok(s) = e.scope.parse::<MemoryScope>() {
+            if seen.insert(s.to_string()) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// Active (non-invalidated, non-superseded) memory ids in the given scopes.
+fn active_memory_ids_in_scopes(start: &Path, scopes: &[MemoryScope]) -> KimetsuResult<Vec<String>> {
+    if scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (_p, _c, conn) = load_project_readonly(start)?;
+    let mut ids = Vec::new();
+    for sc in scopes {
+        let mut stmt = conn.prepare(
+            "SELECT memory_id FROM memories
+             WHERE scope = ?1 AND invalidated_at IS NULL AND superseded_by IS NULL",
+        )?;
+        let rows = stmt.query_map(params![sc.to_string()], |r| r.get::<_, String>(0))?;
+        for r in rows {
+            ids.push(r?);
+        }
+    }
+    Ok(ids)
 }
 
 // ── Q8: brain compact ────────────────────────────────────────────────────────
@@ -6000,7 +6218,8 @@ max_total_cost_usd = 250.0
             .expect("add fp");
 
             // Export
-            let exported = export_memories(&root_a, None, None, false, false).expect("export");
+            let (exported, _scrub) =
+                export_memories(&root_a, None, None, false, false).expect("export");
             assert_eq!(exported.len(), 3, "must export all 3 active memories");
 
             // All fields present
@@ -6077,7 +6296,7 @@ max_total_cost_usd = 250.0
             .expect("add repo-fp");
 
             // Filter: project scope + failure_pattern kind
-            let filtered = export_memories(
+            let (filtered, _) = export_memories(
                 &root,
                 Some(MemoryScope::Project),
                 Some(MemoryKind::FailurePattern),
@@ -6094,12 +6313,13 @@ max_total_cost_usd = 250.0
             assert!(filtered.iter().all(|e| e.kind == "failure_pattern"));
 
             // Scope-only filter: all project memories
-            let scope_only = export_memories(&root, Some(MemoryScope::Project), None, false, false)
-                .expect("scope filter");
+            let (scope_only, _) =
+                export_memories(&root, Some(MemoryScope::Project), None, false, false)
+                    .expect("scope filter");
             assert_eq!(scope_only.len(), 3, "3 project-scope memories total");
 
             // Kind-only filter: all failure_patterns (project + repo)
-            let kind_only =
+            let (kind_only, _) =
                 export_memories(&root, None, Some(MemoryKind::FailurePattern), false, false)
                     .expect("kind filter");
             assert_eq!(
@@ -6373,7 +6593,7 @@ max_total_cost_usd = 250.0
             .expect("add memory");
 
             // Export with redact=true.
-            let exported =
+            let (exported, _) =
                 export_memories(&root_a, None, None, true, false).expect("export redacted");
             assert_eq!(exported.len(), 1);
             assert_eq!(
@@ -6397,6 +6617,114 @@ max_total_cost_usd = 250.0
             let mems = list_memories(&root_b).expect("list");
             assert_eq!(mems.len(), 1);
             assert_eq!(mems[0].text, "use --locked for reproducibility");
+
+            fs::remove_dir_all(&root_a).ok();
+            fs::remove_dir_all(&root_b).ok();
+        });
+    }
+
+    // ── v3.0 #4: shareable pack install (merge | replace + provenance) ──────
+    #[test]
+    fn import_pack_merge_replace_and_provenance() {
+        with_user_brain_disabled(|| {
+            let root_a = test_root();
+            init_project(&root_a, false).expect("init A");
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "use cargo --locked",
+            )
+            .expect("a1");
+            add_memory(
+                &root_a,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "brain db lives in dot kimetsu",
+            )
+            .expect("a2");
+
+            // Export → wrap as a Pack envelope → parse back (round-trip).
+            let (entries, scrub) =
+                export_memories(&root_a, None, None, false, false).expect("export");
+            assert!(scrub.is_clean(), "clean memories must scrub to nothing");
+            let pack = Pack {
+                kimetsu_pack: 1,
+                name: Some("demo".into()),
+                version: Some("1.0".into()),
+                description: None,
+                exported_at: None,
+                memory_count: entries.len(),
+                memories: entries.clone(),
+            };
+            let json = serde_json::to_string(&pack).expect("ser");
+            let (pref, parsed) = parse_pack_or_array(&json).expect("parse");
+            assert_eq!(pref.name.as_deref(), Some("demo"));
+            assert_eq!(parsed.len(), 2);
+            // Bare array also parses (back-compat).
+            let (bare_ref, bare) =
+                parse_pack_or_array(&serde_json::to_string(&entries).unwrap()).expect("parse bare");
+            assert!(bare_ref.name.is_none());
+            assert_eq!(bare.len(), 2);
+
+            // Install (merge) into B, which already has its own memory.
+            let root_b = test_root();
+            init_project(&root_b, false).expect("init B");
+            add_memory(
+                &root_b,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "B's own memory",
+            )
+            .expect("b1");
+            let s = import_pack(&root_b, &parsed, None, false, Some(&pref)).expect("merge");
+            assert_eq!(s.imported, 2, "two new pack memories");
+            assert_eq!(s.superseded, 0);
+
+            // Pack memories carry provenance source=="pack".
+            let pack_tagged = |root: &Path| -> i64 {
+                let (_p, _c, conn) = load_project_readonly(root).expect("ro");
+                conn.query_row(
+                    "SELECT COUNT(*) FROM memories
+                     WHERE provenance_snapshot_json LIKE '%\"source\":\"pack\"%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                pack_tagged(&root_b),
+                2,
+                "installed memories tagged with pack provenance"
+            );
+
+            // Re-install (merge) → all deduped.
+            let s2 = import_pack(&root_b, &parsed, None, false, Some(&pref)).expect("merge2");
+            assert_eq!(s2.imported, 0);
+            assert_eq!(s2.deduped, 2);
+
+            // Replace: B's current project memories (its own + the 2 pack) are
+            // superseded, then the pack reloads → 2 active project memories.
+            let s3 = import_pack(&root_b, &parsed, None, true, Some(&pref)).expect("replace");
+            assert_eq!(
+                s3.superseded, 3,
+                "all 3 active project memories invalidated"
+            );
+            assert_eq!(s3.imported, 2, "pack reloaded as fresh rows");
+            let active_project = {
+                let (_p, _c, conn) = load_project_readonly(&root_b).expect("ro2");
+                conn.query_row(
+                    "SELECT COUNT(*) FROM memories
+                     WHERE scope='project' AND invalidated_at IS NULL AND superseded_by IS NULL",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                active_project, 2,
+                "only the pack's 2 memories remain active"
+            );
 
             fs::remove_dir_all(&root_a).ok();
             fs::remove_dir_all(&root_b).ok();
