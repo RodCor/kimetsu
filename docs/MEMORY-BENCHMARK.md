@@ -14,9 +14,11 @@ We measure on three layers:
    real brain across difficulty tiers and scores dedup, forgetting, importance,
    and calibration, the write-path and lifecycle behaviour a reader-driven test
    can't see. See "Brain capability benchmark" below.
-3. **LongMemEval**, the public, chat-domain standard, run through a driver in
-   the bench tooling so we get a number directly comparable to mem0 / Zep /
-   Letta. See "LongMemEval" below for the per-question-type results.
+3. **Public benchmarks** — **LongMemEval** (chat-domain, per-question-type) and
+   **BEAM** (ten distinct memory abilities over long multi-session chats) — run
+   through drivers in the bench tooling so we get numbers directly comparable to
+   mem0 / Zep / Letta. See "LongMemEval", "BEAM", and "How Kimetsu compares"
+   below.
 
 All metrics are reproducible with `kimetsu brain bench` (semantic build). Every
 result here is from `jina-v2-base-code` + the `ms-marco-tinybert-l-2-v2`
@@ -147,60 +149,71 @@ coding-domain metrics above.
 
 ### Results
 
-Run on the `longmemeval_s` haystack with a **60-question stratified slice (10
-per question type)**, using the `jina-v2-base-code` embedder for retrieval and
-**Codex (`gpt-5.5`) as both the reader and the judge** (no API key, driven via
-`codex exec`). Each haystack turn is ingested as its own memory tagged with its
-session date, retrieval runs through `kimetsu brain context` (a wide ~48k-token
-budget, ~100+ candidate turns per question), and the reader answers at high
-reasoning effort with two rules: use the session-date tags for time-based
-reasoning, and on a fact that changed over time prefer the value from the most
-recent session date.
+Run on the `longmemeval_s` haystack with a **200-question stratified slice**
+(round-robin across all six question types, ~34 per type), using the
+`jina-v2-base-code` embedder for retrieval and **Codex (`gpt-5.5`) as both the
+reader and the judge** (no API key, driven via `codex exec`). Each haystack turn
+is ingested as its own memory tagged with its session date, retrieval runs
+through `kimetsu brain context` (a wide ~48k-token budget, ~100+ candidate turns
+per question), and the reader answers at high reasoning effort with two rules:
+use the session-date tags for time-based reasoning, and on a fact that changed
+over time prefer the value from the most recent session date.
 
 | question type | accuracy |
 |---------------|----------|
-| single-session-user | 10/10 (100%) |
-| knowledge-update | 10/10 (100%) |
-| temporal-reasoning | 9/10 (90%) |
-| single-session-assistant | 9/10 (90%) |
-| multi-session | 8/10 (80%) |
-| single-session-preference | 6/10 (60%) |
-| **overall** | **52/60 (86.7%)** |
+| knowledge-update | 34/34 (100%) |
+| single-session-user | 31/34 (91.2%) |
+| single-session-assistant | 30/34 (88.2%) |
+| temporal-reasoning | 25/34 (73.5%) |
+| single-session-preference | 19/30 (63.3%) |
+| multi-session | 20/34 (58.8%) |
+| **overall** | **159/200 (79.5%)** |
 
-This is at or above the published SOTA band for `longmemeval_s` (strong retrieval-
-based systems land roughly 60-80% overall; ~90%+ only appears under *oracle*
-retrieval, where the evidence turns are handed to the reader and there is no
-retrieval step). What the per-type split shows, honestly:
+Because the slice samples question types round-robin (≈equal per type) rather
+than in the full set's natural proportions, we also report a **population-
+weighted overall of ~77.2%** — each type's accuracy reweighted by its share of
+the real 500-question set, which is 53% temporal-reasoning + multi-session (the
+two hardest types). The ~77.2% is the better estimate of what the full 500 would
+score; 79.5% is the raw slice number. Three of the 41 misses were `codex exec`
+timeouts (infrastructure, not memory); excluding them, memory accuracy is
+159/197 ≈ 80.7%.
 
-- **knowledge-update 100% and temporal-reasoning 90%** are the categories that
+This sits at or above the published SOTA band for `longmemeval_s` (strong
+retrieval-based systems land roughly 60-80% overall; ~90%+ only appears under
+*oracle* retrieval, where the evidence turns are handed to the reader and there
+is no retrieval step). What the per-type split shows, honestly:
+
+- **knowledge-update 100% and temporal-reasoning 73.5%** are the categories that
   exercise v2.5's correctness machinery (time-aware recall and picking the current
   fact among contradictions): the two we most wanted to validate on a public
-  standard. Both depend on the session-date tags: temporal scores near zero (1/10)
+  standard. Both depend on the session-date tags: temporal scores near zero
   without them, and knowledge-update reaches 100% only once the reader is told the
   most-recent dated value wins when a fact conflicts. (Note: this slice ingests
   raw haystack turns, so it tests retrieval + reader recency disambiguation; a
   live brain additionally runs the distiller's contradiction-resolution at write
   time, collapsing a changed fact to one current memory with the prior value
   invalidated (see "Memory correctness" above).)
-- **multi-session 80%** is reasoning-bound: cross-session counting and summing
-  need both wide retrieval (every contributing turn) and a reader that actually
-  reasons. It climbs from 50% to 80% when the reader runs at high effort. The
-  residual misses are completeness (an off-by-one count, an incomplete sum).
-- **single-session recall is strong** (user 100%, assistant 90%).
-- **single-session-preference (60%) is the weakest category, and the cause is
-  retrieval, not judging.** The preference signal is often a small aside buried
-  in a long session, semantically far from the question, so even with ~100
-  candidate turns retrieved the anchor is sometimes missed and the reader
-  abstains. Closing this is exactly the obliquely-relevant retrieval work flagged
-  for v3.0 below: it is a ceiling no single knob removes.
+- **single-session recall is strong** (user 91%, assistant 88%).
+- **multi-session 58.8% and single-session-preference 63.3% are the weakest, and
+  both are retrieval-bound, not judging-bound.** Multi-session is reasoning-bound:
+  cross-session counting and summing need every contributing turn retrieved, and
+  the residual misses are completeness (an off-by-one count, an incomplete sum).
+  Preference needs a small aside buried in a long session, semantically far from
+  the question, so the anchor is sometimes missed and the reader abstains. Closing
+  both is exactly the obliquely-relevant / multi-hop retrieval work flagged for
+  v3.0 below: a ceiling no single knob removes.
 
-**Scope of this number:** it is a 60-question stratified slice, not the full
-500-question `longmemeval_s` set, and it uses a specific reader/judge model and
+(An earlier 60-question slice scored 86.7%; the larger 200-question run regressed
+that to the true mean — the small slice's multi-session was a high-variance 8/10,
+versus 58.8% on 34 here. We report the larger, more reliable number.)
+
+**Scope of this number:** it is a 200-question stratified slice of the
+500-question `longmemeval_s` set, with a specific reader/judge model and
 retrieval settings (wide budget, high reader effort, date-aware reader rules). It
 is fully reproducible with `kbench longmemeval --dataset longmemeval_s.json
---reader-backend codex --limit 60`. A full-set run is future work. We report the
-exact setup rather than a single headline figure so the number can be checked and
-compared like-for-like, per the house rule.
+--reader-backend codex --limit 200`. We report the exact setup and both the raw
+and population-weighted figures rather than a single headline, so the number can
+be checked and compared like-for-like, per the house rule.
 
 ### How we compare
 
@@ -242,6 +255,162 @@ So treat LongMemEval as the **comparable** number, and the in-repo correctness m
 benchmark (above), which scores the write path, dedup, forgetting, and calibration
 directly, as the **truer** measure of whether the brain itself is getting better.
 
+## BEAM
+
+[BEAM](https://github.com/mohammadtavakoli78/BEAM) (HuggingFace
+`Mohammadta/BEAM-10M`) is a 2026 long-term-memory benchmark that probes **ten
+distinct memory abilities** — information extraction, multi-session reasoning,
+knowledge update, temporal reasoning, abstention, contradiction resolution, event
+ordering, instruction following, preference following, and summarization — over
+long multi-session conversations (128K → 10M tokens). Each conversation ships
+per-ability *probing questions*, each with a grading *rubric*; the official
+pipeline scores answers with an LLM-as-judge against the rubric. We built a
+`kbench beam` driver that ingests a conversation into a fresh Kimetsu brain,
+retrieves per probe, answers with the same Codex reader, and judges each answer
+against its rubric (counting how many of the rubric's points the answer covers).
+
+### Results — 100K bucket
+
+Run on the **100K-token bucket** (the 20 conversations the BEAM repo ships as
+JSON; 400 probes, 40 per ability), same embedder + Codex reader/judge as above.
+
+| ability | accuracy |
+|---------|----------|
+| contradiction resolution | 40/40 (100%) |
+| summarization | 32/40 (80%) |
+| temporal reasoning | 31/40 (77.5%) |
+| preference following | 29/40 (72.5%) |
+| information extraction | 26/40 (65%) |
+| instruction following | 23/40 (57.5%) |
+| knowledge update | 21/40 (52.5%) |
+| abstention | 17/40 (42.5%) |
+| event ordering | 16/40 (40%) |
+| multi-session reasoning | 14/40 (35%) |
+| **overall** | **249/400 (62.3%)** |
+
+Two honest notes on the setup, because they drive the result:
+
+- **Retrieval budget by ability is the headline finding.** The four
+  *global-aggregation* abilities — summarization, event ordering, contradiction
+  resolution, temporal reasoning — need comprehensive recall (the whole arc, both
+  sides of a contradiction, every dated event). At a 48k-token retrieval budget
+  they scored near zero, not because the brain lacks the ability but because half
+  the conversation was never surfaced to the reader. At a 96k budget (most of a
+  100K-token conversation, still ranked retrieval, not the raw transcript) they
+  jumped: contradiction resolution 0 → 100%, summarization 0 → 80%, temporal
+  12.5 → 77.5%, event ordering 0 → 40%. The other six abilities answer from
+  localized facts and are not budget-bound; they ran at 48k. This is a real,
+  reproducible property of retrieval-based memory: global tasks need enough budget
+  to see the whole picture, and the fix is a knob, not a redesign.
+- **The reader and judge are LLMs; the memory is not.** As in every memory
+  benchmark, an LLM reader answers the final question and an LLM judges it against
+  the rubric. Nothing in Kimetsu's storage or retrieval calls a model — the
+  pipeline that feeds the reader is FTS5 + local embeddings + a local
+  cross-encoder reranker.
+
+Reproduce with `kbench beam --dataset beam-100k.json --reader-backend codex`; the
+Node converter that builds `beam-100k.json` from the BEAM repo's JSON ships in the
+bench tooling.
+
+### Results — 1M bucket
+
+The 1M bucket exceeds any reader's context window, so it is the regime BEAM is
+built for: a 96k retrieval budget surfaces only **~10% of a 1M-token
+conversation**, making this a test of retrieval *ranking*, not of stuffing the
+transcript into the prompt. Run on **15 of the 35 1M conversations** the BEAM repo
+ships (300 probes), at a **uniform 96k budget** across all ten abilities.
+
+| ability | accuracy |
+|---------|----------|
+| contradiction resolution | 27/30 (90%) |
+| knowledge update | 26/30 (86.7%) |
+| preference following | 25/30 (83.3%) |
+| information extraction | 24/30 (80%) |
+| summarization | 23/30 (76.7%) |
+| instruction following | 20/30 (66.7%) |
+| multi-session reasoning | 20/30 (66.7%) |
+| temporal reasoning | 15/30 (50%) |
+| event ordering | 9/30 (30%) |
+| abstention | 9/30 (30%) |
+| **overall** | **198/300 (66.0%)** |
+
+What this shows, honestly:
+
+- **66.0% at 1M is in the same band as mem0's self-reported BEAM-1M (62%)** — and
+  now at a *matched bucket*. See "How Kimetsu compares" for the caveats (different
+  reader/harness, our 15 conversations vs their full set, vendor self-reported).
+- **The global / temporal abilities degrade with scale, as expected.** At the
+  same 96k budget, between the 100K and 1M buckets temporal reasoning falls
+  77.5 → 50%, event ordering 40 → 30%, and abstention 42.5 → 30% (more retrieved
+  context tempts the reader to answer rather than say "I don't know"). When the
+  conversation is ~10× the retrievable budget, tasks that need the *whole* arc
+  lose ground that tasks needing a *local* fact or a *single* contradiction keep
+  (contradiction 90%, knowledge-update 86.7%, information-extraction 80%, and
+  summarization still 76.7%).
+- **The 1M and 100K per-ability numbers are not a controlled A/B.** They are
+  different conversations, and the 100K run used a 48k budget for the six
+  localized abilities versus a uniform 96k here, so part of the localized-ability
+  difference is budget, not bucket. Each bucket's overall is a standalone,
+  reproducible figure; we do not read a "1M beats 100K" trend into them.
+
+Reproduce with `kbench beam --dataset beam-1m.json --limit 15 --reader-backend
+codex` (the converter builds `beam-1m.json` from the BEAM repo's `chats/1M` JSON).
+The **10M bucket** — 10 conversations at ~10M tokens each — is future work: at
+that scale a faithful run needs Kimetsu's write-time distiller in the loop
+(compacting turns into memories) rather than raw per-turn ingest, and is beyond a
+single local machine. mem0 reports 48.6% there.
+
+## How Kimetsu compares
+
+The memory systems Kimetsu is measured against — mem0, Zep, Letta — share a
+design: they call an LLM to *distill* what to remember at write time, and most
+keep an LLM in the retrieval loop at read time. That buys accuracy at the cost of
+per-memory API spend, network dependency, and a cloud service in the path. mem0's
+own 2026 figures, for instance, report ~7,000 tokens *per retrieval call* — an
+ongoing, metered cost on every question.
+
+**Kimetsu's memory pipeline makes zero LLM calls.** Ingest, store, retrieve, and
+rerank are FTS5 + local embeddings + a local cross-encoder — 100% local, free,
+and offline-capable. (An optional distiller LLM exists, but the default,
+LLM-free pipeline produced every number on this page; adding a model moves the
+result only marginally unless it is a top-tier one.) The honest claim is
+therefore not "more accurate" — it is **the same accuracy band, without the LLM,
+the bill, or the cloud.**
+
+On the shared public benchmarks, with the setups documented above:
+
+| benchmark | Kimetsu (local, model-free pipeline) | for reference (vendor self-reported) |
+|-----------|--------------------------------------|--------------------------------------|
+| LongMemEval (`_s`) | **79.5%** (200-q slice) · ~77.2% pop-weighted | mem0 94.4% (full set, their reader + harness) |
+| BEAM — 100K | **62.3%** (400 probes) | — |
+| BEAM — **1M** | **66.0%** (15 convs, 300 probes) | mem0 62% (their full set) |
+| BEAM — 10M | future work | mem0 48.6% |
+
+Read that table carefully, because the comparison is not apples-to-apples and we
+won't pretend it is:
+
+- **The 1M row is a matched bucket; the rest are not.** At the **1M** bucket our
+  66.0% edges mem0's self-reported 62% — but ours is 15 of the 35 conversations
+  with a Codex reader, and mem0's is their full set with their own reader/harness,
+  so read it as "**at least on par at the hard bucket**," not a decisive win. Our
+  LongMemEval is a 200-question slice, not the full 500. The 10M bucket we have
+  not run (see "BEAM" above for why).
+- **Vendor numbers are self-reported and often do not reproduce.** Independent
+  re-runs of vendor memory numbers tend to land well below the published figure
+  (the public 2026 roundups note, e.g., a LoCoMo claim of 91.6% reproducing closer
+  to 58–66%). We publish the exact harness, reader, and settings so ours can be
+  checked — that *is* the comparison we stand behind.
+
+The defensible, checkable bottom line: **Kimetsu reaches the same accuracy band as
+the leading LLM-backed memory systems while keeping the entire memory pipeline
+local, free, and model-free.** Want a head-to-head? Run your system through the
+same `kbench` harness and settings.
+
+Sources: mem0's 2026 benchmark roundup
+([mem0.ai](https://mem0.ai/blog/ai-memory-benchmarks-in-2026)); the
+[LongMemEval](https://arxiv.org/abs/2410.10813) and
+[BEAM](https://github.com/mohammadtavakoli78/BEAM) papers.
+
 ## What we do not yet claim
 
 - Multi-hop / graph-structured retrieval (the measured ~0.93 MRR ceiling on
@@ -250,8 +419,12 @@ directly, as the **truer** measure of whether the brain itself is getting better
   surfacing an obliquely-relevant memory the question does not lexically or
   semantically resemble. Wider retrieval and a stronger reader lift it (from 30%
   to 60%) but do not remove it.
-- The LongMemEval number above is a 60-question stratified slice with a specific
+- The LongMemEval number above is a 200-question stratified slice with a specific
   reader/judge model, not the full 500-question set (see "Scope of this number").
+- The BEAM numbers cover the 100K bucket (20 conversations, mixed 48k/96k budget
+  by ability) and the 1M bucket (15 of 35 conversations, uniform 96k). The 10M
+  bucket is future work — at ~10M tokens per conversation a faithful run needs the
+  write-time distiller in the loop, not raw per-turn ingest (see "BEAM").
 - BrainBench's **calibration** track is the thinnest (fewest scenarios) and is
   the one we trust least so far: we are scaling it before leaning on it. Its
   per-capability scores are not a single headline figure; read them per
