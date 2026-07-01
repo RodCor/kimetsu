@@ -14,8 +14,8 @@ We measure on three layers:
    real brain across difficulty tiers and scores dedup, forgetting, importance,
    and calibration, the write-path and lifecycle behaviour a reader-driven test
    can't see. See "Brain capability benchmark" below.
-3. **Public benchmarks** — **LongMemEval** (chat-domain, per-question-type) and
-   **BEAM** (ten distinct memory abilities over long multi-session chats) — run
+3. **Public benchmarks**, **LongMemEval** (chat-domain, per-question-type) and
+   **BEAM** (ten distinct memory abilities over long multi-session chats), run
    through drivers in the bench tooling so we get numbers directly comparable to
    mem0 / Zep / Letta. See "LongMemEval", "BEAM", and "How Kimetsu compares"
    below.
@@ -74,7 +74,7 @@ MRR 0.941 before and after.
 
 The numbers above measure *parts* of the brain. To measure the brain as a
 whole, and the way a memory system actually should be judged, we built
-**BrainBench**: a tiered (easy → complex) benchmark that drives the real Kimetsu
+**BrainBench**: a tiered (easy to complex) benchmark that drives the real Kimetsu
 binary against authored fixtures and scores five capabilities a plain vector
 store can't even attempt. Crucially, **no LLM reader is in the loop**, so the
 score reflects what the brain *does*, not what a frontier model can reason around
@@ -171,7 +171,7 @@ over time prefer the value from the most recent session date.
 
 Because the slice samples question types round-robin (≈equal per type) rather
 than in the full set's natural proportions, we also report a **population-
-weighted overall of ~77.2%** — each type's accuracy reweighted by its share of
+weighted overall of ~77.2%**: each type's accuracy reweighted by its share of
 the real 500-question set, which is 53% temporal-reasoning + multi-session (the
 two hardest types). The ~77.2% is the better estimate of what the full 500 would
 score; 79.5% is the raw slice number. Three of the 41 misses were `codex exec`
@@ -204,7 +204,7 @@ is no retrieval step). What the per-type split shows, honestly:
   v3.0 below: a ceiling no single knob removes.
 
 (An earlier 60-question slice scored 86.7%; the larger 200-question run regressed
-that to the true mean — the small slice's multi-session was a high-variance 8/10,
+that to the true mean. The small slice's multi-session was a high-variance 8/10,
 versus 58.8% on 34 here. We report the larger, more reliable number.)
 
 **Scope of this number:** it is a 200-question stratified slice of the
@@ -259,17 +259,17 @@ directly, as the **truer** measure of whether the brain itself is getting better
 
 [BEAM](https://github.com/mohammadtavakoli78/BEAM) (HuggingFace
 `Mohammadta/BEAM-10M`) is a 2026 long-term-memory benchmark that probes **ten
-distinct memory abilities** — information extraction, multi-session reasoning,
+distinct memory abilities** (information extraction, multi-session reasoning,
 knowledge update, temporal reasoning, abstention, contradiction resolution, event
-ordering, instruction following, preference following, and summarization — over
-long multi-session conversations (128K → 10M tokens). Each conversation ships
+ordering, instruction following, preference following, and summarization) over
+long multi-session conversations (128K to 10M tokens). Each conversation ships
 per-ability *probing questions*, each with a grading *rubric*; the official
 pipeline scores answers with an LLM-as-judge against the rubric. We built a
 `kbench beam` driver that ingests a conversation into a fresh Kimetsu brain,
 retrieves per probe, answers with the same Codex reader, and judges each answer
 against its rubric (counting how many of the rubric's points the answer covers).
 
-### Results — 100K bucket
+### Results: 100K bucket
 
 Run on the **100K-token bucket** (the 20 conversations the BEAM repo ships as
 JSON; 400 probes, 40 per ability), same embedder + Codex reader/judge as above.
@@ -291,8 +291,8 @@ JSON; 400 probes, 40 per ability), same embedder + Codex reader/judge as above.
 Two honest notes on the setup, because they drive the result:
 
 - **Retrieval budget by ability is the headline finding.** The four
-  *global-aggregation* abilities — summarization, event ordering, contradiction
-  resolution, temporal reasoning — need comprehensive recall (the whole arc, both
+  *global-aggregation* abilities (summarization, event ordering, contradiction
+  resolution, temporal reasoning) need comprehensive recall (the whole arc, both
   sides of a contradiction, every dated event). At a 48k-token retrieval budget
   they scored near zero, not because the brain lacks the ability but because half
   the conversation was never surfaced to the reader. At a 96k budget (most of a
@@ -304,7 +304,7 @@ Two honest notes on the setup, because they drive the result:
   to see the whole picture, and the fix is a knob, not a redesign.
 - **The reader and judge are LLMs; the memory is not.** As in every memory
   benchmark, an LLM reader answers the final question and an LLM judges it against
-  the rubric. Nothing in Kimetsu's storage or retrieval calls a model — the
+  the rubric. Nothing in Kimetsu's storage or retrieval calls a model: the
   pipeline that feeds the reader is FTS5 + local embeddings + a local
   cross-encoder reranker.
 
@@ -312,7 +312,7 @@ Reproduce with `kbench beam --dataset beam-100k.json --reader-backend codex`; th
 Node converter that builds `beam-100k.json` from the BEAM repo's JSON ships in the
 bench tooling.
 
-### Results — 1M bucket
+### Results: 1M bucket
 
 The 1M bucket exceeds any reader's context window, so it is the regime BEAM is
 built for: a 96k retrieval budget surfaces only **~10% of a 1M-token
@@ -336,7 +336,7 @@ ships (300 probes), at a **uniform 96k budget** across all ten abilities.
 
 What this shows, honestly:
 
-- **66.0% at 1M is in the same band as mem0's self-reported BEAM-1M (62%)** — and
+- **66.0% at 1M is in the same band as mem0's self-reported BEAM-1M (62%)**, and
   now at a *matched bucket*. See "How Kimetsu compares" for the caveats (different
   reader/harness, our 15 conversations vs their full set, vendor self-reported).
 - **The global / temporal abilities degrade with scale, as expected.** At the
@@ -355,26 +355,26 @@ What this shows, honestly:
 
 Reproduce with `kbench beam --dataset beam-1m.json --limit 15 --reader-backend
 codex` (the converter builds `beam-1m.json` from the BEAM repo's `chats/1M` JSON).
-The **10M bucket** — 10 conversations at ~10M tokens each — is future work: at
+The **10M bucket** (10 conversations at ~10M tokens each) is future work: at
 that scale a faithful run needs Kimetsu's write-time distiller in the loop
 (compacting turns into memories) rather than raw per-turn ingest, and is beyond a
 single local machine. mem0 reports 48.6% there.
 
 ## How Kimetsu compares
 
-The memory systems Kimetsu is measured against — mem0, Zep, Letta — share a
+The memory systems Kimetsu is measured against (mem0, Zep, Letta) share a
 design: they call an LLM to *distill* what to remember at write time, and most
 keep an LLM in the retrieval loop at read time. That buys accuracy at the cost of
 per-memory API spend, network dependency, and a cloud service in the path. mem0's
-own 2026 figures, for instance, report ~7,000 tokens *per retrieval call* — an
+own 2026 figures, for instance, report ~7,000 tokens *per retrieval call*, an
 ongoing, metered cost on every question.
 
 **Kimetsu's memory pipeline makes zero LLM calls.** Ingest, store, retrieve, and
-rerank are FTS5 + local embeddings + a local cross-encoder — 100% local, free,
+rerank are FTS5 + local embeddings + a local cross-encoder: 100% local, free,
 and offline-capable. (An optional distiller LLM exists, but the default,
 LLM-free pipeline produced every number on this page; adding a model moves the
 result only marginally unless it is a top-tier one.) The honest claim is
-therefore not "more accurate" — it is **the same accuracy band, without the LLM,
+therefore not "more accurate." It is **the same accuracy band, without the LLM,
 the bill, or the cloud.**
 
 On the shared public benchmarks, with the setups documented above:
@@ -382,15 +382,15 @@ On the shared public benchmarks, with the setups documented above:
 | benchmark | Kimetsu (local, model-free pipeline) | for reference (vendor self-reported) |
 |-----------|--------------------------------------|--------------------------------------|
 | LongMemEval (`_s`) | **79.5%** (200-q slice) · ~77.2% pop-weighted | mem0 94.4% (full set, their reader + harness) |
-| BEAM — 100K | **62.3%** (400 probes) | — |
-| BEAM — **1M** | **66.0%** (15 convs, 300 probes) | mem0 62% (their full set) |
-| BEAM — 10M | future work | mem0 48.6% |
+| BEAM 100K | **62.3%** (400 probes) | n/a |
+| BEAM **1M** | **66.0%** (15 convs, 300 probes) | mem0 62% (their full set) |
+| BEAM 10M | future work | mem0 48.6% |
 
 Read that table carefully, because the comparison is not apples-to-apples and we
 won't pretend it is:
 
 - **The 1M row is a matched bucket; the rest are not.** At the **1M** bucket our
-  66.0% edges mem0's self-reported 62% — but ours is 15 of the 35 conversations
+  66.0% edges mem0's self-reported 62%, but ours is 15 of the 35 conversations
   with a Codex reader, and mem0's is their full set with their own reader/harness,
   so read it as "**at least on par at the hard bucket**," not a decisive win. Our
   LongMemEval is a 200-question slice, not the full 500. The 10M bucket we have
@@ -399,7 +399,7 @@ won't pretend it is:
   re-runs of vendor memory numbers tend to land well below the published figure
   (the public 2026 roundups note, e.g., a LoCoMo claim of 91.6% reproducing closer
   to 58–66%). We publish the exact harness, reader, and settings so ours can be
-  checked — that *is* the comparison we stand behind.
+  checked: that *is* the comparison we stand behind.
 
 The defensible, checkable bottom line: **Kimetsu reaches the same accuracy band as
 the leading LLM-backed memory systems while keeping the entire memory pipeline
@@ -423,7 +423,7 @@ Sources: mem0's 2026 benchmark roundup
   reader/judge model, not the full 500-question set (see "Scope of this number").
 - The BEAM numbers cover the 100K bucket (20 conversations, mixed 48k/96k budget
   by ability) and the 1M bucket (15 of 35 conversations, uniform 96k). The 10M
-  bucket is future work — at ~10M tokens per conversation a faithful run needs the
+  bucket is future work: at ~10M tokens per conversation a faithful run needs the
   write-time distiller in the loop, not raw per-turn ingest (see "BEAM").
 - BrainBench's **calibration** track is the thinnest (fewest scenarios) and is
   the one we trust least so far: we are scaling it before leaning on it. Its

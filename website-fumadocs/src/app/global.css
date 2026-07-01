@@ -2,6 +2,24 @@
 @import 'fumadocs-ui/css/neutral.css';
 @import 'fumadocs-ui/css/preset.css';
 
+/* Dev-tool type pairing: IBM Plex Sans body, JetBrains Mono for code + brand. */
+@theme {
+  --font-sans: var(--font-ibm), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jbmono), ui-monospace, monospace;
+}
+
+/* Kimetsu brand accent: "code dark, run green". Contrast-safe in both modes. */
+:root {
+  --color-fd-primary: #15803d; /* green-700, AA on light surfaces */
+  --color-fd-primary-foreground: #ffffff;
+}
+
+.dark {
+  --color-fd-primary: #22c55e; /* green-500 on dark */
+  --color-fd-primary-foreground: #052e16; /* dark text on bright green */
+  --color-fd-ring: #22c55e;
+}
+
 html {
   scrollbar-gutter: stable;
 }
