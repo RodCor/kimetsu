@@ -33,7 +33,6 @@ const BASE = '/kimetsu'; // GitHub Pages base path
 // Explicit allowlist. Order = sidebar/nav order. `out` names map to route slugs.
 const DOCS = [
   { src: 'README.md',                 out: 'index.mdx',            title: 'Introduction' },
-  { src: 'docs/HOW-KIMETSU-WORKS.md', out: 'how-kimetsu-works.mdx', title: 'How Kimetsu Works' },
   { src: 'docs/INSTALL.md',           out: 'install.mdx',          title: 'Install & Host Wiring' },
   { src: 'docs/LOCAL-MODELS.md',      out: 'local-models.mdx',     title: 'Local Models' },
   { src: 'docs/REMOTE.md',            out: 'remote.mdx',           title: 'Kimetsu Remote' },
@@ -44,8 +43,34 @@ const DOCS = [
   { src: 'CHANGELOG.md',              out: 'changelog.mdx',        title: 'Changelog' },
 ];
 
-// Nav order = the route slugs (out without .mdx). index is the docs root.
-const NAV_PAGES = DOCS.map((d) => d.out.replace(/\.mdx$/, ''));
+// Multi-page sections rendered as a collapsible sidebar group (a folder with its
+// own meta.json). "How Kimetsu Works" was one 900-line page; it is split into
+// focused pages here. `after` positions the group in the root nav.
+const FOLDERS = [
+  {
+    dir: 'how-kimetsu-works',
+    title: 'How Kimetsu Works',
+    after: 'index',
+    pages: [
+      { src: 'docs/how-kimetsu-works/index.md',         out: 'index.mdx',         title: 'Overview' },
+      { src: 'docs/how-kimetsu-works/the-brain.md',     out: 'the-brain.mdx',     title: 'The brain' },
+      { src: 'docs/how-kimetsu-works/the-broker.md',    out: 'the-broker.mdx',    title: 'The broker' },
+      { src: 'docs/how-kimetsu-works/learning-loop.md', out: 'learning-loop.mdx', title: 'The learning loop' },
+      { src: 'docs/how-kimetsu-works/interfaces.md',    out: 'interfaces.mdx',    title: 'Interfaces' },
+      { src: 'docs/how-kimetsu-works/operations.md',    out: 'operations.mdx',    title: 'Operations & reference' },
+    ],
+  },
+];
+
+// Root nav order: flat slugs, with each folder inserted after its `after` slug.
+const NAV_PAGES = (() => {
+  const pages = DOCS.map((d) => d.out.replace(/\.mdx$/, ''));
+  for (const f of FOLDERS) {
+    const i = pages.indexOf(f.after);
+    pages.splice(i < 0 ? pages.length : i + 1, 0, f.dir);
+  }
+  return pages;
+})();
 
 const stripBom = (s) => s.replace(/^﻿/, '');
 
@@ -233,8 +258,29 @@ function firstParagraph(body) {
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/[*_`]/g, '')
     .trim();
-  if (text.length > 200) text = text.slice(0, 197).trimEnd() + '...';
-  return text;
+  return clampDescription(text);
+}
+
+// Trim to a clean, complete description: whole sentences up to ~170 chars,
+// never cut mid-word (Fumadocs shows this in the doc cards + <meta>).
+function clampDescription(text, max = 170) {
+  if (text.length <= max) return text;
+  const sentences = text.match(/[^.!?]+[.!?]+(?:\s|$)/g) || [text];
+  let out = '';
+  for (const s of sentences) {
+    if (out && (out + s).trim().length > max) break;
+    out += s;
+    if (out.trim().length >= max) break;
+  }
+  out = out.trim();
+  // A single sentence longer than the limit: cut at the last word boundary.
+  if (out.length > max) {
+    out = out.slice(0, max);
+    const sp = out.lastIndexOf(' ');
+    if (sp > 40) out = out.slice(0, sp);
+    out = out.replace(/[,;:\s]+$/, '') + '…';
+  }
+  return out;
 }
 
 // YAML double-quoted scalar escaping.
@@ -281,24 +327,51 @@ mkdirSync(outDir, { recursive: true });
 
 copyAssets();
 
-for (const d of DOCS) {
-  const raw = stripBom(readFileSync(resolve(repo, d.src), 'utf8'));
+function writePage(src, outRel, title) {
+  const raw = stripBom(readFileSync(resolve(repo, src), 'utf8'));
   const linked = transformLinks(raw);
   const description = firstParagraph(linked);
   const hardened = hardenMdx(linked);
   const fm = [
     '---',
-    `title: ${yamlStr(d.title)}`,
+    `title: ${yamlStr(title)}`,
     ...(description ? [`description: ${yamlStr(description)}`] : []),
     '---',
     '',
     '',
   ].join('\n');
-  writeFileSync(resolve(outDir, d.out), fm + hardened, 'utf8');
-  console.log(`synced ${d.src} -> content/docs/${d.out}`);
+  const dest = resolve(outDir, outRel);
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, fm + hardened, 'utf8');
+  console.log(`synced ${src} -> content/docs/${outRel.replace(/\\/g, '/')}`);
 }
 
-// meta.json — nav order (index is the docs root).
+let count = 0;
+
+for (const d of DOCS) {
+  writePage(d.src, d.out, d.title);
+  count++;
+}
+
+// Folder sections: pages + a per-folder meta.json (the sidebar group).
+for (const f of FOLDERS) {
+  for (const pg of f.pages) {
+    writePage(pg.src, join(f.dir, pg.out), pg.title);
+    count++;
+  }
+  writeFileSync(
+    resolve(outDir, f.dir, 'meta.json'),
+    JSON.stringify(
+      { title: f.title, pages: f.pages.map((p) => p.out.replace(/\.mdx$/, '')) },
+      null,
+      2,
+    ) + '\n',
+    'utf8',
+  );
+  console.log(`wrote content/docs/${f.dir}/meta.json`);
+}
+
+// Root meta.json — nav order (index is the docs root; folders inserted).
 writeFileSync(
   resolve(outDir, 'meta.json'),
   JSON.stringify({ title: 'Docs', pages: NAV_PAGES }, null, 2) + '\n',
@@ -307,5 +380,5 @@ writeFileSync(
 console.log('wrote content/docs/meta.json');
 
 console.log(
-  `\n${DOCS.length} docs synced (allowlist only; docs/superpowers/ is never included).`,
+  `\n${count} docs synced (allowlist only; docs/superpowers/ is never included).`,
 );
