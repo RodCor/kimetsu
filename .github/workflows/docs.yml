@@ -6,9 +6,10 @@ on:
       - main
     paths:
       - 'docs/**'
-      - 'website/**'
+      - 'website-fumadocs/**'
       - 'README.md'
       - 'CHANGELOG.md'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -33,14 +34,14 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
-          cache-dependency-path: website/package-lock.json
+          cache-dependency-path: website-fumadocs/package-lock.json
 
       - name: Install dependencies
-        working-directory: website
+        working-directory: website-fumadocs
         run: npm ci
 
       - name: Build
-        working-directory: website
+        working-directory: website-fumadocs
         run: npm run build
 
       - name: Setup Pages
@@ -49,7 +50,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: website/build
+          path: website-fumadocs/out
 
   deploy:
     environment:
