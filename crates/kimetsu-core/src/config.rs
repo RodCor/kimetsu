@@ -627,6 +627,15 @@ pub struct BrokerSection {
     /// loading with the floor active.
     #[serde(default = "default_min_lexical_coverage")]
     pub min_lexical_coverage: f32,
+    /// v2.5 (graph-ranking): composite-score floor for the whole retrieval. When
+    /// set above zero and the TOP direct candidate's final score is below it, the
+    /// context bundle comes back empty (`skipped`) so the reader abstains instead
+    /// of answering from weak matches. Keyed off the strongest DIRECT hit (graph
+    /// candidates rank below their seed), so multi-hop expansion never masks a
+    /// genuine "nothing matched". 0.0 disables. `#[serde(default = …)]` keeps
+    /// older project.toml files loading unchanged.
+    #[serde(default = "default_abstain_min_score")]
+    pub abstain_min_score: f32,
     /// F3: floor for the adaptive per-stage brain budget. Small tasks
     /// receive at least this many tokens so the brain is never starved.
     /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
@@ -737,6 +746,13 @@ fn default_min_lexical_coverage() -> f32 {
     0.5
 }
 
+/// v2.5: whole-retrieval abstention floor on the top direct candidate's composite
+/// score. 0.0 = disabled (unchanged behaviour); set per-project to make weak
+/// retrievals return an empty bundle so the reader abstains.
+fn default_abstain_min_score() -> f32 {
+    0.0
+}
+
 fn default_budget_floor_tokens() -> u32 {
     1500
 }
@@ -762,6 +778,7 @@ impl Default for BrokerSection {
             max_capsules: default_max_capsules(),
             min_semantic_score: default_min_semantic_score(),
             min_lexical_coverage: default_min_lexical_coverage(),
+            abstain_min_score: default_abstain_min_score(),
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
