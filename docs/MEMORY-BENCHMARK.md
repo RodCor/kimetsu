@@ -272,41 +272,51 @@ against its rubric (counting how many of the rubric's points the answer covers).
 ### Results: 100K bucket
 
 Run on the **100K-token bucket** (the 20 conversations the BEAM repo ships as
-JSON; 400 probes, 40 per ability), same embedder + Codex reader/judge as above.
+JSON; 400 probes, 40 per ability) with the **v2.5 graph-lite backend** at a
+uniform 96k retrieval budget, same embedder + Codex reader/judge as above.
 
 | ability | accuracy |
 |---------|----------|
 | contradiction resolution | 40/40 (100%) |
-| summarization | 32/40 (80%) |
+| preference following | 38/40 (95%) |
+| information extraction | 36/40 (90%) |
+| summarization | 34/40 (85%) |
 | temporal reasoning | 31/40 (77.5%) |
-| preference following | 29/40 (72.5%) |
-| information extraction | 26/40 (65%) |
-| instruction following | 23/40 (57.5%) |
-| knowledge update | 21/40 (52.5%) |
-| abstention | 17/40 (42.5%) |
-| event ordering | 16/40 (40%) |
-| multi-session reasoning | 14/40 (35%) |
-| **overall** | **249/400 (62.3%)** |
+| multi-session reasoning | 30/40 (75%) |
+| instruction following | 29/40 (72.5%) |
+| knowledge update | 24/40 (60%) |
+| abstention | 18/40 (45%) |
+| event ordering | 13/40 (32.5%) |
+| **overall** | **293/400 (73.3%)** |
 
-Two honest notes on the setup, because they drive the result:
+Three honest notes on the setup, because they drive the result:
 
-- **Retrieval budget by ability is the headline finding.** The four
-  *global-aggregation* abilities (summarization, event ordering, contradiction
-  resolution, temporal reasoning) need comprehensive recall (the whole arc, both
-  sides of a contradiction, every dated event). At a 48k-token retrieval budget
-  they scored near zero, not because the brain lacks the ability but because half
-  the conversation was never surfaced to the reader. At a 96k budget (most of a
-  100K-token conversation, still ranked retrieval, not the raw transcript) they
-  jumped: contradiction resolution 0 → 100%, summarization 0 → 80%, temporal
-  12.5 → 77.5%, event ordering 0 → 40%. The other six abilities answer from
-  localized facts and are not budget-bound; they ran at 48k. This is a real,
-  reproducible property of retrieval-based memory: global tasks need enough budget
-  to see the whole picture, and the fix is a knob, not a redesign.
+- **Graph ranking is what moved the number, model-free.** The earlier
+  flat-retrieval baseline scored **249/400 (62.3%)** on this same set. The v2.5
+  graph-lite backend builds `relates_to` edges between memories and lets a probe's
+  top hits pull in their edge-connected neighbours as *earned* supplements
+  (relevance decays by hop, so noise stays bounded). That lifted the abilities
+  that depend on stitching facts across sessions: multi-session reasoning
+  14 → 30/40, preference following 29 → 38, information extraction 26 → 36, and
+  knowledge update 21 → 24, for a small cost on event ordering (16 → 13). Net
+  62.3 → 73.3, with no model added to the pipeline.
+- **Global-aggregation abilities need a large retrieval budget.** Summarization,
+  contradiction resolution, and temporal reasoning need comprehensive recall (the
+  whole arc, both sides of a contradiction, every dated event). At a 48k-token
+  budget they scored near zero, not because the brain lacks the ability but
+  because half the conversation was never surfaced to the reader. At the 96k
+  budget used here (most of a 100K-token conversation, still ranked retrieval, not
+  the raw transcript) they land at contradiction resolution 100%, summarization
+  85%, and temporal reasoning 77.5%. This is a real, reproducible property of
+  retrieval-based memory: global tasks need enough budget to see the whole
+  picture, and the fix is a knob, not a redesign.
 - **The reader and judge are LLMs; the memory is not.** As in every memory
   benchmark, an LLM reader answers the final question and an LLM judges it against
   the rubric. Nothing in Kimetsu's storage or retrieval calls a model: the
   pipeline that feeds the reader is FTS5 + local embeddings + a local
-  cross-encoder reranker.
+  cross-encoder reranker. The two remaining laggards, abstention (45%) and event
+  ordering (32.5%), are reader-behavior limits (when to say "I don't know", how to
+  order events it can already see), not retrieval gaps.
 
 Reproduce with `kbench beam --dataset beam-100k.json --reader-backend codex`; the
 Node converter that builds `beam-100k.json` from the BEAM repo's JSON ships in the
@@ -362,7 +372,7 @@ single local machine. mem0 reports 48.6% there.
 
 ## How Kimetsu compares
 
-The memory systems Kimetsu is measured against (mem0, Zep, Letta) share a
+The memory systems Kimetsu is measured against (mem0, Cognee, Zep, Letta) share a
 design: they call an LLM to *distill* what to remember at write time, and most
 keep an LLM in the retrieval loop at read time. That buys accuracy at the cost of
 per-memory API spend, network dependency, and a cloud service in the path. mem0's
@@ -379,12 +389,12 @@ the bill, or the cloud.**
 
 On the shared public benchmarks, with the setups documented above:
 
-| benchmark | Kimetsu (local, model-free pipeline) | for reference (vendor self-reported) |
-|-----------|--------------------------------------|--------------------------------------|
-| LongMemEval (`_s`) | **79.5%** (200-q slice) · ~77.2% pop-weighted | mem0 94.4% (full set, their reader + harness) |
-| BEAM 100K | **62.3%** (400 probes) | n/a |
-| BEAM **1M** | **66.0%** (15 convs, 300 probes) | mem0 62% (their full set) |
-| BEAM 10M | future work | mem0 48.6% |
+| benchmark | Kimetsu (local, model-free pipeline) | mem0 (self-reported) | Cognee (self-reported) |
+|-----------|--------------------------------------|----------------------|------------------------|
+| LongMemEval (`_s`) | **79.5%** (200-q slice) · ~77.2% pop-weighted | 94.4% (full set, their reader + harness) | not reported |
+| BEAM 100K | **73.3%** (400 probes) | n/a | 79% (>80% with per-question routing) |
+| BEAM **1M** | **66.0%** (15 convs, 300 probes) | 62% (their full set) | not reported |
+| BEAM 10M | future work | 48.6% | 67% |
 
 Read that table carefully, because the comparison is not apples-to-apples and we
 won't pretend it is:
@@ -395,6 +405,12 @@ won't pretend it is:
   so read it as "**at least on par at the hard bucket**," not a decisive win. Our
   LongMemEval is a 200-question slice, not the full 500. The 10M bucket we have
   not run (see "BEAM" above for why).
+- **Cognee leads on 100K/10M, and it is a knowledge-graph system with an LLM in
+  the loop.** Our 73.3% at 100K matches the prior public state of the art on that
+  bucket (Cognee itself cites 0.735 as the number it beat) and closes most of the
+  gap to their 79%, model-free. Cognee requires an LLM API key on the write and
+  read paths and offers a metered cloud; the trade is theirs to make, the token
+  bill is theirs to pay. Kimetsu's pipeline stays free and local.
 - **Vendor numbers are self-reported and often do not reproduce.** Independent
   re-runs of vendor memory numbers tend to land well below the published figure
   (the public 2026 roundups note, e.g., a LoCoMo claim of 91.6% reproducing closer
@@ -407,8 +423,9 @@ local, free, and model-free.** Want a head-to-head? Run your system through the
 same `kbench` harness and settings.
 
 Sources: mem0's 2026 benchmark roundup
-([mem0.ai](https://mem0.ai/blog/ai-memory-benchmarks-in-2026)); the
-[LongMemEval](https://arxiv.org/abs/2410.10813) and
+([mem0.ai](https://mem0.ai/blog/ai-memory-benchmarks-in-2026)); Cognee's BEAM
+figures ([github.com/topoteretes/cognee](https://github.com/topoteretes/cognee));
+the [LongMemEval](https://arxiv.org/abs/2410.10813) and
 [BEAM](https://github.com/mohammadtavakoli78/BEAM) papers.
 
 ## What we do not yet claim
