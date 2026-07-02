@@ -14,10 +14,10 @@ import { appName, tagline, links } from '@/lib/shared';
 const BASE = '/kimetsu';
 
 const stats = [
-  { value: '13×', label: 'cheaper per solved task', note: '$0.19 vs $2.47 on a 16-task Terminal-Bench slice' },
+  { value: '73.3%', label: 'BEAM 100K memory bench', note: 'matches the prior public SOTA, with no model in the pipeline' },
   { value: '66.0%', label: 'BEAM 1M memory bench', note: "ahead of mem0's self-reported 62% at the same bucket" },
   { value: '79.5%', label: 'LongMemEval', note: 'the public long-term-memory benchmark' },
-  { value: '0.949', label: 'recall@4', note: '0.914 MRR at ~138 ms per retrieval' },
+  { value: '13×', label: 'cheaper per solved task', note: '$0.19 vs $2.47 on a 16-task Terminal-Bench slice' },
   { value: '~1M', label: 'memories in ~3 GB RAM', note: 'sub-2s retrieval, one SQLite file' },
   { value: '$0', label: 'API cost to remember', note: 'the memory pipeline calls no model' },
 ];
@@ -55,10 +55,33 @@ const features = [
   },
 ];
 
-const comparison = [
-  { name: 'BEAM 1M (matched bucket)', kimetsu: '66.0%', vendor: '62%' },
-  { name: 'BEAM 100K', kimetsu: '62.3%', vendor: 'n/a' },
-  { name: 'LongMemEval', kimetsu: '79.5%', vendor: 'in the same band' },
+const compareCols = ['Kimetsu', 'mem0', 'Cognee', 'Zep', 'Letta'];
+const compareRows = [
+  {
+    label: 'Model in the memory pipeline',
+    cells: ['None', 'LLM', 'LLM', 'LLM', 'LLM'],
+    win: true,
+  },
+  {
+    label: 'Cost to store and recall',
+    cells: ['$0', 'Metered', 'Metered', 'Metered', 'Metered'],
+    win: true,
+  },
+  {
+    label: 'Runs fully on your machine',
+    cells: ['Yes', 'Self-host / cloud', 'Self-host / cloud', 'Cloud', 'Self-host / cloud'],
+    win: true,
+  },
+  {
+    label: 'BEAM 1M accuracy',
+    cells: ['66.0%', '62%', '—', '—', '—'],
+    win: false,
+  },
+  {
+    label: 'BEAM 100K accuracy',
+    cells: ['73.3%', '—', '—', '—', '—'],
+    win: false,
+  },
 ];
 
 export default function HomePage() {
@@ -153,51 +176,78 @@ export default function HomePage() {
 
       {/* Benchmark comparison */}
       <section className="w-full border-t border-fd-border bg-fd-card/30">
-        <div className="mx-auto grid max-w-6xl gap-8 px-4 py-20 lg:grid-cols-2 lg:items-center">
-          <div>
+        <div className="mx-auto max-w-5xl px-4 py-20">
+          <div className="mx-auto mb-10 max-w-3xl text-center">
             <div className="mb-3 inline-flex items-center gap-1.5 rounded-full border border-fd-border px-3 py-1 text-xs font-medium text-fd-muted-foreground">
               <Zap className="size-3.5 text-fd-primary" /> Benchmarked, not asserted
             </div>
             <h2 className="mb-4 font-mono text-2xl font-semibold tracking-tight sm:text-3xl">
               The accuracy of the paid clouds. None of the bill.
             </h2>
-            <p className="mb-4 text-fd-muted-foreground">
-              mem0, Zep, and Letta call a model to store and fetch memories, so
-              every question carries an API cost. Kimetsu runs the whole pipeline
-              on local compute. On the shared public benchmarks it lands in the
-              same band, and at BEAM&apos;s 1M bucket it comes out ahead.
+            <p className="text-fd-muted-foreground">
+              mem0, Cognee, Zep, and Letta all call a model to build and query
+              memory, so every stored fact and every lookup carries token cost.
+              Kimetsu runs the whole pipeline on local compute. It hits the prior
+              public state of the art at BEAM&apos;s 100K bucket and comes out
+              ahead of mem0 at 1M, with no model in the loop.
             </p>
+          </div>
+
+          <div className="overflow-x-auto rounded-xl border border-fd-border bg-fd-background">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead>
+                <tr className="border-b border-fd-border text-fd-muted-foreground">
+                  <th className="p-3 text-left font-medium">&nbsp;</th>
+                  {compareCols.map((c, i) => (
+                    <th
+                      key={c}
+                      className={`p-3 text-right font-medium ${
+                        i === 0 ? 'text-fd-primary' : ''
+                      }`}
+                    >
+                      {c}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {compareRows.map((row) => (
+                  <tr key={row.label} className="border-b border-fd-border/60 last:border-0">
+                    <td className="p-3 text-fd-muted-foreground">{row.label}</td>
+                    {row.cells.map((cell, i) => (
+                      <td
+                        key={i}
+                        className={`p-3 text-right tabular-nums ${
+                          i === 0
+                            ? `font-semibold ${row.win ? 'text-fd-primary' : 'text-fd-foreground'}`
+                            : 'text-fd-muted-foreground'
+                        }`}
+                      >
+                        {cell}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="border-t border-fd-border p-3 text-xs text-fd-muted-foreground">
+              Kimetsu&apos;s 73.3% is the full BEAM 100K set (400 probes) and
+              matches the prior public state of the art on that bucket, with no
+              model in the retrieval path. mem0, Cognee, and Letta are also
+              self-hostable, but all four systems call an LLM to store and recall,
+              so retrieval carries token cost. Vendor accuracy is self-reported;
+              a blank cell means no comparable public BEAM number. Full per-ability
+              results and the exact harness are on the benchmark page.
+            </p>
+          </div>
+
+          <div className="mt-6 text-center">
             <Link
               href="/docs/memory-benchmark"
               className="inline-flex items-center gap-1.5 text-sm font-medium text-fd-primary hover:underline"
             >
               Read the full methodology <ArrowRight className="size-4" />
             </Link>
-          </div>
-          <div className="overflow-hidden rounded-xl border border-fd-border bg-fd-background">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-fd-border text-left text-fd-muted-foreground">
-                  <th className="p-3 font-medium">Benchmark</th>
-                  <th className="p-3 text-right font-medium text-fd-foreground">Kimetsu</th>
-                  <th className="p-3 text-right font-medium">mem0</th>
-                </tr>
-              </thead>
-              <tbody>
-                {comparison.map((row) => (
-                  <tr key={row.name} className="border-b border-fd-border/60 last:border-0">
-                    <td className="p-3">{row.name}</td>
-                    <td className="p-3 text-right font-semibold tabular-nums text-fd-foreground">{row.kimetsu}</td>
-                    <td className="p-3 text-right tabular-nums text-fd-muted-foreground">{row.vendor}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <p className="border-t border-fd-border p-3 text-xs text-fd-muted-foreground">
-              Kimetsu on a 200-question LongMemEval slice and 15 BEAM-1M
-              conversations with a local retrieval pipeline. Vendor figures are
-              self-reported. See the benchmark page for the exact setup.
-            </p>
           </div>
         </div>
       </section>

@@ -111,22 +111,24 @@ methodology and results in
 
 Kimetsu's memory pipeline (ingest → store → retrieve → rerank) makes **zero LLM
 calls**: FTS5 + local embeddings + a local cross-encoder, 100% local, free, and
-offline-capable. mem0 / Zep / Letta call a model to *distill* memories at write
-time **and** keep an LLM in the retrieval loop (mem0's own 2026 figures report
-~7,000 tokens **per retrieval call**, a metered cost on every question). Kimetsu
-lands in the **same accuracy band on the shared public benchmarks without the
-LLM, the bill, or the cloud**, and at BEAM's matched 1M bucket it edges mem0
-outright:
+offline-capable. mem0 / Cognee / Zep / Letta call a model to *distill* memories at
+write time **and** keep an LLM in the retrieval loop (mem0's own 2026 figures
+report ~7,000 tokens **per retrieval call**, a metered cost on every question).
+Kimetsu lands in the **same accuracy band on the shared public benchmarks without
+the LLM, the bill, or the cloud**: it edges mem0 at BEAM's matched 1M bucket and
+hits the prior public state of the art at 100K, model-free.
 
-| benchmark | Kimetsu (local, model-free) | mem0 (vendor self-reported) |
-|-----------|-----------------------------|------------------------------|
-| **BEAM 1M** (matched bucket) | **66.0%** | 62% |
-| BEAM 100K | 62.3% | n/a |
-| LongMemEval (`_s`) | 79.5% (200-q) · ~77.2% weighted | 94.4% (full set, their reader) |
+| benchmark | Kimetsu (local, model-free) | mem0 | Cognee |
+|-----------|-----------------------------|------|--------|
+| **BEAM 1M** (matched bucket) | **66.0%** | 62% | not reported |
+| BEAM 100K | **73.3%** | n/a | 79% |
+| BEAM 10M | future work | 48.6% | 67% |
+| LongMemEval (`_s`) | 79.5% (200-q) · ~77.2% weighted | 94.4% (full set, their reader) | not reported |
 
 Honest, not cherry-picked: our LongMemEval is a 200-question slice (not the full
 500), our BEAM-1M is 15 of 35 conversations with a Codex reader vs mem0's full set
-on their own harness, and vendor numbers are self-reported (independent re-runs
+on their own harness, Cognee (a knowledge-graph system with an LLM in the loop)
+leads at 100K/10M, and vendor numbers are self-reported (independent re-runs
 routinely land lower: a published LoCoMo 91.6% reproduces nearer 58–66%). We ship
 the exact harness, reader, and settings so ours can be checked. Per-ability
 tables, caveats, and reproduction steps:
