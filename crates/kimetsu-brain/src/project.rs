@@ -452,6 +452,12 @@ impl BrainSession {
         if request.min_semantic_score == 0.0 {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
+        // v2.5: whole-retrieval abstention floor (top direct candidate's score).
+        // The gate in context.rs returns an empty bundle when top_score is below
+        // this, so a weak retrieval makes the reader abstain. 0.0 = off.
+        if request.min_score == 0.0 {
+            request.min_score = self.config.broker.abstain_min_score;
+        }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         let backend = crate::backend::backend_for(&self.config.storage.backend);
         context::retrieve_context_with_embedder_and_backend(
@@ -558,6 +564,12 @@ impl BrainSession {
         // where a real query embedding makes the cosine floor effective.
         if request.min_semantic_score == 0.0 {
             request.min_semantic_score = self.resolved_min_semantic_score();
+        }
+        // v2.5: whole-retrieval abstention floor (top direct candidate's score).
+        // The gate in context.rs returns an empty bundle when top_score is below
+        // this, so a weak retrieval makes the reader abstain. 0.0 = off.
+        if request.min_score == 0.0 {
+            request.min_score = self.config.broker.abstain_min_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         let backend = crate::backend::backend_for(&self.config.storage.backend);

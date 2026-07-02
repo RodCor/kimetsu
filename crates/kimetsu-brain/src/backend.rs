@@ -181,8 +181,17 @@ pub(crate) struct GraphLiteBackend;
 /// Maximum hops to traverse from the flat hit set.
 const MAX_HOPS: usize = 2;
 
-/// Maximum number of graph-reachable memory ids to fetch per call.
-const MAX_FAN_OUT: usize = 20;
+/// Maximum number of graph-reachable memory ids to fetch per call. Kept modest
+/// so multi-hop candidates stay a supplement rather than a flood (fewer noise
+/// candidates competing for budget on precision-sensitive queries).
+const MAX_FAN_OUT: usize = 12;
+
+/// Relevance a graph-reachable candidate inherits from its seed, decayed per
+/// hop: `raw_relevance = max_flat_relevance * HOP_DECAY^hops`. A 1-hop neighbour
+/// of a strong hit ranks well (the multi-hop win); a far or weak-seed neighbour
+/// sinks below the admission floor (so it does not add noise). Graph candidates
+/// are never scored at 0 — they earn their place from the strength of their seed.
+const HOP_DECAY: f32 = 0.6;
 
 impl RetrievalBackend for GraphLiteBackend {
     fn memory_candidates(
@@ -218,6 +227,10 @@ impl RetrievalBackend for GraphLiteBackend {
         //    (the superseded member can lead back to the survivor and vice versa).
         //    The hop depth guard (depth <= MAX_HOPS) and the NOT IN seed check
         //    bound the expansion.
+        // Seed relevance for hop-decay scoring: graph candidates inherit a
+        // decayed fraction of the strongest flat hit (see HOP_DECAY).
+        let max_flat_relevance = flat.iter().map(|c| c.raw_relevance).fold(0.0_f32, f32::max);
+
         let new_ids = graph_expand(conn, &seen_ids, MAX_HOPS, MAX_FAN_OUT)?;
 
         if new_ids.is_empty() {
@@ -226,7 +239,8 @@ impl RetrievalBackend for GraphLiteBackend {
 
         // 4. Fetch the graph-reachable memories as candidates, marking their
         //    provenance so the broker/caller can distinguish them from flat hits.
-        let graph_candidates = fetch_graph_candidates(conn, &new_ids, &mut seen_ids)?;
+        let graph_candidates =
+            fetch_graph_candidates(conn, &new_ids, &mut seen_ids, max_flat_relevance)?;
 
         // 5. Concatenate: flat hits first (they have real relevance signals),
         //    graph-reachable hits appended (raw_relevance = 0.0 → ranked last
@@ -255,18 +269,19 @@ fn graph_expand(
     seed_ids: &HashSet<String>,
     max_hops: usize,
     max_fan_out: usize,
-) -> KimetsuResult<Vec<String>> {
+) -> KimetsuResult<Vec<(String, usize)>> {
     if seed_ids.is_empty() || max_hops == 0 {
         return Ok(Vec::new());
     }
 
     // `frontier` = the ids visited in the previous hop (start = seeds).
     // `visited`  = all ids seen so far (seeds + discovered).
+    // `new_ids`  = discovered ids paired with their hop distance (1-based).
     let mut visited: HashSet<String> = seed_ids.clone();
     let mut frontier: Vec<String> = seed_ids.iter().cloned().collect();
-    let mut new_ids: Vec<String> = Vec::new();
+    let mut new_ids: Vec<(String, usize)> = Vec::new();
 
-    for _hop in 0..max_hops {
+    for hop_idx in 0..max_hops {
         if frontier.is_empty() {
             break;
         }
@@ -319,7 +334,7 @@ fn graph_expand(
             if !visited.contains(&neighbour) {
                 visited.insert(neighbour.clone());
                 next_frontier.push(neighbour.clone());
-                new_ids.push(neighbour);
+                new_ids.push((neighbour, hop_idx + 1));
                 if new_ids.len() >= max_fan_out {
                     break;
                 }
@@ -344,8 +359,9 @@ fn graph_expand(
 /// `seen_ids` is updated in place so callers can track which ids were added.
 fn fetch_graph_candidates(
     conn: &Connection,
-    new_ids: &[String],
+    new_ids: &[(String, usize)],
     seen_ids: &mut HashSet<String>,
+    seed_relevance: f32,
 ) -> KimetsuResult<Vec<Candidate>> {
     if new_ids.is_empty() {
         return Ok(Vec::new());
@@ -366,8 +382,10 @@ fn fetch_graph_candidates(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        new_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = new_ids
+        .iter()
+        .map(|(s, _)| s as &dyn rusqlite::ToSql)
+        .collect();
 
     let rows = stmt.query_map(params_refs.as_slice(), |row| {
         Ok((
@@ -390,12 +408,22 @@ fn fetch_graph_candidates(
             continue;
         }
 
+        // Hop-decayed relevance inherited from the seed set: a near neighbour of
+        // a strong hit earns a real score; a far / weak-seed one sinks below the
+        // admission floor. Never 0 (see HOP_DECAY).
+        let hop = new_ids
+            .iter()
+            .find(|(id, _)| id == &memory_id)
+            .map(|(_, h)| *h)
+            .unwrap_or(1);
+        let raw_relevance = seed_relevance * HOP_DECAY.powi(hop as i32);
+
         let freshness = crate::context::freshness_pub(&created_at);
         let scope_weight = crate::context::scope_weight_pub(&scope);
         let token_estimate = crate::context::estimate_tokens(&text) + 8;
 
         candidates.push(Candidate {
-            raw_relevance: 0.0,
+            raw_relevance,
             embedding: None,
             cosine: None,
             capsule: ContextCapsule {
@@ -581,7 +609,7 @@ impl PetgraphBackend {
         seed_ids: &HashSet<String>,
         max_hops: usize,
         max_fan_out: usize,
-    ) -> Vec<String> {
+    ) -> Vec<(String, usize)> {
         use petgraph::visit::EdgeRef;
 
         if seed_ids.is_empty() || max_hops == 0 {
@@ -593,9 +621,9 @@ impl PetgraphBackend {
             .iter()
             .filter_map(|id| self.node_map.get(id).copied())
             .collect();
-        let mut new_ids: Vec<String> = Vec::new();
+        let mut new_ids: Vec<(String, usize)> = Vec::new();
 
-        for _hop in 0..max_hops {
+        for hop_idx in 0..max_hops {
             if frontier.is_empty() || new_ids.len() >= max_fan_out {
                 break;
             }
@@ -619,7 +647,7 @@ impl PetgraphBackend {
                     if !visited.contains(neighbour_id) {
                         visited.insert(neighbour_id.clone());
                         next_frontier.push(neighbour_idx);
-                        new_ids.push(neighbour_id.clone());
+                        new_ids.push((neighbour_id.clone(), hop_idx + 1));
                         if new_ids.len() >= max_fan_out {
                             break;
                         }
@@ -665,6 +693,8 @@ impl RetrievalBackend for PetgraphBackend {
             return Ok(flat);
         }
 
+        let max_flat_relevance = flat.iter().map(|c| c.raw_relevance).fold(0.0_f32, f32::max);
+
         // 3. Petgraph BFS expansion (no SQLite round-trips per hop).
         let new_ids = self.petgraph_expand(&seen_ids, MAX_HOPS, MAX_FAN_OUT);
 
@@ -673,7 +703,8 @@ impl RetrievalBackend for PetgraphBackend {
         }
 
         // 4. Fetch graph-reached candidates from SQLite (active memories only).
-        let graph_candidates = fetch_graph_candidates(conn, &new_ids, &mut seen_ids)?;
+        let graph_candidates =
+            fetch_graph_candidates(conn, &new_ids, &mut seen_ids, max_flat_relevance)?;
 
         // 5. Flat first (real relevance signals), graph-reached appended.
         let mut combined = flat;
