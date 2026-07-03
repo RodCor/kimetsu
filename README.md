@@ -53,7 +53,7 @@ kimetsu doctor --selftest            # records a memory and retrieves it
 ```
 
 Other install paths (cargo, prebuilt archives) and host-wiring details are in
-**[the install guide](https://rodcor.github.io/kimetsu/docs/install)**.
+**[the install guide](https://kimetsu.dev/docs/install)**.
 
 ---
 
@@ -93,7 +93,7 @@ Other install paths (cargo, prebuilt archives) and host-wiring details are in
 
 Full mechanics: scoring, citations, decay, conflict detection, retrieval
 levels, and the daemon, in
-**[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**.
+**[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)**.
 
 ---
 
@@ -122,7 +122,7 @@ are redacted automatically, and `--strict` aborts the export if anything was
 found. Merge is idempotent, so re-importing is safe. Replace supersedes rather
 than deletes, so a swap can always be undone. For continuous sharing,
 `kimetsu brain sync` replicates a brain across machines with no server, and
-**[Kimetsu Remote](https://rodcor.github.io/kimetsu/docs/remote)** serves one
+**[Kimetsu Remote](https://kimetsu.dev/docs/remote)** serves one
 brain per repository to a whole team.
 
 ---
@@ -149,7 +149,7 @@ full set on their own harness, Cognee (a knowledge-graph system with an LLM in
 the loop) leads at 100K/10M, and vendor numbers are self-reported. We ship the
 exact harness, reader, and settings so ours can be checked. Per-ability tables,
 caveats, and reproduction steps:
-**[the memory benchmark](https://rodcor.github.io/kimetsu/docs/memory-benchmark)**.
+**[the memory benchmark](https://kimetsu.dev/docs/memory-benchmark)**.
 
 Retrieval itself is benchmarked too: recall@4 0.949 and MRR 0.914 at ~138 ms
 with the default reranker (up to 0.975 / 0.933 with the quality-best one), on a
@@ -176,8 +176,8 @@ corpus with `kimetsu brain bench`.
 | `kimetsu brain bench` | Benchmark retrieval on your own corpus |
 
 The full command surface, configuration keys, and maintenance commands are in
-**[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)** and
-**[the install guide](https://rodcor.github.io/kimetsu/docs/install)**.
+**[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)** and
+**[the install guide](https://kimetsu.dev/docs/install)**.
 
 ---
 
@@ -195,20 +195,20 @@ kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
 
 Bearer auth, per-repo brains, an optional shared org-brain, server-side repo
 ingest, TLS, Prometheus metrics, and a server-side reranker. Full setup in
-**[the Kimetsu Remote guide](https://rodcor.github.io/kimetsu/docs/remote)**.
+**[the Kimetsu Remote guide](https://kimetsu.dev/docs/remote)**.
 
 ---
 
 ## Docs
 
-- **[Install & host wiring](https://rodcor.github.io/kimetsu/docs/install)**: every install path, host
+- **[Install & host wiring](https://kimetsu.dev/docs/install)**: every install path, host
   wiring, auto-harvest and distiller setup, maintenance commands.
-- **[How Kimetsu Works](https://rodcor.github.io/kimetsu/docs/how-kimetsu-works)**: the brain, the broker,
+- **[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)**: the brain, the broker,
   citations, decay, conflict detection, the MCP surface, retrieval models and
   benchmarking, configuration, the bridge, and doctor.
-- **[Local models](https://rodcor.github.io/kimetsu/docs/local-models)**: run fully local with Ollama.
-- **[Kimetsu Remote](https://rodcor.github.io/kimetsu/docs/remote)**: server setup, org brain, TLS, clients.
-- **[CHANGELOG](https://rodcor.github.io/kimetsu/docs/changelog)**: what shipped in each release.
+- **[Local models](https://kimetsu.dev/docs/local-models)**: run fully local with Ollama.
+- **[Kimetsu Remote](https://kimetsu.dev/docs/remote)**: server setup, org brain, TLS, clients.
+- **[CHANGELOG](https://kimetsu.dev/docs/changelog)**: what shipped in each release.
 
 ---
 

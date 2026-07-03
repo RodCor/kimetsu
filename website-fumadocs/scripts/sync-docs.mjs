@@ -28,7 +28,7 @@ const outDir = resolve(siteRoot, 'content', 'docs');
 const publicDir = resolve(siteRoot, 'public');
 
 const GH = 'https://github.com/RodCor/kimetsu';
-const BASE = '/kimetsu'; // GitHub Pages base path
+const BASE = ''; // served at the domain root (kimetsu.dev)
 
 // Explicit allowlist. Order = sidebar/nav order. `out` names map to route slugs.
 const DOCS = [
@@ -88,7 +88,7 @@ const NAV_PAGES = (() => {
 
 const stripBom = (s) => s.replace(/^﻿/, '');
 
-const SITE = 'https://rodcor.github.io/kimetsu/docs/';
+const SITE = 'https://kimetsu.dev/docs/';
 
 // --- Link / image transforms ---------------------------------------------
 // Adapted from website/scripts/sync-docs.mjs for Fumadocs slugs + basePath.
@@ -106,7 +106,7 @@ function transformLinks(s) {
       .replaceAll(`${SITE}contributing`, 'contributing')
       .replaceAll(`${SITE}code-of-conduct`, 'code-of-conduct')
       .replaceAll(`${SITE}changelog`, 'changelog')
-      .replaceAll(SITE, '/kimetsu/docs/') // any remaining doc-root links
+      .replaceAll(SITE, '/docs/') // any remaining doc-root links
       // Images -> static assets under the /kimetsu base path (raw <img> and
       // markdown image links both need the base-prefixed absolute path).
       .replaceAll('docs/assets/kimetsu-logo.png', `${BASE}/kimetsu-logo.png`)

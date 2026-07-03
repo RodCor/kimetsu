@@ -6,8 +6,7 @@ const withMDX = createMDX();
 const config = {
   output: 'export',
   reactStrictMode: true,
-  // GitHub Pages serves the site under https://rodcor.github.io/kimetsu
-  basePath: '/kimetsu',
+  // Served at the domain root: https://kimetsu.dev (GitHub Pages custom domain).
   trailingSlash: true,
   images: { unoptimized: true },
 };

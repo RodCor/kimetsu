@@ -2,7 +2,7 @@ import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 import { appName, links } from './shared';
 
 // Assets live in public/ and are served under the GitHub Pages base path.
-const BASE = '/kimetsu';
+const BASE = '';
 
 export function baseOptions(): BaseLayoutProps {
   return {

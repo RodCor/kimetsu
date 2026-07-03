@@ -13,7 +13,7 @@ import { BrainSharing, Proactive } from './_components/home-visuals';
 import { ExploreSection } from './_components/explore-section';
 import { Reveal } from './_components/reveal';
 
-const BASE = '/kimetsu';
+const BASE = '';
 
 const stats = [
   { value: '73.3%', label: 'BEAM 100K memory bench', note: 'matches the prior public SOTA, with no model in the pipeline' },
