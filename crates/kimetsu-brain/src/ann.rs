@@ -487,9 +487,19 @@ impl AnnIndex {
     /// A process-unique sibling temp path (`<name>.<pid>.tmp`) for an atomic
     /// write-then-rename. The pid suffix prevents two concurrent fleet processes
     /// from colliding on the same temp file.
+    /// A temp path beside `path` that is unique per process AND per call.
+    ///
+    /// The pid keeps concurrent fleet PROCESSES from colliding; the sequence
+    /// number keeps concurrent saves WITHIN one process apart. Without it,
+    /// `get_or_build_handle`'s background `spawn_save` and a foreground
+    /// `save()` of the same handle computed the same tmp path: whichever
+    /// renamed first consumed the file and the other's rename failed with
+    /// ENOENT (caught by ubuntu CI; timing-dependent, so Windows passed).
     fn tmp_sibling(path: &Path) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut name = path.file_name().map(|n| n.to_owned()).unwrap_or_default();
-        name.push(format!(".{}.tmp", std::process::id()));
+        name.push(format!(".{}-{}.tmp", std::process::id(), seq));
         path.with_file_name(name)
     }
 
@@ -519,17 +529,6 @@ impl AnnIndex {
         };
 
         // 1. Index → temp → atomic rename.
-        //
-        // usearch quirk: saving a never-reserved (empty, zero-capacity) index
-        // returns Ok without creating the file on Linux, so the rename below
-        // fails with ENOENT (observed on ubuntu CI; Windows writes a header
-        // file). Reserving a minimal capacity first makes the serializer emit
-        // a valid file on every platform.
-        if self.index.size() == 0 && self.index.capacity() == 0 {
-            self.index
-                .reserve(1)
-                .map_err(|e| format!("usearch reserve (empty save): {e}"))?;
-        }
         let index_tmp = Self::tmp_sibling(sidecar);
         self.index
             .save(index_tmp.to_string_lossy().as_ref())
@@ -1414,5 +1413,30 @@ mod tests {
         invalidate_sidecar(&conn);
         assert!(!db.with_extension("usearch").exists());
         assert!(cached_handle(&conn).is_none());
+    }
+
+    /// Concurrent saves of the same handle must all succeed: the background
+    /// `spawn_save` from `get_or_build_handle` races any foreground `save()`,
+    /// and both used to compute the SAME pid-based tmp path — whichever
+    /// renamed first consumed the file and the other failed with ENOENT
+    /// (the ubuntu CI failure). The per-call sequence number in
+    /// `tmp_sibling` makes every save's tmp path unique.
+    #[test]
+    fn concurrent_saves_do_not_collide() {
+        let dim = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let handle = handle_for_query(&conn, dim, "stub-d8").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let h = handle.clone();
+                s.spawn(move || {
+                    h.read().unwrap().save().unwrap();
+                });
+            }
+        });
+        assert!(db.with_extension("usearch").exists());
     }
 }
