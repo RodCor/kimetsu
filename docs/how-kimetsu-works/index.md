@@ -15,16 +15,12 @@ add/list/blame/conflicts, repo ingest, the bridge to other supported hosts).
 Memories carry across sessions; learning compounds.
 
 The intended loop is two calls: **`kimetsu_brain_context`** early on a
-non-trivial task (zero overhead when the brain has nothing, since it returns
-`skipped: true`), then **`kimetsu_brain_record`** after solving a
-non-obvious problem worth remembering. `kimetsu plugin install <host>` wires the
-context step automatically for **Claude Code**, **Codex**, **Pi**, and
-**OpenClaw**, writing each host's native config (hooks + MCP for Claude/Codex/
-OpenClaw; a TypeScript extension for Pi, which has no MCP). They wire
-`UserPromptSubmit` to `kimetsu brain context-hook`; hosts with a supported stop
-event also wire `kimetsu brain stop-hook` to summarize what was captured (see
-section 7). Pi and OpenClaw are opt-in Cargo features, bundled in the official
-prebuilt/npm binaries.
+non-trivial task (zero overhead when the brain has nothing), then
+**`kimetsu_brain_record`** after solving a problem worth remembering.
+`kimetsu plugin install <host>` wires both automatically for **Claude Code**,
+**Codex**, **Pi**, and **OpenClaw**, writing each host's native config (hooks
+plus MCP; a TypeScript extension for Pi, which has no MCP). Hosts with a stop
+event also get a session summary hook.
 
 **As a standalone REPL.** Run `kimetsu chat`. Same brain, same
 tools, only without a host harness. Useful for debugging a brain or

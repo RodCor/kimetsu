@@ -28,3 +28,35 @@ html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
 }
+
+/* ── Motion ──────────────────────────────────────────────────────────────
+   Scroll/entrance reveals + tab-panel transition. CSS-only, dependency-free.
+   Everything collapses to "just show it" under prefers-reduced-motion. */
+
+@keyframes kimetsu-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Hero + above-the-fold: play once on load. Stagger via inline animation-delay. */
+.km-enter {
+  animation: kimetsu-fade-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Tab panels: replay on switch (keyed remount). */
+.km-panel-in {
+  animation: kimetsu-fade-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .km-enter,
+  .km-panel-in {
+    animation: none;
+  }
+}

@@ -1,4 +1,9 @@
-# ROI Methodology: `kimetsu brain roi`
+# Kimetsu Algorithm
+
+How Kimetsu turns memory into measurable savings: every cited memory is
+credited with the tokens it saved, every injection is charged for the tokens
+it cost, and `kimetsu brain roi` reports the net. This page documents the
+exact accounting so the ledger can be audited rather than trusted.
 
 > **Source of truth for the per-kind constants:**
 > `crates/kimetsu-brain/src/roi.rs`, `SAVED_TOKENS_PER_CITATION`
@@ -101,7 +106,7 @@ conservative zone.
 ```toml
 # project.toml: override the built-in price table for this project
 [model]
-model = "claude-sonnet-4-7"
+model = "claude-sonnet-5"
 price_per_mtok = 3.0   # optional; defaults to built-in table
 ```
 

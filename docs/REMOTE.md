@@ -47,6 +47,24 @@ references `${KIMETSU_REMOTE_TOKEN}` (set that env var where your agent runs)
 rather than writing the token to disk. Pass `--token <t>` to embed a literal.
 The remote surfaces the memory/retrieval/curation tools by default.
 
+## Team writes and attribution
+
+Give each teammate their own bearer token (`--token` is repeatable, or use
+`--tokens-file` for a TOML of global and per-repo tokens). Writes are
+attributed to the token that made them, so `memory blame` on a shared brain
+answers who recorded what. Rate limiting is per token.
+
+You can also write to the shared brain from the CLI without wiring a host:
+
+```bash
+kimetsu brain memory add "prefer sqlx over diesel here" \
+  --remote https://kimetsu.example.com:8787 --repo my-org/my-repo
+```
+
+Concurrent writers are safe: the event log gives every write a stable order,
+conflicting facts are detected and resolved the same way as locally, and
+surviving conflicts are surfaced for review rather than silently dropped.
+
 ## Retrieval quality
 
 The server reranks `kimetsu_brain_context` results with a
