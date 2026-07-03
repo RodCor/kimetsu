@@ -102,6 +102,14 @@ impl ProjectConfig {
     /// Called once at the load chokepoint (`load_config`) so every retrieval
     /// consumer sees the resolved `[embedder]` values automatically.
     pub fn apply_retrieval_level(&mut self) {
+        // The `[embedder] enabled = false` off-switch outranks every level
+        // preset: levels tune the retrieval stack, they must never override an
+        // explicit opt-out (the bidirectional-config rule). Without this guard,
+        // `level = "deep"` silently re-enabled a disabled embedder on every
+        // config load, and vectors were written against the operator's wishes.
+        if !self.embedder.enabled {
+            return;
+        }
         match self.retrieval.level.as_str() {
             "basic" => {
                 self.embedder.enabled = false;
@@ -1404,6 +1412,29 @@ max_total_cost_usd = 250.0
         unknown.embedder.enabled = false;
         unknown.apply_retrieval_level();
         assert!(!unknown.embedder.enabled, "unknown level must be a no-op");
+    }
+
+    /// The `[embedder] enabled = false` off-switch outranks every level
+    /// preset: `level = "deep"` (or any other) must never re-enable a
+    /// disabled embedder on config load. Regression test for the W3.1
+    /// CI failure where vectors were written despite `enabled = false`.
+    #[test]
+    fn retrieval_level_never_overrides_embedder_off_switch() {
+        for level in &["basic", "flexible", "deep", "advanced"] {
+            let mut cfg = ProjectConfig::default_for_project("p");
+            cfg.retrieval.level = level.to_string();
+            cfg.embedder.enabled = false;
+            let reranker_before = cfg.embedder.reranker.clone();
+            cfg.apply_retrieval_level();
+            assert!(
+                !cfg.embedder.enabled,
+                "level {level} must not re-enable a disabled embedder"
+            );
+            assert_eq!(
+                cfg.embedder.reranker, reranker_before,
+                "level {level} must not touch the reranker when the embedder is off"
+            );
+        }
     }
 
     /// A1: default_for_project must use KIMETSU_CONFIG_VERSION (the
