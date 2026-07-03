@@ -519,6 +519,17 @@ impl AnnIndex {
         };
 
         // 1. Index → temp → atomic rename.
+        //
+        // usearch quirk: saving a never-reserved (empty, zero-capacity) index
+        // returns Ok without creating the file on Linux, so the rename below
+        // fails with ENOENT (observed on ubuntu CI; Windows writes a header
+        // file). Reserving a minimal capacity first makes the serializer emit
+        // a valid file on every platform.
+        if self.index.size() == 0 && self.index.capacity() == 0 {
+            self.index
+                .reserve(1)
+                .map_err(|e| format!("usearch reserve (empty save): {e}"))?;
+        }
         let index_tmp = Self::tmp_sibling(sidecar);
         self.index
             .save(index_tmp.to_string_lossy().as_ref())
