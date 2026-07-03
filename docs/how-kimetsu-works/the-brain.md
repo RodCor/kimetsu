@@ -1,61 +1,39 @@
+brain.db: the event-sourced SQLite file that holds everything Kimetsu remembers, and how it migrates safely.
 
-Everything kimetsu remembers lives in **brain.db**, a single SQLite
-file. Each project gets one at `<project>/.kimetsu/brain.db`. A
-global user brain at `~/.kimetsu/brain.db` holds memories that
-follow you across projects (set `KIMETSU_USER_BRAIN=0`, or
-`[kimetsu] use_user_brain = false` in `project.toml`, to disable).
+Everything kimetsu remembers lives in **brain.db**, a single SQLite file per
+project at `<project>/.kimetsu/brain.db`. A global user brain at
+`~/.kimetsu/brain.db` holds memories that follow you across projects
+(disable with `KIMETSU_USER_BRAIN=0` or `[kimetsu] use_user_brain = false`).
 
-`.kimetsu/` is deliberately **lean**: a brain-only install holds just
-`brain.db` (plus its `-wal` / `-shm` and any `brain.db.bak-*` migration
-sidecars) and `project.toml`. Memory writes persist straight to brain.db;
-they do **not** create a per-write `runs/<id>/` directory. Only a real agent
-run still writes a `runs/<id>/` dir with its artifacts. The transient
-non-brain working dirs (`proactive/`, `chat/`, `bench/`) live OUT of the repo,
-under `~/.kimetsu/cache/<project-hash>/`, so they never clutter your tree.
+`.kimetsu/` stays lean: just `brain.db` (plus WAL and migration backups) and
+`project.toml`. Transient working dirs live under
+`~/.kimetsu/cache/<project-hash>/`, never in your tree.
 
-The brain is event-sourced, and the **`events` table inside brain.db is the
-durable event log**, not a loose pile of JSONL files. A **projector** replays
-those events into materialized tables the broker can query fast.
-`kimetsu brain rebuild` re-derives every projection from the `events` table
-(pass `--from-traces` to re-import from legacy on-disk `trace.jsonl` files for
-recovery). The materialized tables:
+The brain is event-sourced: the **`events` table is the durable log**, and a
+projector replays it into materialized tables the broker queries fast.
+`kimetsu brain rebuild` re-derives every projection from the log. The tables:
 
-- `runs`: one row per agent run (started_at, terminal_kind, cost).
-- `events`: every event ever written, raw; the durable source for rebuild.
-- `memories`: the durable knowledge. Each row carries scope
-  (`global_user`, `project`, `repo`, `run`), kind (`preference`,
-  `convention`, `command`, `failure_pattern`, `fact`), text, confidence,
+- `runs`: one row per agent run.
+- `events`: every event ever written; the source for rebuild.
+- `memories`: the durable knowledge, with scope, kind, text, confidence,
   use_count, usefulness_score, and last_useful_at.
-- `memory_proposals`: pending suggestions awaiting human review.
-- `memory_citations`: which memories the model cited during which
-  run, on which turn.
-- `memory_conflicts`: ingest-time hits where a new memory's
-  embedding was too close to an existing one with contradictory text.
-- `repo_files`, `repo_files_fts`, `repo_manifests`,
-  `repo_manifests_fts`: file-level indexes built by
-  `kimetsu brain ingest repo`.
-- `memories_fts`: FTS5 index of memory text for lexical retrieval.
+- `memory_proposals`: pending suggestions awaiting review.
+- `memory_citations`: which memories the model cited, in which run.
+- `memory_conflicts`: ingest-time contradiction hits.
+- `repo_files*`, `repo_manifests*`: file indexes from `brain ingest repo`.
+- `memories_fts`: FTS5 index for lexical retrieval.
 
 ## Durable upgrades: schema migrations
 
-brain.db carries a schema version (`KIMETSU_SCHEMA_VERSION`, currently **3**)
-in its `schema_info` table. On every read-write open, a versioned,
-forward-only migration runner brings the DB up to the binary's target. Each
-migration runs inside **one transaction** (the DDL and the version bump commit
-together), so a crash mid-upgrade leaves the DB cleanly stamped at an
-intermediate version rather than half-applied. Before any version-advancing
-migration the runner takes an online-backup snapshot to a
-`brain.db.bak-<from>-<to>-<ts>` sidecar next to the DB (skipped for empty
-brains, since a fresh install has nothing to protect; the three newest backups are
-kept). A read-only open of an un-migrated brain degrades gracefully: it reports
-"needs migration" and the next read-write open performs it.
+brain.db carries a schema version, and a forward-only migration runner brings
+it up to the binary's target on every read-write open. Each migration runs in
+one transaction, so a crash leaves the DB cleanly stamped at an intermediate
+version, never half-applied. Before any migration the runner snapshots to a
+`brain.db.bak-*` sidecar (three newest kept). A read-only open of an
+un-migrated brain reports "needs migration" instead of failing.
 
-This DB schema version is **decoupled from the `project.toml` config version**
-(`KIMETSU_CONFIG_VERSION`, still `1`). So `[kimetsu] schema_version = 1` in
-`project.toml` is the *config-format* version, not the DB schema: the database
-can evolve (and migrate) without forcing every project.toml to be rewritten.
-The old "forward-additive `add_column_if_missing`, no rebuild" patches from
-v0.1-v0.5 are now folded into the single v1→v2 migration.
+The DB schema version is decoupled from the `project.toml` config version, so
+the database can evolve without rewriting every project's config file.
 
 ## Memory kinds
 
@@ -75,5 +53,3 @@ v0.1-v0.5 are now folded into the single v1→v2 migration.
 | `repo` | This repo | Project conventions, code-specific facts |
 | `project` | This project (== repo today) | Synonym for repo |
 | `global_user` | User-wide brain | Personal preferences, cross-project knowledge |
-
----

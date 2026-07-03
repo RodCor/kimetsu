@@ -36,8 +36,7 @@ const DOCS = [
   { src: 'docs/INSTALL.md',           out: 'install.mdx',          title: 'Install & Host Wiring' },
   { src: 'docs/LOCAL-MODELS.md',      out: 'local-models.mdx',     title: 'Local Models' },
   { src: 'docs/REMOTE.md',            out: 'remote.mdx',           title: 'Kimetsu Remote' },
-  { src: 'docs/MEMORY-BENCHMARK.md',  out: 'memory-benchmark.mdx', title: 'Memory Benchmark' },
-  { src: 'docs/ROI-METHODOLOGY.md',   out: 'roi-methodology.mdx',  title: 'ROI Methodology' },
+  { src: 'docs/ROI-METHODOLOGY.md',   out: 'roi-methodology.mdx',  title: 'Kimetsu Algorithm' },
   { src: 'docs/CONTRIBUTING.md',      out: 'contributing.mdx',     title: 'Contributing' },
   { src: 'docs/CODE_OF_CONDUCT.md',   out: 'code-of-conduct.mdx',  title: 'Code of Conduct' },
   { src: 'CHANGELOG.md',              out: 'changelog.mdx',        title: 'Changelog' },
@@ -56,8 +55,23 @@ const FOLDERS = [
       { src: 'docs/how-kimetsu-works/the-brain.md',     out: 'the-brain.mdx',     title: 'The brain' },
       { src: 'docs/how-kimetsu-works/the-broker.md',    out: 'the-broker.mdx',    title: 'The broker' },
       { src: 'docs/how-kimetsu-works/learning-loop.md', out: 'learning-loop.mdx', title: 'The learning loop' },
-      { src: 'docs/how-kimetsu-works/interfaces.md',    out: 'interfaces.mdx',    title: 'Interfaces' },
-      { src: 'docs/how-kimetsu-works/operations.md',    out: 'operations.mdx',    title: 'Operations & reference' },
+      { src: 'docs/how-kimetsu-works/interfaces.md',       out: 'interfaces.mdx',       title: 'Interfaces' },
+      { src: 'docs/how-kimetsu-works/retrieval-models.md', out: 'retrieval-models.mdx', title: 'Retrieval models' },
+      { src: 'docs/how-kimetsu-works/operations.md',       out: 'operations.mdx',       title: 'Operations' },
+      { src: 'docs/how-kimetsu-works/configuration.md',    out: 'configuration.mdx',    title: 'Configuration' },
+    ],
+  },
+  {
+    dir: 'memory-benchmark',
+    title: 'Memory Benchmark',
+    after: 'remote',
+    pages: [
+      { src: 'docs/memory-benchmark/index.md',                     out: 'index.mdx',                     title: 'Overview' },
+      { src: 'docs/memory-benchmark/retrieval-and-correctness.md', out: 'retrieval-and-correctness.mdx', title: 'Retrieval & correctness' },
+      { src: 'docs/memory-benchmark/brainbench.md',                out: 'brainbench.mdx',                title: 'BrainBench' },
+      { src: 'docs/memory-benchmark/longmemeval.md',               out: 'longmemeval.mdx',               title: 'LongMemEval' },
+      { src: 'docs/memory-benchmark/beam.md',                      out: 'beam.mdx',                      title: 'BEAM' },
+      { src: 'docs/memory-benchmark/comparison.md',                out: 'comparison.mdx',                title: 'How Kimetsu compares' },
     ],
   },
 ];
@@ -97,6 +111,7 @@ function transformLinks(s) {
       // markdown image links both need the base-prefixed absolute path).
       .replaceAll('docs/assets/kimetsu-logo.png', `${BASE}/kimetsu-logo.png`)
       .replaceAll('docs/assets/demo.gif', `${BASE}/demo.gif`)
+      .replaceAll('docs/assets/how-it-works.svg', `${BASE}/how-it-works.svg`)
       // inter-doc links (any of ./  ../  docs/  prefix, with or without .md) -> slugs
       .replace(/\]\((?:\.\/|\.\.\/|docs\/)?HOW-KIMETSU-WORKS(?:\.md)?\)/g, '](how-kimetsu-works)')
       .replace(/\]\((?:\.\/|\.\.\/|docs\/)?INSTALL(?:\.md)?\)/g, '](install)')
@@ -297,6 +312,7 @@ function copyAssets() {
     'demo.gif',
     'favicon.ico',
     'logo.svg',
+    'how-it-works.svg',
   ]);
   for (const dir of sources) {
     let entries;
