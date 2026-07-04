@@ -91,42 +91,86 @@ const stripBom = (s) => s.replace(/^﻿/, '');
 const SITE = 'https://kimetsu.dev/docs/';
 
 // --- Link / image transforms ---------------------------------------------
-// Adapted from website/scripts/sync-docs.mjs for Fumadocs slugs + basePath.
-function transformLinks(s) {
-  return (
-    s
-      // README links to this very site (absolute) -> in-site slugs so the
-      // Introduction page navigates in-site instead of full-reloading.
-      .replaceAll(`${SITE}how-kimetsu-works`, 'how-kimetsu-works')
-      .replaceAll(`${SITE}install`, 'install')
-      .replaceAll(`${SITE}local-models`, 'local-models')
-      .replaceAll(`${SITE}remote`, 'remote')
-      .replaceAll(`${SITE}memory-benchmark`, 'memory-benchmark')
-      .replaceAll(`${SITE}roi-methodology`, 'roi-methodology')
-      .replaceAll(`${SITE}contributing`, 'contributing')
-      .replaceAll(`${SITE}code-of-conduct`, 'code-of-conduct')
-      .replaceAll(`${SITE}changelog`, 'changelog')
-      .replaceAll(SITE, '/docs/') // any remaining doc-root links
-      // Images -> static assets under the /kimetsu base path (raw <img> and
-      // markdown image links both need the base-prefixed absolute path).
-      .replaceAll('docs/assets/kimetsu-logo.png', `${BASE}/kimetsu-logo.png`)
-      .replaceAll('docs/assets/demo.gif', `${BASE}/demo.gif`)
-      .replaceAll('docs/assets/how-it-works.svg', `${BASE}/how-it-works.svg`)
-      // inter-doc links (any of ./  ../  docs/  prefix, with or without .md) -> slugs
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?HOW-KIMETSU-WORKS(?:\.md)?\)/g, '](how-kimetsu-works)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?INSTALL(?:\.md)?\)/g, '](install)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?LOCAL-MODELS(?:\.md)?\)/g, '](local-models)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?REMOTE(?:\.md)?\)/g, '](remote)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?MEMORY-BENCHMARK(?:\.md)?\)/g, '](memory-benchmark)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?ROI-METHODOLOGY(?:\.md)?\)/g, '](roi-methodology)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?CONTRIBUTING(?:\.md)?\)/g, '](contributing)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?CODE_OF_CONDUCT(?:\.md)?\)/g, '](code-of-conduct)')
-      .replace(/\]\((?:\.\/|\.\.\/|docs\/)?CHANGELOG(?:\.md)?\)/g, '](changelog)')
-      // repo-relative file/dir links that have no on-site page -> GitHub
-      .replace(/\]\((?:\.\.\/)?npm\/?\)/g, `](${GH}/tree/main/npm)`)
-      .replaceAll('docs/LICENSE-MIT', `${GH}/blob/main/docs/LICENSE-MIT`)
-      .replaceAll('docs/LICENSE-APACHE', `${GH}/blob/main/docs/LICENSE-APACHE`)
+// All internal links become ABSOLUTE /docs/... paths. Relative slugs break in
+// two ways on the deployed site: a subfolder page linking `(install)` resolves
+// inside its own folder, and a folder INDEX page linking a sibling `(beam)`
+// resolves against /docs/ (no trailing slash on index routes). Absolute paths
+// are immune to both.
+
+// Route tables for the generic resolver below.
+const TOP_ROUTES = new Set(
+  DOCS.map((d) => d.out.replace(/\.mdx$/, '')).filter((r) => r !== 'index'),
+);
+const FOLDER_ROUTES = new Map(
+  FOLDERS.map((f) => [f.dir, new Set(f.pages.map((p) => p.out.replace(/\.mdx$/, '')))]),
+);
+
+// Old ALL-CAPS doc filenames -> their route (any ./ ../ docs/ prefix).
+const NAMED_DOCS = {
+  'HOW-KIMETSU-WORKS': 'how-kimetsu-works',
+  INSTALL: 'install',
+  'LOCAL-MODELS': 'local-models',
+  REMOTE: 'remote',
+  'MEMORY-BENCHMARK': 'memory-benchmark',
+  'ROI-METHODOLOGY': 'roi-methodology',
+  CONTRIBUTING: 'contributing',
+  CODE_OF_CONDUCT: 'code-of-conduct',
+  CHANGELOG: 'changelog',
+};
+
+// `selfDir` is the folder of the page being generated ('' for top-level) so
+// bare sibling links (`(beam)`, `(the-brain.md)`) resolve inside it.
+function transformLinks(s, selfDir = '') {
+  let out = s
+    // Site-absolute links (README) -> in-site absolute paths.
+    .replaceAll(SITE, '/docs/')
+    // Images -> static assets (raw <img> and markdown image links).
+    .replaceAll('docs/assets/kimetsu-logo.png', `${BASE}/kimetsu-logo.png`)
+    .replaceAll('docs/assets/demo.gif', `${BASE}/demo.gif`)
+    .replaceAll('docs/assets/how-it-works.svg', `${BASE}/how-it-works.svg`)
+    // repo-relative file/dir links that have no on-site page -> GitHub
+    .replace(/\]\((?:\.\.\/)?npm\/?\)/g, `](${GH}/tree/main/npm)`)
+    .replaceAll('docs/LICENSE-MIT', `${GH}/blob/main/docs/LICENSE-MIT`)
+    .replaceAll('docs/LICENSE-APACHE', `${GH}/blob/main/docs/LICENSE-APACHE`);
+
+  // Old ALL-CAPS doc names.
+  for (const [name, route] of Object.entries(NAMED_DOCS)) {
+    out = out.replace(
+      new RegExp(String.raw`\]\((?:\./|\.\./|docs/)?${name}(?:\.md)?(#[^)]*)?\)`, 'g'),
+      (_, anchor) => `](/docs/${route}${anchor ?? ''})`,
+    );
+  }
+
+  // Generic resolver for remaining relative page links (with or without .md,
+  // ./ or ../ prefixes, optional #anchor). Unknown targets are left alone.
+  out = out.replace(
+    /\]\((?:\.\/|\.\.\/)?([a-z0-9-]+(?:\/[a-z0-9-]+)?)(?:\.md)?(#[^)]*)?\)/g,
+    (full, target, anchor = '') => {
+      const route = resolveRoute(target, selfDir);
+      return route ? `](${route}${anchor})` : full;
+    },
   );
+  return out;
+}
+
+function resolveRoute(target, selfDir) {
+  // folder/page or folder/index
+  const [head, tail] = target.split('/');
+  if (tail !== undefined) {
+    const pages = FOLDER_ROUTES.get(head);
+    if (!pages || !pages.has(tail)) return null;
+    return tail === 'index' ? `/docs/${head}` : `/docs/${target}`;
+  }
+  // top-level page or a folder's landing page
+  if (TOP_ROUTES.has(target) || FOLDER_ROUTES.has(target)) return `/docs/${target}`;
+  // bare sibling inside the current folder
+  if (selfDir) {
+    const pages = FOLDER_ROUTES.get(selfDir);
+    if (pages?.has(target)) {
+      return target === 'index' ? `/docs/${selfDir}` : `/docs/${selfDir}/${target}`;
+    }
+  }
+  return null;
 }
 
 // --- MDX hardening ---------------------------------------------------------
@@ -345,7 +389,9 @@ copyAssets();
 
 function writePage(src, outRel, title) {
   const raw = stripBom(readFileSync(resolve(repo, src), 'utf8'));
-  const linked = transformLinks(raw);
+  const outNorm = outRel.replace(/\\/g, '/');
+  const selfDir = outNorm.includes('/') ? outNorm.split('/')[0] : '';
+  const linked = transformLinks(raw, selfDir);
   const description = firstParagraph(linked);
   const hardened = hardenMdx(linked);
   const fm = [
