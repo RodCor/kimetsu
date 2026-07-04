@@ -244,9 +244,18 @@ pub fn load_project(start: &Path) -> KimetsuResult<(ProjectPaths, ProjectConfig,
     paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
+        // Name the offending file: project discovery climbs to the enclosing
+        // git root, so the mismatching project.toml is often NOT in the
+        // directory the user ran from (e.g. a legacy ~/.kimetsu/project.toml
+        // when $HOME is itself a git repo). Without the path this error is a
+        // maze — it cost a full benchmark run to locate once.
         return Err(format!(
-            "project.toml schema version {} does not match expected {}",
-            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
+            "project.toml schema version {} does not match expected {} (file: {}). \
+             If this is not the project you meant, run from inside a git \
+             repository or pass --workspace to pin the project root.",
+            config.kimetsu.schema_version,
+            KIMETSU_CONFIG_VERSION,
+            paths.project_toml.display()
         )
         .into());
     }
@@ -301,9 +310,18 @@ pub fn load_project_at_root(
     paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
+        // Name the offending file: project discovery climbs to the enclosing
+        // git root, so the mismatching project.toml is often NOT in the
+        // directory the user ran from (e.g. a legacy ~/.kimetsu/project.toml
+        // when $HOME is itself a git repo). Without the path this error is a
+        // maze — it cost a full benchmark run to locate once.
         return Err(format!(
-            "project.toml schema version {} does not match expected {}",
-            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
+            "project.toml schema version {} does not match expected {} (file: {}). \
+             If this is not the project you meant, run from inside a git \
+             repository or pass --workspace to pin the project root.",
+            config.kimetsu.schema_version,
+            KIMETSU_CONFIG_VERSION,
+            paths.project_toml.display()
         )
         .into());
     }
@@ -322,9 +340,18 @@ pub fn load_project_readonly_at_root(
     paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
+        // Name the offending file: project discovery climbs to the enclosing
+        // git root, so the mismatching project.toml is often NOT in the
+        // directory the user ran from (e.g. a legacy ~/.kimetsu/project.toml
+        // when $HOME is itself a git repo). Without the path this error is a
+        // maze — it cost a full benchmark run to locate once.
         return Err(format!(
-            "project.toml schema version {} does not match expected {}",
-            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
+            "project.toml schema version {} does not match expected {} (file: {}). \
+             If this is not the project you meant, run from inside a git \
+             repository or pass --workspace to pin the project root.",
+            config.kimetsu.schema_version,
+            KIMETSU_CONFIG_VERSION,
+            paths.project_toml.display()
         )
         .into());
     }
@@ -350,9 +377,18 @@ pub fn load_project_readonly(
     paths.validate_state_dir()?;
     let config = load_config(&paths)?;
     if config.kimetsu.schema_version != KIMETSU_CONFIG_VERSION {
+        // Name the offending file: project discovery climbs to the enclosing
+        // git root, so the mismatching project.toml is often NOT in the
+        // directory the user ran from (e.g. a legacy ~/.kimetsu/project.toml
+        // when $HOME is itself a git repo). Without the path this error is a
+        // maze — it cost a full benchmark run to locate once.
         return Err(format!(
-            "project.toml schema version {} does not match expected {}",
-            config.kimetsu.schema_version, KIMETSU_CONFIG_VERSION
+            "project.toml schema version {} does not match expected {} (file: {}). \
+             If this is not the project you meant, run from inside a git \
+             repository or pass --workspace to pin the project root.",
+            config.kimetsu.schema_version,
+            KIMETSU_CONFIG_VERSION,
+            paths.project_toml.display()
         )
         .into());
     }

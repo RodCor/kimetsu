@@ -1348,7 +1348,7 @@ fn memory_row_to_candidate(
     let raw_multiplier = usefulness_multiplier(usefulness_score as f32, use_count as u32);
     let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
     let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
-    let biased_relevance = raw_relevance * multiplier;
+    let biased_relevance = apply_usefulness_boost(raw_relevance, multiplier);
     Some(Candidate {
         raw_relevance: biased_relevance,
         embedding: row_embedding,
@@ -1414,6 +1414,28 @@ pub(crate) fn usefulness_decay(
     let age_days = (age.whole_seconds().max(0) as f32) / 86_400.0;
     let exponent = -std::f32::consts::LN_2 * age_days / half_life_days;
     exponent.exp().clamp(0.0, 1.0)
+}
+
+/// v2.5.1: absolute cap on the usefulness boost's relevance GAIN.
+///
+/// The multiplier used to apply multiplicatively (`raw * 1.5` at max boost),
+/// which let a weakly relevant but often-cited memory outrank a strongly
+/// relevant uncited one — with hundreds of boosted memories, retrieval
+/// flooded with cited-but-irrelevant capsules and collapsed (measured in the
+/// LoCoMo k=5 learning run: 56% -> 0% over three feedback rounds). Capping
+/// the gain makes usefulness a bounded prior: it reorders candidates within
+/// a relevance band but can never rescue an irrelevant memory past a genuine
+/// match. Penalties (multiplier < 1.0) stay multiplicative — suppressing
+/// net-negative memories below their raw relevance is safe and desirable.
+pub(crate) const USEFULNESS_BOOST_CAP: f32 = 0.10;
+
+/// Apply the usefulness multiplier to a relevance score with the boost gain
+/// capped at [`USEFULNESS_BOOST_CAP`] (see there for why).
+pub(crate) fn apply_usefulness_boost(raw_relevance: f32, multiplier: f32) -> f32 {
+    if multiplier <= 1.0 {
+        return raw_relevance * multiplier;
+    }
+    (raw_relevance * multiplier).min(raw_relevance + USEFULNESS_BOOST_CAP)
 }
 
 /// MP-4b multiplier in [0.5, 1.5] derived from a memory's outcome history.
@@ -2577,6 +2599,46 @@ mod tests {
         assert!((usefulness_multiplier(100.0, 5) - 1.5).abs() < f32::EPSILON);
         // ratio < -1.0 is clamped to -1.0 -> 0.5
         assert!((usefulness_multiplier(-100.0, 5) - 0.5).abs() < f32::EPSILON);
+    }
+
+    // ----- v2.5.1: citation-boost saturation (LoCoMo k=5 collapse fix) -----
+
+    /// The boost's absolute gain is capped: a max-boosted (1.5x) weakly
+    /// relevant memory must NOT outrank a strongly relevant uncited one.
+    /// This is the exact inversion observed in the LoCoMo learning run
+    /// (junk at raw 0.39 x 1.5 = 0.58 beat a true match at 0.53).
+    #[test]
+    fn boost_gain_is_capped_so_cited_junk_cannot_beat_relevant_uncited() {
+        let junk = apply_usefulness_boost(0.39, 1.5);
+        let true_match = apply_usefulness_boost(0.53, 1.0);
+        assert!(
+            junk < true_match,
+            "capped boost must preserve relevance order: junk {junk} vs match {true_match}"
+        );
+        // gain never exceeds the cap
+        assert!(junk <= 0.39 + USEFULNESS_BOOST_CAP + f32::EPSILON);
+    }
+
+    /// Within a relevance band the boost still reorders: a proven memory at
+    /// slightly lower relevance may overtake a neutral near-equal. This is
+    /// the behaviour that produced the +4.6 holdout gain and must survive.
+    #[test]
+    fn boost_still_reorders_within_a_relevance_band() {
+        let proven = apply_usefulness_boost(0.85, 1.5);
+        let neutral = apply_usefulness_boost(0.90, 1.0);
+        assert!(
+            proven > neutral,
+            "capped boost must still reorder near-equals: proven {proven} vs neutral {neutral}"
+        );
+    }
+
+    /// Penalties stay multiplicative: suppressing net-negative memories
+    /// below their raw relevance is desirable and unbounded-downward is safe
+    /// (floor 0.5x from the multiplier envelope).
+    #[test]
+    fn penalty_side_remains_multiplicative() {
+        let penalized = apply_usefulness_boost(0.8, 0.5);
+        assert!((penalized - 0.4).abs() < 1e-6);
     }
 
     // ----- MP-17 #11: task-class query expansion -----

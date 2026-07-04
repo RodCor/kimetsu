@@ -9,9 +9,12 @@ The strongest signal is which memories the model actually used. The flow:
 3. At run end, one `memory.cited` event per citation lands in
    `memory_citations`.
 4. On `run.finished`, usefulness updates: **cited memories** get the strong
-   delta (±1.0, and `last_useful_at` bumps on success); **silent passengers**
-   get a weak one (±0.1). A `run.failed` with `category = "Gate"` is no
-   signal: the verifier failing is not the memory's fault.
+   delta (+1.0, and `last_useful_at` bumps); **silent passengers** get a weak
+   one (±0.1). On `run.failed`, the cited penalty is **scaled by the memory's
+   citation history** (`-1.0 / (1 + prior citations / 3)`), so a proven memory
+   absorbs an unlucky flaky run while an unproven one takes the full hit. A
+   `run.failed` with `category = "Gate"` (the plan-stage existence guard) is
+   no signal at all.
 
 Inspect any run with `kimetsu brain memory blame <run-id>` (cited first, then
 passengers; `--json` for CI). The same surface is the

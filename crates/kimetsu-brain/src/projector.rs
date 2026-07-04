@@ -602,7 +602,34 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
 
     for memory_id in &retrieved {
         let is_cited = cited.contains(memory_id);
-        let delta = if is_cited { strong } else { weak };
+        let delta = if is_cited {
+            if strong < 0.0 {
+                // v2.5.1: citation-aware failure penalty. A memory cited in a
+                // run that fails for unrelated reasons (flaky verification, an
+                // environment hiccup categorized non-Gate) used to eat the flat
+                // -1.0; two or three unlucky runs made a genuinely proven
+                // memory a prune candidate. Scale the penalty down by the
+                // memory's citation history: a long positive track record
+                // absorbs occasional cited-failures, an unproven memory takes
+                // proportionally more of the hit.
+                //   effective = -1.0 / (1 + prior_citations / 3)
+                // (0 priors -> -1.0, 3 -> -0.5, 9 -> -0.25). Successes are
+                // never scaled; the Gate carve-out above still applies.
+                let prior_cites: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_citations
+                         WHERE memory_id = ?1 AND run_id != ?2",
+                        params![memory_id, run_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                strong / (1.0 + prior_cites as f64 / 3.0)
+            } else {
+                strong
+            }
+        } else {
+            weak
+        };
         conn.execute(
             "
             UPDATE memories
@@ -2181,6 +2208,112 @@ mod tests {
             )
             .unwrap();
         (conn, conf)
+    }
+
+    /// v2.5.1: the cited-in-failure penalty is scaled by citation history.
+    /// A memory with a positive track record absorbs an unlucky failed run
+    /// (flaky verification etc.); an unproven memory takes the full hit.
+    #[test]
+    fn failure_penalty_scales_with_prior_citations() {
+        let conn = make_conn();
+
+        // Two memories: "proven" accumulates 3 successful cited runs first.
+        for (id, text) in [
+            ("proven", "use lld on windows"),
+            ("rookie", "try the new flag"),
+        ] {
+            apply_events(
+                &conn,
+                &[make_event(
+                    RunId::new(),
+                    "memory.accepted",
+                    json!({"memory_id": id, "text": text, "scope": "project", "kind": "convention", "confidence": 0.7}),
+                )],
+            )
+            .unwrap();
+        }
+        for _ in 0..3 {
+            let run = RunId::new();
+            apply_events(
+                &conn,
+                &[
+                    make_event(run, "run.started", json!({"project_id": "p", "task": "t"})),
+                    make_event(
+                        run,
+                        "context.injected",
+                        json!({"stage": "loc", "memory_ids": ["proven"], "used_tokens": 50}),
+                    ),
+                    make_event(
+                        run,
+                        "memory.cited",
+                        json!({"memory_id": "proven", "turn": 1}),
+                    ),
+                    make_event(run, "run.finished", json!({"outcome": "ok"})),
+                ],
+            )
+            .unwrap();
+        }
+
+        let score = |id: &str| -> f64 {
+            conn.query_row(
+                "SELECT usefulness_score FROM memories WHERE memory_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let proven_before = score("proven");
+        let rookie_before = score("rookie");
+
+        // One failing (non-Gate) run where BOTH are injected and cited.
+        let fail_run = RunId::new();
+        apply_events(
+            &conn,
+            &[
+                make_event(
+                    fail_run,
+                    "run.started",
+                    json!({"project_id": "p", "task": "t"}),
+                ),
+                make_event(
+                    fail_run,
+                    "context.injected",
+                    json!({"stage": "loc", "memory_ids": ["proven", "rookie"], "used_tokens": 80}),
+                ),
+                make_event(
+                    fail_run,
+                    "memory.cited",
+                    json!({"memory_id": "proven", "turn": 1}),
+                ),
+                make_event(
+                    fail_run,
+                    "memory.cited",
+                    json!({"memory_id": "rookie", "turn": 1}),
+                ),
+                make_event(
+                    fail_run,
+                    "run.failed",
+                    json!({"category": "Verification", "message": "flaky test"}),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let proven_drop = proven_before - score("proven");
+        let rookie_drop = rookie_before - score("rookie");
+        assert!(
+            (rookie_drop - 1.0).abs() < 1e-6,
+            "unproven memory takes the full -1.0, got -{rookie_drop}"
+        );
+        assert!(
+            proven_drop < rookie_drop,
+            "3 prior citations must shrink the penalty: proven -{proven_drop} vs rookie -{rookie_drop}"
+        );
+        // effective = 1.0 / (1 + 3/3) = 0.5
+        assert!(
+            (proven_drop - 0.5).abs() < 1e-6,
+            "penalty with 3 priors must be -0.5, got -{proven_drop}"
+        );
     }
 
     /// Story 2.4 (headline): a cited memory in a successful run ends with
