@@ -406,7 +406,7 @@ fn apply_memory_aged(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 }
 
 /// Confidence calibration smoothing factor (Bayesian-ish nudge per outcome).
-const CONF_ALPHA: f64 = 0.05;
+use crate::scoring::{CITED_DELTA, CONF_ALPHA, FAILURE_PENALTY_CITES_DIVISOR, PASSENGER_DELTA};
 
 /// Apply a single cited-memory OUTCOME to one memory row, shared by the run
 /// attribution path and the standalone cite/regret path: bump `use_count`,
@@ -564,7 +564,7 @@ fn apply_terminal_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 /// citation usage where the brain is under-rewarding good capsules.
 fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let (strong, weak): (f64, f64) = match event.kind.as_str() {
-        "run.finished" => (1.0, 0.1),
+        "run.finished" => (CITED_DELTA, PASSENGER_DELTA),
         "run.failed" => {
             let category = event
                 .payload
@@ -574,7 +574,7 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
             if category == "Gate" {
                 return Ok(());
             }
-            (-1.0, -0.1)
+            (-CITED_DELTA, -PASSENGER_DELTA)
         }
         _ => return Ok(()), // run.aborted, anything else: no update
     };
@@ -623,7 +623,7 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
-                strong / (1.0 + prior_cites as f64 / 3.0)
+                strong / (1.0 + prior_cites as f64 / FAILURE_PENALTY_CITES_DIVISOR)
             } else {
                 strong
             }

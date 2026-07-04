@@ -1416,18 +1416,9 @@ pub(crate) fn usefulness_decay(
     exponent.exp().clamp(0.0, 1.0)
 }
 
-/// v2.5.1: absolute cap on the usefulness boost's relevance GAIN.
-///
-/// The multiplier used to apply multiplicatively (`raw * 1.5` at max boost),
-/// which let a weakly relevant but often-cited memory outrank a strongly
-/// relevant uncited one — with hundreds of boosted memories, retrieval
-/// flooded with cited-but-irrelevant capsules and collapsed (measured in the
-/// LoCoMo k=5 learning run: 56% -> 0% over three feedback rounds). Capping
-/// the gain makes usefulness a bounded prior: it reorders candidates within
-/// a relevance band but can never rescue an irrelevant memory past a genuine
-/// match. Penalties (multiplier < 1.0) stay multiplicative — suppressing
-/// net-negative memories below their raw relevance is safe and desirable.
-pub(crate) const USEFULNESS_BOOST_CAP: f32 = 0.10;
+// v2.5.1: the boost cap and multiplier envelope live in crate::scoring (the
+// one-page home of every learning-loop constant).
+pub(crate) use crate::scoring::USEFULNESS_BOOST_CAP;
 
 /// Apply the usefulness multiplier to a relevance score with the boost gain
 /// capped at [`USEFULNESS_BOOST_CAP`] (see there for why).
@@ -1450,9 +1441,7 @@ pub(crate) fn usefulness_multiplier(usefulness_score: f32, use_count: u32) -> f3
     // helpful) was treated identically to a memory with 0 uses, which
     // wasted early signal. New behaviour: linearly blend toward the
     // full multiplier as use_count climbs to FULL_CONFIDENCE_USES.
-    const FULL_CONFIDENCE_USES: u32 = 3;
-    const MULTIPLIER_MIN: f32 = 0.5;
-    const MULTIPLIER_MAX: f32 = 1.5;
+    use crate::scoring::{FULL_CONFIDENCE_USES, MULTIPLIER_MAX, MULTIPLIER_MIN};
     if use_count == 0 {
         return 1.0;
     }
