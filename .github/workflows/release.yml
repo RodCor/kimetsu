@@ -367,6 +367,12 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_NPM == 'true' }}
+    # id-token lets npm generate a provenance attestation (Sigstore): every
+    # published package is publicly verifiable as built by THIS workflow from
+    # THIS repo at THIS commit — the counter to "random npm binary" distrust.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
@@ -472,7 +478,7 @@ jobs:
               echo "skip: @kimetsu-ai/${key}@${VERSION} already published"
             else
               echo "publishing @kimetsu-ai/${key}@${VERSION}"
-              ( cd "$pkgdir" && npm publish --access public )
+              ( cd "$pkgdir" && npm publish --access public --provenance )
             fi
           done
 
@@ -497,7 +503,7 @@ jobs:
             echo "skip: kimetsu-ai@${VERSION} already published"
           else
             echo "publishing kimetsu-ai@${VERSION}"
-            ( cd npm/kimetsu && npm publish --access public )
+            ( cd npm/kimetsu && npm publish --access public --provenance )
           fi
 
       - name: assemble + publish kimetsu-remote platform packages
@@ -570,7 +576,7 @@ jobs:
               echo "skip: @kimetsu-ai/remote-${key}@${VERSION} already published"
             else
               echo "publishing @kimetsu-ai/remote-${key}@${VERSION}"
-              ( cd "$pkgdir" && npm publish --access public )
+              ( cd "$pkgdir" && npm publish --access public --provenance )
             fi
           done
 
@@ -595,7 +601,7 @@ jobs:
             echo "skip: kimetsu-remote@${VERSION} already published"
           else
             echo "publishing kimetsu-remote@${VERSION}"
-            ( cd npm/kimetsu-remote && npm publish --access public )
+            ( cd npm/kimetsu-remote && npm publish --access public --provenance )
           fi
 
       - name: summary
