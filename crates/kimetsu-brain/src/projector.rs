@@ -349,13 +349,30 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         ],
     )?;
 
-    // Flagship 2 / Story 2.4: a STANDALONE citation (sentinel/nil run_id, i.e.
-    // the `record_mcp_citation` / `brain cite` path) is an explicit outcome
-    // signal with no run finalization behind it, so apply the cited-memory
-    // delta here. Citations tied to a REAL run keep metadata-only here and are
-    // bumped by `apply_memory_usefulness_for_run` on the terminal run event —
-    // gating on the sentinel avoids double-counting.
-    if event.run_id.0 == ulid::Ulid::nil() {
+    // v2.5.2: persist which query this citation answered (feeds the
+    // query_routes derived index built by `brain reinforce`). Column exists
+    // from schema v10; skipped for events without a query.
+    if let Some(query) = event.payload.get("query").and_then(|v| v.as_str()) {
+        conn.execute(
+            "UPDATE memory_citations SET query = ?4
+             WHERE run_id = ?1 AND memory_id = ?2 AND turn = ?3",
+            params![event.run_id.to_string(), memory_id, turn, query],
+        )?;
+    }
+
+    // Flagship 2 / Story 2.4: a STANDALONE citation (the `record_citations` /
+    // `brain cite` path, marked `standalone: true` — or the legacy nil
+    // sentinel run_id) is an explicit outcome signal with no run finalization
+    // behind it, so apply the cited-memory delta here. Citations tied to a
+    // REAL run keep metadata-only here and are bumped by
+    // `apply_memory_usefulness_for_run` on the terminal run event — the gate
+    // avoids double-counting.
+    let standalone = event
+        .payload
+        .get("standalone")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if standalone || event.run_id.0 == ulid::Ulid::nil() {
         apply_cited_outcome(conn, memory_id, 1.0, 1.0, &cited_at, true)?;
     }
     Ok(())

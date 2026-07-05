@@ -840,6 +840,13 @@ enum BrainCommand {
     /// outcomes can be injected without a host. Example:
     ///   kimetsu brain cite --memory-id 01K… --note "fixed the build"
     Cite(CiteArgs),
+    /// Consolidate citation outcomes into reinforcement structures (v2.5.2):
+    /// `--staple` merges repeatedly co-cited memories into single fact
+    /// memories (precomputed multi-hop joins); `--routes` rebuilds the
+    /// query-routing index so memories that answered similar questions
+    /// before get a bounded retrieval boost. Model-free; run offline
+    /// (session end / between benchmark iterations).
+    Reinforce(ReinforceArgs),
     /// Record a regret: mark that a surfaced memory was unhelpful/misleading.
     ///
     /// Writes a `retrieval.regret` telemetry event for the memory — the negative
@@ -1321,12 +1328,32 @@ struct ForgetArgs {
 /// Args for `kimetsu brain cite`.
 #[derive(Debug, Args)]
 struct CiteArgs {
-    /// The memory id to credit.
-    #[arg(long)]
-    memory_id: String,
+    /// Memory id(s) to credit. Repeat the flag to cite several memories as
+    /// ONE group — grouped citations are what `brain reinforce --staple`
+    /// consolidates (they answered together).
+    #[arg(long, required = true)]
+    memory_id: Vec<String>,
     /// Optional rationale recorded with the citation.
     #[arg(long)]
     note: Option<String>,
+    /// The question/task these memories helped answer. Feeds the
+    /// query-routing index (`brain reinforce --routes`).
+    #[arg(long)]
+    query: Option<String>,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain reinforce`.
+#[derive(Debug, Args)]
+struct ReinforceArgs {
+    /// Staple co-cited memories into consolidated fact memories.
+    #[arg(long)]
+    staple: bool,
+    /// Rebuild the query-routing index from citation history.
+    #[arg(long)]
+    routes: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,

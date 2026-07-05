@@ -173,24 +173,55 @@ pub fn emit_regret_for_cited_memories(start: &Path, events: &[kimetsu_core::even
 /// projected (populating `memory_citations`) in one connection, and the
 /// regret sidecar is checked best-effort.
 pub fn record_mcp_citation(start: &Path, memory_id: &str, note: Option<&str>) -> KimetsuResult<()> {
+    record_citations(start, &[memory_id.to_string()], note, None)
+}
+
+/// v2.5.2 consolidation v1: record one or more standalone citations as a
+/// GROUP. All memories share a fresh run_id, which is what makes them
+/// co-cited (`brain reinforce --staple` staples pairs that answer together
+/// repeatedly). `query` links the citations to the question they answered,
+/// feeding the `query_routes` derived index. The `standalone: true` payload
+/// flag tells the projector to apply the cited-outcome delta immediately
+/// (there is no terminal run event coming), replacing the old nil-run gate
+/// so grouped citations still bump usefulness.
+pub fn record_citations(
+    start: &Path,
+    memory_ids: &[String],
+    note: Option<&str>,
+    query: Option<&str>,
+) -> KimetsuResult<()> {
+    if memory_ids.is_empty() {
+        return Ok(());
+    }
     let paths = kimetsu_core::paths::ProjectPaths::discover(start)?;
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
 
-    let sentinel_run_id = RunId(ulid::Ulid::nil());
-    let mut payload = serde_json::json!({
-        "memory_id": memory_id,
-        "turn": 0,
-    });
-    if let Some(n) = note {
-        payload["rationale"] = serde_json::json!(n);
+    let group_run_id = RunId::new();
+    let mut events = Vec::with_capacity(memory_ids.len());
+    for (turn, memory_id) in memory_ids.iter().enumerate() {
+        let mut payload = serde_json::json!({
+            "memory_id": memory_id,
+            "turn": turn as i64,
+            "standalone": true,
+        });
+        if let Some(n) = note {
+            payload["rationale"] = serde_json::json!(n);
+        }
+        if let Some(q) = query {
+            payload["query"] = serde_json::json!(q);
+        }
+        events.push(kimetsu_core::event::Event::new(
+            group_run_id,
+            "memory.cited",
+            payload,
+        ));
     }
-    let event = kimetsu_core::event::Event::new(sentinel_run_id, "memory.cited", payload);
     // apply_events calls insert_event + project_event in one transaction.
-    projector::apply_events(&conn, std::slice::from_ref(&event))?;
+    projector::apply_events(&conn, &events)?;
 
     // Best-effort regret check.
-    emit_regret_for_cited_memories(start, std::slice::from_ref(&event));
+    emit_regret_for_cited_memories(start, &events);
 
     Ok(())
 }

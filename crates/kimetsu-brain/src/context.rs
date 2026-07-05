@@ -475,6 +475,18 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             half_life_days,
         )?);
     }
+    // v2.5.2 consolidation v1: bounded query-association routing boost —
+    // memories that repeatedly answered SIMILAR past queries (per the
+    // citation-derived query_routes table) gain up to ROUTING_BOOST_CAP
+    // relevance from a fixed per-retrieval budget. Applied to memory
+    // candidates only, before file/manifest candidates join the pool.
+    crate::reinforce::apply_query_routing(
+        conn,
+        &request.query,
+        query_embedding.as_ref(),
+        &mut candidates,
+    );
+
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
 

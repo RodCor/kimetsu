@@ -518,6 +518,41 @@ pub(crate) fn migrate_v8_to_v9(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// v2.5.2 consolidation v1: citations learn which QUERY they answered, and a
+/// derived `query_routes` table maps successful-query embeddings to the
+/// memories that answered them (built offline by `brain reinforce`, read at
+/// retrieval time as a bounded boost).
+pub(crate) fn migrate_v9_to_v10(conn: &Connection) -> KimetsuResult<()> {
+    // Guarded: synthetic/partial DBs (migration tests, tooling) may lack the
+    // table entirely; real brains always have it from the baseline.
+    let has_citations: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_citations'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )
+        .unwrap_or(false);
+    if has_citations {
+        add_column_if_missing(conn, "memory_citations", "query TEXT")?;
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS query_routes (
+            query_norm      TEXT NOT NULL,
+            memory_id       TEXT NOT NULL,
+            cites           INTEGER NOT NULL DEFAULT 0,
+            last_cited_at   TEXT NOT NULL,
+            query_embedding BLOB,
+            embedding_model TEXT,
+            PRIMARY KEY (query_norm, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_query_routes_memory
+            ON query_routes(memory_id);
+        ",
+    )?;
+    Ok(())
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only

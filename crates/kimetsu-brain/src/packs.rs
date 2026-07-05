@@ -234,9 +234,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-struct ImportProvenanceScope;
+pub(crate) struct ImportProvenanceScope;
 impl ImportProvenanceScope {
-    fn new(v: serde_json::Value) -> Self {
+    pub(crate) fn new(v: serde_json::Value) -> Self {
         IMPORT_PROVENANCE.with(|c| *c.borrow_mut() = Some(v));
         ImportProvenanceScope
     }

@@ -34,6 +34,7 @@ pub mod project;
 pub mod projector;
 pub mod redact;
 pub mod reindex;
+pub mod reinforce;
 pub mod roi;
 pub mod schema;
 pub(crate) mod scoring;

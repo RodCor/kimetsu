@@ -7,7 +7,7 @@ pub mod memory;
 pub mod paths;
 pub mod secret;
 
-pub const KIMETSU_SCHEMA_VERSION: i64 = 9;
+pub const KIMETSU_SCHEMA_VERSION: i64 = 10;
 /// The `project.toml` config-file format version. Deliberately decoupled
 /// from `KIMETSU_SCHEMA_VERSION` (the brain.db schema): the DB schema can
 /// advance via migrations without forcing every project.toml to be rewritten.

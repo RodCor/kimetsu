@@ -199,6 +199,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Forget(args) => brain_forget(args),
         BrainCommand::Cite(args) => brain_cite(args),
+        BrainCommand::Reinforce(args) => brain_reinforce(args),
         BrainCommand::Regret(args) => brain_regret(args),
         BrainCommand::Distill(args) => brain_distill(args),
         BrainCommand::Graph { command } => brain_graph(command),
@@ -2857,8 +2858,41 @@ pub(crate) fn brain_cite(args: CiteArgs) -> KimetsuResult<()> {
     let workspace = args
         .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
-    project::record_mcp_citation(&workspace, &args.memory_id, args.note.as_deref())?;
-    println!("Cited memory {} (memory.cited recorded).", args.memory_id);
+    project::record_citations(
+        &workspace,
+        &args.memory_id,
+        args.note.as_deref(),
+        args.query.as_deref(),
+    )?;
+    println!(
+        "Cited {} memor{} as one group (memory.cited recorded).",
+        args.memory_id.len(),
+        if args.memory_id.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+    Ok(())
+}
+
+pub(crate) fn brain_reinforce(args: ReinforceArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (staple, routes) = if !args.staple && !args.routes {
+        (true, true) // no flags = run both
+    } else {
+        (args.staple, args.routes)
+    };
+    let summary = kimetsu_brain::reinforce::reinforce(&workspace, staple, routes)?;
+    println!(
+        "reinforce: {} staple candidate(s), {} staple(s) created, {} route(s) built ({} embedded)",
+        summary.staple_candidates,
+        summary.staples_created,
+        summary.routes_built,
+        summary.routes_embedded
+    );
     Ok(())
 }
 

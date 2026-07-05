@@ -63,3 +63,35 @@ pub(crate) const USEFULNESS_BOOST_CAP: f32 = 0.10;
 pub(crate) const MULTIPLIER_MIN: f32 = 0.5;
 pub(crate) const MULTIPLIER_MAX: f32 = 1.5;
 pub(crate) const FULL_CONFIDENCE_USES: u32 = 3;
+
+// ── Consolidation v1 (v2.5.2): co-citation stapling + query routing ────────
+// Literature-hardened bounds; see docs/superpowers/consolidation-v1-prior-art
+// (local). Design lineage: staple trigger from Small 1973 co-citation
+// frequency + SOAR success-gated chunking; routing bounds from ACT-R's fixed
+// source-activation budget + power-law decay; propensity from Joachims 2017.
+
+/// A pair of memories must be cited TOGETHER at least this many times before
+/// a staple is created (never staple on a single lucky co-cite).
+pub(crate) const STAPLE_MIN_CO_CITES: u32 = 2;
+
+/// A query->memory route must have at least this many successful citations
+/// before it fires at retrieval time (min-support).
+pub(crate) const ROUTE_MIN_CITES: u32 = 2;
+
+/// Minimum cosine similarity between the incoming query and a stored
+/// successful query for its routes to fire.
+pub(crate) const ROUTE_QUERY_SIM_FLOOR: f32 = 0.80;
+
+/// Absolute cap on the routing boost's relevance GAIN per candidate — the
+/// same bounded-prior discipline as [`USEFULNESS_BOOST_CAP`]: routing may
+/// reorder within a relevance band, never rescue an irrelevant memory.
+pub(crate) const ROUTING_BOOST_CAP: f32 = 0.10;
+
+/// Fixed total routing budget per retrieval (ACT-R source activation):
+/// the sum of all routing gains applied to one query's candidates never
+/// exceeds this, however many routes match.
+pub(crate) const ROUTING_BUDGET: f32 = 0.25;
+
+/// Power-law decay exponent on route strength by age of last citation
+/// (ACT-R base-level d ~ 0.5): strength *= (1 + age_days)^-0.5.
+pub(crate) const ROUTE_DECAY_EXPONENT: f32 = 0.5;
