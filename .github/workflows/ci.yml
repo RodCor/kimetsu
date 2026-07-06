@@ -122,6 +122,12 @@ jobs:
   audit:
     name: cargo-audit (RUSTSEC)
     runs-on: ubuntu-latest
+    # audit-check reports advisories by creating a check run; without
+    # checks: write the reporting API call 403s ("Resource not accessible
+    # by integration") even when the audit itself passes.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
