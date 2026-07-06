@@ -209,6 +209,40 @@ function BenchmarksPanel() {
         </table>
       </div>
 
+      {/* LoCoMo */}
+      <h3 className="mb-2 font-mono text-sm font-semibold tracking-tight">
+        LoCoMo, the long-conversation benchmark
+      </h3>
+      <div className="mb-8 overflow-x-auto rounded-xl border border-fd-border bg-fd-background">
+        <table className="w-full min-w-[560px] text-sm">
+          <thead>
+            <tr className="border-b border-fd-border text-fd-muted-foreground">
+              <th className="p-3 text-left font-medium">System</th>
+              <th className="p-3 text-right font-medium text-fd-primary">Kimetsu</th>
+              <th className="p-3 text-right font-medium">mem0</th>
+              <th className="p-3 text-right font-medium">Honcho</th>
+              <th className="p-3 text-right font-medium">Zep</th>
+              <th className="p-3 text-right font-medium">Letta</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="p-3 text-fd-muted-foreground">LoCoMo (1,540 questions)</td>
+              <td className="p-3 text-right font-semibold tabular-nums text-fd-primary">89.4%</td>
+              <td className="p-3 text-right tabular-nums text-fd-muted-foreground">92.5%</td>
+              <td className="p-3 text-right tabular-nums text-fd-muted-foreground">89.9%</td>
+              <td className="p-3 text-right tabular-nums text-fd-muted-foreground">75.1%</td>
+              <td className="p-3 text-right tabular-nums text-fd-muted-foreground">74.0%</td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="border-t border-fd-border p-3 text-xs text-fd-muted-foreground">
+          LLM-judged accuracy on the standard 1,540-question set, as published by
+          each vendor. Kimetsu is the only system here with no LLM in the memory
+          pipeline. Harness and full methodology are public.
+        </p>
+      </div>
+
       {/* BEAM by scale */}
       <h3 className="mb-2 font-mono text-sm font-semibold tracking-tight">
         BEAM, by conversation size
