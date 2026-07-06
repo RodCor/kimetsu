@@ -7,6 +7,61 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v2.5.2: The brain that learns from its own outcomes
+
+Consolidation v1: the first release where citation outcomes reshape the brain
+itself, with every mechanism model-free and every constant documented on one
+page. Backward-compatible (schema v9 → v10, automatic on open).
+
+### Consolidation v1 (new)
+
+- `kimetsu brain reinforce`: offline consolidation pass. `--staple` merges
+  memories that were repeatedly cited together into single fact memories
+  (precomputed multi-hop joins; originals kept; provenance carries part ids).
+  `--routes` builds a query-routing index from citation history: memories that
+  answered similar questions before get a bounded retrieval boost.
+- `kimetsu brain cite` accepts repeated `--memory-id` (citing a GROUP — the
+  co-citation signal stapling consumes) and `--query` (linking citations to
+  the question they answered, feeding the routing index).
+- Retrieval-time routing boost with a fixed per-retrieval budget, per-candidate
+  cap, minimum support, and power-law decay.
+
+### Learning-loop guardrails
+
+- The usefulness boost's relevance gain is capped: a heavily-cited memory can
+  win ties but can never outrank a genuinely more relevant one (fixes a
+  measured retrieval-flooding failure mode under sustained citation feedback).
+- Cited-in-failure penalty now scales with citation history
+  (`-1.0 / (1 + prior citations / 3)`): a proven memory absorbs occasional
+  flaky-run hits; an unproven one takes the full penalty.
+- All scoring constants (deltas, caps, envelopes, decay) now live in one
+  documented module, `scoring.rs`.
+
+### Quality of life
+
+- Schema-mismatch errors name the offending `project.toml` and hint at the
+  fix (project discovery climbs to the enclosing git root, so the file is
+  often far from where you ran the command).
+- npm packages ship with provenance attestations (Sigstore): every published
+  package is publicly verifiable as built by CI from this repo.
+- Internal: `project.rs` and the CLI `main.rs` split into focused modules.
+
+### Benchmarks
+
+- LoCoMo: 89.4% on the standard 1,540-question set (LLM-judged accuracy).
+- Learning-curve harness validated: citation feedback never degrades
+  retrieval across repeated iterations, with a train/holdout split proving
+  generalization.
+
+## v2.5.0: Ship the brain to your team
+
+Flagships: retrieval level presets (`basic`/`flexible`/`deep`/`advanced`),
+temporal validity and date-aware ingestion, fleet write-safety (concurrent
+writers, per-event origin), convergent team sync (HLC replay + conflict
+surfacing), Kimetsu Remote GA with per-user attribution, and shareable brain
+packs (gzip + security-scrubbed export, merge/replace import from file or
+URL). Docs site moved to kimetsu.dev.
+
 ## v2.0.0: Never explore twice
 
 The biggest token sink is RE-EXPLORATION: the agent re-deriving what the brain
