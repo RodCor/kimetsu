@@ -1,0 +1,62 @@
+[package]
+name = "kimetsu-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Server-hosted Kimetsu brain over HTTP MCP, keyed by repository."
+keywords = ["kimetsu", "mcp", "server", "brain", "http"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[[bin]]
+name = "kimetsu-remote"
+path = "src/main.rs"
+
+[features]
+# Lean by default (like kimetsu-cli) so a workspace build doesn't unify
+# `kimetsu-brain/embeddings` on for every crate. Build/run the server with
+# `--features embeddings` for semantic (usearch HNSW) retrieval; the release
+# artifacts and `cargo install kimetsu-remote --features embeddings` do this.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
+# S5.3: enable the full petgraph Tier-2 backend for remote deployments.
+# Pass through to kimetsu-brain/graph so the PetgraphBackend compiles.
+# `cargo build -p kimetsu-remote --features graph` or
+# `cargo build --workspace` (graph unified on via this feature declaration).
+graph = ["kimetsu-brain/graph"]
+# Optional in-process HTTPS (rustls + ring). Off by default — the recommended
+# deployment terminates TLS at a reverse proxy. `--features tls` enables
+# `--tls-cert`/`--tls-key`.
+tls = ["dep:axum-server", "dep:rustls"]
+
+[dependencies]
+kimetsu-core = { path = "../kimetsu-core" }
+# S5.3: kimetsu-remote always enables the `graph` feature in kimetsu-brain so
+# the petgraph Tier-2 backend compiles for remote builds. During `cargo test
+# --workspace`, this causes Cargo feature-unification to compile the petgraph
+# code for kimetsu-brain even when the lean crates don't request it — which is
+# safe: all graph code is behind `#[cfg(feature = "graph")]` and default config
+# still selects "flat". The local lean CLI never enables this path.
+kimetsu-brain = { path = "../kimetsu-brain", features = ["graph"] }
+kimetsu-chat = { path = "../kimetsu-chat" }
+tokio = { workspace = true }
+axum = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+subtle = "2"
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+rusqlite = { workspace = true }

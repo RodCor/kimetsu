@@ -26,6 +26,10 @@ pub struct AnthropicProvider {
     // injection below.
     api_key: SecretString,
     model: String,
+    /// When set, requests POST to `<base_url>/v1/messages` (Anthropic-
+    /// compatible endpoints such as a LiteLLM proxy). When `None`, the
+    /// default Anthropic API URL is used.
+    base_url: Option<String>,
 }
 
 impl AnthropicProvider {
@@ -58,20 +62,55 @@ impl AnthropicProvider {
             client,
             api_key: SecretString::new(api_key),
             model: config.model.model.clone(),
+            base_url: None,
         }))
     }
 
     pub fn model_name(&self) -> &str {
         &self.model
     }
+
+    /// Build a provider directly from resolved values — used by the
+    /// SessionEnd distiller, which controls model/key/base independent of
+    /// the project's `[model]` section. `base_url` is normalized: empty/
+    /// whitespace becomes `None`.
+    pub fn for_distiller(
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        timeout_secs: u64,
+    ) -> KimetsuResult<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()?;
+        Ok(Self {
+            client,
+            api_key: SecretString::new(api_key.into()),
+            model: model.into(),
+            base_url: base_url.filter(|value| !value.trim().is_empty()),
+        })
+    }
+}
+
+/// Resolve the messages endpoint: `<base>/v1/messages` when a base URL is
+/// configured, else the default Anthropic API URL.
+fn messages_url(base_url: &Option<String>) -> String {
+    match base_url {
+        Some(base) => format!("{}/v1/messages", base.trim_end_matches('/')),
+        None => MESSAGES_URL.to_string(),
+    }
 }
 
 impl ModelProvider for AnthropicProvider {
     fn complete(&mut self, request: ModelRequest) -> KimetsuResult<ModelResponse> {
-        let body = build_request_body(&self.model, &request);
+        // Pass Some(model) — the direct API needs the model in the body.
+        // anthropic-version is carried in the HTTP header for the direct API,
+        // so we pass None here; the header is set explicitly below.
+        let body = build_anthropic_body(Some(&self.model), None, &request);
+        let url = messages_url(&self.base_url);
         let response = self
             .client
-            .post(MESSAGES_URL)
+            .post(&url)
             // v0.4.9: explicit cleartext leak point for the HTTP
             // header. The reqwest client never logs header values
             // by default; if a future caller adds request logging
@@ -87,16 +126,28 @@ impl ModelProvider for AnthropicProvider {
         if !status.is_success() {
             return Err(format!(
                 "anthropic request failed ({status}): {}",
-                response_error_summary(&response_text)
+                anthropic_error_summary(&response_text)
             )
             .into());
         }
 
-        parse_response(&response_text)
+        parse_anthropic_response(&response_text)
     }
 }
 
-fn build_request_body(model: &str, request: &ModelRequest) -> Value {
+/// Build the JSON body for an Anthropic-wire request.
+///
+/// - `model`: when `Some`, injects `"model": <value>` into the body (direct
+///   Anthropic API). Pass `None` for Bedrock — the model lives in the URL, not
+///   the body.
+/// - `anthropic_version`: when `Some`, injects `"anthropic_version": <value>`
+///   (Bedrock requires `"bedrock-2023-05-31"` here). Pass `None` for the direct
+///   API — the version is carried in the `anthropic-version` HTTP header there.
+pub(crate) fn build_anthropic_body(
+    model: Option<&str>,
+    anthropic_version: Option<&str>,
+    request: &ModelRequest,
+) -> Value {
     let mut system_parts = Vec::new();
     let mut messages = Vec::new();
 
@@ -128,11 +179,18 @@ fn build_request_body(model: &str, request: &ModelRequest) -> Value {
     }
 
     let mut body = json!({
-        "model": model,
         "max_tokens": request.max_output_tokens,
         "temperature": request.temperature,
         "messages": messages,
     });
+
+    if let Some(m) = model {
+        body["model"] = json!(m);
+    }
+
+    if let Some(v) = anthropic_version {
+        body["anthropic_version"] = json!(v);
+    }
 
     if !system_parts.is_empty() {
         body["system"] = json!(system_parts.join("\n\n"));
@@ -158,6 +216,12 @@ fn build_request_body(model: &str, request: &ModelRequest) -> Value {
     }
 
     body
+}
+
+/// Kept for back-compat within this module's tests (see below).
+#[cfg(test)]
+fn build_request_body(model: &str, request: &ModelRequest) -> Value {
+    build_anthropic_body(Some(model), None, request)
 }
 
 fn map_content_block(content: &MessageContent) -> Option<Value> {
@@ -187,7 +251,7 @@ fn map_content_block(content: &MessageContent) -> Option<Value> {
     }
 }
 
-fn parse_response(response_text: &str) -> KimetsuResult<ModelResponse> {
+pub(crate) fn parse_anthropic_response(response_text: &str) -> KimetsuResult<ModelResponse> {
     let response: AnthropicResponse = serde_json::from_str(response_text)?;
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -226,7 +290,7 @@ fn parse_response(response_text: &str) -> KimetsuResult<ModelResponse> {
     })
 }
 
-fn response_error_summary(response_text: &str) -> String {
+pub(crate) fn anthropic_error_summary(response_text: &str) -> String {
     let parsed = serde_json::from_str::<Value>(response_text).ok();
     let message = parsed
         .as_ref()
@@ -313,6 +377,7 @@ mod tests {
             client: Client::new(),
             api_key: SecretString::new(token),
             model: "claude-opus-4-7".into(),
+            base_url: None,
         };
         let dbg = format!("{:?}", provider);
         assert!(
@@ -321,6 +386,32 @@ mod tests {
         );
         assert!(dbg.contains("REDACTED"));
         assert!(dbg.contains("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn messages_url_uses_base_when_set() {
+        assert_eq!(messages_url(&None), MESSAGES_URL);
+        assert_eq!(
+            messages_url(&Some("http://localhost:4000".to_string())),
+            "http://localhost:4000/v1/messages"
+        );
+        assert_eq!(
+            messages_url(&Some("http://localhost:4000/".to_string())),
+            "http://localhost:4000/v1/messages"
+        );
+    }
+
+    #[test]
+    fn for_distiller_builds_provider_with_base_url() {
+        let p = AnthropicProvider::for_distiller(
+            "claude-haiku-4-5",
+            "sk-test",
+            Some("http://localhost:4000".to_string()),
+            60,
+        )
+        .expect("build");
+        assert_eq!(p.model_name(), "claude-haiku-4-5");
+        assert_eq!(p.base_url.as_deref(), Some("http://localhost:4000"));
     }
 
     #[test]
@@ -366,7 +457,7 @@ mod tests {
 
     #[test]
     fn response_maps_text_tool_use_and_usage() {
-        let response = parse_response(
+        let response = parse_anthropic_response(
             r#"{
                 "content": [
                     {"type": "text", "text": "Reading file."},

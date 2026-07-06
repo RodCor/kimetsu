@@ -386,6 +386,9 @@ mod tests {
     fn temp_project() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("kimetsu-agent-loop-test-{}", new_id()));
         fs::create_dir_all(&root).expect("create temp root");
+        // Isolate from any enclosing git repo so discover() resolves
+        // here, not a shared ancestor (see git_init_boundary).
+        kimetsu_core::paths::git_init_boundary(&root);
         root
     }
 }

@@ -1,11 +1,11 @@
 //! v0.5.3 e2e: v0.5.2 conflict-detection surface end-to-end.
 //!
-//! Conflict detection at ingest is embedder-gated; the lean default
-//! build uses NoopEmbedder so conflict scans are no-ops. To prove the
-//! end-to-end UX (table + list_conflicts + resolve_conflict) we
-//! manually seed two memories + a conflict row via the public
-//! `kimetsu_brain::conflict` API, then exercise the
-//! `kimetsu_brain::project` wrappers the CLI / MCP surfaces sit on.
+//! Conflict detection at ingest is embedder-gated. The workspace test
+//! build can enable a real embedder through feature unification, so these
+//! tests use unrelated seed memories and manually add the conflict row via
+//! the public `kimetsu_brain::conflict` API. That keeps the project wrapper
+//! assertions deterministic while conflict detection itself stays covered by
+//! kimetsu-brain unit tests.
 //!
 //! This catches:
 //!   * Schema drift on `memory_conflicts` (column rename / type
@@ -25,10 +25,9 @@ fn list_and_resolve_conflict_wrappers_compose_against_a_real_project() {
     with_user_brain_disabled(|| {
         let project = TempProject::init("conflicts_resolve");
 
-        // Two contradictory preferences. Real prod code would hit
-        // these via add_memory's detect_and_record path under an
-        // embeddings build; here we seed both the memories and the
-        // conflict row directly to keep the test lean+deterministic.
+        // Use unrelated memories so the embeddings-enabled workspace build
+        // cannot auto-record a second conflict before this test manually
+        // seeds the one project-wrapper row it wants to exercise.
         let new_id = project::add_memory(
             project.root(),
             MemoryScope::Repo,
@@ -40,7 +39,7 @@ fn list_and_resolve_conflict_wrappers_compose_against_a_real_project() {
             project.root(),
             MemoryScope::Repo,
             MemoryKind::Preference,
-            "Prefer thiserror for library error types.",
+            "Cache HTTP responses with a one-hour TTL.",
         )
         .expect("add existing memory");
 
@@ -48,24 +47,22 @@ fn list_and_resolve_conflict_wrappers_compose_against_a_real_project() {
         let hit = ConflictHit {
             existing_memory_id: existing_id.clone(),
             existing_kind: "preference".to_string(),
-            existing_text: "Prefer thiserror for library error types.".to_string(),
+            existing_text: "Cache HTTP responses with a one-hour TTL.".to_string(),
             similarity: 0.92,
         };
-        let conflict_id = conflict::record_conflict(
-            &conn,
-            &new_id,
-            &MemoryScope::Repo,
-            "preference",
-            &hit,
-        )
-        .expect("record conflict");
+        let conflict_id =
+            conflict::record_conflict(&conn, &new_id, &MemoryScope::Repo, "preference", &hit)
+                .expect("record conflict");
         drop(conn);
 
         // Smoke-check: list_conflicts surfaces the row through the
         // project wrapper (which merges project + user brains).
         let open = project::list_conflicts(project.root(), 50).expect("list_conflicts");
         assert_eq!(open.len(), 1, "exactly one open conflict expected");
-        assert_eq!(open[0].source, "project", "conflict should be sourced from project brain");
+        assert_eq!(
+            open[0].source, "project",
+            "conflict should be sourced from project brain"
+        );
         assert_eq!(open[0].report.new_memory_id, new_id);
         assert_eq!(open[0].report.existing_memory_id, existing_id);
         assert!(
@@ -77,7 +74,10 @@ fn list_and_resolve_conflict_wrappers_compose_against_a_real_project() {
         // Resolve with kept_new — existing memory should be invalidated.
         let resolved = project::resolve_conflict(project.root(), &conflict_id, "kept_new")
             .expect("resolve_conflict");
-        assert!(resolved, "resolve_conflict should return true on first apply");
+        assert!(
+            resolved,
+            "resolve_conflict should return true on first apply"
+        );
 
         // Post-conditions:
         //   * list_conflicts returns empty (resolved row excluded)
@@ -128,7 +128,7 @@ fn re_resolving_same_conflict_is_idempotent_through_project_wrapper() {
             project.root(),
             MemoryScope::Repo,
             MemoryKind::Preference,
-            "Use spaces for indentation.",
+            "Rotate API keys every ninety days.",
         )
         .expect("add existing");
 
@@ -136,17 +136,12 @@ fn re_resolving_same_conflict_is_idempotent_through_project_wrapper() {
         let hit = ConflictHit {
             existing_memory_id: existing_id.clone(),
             existing_kind: "preference".to_string(),
-            existing_text: "Use spaces for indentation.".to_string(),
+            existing_text: "Rotate API keys every ninety days.".to_string(),
             similarity: 0.88,
         };
-        let conflict_id = conflict::record_conflict(
-            &conn,
-            &new_id,
-            &MemoryScope::Repo,
-            "preference",
-            &hit,
-        )
-        .expect("record");
+        let conflict_id =
+            conflict::record_conflict(&conn, &new_id, &MemoryScope::Repo, "preference", &hit)
+                .expect("record");
         drop(conn);
 
         assert!(

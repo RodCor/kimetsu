@@ -1,22 +1,22 @@
 # v0.4.7: tag-driven release pipeline.
 #
-# Push a `v0.4.x` tag and this workflow builds release binaries
-# for Linux (x86_64), macOS (x86_64 + arm64), and Windows
-# (x86_64), then uploads them as assets on the corresponding
-# GitHub Release.
+# Push a `vX.Y.Z` tag and this workflow builds release binaries
+# for Linux (x86_64), macOS (x86_64 + arm64), and Windows (x86_64),
+# then uploads them as assets on the corresponding GitHub Release.
 #
 # The pipeline runs `kimetsu doctor --skip-mcp` on every artifact
 # before uploading — so a broken build fails the release, not the
 # user. Manual `cargo publish` to crates.io is a follow-up step
 # (we don't auto-publish from CI to keep approvals explicit).
 #
-# Two artifact sets per platform:
-#   * `kimetsu-<version>-<target>-lean`     — default Cargo build,
-#     NoopEmbedder + FTS-only retrieval. Smallest binary, no model
-#     download on install.
-#   * `kimetsu-<version>-<target>-embeddings` — built with
-#     `--features embeddings`. Larger binary; fastembed-rs +
-#     ONNX runtime linked statically when possible.
+# Artifact flavors:
+#   * `kimetsu-<version>-<target>-lean` — built with
+#     `--no-default-features`: NoopEmbedder + FTS-only retrieval.
+#     Smallest binary, no model download on install.
+#   * `kimetsu-<version>-<target>-embeddings` — opt-in semantic build.
+#     Larger binary; fastembed-rs + ONNX runtime linked statically
+#     when possible. Not built for x86_64-apple-darwin because `ort`
+#     does not publish a prebuilt ONNX Runtime for that target.
 
 name: release
 
@@ -27,38 +27,56 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write  # needed to upload release assets
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # Fail in seconds (not after a 13-min build + partial publish) if the tag
+  # doesn't match the workspace version. This is the guard that would have
+  # caught the v1.5.0 botch: tag v1.5.0 was pushed while Cargo.toml still said
+  # 1.0.0, so binaries self-reported 1.0.0 and crates.io rejected the dupe.
+  version-guard:
+    name: guard tag == workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: assert tag matches [workspace.package] version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          echo "tag=v$TAG  cargo=$VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Tag v$TAG does not match workspace version $VERSION. Run scripts/bump-version.sh $TAG, commit (incl. Cargo.lock), then re-tag."
+            exit 1
+          fi
+          echo "OK: tag and workspace version agree ($VERSION)"
+
   build:
     name: build ${{ matrix.target }} (${{ matrix.flavor }})
+    needs: version-guard
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           # Linux
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: ""               }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
+          # macOS Intel
+          - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
           # macOS Apple Silicon
-          #
-          # v0.4.11: x86_64-apple-darwin (macos-13) runners were
-          # dropped from the matrix. As of late 2026 those runners
-          # are deprecated + under-provisioned on GitHub's free
-          # tier and the jobs queue indefinitely. Apple Silicon
-          # is the dominant Mac architecture now; users on Intel
-          # Macs can `cargo install kimetsu-cli` from source.
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: ""               }
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings" }
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
+          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
           # Windows
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: ""               }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -72,10 +90,17 @@ jobs:
 
       - name: build kimetsu-cli
         run: |
-          cargo build --release -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
+          cargo build --release --locked -p kimetsu-cli --target ${{ matrix.target }} ${{ matrix.extra_features }}
+
+      - name: build kimetsu-remote (server, embeddings archives only)
+        if: matrix.flavor == 'embeddings'
+        run: |
+          cargo build --release --locked -p kimetsu-remote --features embeddings,tls --target ${{ matrix.target }}
 
       - name: smoke-test built binary (doctor --skip-mcp)
         shell: bash
+        env:
+          KIMETSU_USER_BRAIN: "0"
         run: |
           if [ "${{ matrix.flavor }}" = "lean" ]; then
             BINARY="target/${{ matrix.target }}/release/kimetsu"
@@ -84,8 +109,17 @@ jobs:
           fi
           [ "${{ runner.os }}" = "Windows" ] && BINARY="${BINARY}.exe"
           "$BINARY" --version
+          # Defense in depth: on a tag, the binary MUST self-report the tag's
+          # version (the v1.5.0 symptom was binaries reporting a stale version).
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            EXPECTED="${GITHUB_REF_NAME#v}"
+            if ! "$BINARY" --version | grep -q -- "$EXPECTED"; then
+              echo "::error::binary --version ($("$BINARY" --version)) does not contain tag version $EXPECTED"
+              exit 1
+            fi
+          fi
           # doctor expects a workspace; the cloned repo is one.
-          "$BINARY" doctor --skip-mcp --workspace . || true
+          "$BINARY" doctor --skip-mcp --workspace .
 
       - name: package archive
         shell: bash
@@ -98,7 +132,35 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/kimetsu" "dist/$NAME/"
           fi
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$NAME/"
+          MIT_LICENSE="LICENSE-MIT"
+          APACHE_LICENSE="LICENSE-APACHE"
+          [ -f "$MIT_LICENSE" ] || MIT_LICENSE="docs/LICENSE-MIT"
+          [ -f "$APACHE_LICENSE" ] || APACHE_LICENSE="docs/LICENSE-APACHE"
+          cp "$MIT_LICENSE" "$APACHE_LICENSE" README.md "dist/$NAME/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path $NAME -DestinationPath $NAME.zip"
+          else
+            tar -czf "$NAME.tar.gz" "$NAME"
+          fi
+
+      - name: package kimetsu-remote archive (separate; embeddings targets only)
+        if: matrix.flavor == 'embeddings'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="kimetsu-remote-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/kimetsu-remote.exe" "dist/$NAME/"
+          else
+            cp "target/${{ matrix.target }}/release/kimetsu-remote" "dist/$NAME/"
+          fi
+          MIT_LICENSE="LICENSE-MIT"
+          APACHE_LICENSE="LICENSE-APACHE"
+          [ -f "$MIT_LICENSE" ] || MIT_LICENSE="docs/LICENSE-MIT"
+          [ -f "$APACHE_LICENSE" ] || APACHE_LICENSE="docs/LICENSE-APACHE"
+          cp "$MIT_LICENSE" "$APACHE_LICENSE" npm/kimetsu-remote/README.md "dist/$NAME/"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path $NAME -DestinationPath $NAME.zip"
@@ -107,7 +169,7 @@ jobs:
           fi
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: kimetsu-${{ matrix.target }}-${{ matrix.flavor }}
           path: |
@@ -120,11 +182,15 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write  # needed to upload release assets
+      attestations: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
 
@@ -150,6 +216,26 @@ jobs:
             echo "Generated from the kimetsu monorepo. See README.md for installation + usage." >> release-notes.md
           fi
 
+      - name: generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > checksums.txt
+          while IFS= read -r file; do
+            hash="$(sha256sum "$file" | awk '{print $1}')"
+            name="$(basename "$file")"
+            printf '%s  %s\n' "$hash" "$name" >> checksums.txt
+          done < <(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          cat checksums.txt
+
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+            checksums.txt
+
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
@@ -159,27 +245,17 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/**/*.zip
+            checksums.txt
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-crates:
-    # v0.4.9: serial cargo publish to crates.io after the binary
+    # Serial cargo publish to crates.io after the binary
     # matrix + GH Release succeed. Gated on:
     #   (a) tag push (handled by `if`)
     #   (b) the `release` job succeeding (handled by `needs`)
     #   (c) CARGO_REGISTRY_TOKEN secret being set on the repo
-    #
-    # v0.4.10: kimetsu-harbor-rs is intentionally NOT published.
-    # It's marked `publish = false` in its Cargo.toml because:
-    #   * `kimetsu-cli` (the user-facing binary that powers
-    #     `cargo install kimetsu-cli`) doesn't depend on it.
-    #   * It's a Terminal-Bench operator tool, still iterating
-    #     internally; publishing implies backward-compat we don't
-    #     want to commit to yet.
-    # The `kimetsu-harbor-agent` binary still ships in every
-    # GH Release archive (built by the lean matrix above), so
-    # benchmark users can grab it from there.
     #
     # Crate publish order matches the user-facing dep DAG:
     #   kimetsu-core   (no kimetsu deps)
@@ -203,7 +279,7 @@ jobs:
     # (or set it in repo Settings → Variables), then re-run / re-tag.
     if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_CRATES == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -265,6 +341,283 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli" >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli --features embeddings" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli --features embeddings  # semantic build where ort supports the target" >> $GITHUB_STEP_SUMMARY
+          echo "kimetsu update --check" >> $GITHUB_STEP_SUMMARY
+          echo "kimetsu uninstall --dry-run" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  publish-npm:
+    # Publish the `kimetsu` npm package after the binary matrix + GH Release
+    # succeed. esbuild/turbo style: one per-platform package per target (lean
+    # binary inside, os/cpu set) plus the main `kimetsu` package that lists
+    # them as optionalDependencies. npm installs only the matching platform
+    # package; the bin/cli.js launcher execs its binary. No postinstall.
+    #
+    # Embeddings is NOT shipped as a package — it's fetched on demand by the
+    # launcher when KIMETSU_NPM_FLAVOR=embeddings is set (see npm/kimetsu).
+    #
+    # Gated, like publish-crates, on:
+    #   (a) tag push (handled by `if`)
+    #   (b) the repo variable PUBLISH_NPM == 'true'
+    #   (c) the NPM_TOKEN secret being set
+    # To enable: `gh variable set PUBLISH_NPM --body true` and
+    # `gh secret set NPM_TOKEN` (an npm automation token).
+    name: publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_NPM == 'true' }}
+    # id-token lets npm generate a provenance attestation (Sigstore): every
+    # published package is publicly verifiable as built by THIS workflow from
+    # THIS repo at THIS commit — the counter to "random npm binary" distrust.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+
+      - name: verify NPM_TOKEN secret is set
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not set. Skipping npm publish."
+            echo "::error::Add the secret via: gh secret set NPM_TOKEN"
+            exit 1
+          fi
+          echo "NPM_TOKEN is set (length: ${#NODE_AUTH_TOKEN})"
+
+      - name: assemble + publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # npm-key  target-triple  os  cpu  binname  ext
+          PLATFORMS=(
+            "linux-x64    x86_64-unknown-linux-gnu  linux   x64    kimetsu      tar.gz"
+            "darwin-x64   x86_64-apple-darwin       darwin  x64    kimetsu      tar.gz"
+            "darwin-arm64 aarch64-apple-darwin      darwin  arm64  kimetsu      tar.gz"
+            "win32-x64    x86_64-pc-windows-msvc     win32   x64    kimetsu.exe  zip"
+          )
+
+          mkdir -p stage
+          for row in "${PLATFORMS[@]}"; do
+            read -r key target osv cpuv binname ext <<<"$row"
+            stem="kimetsu-${VERSION}-${target}-lean"
+            archive="dist/kimetsu-${target}-lean/${stem}.${ext}"
+            if [ ! -f "$archive" ]; then
+              echo "::error::missing lean artifact for ${target}: ${archive}"
+              exit 1
+            fi
+
+            tmp="$(mktemp -d)"
+            if [ "$ext" = "zip" ]; then
+              # PowerShell `Compress-Archive` writes ZIP entries with backslash
+              # separators; Info-ZIP `unzip` flattens those into a literal
+              # filename so the binary can't be found by path. `7z` (preinstalled
+              # on ubuntu-latest) normalizes backslashes into real directories.
+              7z x -y -o"$tmp" "$archive" >/dev/null
+            else
+              tar -xf "$archive" -C "$tmp"
+            fi
+
+            pkgdir="stage/${key}"
+            mkdir -p "$pkgdir/bin"
+            # Prefer the expected layout (`<stem>/<binname>`), then fall back to
+            # a recursive search so the step is robust to archive quirks.
+            if [ -f "$tmp/${stem}/${binname}" ]; then
+              src="$tmp/${stem}/${binname}"
+            elif [ -f "$tmp/${binname}" ]; then
+              src="$tmp/${binname}"
+            else
+              # Exact match, then suffix match — the latter catches a
+              # backslash-flattened basename like `<stem>\kimetsu.exe` if some
+              # extractor still mangles the Windows archive.
+              src="$(find "$tmp" -type f -name "${binname}" | head -n1)"
+              [ -z "$src" ] && src="$(find "$tmp" -type f -name "*${binname}" | head -n1)"
+            fi
+            if [ -z "${src:-}" ] || [ ! -f "$src" ]; then
+              echo "::error::binary ${binname} not found inside ${archive}"
+              echo "::error::extracted tree:"; find "$tmp" -maxdepth 3 -print
+              exit 1
+            fi
+            cp "$src" "$pkgdir/bin/${binname}"
+            [ "$ext" = "zip" ] || chmod +x "$pkgdir/bin/${binname}"
+
+            node -e '
+              const fs = require("fs");
+              const [dir, name, version, osv, cpuv] = process.argv.slice(1);
+              fs.writeFileSync(dir + "/package.json", JSON.stringify({
+                name,
+                version,
+                description: name + " — prebuilt kimetsu binary",
+                repository: { type: "git", url: "git+https://github.com/RodCor/kimetsu.git" },
+                license: "MIT OR Apache-2.0",
+                os: [osv],
+                cpu: [cpuv],
+                files: ["bin"],
+              }, null, 2) + "\n");
+            ' "$pkgdir" "@kimetsu-ai/${key}" "$VERSION" "$osv" "$cpuv"
+
+            # Idempotent: skip if this exact version is already on npm, so a
+            # re-run after a partial failure doesn't choke on EPUBLISHCONFLICT.
+            if npm view "@kimetsu-ai/${key}@${VERSION}" version >/dev/null 2>&1; then
+              echo "skip: @kimetsu-ai/${key}@${VERSION} already published"
+            else
+              echo "publishing @kimetsu-ai/${key}@${VERSION}"
+              ( cd "$pkgdir" && npm publish --access public --provenance )
+            fi
+          done
+
+      - name: stamp + publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1];
+            const p = "npm/kimetsu/package.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            j.version = version;
+            for (const k of Object.keys(j.optionalDependencies || {})) {
+              j.optionalDependencies[k] = version;
+            }
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          ' "$VERSION"
+          if npm view "kimetsu-ai@${VERSION}" version >/dev/null 2>&1; then
+            echo "skip: kimetsu-ai@${VERSION} already published"
+          else
+            echo "publishing kimetsu-ai@${VERSION}"
+            ( cd npm/kimetsu && npm publish --access public --provenance )
+          fi
+
+      - name: assemble + publish kimetsu-remote platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # The server ships only where an embeddings build exists (ONNX prebuilts).
+          # npm-key  target-triple  os  cpu  binname  ext
+          PLATFORMS=(
+            "linux-x64    x86_64-unknown-linux-gnu  linux   x64    kimetsu-remote      tar.gz"
+            "darwin-arm64 aarch64-apple-darwin      darwin  arm64  kimetsu-remote      tar.gz"
+            "win32-x64    x86_64-pc-windows-msvc     win32   x64    kimetsu-remote.exe  zip"
+          )
+
+          mkdir -p stage-remote
+          for row in "${PLATFORMS[@]}"; do
+            read -r key target osv cpuv binname ext <<<"$row"
+            stem="kimetsu-remote-${VERSION}-${target}"
+            # The remote archive is uploaded alongside the embeddings kimetsu archive.
+            archive="dist/kimetsu-${target}-embeddings/${stem}.${ext}"
+            if [ ! -f "$archive" ]; then
+              echo "::error::missing kimetsu-remote artifact for ${target}: ${archive}"
+              exit 1
+            fi
+
+            tmp="$(mktemp -d)"
+            if [ "$ext" = "zip" ]; then
+              7z x -y -o"$tmp" "$archive" >/dev/null
+            else
+              tar -xf "$archive" -C "$tmp"
+            fi
+
+            pkgdir="stage-remote/${key}"
+            mkdir -p "$pkgdir/bin"
+            if [ -f "$tmp/${stem}/${binname}" ]; then
+              src="$tmp/${stem}/${binname}"
+            elif [ -f "$tmp/${binname}" ]; then
+              src="$tmp/${binname}"
+            else
+              src="$(find "$tmp" -type f -name "${binname}" | head -n1)"
+              [ -z "$src" ] && src="$(find "$tmp" -type f -name "*${binname}" | head -n1)"
+            fi
+            if [ -z "${src:-}" ] || [ ! -f "$src" ]; then
+              echo "::error::binary ${binname} not found inside ${archive}"
+              find "$tmp" -maxdepth 3 -print
+              exit 1
+            fi
+            cp "$src" "$pkgdir/bin/${binname}"
+            [ "$ext" = "zip" ] || chmod +x "$pkgdir/bin/${binname}"
+
+            node -e '
+              const fs = require("fs");
+              const [dir, name, version, osv, cpuv] = process.argv.slice(1);
+              fs.writeFileSync(dir + "/package.json", JSON.stringify({
+                name,
+                version,
+                description: name + " — prebuilt kimetsu-remote server binary",
+                repository: { type: "git", url: "git+https://github.com/RodCor/kimetsu.git" },
+                license: "MIT OR Apache-2.0",
+                os: [osv],
+                cpu: [cpuv],
+                files: ["bin"],
+              }, null, 2) + "\n");
+            ' "$pkgdir" "@kimetsu-ai/remote-${key}" "$VERSION" "$osv" "$cpuv"
+
+            if npm view "@kimetsu-ai/remote-${key}@${VERSION}" version >/dev/null 2>&1; then
+              echo "skip: @kimetsu-ai/remote-${key}@${VERSION} already published"
+            else
+              echo "publishing @kimetsu-ai/remote-${key}@${VERSION}"
+              ( cd "$pkgdir" && npm publish --access public --provenance )
+            fi
+          done
+
+      - name: stamp + publish kimetsu-remote main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1];
+            const p = "npm/kimetsu-remote/package.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            j.version = version;
+            for (const k of Object.keys(j.optionalDependencies || {})) {
+              j.optionalDependencies[k] = version;
+            }
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          ' "$VERSION"
+          if npm view "kimetsu-remote@${VERSION}" version >/dev/null 2>&1; then
+            echo "skip: kimetsu-remote@${VERSION} already published"
+          else
+            echo "publishing kimetsu-remote@${VERSION}"
+            ( cd npm/kimetsu-remote && npm publish --access public --provenance )
+          fi
+
+      - name: summary
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "## npm publish — v${VERSION} ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Published the main package + 4 platform packages:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [\`kimetsu-ai\`](https://www.npmjs.com/package/kimetsu-ai/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
+          for k in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
+            echo "- [\`@kimetsu-ai/${k}\`](https://www.npmjs.com/package/@kimetsu-ai/${k}/v/${VERSION})" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "npm install -g kimetsu-ai  # lean build" >> $GITHUB_STEP_SUMMARY
+          echo "KIMETSU_NPM_FLAVOR=embeddings npm install -g kimetsu-ai  # semantic build" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

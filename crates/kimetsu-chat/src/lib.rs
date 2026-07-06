@@ -8,7 +8,7 @@
 //!   1. Zero dependence on Terminal-Bench / Harbor — chat is its own
 //!      product, not a benchmark subset.
 //!   2. Reuse the entire 20-tool surface, prompts, brain integration,
-//!      providers (`claude_code` today; `anthropic` natively next), and
+//!      providers (`claude_code`, `anthropic`, and distiller-specific OpenAI), and
 //!      MP-18's iterative goal verify with no per-feature porting.
 //!   3. Tool runtime swaps to host-side `LocalShellExecutor` — commands
 //!      execute against the user's actual filesystem.
@@ -22,6 +22,7 @@
 //! REPL loop is a minimal echo placeholder. Implementation lands in
 //! subsequent commits as the v0.3 sprint progresses.
 
+pub mod ask;
 pub mod bridge;
 pub mod commands;
 pub mod cost;
@@ -30,13 +31,18 @@ pub mod repl;
 pub mod skills;
 pub mod ui;
 
+pub use ask::{
+    AskAnswer, compose_answer, is_command_query, record_helpful_mark, reorder_for_command_fastpath,
+};
 pub use bridge::{
-    BridgeTarget, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
-    plugin_install,
+    BridgeTarget, InstallScope, PluginInstallReport, PluginMode, PluginScopeStatus,
+    PluginUninstallReport, RemoteInstall, WiringState, bridge_export_skill, bridge_import_skill,
+    bridge_scan, bridge_sync, plugin_install, plugin_install_remote, plugin_status,
+    plugin_uninstall,
 };
 pub use commands::SlashCommand;
 pub use cost::CostMeter;
-pub use mcp_server::{McpServeConfig, serve_mcp};
+pub use mcp_server::{McpServeConfig, brain_context_tool, dispatch, serve_mcp};
 pub use repl::{ChatConfig, ChatError, ChatResult, run_repl};
 pub use skills::{SkillConfig, SkillRegistry, skill_origin_label};
 pub use ui::{ChatUi, ChatUiMode, rich_ui_enabled_from_env};

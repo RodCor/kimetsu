@@ -7,16 +7,16 @@ use kimetsu_core::memory::{MemoryKind, MemoryScope};
 use serde_json::{Value, json};
 
 use crate::bridge::{
-    BridgeTarget, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan, bridge_sync,
-    plugin_install,
+    BridgeTarget, InstallScope, PluginMode, bridge_export_skill, bridge_import_skill, bridge_scan,
+    bridge_sync, plugin_install,
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) When a retrieved memory materially helped, call kimetsu_brain_cite with its memory_id — this closes the ground-truth loop and powers self-tuning. (4) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
-const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. v0.6: returns skipped:true (zero tokens) when no capsule is relevant above min_score threshold — safe to call on every non-trivial task without overhead concern.";
+const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Returns skipped:true (zero tokens) when no capsule is relevant above min_score threshold — safe to call on every non-trivial task without overhead concern.";
 
 // TODO (v0.6+): fold benchmark-tag filtering + semantic_operator/anti_pattern
 // preference into kimetsu_brain_context so kimetsu_benchmark_context becomes
@@ -44,9 +44,9 @@ const BRAIN_MEMORY_REJECT_DESCRIPTION: &str = "Reject a pending Kimetsu memory p
 
 const BRAIN_MEMORY_INVALIDATE_DESCRIPTION: &str = "Retire an accepted Kimetsu memory so the broker stops retrieving it. Use when a memory is stale, wrong, harmful, or contradicted by newer evidence. This writes a memory.invalidated event.";
 
-const BRAIN_MEMORY_BLAME_DESCRIPTION: &str = "v0.5.1: per-run memory attribution. Pass a run_id (ULID printed in chat sessions / trace files) to surface which memories the model explicitly cited via the cite_memory tool (strong ±1.0 usefulness signal) vs which were silently retrieved but never cited (weak ±0.1 signal). Use after a run feels off to learn whether a misleading memory was responsible, or after a clean run to see which memories actually earned their keep.";
+const BRAIN_MEMORY_BLAME_DESCRIPTION: &str = "Per-run memory attribution. Pass a run_id (ULID printed in chat sessions / trace files) to surface which memories the model explicitly cited via the cite_memory tool (strong ±1.0 usefulness signal) vs which were silently retrieved but never cited (weak ±0.1 signal). Use after a run feels off to learn whether a misleading memory was responsible, or after a clean run to see which memories actually earned their keep.";
 
-const BRAIN_MEMORY_CONFLICTS_DESCRIPTION: &str = "v0.5.2: list open memory-conflict hits detected at ingest. When a new memory's embedding is close (cosine >= 0.8 by default) to an existing memory in the same scope but their normalized text differs, the brain logs a conflict so an operator can decide which version to keep. Returns up to `limit` conflicts (default 50) merged from project + user brains. Use this before adding contradictory guidance so you don't end up with both 'use anyhow' and 'use thiserror' silently competing in retrieval.";
+const BRAIN_MEMORY_CONFLICTS_DESCRIPTION: &str = "List open memory-conflict hits detected at ingest. When a new memory's embedding is close (cosine >= 0.8 by default) to an existing memory in the same scope but their normalized text differs, the brain logs a conflict so an operator can decide which version to keep. Returns up to `limit` conflicts (default 50) merged from project + user brains. Use this before adding contradictory guidance so you don't end up with both 'use anyhow' and 'use thiserror' silently competing in retrieval.";
 
 const BRAIN_INGEST_REPO_DESCRIPTION: &str = "Index the repository into Kimetsu brain.db so future kimetsu_brain_context calls can retrieve repo snippets and manifests. Use during setup or after major repo changes. This writes repo.ingested events.";
 
@@ -60,7 +60,9 @@ const BRIDGE_EXPORT_DESCRIPTION: &str = "Export a canonical or discovered skill 
 
 const BRIDGE_SYNC_DESCRIPTION: &str = "Bulk-import all discovered non-Kimetsu skills into .kimetsu/extensions. Use for setup or migration, not during a narrow task unless the user asked to synchronize capabilities. This writes files and may touch many skill bundles.";
 
-const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/mcp.json, the kimetsu-bridge skill, and hook scripts; for claude-code, writes .claude/mcp.json, command docs, and hook scripts. Set mode=optional to recommend brain-first usage and soft-audit hooks, or mode=required to install hooks that block non-trivial work when Kimetsu brain context is unavailable. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome.";
+const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, the kimetsu-bridge skill, and the kimetsu-memory-harvester custom agent; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome. Set scope=workspace (default) to install into this workspace, or scope=global to install into the user's home (~/.claude, ~/.claude.json, ~/.codex) for all sessions. Existing user hooks are preserved (merged, not replaced).";
+
+const BRAIN_CITE_DESCRIPTION: &str = "Call when a retrieved Kimetsu memory materially helped you solve the current task. This records a ground-truth citation that powers Kimetsu's self-tuning: the brain learns which memories actually earn their keep. ROI: each citation trains the retrieval objective so future queries surface that memory sooner. Pass memory_id (from the capsule's provenance or kimetsu_brain_memory_list) and an optional note describing how it helped.";
 
 #[derive(Debug, Clone)]
 pub struct McpServeConfig {
@@ -87,6 +89,14 @@ pub fn serve_mcp<R: BufRead, W: Write>(
         .workspace
         .canonicalize()
         .unwrap_or_else(|_| config.workspace.clone());
+    // v0.8: honor the [embedder] config (env still wins) before any
+    // retrieval initializes the process-static embedder. A server
+    // started after `model set` therefore loads the configured model.
+    if let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        && let Ok(project_config) = project::load_config(&paths)
+    {
+        kimetsu_brain::embeddings::apply_embedder_selection(Some(&project_config.embedder.model));
+    }
     for line in reader.lines() {
         let line = line.map_err(|err| format!("read MCP stdin: {err}"))?;
         let line = line.trim_start_matches('\u{feff}');
@@ -123,12 +133,22 @@ pub fn serve_mcp<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn handle_mcp_method(
+/// Transport-agnostic MCP method dispatch.
+///
+/// `allowed_tools = None` → full catalog (identical to the previous
+/// `handle_mcp_method` behaviour; stdio path uses this).
+///
+/// `allowed_tools = Some(set)`:
+///   - `"tools/list"` returns only entries whose `name` ∈ set.
+///   - `"tools/call"` returns an error before dispatching if the
+///     requested tool name is not in the set.
+pub fn dispatch(
     method: &str,
-    params: Value,
-    workspace: &Path,
+    params: serde_json::Value,
+    workspace: &std::path::Path,
     skills: &SkillConfig,
-) -> Result<Value, String> {
+    allowed_tools: Option<&std::collections::BTreeSet<&'static str>>,
+) -> Result<serde_json::Value, String> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
@@ -142,12 +162,54 @@ fn handle_mcp_method(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => {
+            let all = tool_definitions();
+            let tools = match allowed_tools {
+                None => all,
+                Some(set) => {
+                    let filtered: Vec<Value> = all
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|entry| {
+                            entry
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(|n| set.contains(n))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    Value::Array(filtered)
+                }
+            };
+            Ok(json!({ "tools": tools }))
+        }
         "tools/call" => {
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "tools/call missing name".to_string())?;
+            if let Some(set) = allowed_tools {
+                if !set.contains(name) {
+                    return Err(format!("tool `{name}` is not available in remote mode"));
+                }
+            }
+            // `allowed_tools.is_some()` is the remote-mode marker (see the
+            // dispatch docstring): remote serves cloned repos whose
+            // project.toml is untrusted, so only the operator-set env var
+            // can enable writes there. Local stdio consults project config
+            // (default: enabled — recording lessons is the product's own
+            // prescribed workflow).
+            if is_privileged_write_tool(name)
+                && !mcp_write_tools_enabled(workspace, allowed_tools.is_some())
+            {
+                return Err(format!(
+                    "tool `{name}` requires explicit approval; enable with \
+                     `kimetsu config set kimetsu.mcp_write_tools true` (local) or \
+                     KIMETSU_MCP_ENABLE_WRITE_TOOLS=1 (env override, required for remote)"
+                ));
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -212,6 +274,16 @@ fn handle_mcp_method(
     }
 }
 
+/// Thin wrapper for the stdio path: full catalog, no allowlist.
+fn handle_mcp_method(
+    method: &str,
+    params: Value,
+    workspace: &Path,
+    skills: &SkillConfig,
+) -> Result<Value, String> {
+    dispatch(method, params, workspace, skills, None)
+}
+
 fn call_tool(
     name: &str,
     arguments: Value,
@@ -220,8 +292,10 @@ fn call_tool(
 ) -> Result<Value, String> {
     match name {
         "kimetsu_brain_status" => Ok(kimetsu_brain_status(workspace)),
+        "kimetsu_brain_insights" => Ok(kimetsu_brain_insights(workspace, &arguments)),
         "kimetsu_brain_context" => Ok(kimetsu_brain_context(workspace, &arguments)),
         "kimetsu_brain_record" => Ok(kimetsu_brain_record(workspace, &arguments)),
+        "kimetsu_brain_cite" => kimetsu_brain_cite(workspace, &arguments),
         "kimetsu_benchmark_context" => Ok(kimetsu_benchmark_context(workspace, &arguments)),
         "kimetsu_benchmark_record_outcome" => {
             kimetsu_benchmark_record_outcome(workspace, &arguments)
@@ -234,9 +308,7 @@ fn call_tool(
         "kimetsu_brain_memory_reject" => kimetsu_brain_memory_reject(workspace, &arguments),
         "kimetsu_brain_memory_invalidate" => kimetsu_brain_memory_invalidate(workspace, &arguments),
         "kimetsu_brain_memory_blame" => kimetsu_brain_memory_blame(workspace, &arguments),
-        "kimetsu_brain_memory_conflicts" => {
-            kimetsu_brain_memory_conflicts(workspace, &arguments)
-        }
+        "kimetsu_brain_memory_conflicts" => kimetsu_brain_memory_conflicts(workspace, &arguments),
         "kimetsu_brain_ingest_repo" => kimetsu_brain_ingest_repo(workspace, &arguments),
         "kimetsu_bridge_status" => {
             let scan = bridge_scan(workspace, skills)?;
@@ -330,6 +402,15 @@ fn call_tool(
         }
         "kimetsu_plugin_install" => {
             let target = BridgeTarget::parse(&string_arg(&arguments, "target")?)?;
+            let scope = arguments
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(InstallScope::parse)
+                .transpose()?
+                .unwrap_or_default();
+            if matches!(scope, InstallScope::Global) {
+                return Err("global plugin install is not available through MCP; run the explicit CLI command instead".to_string());
+            }
             let mode = arguments
                 .get("mode")
                 .and_then(Value::as_str)
@@ -340,15 +421,86 @@ fn call_tool(
                 .get("force")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let report = plugin_install(workspace, target, mode, force)?;
+            // v0.8: proactive defaults on; pass proactive:false to skip
+            // the PreToolUse/PostToolUse Bash hooks.
+            let proactive = arguments
+                .get("proactive")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let report = plugin_install(workspace, target, scope, mode, force, proactive)?;
             Ok(json!({
                 "target": report.target.as_str(),
+                "scope": report.scope.as_str(),
                 "mode": report.mode.as_str(),
                 "files": report.files,
             }))
         }
+        "kimetsu_brain_model_list" => kimetsu_brain_model_list(workspace),
+        "kimetsu_brain_model_set" => kimetsu_brain_model_set(workspace, &arguments),
+        "kimetsu_brain_reindex" => kimetsu_brain_reindex(workspace, &arguments),
+        "kimetsu_brain_memory_search" => kimetsu_brain_memory_search(workspace, &arguments),
+        "kimetsu_brain_conflict_resolve" => kimetsu_brain_conflict_resolve(workspace, &arguments),
+        "kimetsu_brain_prune" => kimetsu_brain_prune(workspace, &arguments),
+        "kimetsu_brain_config_show" => kimetsu_brain_config_show(workspace),
+        "kimetsu_brain_answer" => kimetsu_brain_answer(workspace, &arguments),
         other => Err(format!("unknown Kimetsu MCP tool `{other}`")),
     }
+}
+
+fn is_privileged_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "kimetsu_brain_record"
+            | "kimetsu_brain_cite"
+            | "kimetsu_benchmark_record_outcome"
+            | "kimetsu_brain_memory_add"
+            | "kimetsu_brain_memory_accept"
+            | "kimetsu_brain_memory_reject"
+            | "kimetsu_brain_memory_invalidate"
+            | "kimetsu_brain_ingest_repo"
+            | "kimetsu_bridge_import"
+            | "kimetsu_bridge_export"
+            | "kimetsu_bridge_sync"
+            | "kimetsu_plugin_install"
+            | "kimetsu_brain_model_set"
+            | "kimetsu_brain_reindex"
+            | "kimetsu_brain_conflict_resolve"
+            | "kimetsu_brain_prune"
+    )
+}
+
+fn mcp_write_tools_enabled(workspace: &Path, remote: bool) -> bool {
+    let env = std::env::var("KIMETSU_MCP_ENABLE_WRITE_TOOLS").ok();
+    let config_allow = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|config| config.kimetsu.mcp_write_tools);
+    write_tools_decision(env.as_deref(), remote, config_allow)
+}
+
+/// v1.0.0: pure decision for the privileged-write gate.
+///
+/// Precedence:
+///   1. The env var, when SET, always wins — truthy enables, anything else
+///      disables. This is the operator override in both directions.
+///   2. Remote mode (env unset): always deny. The workspace config on a
+///      remote server comes from a cloned repo — untrusted input must not
+///      be able to enable writes.
+///   3. Local mode (env unset): the project's `kimetsu.mcp_write_tools`
+///      (default true — a local plugin install IS the trusted session, and
+///      the brain's own workflow instructs the agent to record lessons).
+///      An unreadable config also defaults to true.
+fn write_tools_decision(env: Option<&str>, remote: bool, config_allow: Option<bool>) -> bool {
+    if let Some(value) = env {
+        return matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        );
+    }
+    if remote {
+        return false;
+    }
+    config_allow.unwrap_or(true)
 }
 
 fn kimetsu_brain_status(workspace: &Path) -> Value {
@@ -422,6 +574,61 @@ fn kimetsu_brain_status(workspace: &Path) -> Value {
     })
 }
 
+/// v1.0 (C6): `kimetsu_brain_insights` — effectiveness analytics MCP tool.
+fn kimetsu_brain_insights(workspace: &Path, arguments: &Value) -> Value {
+    use kimetsu_brain::analytics::{self, InsightsOptions};
+
+    let last_n_runs = u32_arg(arguments, "last_n_runs", 50, 1, u32::MAX);
+    let since = optional_string_arg(arguments, "since");
+    let top = u32_arg(arguments, "top", 10, 1, u32::MAX);
+
+    let opts = InsightsOptions {
+        last_n_runs,
+        since,
+        top_n: top,
+    };
+
+    let report = match analytics::compute_insights(workspace, opts) {
+        Ok(r) => r,
+        Err(err) => {
+            return brain_unavailable_json(workspace, &format!("kimetsu_brain_insights: {err}"));
+        }
+    };
+
+    // Build a short interpretation string from headline numbers.
+    let citation_rate = report
+        .citation
+        .citation_rate
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    let acceptance_rate = report
+        .proposals
+        .acceptance_rate
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    let avg_tokens = report
+        .token_economy
+        .avg_injected_tokens
+        .map(|v| format!("{:.0} tokens/injection", v))
+        .unwrap_or_else(|| "n/a tokens/injection".to_string());
+    let interpretation = format!(
+        "Citation rate {citation_rate} ({cited}/{retrieved} memories cited), \
+         proposal acceptance {acceptance_rate} ({accepted}/{total} decided), \
+         token economy {avg_tokens}. Retrieval hit-rate n/a until C7.",
+        cited = report.citation.cited_total,
+        retrieved = report.citation.retrieved_total,
+        accepted = report.proposals.accepted,
+        total = report.proposals.accepted + report.proposals.rejected,
+    );
+
+    let report_json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    json!({
+        "ok": true,
+        "report": report_json,
+        "interpretation": interpretation,
+    })
+}
+
 /// v0.7: shared argument parsing for retrieval MCP tools. Callers pass
 /// their own defaults for `budget_tokens` and `max_capsules` since bench
 /// and brain use different values (2500/8 vs 6000/3).
@@ -449,7 +656,36 @@ fn parse_shared_retrieval_args(
 }
 
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    use kimetsu_brain::context::ContextRequest;
+    match brain_context_tool(workspace, arguments, None) {
+        Ok(v) => v,
+        Err(e) => brain_unavailable_json(workspace, &e),
+    }
+}
+
+/// Candidate pool the remote reranker judges before truncating to the caller's
+/// cap. Mirrors `RERANK_POOL` in `kimetsu-cli/src/embed_daemon/server.rs`.
+pub const REMOTE_RERANK_POOL: usize = 6;
+
+/// Sigmoid-score floor for the remote reranker — capsules scored below this
+/// are noise. Mirrors `RERANK_FLOOR` in `kimetsu-cli/src/embed_daemon/server.rs`.
+pub const REMOTE_RERANK_FLOOR: f32 = 0.30;
+
+/// Transport-agnostic body of the `kimetsu_brain_context` tool.
+///
+/// When `reranker` is `None` the behaviour is identical to the previous
+/// private implementation (used by the stdio MCP path). When `Some`:
+/// - over-fetches a larger candidate pool (`max_capsules = cap.max(REMOTE_RERANK_POOL)`)
+/// - bumps `budget_tokens` to at least 6000 so the pool isn't token-starved
+/// - retrieves, then calls `rerank_capsules` before serialising
+///
+/// The JSON response shape is byte-compatible with the `None` path so
+/// existing tests and the stdio consumer are unaffected.
+pub fn brain_context_tool(
+    workspace: &Path,
+    arguments: &serde_json::Value,
+    reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
+) -> Result<serde_json::Value, String> {
+    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
 
     let query = arguments
         .get("query")
@@ -457,16 +693,16 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         .unwrap_or("")
         .trim();
     if query.is_empty() {
-        return json!({
+        return Ok(json!({
             "ok": false,
             "error": "missing `query`",
             "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
-        });
+        }));
     }
     let shared = parse_shared_retrieval_args(arguments, 6000, 3);
     let stage = shared.stage.as_str();
     let budget_tokens = shared.budget_tokens;
-    let max_capsules = shared.max_capsules;
+    let cap = shared.max_capsules;
     // v0.6: score threshold and role preference controls.
     let min_score = arguments
         .get("min_score")
@@ -499,21 +735,39 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
     // `KIMETSU_BRAIN_AMBIENT=off`. The full ambient block is
     // surfaced in the response so the model knows what augmented
     // its retrieval.
-    let (effective_query, ambient_payload) =
-        augment_with_ambient(workspace, query, arguments, "include_ambient");
+    // W3.2: load broker.ambient from the project config (best-effort;
+    // default true keeps existing behavior when config is missing).
+    let config_ambient = load_config_ambient(workspace);
+    let (effective_query, ambient_payload) = augment_with_ambient(
+        workspace,
+        query,
+        arguments,
+        "include_ambient",
+        config_ambient,
+    );
+
+    // When reranking, over-fetch a larger candidate pool so the cross-encoder
+    // sees enough diversity before truncating to `cap`, and bump the token
+    // budget so the pool isn't starved. Same logic as the embed daemon.
+    let (fetch_cap, fetch_budget) = if reranker.is_some() {
+        (cap.max(REMOTE_RERANK_POOL), budget_tokens.max(6000))
+    } else {
+        (cap, budget_tokens)
+    };
 
     let request = ContextRequest {
         stage: stage.to_string(),
         query: effective_query.clone(),
-        budget_tokens,
+        budget_tokens: fetch_budget,
         tags,
         min_score,
-        max_capsules,
+        max_capsules: fetch_cap,
         prefer_roles,
+        ..Default::default()
     };
 
     match project::retrieve_context_readonly_with_request(workspace, request) {
-        Ok(bundle) if bundle.skipped => json!({
+        Ok(bundle) if bundle.skipped => Ok(json!({
             "ok": true,
             "skipped": true,
             "top_score": bundle.top_score,
@@ -523,32 +777,60 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
             "usage": {
                 "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
             }
-        }),
-        Ok(bundle) => json!({
-            "ok": true,
-            "skipped": false,
-            "top_score": bundle.top_score,
-            "usage": {
-                "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
-                "next_steps": [
-                    "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
-                    "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
-                    "Continue with the host harness's normal file/shell/edit tools.",
-                    "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
-                ]
-            },
-            "stage": bundle.stage,
-            "query": query,
-            "augmented_query": effective_query,
-            "ambient": ambient_payload,
-            "budget_tokens": bundle.budget_tokens,
-            "used_tokens": bundle.used_tokens,
-            "capsule_count": bundle.capsules.len(),
-            "excluded_count": bundle.excluded.len(),
-            "capsules": bundle.capsules,
-            "excluded": bundle.excluded,
-        }),
-        Err(err) => brain_unavailable_json(workspace, &err.to_string()),
+        })),
+        Ok(mut bundle) => {
+            // Apply cross-encoder reranking when a reranker is present.
+            if let Some(rr) = reranker {
+                bundle.capsules = rerank_capsules(
+                    &effective_query,
+                    bundle.capsules,
+                    rr,
+                    REMOTE_RERANK_FLOOR,
+                    cap,
+                );
+            }
+
+            // v1.5 (Story 2.1): render-time compression. Load compress_capsules
+            // best-effort — any config error means no compression (safe default).
+            // Ranking is NEVER affected; this runs after retrieval + reranking.
+            let compress = kimetsu_core::paths::ProjectPaths::discover(workspace)
+                .ok()
+                .and_then(|paths| project::load_config(&paths).ok())
+                .map(|cfg| cfg.broker.compress_capsules)
+                .unwrap_or(false);
+            if compress {
+                use kimetsu_brain::context::compress_for_render;
+                for capsule in &mut bundle.capsules {
+                    capsule.summary = compress_for_render(&capsule.summary, 3);
+                }
+            }
+
+            Ok(json!({
+                "ok": true,
+                "skipped": false,
+                "top_score": bundle.top_score,
+                "usage": {
+                    "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
+                    "next_steps": [
+                        "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
+                        "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
+                        "Continue with the host harness's normal file/shell/edit tools.",
+                        "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
+                    ]
+                },
+                "stage": bundle.stage,
+                "query": query,
+                "augmented_query": effective_query,
+                "ambient": ambient_payload,
+                "budget_tokens": bundle.budget_tokens,
+                "used_tokens": bundle.used_tokens,
+                "capsule_count": bundle.capsules.len(),
+                "excluded_count": bundle.excluded.len(),
+                "capsules": bundle.capsules,
+                "excluded": bundle.excluded,
+            }))
+        }
+        Err(err) => Ok(brain_unavailable_json(workspace, &err.to_string())),
     }
 }
 
@@ -658,20 +940,61 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
     }
 }
 
+/// Record a ground-truth citation for a memory that materially helped.
+/// Writes a `memory.cited` event with the all-zero sentinel run_id so
+/// it links to no active run — this is the MCP path (primary Claude Code usage)
+/// where there is no agent run in progress.
+fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let memory_id = match arguments.get("memory_id").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
+            return Ok(
+                json!({ "ok": false, "error": "memory_id is required and must be non-empty" }),
+            );
+        }
+    };
+    let note = arguments.get("note").and_then(Value::as_str);
+    match project::record_mcp_citation(workspace, memory_id, note) {
+        Ok(()) => Ok(json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "recorded": "memory.cited",
+            "usage": "Citation recorded. This closes the ground-truth loop and trains Kimetsu's self-tuning objective."
+        })),
+        Err(err) => Ok(json!({ "ok": false, "error": err.to_string() })),
+    }
+}
+
+/// W3.2: load `broker.ambient` from the project config, best-effort.
+/// Returns `true` (the default) if the config is missing or unreadable
+/// so existing behavior is preserved when the project hasn't been
+/// initialized or the toml is absent.
+fn load_config_ambient(workspace: &Path) -> bool {
+    kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.ambient)
+        .unwrap_or(true)
+}
+
 /// v0.4.4: shared ambient-augmentation helper for the brain + benchmark
 /// MCP tools.
 ///
 /// Returns `(effective_query, ambient_payload)`. The payload is JSON
 /// (or `null` when ambient is disabled either per-call or globally),
 /// safe to embed directly into the response.
+///
+/// W3.2: `config_ambient` is the project config's `broker.ambient` value
+/// (default true). Resolution: `KIMETSU_BRAIN_AMBIENT` env > `config_ambient`.
 fn augment_with_ambient(
     workspace: &Path,
     query: &str,
     arguments: &Value,
     arg_key: &str,
+    config_ambient: bool,
 ) -> (String, Value) {
     let include = bool_arg(arguments, arg_key, true);
-    if !include || !kimetsu_brain::ambient::ambient_enabled() {
+    if !include || !kimetsu_brain::ambient::ambient_enabled_with(config_ambient) {
         return (query.to_string(), json!(null));
     }
     let ctx = kimetsu_brain::ambient::collect(workspace);
@@ -717,12 +1040,15 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     // into the brain so it appends AFTER slug detection (otherwise
     // the suffix would confuse `normalize_task_slug`). The full
     // ambient block is also surfaced in the response payload.
+    // W3.2: honor broker.ambient from project config with env override.
+    let config_ambient = load_config_ambient(workspace);
     let include_ambient = bool_arg(arguments, "include_ambient", true);
-    let ambient_ctx = if include_ambient && kimetsu_brain::ambient::ambient_enabled() {
-        Some(kimetsu_brain::ambient::collect(workspace))
-    } else {
-        None
-    };
+    let ambient_ctx =
+        if include_ambient && kimetsu_brain::ambient::ambient_enabled_with(config_ambient) {
+            Some(kimetsu_brain::ambient::collect(workspace))
+        } else {
+            None
+        };
     let ambient_suffix = ambient_ctx
         .as_ref()
         .map(kimetsu_brain::ambient::render_as_query_suffix)
@@ -826,12 +1152,23 @@ fn kimetsu_benchmark_record_outcome(workspace: &Path, arguments: &Value) -> Resu
 }
 
 fn kimetsu_brain_memory_list(workspace: &Path, arguments: &Value) -> Result<Value, String> {
-    let limit = u32_arg(arguments, "limit", 50, 1, 100) as usize;
-    let memories = project::list_memories(workspace)
-        .map_err(|err| format!("kimetsu brain memory list: {err}"))?;
+    let limit = u32_arg(arguments, "limit", 50, 1, 100);
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let memories = project::list_memories_with(
+        workspace,
+        project::ListOptions {
+            limit,
+            offset,
+            scope: optional_string_arg(arguments, "scope"),
+        },
+    )
+    .map_err(|err| format!("kimetsu brain memory list: {err}"))?;
     Ok(json!({
-        "memories": memories.iter().take(limit).map(json_memory_row).collect::<Vec<_>>(),
-        "usage": "Use kimetsu_brain_memory_top for outcome-ranked trust signals; use memory_id with kimetsu_brain_memory_invalidate to retire stale memories."
+        "limit": limit,
+        "offset": offset,
+        "count": memories.len(),
+        "memories": memories.iter().map(json_memory_row).collect::<Vec<_>>(),
+        "usage": "Page with limit+offset. Use kimetsu_brain_memory_search to find by text, kimetsu_brain_memory_top for outcome-ranked trust signals, and kimetsu_brain_memory_invalidate to retire stale memories."
     }))
 }
 
@@ -854,11 +1191,10 @@ fn kimetsu_brain_memory_top(workspace: &Path, arguments: &Value) -> Result<Value
 fn kimetsu_brain_memory_add(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let scope = MemoryScope::from_str(&string_arg(arguments, "scope")?)?;
     let kind = MemoryKind::from_str(
-        &arguments
+        arguments
             .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or("fact")
-            .to_string(),
+            .unwrap_or("fact"),
     )?;
     let text = string_arg(arguments, "text")?;
     let memory_id = project::add_memory(workspace, scope, kind, &text)
@@ -882,6 +1218,7 @@ fn kimetsu_brain_memory_proposals(workspace: &Path, arguments: &Value) -> Result
             status: optional_string_arg(arguments, "status")
                 .or_else(|| Some("pending".to_string())),
             limit: u32_arg(arguments, "limit", 50, 1, 200),
+            offset: arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32,
         },
     )
     .map_err(|err| format!("kimetsu brain memory proposals: {err}"))?;
@@ -941,8 +1278,8 @@ fn kimetsu_brain_memory_blame(workspace: &Path, arguments: &Value) -> Result<Val
     let run_id = string_arg(arguments, "run_id")?;
     let report = project::blame_run(workspace, run_id.trim())
         .map_err(|err| format!("kimetsu brain memory blame: {err}"))?;
-    let json = serde_json::to_value(&report)
-        .map_err(|err| format!("serialize blame report: {err}"))?;
+    let json =
+        serde_json::to_value(&report).map_err(|err| format!("serialize blame report: {err}"))?;
     Ok(json!({
         "ok": true,
         "usage": {
@@ -962,10 +1299,7 @@ fn kimetsu_brain_memory_blame(workspace: &Path, arguments: &Value) -> Result<Val
 /// `kimetsu brain memory conflicts`, JSON-shaped for the host
 /// harness. Read-only by design: actual resolution stays on the
 /// CLI to keep the audit trail centralized.
-fn kimetsu_brain_memory_conflicts(
-    workspace: &Path,
-    arguments: &Value,
-) -> Result<Value, String> {
+fn kimetsu_brain_memory_conflicts(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -973,8 +1307,8 @@ fn kimetsu_brain_memory_conflicts(
         .unwrap_or(50);
     let open = project::list_conflicts(workspace, limit)
         .map_err(|err| format!("kimetsu brain memory conflicts: {err}"))?;
-    let conflicts = serde_json::to_value(&open)
-        .map_err(|err| format!("serialize conflicts: {err}"))?;
+    let conflicts =
+        serde_json::to_value(&open).map_err(|err| format!("serialize conflicts: {err}"))?;
     Ok(json!({
         "ok": true,
         "usage": {
@@ -1011,6 +1345,298 @@ fn kimetsu_brain_ingest_repo(workspace: &Path, arguments: &Value) -> Result<Valu
         "skipped_files": summary.skipped_files,
         "manifests": summary.manifests,
         "usage": "After ingest, call kimetsu_brain_context with the task query to retrieve repo-aware capsules."
+    }))
+}
+
+/// v0.8: list the curated built-in embedding models and the active id.
+fn kimetsu_brain_model_list(workspace: &Path) -> Result<Value, String> {
+    use kimetsu_brain::embeddings::{BUILTIN_MODELS, resolve_embedder_id};
+    let config_model = project::load_config(
+        &kimetsu_core::paths::ProjectPaths::discover(workspace)
+            .map_err(|err| format!("discover workspace: {err}"))?,
+    )
+    .ok()
+    .map(|cfg| cfg.embedder.model);
+    let active = resolve_embedder_id(config_model.as_deref());
+    let models: Vec<Value> = BUILTIN_MODELS
+        .iter()
+        .map(|(id, dim, blurb)| {
+            json!({ "id": id, "dim": dim, "description": blurb, "active": *id == active })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "active": active,
+        "configured": config_model,
+        "models": models,
+        "usage": "Call kimetsu_brain_model_set to change the model. Note: a switch only affects new embeddings; restart the MCP server and run kimetsu_brain_reindex (or `kimetsu brain reindex --force` from the CLI) to re-embed existing memories."
+    }))
+}
+
+/// v0.8: change the embedding model. Records it in project.toml and
+/// (unless `reindex:false`) re-embeds the corpus in-process with a
+/// FRESH embedder for the new model — independent of the model this
+/// server loaded at startup. Note: the server's *retrieval* query
+/// embedder is a process-static singleton, so semantic retrieval in
+/// THIS session keeps using the old model (cross-model rows safely fall
+/// back to FTS) until the server restarts; the stored embeddings are
+/// already migrated, so a restart fully activates the new model.
+fn kimetsu_brain_model_set(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    use kimetsu_brain::embeddings::resolve_embedder_id;
+    let id = string_arg(arguments, "id")?;
+    // Validate against known aliases so a typo doesn't silently fall
+    // back to the default model.
+    if !is_known_embedder_alias(&id) {
+        return Err(format!(
+            "unknown embedder id `{id}`. Call kimetsu_brain_model_list for options."
+        ));
+    }
+    let canonical = resolve_embedder_id(Some(&id));
+    let paths = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .map_err(|err| format!("discover workspace: {err}"))?;
+    let mut config = project::load_config(&paths).map_err(|err| format!("load config: {err}"))?;
+    let previous = config.embedder.model.clone();
+    config.embedder.model = canonical.to_string();
+    let toml = config
+        .to_toml()
+        .map_err(|err| format!("serialize config: {err}"))?;
+    std::fs::write(&paths.project_toml, toml)
+        .map_err(|err| format!("write project.toml: {err}"))?;
+
+    let do_reindex = arguments
+        .get("reindex")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !do_reindex {
+        return Ok(json!({
+            "ok": true,
+            "model": canonical,
+            "previous": previous,
+            "reindexed": false,
+            "note": "Recorded in project.toml. Passed reindex:false, so existing memories keep their old embeddings until you run kimetsu_brain_reindex or `kimetsu brain reindex --force`."
+        }));
+    }
+
+    // Re-embed with a fresh embedder for the NEW model (not the server's
+    // cached default). The candidate predicate re-embeds every row whose
+    // embedding_model != the new model — i.e. all of them.
+    let embedder = kimetsu_brain::embeddings::open_embedder_for_model(canonical);
+    let report = kimetsu_brain::reindex::reindex_all_with_embedder(
+        workspace,
+        kimetsu_brain::reindex::ReindexOptions {
+            scope: kimetsu_brain::reindex::ReindexScope::All,
+            dry_run: false,
+            force: false,
+            limit: None,
+        },
+        embedder.as_ref(),
+    )
+    .map_err(|err| format!("reindex after model set: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "model": canonical,
+        "previous": previous,
+        "reindexed": !report.embedder_noop,
+        "updated": report.updated_total(),
+        "embedder_noop": report.embedder_noop,
+        "note": if report.embedder_noop {
+            "Recorded, but this is a lean (no-embeddings) build so no vectors were produced. Reinstall with `--features embeddings` to enable semantic retrieval."
+        } else {
+            "Recorded and existing memories re-embedded with the new model. Restart the MCP server so its retrieval query embedder also switches (until then, retrieval falls back to FTS for the migrated rows)."
+        }
+    }))
+}
+
+fn is_known_embedder_alias(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "default"
+            | "bge-small"
+            | "bge-small-en-v1.5"
+            | "bge-m3"
+            | "m3"
+            | "jina-code"
+            | "jina-v2-base-code"
+            | "jina-embeddings-v2-base-code"
+    )
+}
+
+/// v0.8: backfill stale/missing embeddings using the server's CURRENT
+/// embedder (the one loaded at startup). Useful after adding memories;
+/// to switch models, see kimetsu_brain_model_set.
+fn kimetsu_brain_reindex(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let scope = kimetsu_brain::reindex::ReindexScope::parse(
+        &optional_string_arg(arguments, "scope").unwrap_or_else(|| "all".to_string()),
+    )?;
+    let report = kimetsu_brain::reindex::reindex_all(
+        workspace,
+        kimetsu_brain::reindex::ReindexOptions {
+            scope,
+            dry_run: arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            force: arguments
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+        },
+    )
+    .map_err(|err| format!("kimetsu brain reindex: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "model": report.embedder_model_id,
+        "embedder_noop": report.embedder_noop,
+        "candidates": report.candidates_total(),
+        "updated": report.updated_total(),
+    }))
+}
+
+/// v0.8: full-text search over memory text for navigating the corpus.
+fn kimetsu_brain_memory_search(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let query = string_arg(arguments, "query")?;
+    let limit = u32_arg(arguments, "limit", 20, 1, 100);
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let hits = project::search_memories(
+        workspace,
+        &query,
+        limit,
+        offset,
+        optional_string_arg(arguments, "kind").as_deref(),
+        optional_string_arg(arguments, "scope").as_deref(),
+    )
+    .map_err(|err| format!("kimetsu brain memory search: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "query": query,
+        "limit": limit,
+        "offset": offset,
+        "count": hits.len(),
+        "results": hits.iter().map(|h| json!({
+            "memory_id": h.memory_id,
+            "scope": h.scope,
+            "kind": h.kind,
+            "text": h.text,
+            "rank": h.rank,
+        })).collect::<Vec<_>>(),
+        "usage": "Page with limit+offset. Filter by kind (failure_pattern/command/convention/preference/fact) or scope (global_user/project/repo/run)."
+    }))
+}
+
+/// v0.8: settle an open memory conflict from inside the agent.
+fn kimetsu_brain_conflict_resolve(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let conflict_id = string_arg(arguments, "conflict_id")?;
+    let resolution = string_arg(arguments, "resolution")?;
+    if !matches!(
+        resolution.as_str(),
+        "kept_new" | "kept_existing" | "kept_both"
+    ) {
+        return Err("`resolution` must be one of: kept_new, kept_existing, kept_both".to_string());
+    }
+    let resolved = project::resolve_conflict(workspace, &conflict_id, &resolution)
+        .map_err(|err| format!("kimetsu brain conflict resolve: {err}"))?;
+    Ok(json!({
+        "ok": resolved,
+        "conflict_id": conflict_id,
+        "resolution": resolution,
+        "resolved": resolved,
+        "usage": if resolved { "Conflict settled. kept_new/kept_existing invalidates the losing memory; kept_both keeps both." } else { "No open conflict with that id (already resolved or unknown)." }
+    }))
+}
+
+/// v0.8: prune net-negative memories. Defaults to a dry run (apply:false).
+fn kimetsu_brain_prune(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let apply = arguments
+        .get("apply")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let summary = project::prune_low_usefulness(
+        workspace,
+        project::PruneOptions {
+            scope: optional_string_arg(arguments, "scope"),
+            min_uses: u32_arg(arguments, "min_uses", 3, 1, 1000),
+            max_ratio: optional_f32_arg(arguments, "max_ratio").unwrap_or(0.0),
+            apply,
+        },
+    )
+    .map_err(|err| format!("kimetsu brain prune: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "apply": apply,
+        "candidate_count": summary.candidates.len(),
+        "invalidated": summary.invalidated,
+        "failed": summary.failed,
+        "candidates": summary.candidates.iter().map(|c| json!({
+            "memory_id": c.memory_id,
+            "scope": c.scope,
+            "kind": c.kind,
+            "text": c.text,
+            "use_count": c.use_count,
+            "usefulness_score": c.usefulness_score,
+        })).collect::<Vec<_>>(),
+        "usage": "This is a dry run unless apply:true. Candidates are memories with usefulness_score/use_count <= max_ratio and use_count >= min_uses."
+    }))
+}
+
+/// Flagship 3.2 — `kimetsu_brain_answer` MCP tool.
+///
+/// Synthesises a grounded, cited answer from retrieved project memories.
+/// GROUNDED-ONLY: never adds training-knowledge hallucinations.
+/// Degrades gracefully: verbatim capsules when no model is configured,
+/// "Nothing in memory" when retrieval is empty.
+///
+/// When `mark_helpful: true`, records a citation for every returned memory
+/// (closes the self-tuning ground-truth loop, same as kimetsu_brain_cite).
+fn kimetsu_brain_answer(workspace: &Path, arguments: &Value) -> Result<Value, String> {
+    let question = match arguments.get("question").and_then(Value::as_str) {
+        Some(q) if !q.trim().is_empty() => q.trim(),
+        _ => {
+            return Ok(json!({
+                "ok": false,
+                "error": "missing `question`",
+                "usage": "Pass the question to answer, e.g. {\"question\":\"how do I run the tests?\"}."
+            }));
+        }
+    };
+    let mark_helpful = arguments
+        .get("mark_helpful")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let result = crate::ask::compose_answer(workspace, question);
+
+    // Helpful-mark wiring (3.1 / tuning) — best-effort, never fails the tool.
+    if mark_helpful && result.grounded && !result.citations.is_empty() {
+        crate::ask::record_helpful_mark(workspace, &result.citations);
+    }
+
+    Ok(json!({
+        "ok": true,
+        "question": question,
+        "answer": result.answer,
+        "citations": result.citations,
+        "grounded": result.grounded,
+        "model_used": result.model_used,
+        "verbatim": result.verbatim,
+        "usage": {
+            "how_to_use": "The answer is grounded in project memories only. If it helped, pass mark_helpful:true on a follow-up call or call kimetsu_brain_cite with the relevant memory ids from citations[]."
+        }
+    }))
+}
+
+/// v0.8: read-only view of the project.toml config.
+fn kimetsu_brain_config_show(workspace: &Path) -> Result<Value, String> {
+    let raw = project::config_text(workspace)
+        .map_err(|err| format!("kimetsu brain config show: {err}"))?;
+    let parsed: Value = toml::from_str(&raw).unwrap_or(Value::Null);
+    Ok(json!({
+        "ok": true,
+        "raw": raw,
+        "config": parsed,
     }))
 }
 
@@ -1226,17 +1852,29 @@ fn tool_definitions() -> Value {
                         "enum": ["localization", "patch_plan", "implementation", "verification", "review"]
                     },
                     "budget_tokens": { "type": "integer", "minimum": 500, "maximum": 30000 },
-                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "v0.6: skip threshold — if the best capsule scores below this, return empty (zero tokens injected). Default 0.15." },
-                    "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "v0.6: hard cap on returned capsules. Default 3." },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "v0.6: domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
-                    "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "v0.6: boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
+                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Skip threshold — if the best capsule scores below this, return empty (zero tokens injected). Default 0.15." },
+                    "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Hard cap on returned capsules. Default 3." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
+                    "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "Boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
                 },
                 "required": ["query"]
             }
         },
         {
+            "name": "kimetsu_brain_cite",
+            "description": BRAIN_CITE_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "The memory_id of the retrieved memory that helped (from capsule provenance or kimetsu_brain_memory_list)." },
+                    "note": { "type": "string", "description": "Optional short description of how the memory helped." }
+                },
+                "required": ["memory_id"]
+            }
+        },
+        {
             "name": "kimetsu_brain_record",
-            "description": "v0.6: record a concrete, reusable lesson into the brain. Call after solving a non-obvious problem that required real effort. Do NOT call for trivial or well-known knowledge. High-confidence lessons (≥0.7) are accepted immediately; low-confidence go to pending proposals.",
+            "description": "Record a concrete, reusable lesson into the brain. Call after solving a non-obvious problem that required real effort. Do NOT call for trivial or well-known knowledge. High-confidence lessons (≥0.7) are accepted immediately; low-confidence go to pending proposals.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1489,14 +2127,119 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "enum": ["claude-code", "codex"] },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["workspace", "global"],
+                        "description": "workspace (default) installs into this workspace's .claude/.codex; global installs into ~/.claude(.json) and ~/.codex for all sessions."
+                    },
                     "mode": {
                         "type": "string",
                         "enum": ["optional", "required"],
                         "description": "optional recommends Kimetsu brain first; required tells the host harness to block non-trivial work until Kimetsu context is available or explicitly waived. Benchmark guidance prefers kimetsu_benchmark_context."
                     },
-                    "force": { "type": "boolean" }
+                    "force": { "type": "boolean" },
+                    "proactive": { "type": "boolean", "description": "Default true. Set false to skip the proactive PreToolUse/PostToolUse Bash hooks (mid-work recall); UserPromptSubmit + Stop still install." }
                 },
                 "required": ["target"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_model_list",
+            "description": "List the curated built-in embedding models and the active one. The user can switch models from here (kimetsu_brain_model_set).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "kimetsu_brain_model_set",
+            "description": "Set the brain's embedding model (a built-in id from kimetsu_brain_model_list). Records it in project.toml and (unless reindex:false) re-embeds the corpus with the new model in-process. The server's retrieval query embedder is fixed until restart, so semantic retrieval this session falls back to FTS for migrated rows; restart to fully activate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Built-in model id, e.g. bge-small-en-v1.5, bge-m3, jina-v2-base-code." },
+                    "reindex": { "type": "boolean", "description": "Default true. Re-embed existing memories with the new model now. Set false to record the id only." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_reindex",
+            "description": "Backfill stale/missing embeddings using the server's current embedder. Run after adding memories. To change models, use kimetsu_brain_model_set.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["project", "user", "all"] },
+                    "dry_run": { "type": "boolean" },
+                    "force": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1 }
+                }
+            }
+        },
+        {
+            "name": "kimetsu_brain_memory_search",
+            "description": "Full-text search over memory text. Page with limit+offset; filter by kind or scope. Use this to navigate the memory corpus.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "kind": { "type": "string", "enum": ["preference", "convention", "command", "failure_pattern", "fact"] },
+                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_conflict_resolve",
+            "description": "Settle an open memory conflict (from kimetsu_brain_memory_conflicts) by id. kept_new/kept_existing invalidates the losing memory; kept_both keeps both.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "conflict_id": { "type": "string" },
+                    "resolution": { "type": "string", "enum": ["kept_new", "kept_existing", "kept_both"] }
+                },
+                "required": ["conflict_id", "resolution"]
+            }
+        },
+        {
+            "name": "kimetsu_brain_prune",
+            "description": "List (or with apply:true, invalidate) net-negative memories whose usefulness ratio is at or below max_ratio. Defaults to a dry run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "min_uses": { "type": "integer", "minimum": 1 },
+                    "max_ratio": { "type": "number" },
+                    "apply": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "kimetsu_brain_config_show",
+            "description": "Read the project.toml config (raw + parsed), including the active embedder, broker weights, and run limits.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "kimetsu_brain_insights",
+            "description": "Brain effectiveness analytics: retrieval hit-rate, citation rate, proposal acceptance, usefulness trend, harvest yield, token economy. Use to see whether the brain is helping and to tune it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "last_n_runs": { "type": "integer", "minimum": 1, "description": "Number of most-recent runs to include in the rolling window. Default 50." },
+                    "since": { "type": "string", "description": "ISO-8601 lower bound on run timestamps. When set, overrides last_n_runs." },
+                    "top": { "type": "integer", "minimum": 1, "description": "How many items to include in ranked lists (top-useful, prune-candidates). Default 10." }
+                }
+            }
+        },
+        {
+            "name": "kimetsu_brain_answer",
+            "description": "Flagship 3.2 — mid-task grounded answer synthesis. Ask the brain a factual question and receive a composed, cited answer drawn ONLY from retrieved project memories (GROUNDED-ONLY: never hallucinates). Prefer a locally-configured cheap model (zero frontier tokens, offline). Degrades gracefully to verbatim capsule text when no model is configured. Returns nothing-in-memory when retrieval is empty.\n\nUse mid-task when you need to know what the project brain remembers about a topic instead of re-discovering it from scratch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question to answer from project memory (e.g. 'how do I run the tests?' or 'what does the broker do?')." },
+                    "mark_helpful": { "type": "boolean", "description": "When true, record a citation for every memory in the returned answer, closing the self-tuning ground-truth loop. Default false." }
+                },
+                "required": ["question"]
             }
         }
     ])
@@ -1598,6 +2341,110 @@ mod tests {
     }
 
     #[test]
+    fn brain_insights_appears_in_tool_definitions() {
+        let result = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("tools/list");
+        let tools = result["tools"].as_array().unwrap();
+        let insights_tool = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("kimetsu_brain_insights"))
+            .expect("kimetsu_brain_insights must be in tool_definitions");
+        // Description must mention analytics.
+        assert!(
+            insights_tool["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("analytics"),
+            "kimetsu_brain_insights description should contain 'analytics'"
+        );
+        // Schema must accept optional last_n_runs, since, top.
+        let props = &insights_tool["inputSchema"]["properties"];
+        assert!(
+            props.get("last_n_runs").is_some(),
+            "schema must have last_n_runs"
+        );
+        assert!(props.get("since").is_some(), "schema must have since");
+        assert!(props.get("top").is_some(), "schema must have top");
+    }
+
+    #[test]
+    fn brain_insights_reports_missing_project_without_error() {
+        let root = temp_root("kimetsu-mcp-insights-no-brain");
+        fs::create_dir_all(&root).expect("create temp root");
+        let result = call_tool(
+            "kimetsu_brain_insights",
+            json!({}),
+            &root,
+            &SkillConfig::default(),
+        )
+        .expect("brain insights call");
+        // No brain — must return initialized:false, not panic.
+        assert_eq!(result["initialized"].as_bool(), Some(false));
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn brain_insights_returns_well_formed_report() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-insights-brain");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "insights mcp test fixture memory",
+            )
+            .expect("add memory");
+
+            let result = call_tool(
+                "kimetsu_brain_insights",
+                json!({ "last_n_runs": 50, "top": 5 }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("brain insights call");
+
+            assert_eq!(result["ok"].as_bool(), Some(true), "ok must be true");
+            // The report must have the top-level sections.
+            let report = &result["report"];
+            assert!(
+                report.get("retrieval").is_some(),
+                "report.retrieval missing"
+            );
+            assert!(report.get("citation").is_some(), "report.citation missing");
+            assert!(
+                report.get("proposals").is_some(),
+                "report.proposals missing"
+            );
+            assert!(
+                report.get("usefulness").is_some(),
+                "report.usefulness missing"
+            );
+            assert!(report.get("harvest").is_some(), "report.harvest missing");
+            assert!(report.get("corpus").is_some(), "report.corpus missing");
+            assert!(
+                report.get("token_economy").is_some(),
+                "report.token_economy missing"
+            );
+            // interpretation string must be present and non-empty.
+            let interp = result["interpretation"].as_str().unwrap_or("");
+            assert!(!interp.is_empty(), "interpretation must be non-empty");
+            // hit_rate is None (C7 not landed) — JSON null in the report.
+            assert!(
+                report["retrieval"]["hit_rate"].is_null(),
+                "hit_rate must be null (C7 not yet landed)"
+            );
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
+    }
+
+    #[test]
     fn brain_context_returns_memory_capsules() {
         let root = temp_root("kimetsu-mcp-brain");
         fs::create_dir_all(&root).expect("create temp root");
@@ -1634,6 +2481,66 @@ mod tests {
             "expected a memory capsule: {capsules:?}"
         );
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    /// v1.0.0: `brain_context_tool` with a `StubReranker` reorders and caps
+    /// capsules. Seeds two memories — one semantically close to the query, one
+    /// unrelated — and confirms the reranker places the closer one first and
+    /// respects `max_capsules`.
+    #[test]
+    fn brain_context_tool_with_stub_reranker_reorders_and_caps() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-rerank");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+
+            // High-relevance memory: shares many tokens with the query.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Use ripgrep for fast file search before broad reads",
+            )
+            .expect("add high-relevance memory");
+
+            // Low-relevance memory: unrelated tokens.
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Convention,
+                "Quibblefrotz wobblecache unrelated zephyrqux datum",
+            )
+            .expect("add low-relevance memory");
+
+            let rr = kimetsu_brain::embeddings::StubReranker;
+            let args = json!({
+                "query": "search files ripgrep before reading",
+                "stage": "localization",
+                "min_score": 0.0,
+                "max_capsules": 1,
+            });
+
+            let result = brain_context_tool(&root, &args, Some(&rr)).expect("brain_context_tool");
+
+            assert_eq!(result["ok"].as_bool(), Some(true), "ok false: {result}");
+            // The reranker caps at max_capsules=1.
+            let capsules = result["capsules"].as_array().expect("capsules array");
+            assert!(
+                capsules.len() <= 1,
+                "reranker must cap to max_capsules=1, got {}: {result}",
+                capsules.len()
+            );
+            // The top capsule (if present) must be the ripgrep memory
+            // (higher token overlap with the query).
+            if let Some(top) = capsules.first() {
+                let summary = top["summary"].as_str().unwrap_or("");
+                assert!(
+                    summary.contains("ripgrep"),
+                    "StubReranker must rank the ripgrep memory first: {summary}"
+                );
+            }
+            fs::remove_dir_all(root).expect("remove temp root");
+        });
     }
 
     #[test]
@@ -1807,6 +2714,333 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+        let root = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        // Isolate from any enclosing git repo (e.g. a dev's $HOME repo)
+        // so ProjectPaths::discover resolves here, not a shared ancestor.
+        kimetsu_core::paths::git_init_boundary(&root);
+        root
+    }
+
+    // ── dispatch allowlist tests ──────────────────────────────────────────
+
+    /// (a) dispatch("tools/list", .., None) returns the full catalog.
+    #[test]
+    fn dispatch_no_allowlist_returns_full_catalog() {
+        use std::collections::BTreeSet;
+        let result = dispatch(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+            None,
+        )
+        .expect("dispatch tools/list None");
+        let tools = result["tools"].as_array().expect("tools array");
+        // Full catalog must contain representative tools from every category.
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        for expected in &[
+            "kimetsu_brain_status",
+            "kimetsu_brain_context",
+            "kimetsu_brain_record",
+            "kimetsu_benchmark_context",
+            "kimetsu_benchmark_record_outcome",
+            "kimetsu_brain_memory_list",
+            "kimetsu_brain_memory_top",
+            "kimetsu_brain_memory_add",
+            "kimetsu_brain_memory_proposals",
+            "kimetsu_brain_memory_accept",
+            "kimetsu_brain_memory_reject",
+            "kimetsu_brain_memory_invalidate",
+            "kimetsu_brain_memory_blame",
+            "kimetsu_brain_memory_conflicts",
+            "kimetsu_brain_ingest_repo",
+            "kimetsu_bridge_status",
+            "kimetsu_skills_search",
+            "kimetsu_bridge_import",
+            "kimetsu_bridge_export",
+            "kimetsu_bridge_sync",
+            "kimetsu_plugin_install",
+            "kimetsu_brain_model_list",
+            "kimetsu_brain_model_set",
+            "kimetsu_brain_reindex",
+            "kimetsu_brain_memory_search",
+            "kimetsu_brain_conflict_resolve",
+            "kimetsu_brain_prune",
+            "kimetsu_brain_config_show",
+            "kimetsu_brain_insights",
+        ] {
+            assert!(
+                names.contains(expected),
+                "full catalog missing `{expected}`; got: {names:?}"
+            );
+        }
+        // Confirm handle_mcp_method returns the same count (byte-identical path).
+        let via_handle = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("handle_mcp_method tools/list");
+        assert_eq!(
+            result["tools"].as_array().unwrap().len(),
+            via_handle["tools"].as_array().unwrap().len(),
+            "dispatch(None) and handle_mcp_method must return the same number of tools"
+        );
+        let _ = BTreeSet::<&str>::new(); // suppress unused-import if needed
+    }
+
+    /// (b) dispatch("tools/list", .., Some({"kimetsu_brain_record"})) returns ONLY that tool.
+    #[test]
+    fn dispatch_allowlist_filters_tools_list() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_record");
+        let result = dispatch(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect("dispatch filtered tools/list");
+        let tools = result["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools.len(),
+            1,
+            "allowlist of 1 tool should yield exactly 1 entry, got: {tools:?}"
+        );
+        assert_eq!(
+            tools[0]["name"].as_str(),
+            Some("kimetsu_brain_record"),
+            "the returned tool must be kimetsu_brain_record"
+        );
+    }
+
+    /// (c) dispatch("tools/call", {name:"kimetsu_brain_ingest_repo",..}, Some(set_without_it))
+    ///     returns the "not available in remote mode" error without executing.
+    #[test]
+    fn dispatch_allowlist_blocks_unlisted_tool_call() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_record"); // ingest_repo is NOT in this set
+        let err = dispatch(
+            "tools/call",
+            json!({ "name": "kimetsu_brain_ingest_repo", "arguments": {} }),
+            Path::new("."),
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect_err("should be blocked by allowlist");
+        assert!(
+            err.contains("not available in remote mode"),
+            "error must mention 'not available in remote mode', got: {err:?}"
+        );
+        assert!(
+            err.contains("kimetsu_brain_ingest_repo"),
+            "error must name the blocked tool, got: {err:?}"
+        );
+    }
+
+    /// v1.0.0: the write gate is a pure decision — env (set = wins, both
+    /// directions) > remote deny > local config (default allow). Covering
+    /// it here keeps env manipulation out of the dispatch-level tests.
+    #[test]
+    fn write_tools_decision_precedence() {
+        // Env set: truthy enables everywhere (incl. remote), falsy disables
+        // everywhere (incl. local config-true).
+        assert!(write_tools_decision(Some("1"), true, Some(false)));
+        assert!(write_tools_decision(Some("on"), false, Some(false)));
+        assert!(!write_tools_decision(Some("0"), false, Some(true)));
+        assert!(!write_tools_decision(Some("nope"), false, None));
+        // Env unset, remote: always deny — cloned-repo config must not
+        // be able to enable writes.
+        assert!(!write_tools_decision(None, true, Some(true)));
+        assert!(!write_tools_decision(None, true, None));
+        // Env unset, local: config decides, default allow.
+        assert!(write_tools_decision(None, false, Some(true)));
+        assert!(!write_tools_decision(None, false, Some(false)));
+        assert!(write_tools_decision(None, false, None));
+    }
+
+    /// Local dispatch honors `kimetsu.mcp_write_tools = false`: the user's
+    /// personalization knob still hard-blocks privileged writes.
+    #[test]
+    fn dispatch_blocks_writes_when_config_disables_them() {
+        let root = temp_root("dispatch-write-gate-config");
+        fs::create_dir_all(&root).expect("create temp root");
+        kimetsu_brain::project::init_project(&root, false).expect("init project");
+        // Flip the knob the way `kimetsu config set` would.
+        let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+        let mut config = kimetsu_brain::project::load_config(&paths).expect("load config");
+        config.kimetsu.mcp_write_tools = false;
+        fs::write(&paths.project_toml, config.to_toml().expect("toml")).expect("write config");
+
+        let err = dispatch(
+            "tools/call",
+            json!({
+                "name": "kimetsu_brain_record",
+                "arguments": { "lesson": "persist this without approval" }
+            }),
+            &root,
+            &SkillConfig::default(),
+            None,
+        )
+        .expect_err("config-disabled write tools must be blocked");
+        assert!(err.contains("requires explicit approval"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Remote dispatch (allowed_tools = Some) ignores workspace config —
+    /// even `mcp_write_tools = true` in a (cloned, untrusted) project.toml
+    /// must not enable writes without the operator's env var.
+    #[test]
+    fn dispatch_remote_ignores_config_for_write_tools() {
+        use std::collections::BTreeSet;
+        let root = temp_root("dispatch-write-gate-remote");
+        fs::create_dir_all(&root).expect("create temp root");
+        kimetsu_brain::project::init_project(&root, false).expect("init project");
+        // Default config already has mcp_write_tools = true.
+
+        let mut allowed = BTreeSet::new();
+        allowed.insert("kimetsu_brain_record");
+        let err = dispatch(
+            "tools/call",
+            json!({
+                "name": "kimetsu_brain_record",
+                "arguments": { "lesson": "persist this without approval" }
+            }),
+            &root,
+            &SkillConfig::default(),
+            Some(&allowed),
+        )
+        .expect_err("remote write tools must stay env-gated");
+        assert!(err.contains("requires explicit approval"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn global_plugin_install_is_not_available_through_mcp_helper() {
+        let err = call_tool(
+            "kimetsu_plugin_install",
+            json!({ "target": "codex", "scope": "global" }),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect_err("global plugin install must be blocked");
+        assert!(err.contains("global plugin install is not available"));
+    }
+
+    /// (d) An allowed tools/call dispatches correctly (uses kimetsu_brain_status
+    ///     which returns initialized:false for a missing brain without executing any
+    ///     side-effects, so it's safe in a unit test).
+    #[test]
+    fn dispatch_allowlist_permits_listed_tool_call() {
+        use std::collections::BTreeSet;
+        let root = temp_root("dispatch-allowlist-permitted");
+        fs::create_dir_all(&root).expect("create temp root");
+        let mut set = BTreeSet::new();
+        set.insert("kimetsu_brain_status");
+        let result = dispatch(
+            "tools/call",
+            json!({ "name": "kimetsu_brain_status", "arguments": {} }),
+            &root,
+            &SkillConfig::default(),
+            Some(&set),
+        )
+        .expect("allowed tool call should not be blocked");
+        // Result is wrapped in MCP content envelope.
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text");
+        let inner: Value = serde_json::from_str(text).expect("inner JSON");
+        // No brain initialized → initialized:false (not a panic or block error).
+        assert_eq!(
+            inner["initialized"].as_bool(),
+            Some(false),
+            "brain not initialized — expected initialized:false"
+        );
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    // v1.5: kimetsu_brain_cite tests
+    #[test]
+    fn cite_tool_listed_and_write_gated() {
+        let result = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .expect("tools/list");
+        let tools = result["tools"].as_array().unwrap();
+        let cite = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("kimetsu_brain_cite"))
+            .expect("kimetsu_brain_cite must appear in tools/list");
+        assert!(
+            cite["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("self-tuning"),
+            "description must mention self-tuning"
+        );
+    }
+
+    #[test]
+    fn cite_tool_is_write_gated() {
+        assert!(
+            is_privileged_write_tool("kimetsu_brain_cite"),
+            "kimetsu_brain_cite must be privileged"
+        );
+    }
+
+    #[test]
+    fn cite_tool_writes_memory_citations_row() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("kimetsu-mcp-cite-test");
+            fs::create_dir_all(&root).expect("create root");
+            project::init_project(&root, false).expect("init");
+            let memory_id = project::add_memory(
+                &root,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "cite MCP test memory",
+            )
+            .expect("add memory");
+
+            unsafe {
+                std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1");
+            }
+            let result = call_tool(
+                "kimetsu_brain_cite",
+                json!({ "memory_id": memory_id, "note": "it helped" }),
+                &root,
+                &SkillConfig::default(),
+            )
+            .expect("call kimetsu_brain_cite");
+            unsafe {
+                std::env::remove_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS");
+            }
+
+            assert_eq!(
+                result["ok"].as_bool(),
+                Some(true),
+                "cite must return ok:true"
+            );
+
+            let (_paths, _config, conn) = project::load_project(&root).expect("load");
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_citations WHERE memory_id = ?1",
+                    [memory_id.as_str()],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(count, 1, "memory_citations row must exist");
+            fs::remove_dir_all(root).ok();
+        });
     }
 }

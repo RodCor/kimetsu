@@ -1,10 +1,13 @@
 pub mod agent_loop;
 pub mod anthropic;
+pub mod bedrock;
 pub mod bench;
 pub mod claude_code;
 pub mod harness;
 pub mod model;
+pub mod openai;
 pub mod pipeline;
+pub mod recall_ledger;
 pub mod swe_bench;
 pub mod tools;
 

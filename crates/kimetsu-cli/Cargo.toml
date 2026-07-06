@@ -24,13 +24,18 @@ categories = ["command-line-utilities", "development-tools"]
 # Fan-out covers every kimetsu-* dep that kimetsu-cli actually
 # imports (kimetsu-harbor-rs is NOT among them — that crate's
 # binary is built separately by the release workflow).
-# v0.7.1: embeddings on by default (requires VS2022 C++ runtime — ort prebuilts).
-default = ["embeddings"]
+# v0.7.3: keep the default install lean so `cargo install kimetsu-cli`
+# works on every supported target. Embeddings remain available with
+# `--features embeddings` on targets where `ort` ships prebuilts.
+default = []
 embeddings = [
+    "dep:interprocess",
     "kimetsu-agent/embeddings",
     "kimetsu-brain/embeddings",
     "kimetsu-chat/embeddings",
 ]
+pi = ["kimetsu-chat/pi"]
+openclaw = ["kimetsu-chat/openclaw"]
 
 [[bin]]
 name = "kimetsu"
@@ -38,13 +43,33 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.7.2" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.2" }
-kimetsu-chat = { path = "../kimetsu-chat", version = "0.7.2" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.7.2" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "2.5.2" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.5.2" }
+kimetsu-chat = { path = "../kimetsu-chat", version = "2.5.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.5.2" }
 # v0.4.6: `kimetsu doctor` serializes its report struct so --json
 # output can be piped into CI / hooks.
+flate2 = "1"
+reqwest.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
+time.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+interprocess = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ulid.workspace = true
+
+# Daemon spawn hygiene: clear HANDLE_FLAG_INHERIT on our std handles before
+# spawning the long-lived embed daemon, so it can't hold the hook's stdout
+# pipe open and stall the harness (see embed_daemon::client).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

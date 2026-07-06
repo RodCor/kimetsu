@@ -12,9 +12,9 @@
 //! tests every wire from agent → harness → projector → memory row.
 
 use kimetsu_brain::projector;
+use kimetsu_brain::user_brain::with_user_brain_disabled;
 use kimetsu_core::event::Event;
 use kimetsu_e2e::prelude::*;
-use kimetsu_brain::user_brain::with_user_brain_disabled;
 
 #[test]
 fn cite_memory_tool_call_lands_in_report_context_with_turn_index() {
@@ -167,13 +167,15 @@ fn cited_memory_earns_strong_signal_after_run_finished_projection() {
             )
             .expect("query silent");
 
+        // Fact kind seed = 0.1; cited then earns +1.0 strong signal → 1.1
         assert!(
-            (cited_score - 1.0).abs() < 1e-6,
-            "cited memory should have usefulness_score = +1.0; got {cited_score}"
+            (cited_score - 1.1).abs() < 1e-6,
+            "cited memory should have usefulness_score = +1.1 (0.1 seed + 1.0 strong); got {cited_score}"
         );
+        // Fact kind seed = 0.1; silent passenger earns +0.1 weak signal → 0.2
         assert!(
-            (silent_score - 0.1).abs() < 1e-6,
-            "silent passenger should have usefulness_score = +0.1; got {silent_score}"
+            (silent_score - 0.2).abs() < 1e-6,
+            "silent passenger should have usefulness_score = +0.2 (0.1 seed + 0.1 weak); got {silent_score}"
         );
         assert_eq!(cited_uses, 1, "cited memory use_count should be 1");
         assert_eq!(silent_uses, 1, "silent memory use_count should be 1");

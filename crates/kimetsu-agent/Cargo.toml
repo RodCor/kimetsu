@@ -9,8 +9,8 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 rust-version.workspace = true
-description = "Transport-neutral agent runtime for kimetsu: tools, prompts, verify-loop, providers (claude_code, anthropic)."
-keywords = ["kimetsu", "agent", "llm", "anthropic", "claude"]
+description = "Transport-neutral agent runtime for kimetsu: tools, prompts, verify-loop, providers (claude_code, anthropic, openai)."
+keywords = ["kimetsu", "agent", "llm", "anthropic", "openai"]
 categories = ["development-tools"]
 
 [features]
@@ -22,9 +22,13 @@ default = []
 embeddings = ["kimetsu-brain/embeddings"]
 
 [dependencies]
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-runtime-api.workspace = true
 blake3.workspace = true
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.2" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.7.2" }
+http.workspace = true
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.5.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.5.2" }
 regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

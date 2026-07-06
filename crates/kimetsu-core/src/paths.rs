@@ -1,8 +1,23 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::KimetsuResult;
+
+static DISCOVER_AT_ROOT_ONLY: OnceLock<bool> = OnceLock::new();
+
+/// Pin discovery to at_root semantics process-wide (remote server calls once
+/// at startup): every [`ProjectPaths::discover`] call thereafter behaves like
+/// [`ProjectPaths::at_root`] — no git subprocess, never climbs to an
+/// enclosing repo. Idempotent.
+pub fn pin_discover_to_root() {
+    let _ = DISCOVER_AT_ROOT_ONLY.set(true);
+}
+
+fn discover_pins_to_root() -> bool {
+    *DISCOVER_AT_ROOT_ONLY.get().unwrap_or(&false)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProjectPaths {
@@ -17,11 +32,21 @@ pub struct ProjectPaths {
 
 impl ProjectPaths {
     pub fn discover(start: impl AsRef<Path>) -> KimetsuResult<Self> {
-        let start = start.as_ref();
-        let repo_root = discover_repo_root(start)?;
-        let kimetsu_dir = repo_root.join(".kimetsu");
+        if discover_pins_to_root() {
+            return Ok(Self::at_root(start.as_ref()));
+        }
+        let repo_root = discover_repo_root(start.as_ref())?;
+        Ok(Self::at_root(repo_root))
+    }
 
-        Ok(Self {
+    /// Build the paths anchored at an explicit `repo_root`, WITHOUT
+    /// climbing to an enclosing git repository. Use this when a command
+    /// is told exactly which directory to operate on (e.g. the install
+    /// wizard's `--workspace`), so it never writes into a parent repo.
+    pub fn at_root(repo_root: impl Into<PathBuf>) -> Self {
+        let repo_root = repo_root.into();
+        let kimetsu_dir = repo_root.join(".kimetsu");
+        Self {
             repo_root,
             project_toml: kimetsu_dir.join("project.toml"),
             brain_db: kimetsu_dir.join("brain.db"),
@@ -29,8 +54,68 @@ impl ProjectPaths {
             runs_dir: kimetsu_dir.join("runs"),
             lock_file: kimetsu_dir.join("project.lock"),
             kimetsu_dir,
-        })
+        }
     }
+
+    /// Validate that project state paths remain physically under the project
+    /// root and are not redirected through `.kimetsu` symlinks/junction-style
+    /// final components.
+    pub fn validate_state_dir(&self) -> KimetsuResult<()> {
+        let canonical_root = if self.repo_root.exists() {
+            self.repo_root.canonicalize()?
+        } else {
+            self.repo_root.clone()
+        };
+
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.kimetsu_dir) {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to use symlinked Kimetsu state dir: {}",
+                    self.kimetsu_dir.display()
+                )
+                .into());
+            }
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "Kimetsu state path exists but is not a directory: {}",
+                    self.kimetsu_dir.display()
+                )
+                .into());
+            }
+            let canonical_state = self.kimetsu_dir.canonicalize()?;
+            if !canonical_state.starts_with(&canonical_root) {
+                return Err(format!(
+                    "Kimetsu state dir escaped the project root: {}",
+                    self.kimetsu_dir.display()
+                )
+                .into());
+            }
+        }
+
+        for path in [
+            &self.project_toml,
+            &self.brain_db,
+            &self.project_log,
+            &self.runs_dir,
+            &self.lock_file,
+        ] {
+            reject_symlink(path)?;
+        }
+        Ok(())
+    }
+}
+
+fn reject_symlink(path: &Path) -> KimetsuResult<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to use symlinked Kimetsu state path: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub fn discover_repo_root(start: &Path) -> KimetsuResult<PathBuf> {
@@ -47,6 +132,30 @@ pub fn discover_repo_root(start: &Path) -> KimetsuResult<PathBuf> {
     } else {
         Ok(start)
     }
+}
+
+/// v0.8: make `dir` a standalone git repository (best-effort) so
+/// [`discover_repo_root`] resolves to `dir` itself instead of climbing
+/// to an enclosing repo. Two callers:
+///   * the benchmark harness, for throwaway fixture repos — without
+///     this, a fixture created under the system temp dir on a machine
+///     whose `$HOME` (or any ancestor) is a git repo would init its
+///     brain at that ancestor and leak fixture memories into it;
+///   * tests that create isolated project roots under the temp dir.
+///
+/// Creates `dir` if needed. Returns true when git reported success; a
+/// failure (e.g. git not installed) just means the caller doesn't get
+/// isolation, which is the prior behaviour.
+pub fn git_init_boundary(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn git_root(start: &Path) -> Option<PathBuf> {
@@ -114,12 +223,29 @@ pub fn user_brain_db_path() -> Option<PathBuf> {
 /// enabled by default — the "brain follows you between projects"
 /// pitch only works if the user opts OUT, not opts IN.
 pub fn user_brain_enabled() -> bool {
-    let value = match std::env::var("KIMETSU_USER_BRAIN") {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    let v = value.trim().to_ascii_lowercase();
-    !matches!(v.as_str(), "0" | "false" | "off" | "no")
+    // Delegate to the config-aware variant with the default (true).
+    user_brain_enabled_with(true)
+}
+
+/// W3.3: config-aware user-brain gate. Resolution precedence:
+///   1. `KIMETSU_USER_BRAIN` env is explicitly set → its value wins.
+///   2. Env is unset → `config_use_user_brain` governs.
+///
+/// Callers with a `ProjectConfig` should pass
+/// `config.kimetsu.use_user_brain`; back-compat callers can use
+/// `user_brain_enabled()`.
+pub fn user_brain_enabled_with(config_use_user_brain: bool) -> bool {
+    // Precedence: env override > config > default.
+    match std::env::var("KIMETSU_USER_BRAIN") {
+        Ok(value) => {
+            let v = value.trim().to_ascii_lowercase();
+            // Env is set — respect it (disable values → false, anything
+            // else including empty → treat as "on").
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
+        }
+        // Env unset → config governs.
+        Err(_) => config_use_user_brain,
+    }
 }
 
 pub fn default_project_id(repo_root: &Path) -> String {
@@ -146,4 +272,255 @@ fn slug(value: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// W2: per-project cache root for transient, non-brain artifacts
+/// (proactive hook state, chat REPL output, benchmark output).
+///
+/// Kept OUT of the project's `.kimetsu/` so a brain-only install's
+/// `.kimetsu/` stays lean. Lives under the user kimetsu home
+/// (`~/.kimetsu/cache/<project-id>/`), honouring
+/// `KIMETSU_USER_BRAIN_DIR`. Falls back to the OS temp dir when no
+/// home resolves, so it NEVER lands back inside `.kimetsu/`.
+///
+/// The `<project-id>` component is the same slug produced by
+/// [`default_project_id`], which is filesystem-safe (ASCII
+/// alphanumeric + hyphens only, non-empty).
+pub fn user_cache_dir_for(repo_root: &Path) -> PathBuf {
+    let hash = default_project_id(repo_root);
+    match user_kimetsu_dir() {
+        Some(home) => home.join("cache").join(&hash),
+        None => std::env::temp_dir().join("kimetsu-cache").join(&hash),
+    }
+}
+
+/// Strip the Windows `\\?\` extended-path prefix from a path string for
+/// display purposes only. The stored/internal path is never modified.
+///
+/// Conversions:
+///   `\\?\UNC\server\share` → `\\server\share`
+///   `\\?\C:\foo`           → `C:\foo`
+///   anything else          → unchanged
+///
+/// On non-Windows this is a no-op; the prefix never appears there.
+pub fn display_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    s.into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Process-wide mutex for env-mutating path tests.  Any test that
+    /// temporarily modifies `KIMETSU_USER_BRAIN_DIR`, `HOME`, or
+    /// `USERPROFILE` must hold this guard for the duration.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        &LOCK
+    }
+
+    /// Run `f` with `KIMETSU_USER_BRAIN_DIR` set to `dir`, restoring the
+    /// previous value under the shared env lock.
+    fn with_brain_dir<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+        }
+        out
+    }
+
+    /// Run `f` with both `KIMETSU_USER_BRAIN_DIR` and the platform home
+    /// env var cleared, so `user_kimetsu_dir()` returns `None`.
+    fn without_brain_dir<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let prev_override = std::env::var("KIMETSU_USER_BRAIN_DIR").ok();
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var(home_key).ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_USER_BRAIN_DIR");
+            std::env::remove_var(home_key);
+        }
+        let out = f();
+        unsafe {
+            match prev_override {
+                Some(v) => std::env::set_var("KIMETSU_USER_BRAIN_DIR", v),
+                None => std::env::remove_var("KIMETSU_USER_BRAIN_DIR"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var(home_key, v),
+                None => std::env::remove_var(home_key),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn user_cache_dir_for_lands_under_user_home() {
+        let tmp = std::env::temp_dir().join("kimetsu-test-cache-home");
+        let repo = Path::new("/some/project/my-repo");
+        let result = with_brain_dir(&tmp, || user_cache_dir_for(repo));
+        // Must be under <tmp>/cache/<slug>/
+        assert!(
+            result.starts_with(tmp.join("cache")),
+            "expected result under <tmp>/cache, got {result:?}"
+        );
+        // Must not be inside .kimetsu of the repo.
+        assert!(
+            !result.starts_with(repo.join(".kimetsu")),
+            "must not be inside repo .kimetsu, got {result:?}"
+        );
+        // The leaf component is the slug of the repo name.
+        let leaf = result.file_name().unwrap().to_str().unwrap();
+        assert_eq!(leaf, "my-repo");
+    }
+
+    #[test]
+    fn user_cache_dir_for_falls_back_to_temp_when_no_home() {
+        let repo = Path::new("/some/project/fallback-repo");
+        let result = without_brain_dir(|| user_cache_dir_for(repo));
+        // Must be under the OS temp dir, not under ~/.kimetsu.
+        let tmp = std::env::temp_dir();
+        assert!(
+            result.starts_with(&tmp),
+            "expected result under OS temp dir, got {result:?}"
+        );
+        // Must contain "kimetsu-cache".
+        assert!(
+            result
+                .components()
+                .any(|c| c.as_os_str() == "kimetsu-cache"),
+            "expected 'kimetsu-cache' in path, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn display_path_strips_extended_prefix() {
+        // \\?\C:\foo -> C:\foo
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\foo\.kimetsu\brain.db")),
+            r"C:\Users\foo\.kimetsu\brain.db"
+        );
+        // \\?\UNC\server\share -> \\server\share
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\path")),
+            r"\\server\share\path"
+        );
+        // Already clean — unchanged.
+        assert_eq!(
+            display_path(Path::new(r"C:\Users\foo\.kimetsu")),
+            r"C:\Users\foo\.kimetsu"
+        );
+        // Unix-style — unchanged.
+        assert_eq!(
+            display_path(Path::new("/home/user/.kimetsu")),
+            "/home/user/.kimetsu"
+        );
+    }
+
+    #[test]
+    fn slug_is_filesystem_safe() {
+        // No env mutation — no lock needed.
+        let id = default_project_id(Path::new("/tmp/my repo with spaces & stuff!"));
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "slug contains unsafe chars: {id:?}"
+        );
+        assert!(!id.is_empty());
+    }
+
+    /// pin_discover_to_root — once set, ProjectPaths::discover(nested_dir)
+    /// must return paths rooted AT that dir, NOT at any git ancestor.
+    ///
+    /// IMPORTANT: OnceLock cannot be reset, so this pin is process-wide and
+    /// permanent once set. This test is intentionally kept minimal and
+    /// self-contained. Primary coverage of the no-git seam lives in the
+    /// kimetsu-brain project.rs `*_at_root` tests which do NOT need the pin.
+    #[test]
+    fn validate_state_dir_rejects_symlinked_kimetsu_dir() {
+        let root = temp_root("state_symlink_root");
+        let outside = temp_root("state_symlink_outside");
+        let link = root.join(".kimetsu");
+        if create_dir_symlink(&outside, &link).is_err() {
+            std::fs::remove_dir_all(root).ok();
+            std::fs::remove_dir_all(outside).ok();
+            return;
+        }
+
+        let err = ProjectPaths::at_root(&root)
+            .validate_state_dir()
+            .expect_err("symlinked .kimetsu must be rejected");
+        assert!(
+            format!("{err}").contains("symlinked Kimetsu state dir"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("kimetsu_{label}_{nanos}"));
+        std::fs::create_dir_all(&path).expect("create temp root");
+        path
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[test]
+    fn pin_discover_to_root_skips_git_climb() {
+        // Create a temp dir nested inside the current git repo (E:\Kimetsu is
+        // a git repo, so any child dir without its own .git would normally
+        // climb to E:\Kimetsu). We use a deeply nested path to be sure.
+        let nested = std::env::temp_dir()
+            .join("kimetsu-pin-test")
+            .join("nested")
+            .join("deep");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        // Set the pin (process-global, irreversible — that's by design).
+        pin_discover_to_root();
+
+        // discover(nested) must return nested itself, not a git ancestor.
+        let paths = ProjectPaths::discover(&nested).expect("discover with pin should not fail");
+
+        // The repo_root must be exactly `nested` (or its canonical form).
+        let canonical_nested = nested.canonicalize().unwrap_or(nested.clone());
+        let canonical_root = paths
+            .repo_root
+            .canonicalize()
+            .unwrap_or(paths.repo_root.clone());
+        assert_eq!(
+            canonical_root, canonical_nested,
+            "pin_discover_to_root: expected repo_root == nested dir, got {canonical_root:?}"
+        );
+    }
 }

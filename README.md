@@ -1,177 +1,219 @@
 <div align="center">
 
-<img src="docs/assets/kimetsu-logo.png" alt="Kimetsu logo" width="220" />
+<img src="docs/assets/kimetsu-logo.png" alt="Kimetsu logo" width="200" />
 
 # Kimetsu
 
 ### Give your coding agent a memory that gets sharper every run.
 
-**Evidence-first memory for Claude Code, Codex, and the terminal.**
-Kimetsu sits beside your AI agent, watches what actually solves problems,
-remembers it, and feeds the high-signal context back — so the next run
-starts where the last one left off.
+*Kimetsu* (鬼滅), "demon slayer." It slays the demon every agent fights: amnesia.
 
 [![crates.io](https://img.shields.io/badge/crates.io-kimetsu--cli-orange)](https://crates.io/crates/kimetsu-cli)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-informational)](https://www.rust-lang.org)
 
+<img src="docs/assets/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="720" />
+
 </div>
 
 ---
 
-## Why Kimetsu
+## What is Kimetsu
 
-LLM coding agents are brilliant and forgetful. Every session starts from
-zero — the same wrong turns, the same re-explaining of your conventions,
-the same expensive exploration you already paid for last week.
+Coding agents are brilliant and forgetful. Every session starts from zero: the
+same wrong turns, the same re-explained conventions, the same exploration you
+already paid for last week.
 
-Kimetsu fixes the forgetting. It's a **sidecar brain**: a single Rust binary
-that runs next to Claude Code or Codex (or as its own terminal chat), learns
-which memories the model *actually used to win*, and lets that knowledge
-compound across runs.
+Kimetsu is a sidecar brain for your agent. One Rust binary and one SQLite file
+per project, wired into Claude Code, Codex, Pi, OpenClaw, or Cursor over MCP,
+or driven from its own terminal chat. It captures the lessons an agent earns,
+learns which ones actually help, and hands them back before the next task. The
+memory pipeline calls no LLM: storage and retrieval are 100% local, free, and
+offline-capable.
 
-- **It remembers.** Project conventions, failure patterns, the exact command
-  that regenerates your schema — captured once, retrieved automatically.
-- **It learns what helps.** Memories that the model cites before solving a
-  problem get promoted. Silent passengers and stale advice decay and get pruned.
-- **It's cheap to be right.** On a recorded 16-task Terminal-Bench slice,
-  brain-on runs cost **~13× less per win** than bare Claude Code — $0.19/win
-  vs $2.47/win.
-- **It's yours, on your machine.** The whole brain is one SQLite file per
-  project. No vector DB, no cloud, no telemetry. Back it up with `cp`.
+| | |
+|---:|---|
+| **89.4%** | LoCoMo, the long-conversation memory benchmark, full 1,540-question set |
+| **73.3%** | BEAM 100K memory benchmark, matching the prior public state of the art, model-free |
+| **66.0%** | BEAM 1M, ahead of mem0's self-reported 62% at the same bucket |
+| **83.0%** | LongMemEval, the public long-term-memory benchmark |
+| **13x** | cheaper per solved task: $0.19 vs $2.47 on a 16-task Terminal-Bench slice |
+| **~1M** | memories held in ~3 GB RAM with sub-2s retrieval, one SQLite file |
+| **$0** | API cost to store and recall: zero LLM calls in the memory pipeline |
 
-> *Kimetsu* (鬼滅) — "demon slayer." It slays the demon every agent fights:
-> amnesia.
+---
+
+## Quickstart
+
+```bash
+npm install -g kimetsu-ai
+kimetsu npm-flavor embeddings        # one-time: enable semantic retrieval
+cd /your/project
+kimetsu setup --host claude-code     # or: codex | openclaw | pi
+kimetsu doctor --selftest            # records a memory and retrieves it
+```
+
+Other install paths (cargo, prebuilt archives) and host-wiring details are in
+**[the install guide](https://kimetsu.dev/docs/install)**.
+
+---
+
+## What it does
+
+- **Remembers what matters.** Project conventions, failure patterns, the exact
+  command that regenerates your schema. Captured once, retrieved by meaning,
+  even when you phrase it differently.
+- **Speaks first.** Most memory waits to be asked. Kimetsu is proactive: a
+  session-start digest, an episodic resume, and pre-task context mean the
+  agent's first turn already knows the repo, your conventions, and what you
+  were doing last time.
+- **Learns what helps.** Memories the model cites before solving a problem get
+  promoted. Stale advice and silent passengers decay and get pruned.
+- **Answers, not just injects.** `kimetsu ask` composes a grounded, cited
+  answer from memory using a local model: zero frontier tokens, works offline.
+  Lessons cited often enough graduate into runnable skills.
+- **Pays for itself.** ~13x cheaper per solved task than a no-brain baseline on
+  a recorded Terminal-Bench slice, and the ROI ledger shows the savings on your
+  own work.
+- **Stays yours.** The whole brain is one SQLite file per project. No external
+  vector DB, no cloud, no telemetry. Back it up with `cp`.
 
 ---
 
 ## How it works
 
-```
-   ┌──────────────┐        ┌──────────────────────────────────────┐
-   │  Your agent  │        │              Kimetsu brain            │
-   │ Claude Code  │  MCP   │                                       │
-   │   / Codex    │◀──────▶│   broker ──▶ scores + ranks memories  │
-   │  / kimetsu   │ ~18    │      ▲          by relevance, useful-  │
-   │     chat     │ tools  │      │          ness, freshness, scope │
-   └──────┬───────┘        │   brain.db (SQLite + FTS5 + cosine)   │
-          │                │      ▲                                 │
-          │ cite_memory    │      │ citations + outcomes feed back  │
-          └────────────────┴──────┘                                 │
-                           └────────────────────────────────────────┘
-```
+<img src="docs/assets/how-it-works.svg" alt="How Kimetsu works: the host agent asks the broker for context, the broker scores candidates from brain.db by relevance, usefulness, freshness, and scope, injects the top memories into the agent run, and the run cites what helped so cited memories rise and stale ones decay" width="960" />
 
-1. **Before a task**, the agent asks Kimetsu for context. The **broker**
-   walks your project brain *and* your cross-project user brain, scores every
-   candidate memory (relevance × usefulness × freshness × scope), de-duplicates,
-   and injects the top few inside a token budget.
-2. **During the task**, the model calls `cite_memory` when a memory actually
-   helps. Those citations are the ground truth.
-3. **After the task**, Kimetsu rewards cited memories, lightly nudges the
-   "silent passengers," and lets old advice decay on a half-life curve. The
-   brain gets sharper with every run — automatically.
+1. **Before a task**, the broker walks your project brain and your
+   cross-project user brain, scores every candidate, and injects the top few
+   inside an adaptive token budget.
+2. **While it works**, Kimetsu surfaces known pitfalls before the first
+   attempt, and the model cites the memories that actually help.
+3. **After the task**, cited memories get promoted, unused advice decays on a
+   half-life curve, and non-trivial sessions auto-harvest their lessons.
 
-Want the full mechanics — scoring weights, citation deltas, decay, conflict
-detection? See **[docs/HOW-KIMETSU-WORKS.md](docs/HOW-KIMETSU-WORKS.md)**.
+Full mechanics: scoring, citations, decay, conflict detection, retrieval
+levels, and the daemon, in
+**[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)**.
 
 ---
 
-## Install
+## Share your brain
 
-Kimetsu is a single Rust binary. Pick your flavor:
-
-```bash
-# Lean — fast lexical (FTS) retrieval, no model download (~30s build)
-cargo install kimetsu-cli
-
-# With local semantic search — pulls fastembed + ONNX, first run
-# downloads BGE-small (~67 MB). Cosine retrieval + conflict detection light up.
-cargo install kimetsu-cli --features embeddings
-
-# From source
-cargo install --path crates/kimetsu-cli   # add --features embeddings if you like
-```
-
-Prefer not to touch the Rust toolchain? Pre-built binaries for
-**Linux / macOS / Windows** ship on every
-[GitHub Release](https://github.com/RodCor/kimetsu/releases) — drop one in
-`~/.local/bin`.
-
-Confirm it's healthy:
+A brain is a portable file. Export it as a pack, hand it to a teammate, merge
+theirs into yours, or swap a whole brain in and out. Onboard a new machine or a
+new hire with one import.
 
 ```bash
-kimetsu --version
-kimetsu doctor      # checks paths, brain.db, embedder, MCP, bridge
+# export a shareable pack (always gzip-compressed, always security-scrubbed)
+kimetsu brain export onboarding.json.gz --name rust-conventions --version 1.0.0
+
+# merge a pack into your brain (additive, dedups against what you already know)
+kimetsu brain import onboarding.json.gz
+
+# install straight from a URL
+kimetsu brain import https://example.com/packs/rust-conventions.json.gz
+
+# swap: replace your current memories in the pack's scope (reversible)
+kimetsu brain import other-brain.json.gz --mode replace --yes
 ```
 
-**Prerequisites:** Rust 1.85+ (stable) and a Claude credential
-(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). That's it for chat — Docker,
-Harbor, and Python are only needed for benchmark runs.
+Every export is scrubbed before it leaves your machine: credentials and PII
+are redacted automatically, and `--strict` aborts the export if anything was
+found. Merge is idempotent, so re-importing is safe. Replace supersedes rather
+than deletes, so a swap can always be undone. For continuous sharing,
+`kimetsu brain sync` replicates a brain across machines with no server, and
+**[Kimetsu Remote](https://kimetsu.dev/docs/remote)** serves one
+brain per repository to a whole team.
 
 ---
 
-## Quick start
+## Benchmarks vs other memory systems
 
-### 1. Talk to it directly
+Kimetsu's memory pipeline (ingest, store, retrieve, rerank) makes **zero LLM
+calls**: FTS5 + local embeddings + a local cross-encoder. mem0 / Cognee / Zep /
+Letta call a model to distill memories at write time **and** keep an LLM in the
+retrieval loop (mem0's own 2026 figures report ~7,000 tokens per retrieval
+call, a metered cost on every question). Kimetsu lands in the same accuracy
+band without the LLM, the bill, or the cloud.
 
-```bash
-export CLAUDE_CODE_OAUTH_TOKEN=<your-token>   # or use a workspace .env
-kimetsu chat --workspace . --project .
-```
+| benchmark | Kimetsu (local, model-free) | mem0 | Cognee |
+|-----------|-----------------------------|------|--------|
+| **BEAM 1M** (matched bucket) | **66.0%** | 62% | not reported |
+| BEAM 100K | **73.3%** | n/a | 79% |
+| BEAM 10M | future work | 48.6% | 67% |
+| LongMemEval (`_s`) | **83.0%** (200-q) · ~80.9% weighted | 94.4% (full set, their reader) | not reported |
 
-`--project .` turns on memory: Kimetsu keeps one brain session open for the
-whole conversation and injects retrieved context into every turn. Inside chat,
-`/help` lists everything; favorites: `/plan`, `/run`, `/verify`, `/review`,
-`/skills`, `/cost`, and `$skill <prompt>` to apply a skill.
+Honest, not cherry-picked: our LongMemEval is a 200-question slice (not the
+full 500), our BEAM-1M is 15 of 35 conversations with a Codex reader vs mem0's
+full set on their own harness, Cognee (a knowledge-graph system with an LLM in
+the loop) leads at 100K/10M, and vendor numbers are self-reported. We ship the
+exact harness, reader, and settings so ours can be checked. Per-ability tables,
+caveats, and reproduction steps:
+**[the memory benchmark](https://kimetsu.dev/docs/memory-benchmark)**.
 
-### 2. Or bolt it onto Claude Code / Codex
-
-Wire Kimetsu into your existing agent as an MCP sidecar — one command:
-
-```bash
-kimetsu plugin install claude --workspace .    # writes .claude/mcp.json + hooks
-kimetsu plugin install codex  --workspace .    # writes .codex/mcp.json + skill
-```
-
-Now your agent gets ~18 `kimetsu_*` tools (brain context, memory add/list,
-citations, repo ingest, the cross-harness skill bridge) and starts banking
-memories across every session.
-
-```bash
-kimetsu brain search "build failures"
-kimetsu brain context "where is auth configured?"
-kimetsu brain memory top          # most useful memories so far
-```
+Retrieval itself is benchmarked too: recall@4 0.949 and MRR 0.914 at ~138 ms
+with the default reranker (up to 0.975 / 0.933 with the quality-best one), on a
+210-case dataset of real exported memories. Reproduce or re-tune on your own
+corpus with `kimetsu brain bench`.
 
 ---
 
-## What's in the box
+## Command reference
 
-| Surface | What it is |
-|---------|------------|
-| **`kimetsu chat`** | A full terminal coding assistant — slash commands, skills, hooks, background tasks, MCP, agents. Runs against your workspace, no Harbor required. |
-| **`kimetsu` brain** | Event-sourced project + user memory in SQLite. Citations, decay, conflict detection, FTS + optional semantic retrieval. |
-| **`kimetsu bridge`** | Cross-harness skill portability — import/export skills between Claude Code, Codex, Agents, and Kimetsu. |
-| **MCP sidecar** | `kimetsu mcp serve` exposes the brain to any MCP host as ~18 tools. |
+| Command | What it does |
+|---------|--------------|
+| `kimetsu setup --host <h>` | Wire the brain into a host agent (init + install + selftest) |
+| `kimetsu chat` | Standalone terminal coding assistant with the same brain |
+| `kimetsu brain memory add` | Record a durable lesson by hand |
+| `kimetsu brain context "<q>"` | Broker-ranked context bundle for a query |
+| `kimetsu ask "<q>"` | Grounded, cited answer from memory (local model) |
+| `kimetsu resume` / `kimetsu checkpoint` | Pick up where the last session left off |
+| `kimetsu brain export` / `import` | Share brains: scrubbed packs, merge or replace, file or URL |
+| `kimetsu brain sync` | Replicate your brain across machines, no server |
+| `kimetsu brain skills` | Turn often-cited lessons into runnable skills |
+| `kimetsu brain insights` / `roi` | Is the brain helping, and did it pay for itself |
+| `kimetsu brain tune` | Self-tune retrieval against your own query history |
+| `kimetsu brain bench` | Benchmark retrieval on your own corpus |
 
-Built as a small Rust workspace (`kimetsu-cli`, `-chat`, `-agent`, `-brain`,
-`-core`, plus a benchmark-only Harbor adapter). Lint + tests run clean on every
-change.
+The full command surface, configuration keys, and maintenance commands are in
+**[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)** and
+**[the install guide](https://kimetsu.dev/docs/install)**.
+
+---
+
+## Kimetsu Remote (beta)
+
+Share one brain per repository from a server over HTTP MCP, for a team or for
+yourself across machines:
+
+```bash
+# server
+kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains --token <secret>
+# each client
+kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
+```
+
+Bearer auth, per-repo brains, an optional shared org-brain, server-side repo
+ingest, TLS, Prometheus metrics, and a server-side reranker. Full setup in
+**[the Kimetsu Remote guide](https://kimetsu.dev/docs/remote)**.
 
 ---
 
 ## Docs
 
-- **[How Kimetsu Works](docs/HOW-KIMETSU-WORKS.md)** — the conceptual reference:
-  the brain, the broker, citations, decay, conflict detection, the MCP surface,
-  the bridge, doctor, and config. Start here for depth.
-- **[CHANGELOG](CHANGELOG.md)** — what shipped in each release.
-- Per-crate `src/lib.rs` doc comments for module-level detail.
+- **[Install & host wiring](https://kimetsu.dev/docs/install)**: every install path, host
+  wiring, auto-harvest and distiller setup, maintenance commands.
+- **[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)**: the brain, the broker,
+  citations, decay, conflict detection, the MCP surface, retrieval models and
+  benchmarking, configuration, the bridge, and doctor.
+- **[Local models](https://kimetsu.dev/docs/local-models)**: run fully local with Ollama.
+- **[Kimetsu Remote](https://kimetsu.dev/docs/remote)**: server setup, org brain, TLS, clients.
+- **[CHANGELOG](https://kimetsu.dev/docs/changelog)**: what shipped in each release.
 
 ---
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) — your
-choice. The same dual license used across the Rust ecosystem (tokio, serde,
-fastembed-rs).
+Dual-licensed under [MIT](docs/LICENSE-MIT) or [Apache-2.0](docs/LICENSE-APACHE),
+your choice.

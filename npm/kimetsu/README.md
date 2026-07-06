@@ -1,0 +1,59 @@
+# kimetsu-ai
+
+A persistent memory **brain** sidecar for Claude Code and Codex. It accumulates
+generalizable knowledge across sessions and retrieves it on demand.
+
+This npm package installs the prebuilt native `kimetsu` binary for your platform —
+**no Rust toolchain required**. It's the same binary published on
+[GitHub Releases](https://github.com/RodCor/kimetsu/releases) and via
+`cargo install kimetsu-cli`.
+
+## Install
+
+```bash
+npm install -g kimetsu-ai
+kimetsu --version
+kimetsu doctor      # checks paths, brain.db, embedder, MCP, bridge
+```
+
+Installs the `kimetsu` command (also available as `kimetsu-ai`). npm downloads
+only the platform package that matches your OS/CPU
+(`@kimetsu-ai/linux-x64`, `@kimetsu-ai/darwin-x64`, `@kimetsu-ai/darwin-arm64`,
+`@kimetsu-ai/win32-x64`) via `optionalDependencies`. There is **no postinstall
+download** — it works under `npm install --ignore-scripts`.
+
+### Semantic (embeddings) build
+
+The default install is the **lean** build: fast lexical (FTS) retrieval, no model
+download. To opt into the semantic build (fastembed + ONNX; first run downloads
+BGE-small), run this **once** — the choice is remembered, no env var to keep set:
+
+```bash
+kimetsu npm-flavor embeddings   # fetch + use the semantic build (persists)
+kimetsu npm-flavor lean         # switch back
+kimetsu npm-flavor status       # show the current build
+```
+
+`kimetsu npm-flavor embeddings` fetches and caches the embeddings binary from the
+matching GitHub Release and records the preference in
+`<cache>/kimetsu/npm/flavor`, so every later `kimetsu` uses it automatically.
+(`KIMETSU_NPM_FLAVOR=embeddings`/`=lean` still works as a per-run override.)
+Embeddings prebuilts exist for **Linux x64, macOS Apple Silicon, and Windows
+x64** (the targets ONNX Runtime ships prebuilts for); elsewhere it stays lean.
+
+## Supported platforms
+
+| OS            | Arch  | Lean | Embeddings |
+|---------------|-------|------|------------|
+| Linux         | x64   | ✅   | ✅         |
+| macOS (Intel) | x64   | ✅   | ❌         |
+| macOS (Apple) | arm64 | ✅   | ✅         |
+| Windows       | x64   | ✅   | ✅         |
+
+On unsupported platforms, install with `cargo install kimetsu-cli` or grab an
+archive from the [releases page](https://github.com/RodCor/kimetsu/releases).
+
+## Links
+
+- Source & full docs: <https://github.com/RodCor/kimetsu>
+- License: MIT OR Apache-2.0

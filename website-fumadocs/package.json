@@ -1,0 +1,44 @@
+{
+  "name": "website-fumadocs",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "sync-docs": "node scripts/sync-docs.mjs",
+    "prebuild": "node scripts/sync-docs.mjs",
+    "build": "next build",
+    "postbuild": "node -e \"require('fs').writeFileSync('out/.nojekyll','');require('fs').writeFileSync('out/CNAME','kimetsu.dev')\"",
+    "predev": "node scripts/sync-docs.mjs",
+    "dev": "next dev",
+    "start": "serve out",
+    "types:check": "fumadocs-mdx && next typegen && tsc --noEmit",
+    "postinstall": "fumadocs-mdx",
+    "lint": "biome check",
+    "format": "biome format --write"
+  },
+  "dependencies": {
+    "@orama/orama": "^3.1.18",
+    "cnfast": "^0.0.8",
+    "fumadocs-core": "16.10.7",
+    "fumadocs-mdx": "15.0.13",
+    "fumadocs-ui": "16.10.7",
+    "lucide-react": "^1.21.0",
+    "next": "16.2.9",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.1",
+    "@types/mdx": "^2.0.14",
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "postcss": "^8.5.15",
+    "serve": "^14.2.6",
+    "tailwindcss": "^4.3.1",
+    "typescript": "^6.0.3",
+    "@biomejs/biome": "^2.5.1"
+  },
+  "overrides": {
+    "postcss": "^8.5.15"
+  }
+}

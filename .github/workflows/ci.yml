@@ -1,0 +1,150 @@
+# Continuous integration: quality + security gate for every PR and for
+# pushes to the long-lived branches (main, develop).
+#
+# Jobs (all required for a green PR):
+#   fmt       — rustfmt check, no diffs allowed
+#   clippy    — clippy hard gate: -D warnings on lean and embeddings flavors
+#   test      — full workspace test suite
+#   audit     — RUSTSEC advisory scan over the dependency tree
+#
+# Release/publish lives in release.yml (tag-driven); this file is the
+# pre-merge gate that keeps main + develop clean and secure.
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    # Hard gate on both the lean (no-default-features) and embeddings
+    # flavors. Any new warning fails the PR.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-clippy
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features embeddings -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu is the primary gate; macOS guards the Apple-silicon
+        # build that ships in releases. Windows now runs the full test
+        # suite here; the release workflow still does the build/smoke.
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-${{ matrix.os }}
+      # `cargo test --workspace` feature-unifies the whole graph: a
+      # consumer crate (kimetsu-cli) enables `kimetsu-brain/embeddings`,
+      # so kimetsu-brain -- and its own test binary -- is built WITH the
+      # ONNX/fastembed flavor, not the lean default. Tests must therefore
+      # be embedder-agnostic; they are. (The lean FTS-only flavor is built
+      # + smoke-tested separately in release.yml.)
+      #
+      # KIMETSU_USER_BRAIN=0 keeps the suite hermetic: brain tests never
+      # touch the runner's real ~/.kimetsu. --test-threads=1 keeps the
+      # run deterministic (no cross-test races on shared on-disk state).
+      - name: cargo test
+        shell: bash
+        env:
+          KIMETSU_USER_BRAIN: "0"
+        run: cargo test --workspace --locked -- --test-threads=1
+
+  test-embeddings:
+    name: test (embeddings, ubuntu)
+    runs-on: ubuntu-latest
+    # Closes #22: run the full test suite compiled with the `embeddings` feature
+    # (ONNX/fastembed) on Linux only.  macOS/Windows are covered by `test`
+    # (which feature-unifies the workspace and already pulls in the embeddings
+    # code paths), but the explicit ubuntu run here pins an embeddings-specific
+    # build cache and ensures the feature compiles cleanly as a distinct slice.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-embeddings
+      # Cache the HuggingFace model files and the fastembed on-disk ONNX cache
+      # so repeated runs do not re-download ~200 MB of weights.
+      - name: Cache HuggingFace / fastembed model files
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            .fastembed_cache
+          key: embeddings-models-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: embeddings-models-${{ runner.os }}-
+      - name: cargo test (embeddings)
+        env:
+          KIMETSU_USER_BRAIN: "0"
+        run: cargo test --workspace --locked --features embeddings -- --test-threads=1
+
+  audit:
+    name: cargo-audit (RUSTSEC)
+    runs-on: ubuntu-latest
+    # audit-check reports advisories by creating a check run; without
+    # checks: write the reporting API call 403s ("Resource not accessible
+    # by integration") even when the audit itself passes.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2024-0436: `paste` is unmaintained (an informational
+          # "unmaintained" notice, not an exploitable vulnerability). It is a
+          # transitive proc-macro dep with no first-party usage and no drop-in
+          # upgrade path. cargo-audit reports zero actual vulnerabilities;
+          # this ignore keeps the job green on the informational notice.
+          # Re-evaluate when an upstream dependency drops `paste`.
+          #
+          # RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained (informational
+          # notice; its functionality moved into rustls-pki-types). Transitive
+          # via axum-server (kimetsu-remote in-process TLS) — no first-party
+          # usage and no axum-server release without it yet. cargo-audit
+          # reports zero actual vulnerabilities. Re-evaluate when axum-server
+          # migrates to rustls-pki-types.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2025-0134
+

@@ -23,6 +23,8 @@ categories = ["development-tools", "command-line-utilities"]
 # (needed for WSL2 Linux builds where glibc < 2.38).
 default = []
 embeddings = ["kimetsu-brain/embeddings"]
+pi = []
+openclaw = ["dep:json5"]
 
 # Interactive REPL transport for kimetsu.
 #
@@ -36,11 +38,13 @@ embeddings = ["kimetsu-brain/embeddings"]
 # surface, not a benchmark harness.
 
 [dependencies]
-kimetsu-agent = { path = "../kimetsu-agent", version = "0.7.2" }
-kimetsu-brain = { path = "../kimetsu-brain", version = "0.7.2" }
-kimetsu-core = { path = "../kimetsu-core", version = "0.7.2" }
+kimetsu-agent = { path = "../kimetsu-agent", version = "2.5.2" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.5.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.5.2" }
 base64.workspace = true
 crossterm.workspace = true
+json5 = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true

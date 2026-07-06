@@ -1,0 +1,278 @@
+{
+  "memories": [
+    {
+      "key": "rust-lifetime-borrow",
+      "text": "When Rust emits E0502 (cannot borrow X as mutable because it is also borrowed as immutable), the usual cause is a shared reference kept alive across a scope that later tries to mutate. Introduce an explicit block `{ }` to drop the immutable borrow before the mutable one, or restructure to avoid overlapping lifetimes. The borrow checker operates on NLL regions, so even a bare `let _ = &x;` in the same scope counts as keeping the borrow alive."
+    },
+    {
+      "key": "sqlite-wal-checkpoint",
+      "text": "After a SQLite VACUUM the WAL file can still hold significant space on Windows because the OS keeps it open. Run `PRAGMA wal_checkpoint(TRUNCATE);` immediately before measuring file size. VACUUM itself cannot run inside a transaction; rusqlite's Connection holds no implicit transaction, so `conn.execute_batch(\"VACUUM;\")` works directly."
+    },
+    {
+      "key": "cargo-feature-unification",
+      "text": "Cargo unifies features across the entire workspace build graph. If you add a new crate with `default = [\"embeddings\"]` the embeddings feature will be enabled for every crate in `cargo test --workspace`, causing tests written for the lean (NoopEmbedder) path to fail against the real fastembed model. Keep new crate defaults lean (`default = []`) and opt into embeddings with `--features embeddings` for the embeddings build only."
+    },
+    {
+      "key": "docker-bind-mount-windows",
+      "text": "On Windows, setting DOCKER_HOST=tcp://127.0.0.1:2375 silently breaks bind mounts; the container starts but the mounted directories appear empty inside the container. Check this first whenever bench trials all fail with an empty agent/ directory. Switch to the named-pipe transport (npipe:////./pipe/docker_engine) or ensure the TCP daemon has file-sharing enabled."
+    },
+    {
+      "key": "git-init-boundary-isolation",
+      "text": "When writing tests that call init_project, you must call git_init_boundary(&tmp) on the temp directory before init_project. Without it, ProjectPaths::discover climbs the git tree to a real parent repo (including the user brain at ~/.kimetsu) and your test silently writes to the real brain. Set KIMETSU_USER_BRAIN=0 to disable user-brain merging in hermetic tests."
+    },
+    {
+      "key": "fts-empty-query-fallback",
+      "text": "When the FTS query is empty or consists entirely of stopwords, kimetsu-brain falls back to the latest-recency candidate set rather than returning zero results. This means a very short or common-word query still returns capsules, but they are ranked by freshness rather than lexical relevance. Be careful when evaluating retrieval: a query with only stopwords exercises the recency fallback, not FTS scoring."
+    },
+    {
+      "key": "cosine-floor-semantic",
+      "text": "The min_semantic_score floor on ContextRequest drops memory candidates whose cosine similarity to the query falls below the threshold before scoring. This prevents a corpus of unrelated memories from surfacing its best-of-bad-lot candidate just because it scored highest among irrelevant noise. Set it to 0.0 to disable the floor, which is useful when evaluating recall on small corpora."
+    },
+    {
+      "key": "reranker-pool-floor",
+      "text": "The warm embedder daemon over-fetches a pool of 12 candidates (RERANK_POOL) before passing them to the cross-encoder reranker. The reranker applies a sigmoid-score floor of 0.30 (RERANK_FLOOR): capsules scoring below that threshold are treated as noise and dropped. The final result is capped at the caller's max_capsules. Mirror these constants in any eval harness that measures the rerank mode."
+    },
+    {
+      "key": "embedder-onclock-process-static",
+      "text": "The default embedder is stored in a process-static OnceLock, so the first call to open_default_embedder pays the model-load cost and every subsequent call reuses the same handle. This means changing KIMETSU_BRAIN_EMBEDDER after the first embed call in a process has no effect. Tests that need a different embedder must use retrieve_context_with_embedder with an explicit StubEmbedder instead."
+    },
+    {
+      "key": "ci-green-feature-unification-fix",
+      "text": "The exact three-file fix to make PR #4 (fix/ci-green) pass was: (1) change kimetsu-remote's default features from [\"embeddings\"] to [], (2) update the integration test to explicitly set KIMETSU_BRAIN_EMBEDDER=noop, (3) guard the embeddings-specific assertion with #[cfg(feature = \"embeddings\")]. Feature unification was the root cause — removing the default embeddings from the new crate made the workspace test suite use NoopEmbedder again."
+    },
+    {
+      "key": "ann-usearch-warm",
+      "text": "The usearch HNSW index is warmed at startup in the embedder daemon via warm_on_start. The index file lives next to brain.db under .kimetsu/. On the first query after a cold start the index is rebuilt from the memories table if the file is absent or stale. Subsequent queries use the cached RwLock handle. The ANN search returns (rowid, distance) pairs that are then joined back to the memories table."
+    },
+    {
+      "key": "memory-dedup-normalized",
+      "text": "add_memory performs exact normalized-text dedup: if an active memory with the same scope, kind, and normalized text already exists, it returns the existing ID without writing a duplicate. The normalization collapses whitespace and punctuation. Bulk-import operations that call add_memory in a loop should snapshot pre-existing IDs before the loop to correctly count newly-imported vs. already-present memories."
+    },
+    {
+      "key": "windows-process-start-time",
+      "text": "When adding process start-time to a cross-platform struct on Windows, use Option<u64> (epoch seconds). Parse the WMI DMTF datetime format (YYYYMMDDHHmmss.ffffff+UUU) from the CIM Select-Object CreationDate output. A no-dep pure-Rust parser using days_since_epoch math is sufficient. On Unix, switch ps from 'pid=,args=' to 'pid=,etimes=,args=' and parse the second token as u64."
+    },
+    {
+      "key": "mcp-json-schema-allof",
+      "text": "When implementing MCP server tools, avoid using JSON Schema allOf with inline definitions because some host agents (Claude Code 1.x) reject schemas with deeply nested allOf. Flatten the schema by inlining the referenced object fields directly into the top-level properties object. This removes the allOf while keeping the same logical structure and passes MCP protocol validation."
+    },
+    {
+      "key": "hybrid-alpha-blend",
+      "text": "The hybrid retrieval blend factor (DEFAULT_HYBRID_ALPHA = 0.5) mixes lexical and cosine scores: final_relevance = (1 - alpha) * lexical + alpha * normalized_cosine, where normalized_cosine maps [-1, 1] to [0, 1]. When cosine is unavailable (NoopEmbedder, NULL row embedding, model mismatch) the cosine term drops to 0 and the blend becomes pure lexical — identical to the pre-embeddings retrieval behavior."
+    },
+    {
+      "key": "conflict-detection-disabled",
+      "text": "Conflict detection at add_memory time can be disabled via the [ingestion] detect_conflicts = false config field or the KIMETSU_DETECT_CONFLICTS=0 env var. This skips the O(N^2) cosine scan that looks for existing memories with high similarity. Disable it during bulk seeding operations (e.g., import from a large JSON dump) to avoid quadratic runtime. Re-enable for interactive adds where operator review is expected."
+    },
+    {
+      "key": "rusqlite-connection-flags",
+      "text": "Opening a SQLite connection with OpenFlags::SQLITE_OPEN_READ_ONLY prevents all writes including WAL writes. Use this for the readonly path (BrainSession::open_readonly) to avoid lock contention with concurrent writers. The read-only connection still triggers schema::validate (not schema::initialize) so it checks version compatibility without attempting migrations."
+    },
+    {
+      "key": "toml-parse-v09",
+      "text": "In toml 0.9, use toml::from_str::<toml::Value>(&text) to parse a TOML document into a Value — not str.parse::<toml::Value>() which expects a bare value literal. To serialize a Serialize struct into a toml::Value, use toml::Value::try_from(&cfg). The Value variants are Boolean/Integer/Float/String/Array/Table."
+    },
+    {
+      "key": "kimetsu-brain-record-tags",
+      "text": "When calling kimetsu_brain_record, always supply 2-5 domain tags that reflect the technology stack and problem category. The tags improve future retrieval because the broker applies a 1.4x score boost to capsules whose text contains any of the user-supplied tags in the query. Without tags, a conceptual-paraphrase query that lacks the exact problem keywords may not surface the relevant memory."
+    },
+    {
+      "key": "clap-version-flavor",
+      "text": "To expose a build flavor in kimetsu --version with clap, define const VERSION: &str = concat!(env!(\"CARGO_PKG_VERSION\"), \" (embeddings)\") gated by #[cfg(feature = \"embeddings\")] and a lean variant for cfg(not(feature = \"embeddings\")). Set #[command(version = VERSION)] on the top-level clap struct. Keep env!(\"CARGO_PKG_VERSION\") bare in update.rs so semver comparisons ignore the suffix."
+    },
+    {
+      "key": "docker-wsl2-harbor-cwd",
+      "text": "Harbor 0.8.0 (Terminal-Bench) crashes on the 2nd invocation in one process on WSL2/DrvFs because pyiceberg calls os.getcwd() at import time and the inherited cwd handle goes stale after the first Docker churn. The reliable fix is process isolation: re-exec once per (task, agent) in a hidden --worker-result mode so each Harbor invocation gets a fresh process with a valid cwd."
+    },
+    {
+      "key": "usefulness-decay-halflife",
+      "text": "The usefulness multiplier for retrieval scoring (ranging 0.5 to 1.5) is decayed toward neutral (1.0) using a half-life formula: decay = exp(-ln(2) * age_days / half_life_days). The reference timestamp is last_useful_at if present, else created_at. At age == half_life the boost is halved; at 2*half_life it is quartered. A zero or negative half_life_days disables decay (returns 1.0), useful for test reproducibility."
+    },
+    {
+      "key": "embedder-bge-small-default",
+      "text": "The default embedder model is bge-small-en-v1.5 (384 dimensions, ~67 MB int8 quantized). It is suitable for English-language code and prose. For multilingual corpora use bge-m3 (1024 dim, ~600 MB). For code-heavy corpora use jina-v2-base-code (768 dim, ~165 MB). The model id is stored on each memory row so mixed-model brains are safe; cross-model rows fall back to FTS."
+    },
+    {
+      "key": "run-gc-opt-out",
+      "text": "When adding opportunistic GC triggered from a hot code path (e.g. TraceWriter::create), put the env-var opt-out check (KIMETSU_RUNS_GC=0) in the caller, not inside the GC function itself. This keeps the pure GC function testable without env manipulation and makes the opt-out visible at the trigger site. For tests, set KIMETSU_RUNS_GC=0 in the test setup to disable GC and keep run counts deterministic."
+    },
+    {
+      "key": "parallel-sweeps-crash",
+      "text": "Running two concurrent kbench sweeps crashes the Docker Engine service on Windows. The root cause is resource exhaustion from simultaneous container creation. Always run sweeps sequentially. Use a file lock or process check before starting a new sweep if automation is involved. The Docker Engine process (com.docker.backend.exe) must be restarted to recover."
+    },
+    {
+      "key": "plugin-install-paths",
+      "text": "When writing plugin install paths for Claude Code, use root .mcp.json (not .claude/.mcp.json) for MCP server entries and .claude/settings.json for hook entries. The kimetsu bridge.rs bug that wrote to the wrong paths caused the MCP tools to not appear in Claude Code sessions. Validate by checking both files after install: .mcp.json should have mcpServers.kimetsu, and .claude/settings.json should have the UserPromptSubmit hook."
+    },
+    {
+      "key": "usearch-ann-rebuild",
+      "text": "The usearch HNSW index is automatically rebuilt from the memories table when the index file is absent, the dimension mismatches the active embedder, or the row count diverges from the index size beyond a threshold. The rebuild is O(N) with N memory rows. After a kimetsu brain reindex, the old index file is deleted and rebuilt on the next query. The index is stored per-model-id so switching models triggers a full rebuild."
+    },
+    {
+      "key": "credential-redaction-ingest",
+      "text": "kimetsu-brain redacts secrets at the ingest boundary before any memory text hits brain.db. The redaction pipeline catches Anthropic/OpenAI/GitHub/AWS/Slack/Google credentials, JWTs, PEM blocks, and generic api_key=.../bearer .../token: ... assignments. On a hit the bytes are replaced with [REDACTED:<kind>] and a one-liner is printed to stderr. The write is NOT aborted: keeping the useful part of the lesson is more valuable than rejecting the whole memory."
+    },
+    {
+      "key": "distiller-provider-config",
+      "text": "The distiller that auto-harvests memories is configured independently from the agent pipeline provider. You can run an agent on Bedrock while the distiller uses direct Claude (Anthropic API). Normalize the distiller provider string with normalize_distiller_provider before instantiating it. This allows cost optimization: use a cheap fast model for harvesting, a larger model for the agent."
+    },
+    {
+      "key": "sigv4-bedrock-blocking",
+      "text": "To sign AWS Bedrock InvokeModel with aws-sigv4 v1.4.5 without tokio: (1) build Identity from Credentials::new(ak, sk, session_token, None, \"name\").into(), (2) build SigningParams with identity/region/name/time/settings, (3) create SignableRequest::new(\"POST\", url, headers, SignableBody::Bytes(&payload)), (4) sign and apply instructions to an http::Request, (5) copy signed headers to reqwest. Feature flags: sign-http + http1."
+    },
+    {
+      "key": "mmr-embedding-diversity",
+      "text": "Maximal Marginal Relevance (MMR) is applied in two stages during retrieval. The first stage (candidate-stage embedding-MMR) collapses semantic near-duplicates using cosine similarity between candidate embeddings. The second stage (capsule-stage Jaccard MMR) is a fallback/safety net that uses token overlap on summary text. The MMR lambda is 0.7, meaning 70% relevance weight and 30% diversity weight. On lean builds only Jaccard MMR runs."
+    },
+    {
+      "key": "project-paths-discover",
+      "text": "ProjectPaths::discover(start) walks up the directory tree looking for a .kimetsu/ folder. It stops at the git repository root (found by looking for .git). If the repo root is reached without finding .kimetsu/, init_project is required. The discover algorithm respects GIT_CEILING_DIRECTORIES so tests can set it to the temp dir to prevent climbing out of the sandbox."
+    },
+    {
+      "key": "test-env-isolation",
+      "text": "To isolate kimetsu brain tests from the real user brain and from each other: (1) use with_user_brain_disabled() which acquires the shared test_env_lock mutex AND sets KIMETSU_USER_BRAIN=0, (2) do NOT call test_env_lock().lock() inside the with_user_brain_disabled closure (deadlock — both acquire the same non-reentrant mutex). Set TMP, TEMP, and GIT_CEILING_DIRECTORIES to a process-unique temp dir for full isolation."
+    },
+    {
+      "key": "fastembed-batch-inference",
+      "text": "The fastembed-rs TextEmbedding::embed method takes a Vec<&str> and batches all texts through the ONNX runtime in a single tensor call — roughly 10-40x faster than calling per-text. Use embed_batch when adding many memories at once. The FastembedEmbedder wraps the engine in a Mutex because embed takes &mut self; the lock window is short (one batch per call), so thread contention is low in practice."
+    },
+    {
+      "key": "context-hook-noop-embedder",
+      "text": "The UserPromptSubmit context hook uses retrieve_context_lexical which pins NoopEmbedder, keeping retrieval FTS-only even on embeddings builds. This avoids a cold ONNX model load in the short-lived hook subprocess (which would risk blowing the host's 30-second hook timeout). Semantic recall (ANN + cosine) stays with the warm MCP kimetsu_brain_context tool which reuses the daemon's long-lived loaded model."
+    },
+    {
+      "key": "ulid-ordering",
+      "text": "ULIDs (Universally Unique Lexicographically Sortable Identifiers) are used for all memory_id and proposal_id values in kimetsu. The 48-bit millisecond timestamp prefix guarantees lexicographic sort order matches creation time, enabling efficient range queries on memory_id without a separate created_at index. The 80-bit random suffix provides uniqueness within a millisecond."
+    },
+    {
+      "key": "projector-event-sourcing",
+      "text": "Kimetsu uses an event-sourced architecture: all state changes are first written as immutable events to the events table, then projected into the materialized memories table by projector::apply_events. This means memory state can be fully reconstructed by replaying the event log via kimetsu brain rebuild. The projector is idempotent on replay; duplicate events (same event_id) are silently skipped."
+    },
+    {
+      "key": "kimetsu-remote-brain-root",
+      "text": "In the kimetsu-remote HTTP MCP server, the brain and the repository files live at DIFFERENT roots: the brain is under --data/<repo-id>/.kimetsu/ while the files live in a managed git checkout. ingest_repo_at_root(brain_root, files_root) handles this by loading the project from brain_root and overriding paths.repo_root to files_root for the file walk."
+    },
+    {
+      "key": "dead-code-cfg-windows",
+      "text": "When adding pure parsers that are live-called only on one platform (e.g. parse_unix_ps on Unix), annotate them with #[cfg_attr(windows, allow(dead_code))] so -D warnings stays clean on Windows without hiding the function from cross-platform tests. Using cfg(target_os) to gate the pub fn itself would prevent the test from compiling on the other platform."
+    },
+    {
+      "key": "memory-scope-routing",
+      "text": "GlobalUser memories route to ~/.kimetsu/brain.db when the user brain is enabled. Project/Repo/Run memories go to the project brain at .kimetsu/brain.db. If the user brain is disabled (KIMETSU_USER_BRAIN=0 or config.kimetsu.use_user_brain=false) or unreachable (no $HOME), GlobalUser memories fall through to the project DB so backward compatibility is preserved."
+    },
+    {
+      "key": "bridge-target-seams",
+      "text": "When adding a new host to Kimetsu's BridgeTarget enum, all the following seams must be updated: BridgeTarget enum + parse + as_str, plugin_install_inner match arm, plugin_status_inner loop list + match arm, plugin_uninstall_inner match arm, bridge_export_skill match arm, resolve_setup_hosts (new bool param + detection + TTY prompt + interactive answer), detect_present_hosts (return tuple expands), setup_cmd caller (destructure new tuple), all host_label match expressions in main.rs, and any existing test calls to resolve_setup_hosts."
+    },
+    {
+      "key": "lexical-coverage-floor",
+      "text": "The min_lexical_coverage floor (driven from BrokerSection.min_lexical_coverage) drops memory candidates whose IDF-weighted query token coverage falls below the threshold. This prevents broad queries whose only matching tokens are corpus-ubiquitous from surfacing unrelated memories. The coverage is computed over content tokens (stopwords removed); when all query tokens are ubiquitous (total_idf near 0) the floor is skipped entirely."
+    }
+  ],
+  "cases": [
+    {
+      "query": "how to prevent test from writing to real user brain during integration testing",
+      "relevant": ["git-init-boundary-isolation", "test-env-isolation"]
+    },
+    {
+      "query": "cargo feature unification breaks workspace tests",
+      "relevant": ["cargo-feature-unification", "ci-green-feature-unification-fix"]
+    },
+    {
+      "query": "sqlite vacuum and wal file size not shrinking on windows",
+      "relevant": ["sqlite-wal-checkpoint"]
+    },
+    {
+      "query": "bench trials all fail with empty agent directory on windows docker",
+      "relevant": ["docker-bind-mount-windows"]
+    },
+    {
+      "query": "cosine blend factor for hybrid lexical and semantic retrieval scoring",
+      "relevant": ["hybrid-alpha-blend"]
+    },
+    {
+      "query": "bge-small bge-m3 jina embedding model selection dimensions",
+      "relevant": ["embedder-bge-small-default"]
+    },
+    {
+      "query": "reranker pool size and score threshold in production daemon",
+      "relevant": ["reranker-pool-floor"]
+    },
+    {
+      "query": "how to drop immutable borrow before mutable borrow in rust NLL",
+      "relevant": ["rust-lifetime-borrow"]
+    },
+    {
+      "query": "process-global embedder cache OnceLock model already loaded",
+      "relevant": ["embedder-onclock-process-static"]
+    },
+    {
+      "query": "something that improves later retrieval chances when recording a lesson",
+      "relevant": ["kimetsu-brain-record-tags"]
+    },
+    {
+      "query": "temporal decay of memory usefulness score over time",
+      "relevant": ["usefulness-decay-halflife"]
+    },
+    {
+      "query": "dedup when importing memories from external file",
+      "relevant": ["memory-dedup-normalized"]
+    },
+    {
+      "query": "hook subprocess cannot load ONNX model within timeout budget",
+      "relevant": ["context-hook-noop-embedder"]
+    },
+    {
+      "query": "kimetsu fails to surface memories with paraphrased questions lacking exact keywords",
+      "relevant": ["kimetsu-brain-record-tags", "lexical-coverage-floor", "cosine-floor-semantic"]
+    },
+    {
+      "query": "state can be replayed from event log after database corruption",
+      "relevant": ["projector-event-sourcing"]
+    },
+    {
+      "query": "HNSW index rebuild triggered automatically when model changes",
+      "relevant": ["usearch-ann-rebuild", "ann-usearch-warm"]
+    },
+    {
+      "query": "preventing API keys from leaking into brain database",
+      "relevant": ["credential-redaction-ingest"]
+    },
+    {
+      "query": "MCP tool schema rejected by Claude Code host agent",
+      "relevant": ["mcp-json-schema-allof"]
+    },
+    {
+      "query": "fast batch embedding for bulk memory ingestion",
+      "relevant": ["fastembed-batch-inference"]
+    },
+    {
+      "query": "read-only SQLite connection prevents lock contention with writer",
+      "relevant": ["rusqlite-connection-flags"]
+    },
+    {
+      "query": "conceptual query: how the system avoids surfacing irrelevant low-signal memories",
+      "relevant": ["cosine-floor-semantic", "lexical-coverage-floor", "mmr-embedding-diversity"]
+    },
+    {
+      "query": "conceptual query: mechanism that keeps repeated-hit memories ranked higher over time",
+      "relevant": ["usefulness-decay-halflife"]
+    },
+    {
+      "query": "conceptual query: architecture ensuring memory changes are auditable and recoverable",
+      "relevant": ["projector-event-sourcing", "ulid-ordering"]
+    },
+    {
+      "query": "how to make the cross-encoder reranker reorder capsules and cut noise",
+      "relevant": ["reranker-pool-floor"]
+    },
+    {
+      "query": "sourdough starter hydration ratio for whole wheat levain",
+      "relevant": []
+    },
+    {
+      "query": "recommended pasta cooking time for al dente rigatoni",
+      "relevant": []
+    }
+  ]
+}

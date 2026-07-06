@@ -153,6 +153,7 @@ mod tests {
     #[test]
     fn parent_struct_derive_debug_does_not_leak() {
         #[derive(Debug)]
+        #[allow(dead_code)] // fields only written, not read; struct exists to test Debug redaction
         struct Provider {
             api_key: SecretString,
             model: String,
@@ -167,6 +168,9 @@ mod tests {
             "parent struct's derived Debug must NOT leak nested SecretString: {dbg}"
         );
         assert!(dbg.contains("REDACTED"));
-        assert!(dbg.contains("claude-opus"), "non-secret fields should print");
+        assert!(
+            dbg.contains("claude-opus"),
+            "non-secret fields should print"
+        );
     }
 }

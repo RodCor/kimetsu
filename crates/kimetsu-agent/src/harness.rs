@@ -6,6 +6,7 @@
 //! transport code lives in `kimetsu-harbor-rs`; this module does not own
 //! JSON-RPC wire types, benchmark sessions, or benchmark stubs.
 use kimetsu_core::KimetsuResult;
+use kimetsu_core::event::Event as KimetsuEvent;
 use serde_json::{Value, json};
 
 use crate::tools::{CommandSpec, ListFilesInput, MultiReadLinesInput, ReadFileLinesInput};
@@ -139,6 +140,7 @@ const FULL_TOOL_NAMES: &[&str] = &[
     "think",
     "record_deviation",
     "cite_memory",
+    "expand_capsule",
     "shell_background",
     "shell_status",
     "shell_output",
@@ -243,12 +245,35 @@ impl KimetsuAgentOpts {
 /// session anymore - callers (benchmark adapters, chat mode, future transports)
 /// inspect the returned `ModelAgentReport.summary` and `.context` and
 /// emit them in whatever protocol they speak.
+/// F2: optional resolver for `expand_capsule` tool calls. When `Some`, the
+/// closure is called with the handle string and its return value is sent back
+/// as the tool result. When `None`, `expand_capsule` calls return a safe
+/// "resolver not configured" error without crashing the loop.
+///
+/// Callers that have a brain connection (chat REPL, pipeline) inject a closure
+/// that captures the connection; test callers can inject a stub or pass `None`.
+pub type ExpandCapsuleFn<'a> = Option<&'a dyn Fn(&str) -> KimetsuResult<String>>;
+
 pub fn run_model_agent(
     task: &str,
     runtime: &mut crate::tools::ToolRuntime,
     provider: &mut dyn crate::model::ModelProvider,
     opts: KimetsuAgentOpts,
     brain_context: Option<&str>,
+) -> KimetsuResult<ModelAgentReport> {
+    run_model_agent_with_expand(task, runtime, provider, opts, brain_context, None)
+}
+
+/// F2: variant of [`run_model_agent`] that accepts an optional capsule
+/// resolver for the `expand_capsule` tool. All callers that don't inject a
+/// resolver use the simpler [`run_model_agent`] wrapper above (no API break).
+pub fn run_model_agent_with_expand(
+    task: &str,
+    runtime: &mut crate::tools::ToolRuntime,
+    provider: &mut dyn crate::model::ModelProvider,
+    opts: KimetsuAgentOpts,
+    brain_context: Option<&str>,
+    expand_fn: ExpandCapsuleFn<'_>,
 ) -> KimetsuResult<ModelAgentReport> {
     let turn_budget = opts.turn_budget;
     let auto_orient = opts.auto_orient;
@@ -483,6 +508,49 @@ pub fn run_model_agent(
                         obj.insert("turn".to_string(), serde_json::json!(turn));
                     }
                     recorded_citations.push(entry);
+                } else if name == "expand_capsule" {
+                    // F2: intercept expand_capsule here so we can emit the
+                    // `capsule.expanded` telemetry event and route through the
+                    // injected resolver without touching ToolRuntime's internals.
+                    let handle = call
+                        .input
+                        .get("handle")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let (ok, result_value) = match expand_fn {
+                        Some(resolver) => match resolver(handle) {
+                            Ok(text) => (
+                                true,
+                                json!({ "ok": true, "handle": handle, "content": text }),
+                            ),
+                            Err(err) => (
+                                false,
+                                json!({
+                                    "ok": false,
+                                    "handle": handle,
+                                    "error": err.to_string(),
+                                }),
+                            ),
+                        },
+                        None => (
+                            false,
+                            json!({
+                                "ok": false,
+                                "handle": handle,
+                                "error": "expand_capsule: no capsule resolver is configured for this session",
+                            }),
+                        ),
+                    };
+                    // Emit capsule.expanded telemetry via the runtime's trace writer
+                    // so analytics (C) can measure expansion hit-rate.
+                    let expand_event = KimetsuEvent::new(
+                        runtime.run_id(),
+                        "capsule.expanded",
+                        json!({ "handle": handle, "ok": ok }),
+                    );
+                    let _ = runtime.append_trace_event(&expand_event, false);
+                    messages.push(ModelMessage::tool_result(call.id, name, result_value));
+                    continue;
                 }
                 let result_value = kimetsu_dispatch_tool(runtime, &name, call.input.clone());
                 messages.push(ModelMessage::tool_result(call.id, name, result_value));
@@ -1236,7 +1304,8 @@ fn kimetsu_all_tool_definitions() -> Vec<ToolDefinition> {
                 turn that you used; multiple citations per turn are fine. \
                 Pass the `memory_id` exactly as it appeared in your retrieved \
                 context (look for `memory:<id>` in capsule expansion handles \
-                or the `id` field of memory capsules).".to_string(),
+                or the `id` field of memory capsules)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1250,6 +1319,27 @@ fn kimetsu_all_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["memory_id"],
+            }),
+        },
+        // ---------- F2: lazy capsule expansion ----------
+        ToolDefinition {
+            name: "expand_capsule".to_string(),
+            description: "Expand a headline capsule to its full text by its expansion handle. \
+                Call ONLY when a headline in the Prior context section looks relevant to the \
+                current task and you need the full content to proceed. \
+                Pass the exact handle string from the headline (e.g. `memory:<id>` or `file:<path>`). \
+                Returns the full memory text or a bounded file slice. \
+                Do NOT call this speculatively — each call costs one tool-use turn."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "description": "The expansion handle from the headline line, e.g. `memory:01J9XYZABC` or `file:src/lib.rs`."
+                    }
+                },
+                "required": ["handle"],
             }),
         },
         // ---------- MP-18: brain-powered goal verify ----------
@@ -1424,7 +1514,7 @@ pub fn kimetsu_dispatch_tool(
                  edit_file / apply_patch / git_status / git_diff / shell_command / \
                  glob / multi_read / move_file / delete_file / plan / think / \
                  shell_background / shell_status / shell_output / shell_stop / \
-                 view_image / record_deviation"
+                 view_image / record_deviation / expand_capsule"
             ),
         }),
     }
@@ -3642,10 +3732,7 @@ mod tests {
             assert!(g.get("error").is_some(), "glob allowed {path}");
             let v = kimetsu_view_image(&mut runtime, &json!({"path": path}));
             assert!(v.get("error").is_some(), "view_image allowed {path}");
-            let s = kimetsu_search_files(
-                &mut runtime,
-                &json!({"pattern": "secret", "path": path}),
-            );
+            let s = kimetsu_search_files(&mut runtime, &json!({"pattern": "secret", "path": path}));
             assert!(s.get("error").is_some(), "search_files allowed {path}");
         }
         // apply_patch with an absolute diff target is rejected before execution.
@@ -4083,5 +4170,163 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kimetsu_{label}_{nanos}"));
         fs::create_dir_all(&root).expect("root");
         root
+    }
+
+    // ── F2: expand_capsule tool dispatch tests ─────────────────────────────
+
+    /// F2-dispatch-1: expand_capsule with a valid resolver returns full text
+    /// and emits a capsule.expanded event (traced to the runtime).
+    #[test]
+    fn expand_capsule_dispatches_via_resolver_and_emits_event() {
+        let root = temp_root("f2_expand_dispatch");
+        let mut runtime = ToolRuntime::new(&root, RunId::new()).expect("runtime");
+
+        // Stub resolver: always returns a known text for "memory:test-id".
+        let resolver = |handle: &str| -> KimetsuResult<String> {
+            if handle == "memory:test-id" {
+                Ok("Use rg not grep for fast search".to_string())
+            } else {
+                Err(format!("unknown handle: {handle}").into())
+            }
+        };
+
+        // Mock provider: first call → expand_capsule tool call,
+        //                second call → text finish.
+        let mut provider = MockProvider::new([
+            ModelResponse::tool_call(
+                "call_1",
+                "expand_capsule",
+                json!({"handle": "memory:test-id"}),
+            ),
+            ModelResponse::text("done"),
+        ]);
+
+        let opts = KimetsuAgentOpts::for_tests();
+        let report = run_model_agent_with_expand(
+            "test task",
+            &mut runtime,
+            &mut provider,
+            opts,
+            None,
+            Some(&resolver),
+        )
+        .expect("run");
+
+        // The loop should have completed after 2 model turns (tool + finish).
+        assert_eq!(report.tool_calls, 1);
+        // The tool result in the messages should contain the resolved text.
+        let turn2_content = provider.requests[1]
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, crate::model::MessageRole::Tool))
+            .map(|m| format!("{:?}", m.content))
+            .unwrap_or_default();
+        assert!(
+            turn2_content.contains("Use rg not grep"),
+            "resolved text should appear in tool result: {turn2_content}"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// F2-dispatch-2: expand_capsule with an unknown handle returns a safe
+    /// error message without crashing the loop.
+    #[test]
+    fn expand_capsule_unknown_handle_returns_error_not_crash() {
+        let root = temp_root("f2_expand_err");
+        let mut runtime = ToolRuntime::new(&root, RunId::new()).expect("runtime");
+
+        let resolver = |handle: &str| -> KimetsuResult<String> {
+            Err(format!("no memory for handle `{handle}`").into())
+        };
+
+        let mut provider = MockProvider::new([
+            ModelResponse::tool_call(
+                "call_1",
+                "expand_capsule",
+                json!({"handle": "memory:ghost-id"}),
+            ),
+            ModelResponse::text("done"),
+        ]);
+
+        let opts = KimetsuAgentOpts::for_tests();
+        let report = run_model_agent_with_expand(
+            "test task",
+            &mut runtime,
+            &mut provider,
+            opts,
+            None,
+            Some(&resolver),
+        )
+        .expect("loop must not crash on resolver error");
+
+        assert_eq!(report.tool_calls, 1);
+        // The tool result must carry ok:false and the error text.
+        let turn2_content = provider.requests[1]
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, crate::model::MessageRole::Tool))
+            .map(|m| format!("{:?}", m.content))
+            .unwrap_or_default();
+        assert!(
+            turn2_content.contains("ghost-id"),
+            "error message should reference the bad handle: {turn2_content}"
+        );
+        assert!(
+            turn2_content.contains("false") || turn2_content.contains("error"),
+            "tool result should signal failure: {turn2_content}"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// F2-dispatch-3: expand_capsule with no resolver returns a safe
+    /// "not configured" error rather than panicking.
+    #[test]
+    fn expand_capsule_no_resolver_returns_not_configured_error() {
+        let root = temp_root("f2_no_resolver");
+        let mut runtime = ToolRuntime::new(&root, RunId::new()).expect("runtime");
+
+        let mut provider = MockProvider::new([
+            ModelResponse::tool_call(
+                "call_1",
+                "expand_capsule",
+                json!({"handle": "memory:any-id"}),
+            ),
+            ModelResponse::text("done"),
+        ]);
+
+        let opts = KimetsuAgentOpts::for_tests();
+        // Pass None for expand_fn — no resolver configured.
+        let report = run_model_agent("test task", &mut runtime, &mut provider, opts, None)
+            .expect("loop must not crash without resolver");
+
+        assert_eq!(report.tool_calls, 1);
+        let turn2_content = provider.requests[1]
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, crate::model::MessageRole::Tool))
+            .map(|m| format!("{:?}", m.content))
+            .unwrap_or_default();
+        assert!(
+            turn2_content.contains("not configured") || turn2_content.contains("resolver"),
+            "error should mention resolver not configured: {turn2_content}"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// F2-tool-list: expand_capsule appears in the FULL_TOOL_NAMES loadout.
+    #[test]
+    fn expand_capsule_appears_in_full_tool_loadout() {
+        assert!(
+            FULL_TOOL_NAMES.contains(&"expand_capsule"),
+            "expand_capsule must be in FULL_TOOL_NAMES"
+        );
+        let defs = kimetsu_tool_definitions();
+        assert!(
+            defs.iter().any(|d| d.name == "expand_capsule"),
+            "expand_capsule must have a ToolDefinition"
+        );
     }
 }

@@ -103,12 +103,26 @@ impl Default for CollectOptions {
 /// test isolation pattern can keep ambient collection off when
 /// asserting on deterministic outputs.
 pub fn ambient_enabled() -> bool {
+    // Delegate to the config-aware variant with the default (true).
+    ambient_enabled_with(true)
+}
+
+/// W3.2: config-aware ambient gate. Resolution precedence:
+///   1. `KIMETSU_BRAIN_AMBIENT` env is explicitly set → its value wins.
+///   2. Env is unset → `config_ambient` governs.
+///
+/// Callers with a `ProjectConfig` should pass `config.broker.ambient`;
+/// callers without a config (back-compat) can call `ambient_enabled()`.
+pub fn ambient_enabled_with(config_ambient: bool) -> bool {
+    // Precedence: env override > config > default.
     match std::env::var("KIMETSU_BRAIN_AMBIENT") {
         Ok(value) => {
             let v = value.trim().to_ascii_lowercase();
+            // Env is set (even to empty) — respect it.
             !matches!(v.as_str(), "off" | "0" | "false" | "no" | "none")
         }
-        Err(_) => true,
+        // Env unset → config governs.
+        Err(_) => config_ambient,
     }
 }
 
@@ -273,7 +287,7 @@ fn collect_recent_files(workspace: &Path, limit: usize, budget: Duration) -> Vec
         }
         candidates.push((mtime, rel));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
     candidates
         .into_iter()
         .take(limit)
@@ -348,10 +362,7 @@ mod tests {
             ..Default::default()
         };
         let suffix = render_as_query_suffix(&ctx);
-        assert!(
-            suffix.contains("src/embeddings.rs"),
-            "got {suffix}"
-        );
+        assert!(suffix.contains("src/embeddings.rs"), "got {suffix}");
         assert!(
             suffix.contains("crates/kimetsu-brain/src/ambient.rs"),
             "got {suffix}"
@@ -453,10 +464,7 @@ mod tests {
         // Build a fake workspace with `.kimetsu/` content next to
         // real source files; the walker must surface the source
         // files only.
-        let root = std::env::temp_dir().join(format!(
-            "kimetsu-ambient-test-{}",
-            ulid::Ulid::new()
-        ));
+        let root = std::env::temp_dir().join(format!("kimetsu-ambient-test-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".kimetsu/runs")).unwrap();
         std::fs::write(root.join("src/a.rs"), "// a").unwrap();
@@ -469,7 +477,87 @@ mod tests {
             ".kimetsu/ entries should be filtered out: {:?}",
             files
         );
-        assert!(files.iter().any(|p| p.ends_with("a.rs") || p.ends_with("b.rs")));
+        assert!(
+            files
+                .iter()
+                .any(|p| p.ends_with("a.rs") || p.ends_with("b.rs"))
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── W3.2: ambient_enabled_with tests ─────────────────────────────
+
+    /// W3.2: config=false disables ambient when env is unset.
+    #[test]
+    fn w3_ambient_enabled_with_config_false_when_env_unset() {
+        let _lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_AMBIENT").ok();
+        unsafe {
+            std::env::remove_var("KIMETSU_BRAIN_AMBIENT");
+        }
+        // config=false and env unset → disabled.
+        assert!(
+            !ambient_enabled_with(false),
+            "config=false + env unset must be disabled"
+        );
+        // config=true and env unset → enabled (default behavior preserved).
+        assert!(
+            ambient_enabled_with(true),
+            "config=true + env unset must be enabled"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_AMBIENT", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_AMBIENT"),
+            }
+        }
+    }
+
+    /// W3.2: env=0 overrides config=true (env wins when disable value).
+    #[test]
+    fn w3_ambient_env_disable_overrides_config_true() {
+        let _lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_AMBIENT").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_AMBIENT", "0");
+        }
+        // Even with config=true, env=0 disables.
+        assert!(
+            !ambient_enabled_with(true),
+            "KIMETSU_BRAIN_AMBIENT=0 must override config=true"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_AMBIENT", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_AMBIENT"),
+            }
+        }
+    }
+
+    /// W3.2: env=1 overrides config=false (env wins when enable value).
+    #[test]
+    fn w3_ambient_env_enable_overrides_config_false() {
+        let _lock = crate::user_brain::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("KIMETSU_BRAIN_AMBIENT").ok();
+        unsafe {
+            std::env::set_var("KIMETSU_BRAIN_AMBIENT", "1");
+        }
+        // Even with config=false, env=1 enables.
+        assert!(
+            ambient_enabled_with(false),
+            "KIMETSU_BRAIN_AMBIENT=1 must override config=false"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KIMETSU_BRAIN_AMBIENT", v),
+                None => std::env::remove_var("KIMETSU_BRAIN_AMBIENT"),
+            }
+        }
     }
 }

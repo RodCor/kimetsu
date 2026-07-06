@@ -6,6 +6,7 @@ members = [
     "crates/kimetsu-cli",
     "crates/kimetsu-core",
     "crates/kimetsu-e2e",
+    "crates/kimetsu-remote",
 ]
 resolver = "3"
 
@@ -14,7 +15,7 @@ resolver = "3"
 # everything below except the per-crate `description`, `keywords`,
 # and `categories` which live in each `[package]` block since
 # crates.io enforces them per crate.
-version = "0.7.2"
+version = "2.5.2"
 edition = "2024"
 # Rust ecosystem dual-license (matches tokio, serde, fastembed-rs,
 # etc.). UNLICENSED would block crates.io entirely.
@@ -27,20 +28,28 @@ readme = "README.md"
 rust-version = "1.85"
 
 [workspace.dependencies]
+aws-credential-types = { version = "1.2.14" }
+aws-sigv4 = { version = "1.4.5", default-features = false, features = ["sign-http", "http1"] }
+aws-smithy-runtime-api = { version = "1.12.3" }
 base64 = "0.22"
+http = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 ignore = "0.4"
+json5 = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 similar = "2"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+interprocess = "2"
 toml = "0.9"
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ulid = { version = "1", features = ["serde"] }

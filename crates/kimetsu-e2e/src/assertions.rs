@@ -20,8 +20,10 @@ pub fn count_memories(conn: &Connection) -> i64 {
 /// `memory.cited` event is applied. One row per (run_id, memory_id,
 /// turn).
 pub fn count_citations(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM memory_citations", [], |row| row.get(0))
-        .expect("count citations")
+    conn.query_row("SELECT COUNT(*) FROM memory_citations", [], |row| {
+        row.get(0)
+    })
+    .expect("count citations")
 }
 
 /// Count open (unresolved) conflict-detection hits. Resolved rows are
