@@ -15,6 +15,7 @@ bill, or the cloud.**
 | benchmark | Kimetsu (local, model-free) | mem0 (self-reported) | Cognee (self-reported) |
 |-----------|-----------------------------|----------------------|------------------------|
 | LongMemEval (`_s`) | **83.0%** (200-q slice) · ~80.9% weighted | 94.4% (their reader + harness) | not reported |
+| LoCoMo (1,540 q) | **89.4%** | 92.5% | not reported |
 | BEAM 100K | **73.3%** (400 probes) | n/a | 79% |
 | BEAM **1M** | **66.0%** (300 probes) | 62% | not reported |
 | BEAM 10M | future work | 48.6% | 67% |

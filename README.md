@@ -33,6 +33,7 @@ offline-capable.
 
 | | |
 |---:|---|
+| **89.4%** | LoCoMo, the long-conversation memory benchmark, full 1,540-question set |
 | **73.3%** | BEAM 100K memory benchmark, matching the prior public state of the art, model-free |
 | **66.0%** | BEAM 1M, ahead of mem0's self-reported 62% at the same bucket |
 | **83.0%** | LongMemEval, the public long-term-memory benchmark |

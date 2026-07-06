@@ -6,6 +6,7 @@ them rather than take our word for it.
 
 | benchmark | result |
 |-----------|--------|
+| LoCoMo | **89.4%** (1,540 questions, LLM-judged accuracy) |
 | BEAM 100K | **73.3%**, matching the prior public state of the art, model-free |
 | BEAM 1M | **66.0%**, ahead of mem0's self-reported 62% |
 | LongMemEval (`_s`) | **83.0%** (200-question stratified slice) |

@@ -16,9 +16,9 @@ import { Reveal } from './_components/reveal';
 const BASE = '';
 
 const stats = [
-  { value: '73.3%', label: 'BEAM 100K memory bench', note: 'matches the prior public SOTA, with no model in the pipeline' },
-  { value: '66.0%', label: 'BEAM 1M memory bench', note: "ahead of mem0's self-reported 62% at the same bucket" },
+  { value: '89.4%', label: 'LoCoMo', note: 'the long-conversation memory benchmark, full 1,540-question set' },
   { value: '83.0%', label: 'LongMemEval', note: 'the public long-term-memory benchmark' },
+  { value: '73.3%', label: 'BEAM 100K memory bench', note: 'matches the prior public SOTA, with no model in the pipeline' },
   { value: '13×', label: 'cheaper per solved task', note: '$0.19 vs $2.47 on a 16-task Terminal-Bench slice' },
   { value: '~1M', label: 'memories in ~3 GB RAM', note: 'sub-2s retrieval, one SQLite file' },
   { value: '$0', label: 'API cost to remember', note: 'the memory pipeline calls no model' },
