@@ -2757,7 +2757,7 @@ pub(crate) fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
                     c.use_count,
                     c.usefulness_score,
                     c.age_days,
-                    &c.text_preview
+                    c.text_preview
                 );
             }
         }
