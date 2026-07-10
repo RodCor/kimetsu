@@ -7,6 +7,22 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v2.5.3: Close the benchmark learning loop
+
+A focused follow-up to v2.5.2. Adds the host-side path that lets a graded
+task feed its outcome back into the brain, so the consolidation machinery
+(usefulness, query-routes, staples) receives a real signal on every solve.
+
+### Added
+
+- `kimetsu brain benchmark-credit --task <t> --passed`: on a pass, groups a
+  citation for the memories most relevant to the task and routes it through
+  the same grouped, query-linked path consolidation consumes. Driven by a
+  benchmark harness after grading, so the learning signal never depends on
+  the agent inside the sandbox calling a tool. This is what makes an
+  iterated-benchmark learning loop actually reach the brain; before it, the
+  benchmark memory path recorded outcomes but never exercised consolidation.
+
 ## v2.5.2: The brain that learns from its own outcomes
 
 Consolidation v1: the first release where citation outcomes reshape the brain
