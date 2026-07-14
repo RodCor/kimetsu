@@ -847,6 +847,11 @@ enum BrainCommand {
     /// before get a bounded retrieval boost. Model-free; run offline
     /// (session end / between benchmark iterations).
     Reinforce(ReinforceArgs),
+    /// Close the benchmark learning loop for one graded task: on a PASS,
+    /// grouped-cite the memories most relevant to the task (feeds usefulness,
+    /// query-routes, and staples). Driven host-side by the benchmark harness
+    /// so the learning signal never depends on the in-container agent.
+    BenchmarkCredit(BenchmarkCreditArgs),
     /// Record a regret: mark that a surfaced memory was unhelpful/misleading.
     ///
     /// Writes a `retrieval.regret` telemetry event for the memory — the negative
@@ -1354,6 +1359,23 @@ struct ReinforceArgs {
     /// Rebuild the query-routing index from citation history.
     #[arg(long)]
     routes: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain benchmark-credit`.
+#[derive(Debug, Args)]
+struct BenchmarkCreditArgs {
+    /// The task description / query the graded task represents.
+    #[arg(long)]
+    task: String,
+    /// Mark the task as PASSED — only passes produce a citation.
+    #[arg(long)]
+    passed: bool,
+    /// How many top-ranked memories to credit on a pass.
+    #[arg(long, default_value_t = 3)]
+    top_k: usize,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,

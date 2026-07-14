@@ -200,6 +200,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Forget(args) => brain_forget(args),
         BrainCommand::Cite(args) => brain_cite(args),
         BrainCommand::Reinforce(args) => brain_reinforce(args),
+        BrainCommand::BenchmarkCredit(args) => brain_benchmark_credit(args),
         BrainCommand::Regret(args) => brain_regret(args),
         BrainCommand::Distill(args) => brain_distill(args),
         BrainCommand::Graph { command } => brain_graph(command),
@@ -2756,7 +2757,7 @@ pub(crate) fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
                     c.use_count,
                     c.usefulness_score,
                     c.age_days,
-                    &c.text_preview
+                    c.text_preview
                 );
             }
         }
@@ -2892,6 +2893,30 @@ pub(crate) fn brain_reinforce(args: ReinforceArgs) -> KimetsuResult<()> {
         summary.staples_created,
         summary.routes_built,
         summary.routes_embedded
+    );
+    Ok(())
+}
+
+pub(crate) fn brain_benchmark_credit(args: BenchmarkCreditArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let credited = kimetsu_brain::reinforce::credit_benchmark_outcome(
+        &workspace,
+        &args.task,
+        args.passed,
+        args.top_k,
+    )?;
+    println!(
+        "benchmark-credit: {} memor{} cited for task \"{}\" ({})",
+        credited,
+        if credited == 1 { "y" } else { "ies" },
+        args.task,
+        if args.passed {
+            "passed"
+        } else {
+            "not passed — no citation"
+        }
     );
     Ok(())
 }

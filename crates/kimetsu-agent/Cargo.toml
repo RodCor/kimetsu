@@ -27,8 +27,8 @@ aws-sigv4.workspace = true
 aws-smithy-runtime-api.workspace = true
 blake3.workspace = true
 http.workspace = true
-kimetsu-brain = { path = "../kimetsu-brain", version = "2.5.2" }
-kimetsu-core = { path = "../kimetsu-core", version = "2.5.2" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.5.3" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.5.3" }
 regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
