@@ -209,24 +209,46 @@ Still open in this phase, gated on measurement rather than opinion:
    `kimetsu-cli` binary target so `cargo install` matches the npm flavor, while
    library crates stay lean.
 
-### Phase 1 — Tiers
+### Phase 1 — Tiers (landed)
 
-Add `[kimetsu] tier`, route the Deep-only paths through it, and split the
-benchmark tables. Mechanical, but it has to land before phase 2g and 3b, which
-are the first features with a genuine Deep variant.
+`[kimetsu] tier` names the two pipelines. Every automatic model call in the
+memory pipeline resolves through `distiller::resolve_pipeline_distiller`, which
+returns `None` on Free, so each caller falls back to the rule-based path it
+already had — the guarantee is a property of the code, not of configuration.
+
+Leave the field unset for **auto**: a brain with a cheap model configured is
+already making model calls, so it reads as Deep, which keeps every pre-v3.0
+config behaving exactly as before. `tier = "free"` is a durable opt-out with
+credentials present; `tier = "deep"` with no reachable model resolves back down
+and says so in `doctor` and `brain status`.
+
+Gated (automatic, in-pipeline): session-end distillation, episode capture, HyDE
+query expansion, the stop hook's distiller branch. Ungated (invoked by name):
+`ask`, `brain reflect`, `brain distill`, `brain skills`, `doctor` — silently
+refusing an explicit request would be a worse lie than the one the gate
+prevents.
 
 ### Phase 2 — Retrieval and accuracy
 
-- **2a. RRF fusion** across the FTS, ANN, and (new) graph and temporal candidate
-  lists, replacing union-max plus the linear α blend. Keep the blend behind a
-  config key and sweep `fusion ∈ {rrf, linear}` in `brain tune`.
+- **2a. RRF fusion (landed).** `[broker] fusion` selects `linear` or `rrf`, with
+  a per-request override so `brain tune` can compare them in one process against
+  one corpus; the sweep grid gained the dimension (80 combos → 160), and
+  `--apply` writes the winner. The default stays `linear`: RRF being the 2026
+  default for hybrid retrieval is a fact about the literature, not a measurement
+  on this corpus, and the house rule is that every claim ships with one. The
+  sweep is how a corpus gets to say otherwise.
 - **2b. Global normalization** in place of per-kind max normalization — the
-  thing the lexical and semantic floors exist to compensate for.
-- **2c. First-class entities and edges.** `memory_tags` and `memory_entities`
-  tables; parse `[tags: …]` once at write time rather than on every read; write
-  `relates_to` edges on ingest; start emitting the declared-but-unused
-  `refines` / `dead_end_of` / `lesson_from` types from the supersede, episode
-  and distiller paths.
+  thing the lexical and semantic floors exist to compensate for. **Still open**,
+  and for the same reason: it is a ranking change that needs a measurement on a
+  semantic build to justify, not an argument.
+- **2c. First-class entities and edges (landed).** Schema v11 adds
+  `memory_entities`, a projection of each memory's tags and salient terms, with
+  the author-supplied tag distinguished from a term the extractor guessed. The
+  write path links each memory as it lands via one indexed lookup, asking for
+  two shared entities rather than the batch builder's one — on the write path a
+  single shared word would attach every new memory to half the corpus. Emitting
+  the declared-but-unused `refines` / `dead_end_of` / `lesson_from` types is
+  still open.
 - **2d. Event ordering** (32.5% → target 70%+): an `occurred_at` ordering
   signal, `work_episodes` exposed to retrieval as an ordered episodic strand,
   and ordered capsules rendered with explicit timestamps.
@@ -246,21 +268,35 @@ are the first features with a genuine Deep variant.
 
 ### Phase 3 — Proactive autonomy
 
-- **3a. A real daemon.** Promote the embed daemon into a scheduled background
-  worker with an idle detector. Free tier runs the existing model-free passes on
-  a schedule: `reinforce`, conflict resolution, pruning, digest refresh,
-  trigger-gated self-tuning, skill-graduation detection. Deep adds reflection
-  and sleep-time anticipation. Everything interruptible; nothing may hold the
-  300 ms retrieval budget.
-- **3b. A learned inject-or-stay-silent policy**, replacing fixed thresholds,
-  trained locally on the regret sidecar and citation outcomes over features
-  already being logged: score, kind, novelty, repeat count, prior injection
-  acceptance, time since last injection. Free tier fits a logistic model with no
-  LLM; Deep adds model adjudication. **This is the highest-leverage item in the
-  RFC.**
-- **3c. Real error monitoring**: exit-code inspection, stderr/stdout separation,
-  and per-toolchain parsers (cargo, npm/vitest, pytest, go test) in place of the
-  ten-word substring list.
+- **3a. Background upkeep (landed, not as a daemon).** The embed daemon stays a
+  dumb model cache — anything it does slowly is something the hook waits for.
+  Instead each pass records when it last ran, `due_passes()` answers what is
+  overdue, and the session-start and session-end hooks fire a detached
+  `kimetsu brain maintain` and return immediately: no resident process, no timer
+  thread, nothing to supervise. Reinforce, digest, prune-candidate detection and
+  skill-candidate detection, each on its own interval. A failing pass is not
+  marked as run, so it retries next tick rather than being skipped for its
+  interval. All model-free; reflection and sleep-time anticipation are still
+  open, and both are Deep-tier by construction.
+- **3b. A learned inject-or-stay-silent policy (landed).** A logistic
+  regression over score, loop mode, capsule kind, session novelty, repeat count,
+  recovery since the last injection, and the strength of the failure evidence.
+  Its prior is solved by hand so the decision boundary is *exactly* the old
+  thresholds with every other weight at zero — an untrained brain behaves
+  precisely as it did, so there is no cold-start regression to trade against the
+  gain. Labels come from `proactive.injected` events joined to citations: an
+  injection the agent never cited is the definition of an interruption that was
+  not worth making. Refuses to fit below 40 examples or with one class present.
+  `kimetsu brain policy` prints the weights, `--train` refits, `--reset` returns
+  to the constant. Deep-tier model adjudication is still open.
+- **3c. Real error monitoring (landed).** `tool_outcome::classify` answers "did
+  that fail?" from the exit code when the harness reports one, then a toolchain
+  summary line (cargo, libtest, pytest, jest/vitest, go test, tsc, npm, make),
+  then the substring scan — which an explicit `0 failed` / `test result: ok` now
+  vetoes. A passing test suite is no longer a failure because its summary line
+  contains the word "failed". The verdict carries its evidence tier, and the
+  toolchain parsers extract the real diagnostic, which is a much better
+  retrieval query and loop signature than "first line containing error".
 - **3d. Close the skills loop**: graduation detection from the daemon, with
   newly graduated skills surfaced in the warm start.
 - **3e. Graduate `proactive_prefetch` to default-on**, gated on a measured
@@ -295,14 +331,30 @@ No competitor owns this ground.
 
 ---
 
+## Status
+
+Landed and tested: phase 0 (all seven items, including the `graph-lite` default
+flip), phase 1, 2a, 2c, 3a, 3b, 3c.
+
+Still open: 2b (global normalization), 2d (event ordering), 2e (abstention), 2f
+(bitemporal), 2g (entailment conflicts), 2h (user profile prior), 2i (BEAM 10M),
+3d (skill graduation surfaced in the warm start), 3e (`proactive_prefetch`
+default-on), all of phase 4, and all of phase 5.
+
 ## What this RFC does not claim
 
-- Phase 0 is landed and tested; **everything from phase 1 onward is a proposal**,
-  not a commitment, and each item gates on a measurement before merge.
-- The default-configuration flip (phase 0 item 7) is not done. Until it is,
-  reproducing the published BEAM 100K figure requires
-  `[storage] backend = "graph-lite"` and a `kimetsu brain graph build`.
-- Target numbers in phase 2 are targets, not results.
+- **The ranking changes are not measured.** 2a ships RRF selectable and swept
+  but defaulted off, and 2b is deferred outright, because both need a
+  semantic-build benchmark to justify a default and neither has one yet. The
+  sweep exists so a corpus can settle it; an argument from the literature is not
+  a measurement on your brain.
+- Target numbers in phase 2 are targets, not results. Nothing here has been
+  re-benchmarked on BEAM or LongMemEval since the changes landed.
+- The `graph-lite` default is justified by a *property*, not a benchmark: on a
+  corpus with edges present, graph-lite returns a superset of flat's candidates
+  with every flat candidate's relevance unchanged, so it can broaden recall but
+  never displace a result. That is asserted by a test. The 73.3% vs 62.3% gap
+  that motivated it is the pre-existing BEAM measurement.
 - Competitor figures cited here are self-reported unless otherwise noted, and
   the 2026 roundups show several of them not reproducing. Ours ship with the
   harness so they can be checked.
