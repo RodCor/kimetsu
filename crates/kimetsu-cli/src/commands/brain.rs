@@ -85,9 +85,9 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
             let hyde_enabled = args.hyde || hyde_from_level;
             // Advanced level leans on a capable cheap model; nudge the user if
             // none is configured (non-fatal; the raw query is still used).
-            if hyde_from_level && distiller::resolve_distiller(&cwd).is_none() {
+            if hyde_from_level && distiller::resolve_pipeline_distiller(&cwd).is_none() {
                 eprintln!(
-                    "kimetsu: retrieval level 'advanced' works best with a capable cheap model (OpenAI/Anthropic or a larger local model like qwen2.5:14b); set [cheap_model] in project.toml."
+                    "kimetsu: retrieval level 'advanced' needs the deep tier and a capable cheap model (OpenAI/Anthropic or a larger local model like qwen2.5:14b); set [cheap_model] in project.toml."
                 );
             }
             let effective_query = if hyde_enabled {
@@ -1342,16 +1342,18 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
         .collect();
 
     // F3 Stories 3.2 & 3.4: regret-flagged memories + invalidations by reason.
-    let (regret_flagged, inv_by_reason) = match project::load_project(&cwd) {
+    // v3.0: also report the resolved tier — which pipeline the numbers above
+    // were produced by is not something a user should have to infer.
+    let (regret_flagged, inv_by_reason, tier, tier_downgraded) = match project::load_project(&cwd) {
         Ok((_paths, config, conn)) => {
             let threshold = config.lifecycle.regret_flag_threshold;
             let regret = kimetsu_brain::lifecycle::regret_flagged_memories(&conn, threshold)
                 .map(|v| v.len())
                 .unwrap_or(0);
             let inv = kimetsu_brain::lifecycle::invalidations_by_reason(&conn).unwrap_or_default();
-            (regret, inv)
+            (regret, inv, config.tier(), config.tier_downgraded())
         }
-        Err(_) => (0, vec![]),
+        Err(_) => (0, vec![], kimetsu_core::config::Tier::Free, false),
     };
 
     if json {
@@ -1373,6 +1375,8 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
                 "top_domains": top_domains,
                 "regret_flagged": regret_flagged,
                 "invalidations_by_reason": inv_json,
+                "tier": tier.as_str(),
+                "tier_downgraded": tier_downgraded,
             }))?
         );
     } else {
@@ -1383,6 +1387,20 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
             conflicts.len()
         );
         println!("schema version: {schema_ver}");
+        match tier {
+            kimetsu_core::config::Tier::Free => {
+                println!("tier:    free (no LLM calls in the memory pipeline)")
+            }
+            kimetsu_core::config::Tier::Deep => {
+                println!("tier:    deep (a local/cheap model assists ingest and retrieval)")
+            }
+        }
+        if tier_downgraded {
+            println!(
+                "hint: tier = \"deep\" is configured but no cheap model is reachable — \
+                 running free. See `kimetsu doctor`."
+            );
+        }
         if !top_domains.is_empty() {
             println!("domains: {}", top_domains.join(", "));
         }
@@ -3125,12 +3143,17 @@ pub(crate) fn enrich_typed_edges(
 
 /// HyDE query expansion: append a hypothetical answer passage (from the cheap
 /// model) to `query`, so semantic retrieval matches the answer's vector rather
-/// than the question's. Falls back to the raw query when no cheap model is
-/// configured or the model call fails (graceful, never errors retrieval).
+/// than the question's. Falls back to the raw query when the tier forbids model
+/// calls, when no cheap model is configured, or when the model call fails
+/// (graceful, never errors retrieval).
+///
+/// HyDE is a model call *inside retrieval*, so it resolves through the tier
+/// gate: on Free the raw query is used.
 pub(crate) fn hyde_augment_query(workspace: &Path, query: &str) -> String {
-    let Some(resolved) = distiller::resolve_distiller(workspace) else {
+    let Some(resolved) = distiller::resolve_pipeline_distiller(workspace) else {
         eprintln!(
-            "kimetsu: --hyde requested but no [cheap_model] configured; using the raw query."
+            "kimetsu: HyDE needs the deep tier and a [cheap_model]; using the raw query. \
+             (`kimetsu config set kimetsu.tier deep`)"
         );
         return query.to_string();
     };

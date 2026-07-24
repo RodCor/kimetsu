@@ -522,3 +522,99 @@ fn context_hook_warm_starts_even_on_a_short_prompt() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: the Free/Deep tier
+// ---------------------------------------------------------------------------
+
+/// Read `kimetsu brain status --json` for `root`.
+fn brain_status_json(root: &std::path::Path) -> serde_json::Value {
+    let out = Command::new(kimetsu_bin())
+        .args(["brain", "status", "--json"])
+        .current_dir(root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn brain status");
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
+}
+
+/// Rewrite `project.toml` with `extra` appended.
+fn append_to_project_toml(root: &std::path::Path, extra: &str) {
+    let paths = kimetsu_core::paths::ProjectPaths::discover(root).expect("paths");
+    let mut text = fs::read_to_string(&paths.project_toml).expect("read project.toml");
+    text.push('\n');
+    text.push_str(extra);
+    fs::write(&paths.project_toml, text).expect("write project.toml");
+}
+
+/// A brand-new brain is Free — that is what the "zero LLM calls in the memory
+/// pipeline" claim is measured on, so it must be the shipped default.
+#[test]
+fn brain_status_reports_the_free_tier_by_default() {
+    let root = temp_project_dir("tier_default");
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "free", "got: {status}");
+    assert_eq!(status["tier_downgraded"], false);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Auto-resolution: a brain that already has a cheap model configured is
+/// already making model calls, so it reports Deep without anyone editing a
+/// tier field. This is what keeps every pre-v3.0 config behaving as it did.
+#[test]
+fn configuring_a_cheap_model_resolves_to_the_deep_tier() {
+    let root = temp_project_dir("tier_auto_deep");
+    append_to_project_toml(
+        &root,
+        "[cheap_model]\nenabled = true\nprovider = \"ollama\"\nmodel = \"qwen2.5:7b\"\n",
+    );
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "deep", "got: {status}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `tier = "deep"` with nothing to run on is Free wearing a label. It must
+/// resolve down AND be reported, or a user reads "deep" while every Deep
+/// feature is silently off.
+#[test]
+fn deep_without_a_model_downgrades_and_is_reported() {
+    let root = temp_project_dir("tier_downgrade");
+    append_to_project_toml(&root, "");
+    // Set the tier without configuring any model.
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+    let text = fs::read_to_string(&paths.project_toml).expect("read");
+    let patched = text.replace("[kimetsu]", "[kimetsu]\ntier = \"deep\"");
+    fs::write(&paths.project_toml, patched).expect("write");
+
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "free", "must resolve down; got: {status}");
+    assert_eq!(
+        status["tier_downgraded"], true,
+        "the discrepancy must be visible; got: {status}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `tier = "free"` is a durable opt-out: credentials present, pipeline model
+/// calls off. Without it the only way to stop the distiller is to remove the
+/// credentials, which is not a thing you can do per-project.
+#[test]
+fn explicit_free_tier_overrides_a_configured_model() {
+    let root = temp_project_dir("tier_explicit_free");
+    append_to_project_toml(
+        &root,
+        "[cheap_model]\nenabled = true\nprovider = \"ollama\"\nmodel = \"qwen2.5:7b\"\n",
+    );
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+    let text = fs::read_to_string(&paths.project_toml).expect("read");
+    fs::write(
+        &paths.project_toml,
+        text.replace("[kimetsu]", "[kimetsu]\ntier = \"free\""),
+    )
+    .expect("write");
+
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "free", "got: {status}");
+    assert_eq!(status["tier_downgraded"], false, "free was asked for");
+    let _ = fs::remove_dir_all(&root);
+}

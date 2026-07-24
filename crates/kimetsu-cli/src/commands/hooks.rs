@@ -483,7 +483,7 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .and_then(|p| project::load_config(p).ok())
         .map(|c| c.learning.auto_harvest)
         .unwrap_or(true);
-    let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
+    let distiller_enabled = distiller::resolve_pipeline_distiller(&workspace).is_some();
     let state_path = paths.as_ref().map(|p| {
         let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
         proactive_state::session_path(&cache_dir, sid)

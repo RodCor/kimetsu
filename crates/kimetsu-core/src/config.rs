@@ -66,6 +66,7 @@ impl ProjectConfig {
                 schema_version: KIMETSU_CONFIG_VERSION,
                 use_user_brain: default_true(),
                 mcp_write_tools: default_true(),
+                tier: None,
             },
             model: ModelSection::default(),
             broker: BrokerSection::default(),
@@ -163,6 +164,58 @@ impl ProjectConfig {
         None
     }
 
+    /// v3.0: resolve the effective product tier.
+    ///
+    /// Resolution order (first wins):
+    ///   1. `KIMETSU_TIER` env var (`free` / `deep`; an unparseable value is
+    ///      ignored rather than fatal — a typo in a shell profile must not
+    ///      break retrieval).
+    ///   2. `[kimetsu] tier`, when set explicitly.
+    ///   3. Auto: Deep when a cheap model is configured, Free otherwise.
+    ///
+    /// **`deep` downgrades to `free` when [`Self::cheap_model`] resolves to
+    /// `None`.** Deep with no reachable model is not a third state: it is Free
+    /// with a misleading label, and every consumer would have to re-check.
+    /// Resolving it here means a caller can branch on the tier alone; use
+    /// [`Self::tier_downgraded`] when you want to *report* the discrepancy.
+    pub fn tier(&self) -> Tier {
+        match self.tier_requested() {
+            Some(Tier::Deep) if self.cheap_model().is_some() => Tier::Deep,
+            Some(Tier::Deep) => Tier::Free,
+            Some(Tier::Free) => Tier::Free,
+            // Auto: a brain that already has a cheap model configured is
+            // already making model calls. Calling that "free" would be a lie.
+            None if self.cheap_model().is_some() => Tier::Deep,
+            None => Tier::Free,
+        }
+    }
+
+    /// The tier the user explicitly asked for, if any. `None` means auto.
+    pub fn tier_requested(&self) -> Option<Tier> {
+        match std::env::var("KIMETSU_TIER") {
+            Ok(raw) => raw.parse::<Tier>().ok().or(self.kimetsu.tier),
+            Err(_) => self.kimetsu.tier,
+        }
+    }
+
+    /// True when Deep was asked for but no cheap model is reachable, so the
+    /// brain is silently running Free. `kimetsu doctor` surfaces this: the
+    /// failure mode it guards against is paying attention to a `deep` label
+    /// while none of the Deep features can actually run.
+    pub fn tier_downgraded(&self) -> bool {
+        self.tier_requested() == Some(Tier::Deep) && self.cheap_model().is_none()
+    }
+
+    /// The single gate every Deep-only code path must consult before making a
+    /// model call in the memory pipeline.
+    ///
+    /// Equivalent to `self.tier().allows_model()`, named for the invariant it
+    /// enforces: on Free this returns false, and the "zero LLM calls" claim is
+    /// exactly the statement that no memory-pipeline call site proceeds past it.
+    pub fn allows_model_in_pipeline(&self) -> bool {
+        self.tier().allows_model()
+    }
+
     pub fn from_toml(value: &str) -> KimetsuResult<Self> {
         Ok(toml::from_str(value)?)
     }
@@ -200,6 +253,86 @@ pub struct KimetsuSection {
     /// stays env-only, default-deny.
     #[serde(default = "default_true")]
     pub mcp_write_tools: bool,
+    /// v3.0: which product tier this brain runs as.
+    ///
+    /// `"free"` (default) is the headline claim — **zero LLM calls anywhere in
+    /// the memory pipeline**. Ingest, store, retrieve and rerank are FTS5 +
+    /// local embeddings + a local cross-encoder, and every capability has a
+    /// deterministic or statistical implementation.
+    ///
+    /// `"deep"` opts into a local small model in the loop for the handful of
+    /// features that are genuinely better with one (see [`Tier`]). Every Deep
+    /// feature has a Free fallback that *is* the Free behaviour, so flipping
+    /// the tier can add quality but can never remove a capability.
+    ///
+    /// Absent (the default) means **auto**: a brain with a cheap model
+    /// configured is already making model calls, so it reads as Deep; a brain
+    /// without one reads as Free. That keeps every pre-v3.0 `project.toml`
+    /// behaving exactly as it did while making the label honest. Set it
+    /// explicitly to force the tier — `"free"` is a durable opt-out of model
+    /// calls even when credentials are present.
+    ///
+    /// Precedence: `KIMETSU_TIER` env > this field > auto.
+    /// Resolve it with [`ProjectConfig::tier`], never by reading this field —
+    /// the resolver also downgrades `deep` to `free` when no model is actually
+    /// reachable, which would otherwise be a label over a no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+}
+
+/// v3.0: the product tier. See [`KimetsuSection::tier`].
+///
+/// | Feature | Free | Deep |
+/// |---|---|---|
+/// | write-time lesson distillation | rule-based capture | model-distilled lessons |
+/// | repo digest | rule-based assembly | model-distilled summary |
+/// | reflection over memory clusters | not run | synthesized general principles |
+/// | contradiction detection | cosine proximity | entailment adjudication |
+/// | proactive inject-or-stay-silent | locally-fit statistical policy | model adjudication |
+/// | idle-time work | consolidation, pruning, tuning | the above plus query anticipation |
+///
+/// The benchmark tables in `docs/memory-benchmark/` report both columns
+/// separately: Free is what the "model-free" claim is measured on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Model-free. The default, and what the published claims measure.
+    #[default]
+    Free,
+    /// A local small model in the loop for the features listed on [`Tier`].
+    Deep,
+}
+
+impl Tier {
+    /// True when this tier permits a model call in the memory pipeline.
+    pub fn allows_model(self) -> bool {
+        matches!(self, Tier::Deep)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Free => "free",
+            Tier::Deep => "deep",
+        }
+    }
+}
+
+impl std::str::FromStr for Tier {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "free" => Ok(Tier::Free),
+            "deep" => Ok(Tier::Deep),
+            other => Err(format!("unknown tier `{other}` (expected free or deep)")),
+        }
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// v0.8: embedding-model selection. `model` is one of the curated
@@ -1186,6 +1319,117 @@ impl Default for LifecycleSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── v3.0: Free/Deep tier resolution ──────────────────────────────────
+    //
+    // These deliberately do not touch KIMETSU_TIER: env is process-global and
+    // the suite runs in parallel by default. The env branch is a one-line
+    // `parse().ok().or(field)`; the interesting logic is the field × model
+    // matrix below.
+
+    fn enabled_cheap_model() -> CheapModelSection {
+        CheapModelSection {
+            enabled: true,
+            ..CheapModelSection::default()
+        }
+    }
+
+    /// A brand-new project with no model configured is Free, which is what the
+    /// "zero LLM calls in the memory pipeline" claim is measured on.
+    #[test]
+    fn tier_defaults_to_free_without_a_model() {
+        let config = ProjectConfig::default_for_project("test");
+        assert_eq!(config.tier(), Tier::Free);
+        assert!(!config.tier_downgraded());
+    }
+
+    /// Auto: a brain with a cheap model configured is already making model
+    /// calls. Reporting that as Free would be a lie, so it resolves to Deep
+    /// without anyone having to edit project.toml — which is also what keeps
+    /// every pre-v3.0 config behaving exactly as it did.
+    #[test]
+    fn tier_auto_resolves_to_deep_when_a_model_is_configured() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.cheap_model = Some(enabled_cheap_model());
+        assert_eq!(config.tier_requested(), None, "field left at auto");
+        assert_eq!(config.tier(), Tier::Deep);
+    }
+
+    /// Back-compat: an enabled `[learning.distiller]` is a cheap model by the
+    /// existing resolver, so it lights up Deep the same way.
+    #[test]
+    fn tier_auto_follows_the_legacy_distiller_alias() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.learning.distiller.enabled = true;
+        assert_eq!(config.tier(), Tier::Deep);
+    }
+
+    /// `tier = "free"` is a durable opt-out: credentials present, model calls
+    /// off. Without this the only way to stop the distiller would be to remove
+    /// the credentials.
+    #[test]
+    fn explicit_free_overrides_a_configured_model() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.cheap_model = Some(enabled_cheap_model());
+        config.kimetsu.tier = Some(Tier::Free);
+        assert_eq!(config.tier(), Tier::Free);
+        assert!(!config.allows_model_in_pipeline());
+    }
+
+    /// Deep with nothing to run on is Free with a misleading label. Resolve it
+    /// down, and flag it so `doctor` can say so out loud.
+    #[test]
+    fn deep_without_a_model_downgrades_and_is_flagged() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.kimetsu.tier = Some(Tier::Deep);
+        assert_eq!(config.tier(), Tier::Free, "no model — nothing to run");
+        assert!(
+            config.tier_downgraded(),
+            "the discrepancy must be reportable, not silent"
+        );
+    }
+
+    /// The tier round-trips through TOML, and an absent field stays absent
+    /// (auto) rather than being written back as an explicit choice.
+    #[test]
+    fn tier_round_trips_and_auto_stays_unwritten() {
+        let config = ProjectConfig::default_for_project("test");
+        let toml = config.to_toml().expect("to_toml");
+        assert!(
+            !toml.contains("tier"),
+            "auto must not serialize a tier field; got:\n{toml}"
+        );
+
+        let mut deep = ProjectConfig::default_for_project("test");
+        deep.kimetsu.tier = Some(Tier::Deep);
+        let toml = deep.to_toml().expect("to_toml");
+        assert!(toml.contains("tier = \"deep\""), "got:\n{toml}");
+        let parsed = ProjectConfig::from_toml(&toml).expect("from_toml");
+        assert_eq!(parsed.kimetsu.tier, Some(Tier::Deep));
+    }
+
+    /// A pre-v3.0 project.toml has no `tier` field at all: it must load, and
+    /// it must land on Free rather than on a serde error.
+    #[test]
+    fn missing_tier_field_loads_cleanly() {
+        let mut written = ProjectConfig::default_for_project("legacy");
+        written.kimetsu.tier = Some(Tier::Deep);
+        let toml = written.to_toml().expect("to_toml");
+        // Strip the tier line to simulate a config written before the field existed.
+        let legacy: String = toml
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("tier ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !legacy.contains("tier ="),
+            "fixture must have no tier field"
+        );
+
+        let config = ProjectConfig::from_toml(&legacy).expect("legacy config must load");
+        assert_eq!(config.kimetsu.tier, None);
+        assert_eq!(config.tier(), Tier::Free);
+    }
 
     /// A pre-v0.8 project.toml has no `[embedder]` table. The
     /// `#[serde(default)]` on the field must keep it loading cleanly,
