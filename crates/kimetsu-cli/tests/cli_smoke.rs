@@ -399,3 +399,126 @@ fn concurrent_processes_lose_no_cites() {
     let (_, after) = first_memory(bin, &root).expect("memory after rebuild");
     assert_eq!(after, expected, "rebuild changed the use_count");
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: first-turn warm start for hosts with no session-start event
+// ---------------------------------------------------------------------------
+
+/// Run `kimetsu brain context-hook` against `root` with `payload` on stdin and
+/// return its stdout.
+///
+/// `KIMETSU_USER_BRAIN_DIR` points the per-session sidecar (and the user brain)
+/// at `cache_home` so these tests never touch the developer's real `~/.kimetsu`.
+fn run_context_hook(
+    root: &std::path::Path,
+    cache_home: &std::path::Path,
+    extra_args: &[&str],
+    payload: &str,
+) -> String {
+    let mut cmd = Command::new(kimetsu_bin());
+    cmd.args(["brain", "context-hook", "--workspace"])
+        .arg(root)
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("KIMETSU_USER_BRAIN", "0")
+        .env("KIMETSU_USER_BRAIN_DIR", cache_home);
+    let mut child = cmd.spawn().expect("spawn context-hook");
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().expect("wait context-hook");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Regression guard for the hosts Kimetsu could not speak first on.
+///
+/// Codex, Pi and OpenClaw expose only a per-turn hook — no session-start event —
+/// so the repo digest and episodic resume have to ride along with the session's
+/// first prompt. Exactly once: the block is expensive and the agent only needs
+/// orienting once per session.
+#[test]
+fn context_hook_warm_starts_once_per_session() {
+    let root = temp_project_dir("warm_first_prompt");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    // Seed a memory so the digest has something to report.
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Regenerate the schema with `cargo xtask gen` before committing",
+    )
+    .expect("add_memory");
+
+    let payload = r#"{"session_id":"warm-session-1","prompt":"investigate this failing test in the CI pipeline"}"#;
+
+    let first = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        first.contains("## Repo context"),
+        "first prompt of a session must carry the warm-start block; got: {first}"
+    );
+
+    let second = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        !second.contains("## Repo context"),
+        "warm start must not repeat on later turns of the same session; got: {second}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Claude Code has its own `SessionStart` hook, so it must NOT pass
+/// `--warm-on-first-prompt` — and without the flag the hook must stay exactly
+/// as it was, or those users would get the block twice.
+#[test]
+fn context_hook_without_the_flag_never_warm_starts() {
+    let root = temp_project_dir("warm_opt_in");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Regenerate the schema with `cargo xtask gen` before committing",
+    )
+    .expect("add_memory");
+
+    let payload = r#"{"session_id":"warm-session-2","prompt":"investigate this failing test in the CI pipeline"}"#;
+    let out = run_context_hook(&root, &cache_home, &[], payload);
+    assert!(
+        !out.contains("## Repo context"),
+        "warm start is opt-in per host; got: {out}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A prompt too short for retrieval still gets the warm start: the guard exists
+/// to skip meaningless *retrieval*, not to withhold the session's orientation.
+#[test]
+fn context_hook_warm_starts_even_on_a_short_prompt() {
+    let root = temp_project_dir("warm_short_prompt");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Fact,
+        "The broker halves budget_tokens before filling capsules",
+    )
+    .expect("add_memory");
+
+    let payload = r#"{"session_id":"warm-session-3","prompt":"hi"}"#;
+    let out = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        out.contains("## Repo context"),
+        "a short prompt must still receive the warm start; got: {out}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

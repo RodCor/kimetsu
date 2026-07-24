@@ -490,42 +490,9 @@ pub(crate) fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 /// Gated by `[broker] warm_start` (default true).
 /// Silent when no digest AND no live episode.
 pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
-    // Gate: load warm_start from config (best-effort; default ON).
-    let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
-        .ok()
-        .and_then(|paths| kimetsu_brain::project::load_config(&paths).ok())
-        .map(|cfg| cfg.broker.warm_start)
-        .unwrap_or(true);
-
-    if !warm_start_enabled {
+    let Some(additional_context) = warm_start_context(workspace) else {
         return Ok(());
-    }
-
-    // 1. Repo digest (story 1.1).
-    let digest = kimetsu_brain::digest::build_or_load_digest(workspace, false);
-
-    // 2. Episodic resume (Pass A, story 1.4).
-    let resume = kimetsu_brain::episode::render_resume_context(workspace);
-
-    // Silent when neither has content.
-    if digest.is_none() && resume.is_none() {
-        return Ok(());
-    }
-
-    // Assemble additionalContext.
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(d) = &digest {
-        parts.push(format!("## Repo context\n{d}"));
-    }
-    if let Some(r) = &resume {
-        parts.push(format!("## Your prior session\n{r}"));
-    }
-    let additional_context = parts.join("\n\n");
-
-    // ROI attribution (best-effort).
-    let digest_chars = digest.as_ref().map(|d| d.len()).unwrap_or(0);
-    let resume_chars = resume.as_ref().map(|r| r.len()).unwrap_or(0);
-    kimetsu_brain::digest::record_warmstart_served(workspace, digest_chars, resume_chars);
+    };
 
     // Emit Claude Code SessionStart additionalContext JSON.
     let output = serde_json::json!({
@@ -537,6 +504,15 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
     });
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
+}
+
+/// Assemble the warm-start block: repo digest + episodic resume.
+///
+/// Thin wrapper over [`kimetsu_brain::digest::warm_start_block`], which the
+/// MCP server shares so Cursor — no hooks, no session-start surface — gets the
+/// same block on its first `kimetsu_brain_context` call.
+pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
+    kimetsu_brain::digest::warm_start_block(workspace)
 }
 
 /// `kimetsu brain digest [--refresh]`

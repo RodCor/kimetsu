@@ -5,7 +5,9 @@ Citations, decay, dedup, conflict detection, and the analytics that prove the br
 The strongest signal is which memories the model actually used. The flow:
 
 1. The broker injects N capsules (recorded as a `context.injected` event).
-2. Mid-run, the model calls **`cite_memory`** when it leans on a memory.
+2. Mid-run, the model cites a memory it leaned on: **`cite_memory`** inside the
+   autonomous agent pipeline (`kimetsu run`), or the **`kimetsu_brain_cite`**
+   MCP tool from a host agent. Both land in the same place.
 3. At run end, one `memory.cited` event per citation lands in
    `memory_citations`.
 4. On `run.finished`, usefulness updates: **cited memories** get the strong

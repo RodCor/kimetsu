@@ -7,6 +7,66 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## Unreleased: Speak first on every host
+
+The README says Kimetsu "speaks first." An audit found that true on Claude Code,
+thin on Codex, and absent on Cursor, Pi and OpenClaw. This closes that gap and
+files the v3.0 plan behind it.
+
+### Fixed
+
+- **Pi and OpenClaw now inject anything at all.** Both generated extensions
+  spawned `kimetsu` with `stdio: "ignore"`, so the context hook read an empty
+  stdin (bailing on its minimum-prompt guard) and its output went to
+  `/dev/null`. Kimetsu was write-only on those hosts. The extensions now pipe
+  stdio, feed the hook payload in, and return the parsed context through the
+  host's own contract — Pi's `before_agent_start` message, OpenClaw's
+  `agent_turn_prepare` `prependContext`. Every failure mode stays a silent
+  no-op: missing binary, hung binary, crash, unparseable output.
+- **One source of truth for integration assets.** The Pi and OpenClaw templates
+  moved out of string literals in `bridge.rs` into
+  `crates/kimetsu-chat/assets/`, pulled in with `include_str!`. The published
+  `kimetsu-pi` npm copy is vendored from the same file by
+  `scripts/sync-pi-package.sh`, and a new CI job diffs the two. The drift this
+  prevents was real: the npm copy had timeout hardening the installed copy
+  never got, so a hung binary could stall a Pi lifecycle hook indefinitely.
+- **`digest::is_stale()` is wired up.** It was implemented and documented as
+  driving a detached rebuild, with no production caller — so a moved corpus put
+  a synchronous digest rebuild in front of the agent's first turn. The cached
+  digest is now served immediately and the rebuild spawns detached.
+
+### Added
+
+- **Warm start on every host.** `kimetsu brain context-hook
+  --warm-on-first-prompt` prepends the repo digest and episodic resume to the
+  first turn of a session, exactly once — covering Codex (which has no
+  `SessionStart` event), Pi, OpenClaw, and any future host with only a per-turn
+  hook. Claude Code does not pass the flag and keeps its `SessionStart` route,
+  so nobody receives the block twice. A short prompt still gets the warm start:
+  the length guard exists to skip meaningless retrieval, not to withhold
+  orientation.
+- **Cursor warm start over MCP.** Cursor has no hook surface at all, so the
+  first `kimetsu_brain_context` call of a session now returns a `warm_start`
+  field alongside the capsules, and the installed Cursor rule tells the agent to
+  make that call at task start. Scoped to the stdio path only — one
+  `kimetsu-remote` process fans out across many sessions.
+- **`docs/rfcs/v3-proactive-memory.md`**: the v3.0 RFC. What the audit found
+  (including where the numbers and the defaults disagree), the 2026 competitive
+  and research landscape, the Free/Deep two-tier split, and the phased plan for
+  retrieval accuracy, proactive autonomy, and memory safety.
+
+### Docs
+
+- `interfaces.md` listed `kimetsu_skill`, `cite_memory` and `expand_capsule` as
+  MCP tools. The first does not exist; the other two belong to the autonomous
+  agent pipeline, and are now documented there instead.
+- `the-broker.md` documents that capsules fill against **half** of the requested
+  `budget_tokens` — every published budget number read as double the real one.
+- `[storage] backend` no longer carries stale TODOs for `graph-lite` and
+  `graph`; both are implemented, and the doc now says what they do and notes
+  that `graph-lite` needs `kimetsu brain graph build` before it differs from
+  `flat` at all.
+
 ## v2.5.3: Close the benchmark learning loop
 
 A focused follow-up to v2.5.2. Adds the host-side path that lets a graded

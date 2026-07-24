@@ -655,11 +655,53 @@ fn parse_shared_retrieval_args(
     }
 }
 
+/// Latch for the once-per-session warm start on the stdio MCP path.
+///
+/// One `kimetsu mcp serve` process is one host session, which makes a process
+/// latch a session latch. Deliberately not consulted by the remote server: one
+/// `kimetsu-remote` process fans out across many sessions and repos.
+static WARM_START_SERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the session's warm-start block, or `None` if it has already been served
+/// (or there is nothing to serve).
+///
+/// The latch is only set once a block actually exists, so a call made against a
+/// cold brain does not burn the session's one chance at a warm start.
+fn take_session_warm_start(workspace: &Path) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    if WARM_START_SERVED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let block = kimetsu_brain::digest::warm_start_block(workspace)?;
+    if WARM_START_SERVED.swap(true, Ordering::SeqCst) {
+        return None; // lost the race — another call is already emitting it
+    }
+    Some(block)
+}
+
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    match brain_context_tool(workspace, arguments, None) {
+    let mut value = match brain_context_tool(workspace, arguments, None) {
         Ok(v) => v,
         Err(e) => brain_unavailable_json(workspace, &e),
+    };
+
+    // Hosts with a session-start hook (Claude Code) or a per-turn hook (Codex,
+    // Pi, OpenClaw) already receive the warm-start block out of band. Cursor
+    // has neither — it only speaks MCP — so the session's first context call is
+    // the one place the repo digest and episodic resume can reach it. Attached
+    // as a sibling field so the retrieval response shape stays untouched.
+    if let Some(block) = take_session_warm_start(workspace) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "warm_start".into(),
+                json!({
+                    "context": block,
+                    "how_to_use": "First context call of this session: what this repo is, and where you left off last time. Read it before planning. It is not repeated on later calls."
+                }),
+            );
+        }
     }
+    value
 }
 
 /// Candidate pool the remote reranker judges before truncating to the caller's

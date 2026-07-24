@@ -1166,6 +1166,12 @@ struct ContextHookArgs {
     /// Maximum capsules to inject. Default 2.
     #[arg(long, default_value_t = 2usize)]
     max_capsules: usize,
+    /// For hosts with no session-start event (Codex, Pi, OpenClaw): prepend the
+    /// warm-start block (repo digest + episodic resume) to the FIRST prompt of
+    /// each session. Claude Code leaves this off — it gets the same block from
+    /// `brain session-start-hook` and would otherwise receive it twice.
+    #[arg(long)]
+    warm_on_first_prompt: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,

@@ -20,9 +20,9 @@ will actually reach for:
 | `kimetsu_brain_model_list` / `_set` / `kimetsu_brain_reindex` | Inspect / switch / re-embed the embedding model |
 | `kimetsu_brain_ingest_repo` | Index repo files + manifests |
 | `kimetsu_benchmark_context` / `_record_outcome` | Task-aware playbook + outcome recording |
-| `kimetsu_bridge_*` / `kimetsu_skills_search` / `kimetsu_skill` | Skill registry, install, invoke |
-| `kimetsu_brain_cite` / `cite_memory` | Record that a memory materially helped |
-| `expand_capsule` | Expand a lazily injected capsule headline to full detail |
+| `kimetsu_bridge_*` / `kimetsu_skills_search` | Skill registry discovery, import, export, sync |
+| `kimetsu_brain_cite` | Record that a memory materially helped |
+| `kimetsu_brain_answer` | Grounded, cited answer composed from memory (local model) |
 
 Every tool returns `{"ok": true, "usage": {...}}` so the host gets guidance on
 how to use the output, not just raw data.
@@ -41,6 +41,8 @@ installers make the loop reliable by writing host-native hook config
   lexical FTS if the daemon is unreachable, so the prompt is never blocked.
   The daemon holds the ONNX models in memory and finishes with a
   cross-encoder rerank (see [Retrieval models](retrieval-models)).
+  With `--warm-on-first-prompt` the hook also prepends the warm-start block
+  (digest + resume) to the session's first turn — see below.
 - **`Stop` -> `kimetsu brain stop-hook`** prints a one-line post-turn banner:
   how many lessons were captured, or a nudge to record one after a
   non-trivial session.
@@ -49,6 +51,30 @@ installers make the loop reliable by writing host-native hook config
 
 These are plain CLI subcommands, so the same pattern works under any harness
 that can run a command on a prompt, stop, or session-end event.
+
+### Warm start, on every host
+
+The warm-start block — the ~400-token repo digest plus your episodic resume —
+is what makes the agent's first turn already know the repo. Every host gets it,
+by whichever route that host actually has:
+
+| Host | Route |
+|------|-------|
+| Claude Code | `SessionStart` -> `kimetsu brain session-start-hook` |
+| Codex, Pi, OpenClaw | per-turn hook with `--warm-on-first-prompt`: prepended to the session's first prompt, once |
+| Cursor | no hooks at all — the first `kimetsu_brain_context` call of a session returns a `warm_start` field alongside the capsules |
+
+Only one route fires per host, so the block is never delivered twice. It is
+gated by `[broker] warm_start` (default on) everywhere. A cached digest is
+served immediately even when the corpus has moved under it, and the rebuild
+runs detached, so a stale digest never puts a build in front of your first turn.
+
+Pi and OpenClaw are driven by a generated TypeScript extension rather than a
+hook file: it feeds the hook payload to the CLI on stdin and reads the injected
+context back off stdout (Pi returns it from `before_agent_start`, OpenClaw as
+`prependContext` from `agent_turn_prepare`). A missing, hung, or failing
+`kimetsu` binary is always a silent no-op — the sidecar must never break the
+host.
 
 ### Proactive recall (mid-work)
 

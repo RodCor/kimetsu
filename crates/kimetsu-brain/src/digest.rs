@@ -115,6 +115,25 @@ fn build_or_load_digest_inner(
     Ok(Some(digest_text))
 }
 
+/// Read `.kimetsu/digest.md` verbatim, without checking whether it is
+/// still current.
+///
+/// This is the warm-path counterpart to [`build_or_load_digest`]: the
+/// caller serves the cached text immediately and rebuilds off the hot
+/// path (see [`is_stale`]), instead of paying a synchronous rebuild the
+/// moment the corpus moves. Returns `None` when the brain is not
+/// initialized here or nothing has been cached yet — a cold start still
+/// has to build.
+pub fn load_cached_digest(workspace: &Path) -> Option<String> {
+    let (paths, _config, _conn) = load_project_readonly(workspace).ok()?;
+    let text = std::fs::read_to_string(paths.kimetsu_dir.join("digest.md")).ok()?;
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 // ── Staleness check (1.2) ─────────────────────────────────────────────────────
 
 /// Returns `true` when the cached digest is stale and should be rebuilt.
@@ -144,6 +163,95 @@ fn is_stale_inner(workspace: &Path) -> KimetsuResult<bool> {
     let current_hash = content_hash(&inputs);
 
     Ok(meta.input_hash != current_hash)
+}
+
+// ── Warm start ────────────────────────────────────────────────────────────────
+
+/// Assemble the warm-start block: repo digest + episodic resume.
+///
+/// This is what every host sees first — the `SessionStart` hook on Claude
+/// Code, the first prompt of a session on Codex / Pi / OpenClaw, and the first
+/// `kimetsu_brain_context` call on Cursor, which has neither hooks nor a
+/// session-start surface.
+///
+/// Returns `None` when `[broker] warm_start` is off, or when there is neither a
+/// digest nor a live episode to report.
+///
+/// The cached digest is served even when the corpus has moved under it, and the
+/// rebuild is spawned detached — a synchronous rebuild would sit in front of the
+/// agent's first turn. Only a cold brain (nothing cached yet) builds inline.
+///
+/// Records ROI attribution as a side effect, so call it only when the block is
+/// actually going to be emitted.
+pub fn warm_start_block(workspace: &Path) -> Option<String> {
+    // Gate: load warm_start from config (best-effort; default ON).
+    let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| crate::project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.warm_start)
+        .unwrap_or(true);
+    if !warm_start_enabled {
+        return None;
+    }
+
+    let digest = match load_cached_digest(workspace) {
+        Some(cached) => {
+            if is_stale(workspace) {
+                spawn_detached_refresh(workspace);
+            }
+            Some(cached)
+        }
+        None => build_or_load_digest(workspace, false),
+    };
+    let resume = crate::episode::render_resume_context(workspace);
+
+    if digest.is_none() && resume.is_none() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &digest {
+        parts.push(format!("## Repo context\n{d}"));
+    }
+    if let Some(r) = &resume {
+        parts.push(format!("## Your prior session\n{r}"));
+    }
+
+    record_warmstart_served(
+        workspace,
+        digest.as_ref().map(|d| d.len()).unwrap_or(0),
+        resume.as_ref().map(|r| r.len()).unwrap_or(0),
+    );
+
+    Some(parts.join("\n\n"))
+}
+
+/// Fire-and-forget `<current_exe> brain digest --refresh --workspace <ws>`.
+///
+/// Assumes the running executable is the kimetsu CLI, which holds for every
+/// caller of [`warm_start_block`] (the hooks and the MCP server are both the
+/// `kimetsu` binary). Embedders of this crate that are not the CLI simply get a
+/// spawn that fails and is swallowed — a stale digest, never a broken host.
+///
+/// Fully detached with null stdio, mirroring the embed daemon's spawn: an
+/// inherited stdout pipe would hold the host's hook open until its timeout.
+fn spawn_detached_refresh(workspace: &Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["brain", "digest", "--refresh", "--workspace"])
+        .arg(workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let _ = cmd.spawn();
 }
 
 // ── ROI attribution ───────────────────────────────────────────────────────────
@@ -546,6 +654,85 @@ mod tests {
             assert!(
                 !is_stale(&dir),
                 "must NOT be stale immediately after a fresh build"
+            );
+        });
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // D6b: load_cached_digest returns the cached text without rebuilding, and
+    // keeps returning it once the corpus has moved on. This is what lets the
+    // warm start serve instantly and rebuild off the hot path.
+    #[test]
+    fn load_cached_digest_serves_stale_text() {
+        let dir = tmp_workspace("cached-stale");
+        git_init_boundary(&dir);
+        user_brain::with_user_brain_disabled(|| {
+            project::init_project(&dir, true).expect("init");
+            assert!(
+                load_cached_digest(&dir).is_none(),
+                "nothing cached yet on a cold brain"
+            );
+
+            project::add_memory(
+                &dir,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "Cached digest fact",
+            )
+            .expect("add_memory");
+            let built = build_or_load_digest(&dir, true).expect("first build");
+            assert_eq!(load_cached_digest(&dir).as_deref(), Some(built.as_str()));
+
+            // Move the corpus: the cache is now stale, but still servable.
+            project::add_memory(
+                &dir,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Convention,
+                "A second memory that invalidates the digest hash",
+            )
+            .expect("add_memory");
+            assert!(is_stale(&dir), "corpus moved — cache must read as stale");
+            assert_eq!(
+                load_cached_digest(&dir).as_deref(),
+                Some(built.as_str()),
+                "stale cache is still served verbatim"
+            );
+        });
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // D6c: warm_start_block honours the [broker] warm_start gate, and produces
+    // the digest section when there is content.
+    #[test]
+    fn warm_start_block_respects_gate_and_renders_digest() {
+        let dir = tmp_workspace("warm-block");
+        git_init_boundary(&dir);
+        user_brain::with_user_brain_disabled(|| {
+            project::init_project(&dir, true).expect("init");
+            project::add_memory(
+                &dir,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Convention,
+                "Warm start block convention",
+            )
+            .expect("add_memory");
+
+            let block = warm_start_block(&dir).expect("warm start must have content");
+            assert!(
+                block.contains("## Repo context"),
+                "warm start must carry the repo digest: {block}"
+            );
+
+            // Turn the gate off; the block must disappear entirely.
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&dir).expect("paths");
+            let mut config = crate::project::load_config(&paths).expect("config");
+            config.broker.warm_start = false;
+            std::fs::write(&paths.project_toml, config.to_toml().expect("to_toml"))
+                .expect("write project.toml");
+
+            assert!(
+                warm_start_block(&dir).is_none(),
+                "[broker] warm_start = false must silence the warm start"
             );
         });
         std::fs::remove_dir_all(dir).ok();

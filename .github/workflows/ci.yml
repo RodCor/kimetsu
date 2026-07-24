@@ -119,6 +119,30 @@ jobs:
           KIMETSU_USER_BRAIN: "0"
         run: cargo test --workspace --locked --features embeddings -- --test-threads=1
 
+  integration-assets:
+    name: integration asset drift
+    runs-on: ubuntu-latest
+    # The Pi extension has two homes: the canonical template this repo embeds
+    # with include_str!, and the copy the `kimetsu-pi` npm package publishes.
+    # They drifted once already (the npm copy grew timeout hardening the
+    # installed copy never got), so diff them on every PR.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout kimetsu-pi
+        uses: actions/checkout@v4
+        with:
+          repository: RodCor/kimetsu-pi
+          path: .kimetsu-pi
+      - name: Diff the Pi extension against the published copy
+        run: |
+          diff -u crates/kimetsu-chat/assets/pi-extension.ts \
+                  .kimetsu-pi/extensions/kimetsu.ts \
+            || {
+              echo "::error::crates/kimetsu-chat/assets/pi-extension.ts and kimetsu-pi/extensions/kimetsu.ts have drifted."
+              echo "Run scripts/sync-pi-package.sh against a kimetsu-pi checkout and commit the result there."
+              exit 1
+            }
+
   audit:
     name: cargo-audit (RUSTSEC)
     runs-on: ubuntu-latest

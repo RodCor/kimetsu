@@ -54,6 +54,12 @@ pub struct SessionState {
     /// non-trivial session that recorded nothing). `0` = never cued.
     #[serde(default)]
     pub harvest_cued_unix: u64,
+    /// v3.0: unix time this session was handed the warm-start block (repo
+    /// digest + episodic resume) by the per-turn context hook. Hosts with
+    /// no session-start event get it prepended to their first prompt
+    /// instead; this flag keeps it to exactly one turn. `0` = not yet warmed.
+    #[serde(default)]
+    pub warm_started_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

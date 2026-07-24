@@ -54,9 +54,35 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         None => String::new(),
     };
 
-    // Too short to be meaningful
+    // v1.5 (Story 2.3): session-scoped cross-turn state, loaded here rather
+    // than just before rendering because the warm-start fallback below has to
+    // consult it ahead of every early return.
+    let state_path = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .map(|p| {
+            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
+            proactive_state::session_path(&cache_dir, session_id.as_deref())
+        });
+    let mut state = state_path
+        .as_deref()
+        .map(proactive_state::load)
+        .unwrap_or_default();
+
+    // v3.0: warm-start fallback for hosts with no session-start event (Codex,
+    // Pi, OpenClaw). Those harnesses only expose a per-turn hook, so the repo
+    // digest and episodic resume ride along with the session's first prompt
+    // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
+    // gets the identical block from `brain session-start-hook`.
+    let warm_start_block = if args.warm_on_first_prompt && state.warm_started_unix == 0 {
+        warm_start_context(&workspace)
+    } else {
+        None
+    };
+
+    // Too short for retrieval to mean anything — but a first turn still
+    // deserves its warm start, so hand that over before bailing.
     if prompt.len() < 10 {
-        return Ok(());
+        return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
     }
 
     let request = ContextRequest {
@@ -131,7 +157,9 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     }
 
     if bundle.skipped || bundle.capsules.is_empty() {
-        return Ok(()); // Nothing relevant — zero output
+        // Nothing relevant to retrieve — zero output, except that the
+        // warm-start block is not conditional on retrieval finding anything.
+        return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
     }
 
     // v1.5 / F3 Pass B: load broker render-flags best-effort.
@@ -149,21 +177,10 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             })
             .unwrap_or((true, true, 0.92));
 
-    // v1.5 (Story 2.3): session-scoped cross-turn dedupe.
-    // Load the proactive-state sidecar (already used by proactive hooks) to
-    // track which capsule handles were injected earlier this session.
-    // The context hook has session_id from the hook payload (Change B).
-    let state_path = kimetsu_core::paths::ProjectPaths::discover(&workspace)
-        .ok()
-        .map(|p| {
-            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
-            proactive_state::session_path(&cache_dir, session_id.as_deref())
-        });
-    let mut state = state_path
-        .as_deref()
-        .map(proactive_state::load)
-        .unwrap_or_default();
-
+    // v1.5 (Story 2.3): session-scoped cross-turn dedupe, using the
+    // proactive-state sidecar loaded above (also used by the proactive hooks)
+    // to track which capsule handles were injected earlier this session.
+    //
     // Apply soft dedupe: filter already-surfaced handles, but fall back to the
     // full set if filtering would leave nothing (a repeated top memory may still
     // be the right context). Uses the pure `dedupe_filter` function.
@@ -228,7 +245,14 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             }
         });
 
-    let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
+    let mut additional_context = String::new();
+    // v3.0: on hosts without a session-start event, the warm-start block leads
+    // — the agent needs to know the repo before it is told what to recall.
+    if let Some(block) = &warm_start_block {
+        additional_context.push_str(block);
+        additional_context.push_str("\n\n");
+    }
+    additional_context.push_str("Kimetsu brain relevant knowledge for this task:");
     for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
@@ -265,11 +289,39 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
                 state.mark_surfaced(&capsule.expansion_handle);
             }
         }
+    }
+    if warm_start_block.is_some() {
+        state.warm_started_unix = proactive_state::now_unix();
+    }
+    if session_dedupe || warm_start_block.is_some() {
         if let Some(ref path) = state_path {
             proactive_state::save(path, &state);
         }
     }
 
+    Ok(())
+}
+
+/// Emit a warm-start-only injection and mark the session warmed.
+///
+/// Used by [`brain_context_hook`]'s early returns: a short prompt, or a
+/// retrieval that found nothing, must not swallow the first-turn warm start on
+/// hosts that have no session-start event. A `None` block (not a first turn, or
+/// the host has its own session-start hook) makes this a silent no-op, which is
+/// the pre-v3.0 behaviour.
+fn flush_warm_start(
+    block: Option<String>,
+    state: &mut proactive_state::SessionState,
+    state_path: Option<&Path>,
+) -> KimetsuResult<()> {
+    let Some(block) = block else {
+        return Ok(());
+    };
+    print_user_prompt_submit_context(&block)?;
+    state.warm_started_unix = proactive_state::now_unix();
+    if let Some(path) = state_path {
+        proactive_state::save(path, state);
+    }
     Ok(())
 }
 

@@ -30,6 +30,14 @@ returns nothing rather than padding the prompt. Key knobs in `[broker]`:
 `max_capsules` (8), `budget_floor_tokens` (1500), `budget_run_cap_tokens`
 (8000).
 
+**Budgeting.** Capsules are filled greedily in score order against **half** of
+the requested `budget_tokens` — the other half is headroom for the rest of the
+bundle (repo files, manifests, the render-time framing) and for the chars/4
+token estimate being an approximation rather than a count. So a request for
+2000 tokens fills capsules up to ~1000. Overflow lands in `excluded` rather
+than being dropped silently, and `max_capsules` caps the count before the
+token check.
+
 ## Embeddings vs lean builds
 
 - **Embeddings** (the CLI default): ships fastembed + ONNX. Cosine retrieval,
@@ -47,8 +55,9 @@ returns nothing rather than padding the prompt. Key knobs in `[broker]`:
 
 ## The agent brain (proactive + cost-shrinking)
 
-For the autonomous agent pipeline, an adaptive layer sits on top of
-retrieval:
+For the autonomous agent pipeline (`kimetsu run`), an adaptive layer sits on
+top of retrieval. The tools named below (`expand_capsule`, `cite_memory`) are
+that pipeline's own tools, not part of the MCP surface a host agent sees:
 
 - **Task-kind routing.** A cheap deterministic classifier sorts each task
   into Debug / Feature / Refactor / Docs / Investigation, and a weight layer

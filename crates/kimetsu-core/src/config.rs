@@ -503,13 +503,19 @@ impl CheapModelSection {
 pub struct StorageSection {
     /// Which retrieval backend to use.
     ///
-    /// | Value         | Behaviour                                             |
-    /// |---------------|-------------------------------------------------------|
-    /// | `"flat"`      | FTS + usearch HNSW ANN (current, default)             |
-    /// | `"graph-lite"`| TODO (S5.2): graph-augmented FTS + ANN               |
-    /// | `"graph"`     | TODO (future): full graph traversal                   |
+    /// | Value         | Behaviour                                              |
+    /// |---------------|--------------------------------------------------------|
+    /// | `"flat"`      | FTS + usearch HNSW ANN (default)                       |
+    /// | `"graph-lite"`| flat, plus 2-hop BFS over `memory_edges` with hop decay |
+    /// | `"graph"`     | petgraph backend (feature `graph`; remote server only)  |
     ///
     /// Unknown values fall back to `"flat"` with a warning.
+    ///
+    /// All three are implemented in `kimetsu_brain::backend`. Note that
+    /// `graph-lite` only differs from `flat` once the edge table has
+    /// non-`supersedes` edges in it — run `kimetsu brain graph build` first,
+    /// or it degenerates to flat retrieval. The published BEAM 100K figure
+    /// (73.3%, vs 62.3% flat) was measured on `graph-lite` with edges built.
     #[serde(default = "default_storage_backend")]
     pub backend: String,
 }
