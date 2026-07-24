@@ -841,3 +841,71 @@ fn the_injection_policy_starts_as_the_legacy_rule_and_records_its_decisions() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: background maintenance
+// ---------------------------------------------------------------------------
+
+/// The gap this closes: consolidation, digest refresh, prune detection and
+/// skill graduation were all CLI commands a human had to remember to run, so
+/// on a real brain none of them ever ran.
+#[test]
+fn maintenance_runs_what_is_due_and_then_stops() {
+    let root = temp_project_dir("maintenance");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "[tags: sqlite wal] Checkpoint the WAL before copying brain.db",
+    )
+    .expect("add_memory");
+
+    let maintain = |args: &[&str]| -> String {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "maintain"])
+            .args(args)
+            .arg("--workspace")
+            .arg(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn brain maintain");
+        assert!(
+            out.status.success(),
+            "brain maintain must succeed; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // A brain that has never run upkeep has everything due.
+    let status = maintain(&["--status"]);
+    assert!(
+        status.contains("4 pass(es) due"),
+        "everything is due on a fresh brain; got: {status}"
+    );
+
+    // Running it does the work and reports per pass.
+    let ran = maintain(&[]);
+    for pass in ["reinforce", "digest", "prune", "skills"] {
+        assert!(ran.contains(pass), "{pass} should have run; got: {ran}");
+    }
+    assert!(!ran.contains('✗'), "no pass should fail here; got: {ran}");
+
+    // And immediately after, nothing is due — upkeep must not spin.
+    assert!(
+        maintain(&["--status"]).contains("nothing due"),
+        "a completed pass must not be due again immediately"
+    );
+    assert!(maintain(&[]).contains("nothing due"));
+
+    // --force ignores the schedule.
+    let forced: serde_json::Value =
+        serde_json::from_str(&maintain(&["--force", "--json"])).expect("json");
+    assert_eq!(
+        forced.as_array().map(Vec::len),
+        Some(4),
+        "--force runs every pass: {forced}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

@@ -29,6 +29,7 @@ pub mod inject_policy;
 /// F3 Flagship 3: Lifecycle & forgetting — Stories 3.1–3.4.
 pub mod lifecycle;
 pub mod lock;
+pub mod maintain;
 pub mod maintenance;
 pub mod migrate;
 pub mod packs;

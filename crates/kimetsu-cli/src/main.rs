@@ -795,6 +795,13 @@ enum BrainCommand {
     /// --train: refit from that history and write the result.
     /// --reset: delete the fitted policy, returning to the legacy rule.
     Policy(PolicyArgs),
+    /// Run the brain's background upkeep passes.
+    ///
+    /// Consolidation, query-route rebuilding, prune-candidate detection, digest
+    /// refresh and skill-candidate detection, each on its own interval. The
+    /// session hooks fire this detached when something is overdue, so it
+    /// normally runs on its own; invoke it directly to force a pass.
+    Maintain(MaintainArgs),
     /// Merge near-duplicate memories and optionally distil loose clusters.
     ///
     /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
@@ -1244,6 +1251,26 @@ struct ResumeArgs {
 }
 
 /// Args for `kimetsu brain tune`.
+/// Args for `kimetsu brain maintain`.
+#[derive(Debug, Args)]
+struct MaintainArgs {
+    /// Run every pass regardless of when it last ran.
+    #[arg(long)]
+    force: bool,
+    /// Report what is overdue without running anything.
+    #[arg(long)]
+    status: bool,
+    /// Run only these passes (comma-separated: reinforce, digest, prune, skills).
+    #[arg(long, default_value = "")]
+    only: String,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 /// Args for `kimetsu brain policy`.
 #[derive(Debug, Args)]
 struct PolicyArgs {

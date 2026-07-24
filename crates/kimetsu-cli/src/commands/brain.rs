@@ -169,6 +169,11 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
             // `[sync] dir` is configured (and `auto` not disabled). Best-effort:
             // a sync failure must never break session shutdown.
             auto_sync_at_session_end(&workspace);
+            // v3.0: the other upkeep tick. Codex, Pi and OpenClaw have no
+            // session-start event, so session end is where their brains get
+            // their maintenance — and on Claude Code it is a second chance
+            // after a long session moved the corpus.
+            spawn_maintenance_if_due(&workspace);
             Ok(())
         }
         BrainCommand::SessionStartHook(args) => {
@@ -195,6 +200,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Roi(args) => brain_roi(args),
         BrainCommand::Tune(args) => brain_tune(args),
         BrainCommand::Policy(args) => brain_policy(args),
+        BrainCommand::Maintain(args) => brain_maintain(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
@@ -491,6 +497,12 @@ pub(crate) fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 /// Gated by `[broker] warm_start` (default true).
 /// Silent when no digest AND no live episode.
 pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
+    // v3.0: session start is the natural upkeep tick — the agent is about to
+    // work, so anything overdue should run alongside rather than in front of
+    // it. Detached, so this returns immediately. Before the warm-start guard
+    // below: a brain with nothing to say still needs its upkeep.
+    spawn_maintenance_if_due(workspace);
+
     let Some(additional_context) = warm_start_context(workspace) else {
         return Ok(());
     };
@@ -514,6 +526,131 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
 /// same block on its first `kimetsu_brain_context` call.
 pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
     kimetsu_brain::digest::warm_start_block(workspace)
+}
+
+/// `kimetsu brain maintain [--force] [--status] [--only ...] [--json]`
+///
+/// The brain's upkeep, on a schedule instead of on a human remembering. Fired
+/// detached by the session hooks when a pass is overdue; see
+/// [`kimetsu_brain::maintain`] for why this is not a resident daemon.
+pub(crate) fn brain_maintain(args: MaintainArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::maintain::{self, Pass};
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+    let now = maintain::now_unix();
+    let mut state = maintain::load_state(&paths.kimetsu_dir);
+
+    let selected: Vec<Pass> = if args.only.trim().is_empty() {
+        if args.force {
+            Pass::ALL.to_vec()
+        } else {
+            maintain::due_passes(&state, now)
+        }
+    } else {
+        let mut chosen = Vec::new();
+        for name in args.only.split(',').filter(|s| !s.trim().is_empty()) {
+            chosen.push(name.parse::<Pass>()?);
+        }
+        chosen
+    };
+
+    if args.status {
+        if args.json {
+            let passes: Vec<serde_json::Value> = Pass::ALL
+                .into_iter()
+                .map(|pass| {
+                    serde_json::json!({
+                        "pass": pass.as_str(),
+                        "interval_secs": pass.interval_secs(),
+                        "last_run_unix": state.last_run(pass),
+                        "due": selected.contains(&pass),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&passes)?);
+        } else if selected.is_empty() {
+            println!("Maintenance: nothing due.");
+        } else {
+            println!(
+                "Maintenance: {} pass(es) due — {}",
+                selected.len(),
+                selected
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(());
+    }
+
+    if selected.is_empty() {
+        if args.json {
+            println!("[]");
+        } else {
+            println!("Maintenance: nothing due.");
+        }
+        return Ok(());
+    }
+
+    let outcomes = maintain::run_passes(&workspace, &selected);
+    for (pass, outcome) in selected.iter().zip(&outcomes) {
+        // Only a pass that succeeded counts as having run: a failed pass should
+        // be retried on the next tick, not silently skipped for its interval.
+        if outcome.ok {
+            state.mark_ran(*pass, now);
+        }
+    }
+    // Best-effort: failing to persist the schedule means the next tick repeats
+    // the work, which is wasteful but harmless.
+    let _ = maintain::save_state(&paths.kimetsu_dir, &state);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    } else {
+        for outcome in &outcomes {
+            let mark = if outcome.ok { "✓" } else { "✗" };
+            println!("{mark} {:<10} {}", outcome.pass, outcome.detail);
+        }
+    }
+    Ok(())
+}
+
+/// Fire `kimetsu brain maintain` detached when a pass is overdue.
+///
+/// Called from the session hooks. Fully detached with null stdio, mirroring the
+/// embed daemon and the digest refresh: an inherited stdout pipe would hold the
+/// host's hook open until its timeout, which is exactly the failure this design
+/// exists to avoid.
+pub(crate) fn spawn_maintenance_if_due(workspace: &Path) {
+    use kimetsu_brain::maintain;
+
+    let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(workspace) else {
+        return;
+    };
+    let state = maintain::load_state(&paths.kimetsu_dir);
+    if maintain::due_passes(&state, maintain::now_unix()).is_empty() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["brain", "maintain", "--workspace"])
+        .arg(workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let _ = cmd.spawn();
 }
 
 /// `kimetsu brain policy [--train] [--reset] [--json]`
