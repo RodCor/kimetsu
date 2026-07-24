@@ -92,6 +92,43 @@ survivor keeps its id, members get `superseded_by`, citations reassign.
 prints the plan. `kimetsu brain triage` walks low-usefulness, long-unused
 memories interactively (`--prune-all --yes` for batch).
 
+### Trust and audit
+
+A poisoned memory is not a prompt injection. Prompt injection is session-scoped
+and resets; a memory written into the brain persists and influences every
+future session until someone notices. MINJA reports >95% injection success
+against memory-backed agents through ordinary, unprivileged interaction.
+
+Kimetsu's exposure is narrower than a hosted service's — the brain is a local
+file — but it grows with exactly the features that make the product good:
+`brain import` from a URL, `brain sync`, and Remote's shared org brain. So
+retrieval discounts a memory by where it came from:
+
+| origin | multiplier (uncorroborated) |
+|--------|------------------------------|
+| local, derived | 1.00 |
+| distilled (model-written) | 0.95 |
+| remote / synced | 0.90 |
+| pack (imported) | 0.85 |
+
+**Corroboration erases the discount entirely.** Once a memory has been cited in
+a successful run on this machine — which is exactly what `last_useful_at`
+records — it has been tested here, and where it was written stops being the
+most informative thing about it. Otherwise an imported pack, whose whole point
+is to share knowledge, would stay second-class forever.
+
+Trust is a weight, never a gate: a bad import must not be able to silently
+delete your working knowledge. Memories written before provenance existed read
+as local, so upgrading does not make an existing brain untrusted overnight.
+
+`kimetsu brain audit` groups the active corpus by origin, shows how much of it
+has never been corroborated, and flags write bursts — clusters that arrived
+faster than anyone types, which is the shape both a bulk import and induced
+poisoning leave. Read-only on purpose: an automated purge keyed on that
+heuristic would delete a legitimate import.
+
+---
+
 ### Self-tuning
 
 `kimetsu brain tune` sweeps the retrieval floors against eval cases built from

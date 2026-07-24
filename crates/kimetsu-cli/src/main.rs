@@ -802,6 +802,14 @@ enum BrainCommand {
     /// session hooks fire this detached when something is overdue, so it
     /// normally runs on its own; invoke it directly to force a pass.
     Maintain(MaintainArgs),
+    /// Audit the corpus by origin, and flag suspicious write bursts.
+    ///
+    /// A poisoned memory persists across every future session, unlike a prompt
+    /// injection that resets. This groups the active corpus by where each
+    /// memory came from, shows how much of it has never been corroborated by a
+    /// successful run here, and flags clusters of writes that arrived too fast
+    /// to be someone typing. Read-only: it reports, you decide.
+    Audit(AuditArgs),
     /// Merge near-duplicate memories and optionally distil loose clusters.
     ///
     /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
@@ -1251,6 +1259,17 @@ struct ResumeArgs {
 }
 
 /// Args for `kimetsu brain tune`.
+/// Args for `kimetsu brain audit`.
+#[derive(Debug, Args)]
+struct AuditArgs {
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 /// Args for `kimetsu brain maintain`.
 #[derive(Debug, Args)]
 struct MaintainArgs {

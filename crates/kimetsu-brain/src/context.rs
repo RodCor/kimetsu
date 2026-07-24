@@ -920,7 +920,7 @@ fn memory_ann_candidates(
     let sql = format!(
         "SELECT memory_id, scope, kind, text, confidence, created_at,
                 use_count, usefulness_score, embedding, embedding_model,
-                last_useful_at
+                last_useful_at, provenance_snapshot_json
          FROM   memories
          WHERE  invalidated_at IS NULL
            AND  superseded_by IS NULL
@@ -948,6 +948,7 @@ fn memory_ann_candidates(
             row.get::<_, Option<Vec<u8>>>(8)?,
             row.get::<_, Option<String>>(9)?,
             row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
 
@@ -965,6 +966,7 @@ fn memory_ann_candidates(
             embedding,
             embedding_model,
             last_useful_at,
+            provenance_snapshot,
         ) = row?;
         let (cosine, row_vec) =
             compute_cosine_and_vec(Some(qe), embedding.as_deref(), embedding_model.as_deref());
@@ -979,6 +981,7 @@ fn memory_ann_candidates(
             use_count,
             usefulness_score,
             last_useful_at,
+            provenance_snapshot,
             half_life_days,
             None, // no raw FTS relevance override — cosine drives ranking
             cosine,
@@ -1091,7 +1094,7 @@ fn latest_memory_candidates(
         "
         SELECT memory_id, scope, kind, text, confidence, created_at,
                use_count, usefulness_score, embedding, embedding_model,
-               last_useful_at
+               last_useful_at, provenance_snapshot_json
         FROM memories
         WHERE invalidated_at IS NULL
           AND superseded_by IS NULL
@@ -1114,6 +1117,7 @@ fn latest_memory_candidates(
             row.get::<_, Option<Vec<u8>>>(8)?,
             row.get::<_, Option<String>>(9)?,
             row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
 
@@ -1131,6 +1135,7 @@ fn latest_memory_candidates(
             embedding,
             embedding_model,
             last_useful_at,
+            provenance_snapshot,
         ) = row?;
         let (cosine, row_vec) = compute_cosine_and_vec(
             query_embedding,
@@ -1148,6 +1153,7 @@ fn latest_memory_candidates(
             use_count,
             usefulness_score,
             last_useful_at,
+            provenance_snapshot,
             half_life_days,
             None,
             cosine,
@@ -1171,7 +1177,8 @@ fn memory_fts_candidates(
         "
         SELECT m.memory_id, m.scope, m.kind, m.text, m.confidence, m.created_at,
                m.use_count, m.usefulness_score, bm25(memories_fts) AS rank,
-               m.embedding, m.embedding_model, m.last_useful_at
+               m.embedding, m.embedding_model, m.last_useful_at,
+               m.provenance_snapshot_json
         FROM memories_fts
         JOIN memories m
           ON m.memory_id = memories_fts.memory_id
@@ -1198,6 +1205,7 @@ fn memory_fts_candidates(
             row.get::<_, Option<Vec<u8>>>(9)?,
             row.get::<_, Option<String>>(10)?,
             row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<String>>(12)?,
         ))
     })?;
 
@@ -1216,6 +1224,7 @@ fn memory_fts_candidates(
             embedding,
             embedding_model,
             last_useful_at,
+            provenance_snapshot,
         ) = row?;
         let fts_relevance = (-rank as f32).max(0.0);
         let (cosine, row_vec) = compute_cosine_and_vec(
@@ -1234,6 +1243,7 @@ fn memory_fts_candidates(
             use_count,
             usefulness_score,
             last_useful_at,
+            provenance_snapshot,
             half_life_days,
             Some(fts_relevance),
             cosine,
@@ -1308,6 +1318,9 @@ fn memory_row_to_candidate(
     use_count: i64,
     usefulness_score: f64,
     last_useful_at: Option<String>,
+    // v3.0: the memory's stored provenance snapshot, classified into a trust
+    // multiplier. See `crate::trust`.
+    provenance_snapshot: Option<String>,
     half_life_days: f32,
     raw_relevance_override: Option<f32>,
     cosine_score: Option<f32>,
@@ -1359,8 +1372,22 @@ fn memory_row_to_candidate(
     let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
     let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
     let biased_relevance = apply_usefulness_boost(raw_relevance, multiplier);
+
+    // v3.0: discount by origin, unless the memory has proven itself here.
+    //
+    // `last_useful_at` is set only on a citation in a *successful* run, so its
+    // presence is exactly "this has been tested on this machine" — at which
+    // point where it was written stops being the most informative thing about
+    // it, whatever that was. Applied after the usefulness boost so it is the
+    // last word: a memory of unknown origin cannot boost its way past the
+    // discount, but a corroborated one carries none.
+    let provenance =
+        crate::trust::Provenance::from_snapshot(provenance_snapshot.as_deref().unwrap_or("{}"));
+    let trusted_relevance =
+        biased_relevance * crate::trust::trust_multiplier(provenance, last_useful_at.is_some());
+
     Some(Candidate {
-        raw_relevance: biased_relevance,
+        raw_relevance: trusted_relevance,
         embedding: row_embedding,
         cosine: cosine_score,
         capsule: ContextCapsule {

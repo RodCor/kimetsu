@@ -201,6 +201,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Tune(args) => brain_tune(args),
         BrainCommand::Policy(args) => brain_policy(args),
         BrainCommand::Maintain(args) => brain_maintain(args),
+        BrainCommand::Audit(args) => brain_audit(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
@@ -526,6 +527,71 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
 /// same block on its first `kimetsu_brain_context` call.
 pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
     kimetsu_brain::digest::warm_start_block(workspace)
+}
+
+/// `kimetsu brain audit [--json]`
+///
+/// Where the corpus came from, and how much of it nobody has vetted.
+///
+/// Deliberately read-only. An automated purge keyed on "many writes in one
+/// minute" would delete a legitimate bulk import — a worse outcome than the
+/// attack it guards against — so this reports and a human decides.
+pub(crate) fn brain_audit(args: AuditArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (_paths, _config, conn) = project::load_project_readonly(&workspace)?;
+    let report = kimetsu_brain::trust::audit(&conn)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("Corpus: {} active memories", report.total);
+    if report.groups.is_empty() {
+        return Ok(());
+    }
+    println!();
+    println!(
+        "{:<12} {:>8} {:>14} {:>9}",
+        "origin", "total", "corroborated", "unvetted"
+    );
+    for group in &report.groups {
+        println!(
+            "{:<12} {:>8} {:>14} {:>9}",
+            group.provenance, group.total, group.corroborated, group.unvetted
+        );
+    }
+
+    let unvetted: usize = report.groups.iter().map(|g| g.unvetted).sum();
+    if unvetted > 0 {
+        println!();
+        println!(
+            "{unvetted} memor{} of external origin {} never been cited in a successful run \
+             here, so {} still carrying an origin discount in retrieval. Review with \
+             `kimetsu brain memory list`.",
+            if unvetted == 1 { "y" } else { "ies" },
+            if unvetted == 1 { "has" } else { "have" },
+            if unvetted == 1 { "it is" } else { "they are" },
+        );
+    }
+
+    if !report.bursts.is_empty() {
+        println!();
+        println!(
+            "Write bursts (>= {} in one minute):",
+            kimetsu_brain::trust::BURST_THRESHOLD
+        );
+        for burst in &report.bursts {
+            println!("  {}  {} writes", burst.minute, burst.writes);
+        }
+        println!(
+            "A burst is the shape a bulk import leaves — and also the shape induced \
+             poisoning leaves. Worth confirming you recognise each one."
+        );
+    }
+    Ok(())
 }
 
 /// `kimetsu brain maintain [--force] [--status] [--only ...] [--json]`
