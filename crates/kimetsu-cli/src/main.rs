@@ -12,6 +12,7 @@ mod proactive_state;
 mod process;
 mod remote_client;
 mod skill_synth;
+mod tool_outcome;
 mod update;
 
 use clap::{Args, Parser, Subcommand};

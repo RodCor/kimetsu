@@ -84,8 +84,13 @@ fetching it. Both match only Bash commands and never block:
 
 - **`PreToolUse` -> `kimetsu brain pretool-hook`**: if the command strongly
   matches a stored `failure_pattern` or `convention`, warn first.
-- **`PostToolUse` -> `kimetsu brain posttool-hook`**: when the output looks
-  like a failure, surface a matching fix.
+- **`PostToolUse` -> `kimetsu brain posttool-hook`**: when a command actually
+  failed, surface a matching fix. "Actually failed" is decided by the strongest
+  evidence available — the exit code when the harness reports one, else a
+  toolchain summary line (cargo, pytest, jest/vitest, go test, tsc, npm, make),
+  else a substring scan that an explicit `0 failed` / `test result: ok` can
+  veto. A passing test suite is not a failure just because its summary line
+  contains the word "failed".
 
 Discipline keeps this near-zero-cost: lexical-FTS-only retrieval, a high
 score floor (0.45; 0.35 for a repeated failing command), one capsule max,

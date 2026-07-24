@@ -772,6 +772,9 @@ pub(crate) struct HookToolInput {
     tool_name: Option<String>,
     command: Option<String>,
     tool_response: Option<String>,
+    /// v3.0: the tool's exit code when the harness reports one. Authoritative
+    /// for failure detection — see [`crate::tool_outcome`].
+    exit_code: Option<i64>,
     /// F3 Pass B (3.5): file path from `tool_input.file_path` (ReadFile,
     /// EditFile, etc.). Absent for Bash and other non-file tools. Used by
     /// the proactive pre-fetch path when `broker.proactive_prefetch = true`
@@ -809,12 +812,23 @@ pub(crate) fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         Some(serde_json::Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
     };
+    // v3.0: an exit code, when the harness reports one, settles the
+    // did-it-fail question outright. Harnesses spell it differently and may
+    // nest it under `tool_response`, so check the spellings we have seen.
+    let exit_code = ["exit_code", "exitCode", "returncode", "status"]
+        .iter()
+        .find_map(|key| {
+            v.get(key)
+                .or_else(|| v.get("tool_response").and_then(|tr| tr.get(key)))
+                .and_then(serde_json::Value::as_i64)
+        });
     HookToolInput {
         session_id: str_field("session_id"),
         tool_name: str_field("tool_name"),
         command,
         tool_response,
         tool_file_path,
+        exit_code,
     }
 }
 
@@ -890,7 +904,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
     // moment). Cue the agent (throttled) to harvest the lesson, then exit.
     if matches!(event, ProactiveEvent::PostTool) {
         let resp = hook.tool_response.as_deref().unwrap_or("");
-        if !proactive_state::looks_like_failure(resp) {
+        if !crate::tool_outcome::classify(resp, hook.exit_code).failed {
             let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(""));
             if auto_harvest
                 && !norm.is_empty()
@@ -954,14 +968,24 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         }
         ProactiveEvent::PostTool => {
             let resp = hook.tool_response.as_deref().unwrap_or("");
-            if !proactive_state::looks_like_failure(resp) {
+            // v3.0: exit code > toolchain parser > substring scan. The old
+            // ten-word scan fired on every passing test suite, because
+            // "0 failed" contains "failed".
+            let outcome = crate::tool_outcome::classify(resp, hook.exit_code);
+            if !outcome.failed {
                 return Ok(()); // only react to failures
             }
             let cmd = hook.command.as_deref().unwrap_or("");
+            // A toolchain parser extracts the actual diagnostic, which is a far
+            // better retrieval query than the first line containing "error".
+            let query = match outcome.signature.as_deref() {
+                Some(sig) => format!("{sig} {cmd}"),
+                None => format!("{resp} {cmd}"),
+            };
             (
-                format!("{resp} {cmd}"),
+                query,
                 &["failure_pattern", "command", "convention"],
-                proactive_state::error_signature(resp),
+                outcome.signature,
             )
         }
     };
