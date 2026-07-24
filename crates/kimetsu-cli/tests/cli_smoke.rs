@@ -706,3 +706,138 @@ fn fusion_mode_is_wired_and_is_a_no_op_on_the_lean_path() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: proactive failure detection + the injection policy
+// ---------------------------------------------------------------------------
+
+/// Run `kimetsu brain posttool-hook` with a PostToolUse payload and return
+/// whatever it printed.
+fn run_posttool_hook(
+    root: &std::path::Path,
+    cache_home: &std::path::Path,
+    session: &str,
+    command: &str,
+    tool_response: &str,
+) -> String {
+    let payload = serde_json::json!({
+        "session_id": session,
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_response": tool_response,
+    })
+    .to_string();
+
+    let mut child = Command::new(kimetsu_bin())
+        .args(["brain", "posttool-hook", "--workspace"])
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("KIMETSU_USER_BRAIN", "0")
+        .env("KIMETSU_USER_BRAIN_DIR", cache_home)
+        .spawn()
+        .expect("spawn posttool-hook");
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().expect("wait posttool-hook");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn seeded_proactive_project(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = temp_project_dir(label);
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::FailurePattern,
+        "cargo test needs --test-threads=1; the brain tests share on-disk state",
+    )
+    .expect("add_memory");
+    (root, cache_home)
+}
+
+/// A real compile error surfaces the matching lesson.
+#[test]
+fn a_real_failure_surfaces_a_matching_memory() {
+    let (root, cache_home) = seeded_proactive_project("proactive_real_failure");
+    let out = run_posttool_hook(
+        &root,
+        &cache_home,
+        "s1",
+        "cargo test",
+        "error[E0433]: failed to resolve: use of undeclared crate `foo`",
+    );
+    assert!(
+        out.contains("additionalContext"),
+        "a real failure should surface the lesson; got: {out:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The regression this slice exists for: a fully passing test run contains the
+/// word "failed" on its summary line and used to trigger an interruption.
+#[test]
+fn a_passing_test_run_does_not_trigger_a_proactive_interruption() {
+    let (root, cache_home) = seeded_proactive_project("proactive_passing_run");
+    let out = run_posttool_hook(
+        &root,
+        &cache_home,
+        "s2",
+        "cargo test",
+        "running 517 tests\n\ntest result: ok. 517 passed; 0 failed; 1 ignored",
+    );
+    assert!(
+        out.trim().is_empty(),
+        "a passing test run is not a failure; got: {out:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An untrained brain must report — and behave as — the legacy threshold rule.
+/// This is the upgrade-safety property: nothing changes until there is data.
+#[test]
+fn the_injection_policy_starts_as_the_legacy_rule_and_records_its_decisions() {
+    let (root, cache_home) = seeded_proactive_project("policy_status");
+
+    let status = |root: &std::path::Path| -> serde_json::Value {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "policy", "--json", "--workspace"])
+            .arg(root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+            .output()
+            .expect("spawn brain policy");
+        serde_json::from_slice(&out.stdout).unwrap_or_default()
+    };
+
+    let before = status(&root);
+    assert_eq!(before["trained"], false, "got: {before}");
+    assert_eq!(before["labelled_examples"], 0);
+    assert!(
+        (before["weights"]["score"].as_f64().unwrap_or(0.0) - 20.0).abs() < 1e-6,
+        "the prior must be the pinned legacy boundary; got: {before}"
+    );
+
+    run_posttool_hook(
+        &root,
+        &cache_home,
+        "s3",
+        "cargo test",
+        "error[E0433]: failed to resolve: use of undeclared crate `foo`",
+    );
+
+    let after = status(&root);
+    assert!(
+        after["labelled_examples"].as_u64().unwrap_or(0) >= 1,
+        "an injection decision must be recorded as training data; got: {after}"
+    );
+    assert_eq!(
+        after["trained"], false,
+        "one example is nowhere near enough to retrain"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

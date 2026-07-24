@@ -784,6 +784,17 @@ enum BrainCommand {
     /// --apply: write the winning config to project.toml (dry-run by default).
     /// --revert: restore the previous tune-history entry.
     Tune(TuneArgs),
+    /// Inspect or retrain the proactive-injection policy.
+    ///
+    /// The policy decides whether a mid-task recall is worth interrupting for.
+    /// Untrained, it is exactly the legacy fixed threshold; trained, it has
+    /// learned from which past injections the agent went on to cite.
+    ///
+    /// --status (default): print the weights and how the fit compares to the
+    /// legacy rule on your own injection history.
+    /// --train: refit from that history and write the result.
+    /// --reset: delete the fitted policy, returning to the legacy rule.
+    Policy(PolicyArgs),
     /// Merge near-duplicate memories and optionally distil loose clusters.
     ///
     /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
@@ -1233,6 +1244,23 @@ struct ResumeArgs {
 }
 
 /// Args for `kimetsu brain tune`.
+/// Args for `kimetsu brain policy`.
+#[derive(Debug, Args)]
+struct PolicyArgs {
+    /// Refit the policy from recorded injection outcomes and write it.
+    #[arg(long)]
+    train: bool,
+    /// Delete the fitted policy, returning to the legacy threshold rule.
+    #[arg(long)]
+    reset: bool,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct TuneArgs {
     /// Show personal eval-set statistics without running the sweep.

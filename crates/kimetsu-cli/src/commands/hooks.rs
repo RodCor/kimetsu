@@ -8,6 +8,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use kimetsu_brain::inject_policy;
 use kimetsu_brain::project;
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
@@ -938,6 +939,9 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
     // PreToolUse behaviour is identical to before this flag existed. The same
     // floors (min_score, refractory, dedupe) gate the result — this is strictly
     // additive. Default-on graduation waits for regret data (Epic S2).
+    // How strong the evidence of failure was, as a policy feature. PreToolUse
+    // is a prediction rather than an observation, so it carries none.
+    let mut evidence = 0.0f32;
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
         ProactiveEvent::PreTool => {
             // F3 Pass B (3.5): build the PreToolUse query from command and/or
@@ -982,6 +986,11 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
                 Some(sig) => format!("{sig} {cmd}"),
                 None => format!("{resp} {cmd}"),
             };
+            evidence = match outcome.evidence {
+                crate::tool_outcome::Evidence::Heuristic => 0.0,
+                crate::tool_outcome::Evidence::Toolchain => 0.5,
+                crate::tool_outcome::Evidence::ExitCode => 1.0,
+            };
             (
                 query,
                 &["failure_pattern", "command", "convention"],
@@ -1003,17 +1012,22 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         return Ok(());
     }
 
-    let min_score = if loop_mode {
-        args.loop_min_score
-    } else {
-        args.min_score
-    };
+    // v3.0: retrieve down to a permissive recall floor and let the injection
+    // policy make the call, instead of hard-coding the threshold into
+    // retrieval. The floor still abstains on obvious noise, so the cheap path
+    // stays cheap; what changes is that the *decision* is now learned rather
+    // than a constant. The CLI flags remain the floor's lower bound so an
+    // operator who raises them still gets a stricter hook.
+    let recall_floor = args
+        .min_score
+        .min(args.loop_min_score)
+        .min(inject_policy::POLICY_RECALL_FLOOR);
 
     let request = ContextRequest {
         stage: "localization".to_string(),
         query,
         budget_tokens: 600,
-        min_score,
+        min_score: recall_floor,
         max_capsules: args.max_capsules.max(1),
         kinds: kinds.iter().map(|k| k.to_string()).collect(),
         ..Default::default()
@@ -1037,6 +1051,46 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         proactive_state::save(&state_path, &state);
         return Ok(());
     };
+
+    // Is this worth interrupting for? An untrained brain answers exactly as
+    // the old fixed threshold did; a trained one has learned from which of its
+    // past injections the agent actually went on to cite.
+    let features = inject_policy::Features {
+        score: capsule.score,
+        loop_mode: if loop_mode { 1.0 } else { 0.0 },
+        is_failure_pattern: if capsule.summary.contains("failure_pattern") {
+            1.0
+        } else {
+            0.0
+        },
+        novelty: if state.injection_count() == 0 {
+            1.0
+        } else {
+            1.0 / (1.0 + state.injection_count() as f32)
+        },
+        repeat_count: (seen_count.min(5) as f32) / 5.0,
+        recovery: state.recovery_fraction(now, args.refractory_secs),
+        evidence,
+    };
+    let policy = inject_policy::load(&paths.kimetsu_dir);
+    let should_inject = policy.should_inject(&features);
+
+    // Record the decision either way: a suppressed injection is as much a
+    // training sample as one that fired, provided it is labelled as such.
+    inject_policy::record_injection(
+        &workspace,
+        capsule
+            .expansion_handle
+            .strip_prefix("memory:")
+            .unwrap_or(&capsule.expansion_handle),
+        &features,
+        should_inject,
+    );
+
+    if !should_inject {
+        proactive_state::save(&state_path, &state);
+        return Ok(());
+    }
 
     // v1.5 (Story 2.1): render-time compression for the proactive hook.
     // Runs AFTER retrieval — ranking and stored text are unaffected.

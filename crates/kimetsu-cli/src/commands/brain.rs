@@ -194,6 +194,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Bench(args) => brain_bench(args),
         BrainCommand::Roi(args) => brain_roi(args),
         BrainCommand::Tune(args) => brain_tune(args),
+        BrainCommand::Policy(args) => brain_policy(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
@@ -513,6 +514,128 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
 /// same block on its first `kimetsu_brain_context` call.
 pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
     kimetsu_brain::digest::warm_start_block(workspace)
+}
+
+/// `kimetsu brain policy [--train] [--reset] [--json]`
+///
+/// The proactive-injection policy decides whether a mid-task recall is worth
+/// interrupting for. This is the surface that makes it inspectable: a linear
+/// model whose weights you can read is the reason it is a linear model.
+pub(crate) fn brain_policy(args: PolicyArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::inject_policy;
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+
+    if args.reset {
+        inject_policy::reset(&paths.kimetsu_dir)?;
+        println!("Injection policy reset to the legacy threshold rule.");
+        return Ok(());
+    }
+
+    let (_paths, _config, conn) = project::load_project_readonly(&workspace)?;
+    let examples = inject_policy::collect_examples(&conn).unwrap_or_default();
+    let current = inject_policy::load(&paths.kimetsu_dir);
+
+    let policy = if args.train {
+        let fitted = inject_policy::fit(&examples);
+        if fitted.is_prior() {
+            println!(
+                "Not enough signal to train: {} labelled injection{} \
+                 (need {}, with both outcomes present). Keeping the legacy rule.",
+                examples.len(),
+                if examples.len() == 1 { "" } else { "s" },
+                inject_policy::MIN_TRAINING_EXAMPLES
+            );
+            return Ok(());
+        }
+        let stamped = kimetsu_brain::inject_policy::Policy {
+            trained_at: Some(
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            ..fitted
+        };
+        inject_policy::save(&paths.kimetsu_dir, &stamped)?;
+        stamped
+    } else {
+        current
+    };
+
+    let prior = inject_policy::Policy::prior();
+    let policy_accuracy = inject_policy::accuracy(&policy, &examples);
+    let prior_accuracy = inject_policy::accuracy(&prior, &examples);
+
+    if args.json {
+        let weights: serde_json::Map<String, serde_json::Value> = inject_policy::Features::NAMES
+            .iter()
+            .zip(&policy.weights)
+            .map(|(name, w)| (name.to_string(), serde_json::json!(w)))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "trained": !policy.is_prior(),
+                "trained_on": policy.trained_on,
+                "trained_at": policy.trained_at,
+                "bias": policy.bias,
+                "weights": weights,
+                "labelled_examples": examples.len(),
+                "useful_examples": examples.iter().filter(|e| e.useful).count(),
+                "accuracy": policy_accuracy,
+                "legacy_rule_accuracy": prior_accuracy,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if policy.is_prior() {
+        println!(
+            "Injection policy: the legacy threshold rule (inject at score >= {:.2}, \
+             {:.2} when looping).",
+            inject_policy::LEGACY_MIN_SCORE,
+            inject_policy::LEGACY_LOOP_MIN_SCORE
+        );
+    } else {
+        println!(
+            "Injection policy: trained on {} injection{}{}.",
+            policy.trained_on,
+            if policy.trained_on == 1 { "" } else { "s" },
+            policy
+                .trained_at
+                .as_deref()
+                .map(|ts| format!(" at {ts}"))
+                .unwrap_or_default()
+        );
+    }
+    println!("weights:");
+    for (name, weight) in inject_policy::Features::NAMES.iter().zip(&policy.weights) {
+        println!("  {name:<20} {weight:>8.3}");
+    }
+    println!("  {:<20} {:>8.3}", "(bias)", policy.bias);
+
+    let useful = examples.iter().filter(|e| e.useful).count();
+    println!(
+        "history: {} labelled injection{} ({} cited, {} unused)",
+        examples.len(),
+        if examples.len() == 1 { "" } else { "s" },
+        useful,
+        examples.len() - useful
+    );
+    if !examples.is_empty() {
+        println!(
+            "accuracy on that history: {:.1}% (legacy rule: {:.1}%)",
+            policy_accuracy * 100.0,
+            prior_accuracy * 100.0
+        );
+    }
+    if policy.is_prior() && examples.len() >= inject_policy::MIN_TRAINING_EXAMPLES {
+        println!("hint: run `kimetsu brain policy --train` to fit from this history");
+    }
+    Ok(())
 }
 
 /// `kimetsu brain digest [--refresh]`

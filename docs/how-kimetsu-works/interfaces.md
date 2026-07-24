@@ -92,11 +92,25 @@ fetching it. Both match only Bash commands and never block:
   veto. A passing test suite is not a failure just because its summary line
   contains the word "failed".
 
-Discipline keeps this near-zero-cost: lexical-FTS-only retrieval, a high
-score floor (0.45; 0.35 for a repeated failing command), one capsule max,
-per-session dedup, and a refractory window between injections. When nothing
-clears the bar, the hook prints nothing. Per-session state lives outside the
-repo under `~/.kimetsu/cache/` and is GC'd after 7 days.
+Discipline keeps this near-zero-cost: lexical-FTS-only retrieval, one capsule
+max, per-session dedup, and a refractory window between injections. When
+nothing clears the bar, the hook prints nothing. Per-session state lives
+outside the repo under `~/.kimetsu/cache/` and is GC'd after 7 days.
+
+**Whether to speak is a learned decision.** The score threshold used to be a
+constant (0.45, or 0.35 when the agent was visibly looping) that applied to
+every brain and never moved. It is now a small logistic policy over the score,
+loop mode, capsule kind, how much has already been injected this session, how
+long since the last injection, how often this command has already failed, and
+how strong the evidence of failure was.
+
+Its prior is pinned to *exactly* the old thresholds, with every other weight at
+zero — so an untrained brain behaves precisely as it did before, and there is no
+cold-start regression to trade against the eventual gain. Each decision is
+recorded with its features, and labelled by whether the agent went on to cite
+the memory it was handed. `kimetsu brain policy` prints the weights and how the
+fit compares to the legacy rule on your own history; `--train` refits;
+`--reset` returns to the constant. Model-free, so it runs on the Free tier.
 
 Proactive hooks install by default; pass `--no-proactive` to skip them.
 

@@ -60,6 +60,11 @@ pub struct SessionState {
     /// instead; this flag keeps it to exactly one turn. `0` = not yet warmed.
     #[serde(default)]
     pub warm_started_unix: u64,
+    /// v3.0: how many proactive injections this session has already made.
+    /// Feeds the injection policy's novelty feature — the tenth interruption
+    /// is worth less than the first.
+    #[serde(default)]
+    pub injections: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +241,26 @@ impl SessionState {
 
     pub fn record_injection(&mut self, now: u64) {
         self.last_injection_unix = now;
+        self.injections = self.injections.saturating_add(1);
+    }
+
+    /// v3.0: how many proactive injections this session has already made.
+    pub fn injection_count(&self) -> u32 {
+        self.injections
+    }
+
+    /// v3.0: how far past the refractory window we are, in `[0, 1]`.
+    ///
+    /// 0 immediately after an injection, 1 once well clear of it. A feature
+    /// rather than a gate: the refractory check is still a hard rule, but the
+    /// policy can learn that an injection *just* past the window is worth less
+    /// than one after a long quiet stretch.
+    pub fn recovery_fraction(&self, now: u64, refractory_secs: u64) -> f32 {
+        if self.last_injection_unix == 0 || refractory_secs == 0 {
+            return 1.0;
+        }
+        let elapsed = now.saturating_sub(self.last_injection_unix) as f32;
+        (elapsed / refractory_secs as f32).clamp(0.0, 1.0)
     }
 
     /// v0.8.5: True when `norm` was seen failing earlier this session
