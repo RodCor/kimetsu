@@ -67,6 +67,16 @@ pub const RERANKER_IDS: &[&str] = &[
     "ms-marco-minilm-l-4-v2",
 ];
 
+/// v3.0: how the lexical and semantic rankings are merged. See
+/// [`crate::fusion`] for why this is a real ranking decision and not plumbing.
+///
+/// It is swept rather than defaulted because BM25 and cosine live on different
+/// scales, and which merge rule wins depends on the corpus — the whole reason
+/// the semantic floor already had to be calibrated per embedder family. The
+/// shipped default stays `linear` until a corpus says otherwise; this is how
+/// you get it to say so.
+pub const FUSION_MODES: &[&str] = &["linear", "rrf"];
+
 // ─── Combo ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +84,15 @@ pub struct TuneCombo {
     pub min_lexical_coverage: f32,
     pub min_semantic_score: f32,
     pub reranker_id: String,
+    /// v3.0: `"linear"` or `"rrf"`. `#[serde(default)]` keeps tune-history
+    /// files written before v3.0 deserializing cleanly — they predate the
+    /// dimension, so they describe linear runs.
+    #[serde(default = "default_fusion_mode")]
+    pub fusion: String,
+}
+
+fn default_fusion_mode() -> String {
+    "linear".to_string()
 }
 
 impl TuneCombo {
@@ -82,11 +101,14 @@ impl TuneCombo {
         for &lex in LEXICAL_FLOORS {
             for &sem in SEMANTIC_FLOORS {
                 for &rr in RERANKER_IDS {
-                    out.push(TuneCombo {
-                        min_lexical_coverage: lex,
-                        min_semantic_score: sem,
-                        reranker_id: rr.to_string(),
-                    });
+                    for &fusion in FUSION_MODES {
+                        out.push(TuneCombo {
+                            min_lexical_coverage: lex,
+                            min_semantic_score: sem,
+                            reranker_id: rr.to_string(),
+                            fusion: fusion.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -455,15 +477,40 @@ mod tests {
     use super::*;
     use ulid::Ulid;
 
+    /// The sweep space is the product of every swept dimension. Asserting the
+    /// arithmetic (rather than a literal) keeps this honest when a dimension is
+    /// added: v3.0 added `fusion`, which doubled the grid from 80 to 160.
     #[test]
-    fn all_combos_count_is_80() {
+    fn all_combos_covers_the_full_grid() {
         let combos = TuneCombo::all_combos();
+        let expected =
+            LEXICAL_FLOORS.len() * SEMANTIC_FLOORS.len() * RERANKER_IDS.len() * FUSION_MODES.len();
         assert_eq!(
             combos.len(),
-            4 * 5 * 4,
-            "expected 4×5×4=80 combos, got {}",
+            expected,
+            "expected {}×{}×{}×{}={expected} combos, got {}",
+            LEXICAL_FLOORS.len(),
+            SEMANTIC_FLOORS.len(),
+            RERANKER_IDS.len(),
+            FUSION_MODES.len(),
             combos.len()
         );
+
+        // Every combo must be distinct: a duplicated point wastes a full
+        // evaluation pass over the corpus.
+        let mut keys: Vec<String> = combos
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}|{}|{}|{}",
+                    c.min_lexical_coverage, c.min_semantic_score, c.reranker_id, c.fusion
+                )
+            })
+            .collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "sweep grid contains duplicate combos");
     }
 
     #[test]
@@ -503,6 +550,7 @@ mod tests {
                     min_lexical_coverage: 0.3,
                     min_semantic_score: 0.0,
                     reranker_id: "off".to_string(),
+                    fusion: "linear".to_string(),
                 },
                 mean_mrr: 0.7,
                 mean_tokens: 100.0,
@@ -513,6 +561,7 @@ mod tests {
                     min_lexical_coverage: 0.4,
                     min_semantic_score: 0.25,
                     reranker_id: "off".to_string(),
+                    fusion: "linear".to_string(),
                 },
                 mean_mrr: 0.9,
                 mean_tokens: 80.0,
@@ -534,11 +583,13 @@ mod tests {
                 min_lexical_coverage: 0.5,
                 min_semantic_score: -1.0,
                 reranker_id: "off".to_string(),
+                fusion: "linear".to_string(),
             },
             after: TuneCombo {
                 min_lexical_coverage: 0.4,
                 min_semantic_score: 0.25,
                 reranker_id: "ms-marco-tinybert-l-2-v2".to_string(),
+                fusion: "linear".to_string(),
             },
             train_objective: 0.55,
             holdout_objective: 0.50,
@@ -652,11 +703,13 @@ mod tests {
                     min_lexical_coverage: 0.4,
                     min_semantic_score: 0.0,
                     reranker_id: "off".to_string(),
+                    fusion: "linear".to_string(),
                 },
                 after: TuneCombo {
                     min_lexical_coverage: 0.4,
                     min_semantic_score: 0.0,
                     reranker_id: "off".to_string(),
+                    fusion: "linear".to_string(),
                 },
                 train_objective: 0.5,
                 holdout_objective: 0.5,
@@ -792,11 +845,13 @@ mod tests {
                 min_lexical_coverage: 0.5,
                 min_semantic_score: -1.0,
                 reranker_id: "off".to_string(),
+                fusion: "linear".to_string(),
             },
             after: TuneCombo {
                 min_lexical_coverage: 0.4,
                 min_semantic_score: 0.25,
                 reranker_id: "off".to_string(),
+                fusion: "linear".to_string(),
             },
             train_objective: 0.55,
             holdout_objective: 0.50,

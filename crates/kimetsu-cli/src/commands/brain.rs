@@ -1980,6 +1980,7 @@ pub(crate) fn brain_tune_sweep(
         min_lexical_coverage: config.broker.min_lexical_coverage,
         min_semantic_score: config.broker.min_semantic_score,
         reranker_id: config.embedder.reranker.clone(),
+        fusion: config.broker.fusion.clone(),
     };
 
     // Choose eval cases: personal if READY, else fall back to fixture.
@@ -2094,6 +2095,7 @@ pub(crate) fn brain_tune_sweep(
                     max_capsules: pool,
                     min_semantic_score: combo.min_semantic_score,
                     min_lexical_coverage: combo.min_lexical_coverage,
+                    fusion: combo.fusion.clone(),
                     ..Default::default()
                 };
                 let mut bundle =
@@ -2263,12 +2265,14 @@ pub(crate) fn brain_tune_sweep(
             );
         }
         println!(
-            "DRY RUN — to apply floor changes: kimetsu brain tune --apply\n\
-             (floor changes: lex {:.2}→{:.2}, sem {:.3}→{:.3})",
+            "DRY RUN — to apply: kimetsu brain tune --apply\n\
+             (lex {:.2}→{:.2}, sem {:.3}→{:.3}, fusion {}→{})",
             current_combo.min_lexical_coverage,
             winner.combo.min_lexical_coverage,
             current_combo.min_semantic_score,
             winner.combo.min_semantic_score,
+            current_combo.fusion,
+            winner.combo.fusion,
         );
         return Ok(());
     }
@@ -2290,6 +2294,15 @@ pub(crate) fn brain_tune_sweep(
         &mut doc,
         "broker.min_semantic_score",
         &toml::Value::Float(winner.combo.min_semantic_score as f64),
+    )
+    .map_err(|e| format!("tune --apply: {e}"))?;
+    // v3.0: the fusion rule is swept alongside the floors, so --apply writes
+    // it too. Kimetsu ships `linear`; this is the path by which a corpus that
+    // prefers rank fusion actually gets it.
+    set_toml_edit_path(
+        &mut doc,
+        "broker.fusion",
+        &toml::Value::String(winner.combo.fusion.clone()),
     )
     .map_err(|e| format!("tune --apply: {e}"))?;
     std::fs::write(&paths.project_toml, doc.to_string())?;
@@ -2347,11 +2360,20 @@ pub(crate) fn brain_tune_revert(workspace: &std::path::Path) -> KimetsuResult<()
         &toml::Value::Float(entry.before.min_semantic_score as f64),
     )
     .map_err(|e| format!("tune revert: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.fusion",
+        &toml::Value::String(entry.before.fusion.clone()),
+    )
+    .map_err(|e| format!("tune revert: {e}"))?;
     std::fs::write(&paths.project_toml, doc.to_string())?;
 
     println!(
-        "Reverted: lex_coverage={:.2}, sem_score={:.3} (from tune at {})",
-        entry.before.min_lexical_coverage, entry.before.min_semantic_score, entry.timestamp
+        "Reverted: lex_coverage={:.2}, sem_score={:.3}, fusion={} (from tune at {})",
+        entry.before.min_lexical_coverage,
+        entry.before.min_semantic_score,
+        entry.before.fusion,
+        entry.timestamp
     );
     Ok(())
 }

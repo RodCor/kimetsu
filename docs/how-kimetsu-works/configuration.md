@@ -27,6 +27,8 @@ default_budget_tokens = 6000  # flat fallback; the adaptive budget supersedes it
 ambient = true                # false: no workspace context appended to queries
 max_capsules = 8              # hard cap on capsules per prompt
 min_semantic_score = -1.0     # AUTO (bge: 0.35, others: off); >0 sets a floor
+fusion = "linear"             # "linear" | "rrf" — how the lexical and semantic
+                              # rankings are merged; swept by `brain tune`
 budget_floor_tokens = 1500    # small tasks are never starved
 budget_run_cap_tokens = 8000  # per-run ceiling on injected tokens
 compress_capsules = true      # strip tags, cap at 3 sentences; ranking unaffected

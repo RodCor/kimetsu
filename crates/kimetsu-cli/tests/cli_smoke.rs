@@ -618,3 +618,91 @@ fn explicit_free_tier_overrides_a_configured_model() {
     assert_eq!(status["tier_downgraded"], false, "free was asked for");
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: fusion rule selection
+// ---------------------------------------------------------------------------
+
+/// `[broker] fusion` must be wired end to end, and must be a no-op on the lean
+/// build: with only a lexical ranking there is nothing to fuse, so rank fusion
+/// is the identity and FTS-only users see byte-identical results.
+#[test]
+fn fusion_mode_is_wired_and_is_a_no_op_on_the_lean_path() {
+    let root = temp_project_dir("fusion_wiring");
+    for text in [
+        "[tags: sqlite wal] Checkpoint the WAL before copying brain.db",
+        "[tags: sqlite wal] Opening a WAL database read-only skips recovery",
+        "[tags: rust cargo] Regenerate the schema with cargo xtask gen",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            text,
+        )
+        .expect("add_memory");
+    }
+
+    let context = |mode: &str| -> String {
+        let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+        let text = fs::read_to_string(&paths.project_toml).expect("read");
+        let patched = if text.contains("fusion = ") {
+            text.lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("fusion = ") {
+                        format!("fusion = \"{mode}\"")
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text.replace("[broker]", &format!("[broker]\nfusion = \"{mode}\""))
+        };
+        fs::write(&paths.project_toml, patched).expect("write");
+
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "context", "wal recovery", "--json"])
+            .current_dir(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn brain context");
+        assert!(
+            out.status.success(),
+            "brain context must succeed with fusion={mode}; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let linear = context("linear");
+    let rrf = context("rrf");
+    assert!(
+        linear.contains("capsules"),
+        "expected a context bundle; got: {linear}"
+    );
+    // Capsule ids are fresh ULIDs per retrieval, so compare the summaries.
+    let summaries = |json: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+        v["capsules"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c["summary"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        summaries(&linear),
+        summaries(&rrf),
+        "with one candidate list, rank fusion must not reshuffle anything"
+    );
+
+    // A typo must degrade to the previous behaviour rather than break retrieval.
+    let typo = context("reciprocal-rank");
+    assert_eq!(summaries(&typo), summaries(&linear));
+
+    let _ = fs::remove_dir_all(&root);
+}

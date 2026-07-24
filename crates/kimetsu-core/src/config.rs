@@ -790,6 +790,23 @@ pub struct BrokerSection {
     /// loading with the floor active.
     #[serde(default = "default_min_lexical_coverage")]
     pub min_lexical_coverage: f32,
+    /// v3.0: how the broker merges candidate lists from different retrieval
+    /// strategies (lexical FTS, semantic ANN, graph traversal).
+    ///
+    /// * `"linear"` (default) — union the lists, keeping each memory's best
+    ///   `raw_relevance`, itself a linear blend of BM25 and cosine at α = 0.5.
+    ///   Kimetsu's behaviour through v2.5.
+    /// * `"rrf"` — reciprocal rank fusion. Uses only each candidate's rank in
+    ///   each list, so the fact that BM25 is unbounded and corpus-dependent
+    ///   while cosine is bounded and tightly clustered stops mattering, and a
+    ///   memory both lists rank highly beats one a single list loves.
+    ///
+    /// Defaults to `linear` because the house rule is that every claim ships
+    /// with a measurement, and "RRF is the 2026 default" is not one for *this*
+    /// corpus. `kimetsu brain tune` sweeps both against your own query history.
+    /// Unknown values fall back to `linear`.
+    #[serde(default = "default_fusion")]
+    pub fusion: String,
     /// v2.5 (graph-ranking): composite-score floor for the whole retrieval. When
     /// set above zero and the TOP direct candidate's final score is below it, the
     /// context bundle comes back empty (`skipped`) so the reader abstains instead
@@ -905,6 +922,10 @@ fn default_min_semantic_score() -> f32 {
     -1.0
 }
 
+fn default_fusion() -> String {
+    "linear".to_string()
+}
+
 fn default_min_lexical_coverage() -> f32 {
     0.5
 }
@@ -941,6 +962,7 @@ impl Default for BrokerSection {
             max_capsules: default_max_capsules(),
             min_semantic_score: default_min_semantic_score(),
             min_lexical_coverage: default_min_lexical_coverage(),
+            fusion: default_fusion(),
             abstain_min_score: default_abstain_min_score(),
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),

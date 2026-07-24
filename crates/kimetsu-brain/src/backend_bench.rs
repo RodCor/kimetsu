@@ -282,7 +282,9 @@ pub fn run_cross_backend_bench(corpus_size: usize, _n_queries: usize) -> Vec<Bac
 
     // ── flat ──────────────────────────────────────────────────────────────────
     {
-        let backend = crate::backend::FlatBackend;
+        let backend = crate::backend::FlatBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        };
         let (r5, r10, counts, lats) = run_backend(&conn, &cases, &backend);
         results.push(BackendBenchResult {
             backend: "flat".to_string(),
@@ -297,7 +299,9 @@ pub fn run_cross_backend_bench(corpus_size: usize, _n_queries: usize) -> Vec<Bac
 
     // ── graph-lite ────────────────────────────────────────────────────────────
     {
-        let backend = crate::backend::GraphLiteBackend;
+        let backend = crate::backend::GraphLiteBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        };
         let (r5, r10, counts, lats) = run_backend(&conn, &cases, &backend);
         results.push(BackendBenchResult {
             backend: "graph-lite".to_string(),
@@ -313,7 +317,7 @@ pub fn run_cross_backend_bench(corpus_size: usize, _n_queries: usize) -> Vec<Bac
     // ── petgraph (only when `graph` feature is active) ────────────────────────
     #[cfg(feature = "graph")]
     {
-        match crate::backend::PetgraphBackend::from_conn(&conn) {
+        match crate::backend::PetgraphBackend::from_conn(&conn, crate::fusion::Fusion::Linear) {
             Ok(backend) => {
                 let (r5, r10, counts, lats) = run_backend(&conn, &cases, &backend);
                 results.push(BackendBenchResult {

@@ -279,6 +279,14 @@ pub struct ContextRequest {
     pub stage: String,
     pub query: String,
     pub budget_tokens: u32,
+    /// v3.0: per-request override for how the lexical and semantic rankings
+    /// are merged (`"linear"` / `"rrf"`; see [`crate::fusion`]).
+    ///
+    /// Empty (the default) means "use `[broker] fusion`". This exists so
+    /// `kimetsu brain tune` can sweep the two rules against one corpus in one
+    /// process — the reason the shipped default is still `linear` is that
+    /// nothing had measured the alternative on a real brain.
+    pub fusion: String,
     /// v0.6: domain-hint tags. Capsules whose text or kind contains any
     /// of these strings receive a 1.4× score boost, pushing on-domain
     /// capsules above the `min_score` threshold when they would otherwise
@@ -433,7 +441,9 @@ pub fn retrieve_context_with_embedder(
         request,
         extra_memory_conns,
         embedder,
-        &crate::backend::FlatBackend,
+        &crate::backend::FlatBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        },
     )
 }
 
@@ -990,22 +1000,32 @@ pub(crate) fn memory_candidates_flat(
     query: &str,
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
+    fusion: crate::fusion::Fusion,
 ) -> KimetsuResult<Vec<Candidate>> {
-    memory_candidates(conn, query, query_embedding, half_life_days)
+    memory_candidates(conn, query, query_embedding, half_life_days, fusion)
 }
 
+/// Build the flat candidate pool, merging the lexical and semantic rankings
+/// with `fusion`.
+///
+/// The two sources — FTS5 and the ANN index — are independent rankings over the
+/// same corpus, and how they are merged is a real ranking decision rather than
+/// plumbing. See [`crate::fusion`].
 fn memory_candidates(
     conn: &Connection,
     query: &str,
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
+    // Read only on the embeddings build: the lean path has a single ranking,
+    // so there is nothing to fuse and any rule is the identity.
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))] fusion: crate::fusion::Fusion,
 ) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
 
     // D1c: on embeddings builds with a real query vector, run BOTH FTS and
-    // ANN, then union-dedup by memory_id (keeping the higher-scored instance).
-    // This replaces the recency-bounded latest_memory_candidates fallback as
-    // the semantic-recall source when embeddings are active.
+    // ANN and fuse the two rankings. This replaces the recency-bounded
+    // latest_memory_candidates fallback as the semantic-recall source when
+    // embeddings are active.
     #[cfg(feature = "embeddings")]
     if let Some(qe) = query_embedding {
         // FTS candidates (may be empty if no lexical matches).
@@ -1025,33 +1045,11 @@ fn memory_candidates(
         // ANN candidates — top-80 nearest neighbours from the usearch index.
         let ann_candidates = memory_ann_candidates(conn, qe, 80, &query_tokens, half_life_days)?;
 
-        // Union the two sets, deduped by memory_id.  When a memory appears
-        // in both, keep the instance with the higher raw_relevance so
-        // candidates that both lexically and semantically match the query
-        // get the best score.
-        let mut seen: HashMap<String, usize> = HashMap::new();
-        let mut merged: Vec<Candidate> = Vec::new();
-
-        for candidate in fts_candidates.into_iter().chain(ann_candidates) {
-            // Extract memory_id from the expansion_handle "memory:<id>".
-            let mid = candidate
-                .capsule
-                .expansion_handle
-                .strip_prefix("memory:")
-                .unwrap_or(&candidate.capsule.expansion_handle)
-                .to_string();
-            if let Some(&idx) = seen.get(&mid) {
-                // Keep the higher-scored instance.
-                if candidate.raw_relevance > merged[idx].raw_relevance {
-                    merged[idx] = candidate;
-                }
-            } else {
-                seen.insert(mid, merged.len());
-                merged.push(candidate);
-            }
-        }
-
-        return Ok(merged);
+        // Both sources return best-first, which is what rank-based fusion needs.
+        return Ok(crate::fusion::fuse(
+            fusion,
+            vec![fts_candidates, ann_candidates],
+        ));
     }
 
     // Lean (NoopEmbedder) path: unchanged — FTS then recency fallback.

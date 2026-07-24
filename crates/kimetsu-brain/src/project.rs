@@ -452,7 +452,17 @@ impl BrainSession {
             request.min_score = self.config.broker.abstain_min_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        // A per-request fusion override beats the config, so a sweep can
+        // compare both rules in one process against one corpus.
+        let fusion = if request.fusion.is_empty() {
+            &self.config.broker.fusion
+        } else {
+            &request.fusion
+        };
+        let backend = crate::backend::backend_for(
+            &self.config.storage.backend,
+            crate::fusion::Fusion::from_config(fusion),
+        );
         context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
@@ -496,7 +506,17 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        // A per-request fusion override beats the config, so a sweep can
+        // compare both rules in one process against one corpus.
+        let fusion = if request.fusion.is_empty() {
+            &self.config.broker.fusion
+        } else {
+            &request.fusion
+        };
+        let backend = crate::backend::backend_for(
+            &self.config.storage.backend,
+            crate::fusion::Fusion::from_config(fusion),
+        );
         context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
@@ -528,7 +548,17 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        // A per-request fusion override beats the config, so a sweep can
+        // compare both rules in one process against one corpus.
+        let fusion = if request.fusion.is_empty() {
+            &self.config.broker.fusion
+        } else {
+            &request.fusion
+        };
+        let backend = crate::backend::backend_for(
+            &self.config.storage.backend,
+            crate::fusion::Fusion::from_config(fusion),
+        );
         context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
@@ -565,7 +595,17 @@ impl BrainSession {
             request.min_score = self.config.broker.abstain_min_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
-        let backend = crate::backend::backend_for(&self.config.storage.backend);
+        // A per-request fusion override beats the config, so a sweep can
+        // compare both rules in one process against one corpus.
+        let fusion = if request.fusion.is_empty() {
+            &self.config.broker.fusion
+        } else {
+            &request.fusion
+        };
+        let backend = crate::backend::backend_for(
+            &self.config.storage.backend,
+            crate::fusion::Fusion::from_config(fusion),
+        );
         context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
