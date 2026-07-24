@@ -36,7 +36,7 @@ answer_grade_min_score = 0.92 # top capsule >= this gets a "Verified answer" pre
 proactive_prefetch = false    # opt-in trajectory-based pre-fetch at PreToolUse
 
 [storage]
-backend = "flat"              # "flat" | "graph-lite" | "graph" (remote only).
+backend = "graph-lite"        # "flat" | "graph-lite" | "graph" (remote only).
                               # Switching re-projects from the event log.
 
 [cheap_model]                 # one optional model for digest / resume / ask /

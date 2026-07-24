@@ -99,6 +99,11 @@ fn migrations() -> &'static [Migration] {
             description: "add memory_citations.query + query_routes table (v2.5.2 consolidation v1)",
             up: crate::schema::migrate_v9_to_v10,
         },
+        Migration {
+            version: 11,
+            description: "add memory_entities projection (v3.0 first-class tags + ingest-time edges)",
+            up: crate::schema::migrate_v10_to_v11,
+        },
     ]
 }
 

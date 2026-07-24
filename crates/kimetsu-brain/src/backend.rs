@@ -170,12 +170,14 @@ impl RetrievalBackend for FlatBackend {
 ///
 /// # Scoring
 ///
-/// Graph-reached candidates have `raw_relevance = 0.0` pre-scoring because
-/// they weren't matched by the query directly.  The broker's per-kind max
-/// normalisation will therefore assign them `relevance = 0.0 / max` and they
-/// will rank below any flat hit that had a positive signal.  If the caller
-/// has a `min_score` floor they may be filtered out — which is correct
-/// behaviour: the broker still controls final admission.
+/// Graph-reached candidates were not matched by the query directly, so they
+/// inherit a hop-decayed share of the best flat signal:
+/// `raw_relevance = max_flat_relevance * HOP_DECAY^hops`. A 1-hop neighbour of
+/// the top hit therefore enters at 60% of it — below every strong flat hit, but
+/// above a weak one, which is the point: a memory two words away from the query
+/// but one edge from its best answer is often the better capsule. If the caller
+/// has a `min_score` floor they may still be filtered out — the broker controls
+/// final admission.
 pub(crate) struct GraphLiteBackend;
 
 /// Maximum hops to traverse from the flat hit set.
@@ -861,6 +863,171 @@ mod tests {
         for variant in &["flat", "graph-lite", "graph", "unknown-typo"] {
             let _b = backend_for(variant);
         }
+    }
+
+    // ── v3.0: the no-regression gate for the default flip ────────────────────
+
+    /// The gate on making `graph-lite` the default backend: on a realistic
+    /// corpus, with edges actually present, graph-lite must return a SUPERSET
+    /// of flat's candidates, and every flat candidate must keep its
+    /// `raw_relevance` unchanged.
+    ///
+    /// That is the whole safety argument. Graph-reached candidates enter with
+    /// `raw_relevance = 0.0`, so they rank below every direct hit and can only
+    /// occupy slots flat would have left empty — which means flipping the
+    /// default can broaden recall but cannot displace a result.
+    #[test]
+    fn graph_lite_is_a_superset_of_flat_with_edges_present() {
+        let conn = make_conn();
+        let corpus = [
+            (
+                "mem-a",
+                "convention",
+                "[tags: sqlite wal] checkpoint the WAL before copying brain.db",
+            ),
+            (
+                "mem-b",
+                "failure_pattern",
+                "[tags: sqlite wal] opening a WAL database read-only skips recovery",
+            ),
+            (
+                "mem-c",
+                "command",
+                "[tags: rust cargo] regenerate the schema with cargo xtask gen",
+            ),
+            (
+                "mem-d",
+                "fact",
+                "[tags: rust cargo] the workspace pins edition 2024",
+            ),
+            (
+                "mem-e",
+                "preference",
+                "[tags: search] prefer ripgrep over grep for large trees",
+            ),
+        ];
+        for (id, kind, text) in corpus {
+            insert_memory(&conn, id, kind, text);
+            crate::graph::project_entities(&conn, id, text).expect("project entities");
+        }
+        // Link the corpus exactly the way the write path does.
+        for (id, _, _) in corpus {
+            let edges = crate::graph::incremental_edges_for_memory(&conn, id, 0).expect("edges");
+            let tuples: Vec<(String, String, String)> = edges
+                .into_iter()
+                .map(|e| (e.src_id, e.dst_id, e.edge_type))
+                .collect();
+            projector::add_memory_edges(&conn, &tuples).expect("persist edges");
+        }
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_edges WHERE edge_type='relates_to'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            edge_count > 0,
+            "fixture must actually have edges, or this proves nothing"
+        );
+
+        for query in [
+            "wal checkpoint",
+            "cargo schema",
+            "ripgrep",
+            "sqlite recovery read-only",
+            "something entirely unrelated to this corpus",
+        ] {
+            let flat = FlatBackend
+                .memory_candidates(&conn, query, None, 90.0)
+                .expect("flat");
+            let graph = GraphLiteBackend
+                .memory_candidates(&conn, query, None, 90.0)
+                .expect("graph-lite");
+
+            for candidate in &flat {
+                let same = graph
+                    .iter()
+                    .find(|g| g.capsule.expansion_handle == candidate.capsule.expansion_handle)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "graph-lite dropped a flat candidate for {query:?}: {}",
+                            candidate.capsule.expansion_handle
+                        )
+                    });
+                assert!(
+                    (same.raw_relevance - candidate.raw_relevance).abs() < f32::EPSILON,
+                    "graph-lite changed a flat candidate's relevance for {query:?}: \
+                     {} vs {}",
+                    same.raw_relevance,
+                    candidate.raw_relevance
+                );
+            }
+            assert!(
+                graph.len() >= flat.len(),
+                "graph-lite must never shrink the pool for {query:?}: {} < {}",
+                graph.len(),
+                flat.len()
+            );
+        }
+    }
+
+    /// The corollary: a graph-reached candidate enters at a hop-decayed share
+    /// of the best flat signal, never at full strength — so it ranks below the
+    /// hit that pulled it in.
+    #[test]
+    fn graph_reached_candidates_are_hop_decayed_below_their_seed() {
+        let conn = make_conn();
+        for (id, kind, text) in [
+            (
+                "mem-a",
+                "convention",
+                "[tags: sqlite wal] checkpoint the WAL before copying",
+            ),
+            (
+                "mem-b",
+                "fact",
+                "[tags: sqlite wal] recovery is skipped on read-only opens",
+            ),
+        ] {
+            insert_memory(&conn, id, kind, text);
+            crate::graph::project_entities(&conn, id, text).expect("entities");
+        }
+        projector::add_memory_edges(
+            &conn,
+            &[(
+                "mem-a".to_string(),
+                "mem-b".to_string(),
+                "relates_to".to_string(),
+            )],
+        )
+        .expect("edge");
+
+        // "checkpoint" hits mem-a directly; mem-b arrives only via the edge.
+        let graph = GraphLiteBackend
+            .memory_candidates(&conn, "checkpoint", None, 90.0)
+            .expect("graph-lite");
+        let reached = graph
+            .iter()
+            .find(|c| c.capsule.expansion_handle.contains("mem-b"))
+            .expect("mem-b must be reachable through the edge");
+        let seed = graph
+            .iter()
+            .find(|c| c.capsule.expansion_handle.contains("mem-a"))
+            .expect("mem-a is the direct hit");
+        assert!(
+            reached.raw_relevance < seed.raw_relevance,
+            "a graph-reached candidate must rank below the hit that pulled it in: \
+             {} vs {}",
+            reached.raw_relevance,
+            seed.raw_relevance
+        );
+        let expected = seed.raw_relevance * HOP_DECAY;
+        assert!(
+            (reached.raw_relevance - expected).abs() < 1e-4,
+            "one hop must decay by HOP_DECAY: got {}, expected {expected}",
+            reached.raw_relevance
+        );
     }
 
     // ── S5.2 correctness bars ─────────────────────────────────────────────────

@@ -991,7 +991,34 @@ fn add_memory_inner(
         }
     }
 
+    // v3.0 (RFC phase 2c): link this memory into the graph as it lands.
+    //
+    // Before this, `relates_to` edges only existed if someone ran
+    // `kimetsu brain graph build`, so in practice `memory_edges` held nothing
+    // but `supersedes` — which retrieval already excludes — and the graph-lite
+    // backend silently behaved like flat. Doing it here is one indexed lookup
+    // against `memory_entities`, cheap enough for the write path, and it is
+    // what makes graph-lite worth defaulting to.
+    link_memory_into_graph(conn, &memory_id);
+
     Ok(memory_id)
+}
+
+/// Emit `relates_to` edges between `memory_id` and the active memories it
+/// shares entities with. Best-effort: the graph is an optimization, and a
+/// failure here must never lose the memory the user just recorded.
+fn link_memory_into_graph(conn: &Connection, memory_id: &str) {
+    let Ok(edges) = crate::graph::incremental_edges_for_memory(conn, memory_id, 0) else {
+        return;
+    };
+    if edges.is_empty() {
+        return;
+    }
+    let tuples: Vec<(String, String, String)> = edges
+        .into_iter()
+        .map(|e| (e.src_id, e.dst_id, e.edge_type))
+        .collect();
+    let _ = crate::projector::add_memory_edges(conn, &tuples);
 }
 
 /// Add many memories in one process: the project is opened and the embedder
@@ -1242,6 +1269,12 @@ pub fn propose_or_merge_memory(
             )?;
             // Return value not needed — no conflict scan after a merge.
             embeddings::embed_and_persist(&conn, &hit.existing_memory_id, &merged_text, embedder)?;
+            // v3.0: the merged text may carry entities the survivor did not
+            // have, so reproject and re-link. Skipping this would leave the
+            // absorbed lesson unreachable through the graph even though its
+            // words are now in the corpus.
+            let _ = crate::graph::project_entities(&conn, &hit.existing_memory_id, &merged_text);
+            link_memory_into_graph(&conn, &hit.existing_memory_id);
             return Ok(ProposeResult::Merged(hit.existing_memory_id));
         }
     }

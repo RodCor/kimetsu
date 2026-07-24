@@ -553,6 +553,46 @@ pub(crate) fn migrate_v9_to_v10(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
+/// v3.0 (RFC phase 2c): `memory_entities` — tags and salient terms as rows.
+///
+/// Until now tags lived inline in the memory text as `[tags: …]` and were
+/// re-parsed on every read, and the tag boost was a substring match on the
+/// rendered summary. Promoting them to a table buys three things:
+///
+///   * the graph layer can find "other memories mentioning X" with an index
+///     lookup instead of an O(n²) scan over the whole corpus, which is what
+///     made edge-building a batch job rather than something the write path
+///     could afford;
+///   * `source` distinguishes an author-supplied tag from a salient term the
+///     extractor guessed, so ranking can weight them differently;
+///   * a tag match becomes an equality test rather than a substring one.
+///
+/// It is a pure projection of `memories.text` — `kimetsu brain rebuild`
+/// repopulates it from the event log, and nothing here needs its own events.
+pub(crate) fn migrate_v10_to_v11(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_entities (
+            memory_id  TEXT NOT NULL,
+            entity     TEXT NOT NULL,
+            source     TEXT NOT NULL DEFAULT 'term',
+            PRIMARY KEY (memory_id, entity)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+            ON memory_entities(entity);
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
+            ON memory_entities(memory_id);
+        ",
+    )?;
+    // Backfill from the existing corpus so an upgraded brain has a usable
+    // entity index immediately, rather than only for memories written after
+    // the upgrade. Best-effort: on a synthetic or partial DB (migration tests,
+    // tooling) the `memories` table may not be there, and a missing backfill is
+    // recoverable with `kimetsu brain rebuild` — a failed migration is not.
+    let _ = crate::graph::reproject_all_entities(conn);
+    Ok(())
+}
+
 pub fn validate(conn: &Connection) -> KimetsuResult<()> {
     // Apply performance pragmas on read-only connections too. The helper
     // skips pragmas that error (journal_mode/mmap_size on some read-only

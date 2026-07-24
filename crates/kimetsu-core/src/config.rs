@@ -653,8 +653,24 @@ pub struct StorageSection {
     pub backend: String,
 }
 
+/// v3.0: `graph-lite`, not `flat`.
+///
+/// The published BEAM 100K figure (73.3%) was measured on graph-lite; `flat`
+/// scored 62.3% on the same set. Shipping `flat` as the default meant the
+/// advertised number described a configuration almost nobody was running.
+///
+/// It was the right default until now only because the graph was empty in
+/// practice: `relates_to` edges existed solely if a user remembered to run
+/// `kimetsu brain graph build`, so graph-lite paid for a traversal that found
+/// nothing. Now that the write path links each memory as it lands (see
+/// `crate::graph::incremental_edges_for_memory`), the traversal has something
+/// to traverse.
+///
+/// Safe by construction: graph-lite's candidate set is a superset of flat's,
+/// and graph-reached candidates enter with `raw_relevance = 0.0`, so they rank
+/// below every direct hit and can only fill slots flat would have left empty.
 fn default_storage_backend() -> String {
-    "flat".to_string()
+    "graph-lite".to_string()
 }
 
 impl Default for StorageSection {
@@ -1564,11 +1580,13 @@ max_total_cost_usd = 250.0
             config.broker.warm_start,
             "broker.warm_start must default to true"
         );
-        // S5.1: a pre-S5 project.toml without [storage] must load cleanly
-        // and default to backend = "flat" (the existing FTS + ANN path).
+        // S5.1: a pre-S5 project.toml without [storage] must load cleanly.
+        // v3.0 flipped the default from "flat" to "graph-lite" — the config
+        // the published benchmark numbers were measured on, and safe because
+        // graph-lite's candidate set is a superset of flat's.
         assert_eq!(
-            config.storage.backend, "flat",
-            "storage.backend must default to \"flat\" when absent"
+            config.storage.backend, "graph-lite",
+            "storage.backend must default to \"graph-lite\" when absent"
         );
         // F3 Pass B (3.3): a pre-F3 project.toml without broker.answer_grade_min_score
         // must load cleanly and receive the conservative default (0.92).
@@ -2086,13 +2104,17 @@ max_total_cost_usd = 250.0
         }
     }
 
-    /// S5.1-b: `default_for_project` uses `backend = "flat"`.
+    /// v3.0: `default_for_project` uses `backend = "graph-lite"`.
+    ///
+    /// Guards the thing that made the old default wrong: the published BEAM
+    /// 100K figure was measured on graph-lite (73.3%) while `flat` — what
+    /// users actually got — scored 62.3% on the same set.
     #[test]
-    fn s5_1_default_for_project_uses_flat_backend() {
+    fn default_for_project_uses_the_benchmarked_backend() {
         let config = ProjectConfig::default_for_project("demo");
         assert_eq!(
-            config.storage.backend, "flat",
-            "default project config must use flat backend"
+            config.storage.backend, "graph-lite",
+            "default project config must use the backend the benchmarks measure"
         );
     }
 

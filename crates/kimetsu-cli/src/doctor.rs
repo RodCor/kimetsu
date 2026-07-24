@@ -419,7 +419,19 @@ fn check_embedder_default() -> CheckReport {
                 name: "default embedder loads",
                 category: "retrieval",
                 outcome: Outcome::Warn {
-                    reason: "no `embeddings` feature - semantic retrieval off. Reinstall with `cargo install kimetsu-cli` for the default semantic build.".into(),
+                    // The old wording here told users to run
+                    // `cargo install kimetsu-cli` "for the default semantic
+                    // build" — but that is exactly the command that produces
+                    // THIS build: kimetsu-cli's default feature set is empty,
+                    // deliberately, so the crates.io install works on targets
+                    // where `ort` ships no prebuilt. Say what actually helps.
+                    reason: "lean build: no `embeddings` feature, so retrieval is FTS-only — \
+                             no cosine, no ANN, no reranker, and semantic dedup and \
+                             conflict detection are silent no-ops. Install the semantic \
+                             build with `npm install -g kimetsu-ai` (recommended), or \
+                             `cargo install kimetsu-cli --features embeddings` on a target \
+                             with ONNX Runtime prebuilts."
+                        .into(),
                 },
                 detail: Some("NoopEmbedder (FTS-only retrieval)".into()),
             }

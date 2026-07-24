@@ -22,6 +22,10 @@ projector replays it into materialized tables the broker queries fast.
 - `memory_conflicts`: ingest-time contradiction hits.
 - `repo_files*`, `repo_manifests*`: file indexes from `brain ingest repo`.
 - `memories_fts`: FTS5 index for lexical retrieval.
+- `memory_entities`: tags and salient terms per memory, so the graph layer can
+  find "what else mentions this" with an index lookup instead of a scan.
+- `memory_edges`: typed relations between memories (`relates_to`, `supersedes`),
+  written as each memory lands and traversed by the `graph-lite` backend.
 
 ## Durable upgrades: schema migrations
 

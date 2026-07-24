@@ -9,6 +9,16 @@ embeddings build the broker also queries a **usearch HNSW** index (a
 the FTS set, so a memory whose meaning matches can surface without sharing a
 word with the query.
 
+The default backend is **graph-lite**: on top of that flat set it walks up to
+two hops over `memory_edges`, so a memory one edge from the best hit can be
+pulled in even when the query never mentions it. Graph-reached candidates enter
+at a hop-decayed share of the seed's relevance (`×0.6` per hop), so they rank
+below the hit that surfaced them. The candidate set is a strict superset of
+flat's, which is why the default is safe: broader recall, never a displaced
+result. Edges are written as each memory lands, from the entities it shares
+with the existing corpus — no `kimetsu brain graph build` required, though that
+command still rebuilds the whole graph if you want it re-derived.
+
 The score is a weighted sum plus two multipliers:
 
 ```
