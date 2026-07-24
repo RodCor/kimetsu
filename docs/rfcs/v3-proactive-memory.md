@@ -306,13 +306,21 @@ prevents.
 
 No competitor owns this ground.
 
-- **4a. Provenance-weighted trust**: a per-memory trust term from origin, source
-  kind (manual > distilled > imported pack > remote org brain), and citation
-  outcomes, entering the broker score and gating import.
-- **4b. Poisoning resistance**: quarantine imported and remote-origin memories
-  until corroborated by a local citation; anomaly-detect write bursts; add
-  `kimetsu brain audit` for post-hoc causal attribution. The event-sourced
-  design makes this unusually cheap — the audit trail already exists.
+- **4a. Provenance-weighted trust (landed).** Retrieval discounts a memory by
+  origin: distilled 0.95, remote 0.90, pack 0.85, local and derived unchanged.
+  Corroboration — a citation in a successful run here, which is exactly what
+  `last_useful_at` records — erases the discount outright, so an imported pack
+  is not second-class forever. Unknown provenance reads as local, so upgrading
+  does not make an existing brain untrusted. Trust is a weight, never a gate: a
+  bad import must not be able to silently delete working knowledge.
+- **4b. Poisoning resistance (partly landed).** `kimetsu brain audit` groups the
+  corpus by origin, reports the uncorroborated external population, and flags
+  write bursts — clusters that arrived faster than anyone types, the shape both
+  a bulk import and induced poisoning leave. Read-only: an automated purge on
+  that heuristic would delete a legitimate import. **Quarantining imports is
+  still open**, deliberately — it changes what `brain import` does and needs its
+  own migration story for packs already imported, rather than arriving behind a
+  scoring weight.
 - **4c. Sycophancy resistance**: render memory as a claim to verify rather than
   as ground truth, enforce scope validity at render time, and add a MemSyco-style
   track to BrainBench.
@@ -333,13 +341,25 @@ No competitor owns this ground.
 
 ## Status
 
-Landed and tested: phase 0 (all seven items, including the `graph-lite` default
-flip), phase 1, 2a, 2c, 3a, 3b, 3c.
+**Landed and tested:** phase 0 (all seven items, including the `graph-lite`
+default flip), phase 1, 2a, 2c, 3a, 3b, 3c, 4a, and the audit half of 4b.
 
-Still open: 2b (global normalization), 2d (event ordering), 2e (abstention), 2f
-(bitemporal), 2g (entailment conflicts), 2h (user profile prior), 2i (BEAM 10M),
-3d (skill graduation surfaced in the warm start), 3e (`proactive_prefetch`
-default-on), all of phase 4, and all of phase 5.
+**Open, buildable:** 2d (event ordering), 2e (abstention), 2f (bitemporal),
+2h (user profile prior), 3d (graduated skills in the warm start), 3e
+(`proactive_prefetch` default-on), quarantine-on-import (4b), 4c (sycophancy
+track), 4d (belief drift), and all of phase 5.
+
+**Open, blocked on an asset rather than a design:**
+
+| Item | Blocker |
+|---|---|
+| 2b global normalization | Needs a semantic-build benchmark to justify a default. The ONNX Runtime prebuilt was unreachable from the machine this work was done on, so the `embeddings` flavor would not build, so `brain bench` and `brain eval` could not run. |
+| 2a flipping RRF on by default | Same. The rule ships selectable and swept; only the default is unmeasured. |
+| 2g entailment conflicts | Needs a local NLI cross-encoder — same download path, same blocker. |
+| 2i BEAM 10M | Needs the BEAM corpus and a reader API budget. |
+
+Each of those is a measurement or an asset that has to come from a machine that
+can reach the model CDN, not a question about the design.
 
 ## What this RFC does not claim
 
