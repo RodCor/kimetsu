@@ -349,6 +349,165 @@ pub struct ContextBundle {
     /// v0.6: best composite score observed before the skip check.
     /// Useful for diagnostics ("why was the brain silent?").
     pub top_score: f32,
+    /// v3.0: what fraction of the query's discriminating power the returned
+    /// capsules cover, *collectively*, in `[0, 1]`.
+    ///
+    /// Kimetsu already abstains at the bundle level — nothing above
+    /// `min_score` means an empty bundle and zero tokens. What it never did is
+    /// say anything about a bundle it *does* return, so a reader handed three
+    /// capsules that touch half the question has no way to tell that from
+    /// three that answer it, and confabulates the rest. That is what BEAM's
+    /// abstention track measures, and where Kimetsu scores worst (45% / 30%).
+    ///
+    /// IDF-weighted against the corpus, so a query term present in every
+    /// memory contributes nothing and a rare one dominates — the same weighting
+    /// the per-memory lexical floor uses, applied to the bundle as a whole.
+    /// 1.0 when there is no discriminating term to measure against.
+    pub evidence_coverage: f32,
+    /// v3.0: the discriminating query terms *no* returned capsule mentions.
+    ///
+    /// The actionable half of `evidence_coverage`: a reader can be told
+    /// precisely what memory does not know about, rather than being handed a
+    /// number. Empty when coverage is complete or unmeasurable.
+    pub uncovered_terms: Vec<String>,
+}
+
+/// Discriminating weight per query token, for *bundle* coverage.
+///
+/// Deliberately not [`corpus_token_idf`]. That one zeroes a token the corpus
+/// has never seen (`df == 0`), because for the per-memory floor an
+/// out-of-corpus word would sink every candidate — the on-topic memory that
+/// matches the rare in-corpus word would be wrongly pruned.
+///
+/// For coverage the same fact means the opposite. A query term that appears in
+/// **no** memory is the strongest possible evidence that memory does not cover
+/// this question, which is precisely what the reader needs to be told. Zeroing
+/// it would make "how do I checkpoint the WAL during a Kubernetes rollout"
+/// report full coverage on the strength of the WAL half alone — the exact
+/// confabulation this is meant to prevent.
+///
+/// So `df == 0` gets the maximal weight, and only `df == N` (present in every
+/// memory, e.g. the project name) is zeroed.
+fn coverage_token_idf(conn: &Connection, tokens: &[String]) -> KimetsuResult<HashMap<String, f32>> {
+    let mut idf = HashMap::new();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if n == 0 {
+        return Ok(idf);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT COUNT(*) FROM memories \
+         WHERE invalidated_at IS NULL AND lower(text) LIKE ?1 ESCAPE '\\'",
+    )?;
+    for token in tokens {
+        let pattern = format!("%{}%", escape_like(token));
+        let df: i64 = stmt
+            .query_row(params![pattern], |row| row.get(0))
+            .unwrap_or(0);
+        // ln((N+1)/(df+1)): maximal at df == 0, zero at df == N.
+        let weight = (((n + 1) as f32) / ((df + 1) as f32)).ln().max(0.0);
+        idf.insert(token.clone(), weight);
+    }
+    Ok(idf)
+}
+
+/// Render the partial-evidence warning for a bundle, if it needs one.
+///
+/// The point is to let a reader abstain on Kimetsu's advice rather than
+/// confabulate from partial evidence. Naming the missing terms is what makes
+/// that actionable — "memory does not cover X" is a fact the reader can act on,
+/// where a coverage number is not.
+///
+/// Returns `None` when coverage is adequate, so a complete bundle costs nothing.
+pub fn partial_evidence_notice(bundle: &ContextBundle) -> Option<String> {
+    if bundle.skipped || bundle.capsules.is_empty() {
+        return None; // an empty bundle already says everything it can
+    }
+    if bundle.evidence_coverage > PARTIAL_EVIDENCE_COVERAGE || bundle.uncovered_terms.is_empty() {
+        return None;
+    }
+    // Cap the list: naming twenty terms is noise, and the first few are the
+    // highest-IDF ones anyway (content_tokens preserves query order, and the
+    // uncovered list is filtered from it).
+    const MAX_NAMED: usize = 6;
+    let named: Vec<&str> = bundle
+        .uncovered_terms
+        .iter()
+        .take(MAX_NAMED)
+        .map(String::as_str)
+        .collect();
+    let more = bundle.uncovered_terms.len().saturating_sub(named.len());
+    let suffix = if more > 0 {
+        format!(" (and {more} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Partial memory: nothing above covers {}{}. Treat the rest as unknown \
+         rather than inferring it.",
+        named.join(", "),
+        suffix
+    ))
+}
+
+/// Coverage at or below which a bundle is worth flagging as partial.
+///
+/// Chosen to mirror `min_lexical_coverage`'s default (0.5): a bundle that
+/// collectively covers less of the query than a single memory would need to
+/// survive the per-memory floor is, by the system's own standard, thin.
+pub const PARTIAL_EVIDENCE_COVERAGE: f32 = 0.5;
+
+/// Measure how much of `query`'s discriminating power `capsules` collectively
+/// cover, and which terms none of them mention.
+///
+/// Deliberately computed over the *union* of the capsules rather than the best
+/// one: the question is whether the bundle answers the query, not whether any
+/// single memory does.
+pub(crate) fn evidence_coverage(
+    conn: &Connection,
+    query: &str,
+    capsules: &[ContextCapsule],
+) -> (f32, Vec<String>) {
+    let content = content_tokens(query);
+    if content.is_empty() {
+        return (1.0, Vec::new());
+    }
+    let Ok(idf) = coverage_token_idf(conn, &content) else {
+        return (1.0, Vec::new());
+    };
+    // Everything the bundle says, lowercased once.
+    let haystack = capsules
+        .iter()
+        .map(|c| c.summary.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut total = 0.0f32;
+    let mut hit = 0.0f32;
+    let mut uncovered = Vec::new();
+    for token in &content {
+        let weight = idf.get(token).copied().unwrap_or(0.0);
+        if weight <= 0.0 {
+            continue; // corpus-ubiquitous or out-of-corpus: no signal either way
+        }
+        total += weight;
+        if haystack.contains(token.as_str()) {
+            hit += weight;
+        } else {
+            uncovered.push(token.clone());
+        }
+    }
+    if total <= f32::EPSILON {
+        // No discriminating term to measure against — claiming a gap here
+        // would make every vague query look like a memory failure.
+        return (1.0, Vec::new());
+    }
+    (hit / total, uncovered)
 }
 
 /// S5.1: a single memory candidate produced by candidate generation and
@@ -719,6 +878,9 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             excluded: capsules,
             skipped: true,
             top_score,
+            // A skipped bundle covers nothing, by construction.
+            evidence_coverage: 0.0,
+            uncovered_terms: Vec::new(),
         });
     }
 
@@ -750,6 +912,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         }
     }
 
+    let (coverage, uncovered_terms) = evidence_coverage(conn, &request.query, &included);
     Ok(ContextBundle {
         stage: request.stage,
         budget_tokens: request.budget_tokens,
@@ -758,6 +921,8 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         excluded,
         skipped: false,
         top_score,
+        evidence_coverage: coverage,
+        uncovered_terms,
     })
 }
 
@@ -1773,6 +1938,19 @@ const STOPWORDS: &[&str] = &[
     "please", "tell", "give", "show", "want", "need", "get", "got", "use", "using", "there",
     "their", "they", "them", "then", "than", "some", "any", "all", "more", "most", "such", "via",
     "per",
+    // v3.0: the function words this list had always meant to cover. The
+    // comment in `content_tokens` cited "during" as the reason stemming runs
+    // after the stopword check, and "during" was not actually in the list —
+    // harmless while these tokens only nudged a floor, but v3.0 shows uncovered
+    // terms to the user by name, and "nothing above covers during" is noise.
+    // These also reconcile this list with `graph::STOPWORDS`, which had a
+    // different set; two disagreeing stopword lists in one codebase is its own
+    // small defect.
+    "during", "while", "until", "unless", "before", "after", "again", "against", "above", "below",
+    "between", "through", "under", "over", "because", "also", "just", "only", "very", "much",
+    "many", "each", "both", "same", "other", "another", "always", "never", "still", "even", "ever",
+    "every", "first", "found", "thing", "things", "value", "default", "if", "so", "up", "out",
+    "off", "down", "no", "yes",
 ];
 
 /// v1.0.0: tokenize a query into deduped CONTENT tokens — the same word
@@ -5106,5 +5284,226 @@ mod tests {
             "compression must reduce tokens by >=25% on long memories; \
              raw={raw_tokens} compressed={compressed_tokens} reduction={reduction:.2}"
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn conn_with(texts: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("schema");
+        for (i, text) in texts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO memories
+                 (memory_id, scope, kind, text, normalized_text, confidence,
+                  provenance_snapshot_json, created_at)
+                 VALUES (?1, 'project', 'fact', ?2, ?2, 0.9, '{}', '2026-01-01T00:00:00Z')",
+                rusqlite::params![format!("m{i}"), text],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    fn capsule(summary: &str) -> ContextCapsule {
+        ContextCapsule {
+            id: String::new(),
+            kind: "memory".to_string(),
+            summary: summary.to_string(),
+            token_estimate: 10,
+            expansion_handle: format!("memory:{summary}"),
+            provenance: Vec::new(),
+            confidence: 0.9,
+            freshness: 0.5,
+            relevance: 0.0,
+            scope_weight: 0.9,
+            score: 0.5,
+        }
+    }
+
+    fn bundle(capsules: Vec<ContextCapsule>, coverage: f32, uncovered: &[&str]) -> ContextBundle {
+        ContextBundle {
+            stage: "localization".to_string(),
+            budget_tokens: 2000,
+            used_tokens: 20,
+            capsules,
+            excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.7,
+            evidence_coverage: coverage,
+            uncovered_terms: uncovered.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A bundle that answers the question fully must report full coverage and
+    /// name nothing — a complete answer should cost zero extra tokens.
+    #[test]
+    fn full_coverage_names_nothing() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "vacuum reclaims dead pages",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint wal",
+            &[capsule(
+                "project:fact - checkpoint the wal before copying brain.db",
+            )],
+        );
+        assert!(coverage > 0.99, "got {coverage}");
+        assert!(uncovered.is_empty(), "got {uncovered:?}");
+    }
+
+    /// The case that matters: capsules that touch part of the query. The
+    /// reader must be told which part memory does not cover, rather than being
+    /// left to infer it.
+    #[test]
+    fn partial_coverage_names_the_missing_terms() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "the migration runner snapshots before each step",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint wal migration",
+            &[capsule(
+                "project:fact - checkpoint the wal before copying brain.db",
+            )],
+        );
+        assert!(coverage < 1.0, "coverage should be partial: {coverage}");
+        assert!(
+            uncovered.iter().any(|t| t.starts_with("migrat")),
+            "the uncovered term must be named: {uncovered:?}"
+        );
+    }
+
+    /// Coverage is measured over the union of the capsules, not the best one:
+    /// the question is whether the bundle answers the query.
+    #[test]
+    fn coverage_is_collective_not_per_capsule() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "the migration runner snapshots before each step",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint migration",
+            &[
+                capsule("project:fact - checkpoint the wal before copying"),
+                capsule("project:fact - the migration runner snapshots first"),
+            ],
+        );
+        assert!(
+            coverage > 0.99,
+            "neither capsule covers both terms, but together they do: {coverage}"
+        );
+        assert!(uncovered.is_empty(), "got {uncovered:?}");
+    }
+
+    /// A query of nothing but stopwords has no content to measure. Claiming a
+    /// gap there would make every vague question look like a memory failure.
+    #[test]
+    fn an_unmeasurable_query_does_not_claim_a_gap() {
+        let conn = conn_with(&["checkpoint the wal"]);
+        let (coverage, uncovered) =
+            evidence_coverage(&conn, "the and of", &[capsule("project:fact - checkpoint")]);
+        assert_eq!(coverage, 1.0);
+        assert!(uncovered.is_empty());
+    }
+
+    /// The case that made this need its own IDF. A query term the corpus has
+    /// never seen is the *strongest* evidence memory does not cover the
+    /// question — but the per-memory floor's IDF zeroes exactly those, because
+    /// there an out-of-corpus word would sink every candidate. Reusing it here
+    /// made "checkpoint the wal during a kubernetes rollout" report full
+    /// coverage on the strength of the WAL half alone.
+    #[test]
+    fn a_term_the_corpus_has_never_seen_counts_as_a_gap() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "vacuum reclaims dead pages",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint the wal during a kubernetes rollout",
+            &[capsule(
+                "project:fact - checkpoint the wal before copying brain.db",
+            )],
+        );
+        assert!(
+            coverage <= PARTIAL_EVIDENCE_COVERAGE,
+            "an unknown half of the question must read as thin, not complete: {coverage}"
+        );
+        assert!(
+            uncovered.iter().any(|t| t.starts_with("kubernet")),
+            "the unknown term must be named: {uncovered:?}"
+        );
+    }
+
+    /// …and the mirror: a term in *every* memory (the project name) carries no
+    /// signal either way and must not inflate coverage.
+    #[test]
+    fn a_ubiquitous_term_carries_no_weight() {
+        let conn = conn_with(&["kimetsu checkpoint wal", "kimetsu vacuum pages"]);
+        let (coverage, _) = evidence_coverage(
+            &conn,
+            "kimetsu vacuum",
+            &[capsule("project:fact - kimetsu vacuum pages")],
+        );
+        assert!(coverage > 0.99, "got {coverage}");
+    }
+
+    #[test]
+    fn an_empty_query_does_not_claim_a_gap() {
+        let conn = conn_with(&["checkpoint the wal"]);
+        assert_eq!(evidence_coverage(&conn, "", &[]).0, 1.0);
+    }
+
+    // ── The rendered notice ──────────────────────────────────────────────
+
+    #[test]
+    fn a_complete_bundle_gets_no_notice() {
+        assert!(partial_evidence_notice(&bundle(vec![capsule("a")], 1.0, &[])).is_none());
+        assert!(
+            partial_evidence_notice(&bundle(vec![capsule("a")], 0.9, &["x"])).is_none(),
+            "above the threshold is not partial"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_skipped_bundle_gets_no_notice() {
+        let mut skipped = bundle(Vec::new(), 0.0, &["x"]);
+        skipped.skipped = true;
+        assert!(
+            partial_evidence_notice(&skipped).is_none(),
+            "an empty bundle already says everything it can"
+        );
+        assert!(partial_evidence_notice(&bundle(Vec::new(), 0.0, &["x"])).is_none());
+    }
+
+    #[test]
+    fn a_partial_bundle_names_what_is_missing_and_tells_the_reader_what_to_do() {
+        let notice =
+            partial_evidence_notice(&bundle(vec![capsule("a")], 0.3, &["migration", "rollback"]))
+                .expect("a thin bundle must be flagged");
+        assert!(notice.contains("migration"), "got: {notice}");
+        assert!(notice.contains("rollback"), "got: {notice}");
+        assert!(
+            notice.contains("unknown"),
+            "the notice must tell the reader to abstain, not just report a gap: {notice}"
+        );
+    }
+
+    /// Naming twenty terms is noise.
+    #[test]
+    fn the_notice_caps_how_many_terms_it_names() {
+        let terms: Vec<String> = (0..12).map(|i| format!("term{i}")).collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let notice =
+            partial_evidence_notice(&bundle(vec![capsule("a")], 0.1, &refs)).expect("flagged");
+        assert!(notice.contains("and 6 more"), "got: {notice}");
+        assert!(!notice.contains("term9"), "got: {notice}");
     }
 }

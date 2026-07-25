@@ -40,6 +40,20 @@ returns nothing rather than padding the prompt. Key knobs in `[broker]`:
 `max_capsules` (8), `budget_floor_tokens` (1500), `budget_run_cap_tokens`
 (8000).
 
+**Abstention.** A bundle carries `evidence_coverage`: the IDF-weighted share
+of the query's discriminating terms the returned capsules cover *collectively*.
+Below 0.5 the injection is followed by an explicit line naming what none of them
+mention — "nothing above covers kubernetes, rollout. Treat the rest as unknown
+rather than inferring it." Kimetsu already abstained at the bundle level (top
+score below `min_score` → empty bundle, zero tokens); this is the signal for a
+bundle it *does* return, so a reader handed three capsules that touch half the
+question can tell that from three that answer it. The same fields are exposed on
+`kimetsu_brain_context`.
+
+The weighting is deliberately not the one the per-memory floor uses: there a
+query term absent from the whole corpus is zeroed (it would sink every
+candidate), while here it is the *strongest* evidence of a gap, and weighs most.
+
 **Budgeting.** Capsules are filled greedily in score order against **half** of
 the requested `budget_tokens` — the other half is headroom for the rest of the
 bundle (repo files, manifests, the render-time framing) and for the chars/4

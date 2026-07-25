@@ -279,6 +279,16 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push_str(&text);
     }
 
+    // v3.0: when the bundle collectively covers only part of the question, say
+    // so and name what is missing. Without this a reader handed three capsules
+    // that touch half the query cannot tell that from three that answer it,
+    // and fills the gap by inference — which is what BEAM's abstention track
+    // measures, and where Kimetsu scores worst.
+    if let Some(notice) = kimetsu_brain::context::partial_evidence_notice(&bundle) {
+        additional_context.push('\n');
+        additional_context.push_str(&notice);
+    }
+
     print_user_prompt_submit_context(&additional_context)?;
 
     // v1.5 (Story 2.3): persist newly surfaced handles so subsequent prompts

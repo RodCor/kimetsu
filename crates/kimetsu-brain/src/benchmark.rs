@@ -687,6 +687,8 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            evidence_coverage: 1.0,
+            uncovered_terms: Vec::new(),
         };
 
         let context = build_benchmark_context(
@@ -779,6 +781,8 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            evidence_coverage: 1.0,
+            uncovered_terms: Vec::new(),
         };
 
         let context = build_benchmark_context(
@@ -816,6 +820,8 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            evidence_coverage: 1.0,
+            uncovered_terms: Vec::new(),
         };
 
         let context = build_benchmark_context(
@@ -851,6 +857,8 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            evidence_coverage: 1.0,
+            uncovered_terms: Vec::new(),
         };
 
         let context = build_benchmark_context(
