@@ -358,8 +358,22 @@ No competitor owns this ground.
 ## Status
 
 **Landed and tested:** phase 0 (all seven items, including the `graph-lite`
-default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, 3a, 3b, 3c, 4a, and the audit
-half of 4b.
+default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, phase 3 entire, phase 4 entire,
+and the code half of phase 5 — the BrainBench sycophancy and poisoning tracks in
+`kimetsu-bench`, and `@kimetsu-ai/sdk` at `npm/kimetsu-sdk`.
+
+Three of those did not land as written, and the differences are the useful part
+of this section: 2d turned out to be a render-time bug rather than a ranking
+gap; 3e could not be gated on data nobody was recording; and 4b's "release on a
+local citation" is unreachable by construction, because a quarantined memory can
+never be cited. Each is explained where it appears above.
+
+The safety tracks earned their keep on their first run, which is the only real
+argument for a benchmark: the sycophancy track failed a case it should have
+passed and found that the query stemmer had no y→ies rule, so a question about
+`retry` treated a corpus saying `retries` as never mentioning it — the brain was
+telling users it did not know something it had just been told. Fixed, with the
+track green afterwards.
 
 **Open, buildable:** the benchmark *corpora* — BEAM 10M, LongMemEval to the
 full 500, BEAM-1M to 35/35, and a coding-agent memory benchmark. Those need
