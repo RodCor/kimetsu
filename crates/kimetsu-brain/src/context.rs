@@ -370,6 +370,13 @@ pub struct ContextBundle {
     /// precisely what memory does not know about, rather than being handed a
     /// number. Empty when coverage is complete or unmeasurable.
     pub uncovered_terms: Vec<String>,
+    /// v3.0: true when the query asked about order and the capsules were
+    /// re-rendered chronologically, oldest first, each carrying its date.
+    ///
+    /// The reader needs to be told, or a time-ordered bundle looks like a
+    /// relevance-ranked one whose ranking has gone wrong. See
+    /// [`crate::ordering`] for why ordering is rendered rather than retrieved.
+    pub chronological: bool,
 }
 
 /// Discriminating weight per query token, for *bundle* coverage.
@@ -529,6 +536,11 @@ pub(crate) struct Candidate {
     /// query embedding. Present when `embedding` is `Some`. Used for
     /// the absolute semantic relevance floor (min_semantic_score).
     pub(crate) cosine: Option<f32>,
+    /// v3.0: the memory's RFC 3339 creation time, carried so the bundle can be
+    /// re-rendered in time order when the query asks about sequence (see
+    /// [`crate::ordering`]). `None` for repo files and manifests, which have no
+    /// position in the memory timeline.
+    pub(crate) created_at: Option<String>,
 }
 
 pub fn retrieve_context(
@@ -842,6 +854,23 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         candidates
     };
 
+    // v3.0: keep each memory's creation time keyed by its stable handle before
+    // the candidates are consumed. Only built when the question is actually
+    // about order — on every other query it would be a map nobody reads.
+    let created_at_by_handle: std::collections::HashMap<String, String> =
+        if crate::ordering::is_ordering_query(&request.query) {
+            candidates
+                .iter()
+                .filter_map(|c| {
+                    c.created_at
+                        .clone()
+                        .map(|ts| (c.capsule.expansion_handle.clone(), ts))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let mut capsules = candidates
         .into_iter()
         .map(|candidate| candidate.capsule)
@@ -881,6 +910,8 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             // A skipped bundle covers nothing, by construction.
             evidence_coverage: 0.0,
             uncovered_terms: Vec::new(),
+            // Nothing was rendered, so nothing was rendered in time order.
+            chronological: false,
         });
     }
 
@@ -913,6 +944,22 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
     }
 
     let (coverage, uncovered_terms) = evidence_coverage(conn, &request.query, &included);
+
+    // v3.0: presentation only, and last — the budget has already decided which
+    // capsules ship, so re-rendering can neither admit one it rejected nor drop
+    // one it chose. Coverage is measured before the date prefixes are added so
+    // the score describes the memories, not their timestamps.
+    //
+    // `used_tokens` is recomputed because the prefixes are real tokens.
+    let chronological = !created_at_by_handle.is_empty();
+    let included = if chronological {
+        let dated = crate::ordering::render_chronologically(included, &created_at_by_handle);
+        used_tokens = dated.iter().map(|c| c.token_estimate).sum();
+        dated
+    } else {
+        included
+    };
+
     Ok(ContextBundle {
         stage: request.stage,
         budget_tokens: request.budget_tokens,
@@ -923,6 +970,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         top_score,
         evidence_coverage: coverage,
         uncovered_terms,
+        chronological,
     })
 }
 
@@ -1555,6 +1603,7 @@ fn memory_row_to_candidate(
         raw_relevance: trusted_relevance,
         embedding: row_embedding,
         cosine: cosine_score,
+        created_at: Some(created_at),
         capsule: ContextCapsule {
             id: new_id().to_string(),
             kind: "memory".to_string(),
@@ -1693,6 +1742,8 @@ fn repo_file_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            // A repo file has no position in the memory timeline.
+            created_at: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_file".to_string(),
@@ -1759,6 +1810,8 @@ fn manifest_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            // A repo file has no position in the memory timeline.
+            created_at: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_manifest".to_string(),
@@ -1817,6 +1870,8 @@ fn manifest_fts_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            // A repo file has no position in the memory timeline.
+            created_at: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_manifest".to_string(),
@@ -5334,6 +5389,7 @@ mod evidence_tests {
             top_score: 0.7,
             evidence_coverage: coverage,
             uncovered_terms: uncovered.iter().map(|s| s.to_string()).collect(),
+            chronological: false,
         }
     }
 
@@ -5505,5 +5561,153 @@ mod evidence_tests {
             partial_evidence_notice(&bundle(vec![capsule("a")], 0.1, &refs)).expect("flagged");
         assert!(notice.contains("and 6 more"), "got: {notice}");
         assert!(!notice.contains("term9"), "got: {notice}");
+    }
+
+    // ── v3.0: event ordering (crate::ordering) ──────────────────────────
+
+    /// Seed two memories on the same topic, written months apart, and retrieve
+    /// them. The end-to-end proof that `crate::ordering` is actually reachable
+    /// from the broker — the unit tests there operate on capsules the broker
+    /// never handed them.
+    fn ordering_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        for (mid, created, text) in [
+            (
+                "m_late",
+                "2026-06-01T09:00:00Z",
+                "switched the error type to thiserror",
+            ),
+            (
+                "m_early",
+                "2026-01-15T10:00:00Z",
+                "ran the thiserror schema migration",
+            ),
+        ] {
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at
+                )
+                VALUES (?1, 'project', 'fact', ?2, ?3, 1.0, NULL, '{}', ?4)
+                ",
+                rusqlite::params![mid, text, normalized, created],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'project')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+        conn
+    }
+
+    fn ordering_bundle(conn: &rusqlite::Connection, query: &str) -> ContextBundle {
+        retrieve_context_with_embedder(
+            conn,
+            "/fake-repo",
+            &kimetsu_core::config::BrokerWeights::default(),
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.to_string(),
+                budget_tokens: 4000,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve")
+    }
+
+    /// The fix, end to end: asked which came first, the reader is handed the
+    /// memories oldest-first with the dates it needs to answer.
+    #[test]
+    fn an_ordering_query_returns_a_dated_chronological_bundle() {
+        let conn = ordering_conn();
+        let bundle = ordering_bundle(&conn, "did we run the thiserror migration before or after");
+
+        assert!(bundle.chronological, "the query asked about order");
+        let order: Vec<&str> = bundle
+            .capsules
+            .iter()
+            .filter_map(|c| c.expansion_handle.strip_prefix("memory:"))
+            .collect();
+        assert_eq!(order, vec!["m_early", "m_late"], "oldest first");
+        for (capsule, date) in bundle.capsules.iter().zip(["2026-01-15", "2026-06-01"]) {
+            assert!(
+                capsule.summary.contains(&format!("[{date}]")),
+                "every capsule carries its date; got: {}",
+                capsule.summary
+            );
+        }
+    }
+
+    /// The narrow gate is the whole reason this is safe: an ordinary question
+    /// keeps relevance order and spends no tokens on dates.
+    #[test]
+    fn an_ordinary_query_is_untouched() {
+        let conn = ordering_conn();
+        let bundle = ordering_bundle(&conn, "how do we handle thiserror errors");
+
+        assert!(!bundle.chronological);
+        for capsule in &bundle.capsules {
+            assert!(
+                !capsule.summary.contains('['),
+                "no dates on a non-ordering query; got: {}",
+                capsule.summary
+            );
+        }
+    }
+
+    /// Presentation, not selection: reordering runs after the budget loop, so
+    /// the same capsules ship either way. If this ever diverges, ordering has
+    /// started changing *what* the reader sees rather than how.
+    #[test]
+    fn ordering_changes_the_rendering_not_the_selection() {
+        let conn = ordering_conn();
+        let ordered = ordering_bundle(&conn, "did we run the thiserror migration before or after");
+        let plain = ordering_bundle(&conn, "did we run the thiserror migration");
+
+        let mut got: Vec<&str> = ordered
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        let mut want: Vec<&str> = plain
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "same capsules, different order");
+    }
+
+    /// The dates are real tokens and the bundle's accounting has to say so,
+    /// or a budgeted caller under-counts what it just injected.
+    #[test]
+    fn the_dates_are_counted_against_the_budget() {
+        let conn = ordering_conn();
+        let ordered = ordering_bundle(&conn, "did we run the thiserror migration before or after");
+        let plain = ordering_bundle(&conn, "did we run the thiserror migration");
+        assert!(
+            ordered.used_tokens > plain.used_tokens,
+            "dated: {} vs plain: {}",
+            ordered.used_tokens,
+            plain.used_tokens
+        );
+        assert_eq!(
+            ordered.used_tokens,
+            ordered
+                .capsules
+                .iter()
+                .map(|c| c.token_estimate)
+                .sum::<u32>(),
+            "used_tokens must match what was actually rendered"
+        );
     }
 }

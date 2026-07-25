@@ -212,6 +212,7 @@ mod tests {
             raw_relevance: relevance,
             embedding: None,
             cosine: None,
+            created_at: None,
         }
     }
 

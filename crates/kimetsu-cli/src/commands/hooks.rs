@@ -254,6 +254,13 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push_str("\n\n");
     }
     additional_context.push_str("Kimetsu brain relevant knowledge for this task:");
+    // v3.0: a time-ordered bundle looks like a relevance-ranked one whose
+    // ranking has gone wrong unless the reader is told. Goes above the capsules
+    // because it describes how to read them.
+    if bundle.chronological {
+        additional_context.push('\n');
+        additional_context.push_str(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE);
+    }
     for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.

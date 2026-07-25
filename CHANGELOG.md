@@ -15,6 +15,24 @@ files the v3.0 plan behind it.
 
 ### Fixed
 
+- **Ordering questions get dated, ordered memories.** Memories carry
+  `created_at` and capsules did not, so a bundle rendered in score order with no
+  dates gave a reader asked "did we switch to `thiserror` before or after the
+  migration?" nothing to order the answer by — the reason event ordering was the
+  weakest measured ability (32.5% on BEAM 100K). Retrieval was never at fault:
+  the memories were found and selected, and the ordering was thrown away at
+  render time. When a query carries an ordering marker (`before`, `after`,
+  `first`, `when`, `timeline`, …) the bundle is now re-rendered oldest-first with
+  each memory's date in front of its text, under a line telling the reader that
+  is what they are looking at. It runs after the budget loop, so it is
+  presentation and not selection — it cannot admit a capsule the broker rejected
+  or drop one it chose — and `used_tokens` is recomputed because the dates cost
+  tokens. Repo files, which have no position in the memory timeline, keep their
+  relative order after the dated ones rather than being dropped or dated. The
+  marker gate is narrow on purpose: dating every capsule on every query would
+  spend tokens on the majority of questions that are not about time. Exposed as
+  `chronological` / `chronological_note` on `kimetsu_brain_context`.
+
 - **Pi and OpenClaw now inject anything at all.** Both generated extensions
   spawned `kimetsu` with `stdio: "ignore"`, so the context hook read an empty
   stdin (bailing on its minimum-prompt guard) and its output went to

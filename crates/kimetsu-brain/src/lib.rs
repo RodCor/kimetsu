@@ -33,6 +33,7 @@ pub mod lock;
 pub mod maintain;
 pub mod maintenance;
 pub mod migrate;
+pub mod ordering;
 pub mod packs;
 pub mod project;
 pub mod projector;

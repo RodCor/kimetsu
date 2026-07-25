@@ -875,6 +875,13 @@ pub fn brain_context_tool(
                 "uncovered_terms": bundle.uncovered_terms,
                 "partial_evidence_notice":
                     kimetsu_brain::context::partial_evidence_notice(&bundle),
+                // v3.0: true when the question was about order, so the capsules
+                // are oldest-first and each carries the date it was recorded —
+                // without which a time-ordered bundle reads as a broken ranking.
+                "chronological": bundle.chronological,
+                "chronological_note": bundle
+                    .chronological
+                    .then_some(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE),
                 "capsules": bundle.capsules,
                 "excluded": bundle.excluded,
             }))

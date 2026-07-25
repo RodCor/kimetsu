@@ -54,6 +54,28 @@ The weighting is deliberately not the one the per-memory floor uses: there a
 query term absent from the whole corpus is zeroed (it would sink every
 candidate), while here it is the *strongest* evidence of a gap, and weighs most.
 
+**Event ordering.** Memories carry `created_at`; capsules did not, so a bundle
+rendered in score order with no dates gave a reader asked "did we switch to
+`thiserror` before or after the migration?" nothing to order the answer *by*. At
+two events that is a coin flip, which is roughly what the 32.5% BEAM ordering
+score looked like. Nothing about retrieval was wrong — the memories were found
+and selected, and then the ordering information was thrown away at render time.
+
+So when the query contains an ordering marker (`before`, `after`, `first`,
+`when`, `timeline`, …), the bundle is re-rendered oldest-first with each memory's
+date in front of its text, under a line telling the reader that is what they are
+looking at. Repo files and manifests have no position in the memory timeline;
+they keep their relative order after the dated ones rather than being dropped or
+given a date they do not have.
+
+This runs **after** the budget loop, so it is presentation and not selection: it
+cannot admit a capsule the broker rejected or drop one it chose. `used_tokens` is
+recomputed because the dates are real tokens. The marker gate is deliberately
+narrow — timestamping every capsule on every query would spend tokens on the
+large majority of questions that are not about time, and reordering an ordinary
+bundle away from relevance would bury the best answer. `chronological` and
+`chronological_note` are exposed on `kimetsu_brain_context`.
+
 **Budgeting.** Capsules are filled greedily in score order against **half** of
 the requested `budget_tokens` — the other half is headroom for the rest of the
 bundle (repo files, manifests, the render-time framing) and for the chars/4

@@ -445,6 +445,7 @@ fn fetch_graph_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            created_at: Some(created_at),
             capsule: ContextCapsule {
                 id: kimetsu_core::ids::new_id().to_string(),
                 kind: "memory".to_string(),

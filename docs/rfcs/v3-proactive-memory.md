@@ -249,9 +249,18 @@ prevents.
   single shared word would attach every new memory to half the corpus. Emitting
   the declared-but-unused `refines` / `dead_end_of` / `lesson_from` types is
   still open.
-- **2d. Event ordering** (32.5% → target 70%+): an `occurred_at` ordering
-  signal, `work_episodes` exposed to retrieval as an ordered episodic strand,
-  and ordered capsules rendered with explicit timestamps.
+- **2d. Event ordering** (32.5% → target 70%+): **landed**, though not as
+  planned. The plan proposed an `occurred_at` signal and an episodic strand in
+  scoring. Reading the render path showed the problem is not in retrieval at
+  all: memories carry `created_at`, capsules do not, and the bundle is rendered
+  as an unordered relevance-sorted set with no dates. The information is found
+  and selected and then discarded at the last step, so a reader asked which came
+  first has nothing to order by and guesses — a coin flip at two events, which
+  is what 30% looks like. So the fix is at render time: on a query carrying an
+  ordering marker, re-render the bundle oldest-first with each memory's date in
+  front of its text, under a line saying so. It runs after the budget loop, so
+  it cannot change *which* capsules ship — only how they read. Adding a scoring
+  signal was never necessary, and would have been the more invasive change.
 - **2e. Abstention** (45% → target 75%+): a calibrated evidence-coverage score
   on `ContextBundle`, rendered as an explicit "memory does not cover X" line, so
   a reader can abstain on Kimetsu's advice instead of confabulating from partial
@@ -342,10 +351,10 @@ No competitor owns this ground.
 ## Status
 
 **Landed and tested:** phase 0 (all seven items, including the `graph-lite`
-default flip), phase 1, 2a, 2c, 3a, 3b, 3c, 4a, and the audit half of 4b.
+default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, 3a, 3b, 3c, 4a, and the audit
+half of 4b.
 
-**Open, buildable:** 2d (event ordering), 2e (abstention), 2f (bitemporal),
-2h (user profile prior), 3d (graduated skills in the warm start), 3e
+**Open, buildable:** 3d (graduated skills in the warm start), 3e
 (`proactive_prefetch` default-on), quarantine-on-import (4b), 4c (sycophancy
 track), 4d (belief drift), and all of phase 5.
 

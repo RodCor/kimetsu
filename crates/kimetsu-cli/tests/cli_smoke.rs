@@ -470,6 +470,67 @@ fn context_hook_warm_starts_once_per_session() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// v3.0: the ordering fix, seen from where it matters — the text the agent
+/// actually receives.
+///
+/// Event ordering is Kimetsu's worst measured ability (32.5% on BEAM 100K), and
+/// the cause was that dates existed in the database and never reached the
+/// reader. So this asserts on the injected string, not on the bundle: the dates
+/// have to survive retrieval, the budget loop, and the hook's summary-stripping
+/// to be worth anything.
+#[test]
+fn context_hook_dates_and_orders_capsules_for_an_ordering_question() {
+    let root = temp_project_dir("ordering_hook");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    for text in [
+        "Migrated the brain schema to v11 for the entity table",
+        "Switched the brain schema error type to thiserror",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Fact,
+            text,
+        )
+        .expect("add_memory");
+    }
+
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"ordering-1","prompt":"did we migrate the brain schema before or after switching to thiserror"}"#,
+    );
+    assert!(
+        out.contains("chronological order"),
+        "the reader must be told the bundle is time-ordered; got: {out}"
+    );
+    // Memories added in this test are recorded today, so today's date is what
+    // the capsules must carry. Asserting on the shape rather than a literal
+    // keeps this from expiring.
+    assert!(
+        out.contains("] Migrated the brain schema") || out.contains("] Switched the brain schema"),
+        "capsules must carry their date after the hook strips the kind prefix; got: {out}"
+    );
+
+    // The same corpus, asked an ordinary question, must be untouched: the gate
+    // is what keeps this from spending tokens on the majority of queries.
+    let plain = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"ordering-2","prompt":"what is the brain schema error type"}"#,
+    );
+    assert!(
+        !plain.contains("chronological order"),
+        "an ordinary question must keep relevance order; got: {plain}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Claude Code has its own `SessionStart` hook, so it must NOT pass
 /// `--warm-on-first-prompt` — and without the flag the hook must stay exactly
 /// as it was, or those users would get the block twice.
