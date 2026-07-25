@@ -279,7 +279,7 @@ pub struct ContextRequest {
     pub stage: String,
     pub query: String,
     pub budget_tokens: u32,
-    /// v3.0: per-request override for how the lexical and semantic rankings
+    /// v2.6: per-request override for how the lexical and semantic rankings
     /// are merged (`"linear"` / `"rrf"`; see [`crate::fusion`]).
     ///
     /// Empty (the default) means "use `[broker] fusion`". This exists so
@@ -287,6 +287,14 @@ pub struct ContextRequest {
     /// process — the reason the shipped default is still `linear` is that
     /// nothing had measured the alternative on a real brain.
     pub fusion: String,
+    /// v2.6: per-request override for how `raw_relevance` is normalized into
+    /// the `relevance` term (`"per_kind"` / `"global"`; see
+    /// [`Normalization`]).
+    ///
+    /// Empty (the default) means "use `[broker] normalization`". Exists for
+    /// the same reason `fusion` does: the alternative had to be measurable on
+    /// one corpus in one process before it could be argued for.
+    pub normalization: String,
     /// v0.6: domain-hint tags. Capsules whose text or kind contains any
     /// of these strings receive a 1.4× score boost, pushing on-domain
     /// capsules above the `min_score` threshold when they would otherwise
@@ -349,7 +357,7 @@ pub struct ContextBundle {
     /// v0.6: best composite score observed before the skip check.
     /// Useful for diagnostics ("why was the brain silent?").
     pub top_score: f32,
-    /// v3.0: what fraction of the query's discriminating power the returned
+    /// v2.6: what fraction of the query's discriminating power the returned
     /// capsules cover, *collectively*, in `[0, 1]`.
     ///
     /// Kimetsu already abstains at the bundle level — nothing above
@@ -364,13 +372,13 @@ pub struct ContextBundle {
     /// the per-memory lexical floor uses, applied to the bundle as a whole.
     /// 1.0 when there is no discriminating term to measure against.
     pub evidence_coverage: f32,
-    /// v3.0: the discriminating query terms *no* returned capsule mentions.
+    /// v2.6: the discriminating query terms *no* returned capsule mentions.
     ///
     /// The actionable half of `evidence_coverage`: a reader can be told
     /// precisely what memory does not know about, rather than being handed a
     /// number. Empty when coverage is complete or unmeasurable.
     pub uncovered_terms: Vec<String>,
-    /// v3.0: true when the query asked about order and the capsules were
+    /// v2.6: true when the query asked about order and the capsules were
     /// re-rendered chronologically, oldest first, each carrying its date.
     ///
     /// The reader needs to be told, or a time-ordered bundle looks like a
@@ -536,7 +544,7 @@ pub(crate) struct Candidate {
     /// query embedding. Present when `embedding` is `Some`. Used for
     /// the absolute semantic relevance floor (min_semantic_score).
     pub(crate) cosine: Option<f32>,
-    /// v3.0: the memory's RFC 3339 creation time, carried so the bundle can be
+    /// v2.6: the memory's RFC 3339 creation time, carried so the bundle can be
     /// re-rendered in time order when the query asks about sequence (see
     /// [`crate::ordering`]). `None` for repo files and manifests, which have no
     /// position in the memory timeline.
@@ -733,7 +741,11 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
     // For Feature (default), weights_for_task_kind returns the base unchanged.
     let stage_weights = weights_for_stage(weights, &request.stage);
     let effective_weights = weights_for_task_kind(stage_weights, request.task_kind);
-    normalize_and_score(&mut candidates, effective_weights);
+    normalize_and_score(
+        &mut candidates,
+        effective_weights,
+        Normalization::from_config(&request.normalization),
+    );
 
     // E3: merge task-kind prefer_role hints with caller-supplied prefer_roles.
     // For Feature the hints are empty so this is a no-op (neutral).
@@ -854,7 +866,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         candidates
     };
 
-    // v3.0: keep each memory's creation time keyed by its stable handle before
+    // v2.6: keep each memory's creation time keyed by its stable handle before
     // the candidates are consumed. Only built when the question is actually
     // about order — on every other query it would be a map nobody reads.
     let created_at_by_handle: std::collections::HashMap<String, String> =
@@ -945,7 +957,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
 
     let (coverage, uncovered_terms) = evidence_coverage(conn, &request.query, &included);
 
-    // v3.0: presentation only, and last — the budget has already decided which
+    // v2.6: presentation only, and last — the budget has already decided which
     // capsules ship, so re-rendering can neither admit one it rejected nor drop
     // one it chose. Coverage is measured before the date prefixes are added so
     // the score describes the memories, not their timestamps.
@@ -1531,7 +1543,7 @@ fn memory_row_to_candidate(
     use_count: i64,
     usefulness_score: f64,
     last_useful_at: Option<String>,
-    // v3.0: the memory's stored provenance snapshot, classified into a trust
+    // v2.6: the memory's stored provenance snapshot, classified into a trust
     // multiplier. See `crate::trust`.
     provenance_snapshot: Option<String>,
     half_life_days: f32,
@@ -1586,7 +1598,7 @@ fn memory_row_to_candidate(
     let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
     let biased_relevance = apply_usefulness_boost(raw_relevance, multiplier);
 
-    // v3.0: discount by origin, unless the memory has proven itself here.
+    // v2.6: discount by origin, unless the memory has proven itself here.
     //
     // `last_useful_at` is set only on a citation in a *successful* run, so its
     // presence is exactly "this has been tested on this machine" — at which
@@ -1894,20 +1906,79 @@ fn manifest_fts_candidates(
     Ok(candidates)
 }
 
-fn normalize_and_score(candidates: &mut [Candidate], weights: StageWeights) {
+/// v2.6: how `raw_relevance` becomes the `relevance` term of the composite
+/// score.
+///
+/// ## Per-kind (the rule through v2.5)
+///
+/// Each `kind` is normalized against the best `raw_relevance` *of that kind*.
+/// The consequence is that the top memory and the top repo_file both score
+/// `relevance = 1.0` no matter how good either actually is: on a query where
+/// memory has the answer and no file is relevant, the best of the irrelevant
+/// files is still promoted to a perfect relevance and competes for budget on
+/// the strength of the other three score terms alone.
+///
+/// That is the distortion the lexical and semantic *floors* exist to
+/// compensate for — they prune the weak candidate before normalization can
+/// flatter it. A floor is a blunt instrument for this: it is a fixed
+/// threshold standing in for a comparison the normalizer could just make.
+///
+/// ## Global
+///
+/// One max over all candidates, so `relevance` means the same thing across
+/// kinds and a candidate that is merely the best of a bad kind keeps a low
+/// relevance. Nothing else in the pipeline changes.
+///
+/// ## Which one runs
+///
+/// Selectable, defaulting to `per_kind`. Global normalization is the more
+/// principled rule and it is *still* not the default here, for the same
+/// reason RRF is not: the house rule is that a ranking change ships with a
+/// measurement on a real corpus, and an argument from first principles is not
+/// one. `[broker] normalization` and the per-request override are how a
+/// corpus gets to settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Normalization {
+    /// Normalize within each capsule kind. Kimetsu's behaviour through v2.5.
+    #[default]
+    PerKind,
+    /// Normalize against a single max over every candidate.
+    Global,
+}
+
+impl Normalization {
+    /// Parse from config. Unknown values fall back to the default, matching
+    /// how `[broker] fusion` treats an unrecognized rule — a typo in a config
+    /// file must not silently change ranking.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "global" => Self::Global,
+            _ => Self::PerKind,
+        }
+    }
+}
+
+fn normalize_and_score(
+    candidates: &mut [Candidate],
+    weights: StageWeights,
+    normalization: Normalization,
+) {
+    // The per-kind rule keys on the capsule kind; the global rule uses one
+    // bucket for everything. Sharing the map keeps a single scoring loop.
     let mut max_by_kind = HashMap::<String, f32>::new();
+    let bucket = |candidate: &Candidate| match normalization {
+        Normalization::PerKind => candidate.capsule.kind.clone(),
+        Normalization::Global => String::new(),
+    };
     for candidate in candidates.iter() {
         max_by_kind
-            .entry(candidate.capsule.kind.clone())
+            .entry(bucket(candidate))
             .and_modify(|max| *max = (*max).max(candidate.raw_relevance))
             .or_insert(candidate.raw_relevance);
     }
 
     for candidate in candidates {
-        let max = max_by_kind
-            .get(&candidate.capsule.kind)
-            .copied()
-            .unwrap_or(0.0);
+        let max = max_by_kind.get(&bucket(candidate)).copied().unwrap_or(0.0);
         let relevance = if max <= f32::EPSILON {
             if candidate.raw_relevance > 0.0 {
                 1.0
@@ -1993,10 +2064,10 @@ const STOPWORDS: &[&str] = &[
     "please", "tell", "give", "show", "want", "need", "get", "got", "use", "using", "there",
     "their", "they", "them", "then", "than", "some", "any", "all", "more", "most", "such", "via",
     "per",
-    // v3.0: the function words this list had always meant to cover. The
+    // v2.6: the function words this list had always meant to cover. The
     // comment in `content_tokens` cited "during" as the reason stemming runs
     // after the stopword check, and "during" was not actually in the list —
-    // harmless while these tokens only nudged a floor, but v3.0 shows uncovered
+    // harmless while these tokens only nudged a floor, but v2.6 shows uncovered
     // terms to the user by name, and "nothing above covers during" is noise.
     // These also reconcile this list with `graph::STOPWORDS`, which had a
     // different set; two disagreeing stopword lists in one codebase is its own
@@ -2120,7 +2191,7 @@ fn weighted_coverage(content: &[String], idf: &HashMap<String, f32>, summary: &s
 /// Conservative: a suffix is stripped only when ≥4 chars remain, and only
 /// one suffix is stripped.
 ///
-/// v3.0: plus the English y→ies rule, which the suffix list alone gets wrong in
+/// v2.6: plus the English y→ies rule, which the suffix list alone gets wrong in
 /// both directions. `"retries"` strips `es` to `retri`; `"retry"` matches no
 /// suffix and stays `retry`; neither is a prefix of the other, so a query
 /// asking about `retry` treats a corpus that says `retries` as not mentioning
@@ -4651,6 +4722,83 @@ mod tests {
 
     /// E3-2: weight renormalization — weights_for_task_kind(w, Debug) sums
     /// to approximately the same total as the input weights.
+    /// v2.6 (2b): build two candidates of different kinds where the memory is
+    /// a strong match and the repo_file is a weak one.
+    fn two_kinds_one_strong() -> Vec<Candidate> {
+        let mk = |kind: &str, raw: f32| Candidate {
+            capsule: ContextCapsule {
+                id: format!("{kind}-1"),
+                kind: kind.to_string(),
+                summary: String::new(),
+                token_estimate: 0,
+                expansion_handle: String::new(),
+                provenance: Vec::new(),
+                confidence: 0.0,
+                freshness: 0.0,
+                relevance: 0.0,
+                scope_weight: 0.0,
+                score: 0.0,
+            },
+            raw_relevance: raw,
+            embedding: None,
+            cosine: None,
+            created_at: None,
+        };
+        vec![mk("memory", 0.9), mk("repo_file", 0.1)]
+    }
+
+    /// The behaviour 2b exists to describe: per-kind normalization promotes
+    /// the best of an irrelevant kind to a perfect relevance.
+    #[test]
+    fn per_kind_normalization_flatters_the_best_of_a_weak_kind() {
+        let mut candidates = two_kinds_one_strong();
+        let weights = StageWeights {
+            relevance: 1.0,
+            confidence: 0.0,
+            freshness: 0.0,
+            scope: 0.0,
+        };
+        normalize_and_score(&mut candidates, weights, Normalization::PerKind);
+        assert!((candidates[0].capsule.relevance - 1.0).abs() < 1e-6);
+        assert!(
+            (candidates[1].capsule.relevance - 1.0).abs() < 1e-6,
+            "per-kind gives the lone weak repo_file relevance 1.0, got {}",
+            candidates[1].capsule.relevance
+        );
+    }
+
+    /// Global normalization keeps relevance comparable across kinds: the weak
+    /// repo_file stays weak because it is measured against the same max.
+    #[test]
+    fn global_normalization_keeps_relevance_comparable_across_kinds() {
+        let mut candidates = two_kinds_one_strong();
+        let weights = StageWeights {
+            relevance: 1.0,
+            confidence: 0.0,
+            freshness: 0.0,
+            scope: 0.0,
+        };
+        normalize_and_score(&mut candidates, weights, Normalization::Global);
+        assert!((candidates[0].capsule.relevance - 1.0).abs() < 1e-6);
+        let weak = candidates[1].capsule.relevance;
+        assert!(
+            (weak - (0.1 / 0.9)).abs() < 1e-6,
+            "global normalizes against the single max, got {weak}"
+        );
+        assert!(weak < candidates[0].capsule.relevance);
+    }
+
+    /// An unknown or empty value must not silently change ranking — a typo in
+    /// project.toml falls back to the shipped rule.
+    #[test]
+    fn unknown_normalization_falls_back_to_per_kind() {
+        assert_eq!(Normalization::from_config(""), Normalization::PerKind);
+        assert_eq!(Normalization::from_config("per_kind"), Normalization::PerKind);
+        assert_eq!(Normalization::from_config("nonsense"), Normalization::PerKind);
+        assert_eq!(Normalization::from_config("global"), Normalization::Global);
+        assert_eq!(Normalization::from_config("  GLOBAL "), Normalization::Global);
+    }
+
     #[test]
     fn weights_for_task_kind_renormalizes_to_unit_sum() {
         let base = StageWeights {
@@ -5588,7 +5736,7 @@ mod evidence_tests {
         assert!(!notice.contains("term9"), "got: {notice}");
     }
 
-    // ── v3.0: light stemming ─────────────────────────────────────────────
+    // ── v2.6: light stemming ─────────────────────────────────────────────
 
     /// The defect BrainBench's sycophancy track surfaced: a query asking about
     /// `retry` treated a corpus saying `retries` as not mentioning it, because
@@ -5689,7 +5837,7 @@ mod evidence_tests {
         );
     }
 
-    // ── v3.0: event ordering (crate::ordering) ──────────────────────────
+    // ── v2.6: event ordering (crate::ordering) ──────────────────────────
 
     /// Seed two memories on the same topic, written months apart, and retrieve
     /// them. The end-to-end proof that `crate::ordering` is actually reachable

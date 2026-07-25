@@ -1659,7 +1659,7 @@ struct BrainExportArgs {
     /// lesson body with no metadata.
     #[arg(long)]
     redact_tags: bool,
-    /// v3.0 #4: pack name. Setting any manifest flag (--name/--version/
+    /// v2.6 #4: pack name. Setting any manifest flag (--name/--version/
     /// --description) writes a self-describing shareable PACK envelope; without
     /// them, the bare memory array (back-compat). Output is ALWAYS gzip-compressed.
     #[arg(long)]
@@ -1687,7 +1687,7 @@ struct BrainImportArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
-    /// v3.0 #4: install mode. `merge` (default) adds the pack additively, dedups
+    /// v2.6 #4: install mode. `merge` (default) adds the pack additively, dedups
     /// against what you have. `replace` supersedes your current memories in the
     /// pack's scope(s) first (reversible — invalidated, not deleted), then loads
     /// the pack; requires --yes.
@@ -1696,7 +1696,7 @@ struct BrainImportArgs {
     /// Confirm a destructive `--mode replace`.
     #[arg(long)]
     yes: bool,
-    /// v3.0: hold every imported memory in the review queue instead of putting
+    /// v2.6: hold every imported memory in the review queue instead of putting
     /// it straight into retrieval. Nothing the pack contains can influence a
     /// session until you accept it with `kimetsu brain memory accept`.
     ///
@@ -1884,7 +1884,7 @@ struct MemoryAddArgs {
     remote: RemoteWriteArgs,
 }
 
-/// v3.0 #3 Slice C: target a `kimetsu-remote` server for a CLI write instead of
+/// v2.6 #3 Slice C: target a `kimetsu-remote` server for a CLI write instead of
 /// the local brain. Shared (clap `flatten`) by remote-capable write commands.
 #[derive(Debug, Args, Clone)]
 struct RemoteWriteArgs {
@@ -2246,7 +2246,7 @@ fn install_tracing() {
 fn run() -> KimetsuResult<()> {
     let cli = Cli::parse();
 
-    // v3.0 #3 (fleet write-safety): stamp a write origin `<machine>/<agent>` on
+    // v2.6 #3 (fleet write-safety): stamp a write origin `<machine>/<agent>` on
     // every event this process appends, so a shared/replicated brain can
     // attribute writes to the device + agent that made them. The machine part is
     // also the HLC node id (Slice B), so equal-timestamp events break ties
@@ -4152,12 +4152,64 @@ scope = 0.1
             kind: "memory".to_string(),
             score: 0.9,
         }];
-        let bundle = daemon_capsules_to_bundle(&request, wire, false, 0.9);
+        // No brain at this path, so coverage measurement declines and returns
+        // the neutral (1.0, []) — which is the point: an unmeasurable bundle
+        // must render as no claim, never as a false "memory does not cover".
+        let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-no-brain");
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9);
         assert_eq!(bundle.capsules.len(), 1);
         assert_eq!(bundle.capsules[0].summary, "repo:fact - x");
         assert_eq!(bundle.capsules[0].kind, "memory");
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);
+        assert!(
+            (bundle.evidence_coverage - 1.0).abs() < 1e-6,
+            "unmeasurable coverage must be neutral, got {}",
+            bundle.evidence_coverage
+        );
+        assert!(bundle.uncovered_terms.is_empty());
+        assert!(
+            !bundle.chronological,
+            "ordering queries never reach the daemon path"
+        );
+    }
+
+    /// v2.6: a skipped bundle covers nothing, matching the in-process rule.
+    /// Regression guard for the daemon path, which assembles bundles outside
+    /// the retrieval finalization where that rule is enforced.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn daemon_skipped_bundle_reports_zero_coverage() {
+        let request = kimetsu_brain::context::ContextRequest {
+            stage: "localization".to_string(),
+            budget_tokens: 2000,
+            ..Default::default()
+        };
+        let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-skipped");
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, Vec::new(), true, 0.1);
+        assert!(bundle.skipped);
+        assert_eq!(bundle.evidence_coverage, 0.0);
+        assert!(bundle.uncovered_terms.is_empty());
+    }
+
+    /// v2.6: the daemon carries no `created_at`, so an ordering query has to
+    /// decline it and fall back to the in-process path that has the dates.
+    /// Without this the semantic build silently lost the phase-2d fix — the
+    /// bug this release found by building the embeddings flavor at all.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_ordering_query_declines_the_daemon() {
+        let request = kimetsu_brain::context::ContextRequest {
+            stage: "localization".to_string(),
+            query: "which came first, the retry cap or the backoff?".to_string(),
+            budget_tokens: 2000,
+            ..Default::default()
+        };
+        let tmp = std::env::temp_dir().join("kimetsu-ordering-declines-daemon");
+        assert!(
+            crate::commands::brain::try_daemon_retrieve(&tmp, &request).is_none(),
+            "an ordering query must not be answered from the dateless daemon path"
+        );
     }
 
     // ── build_served_event_payload unit tests (Changes A + B) ───────────────

@@ -110,7 +110,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
                         "used_tokens": bundle.used_tokens,
                         "capsule_count": bundle.capsules.len(),
                         "excluded_count": bundle.excluded.len(),
-                        // v3.0: the bundle's own judgement of itself, which the
+                        // v2.6: the bundle's own judgement of itself, which the
                         // MCP surface has exposed since abstention landed. It
                         // belongs here too — a JSON caller cannot tell a bundle
                         // that answers the question from one that touches half
@@ -180,7 +180,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
             // `[sync] dir` is configured (and `auto` not disabled). Best-effort:
             // a sync failure must never break session shutdown.
             auto_sync_at_session_end(&workspace);
-            // v3.0: the other upkeep tick. Codex, Pi and OpenClaw have no
+            // v2.6: the other upkeep tick. Codex, Pi and OpenClaw have no
             // session-start event, so session end is where their brains get
             // their maintenance — and on Claude Code it is a second chance
             // after a long session moved the corpus.
@@ -511,7 +511,7 @@ pub(crate) fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 /// Gated by `[broker] warm_start` (default true).
 /// Silent when no digest AND no live episode.
 pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
-    // v3.0: session start is the natural upkeep tick — the agent is about to
+    // v2.6: session start is the natural upkeep tick — the agent is about to
     // work, so anything overdue should run alongside rather than in front of
     // it. Detached, so this returns immediately. Before the warm-start guard
     // below: a brain with nothing to say still needs its upkeep.
@@ -1008,7 +1008,7 @@ pub(crate) fn brain_policy(args: PolicyArgs) -> KimetsuResult<()> {
     let prior = inject_policy::Policy::prior();
     let policy_accuracy = inject_policy::accuracy(&policy, &examples);
     let prior_accuracy = inject_policy::accuracy(&prior, &examples);
-    // v3.0: acceptance per hook surface. `broker.proactive_prefetch` has been
+    // v2.6: acceptance per hook surface. `broker.proactive_prefetch` has been
     // default-off since it shipped, waiting on exactly this number, and nothing
     // was recording it — so the flag could never graduate. See
     // `inject_policy::surface_acceptance`.
@@ -1362,7 +1362,7 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         }
     };
 
-    // v3.0: whether the pack is held for review rather than entering
+    // v2.6: whether the pack is held for review rather than entering
     // retrieval. The default is decided by where the pack came from, because
     // that is what the threat model turns on: a URL is content authored
     // elsewhere by someone else, fetched over the network, which `trust.rs`
@@ -1849,6 +1849,16 @@ pub(crate) fn try_daemon_retrieve(
     request: &kimetsu_brain::context::ContextRequest,
 ) -> Option<kimetsu_brain::context::ContextBundle> {
     use embed_daemon::{client, proto};
+    // v2.6: an ordering query needs each memory's `created_at`, and the wire
+    // protocol carries summary/kind/score only — no handle to look a date up
+    // by. Rather than widen the protocol for a rare query shape, decline the
+    // daemon entirely and let the caller fall back to the in-process path,
+    // which has the dates and renders them. Semantic ranking is worth less
+    // here than the dates are: "which came first" is answered by the ordering,
+    // not by which memory ranks top.
+    if kimetsu_brain::ordering::is_ordering_query(&request.query) {
+        return None;
+    }
     let model = resolve_daemon_model(workspace)?;
     let args = proto::RetrieveArgs {
         v: proto::PROTOCOL_VERSION,
@@ -1866,7 +1876,7 @@ pub(crate) fn try_daemon_retrieve(
             skipped,
             top_score,
         }) => Some(daemon_capsules_to_bundle(
-            request, capsules, skipped, top_score,
+            workspace, request, capsules, skipped, top_score,
         )),
         _ => {
             // Unreachable/errored: we already know it didn't answer, so spawn
@@ -1891,16 +1901,26 @@ pub(crate) fn try_daemon_retrieve(
 /// rendering code path.
 #[cfg(feature = "embeddings")]
 pub(crate) fn daemon_capsules_to_bundle(
+    workspace: &std::path::Path,
     request: &kimetsu_brain::context::ContextRequest,
     capsules: Vec<embed_daemon::proto::Capsule>,
     skipped: bool,
     top_score: f32,
 ) -> kimetsu_brain::context::ContextBundle {
     use kimetsu_brain::context::{ContextBundle, ContextCapsule};
-    let capsules = capsules
+    let capsules: Vec<ContextCapsule> = capsules
         .into_iter()
         .map(|c| ContextCapsule::wire_minimal(c.summary, c.kind, c.score))
         .collect();
+    // v2.6: measure coverage here too. The in-process path does it during
+    // finalization, which this path skips — so without this the "memory does
+    // not cover X" line was dead on exactly the builds that run a daemon.
+    // A skipped bundle covers nothing, matching the in-process rule.
+    let (evidence_coverage, uncovered_terms) = if skipped {
+        (0.0, Vec::new())
+    } else {
+        project::evidence_coverage_readonly(workspace, &request.query, &capsules)
+    };
     ContextBundle {
         stage: request.stage.clone(),
         budget_tokens: request.budget_tokens,
@@ -1909,6 +1929,11 @@ pub(crate) fn daemon_capsules_to_bundle(
         excluded: Vec::new(),
         skipped,
         top_score,
+        evidence_coverage,
+        uncovered_terms,
+        // Ordering queries never reach the daemon (`try_daemon_retrieve`
+        // declines them), so a bundle from here is never time-ordered.
+        chronological: false,
     }
 }
 
@@ -1992,7 +2017,7 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
         .collect();
 
     // F3 Stories 3.2 & 3.4: regret-flagged memories + invalidations by reason.
-    // v3.0: also report the resolved tier — which pipeline the numbers above
+    // v2.6: also report the resolved tier — which pipeline the numbers above
     // were produced by is not something a user should have to infer.
     let (regret_flagged, inv_by_reason, tier, tier_downgraded) = match project::load_project(&cwd) {
         Ok((_paths, config, conn)) => {
@@ -2946,7 +2971,7 @@ pub(crate) fn brain_tune_sweep(
         &toml::Value::Float(winner.combo.min_semantic_score as f64),
     )
     .map_err(|e| format!("tune --apply: {e}"))?;
-    // v3.0: the fusion rule is swept alongside the floors, so --apply writes
+    // v2.6: the fusion rule is swept alongside the floors, so --apply writes
     // it too. Kimetsu ships `linear`; this is the path by which a corpus that
     // prefers rank fusion actually gets it.
     set_toml_edit_path(

@@ -452,6 +452,11 @@ impl BrainSession {
             request.min_score = self.config.broker.abstain_min_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        // v2.6: same override rule for the normalization mode — resolved onto
+        // the request itself because that is where scoring reads it.
+        if request.normalization.is_empty() {
+            request.normalization = self.config.broker.normalization.clone();
+        }
         // A per-request fusion override beats the config, so a sweep can
         // compare both rules in one process against one corpus.
         let fusion = if request.fusion.is_empty() {
@@ -506,6 +511,11 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        // v2.6: same override rule for the normalization mode — resolved onto
+        // the request itself because that is where scoring reads it.
+        if request.normalization.is_empty() {
+            request.normalization = self.config.broker.normalization.clone();
+        }
         // A per-request fusion override beats the config, so a sweep can
         // compare both rules in one process against one corpus.
         let fusion = if request.fusion.is_empty() {
@@ -548,6 +558,11 @@ impl BrainSession {
             request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        // v2.6: same override rule for the normalization mode — resolved onto
+        // the request itself because that is where scoring reads it.
+        if request.normalization.is_empty() {
+            request.normalization = self.config.broker.normalization.clone();
+        }
         // A per-request fusion override beats the config, so a sweep can
         // compare both rules in one process against one corpus.
         let fusion = if request.fusion.is_empty() {
@@ -595,6 +610,11 @@ impl BrainSession {
             request.min_score = self.config.broker.abstain_min_score;
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
+        // v2.6: same override rule for the normalization mode — resolved onto
+        // the request itself because that is where scoring reads it.
+        if request.normalization.is_empty() {
+            request.normalization = self.config.broker.normalization.clone();
+        }
         // A per-request fusion override beats the config, so a sweep can
         // compare both rules in one process against one corpus.
         let fusion = if request.fusion.is_empty() {
@@ -1031,7 +1051,7 @@ fn add_memory_inner(
         }
     }
 
-    // v3.0 (RFC phase 2c): link this memory into the graph as it lands.
+    // v2.6 (RFC phase 2c): link this memory into the graph as it lands.
     //
     // Before this, `relates_to` edges only existed if someone ran
     // `kimetsu brain graph build`, so in practice `memory_edges` held nothing
@@ -1309,7 +1329,7 @@ pub fn propose_or_merge_memory(
             )?;
             // Return value not needed — no conflict scan after a merge.
             embeddings::embed_and_persist(&conn, &hit.existing_memory_id, &merged_text, embedder)?;
-            // v3.0: the merged text may carry entities the survivor did not
+            // v2.6: the merged text may carry entities the survivor did not
             // have, so reproject and re-link. Skipping this would leave the
             // absorbed lesson unreachable through the graph even though its
             // words are now in the corpus.
@@ -1556,6 +1576,31 @@ pub fn retrieve_context_lexical_readonly(
     request: ContextRequest,
 ) -> KimetsuResult<ContextBundle> {
     BrainSession::open_readonly(start)?.retrieve_context_lexical(request)
+}
+
+/// v2.6: measure evidence coverage for a bundle that was assembled *outside*
+/// [`context::retrieve_context_with_embedder_and_backend`].
+///
+/// There is exactly one such bundle: the embed daemon returns ranked capsules
+/// over a wire protocol, and the CLI rebuilds a [`ContextBundle`] from them. It
+/// therefore skips the finalization step where coverage is measured, so on an
+/// `embeddings` build with a live daemon — the *default* proactive path — the
+/// "memory does not cover X" line silently never fired. That is the opposite of
+/// the intent: the semantic build is the one whose retrieval is good enough to
+/// be trusted, so it is the one where an uncovered query most needs saying so.
+///
+/// Read-only and best-effort by construction: any failure to open the brain
+/// yields `(1.0, [])`, which renders as no claim at all rather than as a false
+/// "memory does not cover" line.
+pub fn evidence_coverage_readonly(
+    start: &Path,
+    query: &str,
+    capsules: &[context::ContextCapsule],
+) -> (f32, Vec<String>) {
+    let Ok((_paths, _config, conn)) = load_project_readonly(start) else {
+        return (1.0, Vec::new());
+    };
+    context::evidence_coverage(&conn, query, capsules)
 }
 
 /// v0.8: read-only proactive retrieval (lexical-FTS-only, no model
@@ -5189,7 +5234,7 @@ max_total_cost_usd = 250.0
         });
     }
 
-    // ── v3.0 #4: shareable pack install (merge | replace + provenance) ──────
+    // ── v2.6 #4: shareable pack install (merge | replace + provenance) ──────
     #[test]
     fn import_pack_merge_replace_and_provenance() {
         with_user_brain_disabled(|| {
@@ -5299,7 +5344,7 @@ max_total_cost_usd = 250.0
         });
     }
 
-    // ── v3.0: quarantine on import ─────────────────────────────────────────
+    // ── v2.6: quarantine on import ─────────────────────────────────────────
 
     fn quarantine_pack() -> (PackRef, Vec<crate::packs::MemoryExport>) {
         let entries = vec![
