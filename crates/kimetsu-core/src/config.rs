@@ -904,9 +904,19 @@ pub struct BrokerSection {
     /// throttle) all apply — this is additive only.
     ///
     /// Default false (OFF): the PreToolUse hook behaviour is identical to
-    /// before this flag existed. Graduating to default-on waits for regret
-    /// data (Epic S2) to confirm that file-path-augmented queries don't
-    /// increase noise. Enable per-project in project.toml once comfortable.
+    /// before this flag existed.
+    ///
+    /// v3.0: graduating to default-on has always been stated to depend on
+    /// evidence that file-path-augmented queries do not increase noise — and
+    /// nothing was recording which hook surface an injection came from, so
+    /// that evidence could not accumulate and the flag could not graduate on
+    /// any timescale. Injections now carry their surface
+    /// (`inject_policy::Surface`), and `kimetsu brain policy` reports
+    /// acceptance per surface, so the prefetch surface can be compared against
+    /// the ones that react to something observed rather than predicted. The
+    /// default stays off until that comparison is made on a real brain; the
+    /// point of this change is that it is now makeable. Enable per-project in
+    /// project.toml meanwhile.
     ///
     /// `#[serde(default)]` keeps all pre-F3 project.toml files loading with
     /// the feature OFF (zero behaviour change for existing users).

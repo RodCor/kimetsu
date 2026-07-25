@@ -215,7 +215,13 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     // question is asked. See `crate::user_profile`.
     let profile = user_profile_block(workspace);
 
-    if digest.is_none() && resume.is_none() && profile.is_none() {
+    // v3.0: what the skills loop is waiting on. Detection has run on a schedule
+    // since the maintenance daemon landed, but its result went into a log file
+    // nobody opens — so a memory could earn skill status and never become one.
+    // See `crate::skill_synthesis::graduation_notice`.
+    let skills = skills_block(workspace);
+
+    if digest.is_none() && resume.is_none() && profile.is_none() && skills.is_none() {
         return None;
     }
 
@@ -229,6 +235,11 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     if let Some(r) = &resume {
         parts.push(format!("## Your prior session\n{r}"));
     }
+    // Last: it is a nudge about Kimetsu itself, not context about the repo, so
+    // it must not sit between the agent and the work.
+    if let Some(s) = &skills {
+        parts.push(format!("## Skills ready to graduate\n{s}"));
+    }
 
     record_warmstart_served(
         workspace,
@@ -237,6 +248,15 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     );
 
     Some(parts.join("\n\n"))
+}
+
+/// Assemble the skills-loop nudge for the warm start.
+///
+/// Best-effort, like every other block here: an unreadable brain means no
+/// nudge, never a failed warm start.
+fn skills_block(workspace: &Path) -> Option<String> {
+    let (_paths, _config, conn) = load_project_readonly(workspace).ok()?;
+    crate::skill_synthesis::graduation_notice(&conn)
 }
 
 /// Assemble the standing-preferences block for the warm start.

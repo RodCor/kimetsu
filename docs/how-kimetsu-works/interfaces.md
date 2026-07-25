@@ -55,8 +55,8 @@ that can run a command on a prompt, stop, or session-end event.
 ### Warm start, on every host
 
 The warm-start block — the ~400-token repo digest, your standing preferences,
-and your episodic resume — is what makes the agent's first turn already know the
-repo. Every host gets it, by whichever route that host actually has:
+your episodic resume, and anything the skills loop is waiting on — is what makes
+the agent's first turn already know the repo. Every host gets it, by whichever route that host actually has:
 
 | Host | Route |
 |------|-------|
@@ -72,6 +72,18 @@ because the candidate never enters the pool. So preferences are *delivered*
 rather than retrieved: the top few `preference` memories by proven usefulness,
 project ones first, framed as instructions to follow without being asked. They
 are excluded from the digest above them so the same line never prints twice.
+
+The last section closes the **skills loop**. A memory cited across three
+distinct runs has earned skill status; detection is a pure query and has run on
+the maintenance schedule since the daemon landed — but its result went into a log
+file nobody opens, so a memory could cross the threshold and sit there forever.
+(`find_synthesis_candidates` having exactly one caller, the `brain skills` CLI,
+was that same fact stated as a call graph.) The warm start now carries one line
+naming what is waiting and the command that acts on it: candidates with no draft
+yet, and drafts awaiting an accept or reject. A candidate that already has a
+pending or accepted proposal is not reported as a candidate — the loop has moved
+on. When there is nothing to act on, which is the common case, the section is
+absent entirely.
 
 Only one route fires per host, so the block is never delivered twice. It is
 gated by `[broker] warm_start` (default on) everywhere. A cached digest is
@@ -120,6 +132,17 @@ recorded with its features, and labelled by whether the agent went on to cite
 the memory it was handed. `kimetsu brain policy` prints the weights and how the
 fit compares to the legacy rule on your own history; `--train` refits;
 `--reset` returns to the constant. Model-free, so it runs on the Free tier.
+
+It also prints **acceptance per hook surface** — how often an injection from
+each surface was followed by a citation of the memory it handed over. The three
+surfaces are not equivalent bets: `posttool` reacts to a command that observably
+failed, while `pretool_prefetch` predicts from a file path alone. That is the
+weakest signal Kimetsu acts on and the reason `broker.proactive_prefetch` is
+default-off — a flag whose own documentation said graduation "waits for regret
+data" while nothing recorded which surface an injection came from, so the data
+could never accumulate and the flag could never graduate. It now does, scored
+per surface so a strong one cannot launder a weak one's noise. The default stays
+off until the comparison is made on a real brain; what changed is that it can be.
 
 Proactive hooks install by default; pass `--no-proactive` to skip them.
 

@@ -354,9 +354,19 @@ No competitor owns this ground.
 default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, 3a, 3b, 3c, 4a, and the audit
 half of 4b.
 
-**Open, buildable:** 3d (graduated skills in the warm start), 3e
-(`proactive_prefetch` default-on), quarantine-on-import (4b), 4c (sycophancy
-track), 4d (belief drift), and all of phase 5.
+**Open, buildable:** quarantine-on-import (4b), 4c (sycophancy track),
+4d (belief drift), and all of phase 5.
+
+3d and 3e landed, 3e not as written. The plan said to graduate
+`broker.proactive_prefetch` to default-on "gated on a measured false-positive
+rate from the regret data". There is no such data and there could not be: the
+flag's own doc comment had said graduation waits on it since the flag shipped,
+and nothing recorded which hook surface an injection came from, so pooling the
+history could only compare prefetch against itself. Injections now carry their
+surface and `brain policy` reports acceptance per surface, so the flag has a
+gate it can actually pass. The default stays off until someone passes it —
+flipping it here would be asserting the number rather than measuring it, which
+is the thing this RFC keeps refusing to do.
 
 **Open, blocked on an asset rather than a design:**
 

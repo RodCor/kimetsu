@@ -959,6 +959,9 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
     // How strong the evidence of failure was, as a policy feature. PreToolUse
     // is a prediction rather than an observation, so it carries none.
     let mut evidence = 0.0f32;
+    // v3.0: which surface this injection came from, recorded so the surfaces
+    // can be judged separately. See `inject_policy::surface_acceptance`.
+    let mut surface = inject_policy::Surface::PreToolCommand;
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
         ProactiveEvent::PreTool => {
             // F3 Pass B (3.5): build the PreToolUse query from command and/or
@@ -979,6 +982,12 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
             } else {
                 None
             };
+            // The file path is what makes this a *prediction* rather than a
+            // reaction, so any query it contributed to is a prefetch — that is
+            // the surface whose noise the flag's graduation turns on.
+            if fp_opt.is_some() {
+                surface = inject_policy::Surface::PreToolPrefetch;
+            }
             let query = match (cmd_opt, fp_opt) {
                 (Some(cmd), Some(fp)) => format!("{cmd} {fp}"),
                 (Some(cmd), None) => cmd.to_string(),
@@ -988,6 +997,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
             (query, &["failure_pattern", "convention"], None)
         }
         ProactiveEvent::PostTool => {
+            surface = inject_policy::Surface::PostTool;
             let resp = hook.tool_response.as_deref().unwrap_or("");
             // v3.0: exit code > toolchain parser > substring scan. The old
             // ten-word scan fired on every passing test suite, because
@@ -1102,6 +1112,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
             .unwrap_or(&capsule.expansion_handle),
         &features,
         should_inject,
+        surface,
     );
 
     if !should_inject {

@@ -90,6 +90,84 @@ pub struct StalenessReport {
 // 2.1 — Candidate detection (pure query, no model cost)
 // ---------------------------------------------------------------------------
 
+/// v3.0: what the skills loop is waiting on, as one line for the warm start.
+///
+/// Detection is a pure query and has run on a schedule since the maintenance
+/// daemon landed — but its result went into a log file nobody opens. So a
+/// memory could cross the citation threshold, sit there indefinitely, and never
+/// become a skill, because closing the loop needed a person who was never told
+/// there was anything to close. `find_synthesis_candidates` having exactly one
+/// caller (the `brain skills` CLI) was the same problem stated as a call graph.
+///
+/// Two things are worth a session's attention, and nothing else is:
+///
+/// - **Candidates with no proposal yet** — memories that have earned skill
+///   status and are waiting for `brain skills --detect` to draft them.
+/// - **Pending proposals** — drafts waiting for an accept or reject.
+///
+/// A candidate that already has a pending or accepted proposal is *not*
+/// reported as a candidate: the loop has moved on, and repeating it would
+/// double-count the same memory in two halves of the same line. That is the
+/// same rule `run_skill_synthesis` uses to stay idempotent.
+///
+/// Returns `None` when there is nothing to act on, which is the common case —
+/// the warm start pays for this block on every session, so it must be silent
+/// unless it has something to say.
+pub fn graduation_notice(conn: &Connection) -> Option<String> {
+    let pending = conn
+        .query_row(
+            "SELECT COUNT(*) FROM skill_proposals WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    let undrafted = find_synthesis_candidates(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|candidate| !has_open_proposal(conn, &candidate.memory_id))
+        .count();
+
+    let mut parts: Vec<String> = Vec::new();
+    if undrafted > 0 {
+        parts.push(format!(
+            "{undrafted} {} earned skill status (`kimetsu brain skills --detect`)",
+            plural(undrafted, "memory has", "memories have"),
+        ));
+    }
+    if pending > 0 {
+        parts.push(format!(
+            "{pending} skill {} awaiting review (`kimetsu brain skills --list`)",
+            plural(pending as usize, "proposal is", "proposals are"),
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("; "))
+}
+
+/// True when this memory already has a pending or accepted proposal.
+///
+/// The substring match on the JSON column mirrors `run_skill_synthesis`'s
+/// existing duplicate check; a ULID is long enough that a false match is not a
+/// practical concern, and the cost of one is a line that under-reports by one.
+fn has_open_proposal(conn: &Connection, memory_id: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM skill_proposals
+         WHERE status IN ('pending', 'accepted')
+           AND source_memory_ids_json LIKE ?1",
+        params![format!("%{memory_id}%")],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 { one } else { many }
+}
+
 /// Find all synthesis candidates in `conn`.
 ///
 /// Path 1 — citation count: memories cited ≥ `CITATION_THRESHOLD` times
@@ -614,6 +692,109 @@ mod tests {
             .unwrap();
         assert_eq!(hot.trigger_kind, "citations");
         assert_eq!(hot.trigger_count, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // graduation_notice — v3.0, closing the skills loop
+    // -----------------------------------------------------------------------
+
+    /// Cite `memory_id` from `n` distinct runs, which is what earns skill status.
+    fn cite_from_distinct_runs(conn: &Connection, memory_id: &str, n: i64) {
+        conn.execute(
+            "INSERT INTO memories
+               (memory_id, scope, kind, text, normalized_text, confidence,
+                provenance_snapshot_json, created_at)
+             VALUES (?1, 'project', 'convention', 'Always run fmt', 'always run fmt',
+                     0.9, '{}', '2026-01-01T00:00:00Z')",
+            params![memory_id],
+        )
+        .expect("insert memory");
+        for run in 0..n {
+            conn.execute(
+                "INSERT INTO memory_citations (run_id, memory_id, turn, cited_at)
+                 VALUES (?1, ?2, 1, '2026-01-01T00:00:00Z')",
+                params![format!("run-{memory_id}-{run}"), memory_id],
+            )
+            .expect("insert citation");
+        }
+    }
+
+    /// The warm start pays for this block on every session, so a brain with
+    /// nothing to graduate must say nothing at all.
+    #[test]
+    fn a_quiet_brain_gets_no_nudge() {
+        let conn = init_conn();
+        assert!(graduation_notice(&conn).is_none());
+        cite_from_distinct_runs(&conn, "cold-mem", CITATION_THRESHOLD - 1);
+        assert!(
+            graduation_notice(&conn).is_none(),
+            "below the threshold is not a graduation"
+        );
+    }
+
+    /// The gap this closes: detection ran, found something, and told nobody.
+    #[test]
+    fn an_undrafted_candidate_is_surfaced_with_its_command() {
+        let conn = init_conn();
+        cite_from_distinct_runs(&conn, "hot-mem", CITATION_THRESHOLD);
+        let notice = graduation_notice(&conn).expect("surfaced");
+        assert!(notice.contains('1'), "got: {notice}");
+        assert!(
+            notice.contains("kimetsu brain skills --detect"),
+            "a nudge without the command is not actionable; got: {notice}"
+        );
+    }
+
+    /// Once a candidate has been drafted the loop has moved on, and reporting
+    /// it as still-undrafted would double-count the same memory across both
+    /// halves of the line.
+    #[test]
+    fn a_drafted_candidate_is_reported_as_pending_not_as_a_candidate() {
+        let conn = init_conn();
+        cite_from_distinct_runs(&conn, "hot-mem", CITATION_THRESHOLD);
+        insert_skill_proposal(
+            &conn,
+            "always-run-fmt",
+            "Run cargo fmt before committing",
+            None,
+            &["hot-mem".to_string()],
+            "citations",
+            CITATION_THRESHOLD,
+        )
+        .expect("insert proposal");
+
+        let notice = graduation_notice(&conn).expect("surfaced");
+        assert!(
+            !notice.contains("--detect"),
+            "nothing left to detect; got: {notice}"
+        );
+        assert!(
+            notice.contains("awaiting review"),
+            "the draft is what needs a decision now; got: {notice}"
+        );
+    }
+
+    /// An accepted proposal is a closed loop — nothing to nudge about.
+    #[test]
+    fn an_accepted_proposal_ends_the_nudge() {
+        let conn = init_conn();
+        cite_from_distinct_runs(&conn, "hot-mem", CITATION_THRESHOLD);
+        let proposal_id = insert_skill_proposal(
+            &conn,
+            "always-run-fmt",
+            "Run cargo fmt before committing",
+            None,
+            &["hot-mem".to_string()],
+            "citations",
+            CITATION_THRESHOLD,
+        )
+        .expect("insert proposal");
+        accept_skill_proposal(&conn, &proposal_id, "/skills/always-run-fmt").expect("accept");
+
+        assert!(
+            graduation_notice(&conn).is_none(),
+            "an installed skill is a closed loop"
+        );
     }
 
     #[test]

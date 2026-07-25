@@ -371,13 +371,159 @@ pub fn record_injection(
     memory_id: &str,
     features: &Features,
     injected: bool,
+    surface: Surface,
 ) {
     let payload = serde_json::json!({
         "memory_id": memory_id,
         "features": features.to_vec().to_vec(),
         "injected": injected,
+        "surface": surface.as_str(),
     });
     let _ = crate::feedback::log_telemetry_event(start, INJECTED_EVENT, payload);
+}
+
+/// Which hook surface a proactive injection came from.
+///
+/// Recorded so the surfaces can be judged separately. They are not equivalent
+/// bets: [`Surface::PostTool`] reacts to a command that *observably* failed,
+/// while [`Surface::PreToolPrefetch`] is a prediction from a file path alone —
+/// the weakest signal Kimetsu acts on, and the reason `broker.proactive_prefetch`
+/// has stayed default-off. Pooling them would let the strong surface's
+/// acceptance hide the weak one's noise, which is precisely the question
+/// graduating that flag has to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// `PreToolUse`, matching on the command about to run.
+    PreToolCommand,
+    /// `PreToolUse`, matching on the file about to be touched. Only reachable
+    /// when `broker.proactive_prefetch` is on.
+    PreToolPrefetch,
+    /// `PostToolUse`, reacting to a command that failed.
+    PostTool,
+}
+
+impl Surface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Surface::PreToolCommand => "pretool_command",
+            Surface::PreToolPrefetch => "pretool_prefetch",
+            Surface::PostTool => "posttool",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pretool_command" => Some(Surface::PreToolCommand),
+            "pretool_prefetch" => Some(Surface::PreToolPrefetch),
+            "posttool" => Some(Surface::PostTool),
+            _ => None,
+        }
+    }
+}
+
+/// How one hook surface has actually performed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceStats {
+    pub surface: &'static str,
+    /// Injections that fired on this surface.
+    pub injected: usize,
+    /// Of those, how many were followed by a citation of the memory injected.
+    pub cited: usize,
+}
+
+impl SurfaceStats {
+    /// Share of injections the agent went on to lean on, in `[0, 1]`.
+    ///
+    /// The complement is the false-positive rate: an injection the agent never
+    /// cited is an interruption it did not need.
+    pub fn acceptance(&self) -> f32 {
+        if self.injected == 0 {
+            return 0.0;
+        }
+        self.cited as f32 / self.injected as f32
+    }
+}
+
+/// Acceptance per hook surface, over this brain's own history.
+///
+/// This exists to settle a specific question. `broker.proactive_prefetch` has
+/// been default-off since it shipped, with its own doc comment saying
+/// graduation "waits for regret data" — and nothing was recording which surface
+/// an injection came from, so that data could never accumulate and the flag
+/// could never graduate. Whatever the number turns out to be, it is now
+/// answerable on a real brain rather than argued about.
+///
+/// Surfaces with no injections are omitted: a zero denominator is not a
+/// measurement, and printing 0% for a surface nobody has exercised reads as a
+/// verdict.
+pub fn surface_acceptance(conn: &Connection) -> KimetsuResult<Vec<SurfaceStats>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.payload_json, e.ts
+         FROM events AS e
+         WHERE e.kind = ?1
+         ORDER BY e.ts",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![INJECTED_EVENT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut tally: Vec<SurfaceStats> = [
+        Surface::PreToolCommand,
+        Surface::PreToolPrefetch,
+        Surface::PostTool,
+    ]
+    .iter()
+    .map(|s| SurfaceStats {
+        surface: s.as_str(),
+        injected: 0,
+        cited: 0,
+    })
+    .collect();
+
+    for (payload_json, ts) in rows {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else {
+            continue;
+        };
+        // A suppressed injection has no outcome to observe, so it cannot speak
+        // to whether the surface interrupts usefully.
+        if payload.get("injected").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        // Events written before surfaces were recorded carry no surface. They
+        // are dropped rather than bucketed into a default, which would credit
+        // one surface with another's history.
+        let Some(surface) = payload
+            .get("surface")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Surface::from_str)
+        else {
+            continue;
+        };
+        let Some(memory_id) = payload.get("memory_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let cited: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM memory_citations
+                     WHERE memory_id = ?1 AND cited_at >= ?2
+                 )",
+                rusqlite::params![memory_id, ts],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if let Some(stats) = tally.iter_mut().find(|s| s.surface == surface.as_str()) {
+            stats.injected += 1;
+            if cited {
+                stats.cited += 1;
+            }
+        }
+    }
+
+    tally.retain(|s| s.injected > 0);
+    Ok(tally)
 }
 
 /// Build the training set: every recorded injection, labelled by whether the
@@ -646,5 +792,160 @@ mod tests {
         assert!(sigmoid(0.0) == 0.5);
         assert!(sigmoid(200.0).is_finite() && sigmoid(200.0) > 0.999);
         assert!(sigmoid(-200.0).is_finite() && sigmoid(-200.0) < 0.001);
+    }
+
+    // ── Surface acceptance (v3.0) ────────────────────────────────────────
+
+    fn surface_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("schema");
+        conn
+    }
+
+    /// Write an injection event directly, the way `record_injection` does
+    /// through the telemetry path.
+    fn log_injection(
+        conn: &Connection,
+        memory_id: &str,
+        surface: Option<&str>,
+        injected: bool,
+        ts: &str,
+    ) {
+        let mut payload = serde_json::json!({
+            "memory_id": memory_id,
+            "features": features(0.6, false).to_vec().to_vec(),
+            "injected": injected,
+        });
+        if let Some(surface) = surface {
+            payload["surface"] = serde_json::json!(surface);
+        }
+        conn.execute(
+            "INSERT INTO events (event_id, run_id, ts, kind, schema_version, payload_json)
+             VALUES (?1, 'test-run', ?2, ?3, 1, ?4)",
+            rusqlite::params![
+                kimetsu_core::ids::new_id().to_string(),
+                ts,
+                INJECTED_EVENT,
+                payload.to_string()
+            ],
+        )
+        .expect("insert event");
+    }
+
+    fn cite(conn: &Connection, memory_id: &str, ts: &str) {
+        conn.execute(
+            "INSERT INTO memory_citations (run_id, memory_id, turn, cited_at)
+             VALUES (?1, ?2, 1, ?3)",
+            rusqlite::params![format!("run-{memory_id}"), memory_id, ts],
+        )
+        .expect("insert citation");
+    }
+
+    /// The whole point: the surfaces are scored apart, so a strong one cannot
+    /// launder a weak one's noise.
+    #[test]
+    fn surfaces_are_scored_separately() {
+        let conn = surface_conn();
+        // Reactive: two injections, both cited.
+        for id in ["post-a", "post-b"] {
+            log_injection(&conn, id, Some("posttool"), true, "2026-01-01T00:00:00Z");
+            cite(&conn, id, "2026-01-01T00:01:00Z");
+        }
+        // Predictive: two injections, neither cited.
+        for id in ["pre-a", "pre-b"] {
+            log_injection(
+                &conn,
+                id,
+                Some("pretool_prefetch"),
+                true,
+                "2026-01-01T00:00:00Z",
+            );
+        }
+
+        let stats = surface_acceptance(&conn).expect("stats");
+        let post = stats
+            .iter()
+            .find(|s| s.surface == Surface::PostTool.as_str())
+            .expect("posttool");
+        let pre = stats
+            .iter()
+            .find(|s| s.surface == Surface::PreToolPrefetch.as_str())
+            .expect("prefetch");
+        assert_eq!((post.injected, post.cited), (2, 2));
+        assert_eq!((pre.injected, pre.cited), (2, 0));
+        assert!((post.acceptance() - 1.0).abs() < f32::EPSILON);
+        assert!(pre.acceptance() == 0.0);
+    }
+
+    /// A zero denominator is not a measurement, and printing 0% for a surface
+    /// nobody has exercised reads as a verdict on it.
+    #[test]
+    fn an_unexercised_surface_is_omitted_rather_than_scored_zero() {
+        let conn = surface_conn();
+        log_injection(
+            &conn,
+            "post-a",
+            Some("posttool"),
+            true,
+            "2026-01-01T00:00:00Z",
+        );
+        let stats = surface_acceptance(&conn).expect("stats");
+        assert_eq!(stats.len(), 1, "got: {stats:?}");
+        assert_eq!(stats[0].surface, Surface::PostTool.as_str());
+    }
+
+    /// A suppressed injection has no outcome to observe, so it cannot speak to
+    /// whether a surface interrupts usefully.
+    #[test]
+    fn suppressed_injections_do_not_count_against_a_surface() {
+        let conn = surface_conn();
+        log_injection(
+            &conn,
+            "post-a",
+            Some("posttool"),
+            false,
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(surface_acceptance(&conn).expect("stats").is_empty());
+    }
+
+    /// Events written before surfaces were recorded belong to no surface.
+    /// Bucketing them into a default would credit one surface with another's
+    /// history, which is the error this whole split exists to avoid.
+    #[test]
+    fn history_from_before_surfaces_is_dropped_not_defaulted() {
+        let conn = surface_conn();
+        log_injection(&conn, "old-a", None, true, "2026-01-01T00:00:00Z");
+        cite(&conn, "old-a", "2026-01-01T00:01:00Z");
+        assert!(surface_acceptance(&conn).expect("stats").is_empty());
+    }
+
+    /// A citation that predates the injection is not evidence the injection
+    /// caused it.
+    #[test]
+    fn only_citations_after_the_injection_count() {
+        let conn = surface_conn();
+        cite(&conn, "post-a", "2025-12-01T00:00:00Z");
+        log_injection(
+            &conn,
+            "post-a",
+            Some("posttool"),
+            true,
+            "2026-01-01T00:00:00Z",
+        );
+        let stats = surface_acceptance(&conn).expect("stats");
+        assert_eq!(stats[0].cited, 0, "got: {stats:?}");
+    }
+
+    #[test]
+    fn surface_strings_round_trip() {
+        for surface in [
+            Surface::PreToolCommand,
+            Surface::PreToolPrefetch,
+            Surface::PostTool,
+        ] {
+            assert_eq!(Surface::from_str(surface.as_str()), Some(surface));
+        }
+        assert!(Surface::from_str("something_else").is_none());
     }
 }

@@ -876,6 +876,11 @@ pub(crate) fn brain_policy(args: PolicyArgs) -> KimetsuResult<()> {
     let prior = inject_policy::Policy::prior();
     let policy_accuracy = inject_policy::accuracy(&policy, &examples);
     let prior_accuracy = inject_policy::accuracy(&prior, &examples);
+    // v3.0: acceptance per hook surface. `broker.proactive_prefetch` has been
+    // default-off since it shipped, waiting on exactly this number, and nothing
+    // was recording it — so the flag could never graduate. See
+    // `inject_policy::surface_acceptance`.
+    let surfaces = inject_policy::surface_acceptance(&conn).unwrap_or_default();
 
     if args.json {
         let weights: serde_json::Map<String, serde_json::Value> = inject_policy::Features::NAMES
@@ -895,6 +900,12 @@ pub(crate) fn brain_policy(args: PolicyArgs) -> KimetsuResult<()> {
                 "useful_examples": examples.iter().filter(|e| e.useful).count(),
                 "accuracy": policy_accuracy,
                 "legacy_rule_accuracy": prior_accuracy,
+                "surfaces": surfaces.iter().map(|s| serde_json::json!({
+                    "surface": s.surface,
+                    "injected": s.injected,
+                    "cited": s.cited,
+                    "acceptance": s.acceptance(),
+                })).collect::<Vec<_>>(),
             }))?
         );
         return Ok(());
@@ -939,6 +950,42 @@ pub(crate) fn brain_policy(args: PolicyArgs) -> KimetsuResult<()> {
             policy_accuracy * 100.0,
             prior_accuracy * 100.0
         );
+    }
+    if !surfaces.is_empty() {
+        println!("acceptance by hook surface (cited / injected):");
+        for stats in &surfaces {
+            println!(
+                "  {:<20} {:>3} / {:<3}  {:>5.1}%",
+                stats.surface,
+                stats.cited,
+                stats.injected,
+                stats.acceptance() * 100.0
+            );
+        }
+        // The prefetch surface is the one with a decision riding on it: it
+        // predicts from a file path rather than reacting to a failure, and
+        // `broker.proactive_prefetch` stays default-off until its acceptance is
+        // not materially below the surfaces that react to something observed.
+        let prefetch = surfaces
+            .iter()
+            .find(|s| s.surface == inject_policy::Surface::PreToolPrefetch.as_str());
+        let reactive: Vec<_> = surfaces
+            .iter()
+            .filter(|s| s.surface != inject_policy::Surface::PreToolPrefetch.as_str())
+            .collect();
+        if let Some(prefetch) = prefetch
+            && !reactive.is_empty()
+        {
+            let reactive_injected: usize = reactive.iter().map(|s| s.injected).sum();
+            let reactive_cited: usize = reactive.iter().map(|s| s.cited).sum();
+            let reactive_acceptance = reactive_cited as f32 / reactive_injected as f32;
+            println!(
+                "  prefetch vs reactive: {:.1}% vs {:.1}% — `broker.proactive_prefetch` \
+                 graduates to default-on when the gap closes on real history",
+                prefetch.acceptance() * 100.0,
+                reactive_acceptance * 100.0
+            );
+        }
     }
     if policy.is_prior() && examples.len() >= inject_policy::MIN_TRAINING_EXAMPLES {
         println!("hint: run `kimetsu brain policy --train` to fit from this history");

@@ -15,6 +15,30 @@ files the v3.0 plan behind it.
 
 ### Fixed
 
+- **The skills loop tells you it is waiting.** A memory cited across three
+  distinct runs earns skill status, and detection has run on the maintenance
+  schedule since the daemon landed — into a log file nobody opens. So a memory
+  could cross the threshold and sit there indefinitely, because closing the loop
+  needed a person who was never told there was anything to close.
+  `find_synthesis_candidates` having exactly one caller was the same fact stated
+  as a call graph. The warm start now carries one line naming what is waiting and
+  the command that acts on it: candidates with no draft yet, and drafts awaiting
+  a decision. A candidate that already has a proposal is not counted as a
+  candidate — the loop has moved on. Silent when there is nothing to act on.
+- **Proactive injections are scored per hook surface.** `broker.proactive_prefetch`
+  has been default-off since it shipped, its doc comment saying graduation waits
+  on evidence that file-path-augmented queries do not add noise — while nothing
+  recorded which surface an injection came from, so that evidence could never
+  accumulate and the flag could never graduate on any timescale. Injections now
+  carry their surface, and `kimetsu brain policy` reports acceptance (injected
+  vs. subsequently cited) for each: `posttool`, which reacts to a command that
+  observably failed; `pretool_command`; and `pretool_prefetch`, which predicts
+  from a file path alone. Scored apart, so a strong surface cannot launder a weak
+  one's noise. Events from before this change carry no surface and are dropped
+  rather than bucketed into a default, which would credit one surface with
+  another's history. The default stays off until the comparison is made on a real
+  brain — what changed is that it can be.
+
 - **Ordering questions get dated, ordered memories.** Memories carry
   `created_at` and capsules did not, so a bundle rendered in score order with no
   dates gave a reader asked "did we switch to `thiserror` before or after the
