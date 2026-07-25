@@ -167,15 +167,16 @@ fn is_stale_inner(workspace: &Path) -> KimetsuResult<bool> {
 
 // ── Warm start ────────────────────────────────────────────────────────────────
 
-/// Assemble the warm-start block: repo digest + episodic resume.
+/// Assemble the warm-start block: repo digest, standing preferences, and
+/// episodic resume.
 ///
 /// This is what every host sees first — the `SessionStart` hook on Claude
 /// Code, the first prompt of a session on Codex / Pi / OpenClaw, and the first
 /// `kimetsu_brain_context` call on Cursor, which has neither hooks nor a
 /// session-start surface.
 ///
-/// Returns `None` when `[broker] warm_start` is off, or when there is neither a
-/// digest nor a live episode to report.
+/// Returns `None` when `[broker] warm_start` is off, or when there is no
+/// digest, no preferences and no live episode to report.
 ///
 /// The cached digest is served even when the corpus has moved under it, and the
 /// rebuild is spawned detached — a synchronous rebuild would sit in front of the
@@ -205,13 +206,25 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     };
     let resume = crate::episode::render_resume_context(workspace);
 
-    if digest.is_none() && resume.is_none() {
+    // v3.0: the user's standing preferences, delivered rather than retrieved.
+    //
+    // Preference following is the second-weakest measured ability, and the
+    // diagnosis is that "a preference is a small aside semantically far from
+    // the question" — which rules out re-ranking, because the candidate never
+    // enters the pool. A standing preference belongs in context before the
+    // question is asked. See `crate::user_profile`.
+    let profile = user_profile_block(workspace);
+
+    if digest.is_none() && resume.is_none() && profile.is_none() {
         return None;
     }
 
     let mut parts: Vec<String> = Vec::new();
     if let Some(d) = &digest {
         parts.push(format!("## Repo context\n{d}"));
+    }
+    if let Some(p) = &profile {
+        parts.push(format!("## How you like to work\n{p}"));
     }
     if let Some(r) = &resume {
         parts.push(format!("## Your prior session\n{r}"));
@@ -224,6 +237,21 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     );
 
     Some(parts.join("\n\n"))
+}
+
+/// Assemble the standing-preferences block for the warm start.
+///
+/// Best-effort: an unreadable brain means no preferences block, never a failed
+/// warm start.
+fn user_profile_block(workspace: &Path) -> Option<String> {
+    let (_paths, _config, conn) = load_project_readonly(workspace).ok()?;
+    // The cross-project user brain is opened separately; when it is disabled or
+    // unreachable the project's own preferences stand on their own.
+    let user_conn = kimetsu_core::paths::user_brain_db_path()
+        .filter(|path| path.exists())
+        .and_then(|path| Connection::open(&path).ok());
+    let profile = crate::user_profile::build_profile(&conn, user_conn.as_ref()).ok()?;
+    crate::user_profile::render_profile(&profile)
 }
 
 /// Fire-and-forget `<current_exe> brain digest --refresh --workspace <ws>`.
@@ -335,12 +363,19 @@ fn gather_inputs(conn: &Connection, repo_root: &str) -> KimetsuResult<DigestInpu
     // so new brains produce useful digests without requiring prior runs.
     // use_count > 0 memories are ranked by usefulness ratio; use_count = 0
     // rows sort last (usefulness_score default 0).
+    //
+    // v3.0: preferences are excluded. They now have their own warm-start
+    // section (`crate::user_profile`), which sits directly beside this one, so
+    // including them here would print the same lines twice in the same block —
+    // and the digest's slots are better spent on facts the preferences section
+    // will never carry.
     {
         let mut stmt = conn.prepare(
             "SELECT kind, text
              FROM memories
              WHERE invalidated_at IS NULL
                AND superseded_by IS NULL
+               AND kind != 'preference'
              ORDER BY
                CASE WHEN use_count > 0
                     THEN (usefulness_score / CAST(use_count AS REAL))

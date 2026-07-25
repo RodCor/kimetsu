@@ -997,3 +997,74 @@ fn as_of_reports_what_the_brain_believed_at_a_point_in_time() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: standing preferences in the warm start
+// ---------------------------------------------------------------------------
+
+/// Preference following is the second-weakest measured ability, and the
+/// diagnosis is that a preference is semantically far from the question. So it
+/// must reach the agent WITHOUT being retrieved — on a query that shares no
+/// words with it.
+#[test]
+fn standing_preferences_reach_the_agent_without_being_retrieved() {
+    let root = temp_project_dir("standing_prefs");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Preference,
+        "Prefer thiserror for library error types",
+    )
+    .expect("add preference");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Fact,
+        "The schema is at version 11",
+    )
+    .expect("add fact");
+
+    // A query with no lexical overlap with the preference at all.
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &["--warm-on-first-prompt"],
+        r#"{"session_id":"prefs-1","prompt":"rename the widget module to gadget"}"#,
+    );
+    let context = serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| {
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    assert!(
+        context.contains("How you like to work"),
+        "the preferences section must be present; got: {context}"
+    );
+    assert!(
+        context.contains("thiserror"),
+        "a preference must arrive even when the query never mentions it; got: {context}"
+    );
+    assert!(
+        context.contains("follow these without being asked"),
+        "preferences are instructions, not retrieved facts; got: {context}"
+    );
+
+    // …and must not also be duplicated into the repo digest above it.
+    let digest_section = context
+        .split("## How you like to work")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !digest_section.contains("thiserror"),
+        "the digest must not repeat what the preferences section carries; got: {digest_section}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

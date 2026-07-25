@@ -54,15 +54,24 @@ that can run a command on a prompt, stop, or session-end event.
 
 ### Warm start, on every host
 
-The warm-start block — the ~400-token repo digest plus your episodic resume —
-is what makes the agent's first turn already know the repo. Every host gets it,
-by whichever route that host actually has:
+The warm-start block — the ~400-token repo digest, your standing preferences,
+and your episodic resume — is what makes the agent's first turn already know the
+repo. Every host gets it, by whichever route that host actually has:
 
 | Host | Route |
 |------|-------|
 | Claude Code | `SessionStart` -> `kimetsu brain session-start-hook` |
 | Codex, Pi, OpenClaw | per-turn hook with `--warm-on-first-prompt`: prepended to the session's first prompt, once |
 | Cursor | no hooks at all — the first `kimetsu_brain_context` call of a session returns a `warm_start` field alongside the capsules |
+
+The **standing preferences** section is why the block carries more than repo
+state. Preference following is Kimetsu's second-weakest measured ability
+(LongMemEval 66.7%), and the diagnosis is that a preference is a small aside
+semantically far from the question — which rules out fixing it by re-ranking,
+because the candidate never enters the pool. So preferences are *delivered*
+rather than retrieved: the top few `preference` memories by proven usefulness,
+project ones first, framed as instructions to follow without being asked. They
+are excluded from the digest above them so the same line never prints twice.
 
 Only one route fires per host, so the block is never delivered twice. It is
 gated by `[broker] warm_start` (default on) everywhere. A cached digest is
