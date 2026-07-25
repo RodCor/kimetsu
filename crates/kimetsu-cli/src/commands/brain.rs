@@ -202,6 +202,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Policy(args) => brain_policy(args),
         BrainCommand::Maintain(args) => brain_maintain(args),
         BrainCommand::Audit(args) => brain_audit(args),
+        BrainCommand::Drift(args) => brain_drift(args),
         BrainCommand::AsOf(args) => brain_as_of(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
@@ -694,6 +695,126 @@ pub(crate) fn brain_audit(args: AuditArgs) -> KimetsuResult<()> {
         println!(
             "A burst is the shape a bulk import leaves — and also the shape induced \
              poisoning leaves. Worth confirming you recognise each one."
+        );
+    }
+    Ok(())
+}
+
+/// `kimetsu brain drift [--limit N] [--json]`
+///
+/// Which recent sessions wandered off the task they opened with. See
+/// [`kimetsu_brain::drift`] for what this can and cannot see — Kimetsu observes
+/// user prompts, not agent actions, so this is a claim about the session's
+/// topic and not about the agent's behaviour.
+pub(crate) fn brain_drift(args: DriftArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (_paths, config, conn) = project::load_project_readonly(&workspace)?;
+    let sessions = kimetsu_brain::drift::recent_sessions(&conn, args.limit)?;
+
+    // The signal is cosine against an anchor, so a build with no embedder has
+    // nothing to compute. Saying so is the only honest output — a lexical
+    // stand-in would report a number on a different scale under the same
+    // threshold, which is worse than reporting none.
+    let embedder = kimetsu_brain::embeddings::open_embedder_for(config.embedder.enabled);
+    if embedder.is_noop() {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "reason": "no embedder: drift is cosine against an anchor",
+                    "sessions_available": sessions.len(),
+                })
+            );
+        } else {
+            println!(
+                "Drift is measured as cosine against the session's opening turn, and this \
+                 build has no embedder, so there is nothing to compute. {} recent session{} \
+                 would be scorable on an embeddings build.",
+                sessions.len(),
+                if sessions.len() == 1 { "" } else { "s" }
+            );
+        }
+        return Ok(());
+    }
+
+    let mut reports = Vec::new();
+    for session in &sessions {
+        let mut embedded = Vec::with_capacity(session.queries.len());
+        for query in &session.queries {
+            match embedder.embed(query) {
+                Ok(vector) => embedded.push(vector),
+                // One unembeddable turn must not silently shorten the sequence
+                // and shift every index after it.
+                Err(_) => {
+                    embedded.clear();
+                    break;
+                }
+            }
+        }
+        if embedded.is_empty() {
+            continue;
+        }
+        reports.push(kimetsu_brain::drift::analyze(
+            &session.session_id,
+            &embedded,
+        ));
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "sessions": reports.iter().map(|r| serde_json::json!({
+                    "session_id": r.session_id,
+                    "turns": r.similarity.len(),
+                    "similarity": r.similarity,
+                    "drifted_at": r.drifted_at,
+                    "min_similarity": r.min_similarity(),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    if reports.is_empty() {
+        println!(
+            "No scorable sessions. Drift needs at least two stored prompts from one \
+             session; `[learning] store_queries = false` keeps only a hash."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:>6} {:>8} {:>10}",
+        "session", "turns", "closest", "turned at"
+    );
+    for report in &reports {
+        println!(
+            "{:<24} {:>6} {:>8.2} {:>10}",
+            report.session_id,
+            report.similarity.len(),
+            report.min_similarity(),
+            match report.drifted_at {
+                Some(idx) => format!("turn {}", idx + 1),
+                None => "-".to_string(),
+            }
+        );
+    }
+
+    let drifted = reports.iter().filter(|r| r.drifted()).count();
+    if drifted > 0 {
+        println!();
+        println!(
+            "{drifted} session{} moved away from the question {} opened with and stayed \
+             there for {} turns. Retrieval still anchors on the whole session, so its \
+             opening turns are steering results toward a task nobody is working on.",
+            if drifted == 1 { "" } else { "s" },
+            if drifted == 1 { "it" } else { "they" },
+            kimetsu_brain::drift::SUSTAINED_TURNS
         );
     }
     Ok(())

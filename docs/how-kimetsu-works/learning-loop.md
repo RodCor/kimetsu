@@ -171,6 +171,34 @@ faster than anyone types, which is the shape both a bulk import and induced
 poisoning leave. Read-only on purpose: an automated purge keyed on that
 heuristic would delete a legitimate import.
 
+### Session drift
+
+Nautilus Compass reaches ROC AUC 0.83 detecting behavioural drift on real Claude
+Code traces using nothing but cosine against a behavioural anchor — no model, no
+labels, no training. `kimetsu brain drift` computes the Kimetsu-shaped version
+of that signal: cosine of each turn in a session against the session's *first*
+prompt, which is what it set out to do.
+
+Be precise about what it sees. Compass reads agent traces — the actions taken. A
+memory sidecar has no such thing; what Kimetsu has is the sequence of user
+prompts, logged per session in `context.served`. So this says how far a session
+moved from the question it opened with, not whether an agent drifted from its
+instructions. Weaker than the paper's claim, and the honest one.
+
+The signal is sustained by construction: three consecutive turns below the
+threshold, never a single one. One tangential question is a question. Anchoring
+on the opening turn rather than a rolling window is deliberate — a rolling anchor
+lets a session walk anywhere one small step at a time without ever registering,
+which is the case worth catching.
+
+It matters to a memory system because retrieval anchors on the session: once a
+session has turned, its opening turns are steering results toward a task nobody
+is working on. Report-only, like `prune` and `audit` — a signal that silently
+re-anchors retrieval is one whose false positives are invisible, and this one has
+no measured operating point on a Kimetsu corpus yet. Needs an embeddings build;
+on a lean build the command says so rather than reporting a number computed on a
+different scale.
+
 ---
 
 ### Self-tuning

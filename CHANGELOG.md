@@ -15,6 +15,22 @@ files the v3.0 plan behind it.
 
 ### Added
 
+- **`kimetsu brain drift`** reports which recent sessions wandered off the task
+  they opened with — cosine of each turn against the session's first prompt,
+  which is what it set out to do. Nautilus Compass gets ROC AUC 0.83 on this
+  shape of signal against real Claude Code traces with no model in the loop, and
+  Kimetsu already keeps a warm embedder, so the marginal cost is one embedding
+  per turn. What it sees is narrower than the paper's setting and the docs say
+  so: Compass reads agent traces, a memory sidecar reads user prompts, so this is
+  a claim about the session's topic and not about the agent's behaviour.
+  Divergence must be sustained across three consecutive turns — one tangential
+  question is a question — and the anchor is the opening turn rather than a
+  rolling window, since a rolling anchor lets a session walk anywhere one step at
+  a time without registering. Report-only: retrieval is not silently re-anchored
+  on a signal with no measured operating point. On a build with no embedder the
+  command says there is nothing to compute rather than substituting a lexical
+  stand-in on a different scale.
+
 - **Injected memory is framed as a prior conclusion, not as knowledge.**
   MemSyco-Bench reports most memory systems scoring *worse* on sycophancy than
   using no memory at all: a retrieved memory arrives looking like ground truth,

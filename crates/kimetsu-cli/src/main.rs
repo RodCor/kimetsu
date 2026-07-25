@@ -810,6 +810,14 @@ enum BrainCommand {
     /// successful run here, and flags clusters of writes that arrived too fast
     /// to be someone typing. Read-only: it reports, you decide.
     Audit(AuditArgs),
+    /// Report which recent sessions wandered off the task they opened with.
+    ///
+    /// Cosine of each turn against the session's first prompt, which is what a
+    /// session set out to do. Sustained divergence, never a single tangential
+    /// question. Read-only: retrieval is not re-anchored on this, because a
+    /// signal that silently changes retrieval is one whose false positives are
+    /// invisible. Needs an embeddings build.
+    Drift(DriftArgs),
     /// Ask what the brain believed at a point in time.
     ///
     /// Default retrieval answers "what is true now". This answers "what did the
@@ -1290,6 +1298,20 @@ struct AsOfArgs {
 /// Args for `kimetsu brain audit`.
 #[derive(Debug, Args)]
 struct AuditArgs {
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain drift`.
+#[derive(Debug, Args)]
+struct DriftArgs {
+    /// How many recent sessions to score.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
     /// Machine-readable output.
     #[arg(long)]
     json: bool,
