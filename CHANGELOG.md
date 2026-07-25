@@ -15,6 +15,22 @@ files the v3.0 plan behind it.
 
 ### Added
 
+- **A TypeScript SDK** at `npm/kimetsu-sdk`, published as `@kimetsu-ai/sdk`. The
+  ecosystem Kimetsu integrates with — Pi extensions, OpenClaw plugins, Cursor,
+  VS Code, MCP clients — is TypeScript, and every one of those integrations was
+  shelling out to the binary and parsing its text output. That is how the Pi
+  extension and its published npm copy drifted apart without anyone noticing:
+  there was no shared typed surface for them to share. It mirrors the Python
+  SDK method-for-method (`memory`, `config`, `models`, `benchmark`, plus
+  `context` / `record` / `status` / `insights` / `cite`), reads the same
+  `KIMETSU_REMOTE_*` variables, and keeps the same four error classes so a
+  caller can tell "retry this" from "re-authenticate" from "the answer is no".
+  Zero runtime dependencies — Node 18's `fetch` — because an embedded client's
+  dependencies become its host's. One client rather than a sync/async pair,
+  since in JavaScript every call is already a promise. `client.call()` reaches
+  tools newer than the SDK, so a version mismatch never sends anyone back to
+  parsing text.
+
 - **`kimetsu brain drift`** reports which recent sessions wandered off the task
   they opened with — cosine of each turn against the session's first prompt,
   which is what it set out to do. Nautilus Compass gets ROC AUC 0.83 on this

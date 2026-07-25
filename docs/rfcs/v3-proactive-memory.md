@@ -361,9 +361,11 @@ No competitor owns this ground.
 default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, 3a, 3b, 3c, 4a, and the audit
 half of 4b.
 
-**Open, buildable:** the BrainBench half of 4c (a MemSyco-derived track lives
-in `kimetsu-bench`) and all of phase 5. The render half of 4c has landed, as has
-4d.
+**Open, buildable:** the benchmark *corpora* — BEAM 10M, LongMemEval to the
+full 500, BEAM-1M to 35/35, and a coding-agent memory benchmark. Those need
+datasets and reader API budget, not code. Everything else in phases 4 and 5 has
+landed: the BrainBench sycophancy and poisoning tracks are in `kimetsu-bench`,
+and the TypeScript SDK is at `npm/kimetsu-sdk`.
 
 3d and 3e landed, 3e not as written. The plan said to graduate
 `broker.proactive_prefetch` to default-on "gated on a measured false-positive

@@ -23,8 +23,28 @@ npm/
     bin/cli.js      resolves @kimetsu-ai/remote-<platform> and execs kimetsu-remote
     package.json    optionalDependencies -> 3 @kimetsu-ai/remote-* packages
     README.md
+  kimetsu-sdk/      @kimetsu-ai/sdk — typed TS client for Kimetsu Remote's MCP
+    src/            TypeScript sources (compiled to dist/ at publish time)
+    test/           node:test suite, run against the compiled dist/
+    README.md
   README.md         this file
 ```
+
+## `@kimetsu-ai/sdk` is a different kind of package
+
+The two above ship a native binary. The SDK ships code: a typed client for
+Kimetsu Remote's MCP surface, mirroring the Python SDK method-for-method, with
+zero runtime dependencies (Node 18's `fetch`).
+
+It exists because the TypeScript ecosystem Kimetsu integrates with — Pi
+extensions, OpenClaw plugins, Cursor, VS Code — was shelling out to the binary
+and parsing its text output, which is how the Pi extension and its published npm
+copy drifted apart without anyone noticing. There was no shared typed surface
+for them to share. Now there is.
+
+Unlike the launcher packages, it has a build step (`tsc`) and its version is not
+stamped from the Cargo workspace: it versions independently, because it tracks
+the MCP tool surface rather than the binary.
 
 ## How publishing works (esbuild / turbo style)
 
