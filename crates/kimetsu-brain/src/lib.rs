@@ -7,6 +7,7 @@ pub(crate) mod backend;
 /// S5.4: cross-backend benchmark harness (flat / graph-lite / petgraph).
 pub mod backend_bench;
 pub mod benchmark;
+pub mod bitemporal;
 pub mod blame;
 pub mod conflict;
 pub mod conflicts;

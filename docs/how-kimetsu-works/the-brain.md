@@ -27,6 +27,32 @@ projector replays it into materialized tables the broker queries fast.
 - `memory_edges`: typed relations between memories (`relates_to`, `supersedes`),
   written as each memory lands and traversed by the `graph-lite` backend.
 
+## Two clocks: what was true, and what we knew
+
+Every memory carries two independent timelines:
+
+- **Valid time** — when the fact was true in the world (`valid_from` /
+  `valid_to`). Default retrieval filters on this: an expired memory is excluded.
+- **Transaction time** — when the brain *learned* it (`created_at`) and when it
+  retracted it (`invalidated_at`, or the loser's stamped `valid_to`).
+
+Nothing is ever destroyed — supersession, invalidation and automatic
+contradiction resolution all stamp a tombstone rather than delete — so the
+brain can answer what it believed at any past moment:
+
+```bash
+kimetsu brain as-of 2026-03-01                      # the view then
+kimetsu brain as-of 2026-06-01 --since 2026-03-01   # what changed between
+```
+
+This is the question that matters when a past decision looks wrong: it
+separates a bad call from missing information. A memory that has since been
+retracted still appears in a view from before its retraction, annotated with
+what became of it, and a memory merged into a survivor still counts as the live
+belief it was at the time.
+
+---
+
 ## Durable upgrades: schema migrations
 
 brain.db carries a schema version, and a forward-only migration runner brings

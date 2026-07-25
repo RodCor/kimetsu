@@ -810,6 +810,13 @@ enum BrainCommand {
     /// successful run here, and flags clusters of writes that arrived too fast
     /// to be someone typing. Read-only: it reports, you decide.
     Audit(AuditArgs),
+    /// Ask what the brain believed at a point in time.
+    ///
+    /// Default retrieval answers "what is true now". This answers "what did the
+    /// agent know on the 3rd" — the question that matters when a past decision
+    /// looks wrong and you need to tell a bad call from missing information.
+    /// With --since, reports what changed between two times instead.
+    AsOf(AsOfArgs),
     /// Merge near-duplicate memories and optionally distil loose clusters.
     ///
     /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
@@ -1259,6 +1266,27 @@ struct ResumeArgs {
 }
 
 /// Args for `kimetsu brain tune`.
+/// Args for `kimetsu brain as-of`.
+#[derive(Debug, Args)]
+struct AsOfArgs {
+    /// The point in time, RFC 3339 (e.g. 2026-03-01T00:00:00Z) or YYYY-MM-DD.
+    #[arg(value_name = "WHEN")]
+    when: String,
+    /// Report what changed between this time and WHEN, rather than the full
+    /// view at WHEN.
+    #[arg(long, value_name = "WHEN")]
+    since: Option<String>,
+    /// Maximum memories to show. 0 = all.
+    #[arg(long, default_value_t = 50u32)]
+    limit: u32,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 /// Args for `kimetsu brain audit`.
 #[derive(Debug, Args)]
 struct AuditArgs {

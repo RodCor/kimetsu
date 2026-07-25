@@ -202,6 +202,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Policy(args) => brain_policy(args),
         BrainCommand::Maintain(args) => brain_maintain(args),
         BrainCommand::Audit(args) => brain_audit(args),
+        BrainCommand::AsOf(args) => brain_as_of(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
@@ -527,6 +528,110 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
 /// same block on its first `kimetsu_brain_context` call.
 pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
     kimetsu_brain::digest::warm_start_block(workspace)
+}
+
+/// Normalize a user-supplied time into RFC 3339.
+///
+/// Accepts a bare `YYYY-MM-DD` because that is how people actually name a day,
+/// and a full RFC 3339 timestamp for precision. A date alone means midnight
+/// UTC — the start of that day, so "what did it know on the 3rd" excludes
+/// everything learned during the 3rd, which is the conservative reading.
+fn normalize_as_of(when: &str) -> KimetsuResult<String> {
+    let trimmed = when.trim();
+    if trimmed.len() == 10 && trimmed.matches('-').count() == 2 {
+        return Ok(format!("{trimmed}T00:00:00Z"));
+    }
+    // Anything else must already be a timestamp the DB can compare
+    // lexicographically, which for RFC 3339 in UTC is the same as temporally.
+    if trimmed.len() >= 20 && trimmed.contains('T') {
+        return Ok(trimmed.to_string());
+    }
+    Err(format!(
+        "could not read `{trimmed}` as a time — use YYYY-MM-DD or a full RFC 3339 timestamp \
+         like 2026-03-01T00:00:00Z"
+    )
+    .into())
+}
+
+/// `kimetsu brain as-of <WHEN> [--since <WHEN>] [--limit N] [--json]`
+pub(crate) fn brain_as_of(args: AsOfArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::bitemporal;
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (_paths, _config, conn) = project::load_project_readonly(&workspace)?;
+    let when = normalize_as_of(&args.when)?;
+
+    if let Some(since) = args.since.as_deref() {
+        let from = normalize_as_of(since)?;
+        let delta = bitemporal::belief_delta(&conn, &from, &when)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "from": from,
+                    "to": when,
+                    "learned": delta.learned.iter().map(as_of_json).collect::<Vec<_>>(),
+                    "retired": delta.retired.iter().map(as_of_json).collect::<Vec<_>>(),
+                }))?
+            );
+            return Ok(());
+        }
+        println!("Between {from} and {when}:");
+        println!();
+        println!("  learned ({}):", delta.learned.len());
+        for m in delta.learned.iter().take(args.limit.max(1) as usize) {
+            println!("    + [{}] {}", m.kind, m.text);
+        }
+        println!("  retired ({}):", delta.retired.len());
+        for m in delta.retired.iter().take(args.limit.max(1) as usize) {
+            let why = m.retired_reason.as_deref().unwrap_or("no longer believed");
+            println!("    - [{}] {} ({why})", m.kind, m.text);
+        }
+        return Ok(());
+    }
+
+    let memories = bitemporal::memories_as_of(&conn, &when, args.limit)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "as_of": when,
+                "count": memories.len(),
+                "memories": memories.iter().map(as_of_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "The brain believed {} memor{} at {when}:",
+        memories.len(),
+        if memories.len() == 1 { "y" } else { "ies" }
+    );
+    println!();
+    for m in &memories {
+        match m.retired_reason.as_deref() {
+            // Flag the interesting ones: beliefs that were live then and are
+            // not now. That contrast is the reason to run this at all.
+            Some(reason) => println!("  [{}] {}  — since {reason}", m.kind, m.text),
+            None => println!("  [{}] {}", m.kind, m.text),
+        }
+    }
+    Ok(())
+}
+
+fn as_of_json(m: &kimetsu_brain::bitemporal::AsOfMemory) -> serde_json::Value {
+    serde_json::json!({
+        "memory_id": m.memory_id,
+        "scope": m.scope,
+        "kind": m.kind,
+        "text": m.text,
+        "created_at": m.created_at,
+        "retired_at": m.retired_at,
+        "retired_reason": m.retired_reason,
+    })
 }
 
 /// `kimetsu brain audit [--json]`

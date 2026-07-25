@@ -909,3 +909,91 @@ fn maintenance_runs_what_is_due_and_then_stops() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// v3.0: as-of (bitemporal) queries
+// ---------------------------------------------------------------------------
+
+/// The question default retrieval cannot answer: what did the agent know then?
+///
+/// The semantics are unit-tested in `kimetsu_brain::bitemporal`; this covers
+/// the command surface — date parsing, the JSON shape, and that a memory
+/// written after the as-of point is genuinely absent.
+#[test]
+fn as_of_reports_what_the_brain_believed_at_a_point_in_time() {
+    let root = temp_project_dir("as_of");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Run cargo fmt before committing",
+    )
+    .expect("add_memory");
+
+    let as_of = |when: &str| -> serde_json::Value {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "as-of", when, "--json", "--workspace"])
+            .arg(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn brain as-of");
+        assert!(
+            out.status.success(),
+            "brain as-of {when} should succeed; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("json")
+    };
+
+    // A bare date is accepted and read as midnight UTC.
+    let past = as_of("2025-01-01");
+    assert_eq!(past["as_of"], "2025-01-01T00:00:00Z");
+    assert_eq!(
+        past["count"], 0,
+        "nothing had been written yet; got: {past}"
+    );
+
+    // A full RFC 3339 timestamp works too.
+    let future = as_of("2099-01-01T00:00:00Z");
+    assert_eq!(
+        future["count"], 1,
+        "the memory exists by then; got: {future}"
+    );
+
+    // `--since` reports the delta rather than the view.
+    let out = Command::new(kimetsu_bin())
+        .args([
+            "brain",
+            "as-of",
+            "2099-01-01",
+            "--since",
+            "2025-01-01",
+            "--json",
+            "--workspace",
+        ])
+        .arg(&root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn brain as-of --since");
+    let delta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        delta["learned"].as_array().map(Vec::len),
+        Some(1),
+        "the memory was learned in that window; got: {delta}"
+    );
+    assert_eq!(delta["retired"].as_array().map(Vec::len), Some(0));
+
+    // An unparseable time is an error, not a silently empty result.
+    let bad = Command::new(kimetsu_bin())
+        .args(["brain", "as-of", "last tuesday", "--workspace"])
+        .arg(&root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn");
+    assert!(
+        !bad.status.success(),
+        "a bad time must not read as 'nothing'"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
