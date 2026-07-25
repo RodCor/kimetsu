@@ -7,11 +7,40 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
-## Unreleased: Speak first on every host
+## v2.6.0: Speak first on every host
 
 The README says Kimetsu "speaks first." An audit found that true on Claude Code,
 thin on Codex, and absent on Cursor, Pi and OpenClaw. This closes that gap and
 files the v2.6 plan behind it.
+
+### Fixed — the semantic build, and what it was silently dropping
+
+- **`--features embeddings` did not compile, and the reason on record was
+  wrong.** The RFC listed four open items as blocked on an unreachable ONNX
+  Runtime prebuilt. `ort` fetches fine and every model was already cached; the
+  build failed on `E0063` in Kimetsu's own code. `daemon_capsules_to_bundle`
+  sits inside `#[cfg(feature = "embeddings")]` and never supplied the three
+  `ContextBundle` fields that the ordering and coverage work added, so no lean
+  build could see it. CI does run `cargo test --features embeddings` — the
+  branch had simply never been pushed.
+
+- **Ordering and evidence-coverage never reached anyone on a semantic build.**
+  This is the part that mattered. On a build with a live embed daemon,
+  `try_daemon_retrieve` answers first and the in-process retrieval — which
+  measures coverage and renders capsules in date order — runs only on a miss.
+  So the daemon path, the *default* proactive path on the semantic flavor, was
+  serving bundles with neither. Two features the RFC listed as landed and
+  tested reached nobody on the flavor where retrieval is good enough to trust
+  them. Now: ordering queries decline the daemon outright, because the wire
+  protocol carries no date to order by and the in-process path does; and
+  coverage is measured on the daemon path too, degrading to "no claim" rather
+  than to a false "memory does not cover X" when the brain will not open.
+
+- **A test wrote into the developer's own brain.**
+  `remote_write_is_attributed_to_the_token_user` let project discovery walk out
+  of its tempdir and into `~/.kimetsu`. On this machine it failed loudly on a
+  schema mismatch, which was the lucky outcome — on a machine where the schemas
+  agree it passes, having written a test memory into a real brain.
 
 ### Added
 
@@ -170,10 +199,39 @@ files the v2.6 plan behind it.
   field alongside the capsules, and the installed Cursor rule tells the agent to
   make that call at task start. Scoped to the stdio path only — one
   `kimetsu-remote` process fans out across many sessions.
+- **`[broker] normalization`** selects how a candidate's raw relevance becomes
+  the `relevance` term: `per_kind` (the rule through v2.5) or `global`. Per-kind
+  normalizes within each capsule kind, so the best memory and the best repo_file
+  each reach `relevance = 1.0` however good either actually is — which is why
+  the lexical and semantic floors have to exist, pruning weak candidates before
+  normalization can flatter them. Global uses one max, so relevance means the
+  same thing across kinds. Ships with a per-request override so both rules can
+  be compared in one process against one corpus.
+
+  The default stays `per_kind`, and the reason is unusual enough to state: the
+  eval fixture is 18 memories of a single kind, and on a single-kind corpus the
+  two rules are *arithmetically identical*. `brain bench` cannot tell them
+  apart. Settling this needs a mixed-kind corpus that does not exist yet, and
+  building it inside the release that flips the default would be authoring the
+  instrument and the measurement together.
+
+- **CI builds and tests the TypeScript SDK**, and the release workflow
+  publishes it. `@kimetsu-ai/sdk` shipped in this release series with neither:
+  no job compiled it, and no step pushed it to npm. The whole argument for an
+  SDK is that integrations call a typed client instead of parsing text, which
+  only holds if the types compile. It publishes at its own package.json
+  version rather than the git tag — its API moves independently of the
+  binary's, and its PyPI sibling is versioned the same way.
+
 - **`docs/rfcs/v2.6-proactive-memory.md`**: the v2.6 RFC. What the audit found
   (including where the numbers and the defaults disagree), the 2026 competitive
   and research landscape, the Free/Deep two-tier split, and the phased plan for
-  retrieval accuracy, proactive autonomy, and memory safety.
+  retrieval accuracy, proactive autonomy, and memory safety. Its Status section
+  now also records two things it previously got wrong: the ONNX diagnosis
+  above, and a claim that BrainBench sycophancy and poisoning tracks exist in
+  `kimetsu-bench`. They do not — the *feature* is real and tested end-to-end in
+  `cli_smoke.rs`, but the benchmark tracks were never built, and that is where
+  the y→ies stemmer bug was actually caught.
 
 ### Docs
 

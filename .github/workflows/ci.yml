@@ -143,6 +143,27 @@ jobs:
               exit 1
             }
 
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    # v2.6 shipped `@kimetsu-ai/sdk` and nothing built it. The whole argument
+    # for the SDK is that integrations should call a typed client instead of
+    # shelling out to the binary and parsing text — an argument that only
+    # holds if the types compile, which until now no job checked.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: npm/kimetsu-sdk/package-lock.json
+      - name: Install
+        working-directory: npm/kimetsu-sdk
+        run: npm ci
+      - name: Typecheck + test
+        working-directory: npm/kimetsu-sdk
+        run: npm test
+
   audit:
     name: cargo-audit (RUSTSEC)
     runs-on: ubuntu-latest
