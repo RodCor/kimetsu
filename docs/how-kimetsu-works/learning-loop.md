@@ -121,6 +121,22 @@ Trust is a weight, never a gate: a bad import must not be able to silently
 delete your working knowledge. Memories written before provenance existed read
 as local, so upgrading does not make an existing brain untrusted overnight.
 
+**Quarantine is the gate the weight is not.** Discounting a poisoned pack ranks
+it lower; it still influences sessions. So `kimetsu brain import` holds an
+imported pack in the review queue — the same one `brain memory proposals`
+already drives — and nothing in it can reach a session until you accept it. On
+by default for `http(s)://` sources, since content authored elsewhere and
+fetched over the network is the widest attack surface here; off for a local file
+or stdin, which you chose and can open. `--quarantine` / `--no-quarantine`
+override either way, and `--mode replace` is refused alongside quarantine —
+superseding memories you have in favour of content you have not read is the
+worst of both. Entries matching a memory you already hold are deduped rather
+than proposed: a review queue nobody can face is not a safety mechanism.
+
+Nothing reaches back. A pack imported before quarantine existed stays where it
+is, discounted by origin — pulling working memories out of retrieval on an
+upgrade is a worse failure than the one quarantine prevents.
+
 `kimetsu brain audit` groups the active corpus by origin, shows how much of it
 has never been corroborated, and flags write bursts — clusters that arrived
 faster than anyone types, which is the shape both a bulk import and induced

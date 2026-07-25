@@ -327,9 +327,16 @@ No competitor owns this ground.
   write bursts — clusters that arrived faster than anyone types, the shape both
   a bulk import and induced poisoning leave. Read-only: an automated purge on
   that heuristic would delete a legitimate import. **Quarantining imports is
-  still open**, deliberately — it changes what `brain import` does and needs its
-  own migration story for packs already imported, rather than arriving behind a
-  scoring weight.
+  now landed**, in the import path rather than behind a scoring weight. It
+  routes an imported pack into the existing review queue, on by default for
+  `http(s)://` sources and off for a local file. One part of the plan was not
+  implementable as written: "quarantine until corroborated by a local citation"
+  cannot fire, because a memory outside the retrieval pool can never be cited.
+  A human decision through `brain memory proposals` is the smallest thing that
+  actually gates. The migration story is that there is none — packs imported
+  before quarantine existed stay live and stay discounted by origin, since
+  pulling working memories out of retrieval on an upgrade is a worse failure
+  than the one quarantine prevents.
 - **4c. Sycophancy resistance**: render memory as a claim to verify rather than
   as ground truth, enforce scope validity at render time, and add a MemSyco-style
   track to BrainBench.
@@ -354,8 +361,8 @@ No competitor owns this ground.
 default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, 3a, 3b, 3c, 4a, and the audit
 half of 4b.
 
-**Open, buildable:** quarantine-on-import (4b), 4c (sycophancy track),
-4d (belief drift), and all of phase 5.
+**Open, buildable:** 4c (sycophancy track), 4d (belief drift), and all of
+phase 5.
 
 3d and 3e landed, 3e not as written. The plan said to graduate
 `broker.proactive_prefetch` to default-on "gated on a measured false-positive

@@ -223,6 +223,9 @@ pub struct ImportSummary {
     /// v3.0 #4: memories superseded by a `replace`-mode pack install (existing
     /// active memories in the pack's scope(s), invalidated before the load).
     pub superseded: usize,
+    /// v3.0: entries routed into the review queue instead of the retrieval
+    /// pool. See [`quarantine_memories`].
+    pub quarantined: usize,
 }
 
 thread_local! {
@@ -475,16 +478,135 @@ pub fn import_memories(
     Ok(summary)
 }
 
+/// v3.0: route a pack's entries into the review queue instead of the brain.
+///
+/// [`crate::trust`] scores a memory's origin and folds it into the broker
+/// score, and says outright what that does not do: a weight makes a poisoned
+/// pack rank lower, it does not stop it influencing anything. Memory poisoning
+/// (OWASP ASI06) is worth stopping rather than discounting precisely because it
+/// persists — MINJA (arXiv 2601.05504) reports >95% success against
+/// memory-backed agents, and unlike prompt injection the effect does not end
+/// with the session.
+///
+/// So a quarantined import writes `memory.proposed` events rather than
+/// memories. Nothing enters retrieval until a human accepts it through the
+/// review queue that already exists (`brain memory proposals`, `--accept`,
+/// `--reject`) — no new surface to learn, and no new table.
+///
+/// The plan called for releasing quarantine on a local citation instead of a
+/// human decision. That is not implementable as stated: a memory outside the
+/// retrieval pool can never be cited, so the release condition can never fire.
+/// A human decision is the smallest thing that actually gates.
+///
+/// Entries whose normalized text already matches an active memory are counted
+/// as deduped rather than proposed. Without that, re-importing a pack you
+/// already trust would fill the review queue with copies of your own memories,
+/// and a review queue nobody can face is not a safety mechanism.
+pub fn quarantine_memories(
+    start: &Path,
+    entries: &[MemoryExport],
+    scope_override: Option<MemoryScope>,
+    pack: Option<&PackRef>,
+) -> KimetsuResult<ImportSummary> {
+    let mut summary = ImportSummary::default();
+
+    let existing: std::collections::HashSet<String> = match load_project_readonly(start) {
+        Ok((_paths, _config, conn)) => conn
+            .prepare("SELECT normalized_text FROM memories WHERE invalidated_at IS NULL")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+
+    let origin = match pack {
+        Some(p) => format!(
+            "pack {}@{}",
+            p.name.as_deref().unwrap_or("unknown"),
+            p.version.as_deref().unwrap_or("?")
+        ),
+        None => "an import".to_string(),
+    };
+    let rationale = format!(
+        "Quarantined on import from {origin}. Imported memories are held for \
+         review rather than entering retrieval, because a poisoned memory \
+         persists across every future session. Accept only what you would have \
+         written yourself."
+    );
+
+    let mut seen_in_batch = std::collections::HashSet::new();
+    for entry in entries {
+        let scope = match scope_override {
+            Some(ov) => ov,
+            None => match entry.scope.parse::<MemoryScope>() {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!(
+                        "kimetsu-brain import: skipping entry with unknown scope `{}`",
+                        entry.scope
+                    );
+                    summary.deduped += 1;
+                    continue;
+                }
+            },
+        };
+        let kind = match entry.kind.parse::<MemoryKind>() {
+            Ok(k) => k,
+            Err(_) => {
+                eprintln!(
+                    "kimetsu-brain import: skipping entry with unknown kind `{}`",
+                    entry.kind
+                );
+                summary.deduped += 1;
+                continue;
+            }
+        };
+
+        let normalized = kimetsu_core::memory::normalize_memory_text(&entry.text);
+        if existing.contains(&normalized) || !seen_in_batch.insert(normalized) {
+            summary.deduped += 1;
+            continue;
+        }
+
+        // Confidence is the pack author's claim about their own content, which
+        // is exactly what quarantine declines to take at face value. It is
+        // carried through so the reviewer sees what was asserted.
+        match crate::project::propose_memory(
+            start,
+            scope,
+            kind,
+            &entry.text,
+            entry.confidence,
+            &rationale,
+        ) {
+            Ok(_) => summary.quarantined += 1,
+            Err(e) => {
+                eprintln!("kimetsu-brain import: failed to quarantine memory: {e}");
+                summary.deduped += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
 /// v3.0 #4: install a pack's memories. `merge` adds additively (dedup against
 /// existing). `replace` first invalidates active memories in the pack's scope(s)
 /// — REVERSIBLE (events kept; rows marked invalidated) — then loads the pack.
 /// Each installed memory is stamped with the `pack` provenance.
+///
+/// v3.0: when `quarantine` is set, entries go to the review queue instead of
+/// the retrieval pool — see [`quarantine_memories`]. `replace` and `quarantine`
+/// are mutually exclusive by construction at the CLI, since superseding what
+/// you have in favour of content you have not reviewed is the worst of both.
 pub fn import_pack(
     start: &Path,
     entries: &[MemoryExport],
     scope_override: Option<MemoryScope>,
     replace: bool,
     pack: Option<&PackRef>,
+    quarantine: bool,
 ) -> KimetsuResult<ImportSummary> {
     let mut superseded = 0usize;
     if replace {
@@ -523,7 +645,11 @@ pub fn import_pack(
             "pack_version": p.version,
         }))
     });
-    let mut summary = import_memories(start, &scrubbed, scope_override)?;
+    let mut summary = if quarantine {
+        quarantine_memories(start, &scrubbed, scope_override, pack)?
+    } else {
+        import_memories(start, &scrubbed, scope_override)?
+    };
     summary.superseded = superseded;
     Ok(summary)
 }

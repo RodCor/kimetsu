@@ -1230,6 +1230,29 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         }
     };
 
+    // v3.0: whether the pack is held for review rather than entering
+    // retrieval. The default is decided by where the pack came from, because
+    // that is what the threat model turns on: a URL is content authored
+    // elsewhere by someone else, fetched over the network, which `trust.rs`
+    // names as the widest attack surface Kimetsu has. A local file is one the
+    // user chose and can open. Either default is overridable.
+    let from_url = args.file.starts_with("http://") || args.file.starts_with("https://");
+    let quarantine = if args.quarantine {
+        true
+    } else if args.no_quarantine {
+        false
+    } else {
+        from_url
+    };
+    if quarantine && replace {
+        return Err(
+            "brain import: --mode replace and --quarantine are incompatible — replace \
+             supersedes memories you have in favour of content you have not reviewed. \
+             Review the pack first, or pass --no-quarantine to accept it outright."
+                .into(),
+        );
+    }
+
     // Read raw bytes from a path, stdin (`-`), or an http(s):// URL.
     let bytes: Vec<u8> = if args.file == "-" {
         use std::io::Read;
@@ -1268,6 +1291,7 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         scope_override,
         replace,
         Some(&pack_ref),
+        quarantine,
     )?;
 
     let label = match (&pack_ref.name, &pack_ref.version) {
@@ -1275,7 +1299,23 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         (Some(n), None) => format!(" (pack {n})"),
         _ => String::new(),
     };
-    if summary.superseded > 0 {
+    if quarantine {
+        println!(
+            "quarantined {}, deduped {}{label}",
+            summary.quarantined, summary.deduped
+        );
+        if summary.quarantined > 0 {
+            println!(
+                "Nothing from this pack can reach a session until you accept it. \
+                 Review with `kimetsu brain memory proposals`{}.",
+                if from_url && !args.quarantine {
+                    " (quarantined because it came from a URL; pass --no-quarantine to skip review)"
+                } else {
+                    ""
+                }
+            );
+        }
+    } else if summary.superseded > 0 {
         println!(
             "installed {}, deduped {}, superseded {}{label}",
             summary.imported, summary.deduped, summary.superseded

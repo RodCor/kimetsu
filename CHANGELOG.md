@@ -13,6 +13,23 @@ The README says Kimetsu "speaks first." An audit found that true on Claude Code,
 thin on Codex, and absent on Cursor, Pi and OpenClaw. This closes that gap and
 files the v3.0 plan behind it.
 
+### Added
+
+- **`brain import` quarantines packs from the network.** Provenance-weighted
+  trust discounts a poisoned pack; it does not stop one. Memory poisoning is
+  worth stopping rather than ranking down precisely because, unlike prompt
+  injection, it persists across every future session. So an imported pack is now
+  held in the review queue `brain memory proposals` already drives, and nothing
+  in it can reach a session until you accept it. On by default for `http(s)://`
+  sources — content authored elsewhere and fetched over the network is the widest
+  attack surface here — and off for a local file or stdin, which you chose and
+  can open; `--quarantine` / `--no-quarantine` override either way. `--mode
+  replace` alongside quarantine is refused, since superseding memories you have
+  in favour of content you have not read is the worst of both. Entries matching a
+  memory you already hold are deduped rather than proposed, because a review
+  queue nobody can face is not a safety mechanism. Nothing reaches backward:
+  packs imported before this stay live and stay discounted by origin.
+
 ### Fixed
 
 - **The skills loop tells you it is waiting.** A memory cited across three

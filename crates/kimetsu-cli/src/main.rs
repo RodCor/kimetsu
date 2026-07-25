@@ -1674,6 +1674,20 @@ struct BrainImportArgs {
     /// Confirm a destructive `--mode replace`.
     #[arg(long)]
     yes: bool,
+    /// v3.0: hold every imported memory in the review queue instead of putting
+    /// it straight into retrieval. Nothing the pack contains can influence a
+    /// session until you accept it with `kimetsu brain memory accept`.
+    ///
+    /// Defaults to ON for http(s):// sources — content authored elsewhere,
+    /// fetched over the network, is the widest attack surface Kimetsu has — and
+    /// OFF for a local file or stdin, which you chose and can read. Pass
+    /// `--no-quarantine` to import a URL directly, or `--quarantine` to review
+    /// a local file.
+    #[arg(long, overrides_with = "no_quarantine")]
+    quarantine: bool,
+    /// Import straight into retrieval, skipping review. See `--quarantine`.
+    #[arg(long, overrides_with = "quarantine")]
+    no_quarantine: bool,
 }
 
 #[derive(Debug, Args)]

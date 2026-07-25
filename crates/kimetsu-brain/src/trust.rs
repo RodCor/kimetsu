@@ -39,11 +39,15 @@
 //! ## Not done here
 //!
 //! Quarantining imports — routing pack memories into the proposal queue instead
-//! of accepting them outright — is the mechanism that would actually stop a
-//! poisoned pack from influencing anything before a human looks at it. It is
-//! deliberately not in this module: it changes what `brain import` *does*, and
-//! that belongs in a change to the import path with its own migration story for
-//! packs already imported, not smuggled in behind a scoring weight.
+//! of accepting them outright — is the mechanism that actually stops a poisoned
+//! pack from influencing anything before a human looks at it, and it is
+//! deliberately not in this module: it changes what `brain import` *does*, which
+//! belongs in the import path rather than behind a scoring weight. It lives in
+//! [`crate::packs::quarantine_memories`], on by default for `http(s)://`
+//! sources. This module stays the answer for *history* — a pack imported before
+//! quarantine existed is discounted by origin rather than pulled back out of
+//! retrieval, because reaching into a working brain on an upgrade is a worse
+//! failure than the one quarantine prevents.
 
 use serde::{Deserialize, Serialize};
 
