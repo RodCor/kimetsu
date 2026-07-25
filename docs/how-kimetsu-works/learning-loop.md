@@ -137,6 +137,34 @@ Nothing reaches back. A pack imported before quarantine existed stays where it
 is, discounted by origin — pulling working memories out of retrieval on an
 upgrade is a worse failure than the one quarantine prevents.
 
+### Framing, not deference
+
+MemSyco-Bench reports that most memory systems score *worse* on their sycophancy
+track than using no memory at all. The mechanism is not that retrieved memories
+are wrong more often than right — it is that a memory arrives looking like
+ground truth, so the model defers to it over evidence directly in front of it.
+A memory saying the config lives at `config/app.toml` beats the agent's own `ls`
+showing it does not, because nothing in the injection said which of the two wins.
+
+Kimetsu's header used to read "relevant knowledge for this task". *Knowledge* is
+the wrong word: what the brain holds is what was recorded, at some past moment,
+by someone who believed it then. The injection now says so, and says which
+questions memory settles:
+
+- Memory **is** the authority on what was decided, learned, or preferred. There
+  is no other source for those — the repository does not record why.
+- Memory is **not** the authority on what the code currently is. The working
+  tree is, and it has moved. Every memory-versus-reality conflict is this kind.
+
+So the framing is a rule about conflicts rather than a disclaimer: prefer what
+you can check now over what was recorded then. Hedging would be the wrong fix —
+an agent told "this might be wrong" ignores memory, which is the whole product —
+so the memory itself is never qualified, only outranked. The proactive hook gets
+a short suffix instead of a preamble: it interrupts work already underway on a
+one-capsule budget, and framing longer than the memory reads as noise. MCP
+clients, which have no fixed render, get the same rule as guidance in
+`usage.how_to_use`.
+
 `kimetsu brain audit` groups the active corpus by origin, shows how much of it
 has never been corroborated, and flags write bursts — clusters that arrived
 faster than anyone types, which is the shape both a bulk import and induced

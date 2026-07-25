@@ -21,6 +21,7 @@ pub mod embeddings;
 pub mod episode;
 pub mod eval;
 pub mod feedback;
+pub mod framing;
 /// #2 knowledge graph: rule-based relation-edge extraction for `memory_edges`.
 pub mod fusion;
 pub mod graph;

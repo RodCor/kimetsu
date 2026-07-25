@@ -253,7 +253,11 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push_str(block);
         additional_context.push_str("\n\n");
     }
-    additional_context.push_str("Kimetsu brain relevant knowledge for this task:");
+    // v3.0: memory arrives looking like ground truth unless the framing says
+    // otherwise, and MemSyco-Bench finds that deference is what makes most
+    // memory systems score worse than no memory at all. See
+    // `kimetsu_brain::framing`.
+    additional_context.push_str(kimetsu_brain::framing::CONTEXT_HEADER);
     // v3.0: a time-ordered bundle looks like a relevance-ranked one whose
     // ranking has gone wrong unless the reader is told. Goes above the capsules
     // because it describes how to read them.
@@ -1133,7 +1137,13 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         .map(str::to_string)
         .unwrap_or(rendered);
     let header = proactive_header(event, loop_mode);
-    let additional_context = format!("{header}\n{body}");
+    // The suffix rather than a second line: this hook interrupts work already
+    // underway on a one-capsule budget, and a preamble longer than the memory
+    // reads as noise.
+    let additional_context = format!(
+        "{header}{}\n{body}",
+        kimetsu_brain::framing::PROACTIVE_SUFFIX
+    );
 
     print_tool_use_context(event, &additional_context)?;
 

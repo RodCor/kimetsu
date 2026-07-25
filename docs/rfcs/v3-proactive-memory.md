@@ -361,8 +361,9 @@ No competitor owns this ground.
 default flip), phase 1, 2a, 2c, 2d, 2e, 2f, 2h, 3a, 3b, 3c, 4a, and the audit
 half of 4b.
 
-**Open, buildable:** 4c (sycophancy track), 4d (belief drift), and all of
-phase 5.
+**Open, buildable:** the BrainBench half of 4c (a MemSyco-derived track lives
+in `kimetsu-bench`), 4d (belief drift), and all of phase 5. The render half of
+4c has landed.
 
 3d and 3e landed, 3e not as written. The plan said to graduate
 `broker.proactive_prefetch` to default-on "gated on a measured false-positive

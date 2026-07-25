@@ -852,7 +852,7 @@ pub fn brain_context_tool(
                 "skipped": false,
                 "top_score": bundle.top_score,
                 "usage": {
-                    "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
+                    "how_to_use": kimetsu_brain::framing::MCP_HOW_TO_USE,
                     "next_steps": [
                         "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
                         "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",

@@ -15,6 +15,22 @@ files the v3.0 plan behind it.
 
 ### Added
 
+- **Injected memory is framed as a prior conclusion, not as knowledge.**
+  MemSyco-Bench reports most memory systems scoring *worse* on sycophancy than
+  using no memory at all: a retrieved memory arrives looking like ground truth,
+  so the model defers to it over evidence directly in front of it. Kimetsu's
+  header read "Kimetsu brain relevant knowledge for this task" — and *knowledge*
+  is the wrong word for what was recorded at some past moment by someone who
+  believed it then. The injection now states which questions memory settles
+  (what was decided, learned, or preferred — the repository does not record why)
+  and which it does not (what the code currently is), and resolves the conflict
+  case explicitly: prefer what you can check now over what was recorded then.
+  The memory itself is never hedged — an agent told "this might be wrong"
+  ignores memory, which is the whole product — only outranked. The proactive
+  hook gets a short suffix rather than a preamble, since it interrupts work
+  already underway on a one-capsule budget. MCP clients get the same rule
+  through `usage.how_to_use`.
+
 - **`brain import` quarantines packs from the network.** Provenance-weighted
   trust discounts a poisoned pack; it does not stop one. Memory poisoning is
   worth stopping rather than ranking down precisely because, unlike prompt

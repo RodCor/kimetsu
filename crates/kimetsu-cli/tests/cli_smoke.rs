@@ -541,6 +541,47 @@ fn brain_import_quarantines_by_source_and_honours_the_overrides() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// v3.0: MemSyco-Bench finds most memory systems score *worse* on sycophancy
+/// than using no memory, because a retrieved memory arrives looking like ground
+/// truth and the model defers to it over evidence in front of it. The fix is a
+/// rule about conflicts in the injected text itself, so it is asserted there.
+#[test]
+fn context_hook_frames_memory_as_a_prior_conclusion_not_ground_truth() {
+    let root = temp_project_dir("framing");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Fact,
+        "The broker configuration lives at config/broker.toml",
+    )
+    .expect("add_memory");
+
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"framing-1","prompt":"where does the broker configuration live"}"#,
+    );
+    assert!(
+        out.contains("prior conclusions"),
+        "memory must not be framed as knowledge; got: {out}"
+    );
+    assert!(
+        out.contains("what you can check now wins"),
+        "the framing must resolve the conflict, not merely flag it; got: {out}"
+    );
+    // The value of the product is the agent acting on memory, so the framing
+    // must not tell it the memory is probably wrong.
+    for hedge in ["may be wrong", "unreliable"] {
+        assert!(!out.contains(hedge), "framing must not hedge; got: {out}");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// v3.0: the ordering fix, seen from where it matters — the text the agent
 /// actually receives.
 ///
