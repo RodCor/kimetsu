@@ -64,6 +64,19 @@ files the v3.0 plan behind it.
 
 ### Fixed
 
+- **`retry` now matches a corpus that says `retries`.** The light query stemmer
+  stripped `-ing/-ed/-es/-s` but had no y→ies rule, so `retries` reduced to
+  `retri`, `retry` matched no suffix at all, and neither prefixed the other.
+  Since matching downstream is substring and FTS-prefix, a query about `retry`
+  treated a corpus that plainly said `retries` as never mentioning it — losing
+  the term's IDF weight in the lexical floor and, since v3.0, reporting it to the
+  user as a gap in coverage. It affects every `-y` word: `query`, `policy`,
+  `memory`, `binary`, `registry` — a large share of the vocabulary this corpus is
+  made of. A trailing `y`/`i` after a consonant is now stripped so both forms
+  land on the shared prefix. Vowel-`y` (`delay`, `gateway`, `journeys`) is left
+  alone, as are short words. Found by BrainBench's new sycophancy track, which
+  flagged a gap on a question the fixture memories answered outright.
+
 - **The skills loop tells you it is waiting.** A memory cited across three
   distinct runs earns skill status, and detection has run on the maintenance
   schedule since the daemon landed — into a log file nobody opens. So a memory

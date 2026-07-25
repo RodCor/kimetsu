@@ -2119,15 +2119,40 @@ fn weighted_coverage(content: &[String], idf: &HashMap<String, f32>, summary: &s
 /// discriminating word. Haystacks stay raw; only query tokens are stemmed.
 /// Conservative: a suffix is stripped only when ≥4 chars remain, and only
 /// one suffix is stripped.
+///
+/// v3.0: plus the English y→ies rule, which the suffix list alone gets wrong in
+/// both directions. `"retries"` strips `es` to `retri`; `"retry"` matches no
+/// suffix and stays `retry`; neither is a prefix of the other, so a query
+/// asking about `retry` treats a corpus that says `retries` as not mentioning
+/// it at all. BrainBench's sycophancy track found this by flagging a gap on a
+/// question the memories plainly answered — the same defect silently costs the
+/// lexical floor its IDF weight on any `-y` word (`query`, `policy`, `memory`,
+/// `binary`), which is a large share of the vocabulary this corpus is made of.
+///
+/// Stripping a trailing `y`/`i` after a consonant collapses both forms onto the
+/// shared prefix (`retry`, `retries` → `retr`), which is what substring and
+/// FTS-prefix matching need. Only after a consonant, so `day`/`key` keep their
+/// vowel-`y`, and only with ≥4 chars remaining, so short words are left alone.
 fn light_stem(token: &str) -> &str {
+    let mut stem = token;
     for suffix in ["ing", "ed", "es", "s"] {
-        if let Some(stem) = token.strip_suffix(suffix)
-            && stem.len() >= 4
+        if let Some(stripped) = token.strip_suffix(suffix)
+            && stripped.len() >= 4
         {
-            return stem;
+            stem = stripped;
+            break;
         }
     }
-    token
+    if stem.len() >= 5
+        && let Some(trimmed) = stem.strip_suffix('y').or_else(|| stem.strip_suffix('i'))
+        && trimmed
+            .chars()
+            .next_back()
+            .is_some_and(|c| !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
+    {
+        return trimmed;
+    }
+    stem
 }
 
 fn query_tokens(query: &str) -> Vec<String> {
@@ -5561,6 +5586,107 @@ mod evidence_tests {
             partial_evidence_notice(&bundle(vec![capsule("a")], 0.1, &refs)).expect("flagged");
         assert!(notice.contains("and 6 more"), "got: {notice}");
         assert!(!notice.contains("term9"), "got: {notice}");
+    }
+
+    // ── v3.0: light stemming ─────────────────────────────────────────────
+
+    /// The defect BrainBench's sycophancy track surfaced: a query asking about
+    /// `retry` treated a corpus saying `retries` as not mentioning it, because
+    /// the two stemmed to `retry` and `retri` and neither prefixes the other.
+    #[test]
+    fn the_y_ies_pair_shares_a_stem() {
+        for (a, b) in [
+            ("retry", "retries"),
+            ("query", "queries"),
+            ("policy", "policies"),
+            ("memory", "memories"),
+            ("binary", "binaries"),
+            ("registry", "registries"),
+        ] {
+            assert_eq!(
+                light_stem(a),
+                light_stem(b),
+                "{a}/{b} stemmed to {:?}/{:?}",
+                light_stem(a),
+                light_stem(b)
+            );
+        }
+    }
+
+    /// Vowel-`y` is part of the word, not an inflection: `day` is not `da`.
+    #[test]
+    fn a_vowel_y_is_not_stripped() {
+        assert_eq!(light_stem("delay"), "delay");
+        assert_eq!(light_stem("gateway"), "gateway");
+        // "journeys" strips the s (7 chars remain), and the y survives because
+        // a vowel precedes it.
+        assert_eq!(light_stem("journeys"), "journey");
+    }
+
+    /// Short words are left alone: over-stemming a four-letter token leaves a
+    /// prefix that matches half the corpus.
+    #[test]
+    fn short_words_keep_their_ending() {
+        assert_eq!(light_stem("body"), "body");
+        assert_eq!(light_stem("copy"), "copy");
+    }
+
+    /// The pre-existing behaviour must be unchanged — this rule is additive.
+    #[test]
+    fn the_original_suffix_rules_still_hold() {
+        assert_eq!(light_stem("benchmarked"), "benchmark");
+        assert_eq!(light_stem("benchmarking"), "benchmark");
+        assert_eq!(light_stem("migrations"), "migration");
+        assert_eq!(light_stem("run"), "run");
+    }
+
+    /// End to end, which is the form the defect actually took: a bundle must
+    /// not report a gap on a term the corpus inflects differently.
+    #[test]
+    fn an_inflected_corpus_term_counts_as_covered() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let text = "the ingest worker retries a failed batch three times before giving up";
+        let normalized = kimetsu_core::memory::normalize_memory_text(text);
+        conn.execute(
+            "
+            INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text, confidence,
+                source_event_id, provenance_snapshot_json, created_at
+            )
+            VALUES ('m_retry', 'project', 'fact', ?1, ?2, 1.0, NULL, '{}',
+                    '2026-01-01T00:00:00Z')
+            ",
+            rusqlite::params![text, normalized],
+        )
+        .expect("insert memory");
+        conn.execute(
+            "INSERT INTO memories_fts (memory_id, text, kind, scope)
+             VALUES ('m_retry', ?1, 'fact', 'project')",
+            rusqlite::params![text],
+        )
+        .expect("insert fts");
+
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &kimetsu_core::config::BrokerWeights::default(),
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "how many times does the ingest worker retry a failed batch".to_string(),
+                budget_tokens: 4000,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        assert!(
+            !bundle.uncovered_terms.iter().any(|t| t.starts_with("retr")),
+            "`retry` must match a corpus that says `retries`; uncovered: {:?}",
+            bundle.uncovered_terms
+        );
     }
 
     // ── v3.0: event ordering (crate::ordering) ──────────────────────────

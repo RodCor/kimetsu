@@ -110,6 +110,17 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
                         "used_tokens": bundle.used_tokens,
                         "capsule_count": bundle.capsules.len(),
                         "excluded_count": bundle.excluded.len(),
+                        // v3.0: the bundle's own judgement of itself, which the
+                        // MCP surface has exposed since abstention landed. It
+                        // belongs here too — a JSON caller cannot tell a bundle
+                        // that answers the question from one that touches half
+                        // of it without these, and that is exactly the
+                        // difference BrainBench's sycophancy track scores.
+                        "top_score": bundle.top_score,
+                        "skipped": bundle.skipped,
+                        "evidence_coverage": bundle.evidence_coverage,
+                        "uncovered_terms": bundle.uncovered_terms,
+                        "chronological": bundle.chronological,
                         "capsules": bundle.capsules,
                         "excluded": bundle.excluded,
                     }))?
