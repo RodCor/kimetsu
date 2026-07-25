@@ -239,7 +239,7 @@ pub fn audit(conn: &rusqlite::Connection) -> kimetsu_core::KimetsuResult<AuditRe
         .filter(|(_, writes)| *writes >= BURST_THRESHOLD)
         .map(|(minute, writes)| WriteBurst { minute, writes })
         .collect();
-    bursts.sort_by(|a, b| b.writes.cmp(&a.writes));
+    bursts.sort_by_key(|b| std::cmp::Reverse(b.writes));
 
     Ok(AuditReport {
         groups,

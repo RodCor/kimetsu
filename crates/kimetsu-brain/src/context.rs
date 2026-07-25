@@ -4793,10 +4793,19 @@ mod tests {
     #[test]
     fn unknown_normalization_falls_back_to_per_kind() {
         assert_eq!(Normalization::from_config(""), Normalization::PerKind);
-        assert_eq!(Normalization::from_config("per_kind"), Normalization::PerKind);
-        assert_eq!(Normalization::from_config("nonsense"), Normalization::PerKind);
+        assert_eq!(
+            Normalization::from_config("per_kind"),
+            Normalization::PerKind
+        );
+        assert_eq!(
+            Normalization::from_config("nonsense"),
+            Normalization::PerKind
+        );
         assert_eq!(Normalization::from_config("global"), Normalization::Global);
-        assert_eq!(Normalization::from_config("  GLOBAL "), Normalization::Global);
+        assert_eq!(
+            Normalization::from_config("  GLOBAL "),
+            Normalization::Global
+        );
     }
 
     #[test]
