@@ -1,4 +1,4 @@
-//! v3.0: asking the brain what it believed at a point in time.
+//! v2.6: asking the brain what it believed at a point in time.
 //!
 //! A memory has two independent time axes, and Kimetsu has only ever had one
 //! of them working:

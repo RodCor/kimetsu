@@ -67,7 +67,7 @@ pub const RERANKER_IDS: &[&str] = &[
     "ms-marco-minilm-l-4-v2",
 ];
 
-/// v3.0: how the lexical and semantic rankings are merged. See
+/// v2.6: how the lexical and semantic rankings are merged. See
 /// [`crate::fusion`] for why this is a real ranking decision and not plumbing.
 ///
 /// It is swept rather than defaulted because BM25 and cosine live on different
@@ -84,8 +84,8 @@ pub struct TuneCombo {
     pub min_lexical_coverage: f32,
     pub min_semantic_score: f32,
     pub reranker_id: String,
-    /// v3.0: `"linear"` or `"rrf"`. `#[serde(default)]` keeps tune-history
-    /// files written before v3.0 deserializing cleanly — they predate the
+    /// v2.6: `"linear"` or `"rrf"`. `#[serde(default)]` keeps tune-history
+    /// files written before v2.6 deserializing cleanly — they predate the
     /// dimension, so they describe linear runs.
     #[serde(default = "default_fusion_mode")]
     pub fusion: String,
@@ -479,7 +479,7 @@ mod tests {
 
     /// The sweep space is the product of every swept dimension. Asserting the
     /// arithmetic (rather than a literal) keeps this honest when a dimension is
-    /// added: v3.0 added `fusion`, which doubled the grid from 80 to 160.
+    /// added: v2.6 added `fusion`, which doubled the grid from 80 to 160.
     #[test]
     fn all_combos_covers_the_full_grid() {
         let combos = TuneCombo::all_combos();

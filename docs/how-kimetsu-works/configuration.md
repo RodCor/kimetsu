@@ -115,7 +115,7 @@ switching tiers can add quality but never removes a capability:
 
 Leave `tier` unset for **auto**: a brain with a cheap model configured is
 already making model calls, so it resolves to Deep; a brain without one
-resolves to Free. That keeps every pre-v3.0 config behaving exactly as before.
+resolves to Free. That keeps every pre-v2.6 config behaving exactly as before.
 Set it explicitly to force the choice — `tier = "free"` is a durable opt-out of
 model calls even when credentials are present, and `tier = "deep"` with no
 reachable model resolves back down to Free and says so in `kimetsu doctor` and

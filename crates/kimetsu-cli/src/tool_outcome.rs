@@ -1,4 +1,4 @@
-//! v3.0: deciding whether a tool call actually failed.
+//! v2.6: deciding whether a tool call actually failed.
 //!
 //! The proactive PostToolUse hook only earns its keep if "did that fail?" is
 //! answered accurately. Through v2.5 the answer was a case-insensitive

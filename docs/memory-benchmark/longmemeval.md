@@ -43,7 +43,7 @@ What the split shows:
 - **Multi-session 58.8% and preference 66.7% are the weakest.** Cross-session
   counting needs every contributing turn retrieved; a preference is a small
   aside semantically far from the question. Both are the multi-hop retrieval
-  work flagged for v3.0.
+  work flagged for v2.6.
 
 Reproduce with `kbench longmemeval --dataset longmemeval_s.json
 --reader-backend codex --limit 200`.

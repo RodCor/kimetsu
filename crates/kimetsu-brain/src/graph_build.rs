@@ -72,7 +72,7 @@ pub fn build_graph(
         |r| r.get::<_, i64>(0),
     )? as usize;
 
-    // v3.0: refresh the entity index before deriving edges. A brain that was
+    // v2.6: refresh the entity index before deriving edges. A brain that was
     // migrated with an unreadable corpus, or one whose extractor rules have
     // since changed, would otherwise build its graph from a stale index —
     // and this command is exactly what a user runs to fix that.

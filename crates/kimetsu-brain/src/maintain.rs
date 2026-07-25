@@ -1,4 +1,4 @@
-//! v3.0: the brain's background upkeep.
+//! v2.6: the brain's background upkeep.
 //!
 //! Kimetsu accumulated a shelf of maintenance passes — consolidation, query
 //! routing, pruning, digest refresh, self-tuning, skill graduation — and every

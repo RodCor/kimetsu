@@ -54,13 +54,13 @@ pub struct SessionState {
     /// non-trivial session that recorded nothing). `0` = never cued.
     #[serde(default)]
     pub harvest_cued_unix: u64,
-    /// v3.0: unix time this session was handed the warm-start block (repo
+    /// v2.6: unix time this session was handed the warm-start block (repo
     /// digest + episodic resume) by the per-turn context hook. Hosts with
     /// no session-start event get it prepended to their first prompt
     /// instead; this flag keeps it to exactly one turn. `0` = not yet warmed.
     #[serde(default)]
     pub warm_started_unix: u64,
-    /// v3.0: how many proactive injections this session has already made.
+    /// v2.6: how many proactive injections this session has already made.
     /// Feeds the injection policy's novelty feature — the tenth interruption
     /// is worth less than the first.
     #[serde(default)]
@@ -178,7 +178,7 @@ pub fn normalize_command(cmd: &str) -> String {
         .to_ascii_lowercase()
 }
 
-// v3.0: failure detection moved to `crate::tool_outcome`.
+// v2.6: failure detection moved to `crate::tool_outcome`.
 //
 // It used to live here as a case-insensitive substring scan for ten words,
 // which fired on every passing test suite ("0 failed" contains "failed") and
@@ -244,12 +244,12 @@ impl SessionState {
         self.injections = self.injections.saturating_add(1);
     }
 
-    /// v3.0: how many proactive injections this session has already made.
+    /// v2.6: how many proactive injections this session has already made.
     pub fn injection_count(&self) -> u32 {
         self.injections
     }
 
-    /// v3.0: how far past the refractory window we are, in `[0, 1]`.
+    /// v2.6: how far past the refractory window we are, in `[0, 1]`.
     ///
     /// 0 immediately after an injection, 1 once well clear of it. A feature
     /// rather than a gate: the refractory check is still a hard rule, but the

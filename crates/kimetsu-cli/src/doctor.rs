@@ -454,7 +454,7 @@ fn check_cheap_model(workspace: &Path) -> CheckReport {
     const NAME: &str = "cheap model (distiller / harvester)";
     const CATEGORY: &str = "learning";
 
-    // v3.0: the tier is the umbrella gate. Deep asked for but unreachable is
+    // v2.6: the tier is the umbrella gate. Deep asked for but unreachable is
     // the one case worth shouting about — the label says model calls are on
     // while nothing can actually run.
     let config = kimetsu_core::paths::ProjectPaths::discover(workspace)

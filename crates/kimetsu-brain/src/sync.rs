@@ -97,12 +97,12 @@ pub struct SyncEvent {
     pub kind: String,
     pub schema_version: u32,
     pub payload: serde_json::Value,
-    /// v3.0 #3: who/where wrote this event (`<machine_id>/<agent>`). Carried so a
+    /// v2.6 #3: who/where wrote this event (`<machine_id>/<agent>`). Carried so a
     /// replicated/team brain can attribute each event. `#[serde(default)]` keeps
     /// pre-v8 sync batches (no `origin`) importable.
     #[serde(default)]
     pub origin: Option<String>,
-    /// v3.0 #3 Slice B: the event's HLC (canonical string) for convergent
+    /// v2.6 #3 Slice B: the event's HLC (canonical string) for convergent
     /// total-order replay. `#[serde(default)]` keeps pre-v9 batches importable
     /// (the importer synthesizes a local HLC for those).
     #[serde(default)]

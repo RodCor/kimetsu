@@ -11,7 +11,7 @@ breaking changes require a major bump.
 
 The README says Kimetsu "speaks first." An audit found that true on Claude Code,
 thin on Codex, and absent on Cursor, Pi and OpenClaw. This closes that gap and
-files the v3.0 plan behind it.
+files the v2.6 plan behind it.
 
 ### Added
 
@@ -85,7 +85,7 @@ files the v3.0 plan behind it.
   `retri`, `retry` matched no suffix at all, and neither prefixed the other.
   Since matching downstream is substring and FTS-prefix, a query about `retry`
   treated a corpus that plainly said `retries` as never mentioning it — losing
-  the term's IDF weight in the lexical floor and, since v3.0, reporting it to the
+  the term's IDF weight in the lexical floor and, since v2.6, reporting it to the
   user as a gap in coverage. It affects every `-y` word: `query`, `policy`,
   `memory`, `binary`, `registry` — a large share of the vocabulary this corpus is
   made of. A trailing `y`/`i` after a consonant is now stripped so both forms
@@ -170,7 +170,7 @@ files the v3.0 plan behind it.
   field alongside the capsules, and the installed Cursor rule tells the agent to
   make that call at task start. Scoped to the stdio path only — one
   `kimetsu-remote` process fans out across many sessions.
-- **`docs/rfcs/v3-proactive-memory.md`**: the v3.0 RFC. What the audit found
+- **`docs/rfcs/v2.6-proactive-memory.md`**: the v2.6 RFC. What the audit found
   (including where the numbers and the defaults disagree), the 2026 competitive
   and research landscape, the Free/Deep two-tier split, and the phased plan for
   retrieval accuracy, proactive autonomy, and memory safety.

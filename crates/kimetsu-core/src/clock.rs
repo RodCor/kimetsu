@@ -1,4 +1,4 @@
-//! v3.0 #3 Slice B: Hybrid Logical Clock (HLC) for convergent team sync.
+//! v2.6 #3 Slice B: Hybrid Logical Clock (HLC) for convergent team sync.
 //!
 //! An HLC stamps every event with a timestamp that is (a) globally
 //! lexicographically sortable, (b) monotonic on a single brain, and (c) CAUSAL

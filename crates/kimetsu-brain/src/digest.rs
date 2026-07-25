@@ -206,7 +206,7 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     };
     let resume = crate::episode::render_resume_context(workspace);
 
-    // v3.0: the user's standing preferences, delivered rather than retrieved.
+    // v2.6: the user's standing preferences, delivered rather than retrieved.
     //
     // Preference following is the second-weakest measured ability, and the
     // diagnosis is that "a preference is a small aside semantically far from
@@ -215,7 +215,7 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
     // question is asked. See `crate::user_profile`.
     let profile = user_profile_block(workspace);
 
-    // v3.0: what the skills loop is waiting on. Detection has run on a schedule
+    // v2.6: what the skills loop is waiting on. Detection has run on a schedule
     // since the maintenance daemon landed, but its result went into a log file
     // nobody opens — so a memory could earn skill status and never become one.
     // See `crate::skill_synthesis::graduation_notice`.
@@ -384,7 +384,7 @@ fn gather_inputs(conn: &Connection, repo_root: &str) -> KimetsuResult<DigestInpu
     // use_count > 0 memories are ranked by usefulness ratio; use_count = 0
     // rows sort last (usefulness_score default 0).
     //
-    // v3.0: preferences are excluded. They now have their own warm-start
+    // v2.6: preferences are excluded. They now have their own warm-start
     // section (`crate::user_profile`), which sits directly beside this one, so
     // including them here would print the same lines twice in the same block —
     // and the digest's slots are better spent on facts the preferences section

@@ -90,7 +90,7 @@ pub struct StalenessReport {
 // 2.1 — Candidate detection (pure query, no model cost)
 // ---------------------------------------------------------------------------
 
-/// v3.0: what the skills loop is waiting on, as one line for the warm start.
+/// v2.6: what the skills loop is waiting on, as one line for the warm start.
 ///
 /// Detection is a pure query and has run on a schedule since the maintenance
 /// daemon landed — but its result went into a log file nobody opens. So a
@@ -695,7 +695,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // graduation_notice — v3.0, closing the skills loop
+    // graduation_notice — v2.6, closing the skills loop
     // -----------------------------------------------------------------------
 
     /// Cite `memory_id` from `n` distinct runs, which is what earns skill status.

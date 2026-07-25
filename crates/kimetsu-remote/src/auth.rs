@@ -13,7 +13,7 @@ pub struct AuthConfig {
     pub global: Vec<String>,
     /// repo-id → tokens valid only for that repo.
     pub per_repo: HashMap<String, Vec<String>>,
-    /// v3.0 #3 Slice C: token → display name, for per-user write attribution
+    /// v2.6 #3 Slice C: token → display name, for per-user write attribution
     /// (`<server-node>/user:<name>`). Optional; tokens without a name attribute
     /// to a stable, non-secret `anon-<fingerprint>` (see [`user_for_token`]).
     pub token_names: HashMap<String, String>,
@@ -96,7 +96,7 @@ pub fn check(auth: &AuthConfig, repo: &str, bearer: Option<&str>) -> AuthOutcome
     }
 }
 
-/// v3.0 #3 Slice C: resolve a stable, non-secret USER label for the presented
+/// v2.6 #3 Slice C: resolve a stable, non-secret USER label for the presented
 /// bearer token, used to attribute writes (`<server-node>/user:<label>`).
 /// Returns the configured display name from `token_names` if present, else a
 /// one-way fingerprint `anon-<8 hex>` derived from the token — distinct per token

@@ -1,4 +1,4 @@
-//! v3.0: how injected memory is framed to the reader.
+//! v2.6: how injected memory is framed to the reader.
 //!
 //! MemSyco-Bench (arXiv 2607.01071) reports the uncomfortable result that most
 //! memory systems score *worse* on their sycophancy track than using no memory

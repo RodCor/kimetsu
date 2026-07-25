@@ -69,7 +69,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .map(proactive_state::load)
         .unwrap_or_default();
 
-    // v3.0: warm-start fallback for hosts with no session-start event (Codex,
+    // v2.6: warm-start fallback for hosts with no session-start event (Codex,
     // Pi, OpenClaw). Those harnesses only expose a per-turn hook, so the repo
     // digest and episodic resume ride along with the session's first prompt
     // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
@@ -247,18 +247,18 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         });
 
     let mut additional_context = String::new();
-    // v3.0: on hosts without a session-start event, the warm-start block leads
+    // v2.6: on hosts without a session-start event, the warm-start block leads
     // — the agent needs to know the repo before it is told what to recall.
     if let Some(block) = &warm_start_block {
         additional_context.push_str(block);
         additional_context.push_str("\n\n");
     }
-    // v3.0: memory arrives looking like ground truth unless the framing says
+    // v2.6: memory arrives looking like ground truth unless the framing says
     // otherwise, and MemSyco-Bench finds that deference is what makes most
     // memory systems score worse than no memory at all. See
     // `kimetsu_brain::framing`.
     additional_context.push_str(kimetsu_brain::framing::CONTEXT_HEADER);
-    // v3.0: a time-ordered bundle looks like a relevance-ranked one whose
+    // v2.6: a time-ordered bundle looks like a relevance-ranked one whose
     // ranking has gone wrong unless the reader is told. Goes above the capsules
     // because it describes how to read them.
     if bundle.chronological {
@@ -290,7 +290,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push_str(&text);
     }
 
-    // v3.0: when the bundle collectively covers only part of the question, say
+    // v2.6: when the bundle collectively covers only part of the question, say
     // so and name what is missing. Without this a reader handed three capsules
     // that touch half the query cannot tell that from three that answer it,
     // and fills the gap by inference — which is what BEAM's abstention track
@@ -330,7 +330,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
 /// retrieval that found nothing, must not swallow the first-turn warm start on
 /// hosts that have no session-start event. A `None` block (not a first turn, or
 /// the host has its own session-start hook) makes this a silent no-op, which is
-/// the pre-v3.0 behaviour.
+/// the pre-v2.6 behaviour.
 fn flush_warm_start(
     block: Option<String>,
     state: &mut proactive_state::SessionState,
@@ -794,7 +794,7 @@ pub(crate) struct HookToolInput {
     tool_name: Option<String>,
     command: Option<String>,
     tool_response: Option<String>,
-    /// v3.0: the tool's exit code when the harness reports one. Authoritative
+    /// v2.6: the tool's exit code when the harness reports one. Authoritative
     /// for failure detection — see [`crate::tool_outcome`].
     exit_code: Option<i64>,
     /// F3 Pass B (3.5): file path from `tool_input.file_path` (ReadFile,
@@ -834,7 +834,7 @@ pub(crate) fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         Some(serde_json::Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
     };
-    // v3.0: an exit code, when the harness reports one, settles the
+    // v2.6: an exit code, when the harness reports one, settles the
     // did-it-fail question outright. Harnesses spell it differently and may
     // nest it under `tool_response`, so check the spellings we have seen.
     let exit_code = ["exit_code", "exitCode", "returncode", "status"]
@@ -963,7 +963,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
     // How strong the evidence of failure was, as a policy feature. PreToolUse
     // is a prediction rather than an observation, so it carries none.
     let mut evidence = 0.0f32;
-    // v3.0: which surface this injection came from, recorded so the surfaces
+    // v2.6: which surface this injection came from, recorded so the surfaces
     // can be judged separately. See `inject_policy::surface_acceptance`.
     let mut surface = inject_policy::Surface::PreToolCommand;
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
@@ -1003,7 +1003,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         ProactiveEvent::PostTool => {
             surface = inject_policy::Surface::PostTool;
             let resp = hook.tool_response.as_deref().unwrap_or("");
-            // v3.0: exit code > toolchain parser > substring scan. The old
+            // v2.6: exit code > toolchain parser > substring scan. The old
             // ten-word scan fired on every passing test suite, because
             // "0 failed" contains "failed".
             let outcome = crate::tool_outcome::classify(resp, hook.exit_code);
@@ -1043,7 +1043,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         return Ok(());
     }
 
-    // v3.0: retrieve down to a permissive recall floor and let the injection
+    // v2.6: retrieve down to a permissive recall floor and let the injection
     // policy make the call, instead of hard-coding the threshold into
     // retrieval. The floor still abstains on obvious noise, so the cheap path
     // stays cheap; what changes is that the *decision* is now learned rather

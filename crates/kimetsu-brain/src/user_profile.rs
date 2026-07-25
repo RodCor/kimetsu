@@ -1,4 +1,4 @@
-//! v3.0: the user's standing preferences, delivered unconditionally.
+//! v2.6: the user's standing preferences, delivered unconditionally.
 //!
 //! Preference following is Kimetsu's second-weakest measured ability
 //! (LongMemEval 66.7%), and the benchmark page already diagnoses why: *"a

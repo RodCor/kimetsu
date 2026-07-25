@@ -1,4 +1,4 @@
-//! v3.0: has this session wandered off the thing it set out to do?
+//! v2.6: has this session wandered off the thing it set out to do?
 //!
 //! Nautilus Compass reaches ROC AUC 0.83 detecting behavioural drift on real
 //! Claude Code traces using nothing but cosine similarity against a behavioural

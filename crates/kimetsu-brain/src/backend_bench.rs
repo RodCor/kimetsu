@@ -80,7 +80,7 @@ use crate::schema;
 ///   * RAM: < 1 MB at 50 nodes. At 100k memories ≈ 8 MB — well within budget.
 ///
 /// **Conclusion for v2.5**: Kùzu/Cozo is NOT justified yet. The embedded
-/// petgraph in remote is sufficient for the 100k-memory scale. Revisit at v3.0
+/// petgraph in remote is sufficient for the 100k-memory scale. Revisit at v2.6
 /// if (a) corpus exceeds 500k memories or (b) the embedding eval shows > 5 pp
 /// recall lift for petgraph-specific algorithms (e.g., PPR-weighted expansion).
 pub const V25_DECISION_CRITERION: &str = "\
@@ -104,7 +104,7 @@ Spike measurement (synthetic FTS corpus, no embedding):
   - RAM: < 1 MB at 50 nodes; ~8 MB at 100k memories — safe for remote.
 
 VERDICT for v2.5: Kùzu/Cozo NOT justified. Petgraph-in-remote is sufficient.
-Revisit at v3.0 if corpus > 500k memories OR embedding eval shows > 5 pp lift.
+Revisit at v2.6 if corpus > 500k memories OR embedding eval shows > 5 pp lift.
 Full numbers require: `--features embeddings`, real brain.db, EvalFixture corpus.";
 
 // ─── Result types ─────────────────────────────────────────────────────────────

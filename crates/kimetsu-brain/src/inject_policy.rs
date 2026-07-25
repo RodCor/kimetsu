@@ -1,4 +1,4 @@
-//! v3.0: deciding whether a proactive recall is worth interrupting for.
+//! v2.6: deciding whether a proactive recall is worth interrupting for.
 //!
 //! Kimetsu's proactive hooks surface a memory mid-task — before a command that
 //! matches a known failure, or after one that just failed. Whether to speak is
@@ -161,7 +161,7 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The hand-set prior: exactly the pre-v3.0 fixed-threshold rule.
+    /// The hand-set prior: exactly the pre-v2.6 fixed-threshold rule.
     ///
     /// `z = W_SCORE·score + W_LOOP·loop_mode + BIAS`, solved so that `z = 0`
     /// (p = 0.5) at score 0.45 normally and at 0.35 in loop mode. Every other
@@ -794,7 +794,7 @@ mod tests {
         assert!(sigmoid(-200.0).is_finite() && sigmoid(-200.0) < 0.001);
     }
 
-    // ── Surface acceptance (v3.0) ────────────────────────────────────────
+    // ── Surface acceptance (v2.6) ────────────────────────────────────────
 
     fn surface_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open");

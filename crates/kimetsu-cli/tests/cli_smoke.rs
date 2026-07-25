@@ -315,7 +315,7 @@ fn first_memory(bin: &str, root: &std::path::Path) -> Option<(String, u64)> {
     Some((id, uc))
 }
 
-/// v3.0 #3 (fleet write-safety): MULTI-PROCESS concurrency proof. Spawns several
+/// v2.6 #3 (fleet write-safety): MULTI-PROCESS concurrency proof. Spawns several
 /// `kimetsu` processes that hammer `brain cite` on the same memory in the same
 /// brain.db at once, then asserts no citation was lost (final use_count equals
 /// the total) and the projection rebuilds cleanly. `#[ignore]` because it spawns
@@ -401,7 +401,7 @@ fn concurrent_processes_lose_no_cites() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: first-turn warm start for hosts with no session-start event
+// v2.6: first-turn warm start for hosts with no session-start event
 // ---------------------------------------------------------------------------
 
 /// Run `kimetsu brain context-hook` against `root` with `payload` on stdin and
@@ -470,7 +470,7 @@ fn context_hook_warm_starts_once_per_session() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// v3.0: the quarantine default is decided by where a pack came from, so it has
+/// v2.6: the quarantine default is decided by where a pack came from, so it has
 /// to be tested through the CLI — that decision lives nowhere else.
 #[test]
 fn brain_import_quarantines_by_source_and_honours_the_overrides() {
@@ -541,7 +541,7 @@ fn brain_import_quarantines_by_source_and_honours_the_overrides() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// v3.0: MemSyco-Bench finds most memory systems score *worse* on sycophancy
+/// v2.6: MemSyco-Bench finds most memory systems score *worse* on sycophancy
 /// than using no memory, because a retrieved memory arrives looking like ground
 /// truth and the model defers to it over evidence in front of it. The fix is a
 /// rule about conflicts in the injected text itself, so it is asserted there.
@@ -582,7 +582,7 @@ fn context_hook_frames_memory_as_a_prior_conclusion_not_ground_truth() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// v3.0: the ordering fix, seen from where it matters — the text the agent
+/// v2.6: the ordering fix, seen from where it matters — the text the agent
 /// actually receives.
 ///
 /// Event ordering is Kimetsu's worst measured ability (32.5% on BEAM 100K), and
@@ -697,7 +697,7 @@ fn context_hook_warm_starts_even_on_a_short_prompt() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: the Free/Deep tier
+// v2.6: the Free/Deep tier
 // ---------------------------------------------------------------------------
 
 /// Read `kimetsu brain status --json` for `root`.
@@ -733,7 +733,7 @@ fn brain_status_reports_the_free_tier_by_default() {
 
 /// Auto-resolution: a brain that already has a cheap model configured is
 /// already making model calls, so it reports Deep without anyone editing a
-/// tier field. This is what keeps every pre-v3.0 config behaving as it did.
+/// tier field. This is what keeps every pre-v2.6 config behaving as it did.
 #[test]
 fn configuring_a_cheap_model_resolves_to_the_deep_tier() {
     let root = temp_project_dir("tier_auto_deep");
@@ -793,7 +793,7 @@ fn explicit_free_tier_overrides_a_configured_model() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: fusion rule selection
+// v2.6: fusion rule selection
 // ---------------------------------------------------------------------------
 
 /// `[broker] fusion` must be wired end to end, and must be a no-op on the lean
@@ -881,7 +881,7 @@ fn fusion_mode_is_wired_and_is_a_no_op_on_the_lean_path() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: proactive failure detection + the injection policy
+// v2.6: proactive failure detection + the injection policy
 // ---------------------------------------------------------------------------
 
 /// Run `kimetsu brain posttool-hook` with a PostToolUse payload and return
@@ -1016,7 +1016,7 @@ fn the_injection_policy_starts_as_the_legacy_rule_and_records_its_decisions() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: background maintenance
+// v2.6: background maintenance
 // ---------------------------------------------------------------------------
 
 /// The gap this closes: consolidation, digest refresh, prune detection and
@@ -1084,7 +1084,7 @@ fn maintenance_runs_what_is_due_and_then_stops() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: as-of (bitemporal) queries
+// v2.6: as-of (bitemporal) queries
 // ---------------------------------------------------------------------------
 
 /// The question default retrieval cannot answer: what did the agent know then?
@@ -1172,7 +1172,7 @@ fn as_of_reports_what_the_brain_believed_at_a_point_in_time() {
 }
 
 // ---------------------------------------------------------------------------
-// v3.0: standing preferences in the warm start
+// v2.6: standing preferences in the warm start
 // ---------------------------------------------------------------------------
 
 /// Preference following is the second-weakest measured ability, and the

@@ -902,7 +902,7 @@ mod tests {
         }
     }
 
-    // ── v3.0: the no-regression gate for the default flip ────────────────────
+    // ── v2.6: the no-regression gate for the default flip ────────────────────
 
     /// The gate on making `graph-lite` the default backend: on a realistic
     /// corpus, with edges actually present, graph-lite must return a SUPERSET

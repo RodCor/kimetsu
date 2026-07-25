@@ -244,7 +244,7 @@ fn query_forget_candidates(
     //     age window. The staleness reference is the most recent of
     //     `last_used_at` (bumped on every retrieval), `last_useful_at` (bumped on
     //     a successful citation), and `created_at`. Including `last_used_at` is
-    //     the v3.0 fix for recall-preservation: a memory that is still being
+    //     the v2.6 fix for recall-preservation: a memory that is still being
     //     surfaced is in active use, so it must not be forgotten just because it
     //     has a low usefulness score and was never explicitly cited.
     let mut stmt = conn.prepare(
@@ -759,7 +759,7 @@ mod tests {
         });
     }
 
-    // v3.0 recall-preservation fix: a memory that was RETRIEVED recently
+    // v2.6 recall-preservation fix: a memory that was RETRIEVED recently
     // (`last_used_at` set, e.g. injected into a recent run) is in active use and
     // must NOT be forgotten just because it has low usefulness and was never
     // explicitly cited — even when its `created_at` is old.

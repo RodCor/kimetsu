@@ -1,4 +1,4 @@
-//! v3.0: answering "which came first".
+//! v2.6: answering "which came first".
 //!
 //! Event ordering is Kimetsu's worst measured ability by a wide margin — 32.5%
 //! on BEAM 100K, 30% at 1M — and the reason is visible the moment you look at

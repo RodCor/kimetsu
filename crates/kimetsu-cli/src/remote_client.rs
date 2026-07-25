@@ -1,4 +1,4 @@
-//! v3.0 #3 Slice C: a tiny HTTP client for writing to a `kimetsu-remote` server
+//! v2.6 #3 Slice C: a tiny HTTP client for writing to a `kimetsu-remote` server
 //! from the CLI. Posts a JSON-RPC `tools/call` to `POST <base>/mcp/<repo>` with a
 //! bearer token, so a user can write to the shared team brain without going
 //! through a host MCP harness. Reads still go through the host or local brain.

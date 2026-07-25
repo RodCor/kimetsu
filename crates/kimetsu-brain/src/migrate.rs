@@ -86,12 +86,12 @@ fn migrations() -> &'static [Migration] {
         },
         Migration {
             version: 8,
-            description: "add per-event origin column (v3.0 #3 fleet write-safety / provenance)",
+            description: "add per-event origin column (v2.6 #3 fleet write-safety / provenance)",
             up: crate::schema::migrate_v7_to_v8,
         },
         Migration {
             version: 9,
-            description: "add per-event HLC column + backfill (v3.0 #3 Slice B convergent team sync)",
+            description: "add per-event HLC column + backfill (v2.6 #3 Slice B convergent team sync)",
             up: crate::schema::migrate_v8_to_v9,
         },
         Migration {
@@ -101,7 +101,7 @@ fn migrations() -> &'static [Migration] {
         },
         Migration {
             version: 11,
-            description: "add memory_entities projection (v3.0 first-class tags + ingest-time edges)",
+            description: "add memory_entities projection (v2.6 first-class tags + ingest-time edges)",
             up: crate::schema::migrate_v10_to_v11,
         },
     ]
@@ -486,7 +486,7 @@ mod tests {
         conn
     }
 
-    /// v3.0 #3: migrating a v7 brain forward adds a nullable `events.origin`
+    /// v2.6 #3: migrating a v7 brain forward adds a nullable `events.origin`
     /// (v8) and an `events.hlc` (v9) column. Pre-existing event rows read back
     /// with `origin = NULL` and an `hlc` backfilled from rowid so they keep their
     /// original order (and sort before any new HLC event).

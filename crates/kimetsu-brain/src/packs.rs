@@ -28,7 +28,7 @@ pub struct MemoryExport {
     pub created_at: Option<String>,
 }
 
-/// v3.0 #4: a shareable brain PACK — a self-describing envelope (manifest +
+/// v2.6 #4: a shareable brain PACK — a self-describing envelope (manifest +
 /// memories) for distribution via the marketplace. Serialized to JSON then
 /// gzip-compressed by the CLI. A bare `Vec<MemoryExport>` (the pre-pack export
 /// format) also imports, for back-compat — see [`parse_pack_or_array`].
@@ -220,16 +220,16 @@ pub struct ImportSummary {
     /// (detected by `add_memory`'s normalized-text dedup) or because the
     /// scope/kind was malformed.
     pub deduped: usize,
-    /// v3.0 #4: memories superseded by a `replace`-mode pack install (existing
+    /// v2.6 #4: memories superseded by a `replace`-mode pack install (existing
     /// active memories in the pack's scope(s), invalidated before the load).
     pub superseded: usize,
-    /// v3.0: entries routed into the review queue instead of the retrieval
+    /// v2.6: entries routed into the review queue instead of the retrieval
     /// pool. See [`quarantine_memories`].
     pub quarantined: usize,
 }
 
 thread_local! {
-    /// v3.0 #4: provenance source stamped onto memories written during a pack
+    /// v2.6 #4: provenance source stamped onto memories written during a pack
     /// install (e.g. `{source:"pack", pack_name, pack_version}`). When unset,
     /// `add_memory` uses its default `manual_cli` provenance. RAII-scoped by
     /// [`ImportProvenanceScope`] so it never leaks past the import.
@@ -366,7 +366,7 @@ pub fn export_memories(
         })
     })?;
 
-    // Security scrub (v3.0 #4): every exported memory passes through the
+    // Security scrub (v2.6 #4): every exported memory passes through the
     // credential + PII scrubber so a shareable pack can never ship secrets or
     // personal data. The scrub is on the EXPORT COPY only — the source DB is
     // untouched. Findings are tallied for the caller to report (and --strict).
@@ -478,7 +478,7 @@ pub fn import_memories(
     Ok(summary)
 }
 
-/// v3.0: route a pack's entries into the review queue instead of the brain.
+/// v2.6: route a pack's entries into the review queue instead of the brain.
 ///
 /// [`crate::trust`] scores a memory's origin and folds it into the broker
 /// score, and says outright what that does not do: a weight makes a poisoned
@@ -591,12 +591,12 @@ pub fn quarantine_memories(
     Ok(summary)
 }
 
-/// v3.0 #4: install a pack's memories. `merge` adds additively (dedup against
+/// v2.6 #4: install a pack's memories. `merge` adds additively (dedup against
 /// existing). `replace` first invalidates active memories in the pack's scope(s)
 /// — REVERSIBLE (events kept; rows marked invalidated) — then loads the pack.
 /// Each installed memory is stamped with the `pack` provenance.
 ///
-/// v3.0: when `quarantine` is set, entries go to the review queue instead of
+/// v2.6: when `quarantine` is set, entries go to the review queue instead of
 /// the retrieval pool — see [`quarantine_memories`]. `replace` and `quarantine`
 /// are mutually exclusive by construction at the CLI, since superseding what
 /// you have in favour of content you have not reviewed is the worst of both.

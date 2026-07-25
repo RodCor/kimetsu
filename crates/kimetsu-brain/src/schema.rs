@@ -315,7 +315,7 @@ pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
         CREATE INDEX IF NOT EXISTS idx_conflicts_new_memory
             ON memory_conflicts (new_memory_id);
 
-        -- v3.0 #3 Slice B: concurrent-supersede conflicts surfaced during team
+        -- v2.6 #3 Slice B: concurrent-supersede conflicts surfaced during team
         -- sync (a member superseded to two DIFFERENT survivors by concurrent
         -- edits). HLC replay still picks a deterministic winner; this records the
         -- collision for human review. A PROJECTION — cleared + repopulated by
@@ -492,7 +492,7 @@ pub(crate) fn migrate_v6_to_v7(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v3.0 #3 (fleet write-safety): add a per-event `origin` column so every event
+/// v2.6 #3 (fleet write-safety): add a per-event `origin` column so every event
 /// records the device + agent that wrote it (`<machine_id>/<agent>`). Nullable;
 /// pre-v8 events read back as `origin = NULL` ("unknown"). Rebuild-safe and
 /// sync-ready (the origin is replicated verbatim).
@@ -501,7 +501,7 @@ pub(crate) fn migrate_v7_to_v8(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v3.0 #3 Slice B (team sync): add a per-event `hlc` column (Hybrid Logical
+/// v2.6 #3 Slice B (team sync): add a per-event `hlc` column (Hybrid Logical
 /// Clock, canonical string) for globally-deterministic total-order replay.
 /// Existing rows are backfilled as `0000000000000.{rowid:010}.local` — `wall = 0`
 /// so all pre-v9 events sort BEFORE any new HLC event, ordered among themselves by
@@ -553,7 +553,7 @@ pub(crate) fn migrate_v9_to_v10(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v3.0 (RFC phase 2c): `memory_entities` — tags and salient terms as rows.
+/// v2.6 (RFC phase 2c): `memory_entities` — tags and salient terms as rows.
 ///
 /// Until now tags lived inline in the memory text as `[tags: …]` and were
 /// re-parsed on every read, and the tag boost was a substring match on the

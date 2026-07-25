@@ -868,14 +868,14 @@ pub fn brain_context_tool(
                 "used_tokens": bundle.used_tokens,
                 "capsule_count": bundle.capsules.len(),
                 "excluded_count": bundle.excluded.len(),
-                // v3.0: how much of the query these capsules collectively
+                // v2.6: how much of the query these capsules collectively
                 // cover, and what none of them mention. A reader that knows
                 // memory is thin here can abstain instead of inferring.
                 "evidence_coverage": bundle.evidence_coverage,
                 "uncovered_terms": bundle.uncovered_terms,
                 "partial_evidence_notice":
                     kimetsu_brain::context::partial_evidence_notice(&bundle),
-                // v3.0: true when the question was about order, so the capsules
+                // v2.6: true when the question was about order, so the capsules
                 // are oldest-first and each carries the date it was recorded —
                 // without which a time-ordered bundle reads as a broken ranking.
                 "chronological": bundle.chronological,

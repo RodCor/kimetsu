@@ -1,4 +1,4 @@
-//! v3.0: how much a memory's origin is worth.
+//! v2.6: how much a memory's origin is worth.
 //!
 //! Every memory in the brain has been treated as equally believable regardless
 //! of where it came from — a lesson you typed yourself, one a model distilled

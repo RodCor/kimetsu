@@ -619,7 +619,7 @@ pub fn resolve_distiller(workspace: &Path) -> Option<ResolvedDistiller> {
     resolve_distiller_with(workspace, global_dir)
 }
 
-/// v3.0: [`resolve_distiller`], gated on the Free/Deep tier.
+/// v2.6: [`resolve_distiller`], gated on the Free/Deep tier.
 ///
 /// **Every automatic model call in the memory pipeline must resolve through
 /// this, not through [`resolve_distiller`].** On the Free tier it returns
@@ -1190,7 +1190,7 @@ mod tests {
         let json = r#"[
             {"lesson": "works on Python 3.11", "tags": ["python"], "kind": "convention",
              "confidence": 0.9, "valid_from": "2023-04-05T00:00:00Z", "valid_to": null},
-            {"lesson": "deprecated in v3.0", "tags": ["api"], "kind": "semantic_operator",
+            {"lesson": "deprecated in v2.6", "tags": ["api"], "kind": "semantic_operator",
              "confidence": 0.8, "valid_from": null, "valid_to": "2025-01-01T00:00:00Z"},
             {"lesson": "timeless fact", "tags": ["rust"], "confidence": 0.85}
         ]"#;

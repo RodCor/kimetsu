@@ -13,7 +13,7 @@
 //! shares at least one entity. The optional LLM enrichment layer (`--enrich`)
 //! lives in the CLI, where the cheap-model provider is resolved.
 //!
-//! ## Batch vs incremental (v3.0)
+//! ## Batch vs incremental (v2.6)
 //!
 //! [`build_relates_to_edges`] rebuilds the whole graph and is what
 //! `kimetsu brain graph build` runs. Because it only ever ran when a user
@@ -240,7 +240,7 @@ pub fn build_relates_to_edges(
     Ok(proposals)
 }
 
-// ── v3.0: the entity projection + incremental edge building ─────────────────
+// ── v2.6: the entity projection + incremental edge building ─────────────────
 
 /// Minimum shared entities before two memories are linked on the write path.
 ///
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(n as usize, edges.len());
     }
 
-    // ── v3.0: the entity projection + incremental edges ──────────────────
+    // ── v2.6: the entity projection + incremental edges ──────────────────
 
     #[test]
     fn entity_source_prefers_the_author_supplied_tag() {
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(entities, vec!["sqlite".to_string()]);
     }
 
-    /// The regression this whole slice exists for: before v3.0 the only edges
+    /// The regression this whole slice exists for: before v2.6 the only edges
     /// ever written were `supersedes`, so `graph-lite` retrieval quietly
     /// behaved like flat unless someone remembered to run `graph build`.
     #[test]

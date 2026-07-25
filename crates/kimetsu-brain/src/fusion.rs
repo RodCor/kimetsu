@@ -105,7 +105,7 @@ fn candidate_key(candidate: &Candidate) -> &str {
 
 /// Union `lists`, keeping the highest-scoring instance of each candidate.
 ///
-/// This is the pre-v3.0 rule, extracted so both fusion modes go through one
+/// This is the pre-v2.6 rule, extracted so both fusion modes go through one
 /// code path and the difference between them is a single call.
 pub(crate) fn union_max(lists: Vec<Vec<Candidate>>) -> Vec<Candidate> {
     let mut seen: HashMap<String, usize> = HashMap::new();
