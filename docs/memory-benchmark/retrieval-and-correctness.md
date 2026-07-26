@@ -80,6 +80,53 @@ single-kind, which makes per-kind and global normalization arithmetically
 identical, and too small and uniform to be a fair test of rank fusion.
 
 
+### Which combination to run
+
+The full 2 × 5 embedder × reranker grid, on the 100-memory / 210-case set,
+binary `kimetsu 2.6.0 (embeddings)`. Sorted by MRR:
+
+| embedder | reranker | recall@2 | recall@4 | MRR | mean ms | peak RSS |
+|---|---|---|---|---|---|---|
+| jina-v2-base-code | jina-reranker-v1-turbo-en | 0.949 | 0.970 | 0.930 | 565 | 2002 MB |
+| jina-v2-base-code | ms-marco-minilm-l-4-v2 | 0.954 | 0.959 | 0.930 | 363 | 2352 MB |
+| jina-v2-base-code | jina-reranker-v1-tiny-en | 0.944 | 0.970 | 0.926 | 415 | 1982 MB |
+| bge-small-en-v1.5 | ms-marco-minilm-l-4-v2 | 0.944 | 0.959 | 0.926 | 729 | 1331 MB |
+| bge-small-en-v1.5 | jina-reranker-v1-tiny-en | 0.944 | 0.964 | 0.925 | 785 | 1060 MB |
+| bge-small-en-v1.5 | jina-reranker-v1-turbo-en | 0.934 | 0.964 | 0.923 | 943 | 1079 MB |
+| **jina-v2-base-code** | **ms-marco-tinybert-l-2-v2** | 0.914 | 0.944 | 0.910 | **125** | 1551 MB |
+| bge-small-en-v1.5 | ms-marco-tinybert-l-2-v2 | 0.919 | 0.949 | 0.909 | 484 | **521 MB** |
+| jina-v2-base-code | off | 0.827 | 0.878 | 0.824 | 101 | 1467 MB |
+| bge-small-en-v1.5 | off | 0.812 | 0.863 | 0.810 | 462 | 361 MB |
+
+**The recommendation is the shipped default** — `jina-v2-base-code` ×
+`ms-marco-tinybert-l-2-v2`, which is what `[retrieval] level = "deep"`
+resolves to. It gives up 0.020 MRR against the best combination and runs
+**2.9× faster** for it. Nothing in the grid dominates it: every combination
+that scores higher costs at least 3× the latency, and the two that also want
+less RAM cost 4–8×.
+
+Three things the grid says that are worth more than the ranking:
+
+1. **The reranker is the whole game.** Turning it off costs ~0.10 MRR — five
+   times the spread between the best and worst *reranked* combination. If you
+   tune one thing, tune this. `level = "flexible"` (embedder, no reranker) is
+   the configuration to avoid unless RAM is genuinely scarce.
+2. **The embedder barely matters once a reranker is present.** Every reranked
+   pair lands in 0.909–0.930. Picking `bge-small` buys a 3× smaller resident
+   set at ~0.001 MRR — a real trade for a constrained host, and close to free
+   in quality terms.
+3. **bge-small is not the fast option on this corpus, despite being the small
+   model.** It is faster on the 18-memory fixture (18 ms vs 32 ms unreranked)
+   and 4× *slower* on the 100-memory one (462 ms vs 101 ms). Two independent
+   runs agree to within 2%, so the effect is real; the cause is not
+   established here, and the note is left as a measurement rather than dressed
+   up as an explanation. Choose `bge-small` for memory footprint, not for
+   speed, and re-measure on your own corpus if latency is what you care about.
+
+None of this settles `[broker] fusion` or `[broker] normalization`. Both
+fixtures are single-kind, which makes the normalization rules arithmetically
+identical and leaves fusion with too little to fuse.
+
 ### Cold start, measured
 
 The steady-state latencies above are all *warm*. The first semantic retrieval
