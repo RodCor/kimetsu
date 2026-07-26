@@ -223,15 +223,16 @@ files the v2.6 plan behind it.
   version rather than the git tag — its API moves independently of the
   binary's, and its PyPI sibling is versioned the same way.
 
-- **`docs/rfcs/v2.6-proactive-memory.md`**: the v2.6 RFC. What the audit found
-  (including where the numbers and the defaults disagree), the 2026 competitive
-  and research landscape, the Free/Deep two-tier split, and the phased plan for
-  retrieval accuracy, proactive autonomy, and memory safety. Its Status section
-  now also records two things it previously got wrong: the ONNX diagnosis
-  above, and a claim that BrainBench sycophancy and poisoning tracks exist in
-  `kimetsu-bench`. They do not — the *feature* is real and tested end-to-end in
-  `cli_smoke.rs`, but the benchmark tracks were never built, and that is where
-  the y→ies stemmer bug was actually caught.
+Two corrections that belong in the record even though the planning document
+carrying them is not published:
+
+- The reason given for the `embeddings` flavor not building was an unreachable
+  ONNX Runtime prebuilt. It was not; see **Fixed** above. Anyone who reads that
+  diagnosis somewhere else should ignore it.
+- Sycophancy and poisoning tracks were described as landed in `kimetsu-bench`.
+  They are not there. The *feature* is real and asserted end-to-end in
+  `cli_smoke.rs` — that test is what caught the y→ies stemmer bug — but the
+  benchmark tracks were never built and remain open.
 
 ### Docs
 

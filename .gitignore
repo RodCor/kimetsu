@@ -50,6 +50,8 @@
 # Local Codex security-scan artifacts (not part of the project)
 .codex-security-scans/
 /docs/superpowers
+# The proactive-memory RFC is planning material, not shipped docs — local only.
+/docs/rfcs/
 
 # Docusaurus website — generated/installed dirs must not be committed
 /website/node_modules/
