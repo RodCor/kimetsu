@@ -95,6 +95,25 @@ export function parseEnvelope(
   return body.result as Record<string, unknown>;
 }
 
+/**
+ * Drop trailing `/` from a base URL.
+ *
+ * Deliberately not `replace(/\/+$/, '')`. That regex is a polynomial ReDoS:
+ * on a base URL ending in a long run of slashes followed by anything else,
+ * the engine retries `\/+$` from every position in the run, which is
+ * quadratic in the length of the run. The base URL comes from the caller's
+ * configuration rather than from an attacker in most deployments, but "most"
+ * is not an argument an embedded client gets to make — its cost becomes its
+ * host's, and a linear scan is no harder to read.
+ */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 0x2f /* '/' */) {
+    end -= 1;
+  }
+  return value.slice(0, end);
+}
+
 export interface HttpTransportOptions {
   /** Milliseconds before a request is aborted. Default 30_000. */
   timeoutMs?: number;
@@ -120,7 +139,7 @@ export class HttpTransport implements Transport {
   #handshake: Promise<void> | undefined;
 
   constructor(baseUrl: string, token: string, repo: string, options: HttpTransportOptions = {}) {
-    this.#url = `${baseUrl.replace(/\/+$/, '')}/mcp/${repo}`;
+    this.#url = `${trimTrailingSlashes(baseUrl)}/mcp/${repo}`;
     this.#headers = {
       authorization: `Bearer ${token}`,
       'content-type': 'application/json',

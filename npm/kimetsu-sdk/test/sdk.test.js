@@ -14,6 +14,7 @@ import {
   buildCall,
   clean,
   parseEnvelope,
+  trimTrailingSlashes,
 } from '../dist/index.js';
 
 /** A transport that records calls and replays canned results. */
@@ -84,6 +85,34 @@ describe('parseEnvelope', () => {
 describe('clean', () => {
   it('drops undefined so an unset option is simply absent', () => {
     assert.deepEqual(clean({ a: 1, b: undefined, c: null, d: false }), { a: 1, c: null, d: false });
+  });
+});
+
+describe('trimTrailingSlashes', () => {
+  it('drops a trailing slash', () => {
+    assert.equal(trimTrailingSlashes('https://x/'), 'https://x');
+  });
+
+  it('drops several', () => {
+    assert.equal(trimTrailingSlashes('https://x///'), 'https://x');
+  });
+
+  it('leaves a clean url alone', () => {
+    assert.equal(trimTrailingSlashes('https://x'), 'https://x');
+  });
+
+  it('only trims the tail', () => {
+    assert.equal(trimTrailingSlashes('https://x/a/b'), 'https://x/a/b');
+  });
+
+  // The regex this replaced (/\/+$/) is a polynomial ReDoS: on a long run of
+  // slashes that does NOT end the string, the engine retries from every
+  // position in the run. 50k slashes took seconds; a linear scan is instant.
+  it('is linear on a long run of slashes that does not end the string', () => {
+    const hostile = `https://x${'/'.repeat(50_000)}a`;
+    const started = Date.now();
+    assert.equal(trimTrailingSlashes(hostile), hostile);
+    assert.ok(Date.now() - started < 1_000, 'must not backtrack');
   });
 });
 

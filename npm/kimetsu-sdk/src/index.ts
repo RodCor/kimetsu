@@ -27,6 +27,7 @@ export {
   buildInitialize,
   clean,
   parseEnvelope,
+  trimTrailingSlashes,
   type Args,
   type HttpTransportOptions,
   type Transport,
