@@ -80,6 +80,30 @@ single-kind, which makes per-kind and global normalization arithmetically
 identical, and too small and uniform to be a fair test of rank fusion.
 
 
+### Cold start, measured
+
+The steady-state latencies above are all *warm*. The first semantic retrieval
+in a **fresh brain** is a different number entirely, and v2.6 is the first
+release able to measure it:
+
+| call | fresh brain | same brain, second call |
+|---|---|---|
+| `brain context` (jina-v2-base-code) | **122 s** | 1.5 s |
+| `brain context` (bge-small-en-v1.5) | **57 s** | — |
+| `brain context` (lean / FTS-only) | 0.3 s | 0.3 s |
+
+The cost is per *brain*, not per process: a second workspace pays it again even
+with a model already resident from the first. This is why the `UserPromptSubmit`
+context hook is FTS-only by deliberate design — the code comments say a cold
+ONNX load "can exceed the host's 30s hook timeout", and on this hardware it
+exceeds it by four times over. The daemon exists to absorb exactly this, and the
+hook never waits on a cold one.
+
+It is worth knowing before running any harness that seeds a fresh brain per
+case. BrainBench does, which puts a 264-scenario run in the ten-hour range on
+the semantic build; the harness refuses a lean binary outright, because
+FTS-only retrieval would crater the scores rather than measure them.
+
 ## Cost
 
 On a recorded 16-task Terminal-Bench slice, runs with the brain cost about 13×
