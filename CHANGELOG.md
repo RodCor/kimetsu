@@ -36,6 +36,25 @@ files the v2.6 plan behind it.
   coverage is measured on the daemon path too, degrading to "no claim" rather
   than to a false "memory does not cover X" when the brain will not open.
 
+- **The Deep tier could not talk to any current frontier Claude model.** The
+  Anthropic provider sent `"temperature"` on every request, hardcoded to
+  0.1–0.3 across the pipeline. Sampling parameters were removed from the Claude
+  line at Opus 4.7: `temperature`, `top_p` and `top_k` now return a **400** on
+  Opus 4.7, Opus 4.8, Opus 5 and Fable 5, and Sonnet 5 rejects any non-default
+  value. So configuring any of those as the distiller, `ask`, or reflection
+  model failed outright — not degraded output, no output. Anything at or below
+  the Opus 4.6 / Sonnet 4.6 generation was unaffected, which is why it went
+  unnoticed.
+
+  The parameter is now omitted for models that reject it. The gate is an
+  *allowlist* of models known to accept it, so a model this build has never
+  heard of omits it: guessing wrong by omitting costs a little determinism on
+  one distillation, and guessing wrong by sending costs the entire request.
+  Sampling removal has only ever moved one way across the Claude line. Matching
+  starts at the first `claude-`, so bare, Bedrock (`anthropic.claude-…`) and
+  cross-region inference-profile (`us.anthropic.claude-…`) ids all resolve the
+  same way.
+
 - **A test wrote into the developer's own brain.**
   `remote_write_is_attributed_to_the_token_user` let project discovery walk out
   of its tempdir and into `~/.kimetsu`. On this machine it failed loudly on a

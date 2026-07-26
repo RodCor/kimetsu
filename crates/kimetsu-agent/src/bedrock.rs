@@ -231,7 +231,7 @@ impl ModelProvider for BedrockProvider {
     fn complete(&mut self, request: ModelRequest) -> KimetsuResult<ModelResponse> {
         // Bedrock InvokeModel: model lives in the URL path, not the body.
         // anthropic_version must be in the body (not a header).
-        let body = build_anthropic_body(None, Some(BEDROCK_ANTHROPIC_VERSION), &request);
+        let body = build_anthropic_body(None, &self.model_id, Some(BEDROCK_ANTHROPIC_VERSION), &request);
         let payload = serde_json::to_vec(&body)?;
         let url = format!(
             "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke",
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn bedrock_body_has_anthropic_version_and_no_model_key() {
         let req = simple_request();
-        let body = build_anthropic_body(None, Some(BEDROCK_ANTHROPIC_VERSION), &req);
+        let body = build_anthropic_body(None, "claude-opus-4-6", Some(BEDROCK_ANTHROPIC_VERSION), &req);
         assert_eq!(
             body["anthropic_version"], BEDROCK_ANTHROPIC_VERSION,
             "anthropic_version must match Bedrock spec"
@@ -318,7 +318,7 @@ mod tests {
         // build_anthropic_body(Some(model), None, req) must preserve the old
         // behaviour: model in body, no anthropic_version in body.
         let req = simple_request();
-        let body = build_anthropic_body(Some("claude-opus-4-7"), None, &req);
+        let body = build_anthropic_body(Some("claude-opus-4-7"), "claude-opus-4-7", None, &req);
         assert_eq!(body["model"], "claude-opus-4-7");
         assert!(
             body.get("anthropic_version").is_none(),
@@ -355,7 +355,7 @@ mod tests {
             temperature: 0.2,
             metadata: serde_json::Value::Null,
         };
-        let body = build_anthropic_body(None, Some(BEDROCK_ANTHROPIC_VERSION), &req);
+        let body = build_anthropic_body(None, "claude-opus-4-6", Some(BEDROCK_ANTHROPIC_VERSION), &req);
         assert_eq!(body["system"], "Be helpful.");
         assert!(body.get("tools").is_some());
         assert!(body.get("model").is_none());
