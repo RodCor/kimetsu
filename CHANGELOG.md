@@ -218,6 +218,42 @@ files the v2.6 plan behind it.
   field alongside the capsules, and the installed Cursor rule tells the agent to
   make that call at task start. Scoped to the stdio path only — one
   `kimetsu-remote` process fans out across many sessions.
+### Changed — the installed instructions, rewritten for how current models read
+
+Kimetsu's own guidance — the MCP server instructions, the CLAUDE.md block, and
+the Cursor / Pi / OpenClaw skill files — was written in the style that worked on
+2025-era models: numbered steps and a conservative filter on the write path
+(*"Do NOT call for trivial or well-known knowledge"*, *"before non-trivial
+tasks"*, *"things that required real effort"*).
+
+From Opus 4.7 onward that style works against us. Instruction following became
+literal: a model no longer generalizes an instruction it wasn't given, and a
+stated conservative bar is honoured faithfully rather than treated as a hint.
+Anthropic's own migration guidance names the pattern — a review prompt saying
+*"only report high-severity issues"* causes the model to investigate just as
+hard and then withhold findings below the bar. Kimetsu had three such
+qualifiers stacked on `brain_record`, which is the input to everything the brain
+later does: importance scoring, the inject policy, skill graduation. A quietly
+throttled write path starves all of it, and would do so worst on the newest
+models.
+
+So the instructions now state **when to reach for each tool** and give the
+reason, instead of fencing off when not to. Two specific inversions: retrieval
+says plainly that an empty result cost nothing and *"retrieving is cheaper than
+rediscovering"* (Opus 4.8 under-reaches for memory unless told when it applies),
+and the trivial-knowledge exclusion became a reason rather than a prohibition —
+well-known facts are *already available next session*, so recording them gains
+nothing. A literal reader applies a reason narrowly and a prohibition broadly.
+
+The `_REQUIRED` bridge and delegate variants are deliberately untouched: forcing
+the tool is what that mode is for, and the benchmark harness depends on it. A
+regression test now asserts the instructions name each tool and carry no
+prohibition, so the old style cannot creep back.
+
+Not benchmarked. `kimetsu brain policy` reports acceptance per surface, which is
+where a change in call rate would show; the argument here is from the vendor's
+documented behavioral guidance, not from a measurement on this corpus.
+
 - **`[broker] normalization`** selects how a candidate's raw relevance becomes
   the `relevance` term: `per_kind` (the rule through v2.5) or `global`. Per-kind
   normalizes within each capsule kind, so the best memory and the best repo_file

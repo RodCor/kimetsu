@@ -12,7 +12,7 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) When a retrieved memory materially helped, call kimetsu_brain_cite with its memory_id — this closes the ground-truth loop and powers self-tuning. (4) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant and the call cost nothing, so a call that returns empty is not a wasted one — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Well-known facts and things the repository already states are already available to the next session, so they gain nothing from being recorded. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations are the brain's only evidence about which memories earn their place; an uncited memory reads as unused. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
@@ -2373,12 +2373,26 @@ mod tests {
             &SkillConfig::default(),
         )
         .expect("initialize");
-        assert!(
-            result["instructions"]
-                .as_str()
-                .unwrap()
-                .contains("Recommended workflow")
-        );
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("persistent brain sidecar"));
+        // v2.6: the instructions must state when to reach for each tool, and
+        // must not carry a prohibition. From Opus 4.7 onward a conservative
+        // bar ("do NOT call for trivial…") is honoured literally, so it
+        // suppresses the write path on exactly the newest models — and the
+        // brain's learning loop runs on what gets written.
+        for tool in [
+            "kimetsu_brain_context",
+            "kimetsu_brain_record",
+            "kimetsu_brain_cite",
+        ] {
+            assert!(instructions.contains(tool), "must say when to use {tool}");
+        }
+        for prohibition in ["Do NOT", "do not call", "non-trivial"] {
+            assert!(
+                !instructions.contains(prohibition),
+                "instructions must not carry a filter a literal reader over-applies: {prohibition}"
+            );
+        }
     }
 
     #[test]

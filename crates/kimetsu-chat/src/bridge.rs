@@ -314,17 +314,19 @@ Kimetsu is a persistent brain sidecar accessible via the `kimetsu` CLI. Use it
 when the task may benefit from prior session knowledge, workflow memory, or
 durable cross-session context.
 
-Brain-first workflow:
-1. Before planning or editing broad coding, review, debugging, or setup tasks,
-   run `kimetsu brain context <query>` and read the returned capsules as working
-   context before deciding on a plan.
-2. After solving a non-obvious problem, run `kimetsu brain record` with a
-   concrete, actionable lesson and 2-5 domain tags so future sessions benefit.
-3. Run `kimetsu brain status` when you need to know whether the brain is
-   initialized, has accepted memories, or has pending proposals.
+Run `kimetsu brain context <query>` when you start a task and read the returned
+capsules before deciding on a plan. An empty result means the brain held nothing
+relevant and cost nothing — retrieving is cheaper than rediscovering.
 
-Optional mode: Kimetsu brain context is a preferred first step for non-trivial
-work. If the binary is unavailable, note the absence and continue normally.
+Run `kimetsu brain record` once you know something a later session would
+otherwise have to work out again, with a concrete, actionable lesson and 2-5
+domain tags. Well-known facts and things the repository already states are
+already available next session.
+
+`kimetsu brain status` reports whether the brain is initialized, has accepted
+memories, or has pending proposals.
+
+If the binary is unavailable, note the absence and continue normally.
 "#;
 
 #[cfg(feature = "openclaw")]
@@ -377,17 +379,20 @@ Kimetsu is a persistent memory brain accessible via the `kimetsu` MCP server
 task may benefit from prior session knowledge, workflow memory, or durable
 cross-session context.
 
-Brain-first workflow:
-1. Before planning or editing broad coding, review, debugging, or setup tasks,
-   call `kimetsu_brain_context` with a concise query and use the returned
-   capsules as working context before deciding on a plan.
-2. After solving a non-obvious problem, call `kimetsu_brain_record` with a
-   concrete, actionable lesson and 2-5 domain tags so future sessions benefit.
-3. Call `kimetsu_brain_status` when you need to know whether the brain is
-   initialized, has accepted memories, or has pending proposals.
+Call `kimetsu_brain_context` when you start a task and use the returned capsules
+as working context before deciding on a plan. An empty result means the brain
+held nothing relevant and cost nothing — retrieving is cheaper than
+rediscovering.
 
-Optional mode: Kimetsu brain context is a preferred first step for non-trivial
-work. If the MCP server is unavailable, note the absence and continue normally.
+Call `kimetsu_brain_record` once you know something a later session would
+otherwise have to work out again, with a concrete, actionable lesson and 2-5
+domain tags. Well-known facts and things the repository already states are
+already available next session.
+
+`kimetsu_brain_status` reports whether the brain is initialized, has accepted
+memories, or has pending proposals.
+
+If the MCP server is unavailable, note the absence and continue normally.
 "#;
 
 /// Kimetsu brain guidance installed in `.cursor/rules/kimetsu-brain/rule.md`.
@@ -413,16 +418,16 @@ You have a persistent memory brain attached via MCP (tools prefixed `kimetsu_`).
   task. Cursor has no session-start hook, so this first call is the only time the brain can
   hand you the `warm_start` block: what this repo is, and where the last session left off.
   Read that block before planning. It is not repeated on later calls.
-- **Before non-trivial tasks**: call `kimetsu_brain_context` with a short query. If the brain
-  has relevant prior knowledge it will return it. If not (`skipped: true`), proceed as normal —
-  this is zero overhead.
-- **After solving a non-obvious problem**: call `kimetsu_brain_record` with what you learned
-  and 2-5 domain tags. Keep lessons concrete and actionable, not platitudes.
-- **When a retrieved memory materially helped**: call `kimetsu_brain_cite` with its
-  `memory_id`. That is the signal the brain learns from.
-
-Do not call `kimetsu_brain_record` on simple/one-liner tasks. The brain is for things that
-required real effort or that you would want to remember next session.
+- **Starting a task**: call `kimetsu_brain_context` with a short query. A `skipped: true` reply
+  means the brain held nothing relevant and the call cost nothing, so a call that comes back
+  empty is not a wasted one — retrieving is cheaper than rediscovering.
+- **Once you know something a later session would have to work out again**: call
+  `kimetsu_brain_record` — a constraint that was not obvious, an approach that turned out to be
+  wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags.
+  Well-known facts and things the repository already states are already available next session,
+  so they gain nothing from being recorded.
+- **When a retrieved memory changed what you did**: call `kimetsu_brain_cite` with its
+  `memory_id`. Citations are the brain's only evidence about which memories earn their place.
 "#;
 
 pub fn bridge_scan(workspace: &Path, config: &SkillConfig) -> Result<BridgeScan, String> {
@@ -2528,14 +2533,18 @@ const CLAUDE_MD_CONTENT: &str = r#"# Kimetsu brain
 
 You have a persistent memory brain attached via MCP (tools prefixed `mcp__kimetsu__`).
 
-- **Before non-trivial tasks**: call `kimetsu_brain_context` with a short query. If the brain
-  has relevant prior knowledge it will return it. If not (`skipped: true`), proceed as normal —
-  this is zero overhead.
-- **After solving a non-obvious problem**: call `kimetsu_brain_record` with what you learned
-  and 2-5 domain tags. Keep lessons concrete and actionable, not platitudes.
+Retrieve with `kimetsu_brain_context` when you start a task. A `skipped: true` reply means the
+brain held nothing relevant and the call cost nothing, so a call that comes back empty is not a
+wasted one — retrieving is cheaper than rediscovering.
 
-Do not call either tool on simple/one-liner tasks. The brain is for things that required real
-effort or that you would want to remember next session.
+Record with `kimetsu_brain_record` once you know something a later session would otherwise have
+to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a
+convention this project follows. Concrete and actionable, with 2-5 domain tags. Well-known facts
+and things the repository already states are already available next session, so they gain nothing
+from being recorded.
+
+Cite with `kimetsu_brain_cite` when a retrieved memory changed what you did. Citations are the
+brain's only evidence about which memories earn their place.
 
 ## Auto-harvesting memories
 
