@@ -218,41 +218,58 @@ files the v2.6 plan behind it.
   field alongside the capsules, and the installed Cursor rule tells the agent to
   make that call at task start. Scoped to the stdio path only — one
   `kimetsu-remote` process fans out across many sessions.
-### Changed — the installed instructions, rewritten for how current models read
+### Changed — the installed instructions, restructured (and a claim withdrawn)
 
 Kimetsu's own guidance — the MCP server instructions, the CLAUDE.md block, and
-the Cursor / Pi / OpenClaw skill files — was written in the style that worked on
-2025-era models: numbered steps and a conservative filter on the write path
-(*"Do NOT call for trivial or well-known knowledge"*, *"before non-trivial
-tasks"*, *"things that required real effort"*).
+the Cursor / Pi / OpenClaw skill files — was written in 2025-era style: numbered
+steps plus a conservative filter on the write path (*"Do NOT call for trivial or
+well-known knowledge"*, *"before non-trivial tasks"*, *"things that required real
+effort"*). It now states when to reach for each tool rather than fencing off when
+not to, drops the step-numbering, and tells the retrieval path plainly that an
+empty result cost nothing.
 
-From Opus 4.7 onward that style works against us. Instruction following became
-literal: a model no longer generalizes an instruction it wasn't given, and a
-stated conservative bar is honoured faithfully rather than treated as a hint.
-Anthropic's own migration guidance names the pattern — a review prompt saying
-*"only report high-severity issues"* causes the model to investigate just as
-hard and then withhold findings below the bar. Kimetsu had three such
-qualifiers stacked on `brain_record`, which is the input to everything the brain
-later does: importance scoring, the inject policy, skill graduation. A quietly
-throttled write path starves all of it, and would do so worst on the newest
-models.
+**The behavioural claim behind this change did not survive being measured, and
+the honest version is the useful one.** The prediction was that stacked
+conservative qualifiers suppress `brain_record` on models that follow
+instructions literally, so removing them would raise the write rate. An A/B on
+`claude-opus-5` — three instruction variants × 10 scenarios × 5 repetitions,
+each a fresh headless session — says otherwise:
 
-So the instructions now state **when to reach for each tool** and give the
-reason, instead of fencing off when not to. Two specific inversions: retrieval
-says plainly that an empty result cost nothing and *"retrieving is cheaper than
-rediscovering"* (Opus 4.8 under-reaches for memory unless told when it applies),
-and the trivial-knowledge exclusion became a reason rather than a prohibition —
-well-known facts are *already available next session*, so recording them gains
-nothing. A literal reader applies a reason narrowly and a prohibition broadly.
+| variant | clear-record | ambiguous middle | clear-skip |
+|---|---|---|---|
+| old text | 100% | 23% | 0% |
+| new text | 100% | **17%** | 0% |
+| new text, minus one clause | 100% | 23% | 0% |
+
+Two findings, neither of them the one expected. The write rate did not rise; the
+only measurable movement was **downward**, and it came from a clause this release
+itself introduced — *"well-known facts and things the repository already states
+are already available next session"*. Removing that clause returns behaviour
+exactly to the old text, which isolates it as the sole active ingredient: every
+other change was inert on this measurement. The clause is therefore gone.
+
+The second finding is the more interesting one. The rewrite replaced a
+prohibition with a reason on the theory that a literal reader applies a reason
+narrowly and a prohibition broadly. The model's own stated rationales show the
+opposite: under the old text it cited *"no real effort"*, and under the new one
+it cited the new clause almost verbatim — *"repo already states it"*. A reason
+that is **easier to evaluate** ("is this in the repository?") anchors harder than
+a vague bar ("did this require real effort?"). Reason-versus-prohibition was the
+wrong axis; specificity was the axis that mattered.
+
+Scope of the evidence, stated plainly: this measured the *record* decision only,
+via an explicit policy judgement rather than observed tool use inside a real
+agent loop, at n=5 with 8 of 10 scenarios unanimous across all three variants.
+The middle-band difference is 2 decisions out of 30 — small enough that "no
+detectable loosening" is the safe reading rather than "a proven regression". The
+retrieval-side change was not measured at all. What the release claims is
+therefore only that the text is structurally cleaner, not that it performs
+better.
 
 The `_REQUIRED` bridge and delegate variants are deliberately untouched: forcing
 the tool is what that mode is for, and the benchmark harness depends on it. A
-regression test now asserts the instructions name each tool and carry no
-prohibition, so the old style cannot creep back.
-
-Not benchmarked. `kimetsu brain policy` reports acceptance per surface, which is
-where a change in call rate would show; the argument here is from the vendor's
-documented behavioral guidance, not from a measurement on this corpus.
+regression test asserts the instructions name each tool and carry no
+prohibition.
 
 - **`[broker] normalization`** selects how a candidate's raw relevance becomes
   the `relevance` term: `per_kind` (the rule through v2.5) or `global`. Per-kind

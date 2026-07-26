@@ -320,8 +320,7 @@ relevant and cost nothing — retrieving is cheaper than rediscovering.
 
 Run `kimetsu brain record` once you know something a later session would
 otherwise have to work out again, with a concrete, actionable lesson and 2-5
-domain tags. Well-known facts and things the repository already states are
-already available next session.
+domain tags.
 
 `kimetsu brain status` reports whether the brain is initialized, has accepted
 memories, or has pending proposals.
@@ -386,8 +385,7 @@ rediscovering.
 
 Call `kimetsu_brain_record` once you know something a later session would
 otherwise have to work out again, with a concrete, actionable lesson and 2-5
-domain tags. Well-known facts and things the repository already states are
-already available next session.
+domain tags.
 
 `kimetsu_brain_status` reports whether the brain is initialized, has accepted
 memories, or has pending proposals.
@@ -424,8 +422,6 @@ You have a persistent memory brain attached via MCP (tools prefixed `kimetsu_`).
 - **Once you know something a later session would have to work out again**: call
   `kimetsu_brain_record` — a constraint that was not obvious, an approach that turned out to be
   wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags.
-  Well-known facts and things the repository already states are already available next session,
-  so they gain nothing from being recorded.
 - **When a retrieved memory changed what you did**: call `kimetsu_brain_cite` with its
   `memory_id`. Citations are the brain's only evidence about which memories earn their place.
 "#;
@@ -2539,9 +2535,7 @@ wasted one — retrieving is cheaper than rediscovering.
 
 Record with `kimetsu_brain_record` once you know something a later session would otherwise have
 to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a
-convention this project follows. Concrete and actionable, with 2-5 domain tags. Well-known facts
-and things the repository already states are already available next session, so they gain nothing
-from being recorded.
+convention this project follows. Concrete and actionable, with 2-5 domain tags.
 
 Cite with `kimetsu_brain_cite` when a retrieved memory changed what you did. Citations are the
 brain's only evidence about which memories earn their place.
