@@ -218,6 +218,37 @@ files the v2.6 plan behind it.
   field alongside the capsules, and the installed Cursor rule tells the agent to
   make that call at task start. Scoped to the stdio path only — one
   `kimetsu-remote` process fans out across many sessions.
+### Measured — an agentic re-run that does not reproduce the 13x claim
+
+`kbench` was run end-to-end for this release: 12 Terminal-Bench tasks
+stratified across all nine families of `prog-families-v1`, `claude+km` against
+`claude`, 24 trials on Claude Opus 5, no grading or quota errors.
+
+| | wins | cost | cost/win | input tokens |
+|---|---|---|---|---|
+| `claude+km` | 8/12 | $82.19 | $10.27 | 13.9M |
+| `claude` | 9/12 | $67.32 | $7.48 | 11.4M |
+
+The win-rate difference is a single task and is **not** a result — discordant
+pairs are 1 vs 2, one flip reverses the ranking, and a repeat of the same task
+inside this session scored differently between runs. What n=12 supports is *no
+detectable difference in win rate*, not that the brain hurts.
+
+The cost difference is firmer, because token counts are measured rather than
+sampled: 22% more tokens overall, 37% more per win. That is the opposite
+direction from the ~13x cost-per-win advantage recorded in
+`docs/ROI-METHODOLOGY.md`, which is now caveated in place rather than quietly
+left standing. That figure was measured on Sonnet 3.5 against a different,
+unenumerated slice, so this is not a like-for-like refutation — but it is
+enough that 13x should not be quoted without the caveat.
+
+Worth stating because it is the fairest reading and still not an excuse:
+Terminal-Bench gives every task a fresh container and unrelated neighbours, so
+there is almost no prior-session knowledge for a cross-session memory system to
+retrieve. It is the weakest setting for Kimetsu's thesis. It is also the
+instrument the 13x number came from, so it cannot be used to dismiss this
+result while retaining that one.
+
 ### Changed — the installed instructions, restructured (and a claim withdrawn)
 
 Kimetsu's own guidance — the MCP server instructions, the CLAUDE.md block, and

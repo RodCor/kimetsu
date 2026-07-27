@@ -74,6 +74,44 @@ The 16-task slice recorded in internal bench runs shows:
 | With brain context    | $0.19 |
 
 This ~13× difference is the _observed_ cost difference, not a model.
+
+> **v2.6.0 re-measurement did not reproduce this.** A 12-task slice stratified
+> across all nine families of `prog-families-v1`, run on Claude Opus 5 (24
+> trials, no grading or quota errors), came out:
+>
+> | | wins | cost | cost/win | input tokens |
+> |---|---|---|---|---|
+> | `claude+km` | 8/12 | $82.19 | **$10.27** | 13.9M |
+> | `claude` | 9/12 | $67.32 | **$7.48** | 11.4M |
+>
+> Read this carefully in both directions. The **win-rate** difference is one
+> task and is not a result: the discordant pairs are 1 vs 2, a single flip
+> reverses the ranking, and a repeat of `cancel-async-tasks` in this same
+> session scored differently between runs. "No detectable difference in win
+> rate" is what n=12 supports — not that Kimetsu is worse.
+>
+> The **cost** difference is more solid, because token counts are measured
+> rather than sampled: Kimetsu used 22% more total tokens and 37% more per win.
+> That direction is the opposite of the table above.
+>
+> Three things separate the two measurements, and none of them rescues the 13×
+> figure: different model (Opus 5 vs Sonnet 3.5), different and unenumerated
+> task slice, and cost here is reconstructed from recorded token counts at
+> published pricing because Harbor reports a null `cost_usd` under
+> subscription auth.
+>
+> The honest reading is that **13× is not a claim this project can currently
+> support**. It is retained above as the historical measurement it was, with
+> this caveat attached, until a matched re-run replaces it. It should not be
+> quoted without this paragraph.
+>
+> There is one structural point worth stating, and it cuts both ways:
+> Terminal-Bench gives each task a fresh container and the tasks are unrelated,
+> so there is almost no prior-session knowledge for a cross-session memory
+> system to retrieve — the weakest possible setting for Kimetsu's actual
+> thesis. That is a fair explanation of the null. It is *not* a defence of the
+> 13× number, because that number was measured on the same instrument.
+
 The per-kind constants were back-derived from this data: if a typical winning
 run uses ~2 citations of mixed kinds, the implied saving is roughly
 ($2.47 − $0.19) / 2 ≈ $1.14/citation at Claude Sonnet 3.5 pricing
