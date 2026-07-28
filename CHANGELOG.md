@@ -249,6 +249,41 @@ retrieve. It is the weakest setting for Kimetsu's thesis. It is also the
 instrument the 13x number came from, so it cannot be used to dismiss this
 result while retaining that one.
 
+### Measured — BrainBench re-run, and two safety tracks that now exist
+
+Full 264-scenario BrainBench re-run on the semantic build, plus the sycophancy
+and poisoning tracks this release had to withdraw a claim about.
+
+**dedup 77.0% (published 77%) and forgetting 87.8% (published 88%) reproduce
+almost exactly.** Two independent measurements landing on the same number is the
+useful result — it says the harness and the brain are both stable. Importance
+gained ~16 points, outside its confidence interval and apparently real.
+
+**Calibration reads 99.7% at n=122, and that is a problem rather than a win.**
+BrainBench's own published standard is that a benchmark returning ~100% measures
+nothing; a ±0.3% interval means the track has stopped discriminating. Those
+scenarios are synthesized from a retrieval pool rather than authored, and they
+have become too easy to be informative.
+
+**The Overall Brain Quality Index is not comparable across the two runs**, and
+the docs now say so rather than banking the delta. It is an unweighted mean over
+whatever ran; the mix changed from 142 scenarios to 264, with calibration alone
+now 46% of the run at 99.7%. A mean dominated by a saturated dimension rises
+whether or not anything improved. The published 80.0% stands as the figure it
+was, over the set it was measured on.
+
+The new tracks are `poisoning` and `render-contract`, in `kimetsu-bench`. They
+confirm three shipped defences work: 4b import quarantine, 4a trust-weighted
+ranking, and `brain audit` write-burst detection. Both score 100%, which is
+again a weakness and is documented as one — five scenarios covering the
+straightforward case, with no adversarial case that breaks.
+
+`render-contract` is deliberately not named "sycophancy": MemSyco measures a
+*reader* over-deferring to memory, BrainBench has no reader, and a number
+labelled sycophancy sitting next to `dedup 77%` is exactly the claim this
+release already had to withdraw once. Neither safety dimension is folded into
+any Overall Brain Quality Index.
+
 ### Changed — the installed instructions, restructured (and a claim withdrawn)
 
 Kimetsu's own guidance — the MCP server instructions, the CLAUDE.md block, and
