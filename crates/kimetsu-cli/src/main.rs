@@ -12,6 +12,7 @@ mod proactive_state;
 mod process;
 mod remote_client;
 mod skill_synth;
+mod tool_outcome;
 mod update;
 
 use clap::{Args, Parser, Subcommand};
@@ -783,6 +784,47 @@ enum BrainCommand {
     /// --apply: write the winning config to project.toml (dry-run by default).
     /// --revert: restore the previous tune-history entry.
     Tune(TuneArgs),
+    /// Inspect or retrain the proactive-injection policy.
+    ///
+    /// The policy decides whether a mid-task recall is worth interrupting for.
+    /// Untrained, it is exactly the legacy fixed threshold; trained, it has
+    /// learned from which past injections the agent went on to cite.
+    ///
+    /// --status (default): print the weights and how the fit compares to the
+    /// legacy rule on your own injection history.
+    /// --train: refit from that history and write the result.
+    /// --reset: delete the fitted policy, returning to the legacy rule.
+    Policy(PolicyArgs),
+    /// Run the brain's background upkeep passes.
+    ///
+    /// Consolidation, query-route rebuilding, prune-candidate detection, digest
+    /// refresh and skill-candidate detection, each on its own interval. The
+    /// session hooks fire this detached when something is overdue, so it
+    /// normally runs on its own; invoke it directly to force a pass.
+    Maintain(MaintainArgs),
+    /// Audit the corpus by origin, and flag suspicious write bursts.
+    ///
+    /// A poisoned memory persists across every future session, unlike a prompt
+    /// injection that resets. This groups the active corpus by where each
+    /// memory came from, shows how much of it has never been corroborated by a
+    /// successful run here, and flags clusters of writes that arrived too fast
+    /// to be someone typing. Read-only: it reports, you decide.
+    Audit(AuditArgs),
+    /// Report which recent sessions wandered off the task they opened with.
+    ///
+    /// Cosine of each turn against the session's first prompt, which is what a
+    /// session set out to do. Sustained divergence, never a single tangential
+    /// question. Read-only: retrieval is not re-anchored on this, because a
+    /// signal that silently changes retrieval is one whose false positives are
+    /// invisible. Needs an embeddings build.
+    Drift(DriftArgs),
+    /// Ask what the brain believed at a point in time.
+    ///
+    /// Default retrieval answers "what is true now". This answers "what did the
+    /// agent know on the 3rd" — the question that matters when a past decision
+    /// looks wrong and you need to tell a bad call from missing information.
+    /// With --since, reports what changed between two times instead.
+    AsOf(AsOfArgs),
     /// Merge near-duplicate memories and optionally distil loose clusters.
     ///
     /// Story 3.1 (--merge, default): brute-force cosine scan over stored embeddings;
@@ -1166,6 +1208,12 @@ struct ContextHookArgs {
     /// Maximum capsules to inject. Default 2.
     #[arg(long, default_value_t = 2usize)]
     max_capsules: usize,
+    /// For hosts with no session-start event (Codex, Pi, OpenClaw): prepend the
+    /// warm-start block (repo digest + episodic resume) to the FIRST prompt of
+    /// each session. Claude Code leaves this off — it gets the same block from
+    /// `brain session-start-hook` and would otherwise receive it twice.
+    #[arg(long)]
+    warm_on_first_prompt: bool,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1226,6 +1274,89 @@ struct ResumeArgs {
 }
 
 /// Args for `kimetsu brain tune`.
+/// Args for `kimetsu brain as-of`.
+#[derive(Debug, Args)]
+struct AsOfArgs {
+    /// The point in time, RFC 3339 (e.g. 2026-03-01T00:00:00Z) or YYYY-MM-DD.
+    #[arg(value_name = "WHEN")]
+    when: String,
+    /// Report what changed between this time and WHEN, rather than the full
+    /// view at WHEN.
+    #[arg(long, value_name = "WHEN")]
+    since: Option<String>,
+    /// Maximum memories to show. 0 = all.
+    #[arg(long, default_value_t = 50u32)]
+    limit: u32,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain audit`.
+#[derive(Debug, Args)]
+struct AuditArgs {
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain drift`.
+#[derive(Debug, Args)]
+struct DriftArgs {
+    /// How many recent sessions to score.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain maintain`.
+#[derive(Debug, Args)]
+struct MaintainArgs {
+    /// Run every pass regardless of when it last ran.
+    #[arg(long)]
+    force: bool,
+    /// Report what is overdue without running anything.
+    #[arg(long)]
+    status: bool,
+    /// Run only these passes (comma-separated: reinforce, digest, prune, skills).
+    #[arg(long, default_value = "")]
+    only: String,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+/// Args for `kimetsu brain policy`.
+#[derive(Debug, Args)]
+struct PolicyArgs {
+    /// Refit the policy from recorded injection outcomes and write it.
+    #[arg(long)]
+    train: bool,
+    /// Delete the fitted policy, returning to the legacy threshold rule.
+    #[arg(long)]
+    reset: bool,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Override the brain workspace path (defaults to current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct TuneArgs {
     /// Show personal eval-set statistics without running the sweep.
@@ -1528,7 +1659,7 @@ struct BrainExportArgs {
     /// lesson body with no metadata.
     #[arg(long)]
     redact_tags: bool,
-    /// v3.0 #4: pack name. Setting any manifest flag (--name/--version/
+    /// v2.6 #4: pack name. Setting any manifest flag (--name/--version/
     /// --description) writes a self-describing shareable PACK envelope; without
     /// them, the bare memory array (back-compat). Output is ALWAYS gzip-compressed.
     #[arg(long)]
@@ -1556,7 +1687,7 @@ struct BrainImportArgs {
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
-    /// v3.0 #4: install mode. `merge` (default) adds the pack additively, dedups
+    /// v2.6 #4: install mode. `merge` (default) adds the pack additively, dedups
     /// against what you have. `replace` supersedes your current memories in the
     /// pack's scope(s) first (reversible — invalidated, not deleted), then loads
     /// the pack; requires --yes.
@@ -1565,6 +1696,20 @@ struct BrainImportArgs {
     /// Confirm a destructive `--mode replace`.
     #[arg(long)]
     yes: bool,
+    /// v2.6: hold every imported memory in the review queue instead of putting
+    /// it straight into retrieval. Nothing the pack contains can influence a
+    /// session until you accept it with `kimetsu brain memory accept`.
+    ///
+    /// Defaults to ON for http(s):// sources — content authored elsewhere,
+    /// fetched over the network, is the widest attack surface Kimetsu has — and
+    /// OFF for a local file or stdin, which you chose and can read. Pass
+    /// `--no-quarantine` to import a URL directly, or `--quarantine` to review
+    /// a local file.
+    #[arg(long, overrides_with = "no_quarantine")]
+    quarantine: bool,
+    /// Import straight into retrieval, skipping review. See `--quarantine`.
+    #[arg(long, overrides_with = "quarantine")]
+    no_quarantine: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1739,7 +1884,7 @@ struct MemoryAddArgs {
     remote: RemoteWriteArgs,
 }
 
-/// v3.0 #3 Slice C: target a `kimetsu-remote` server for a CLI write instead of
+/// v2.6 #3 Slice C: target a `kimetsu-remote` server for a CLI write instead of
 /// the local brain. Shared (clap `flatten`) by remote-capable write commands.
 #[derive(Debug, Args, Clone)]
 struct RemoteWriteArgs {
@@ -2101,7 +2246,7 @@ fn install_tracing() {
 fn run() -> KimetsuResult<()> {
     let cli = Cli::parse();
 
-    // v3.0 #3 (fleet write-safety): stamp a write origin `<machine>/<agent>` on
+    // v2.6 #3 (fleet write-safety): stamp a write origin `<machine>/<agent>` on
     // every event this process appends, so a shared/replicated brain can
     // attribute writes to the device + agent that made them. The machine part is
     // also the HLC node id (Slice B), so equal-timestamp events break ties
@@ -4007,12 +4152,64 @@ scope = 0.1
             kind: "memory".to_string(),
             score: 0.9,
         }];
-        let bundle = daemon_capsules_to_bundle(&request, wire, false, 0.9);
+        // No brain at this path, so coverage measurement declines and returns
+        // the neutral (1.0, []) — which is the point: an unmeasurable bundle
+        // must render as no claim, never as a false "memory does not cover".
+        let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-no-brain");
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9);
         assert_eq!(bundle.capsules.len(), 1);
         assert_eq!(bundle.capsules[0].summary, "repo:fact - x");
         assert_eq!(bundle.capsules[0].kind, "memory");
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);
+        assert!(
+            (bundle.evidence_coverage - 1.0).abs() < 1e-6,
+            "unmeasurable coverage must be neutral, got {}",
+            bundle.evidence_coverage
+        );
+        assert!(bundle.uncovered_terms.is_empty());
+        assert!(
+            !bundle.chronological,
+            "ordering queries never reach the daemon path"
+        );
+    }
+
+    /// v2.6: a skipped bundle covers nothing, matching the in-process rule.
+    /// Regression guard for the daemon path, which assembles bundles outside
+    /// the retrieval finalization where that rule is enforced.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn daemon_skipped_bundle_reports_zero_coverage() {
+        let request = kimetsu_brain::context::ContextRequest {
+            stage: "localization".to_string(),
+            budget_tokens: 2000,
+            ..Default::default()
+        };
+        let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-skipped");
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, Vec::new(), true, 0.1);
+        assert!(bundle.skipped);
+        assert_eq!(bundle.evidence_coverage, 0.0);
+        assert!(bundle.uncovered_terms.is_empty());
+    }
+
+    /// v2.6: the daemon carries no `created_at`, so an ordering query has to
+    /// decline it and fall back to the in-process path that has the dates.
+    /// Without this the semantic build silently lost the phase-2d fix — the
+    /// bug this release found by building the embeddings flavor at all.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_ordering_query_declines_the_daemon() {
+        let request = kimetsu_brain::context::ContextRequest {
+            stage: "localization".to_string(),
+            query: "which came first, the retry cap or the backoff?".to_string(),
+            budget_tokens: 2000,
+            ..Default::default()
+        };
+        let tmp = std::env::temp_dir().join("kimetsu-ordering-declines-daemon");
+        assert!(
+            crate::commands::brain::try_daemon_retrieve(&tmp, &request).is_none(),
+            "an ordering query must not be answered from the dateless daemon path"
+        );
     }
 
     // ── build_served_event_payload unit tests (Changes A + B) ───────────────

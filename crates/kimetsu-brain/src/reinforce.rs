@@ -416,6 +416,7 @@ mod tests {
             raw_relevance: 0.50,
             embedding: None,
             cosine: None,
+            created_at: None,
             capsule: crate::context::ContextCapsule {
                 id: "x".into(),
                 kind: "memory".into(),

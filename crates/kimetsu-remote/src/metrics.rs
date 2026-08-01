@@ -35,7 +35,7 @@ pub struct Metrics {
     rate_limited: AtomicU64,
     bad_request: AtomicU64,
     error: AtomicU64,
-    /// v3.0 #3 Slice C: successful memory-write tool calls (aggregate, no repo
+    /// v2.6 #3 Slice C: successful memory-write tool calls (aggregate, no repo
     /// label — `/metrics` is unauthenticated and must not leak repo ids).
     writes: AtomicU64,
 }
@@ -100,7 +100,7 @@ impl Metrics {
     }
 }
 
-/// v3.0 #3 Slice C: tool names that MUTATE the brain (used to count writes +,
+/// v2.6 #3 Slice C: tool names that MUTATE the brain (used to count writes +,
 /// in rpc, to know a request did a write). Reads are excluded.
 pub fn is_write_tool(name: &str) -> bool {
     matches!(

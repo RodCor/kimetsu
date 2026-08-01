@@ -5,7 +5,9 @@ Citations, decay, dedup, conflict detection, and the analytics that prove the br
 The strongest signal is which memories the model actually used. The flow:
 
 1. The broker injects N capsules (recorded as a `context.injected` event).
-2. Mid-run, the model calls **`cite_memory`** when it leans on a memory.
+2. Mid-run, the model cites a memory it leaned on: **`cite_memory`** inside the
+   autonomous agent pipeline (`kimetsu run`), or the **`kimetsu_brain_cite`**
+   MCP tool from a host agent. Both land in the same place.
 3. At run end, one `memory.cited` event per citation lands in
    `memory_citations`.
 4. On `run.finished`, usefulness updates: **cited memories** get the strong
@@ -89,6 +91,115 @@ survivor keeps its id, members get `superseded_by`, citations reassign.
 `--distill` feeds looser clusters to the distiller as proposals; `--dry-run`
 prints the plan. `kimetsu brain triage` walks low-usefulness, long-unused
 memories interactively (`--prune-all --yes` for batch).
+
+### Trust and audit
+
+A poisoned memory is not a prompt injection. Prompt injection is session-scoped
+and resets; a memory written into the brain persists and influences every
+future session until someone notices. MINJA reports >95% injection success
+against memory-backed agents through ordinary, unprivileged interaction.
+
+Kimetsu's exposure is narrower than a hosted service's — the brain is a local
+file — but it grows with exactly the features that make the product good:
+`brain import` from a URL, `brain sync`, and Remote's shared org brain. So
+retrieval discounts a memory by where it came from:
+
+| origin | multiplier (uncorroborated) |
+|--------|------------------------------|
+| local, derived | 1.00 |
+| distilled (model-written) | 0.95 |
+| remote / synced | 0.90 |
+| pack (imported) | 0.85 |
+
+**Corroboration erases the discount entirely.** Once a memory has been cited in
+a successful run on this machine — which is exactly what `last_useful_at`
+records — it has been tested here, and where it was written stops being the
+most informative thing about it. Otherwise an imported pack, whose whole point
+is to share knowledge, would stay second-class forever.
+
+Trust is a weight, never a gate: a bad import must not be able to silently
+delete your working knowledge. Memories written before provenance existed read
+as local, so upgrading does not make an existing brain untrusted overnight.
+
+**Quarantine is the gate the weight is not.** Discounting a poisoned pack ranks
+it lower; it still influences sessions. So `kimetsu brain import` holds an
+imported pack in the review queue — the same one `brain memory proposals`
+already drives — and nothing in it can reach a session until you accept it. On
+by default for `http(s)://` sources, since content authored elsewhere and
+fetched over the network is the widest attack surface here; off for a local file
+or stdin, which you chose and can open. `--quarantine` / `--no-quarantine`
+override either way, and `--mode replace` is refused alongside quarantine —
+superseding memories you have in favour of content you have not read is the
+worst of both. Entries matching a memory you already hold are deduped rather
+than proposed: a review queue nobody can face is not a safety mechanism.
+
+Nothing reaches back. A pack imported before quarantine existed stays where it
+is, discounted by origin — pulling working memories out of retrieval on an
+upgrade is a worse failure than the one quarantine prevents.
+
+### Framing, not deference
+
+MemSyco-Bench reports that most memory systems score *worse* on their sycophancy
+track than using no memory at all. The mechanism is not that retrieved memories
+are wrong more often than right — it is that a memory arrives looking like
+ground truth, so the model defers to it over evidence directly in front of it.
+A memory saying the config lives at `config/app.toml` beats the agent's own `ls`
+showing it does not, because nothing in the injection said which of the two wins.
+
+Kimetsu's header used to read "relevant knowledge for this task". *Knowledge* is
+the wrong word: what the brain holds is what was recorded, at some past moment,
+by someone who believed it then. The injection now says so, and says which
+questions memory settles:
+
+- Memory **is** the authority on what was decided, learned, or preferred. There
+  is no other source for those — the repository does not record why.
+- Memory is **not** the authority on what the code currently is. The working
+  tree is, and it has moved. Every memory-versus-reality conflict is this kind.
+
+So the framing is a rule about conflicts rather than a disclaimer: prefer what
+you can check now over what was recorded then. Hedging would be the wrong fix —
+an agent told "this might be wrong" ignores memory, which is the whole product —
+so the memory itself is never qualified, only outranked. The proactive hook gets
+a short suffix instead of a preamble: it interrupts work already underway on a
+one-capsule budget, and framing longer than the memory reads as noise. MCP
+clients, which have no fixed render, get the same rule as guidance in
+`usage.how_to_use`.
+
+`kimetsu brain audit` groups the active corpus by origin, shows how much of it
+has never been corroborated, and flags write bursts — clusters that arrived
+faster than anyone types, which is the shape both a bulk import and induced
+poisoning leave. Read-only on purpose: an automated purge keyed on that
+heuristic would delete a legitimate import.
+
+### Session drift
+
+Nautilus Compass reaches ROC AUC 0.83 detecting behavioural drift on real Claude
+Code traces using nothing but cosine against a behavioural anchor — no model, no
+labels, no training. `kimetsu brain drift` computes the Kimetsu-shaped version
+of that signal: cosine of each turn in a session against the session's *first*
+prompt, which is what it set out to do.
+
+Be precise about what it sees. Compass reads agent traces — the actions taken. A
+memory sidecar has no such thing; what Kimetsu has is the sequence of user
+prompts, logged per session in `context.served`. So this says how far a session
+moved from the question it opened with, not whether an agent drifted from its
+instructions. Weaker than the paper's claim, and the honest one.
+
+The signal is sustained by construction: three consecutive turns below the
+threshold, never a single one. One tangential question is a question. Anchoring
+on the opening turn rather than a rolling window is deliberate — a rolling anchor
+lets a session walk anywhere one small step at a time without ever registering,
+which is the case worth catching.
+
+It matters to a memory system because retrieval anchors on the session: once a
+session has turned, its opening turns are steering results toward a task nobody
+is working on. Report-only, like `prune` and `audit` — a signal that silently
+re-anchors retrieval is one whose false positives are invisible, and this one has
+no measured operating point on a Kimetsu corpus yet. Needs an embeddings build;
+on a lean build the command says so rather than reporting a number computed on a
+different scale.
+
+---
 
 ### Self-tuning
 

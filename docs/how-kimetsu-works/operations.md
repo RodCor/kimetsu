@@ -38,6 +38,34 @@ copying SQLite files. Kimetsu Remote serves a shared brain per repository.
 
 ---
 
+## Background upkeep
+
+The brain has a shelf of maintenance passes — consolidation, query-route
+rebuilding, prune-candidate detection, digest refresh, skill-candidate
+detection. Every one of them used to be a command a human had to remember to
+run, which in practice meant none of them ran.
+
+`kimetsu brain maintain` runs whatever is overdue, each pass on its own
+interval (reinforce and skills daily, digest twice daily, prune weekly), with
+the last-run times in `.kimetsu/maintenance.json`. The session-start and
+session-end hooks fire it **detached** when something is due, so it never sits
+in front of a prompt, and there is no resident scheduler to supervise — the
+same shape as the detached digest rebuild.
+
+```bash
+kimetsu brain maintain --status          # what is overdue
+kimetsu brain maintain                   # run the overdue passes
+kimetsu brain maintain --force           # run everything now
+kimetsu brain maintain --only reinforce  # one pass
+```
+
+Every pass is model-free, so upkeep runs on the Free tier. Reflection is
+deliberately not among them: it is a model call, and a background model call is
+the kind of surprise bill this project exists to avoid. Pruning here only
+*reports* candidates — retiring a memory stays a human decision.
+
+---
+
 ## Doctor
 
 `kimetsu doctor` validates that every subsystem works against the current

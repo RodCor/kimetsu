@@ -119,6 +119,51 @@ jobs:
           KIMETSU_USER_BRAIN: "0"
         run: cargo test --workspace --locked --features embeddings -- --test-threads=1
 
+  integration-assets:
+    name: integration asset drift
+    runs-on: ubuntu-latest
+    # The Pi extension has two homes: the canonical template this repo embeds
+    # with include_str!, and the copy the `kimetsu-pi` npm package publishes.
+    # They drifted once already (the npm copy grew timeout hardening the
+    # installed copy never got), so diff them on every PR.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout kimetsu-pi
+        uses: actions/checkout@v4
+        with:
+          repository: RodCor/kimetsu-pi
+          path: .kimetsu-pi
+      - name: Diff the Pi extension against the published copy
+        run: |
+          diff -u crates/kimetsu-chat/assets/pi-extension.ts \
+                  .kimetsu-pi/extensions/kimetsu.ts \
+            || {
+              echo "::error::crates/kimetsu-chat/assets/pi-extension.ts and kimetsu-pi/extensions/kimetsu.ts have drifted."
+              echo "Run scripts/sync-pi-package.sh against a kimetsu-pi checkout and commit the result there."
+              exit 1
+            }
+
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    # v2.6 shipped `@kimetsu-ai/sdk` and nothing built it. The whole argument
+    # for the SDK is that integrations should call a typed client instead of
+    # shelling out to the binary and parsing text — an argument that only
+    # holds if the types compile, which until now no job checked.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: npm/kimetsu-sdk/package-lock.json
+      - name: Install
+        working-directory: npm/kimetsu-sdk
+        run: npm ci
+      - name: Typecheck + test
+        working-directory: npm/kimetsu-sdk
+        run: npm test
+
   audit:
     name: cargo-audit (RUSTSEC)
     runs-on: ubuntu-latest

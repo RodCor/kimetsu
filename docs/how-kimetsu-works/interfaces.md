@@ -20,9 +20,9 @@ will actually reach for:
 | `kimetsu_brain_model_list` / `_set` / `kimetsu_brain_reindex` | Inspect / switch / re-embed the embedding model |
 | `kimetsu_brain_ingest_repo` | Index repo files + manifests |
 | `kimetsu_benchmark_context` / `_record_outcome` | Task-aware playbook + outcome recording |
-| `kimetsu_bridge_*` / `kimetsu_skills_search` / `kimetsu_skill` | Skill registry, install, invoke |
-| `kimetsu_brain_cite` / `cite_memory` | Record that a memory materially helped |
-| `expand_capsule` | Expand a lazily injected capsule headline to full detail |
+| `kimetsu_bridge_*` / `kimetsu_skills_search` | Skill registry discovery, import, export, sync |
+| `kimetsu_brain_cite` | Record that a memory materially helped |
+| `kimetsu_brain_answer` | Grounded, cited answer composed from memory (local model) |
 
 Every tool returns `{"ok": true, "usage": {...}}` so the host gets guidance on
 how to use the output, not just raw data.
@@ -41,6 +41,8 @@ installers make the loop reliable by writing host-native hook config
   lexical FTS if the daemon is unreachable, so the prompt is never blocked.
   The daemon holds the ONNX models in memory and finishes with a
   cross-encoder rerank (see [Retrieval models](retrieval-models)).
+  With `--warm-on-first-prompt` the hook also prepends the warm-start block
+  (digest + resume) to the session's first turn — see below.
 - **`Stop` -> `kimetsu brain stop-hook`** prints a one-line post-turn banner:
   how many lessons were captured, or a nudge to record one after a
   non-trivial session.
@@ -50,6 +52,51 @@ installers make the loop reliable by writing host-native hook config
 These are plain CLI subcommands, so the same pattern works under any harness
 that can run a command on a prompt, stop, or session-end event.
 
+### Warm start, on every host
+
+The warm-start block — the ~400-token repo digest, your standing preferences,
+your episodic resume, and anything the skills loop is waiting on — is what makes
+the agent's first turn already know the repo. Every host gets it, by whichever route that host actually has:
+
+| Host | Route |
+|------|-------|
+| Claude Code | `SessionStart` -> `kimetsu brain session-start-hook` |
+| Codex, Pi, OpenClaw | per-turn hook with `--warm-on-first-prompt`: prepended to the session's first prompt, once |
+| Cursor | no hooks at all — the first `kimetsu_brain_context` call of a session returns a `warm_start` field alongside the capsules |
+
+The **standing preferences** section is why the block carries more than repo
+state. Preference following is Kimetsu's second-weakest measured ability
+(LongMemEval 66.7%), and the diagnosis is that a preference is a small aside
+semantically far from the question — which rules out fixing it by re-ranking,
+because the candidate never enters the pool. So preferences are *delivered*
+rather than retrieved: the top few `preference` memories by proven usefulness,
+project ones first, framed as instructions to follow without being asked. They
+are excluded from the digest above them so the same line never prints twice.
+
+The last section closes the **skills loop**. A memory cited across three
+distinct runs has earned skill status; detection is a pure query and has run on
+the maintenance schedule since the daemon landed — but its result went into a log
+file nobody opens, so a memory could cross the threshold and sit there forever.
+(`find_synthesis_candidates` having exactly one caller, the `brain skills` CLI,
+was that same fact stated as a call graph.) The warm start now carries one line
+naming what is waiting and the command that acts on it: candidates with no draft
+yet, and drafts awaiting an accept or reject. A candidate that already has a
+pending or accepted proposal is not reported as a candidate — the loop has moved
+on. When there is nothing to act on, which is the common case, the section is
+absent entirely.
+
+Only one route fires per host, so the block is never delivered twice. It is
+gated by `[broker] warm_start` (default on) everywhere. A cached digest is
+served immediately even when the corpus has moved under it, and the rebuild
+runs detached, so a stale digest never puts a build in front of your first turn.
+
+Pi and OpenClaw are driven by a generated TypeScript extension rather than a
+hook file: it feeds the hook payload to the CLI on stdin and reads the injected
+context back off stdout (Pi returns it from `before_agent_start`, OpenClaw as
+`prependContext` from `agent_turn_prepare`). A missing, hung, or failing
+`kimetsu` binary is always a silent no-op — the sidecar must never break the
+host.
+
 ### Proactive recall (mid-work)
 
 `UserPromptSubmit` only fires between turns. Two tool-level hooks surface a
@@ -58,14 +105,44 @@ fetching it. Both match only Bash commands and never block:
 
 - **`PreToolUse` -> `kimetsu brain pretool-hook`**: if the command strongly
   matches a stored `failure_pattern` or `convention`, warn first.
-- **`PostToolUse` -> `kimetsu brain posttool-hook`**: when the output looks
-  like a failure, surface a matching fix.
+- **`PostToolUse` -> `kimetsu brain posttool-hook`**: when a command actually
+  failed, surface a matching fix. "Actually failed" is decided by the strongest
+  evidence available — the exit code when the harness reports one, else a
+  toolchain summary line (cargo, pytest, jest/vitest, go test, tsc, npm, make),
+  else a substring scan that an explicit `0 failed` / `test result: ok` can
+  veto. A passing test suite is not a failure just because its summary line
+  contains the word "failed".
 
-Discipline keeps this near-zero-cost: lexical-FTS-only retrieval, a high
-score floor (0.45; 0.35 for a repeated failing command), one capsule max,
-per-session dedup, and a refractory window between injections. When nothing
-clears the bar, the hook prints nothing. Per-session state lives outside the
-repo under `~/.kimetsu/cache/` and is GC'd after 7 days.
+Discipline keeps this near-zero-cost: lexical-FTS-only retrieval, one capsule
+max, per-session dedup, and a refractory window between injections. When
+nothing clears the bar, the hook prints nothing. Per-session state lives
+outside the repo under `~/.kimetsu/cache/` and is GC'd after 7 days.
+
+**Whether to speak is a learned decision.** The score threshold used to be a
+constant (0.45, or 0.35 when the agent was visibly looping) that applied to
+every brain and never moved. It is now a small logistic policy over the score,
+loop mode, capsule kind, how much has already been injected this session, how
+long since the last injection, how often this command has already failed, and
+how strong the evidence of failure was.
+
+Its prior is pinned to *exactly* the old thresholds, with every other weight at
+zero — so an untrained brain behaves precisely as it did before, and there is no
+cold-start regression to trade against the eventual gain. Each decision is
+recorded with its features, and labelled by whether the agent went on to cite
+the memory it was handed. `kimetsu brain policy` prints the weights and how the
+fit compares to the legacy rule on your own history; `--train` refits;
+`--reset` returns to the constant. Model-free, so it runs on the Free tier.
+
+It also prints **acceptance per hook surface** — how often an injection from
+each surface was followed by a citation of the memory it handed over. The three
+surfaces are not equivalent bets: `posttool` reacts to a command that observably
+failed, while `pretool_prefetch` predicts from a file path alone. That is the
+weakest signal Kimetsu acts on and the reason `broker.proactive_prefetch` is
+default-off — a flag whose own documentation said graduation "waits for regret
+data" while nothing recorded which surface an injection came from, so the data
+could never accumulate and the flag could never graduate. It now does, scored
+per surface so a strong one cannot launder a weak one's noise. The default stays
+off until the comparison is made on a real brain; what changed is that it can be.
 
 Proactive hooks install by default; pass `--no-proactive` to skip them.
 

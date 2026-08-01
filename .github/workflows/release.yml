@@ -604,6 +604,25 @@ jobs:
             ( cd npm/kimetsu-remote && npm publish --access public --provenance )
           fi
 
+      - name: build + publish @kimetsu-ai/sdk
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Deliberately NOT versioned off the tag. The SDK is a client
+          # library whose API moves independently of the binary's, and its
+          # sibling `kimetsu` on PyPI is versioned the same way — pinning it
+          # to the CLI version would promise a lockstep that does not exist.
+          # So it publishes at whatever package.json says, and a release that
+          # did not touch the SDK simply skips.
+          SDK_VERSION="$(node -p "require('./npm/kimetsu-sdk/package.json').version")"
+          if npm view "@kimetsu-ai/sdk@${SDK_VERSION}" version >/dev/null 2>&1; then
+            echo "skip: @kimetsu-ai/sdk@${SDK_VERSION} already published"
+          else
+            echo "publishing @kimetsu-ai/sdk@${SDK_VERSION}"
+            ( cd npm/kimetsu-sdk && npm ci && npm publish --access public --provenance )
+          fi
+
       - name: summary
         run: |
           VERSION="${GITHUB_REF_NAME#v}"

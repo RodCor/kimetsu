@@ -1,0 +1,48 @@
+{
+  "name": "@kimetsu-ai/sdk",
+  "version": "0.1.0",
+  "description": "Typed TypeScript client for Kimetsu Remote's MCP surface \u2014 the counterpart to the kimetsu Python SDK.",
+  "keywords": [
+    "kimetsu",
+    "mcp",
+    "memory",
+    "rag",
+    "agent",
+    "sdk"
+  ],
+  "homepage": "https://github.com/RodCor/kimetsu#readme",
+  "bugs": {
+    "url": "https://github.com/RodCor/kimetsu/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RodCor/kimetsu.git",
+    "directory": "npm/kimetsu-sdk"
+  },
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test test/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0"
+  }
+}

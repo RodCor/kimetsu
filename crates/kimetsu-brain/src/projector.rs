@@ -198,6 +198,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
         DELETE FROM memory_conflicts;
         DELETE FROM sync_conflicts;
         DELETE FROM memory_edges;
+        DELETE FROM memory_entities;
         DELETE FROM work_episodes;
         ",
     )?;
@@ -825,6 +826,11 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
         params![memory_id, text, kind, scope],
     )?;
+    // v2.6: `memory_entities` is a projection of the text, exactly like the FTS
+    // row above, so it is maintained here and rebuilt by `brain rebuild`.
+    // Best-effort: an entity-index hiccup must not fail the write that carries
+    // the user's actual memory.
+    let _ = crate::graph::project_entities(conn, memory_id, text);
     Ok(())
 }
 
@@ -945,6 +951,9 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
     )?;
     #[cfg(feature = "embeddings")]
     crate::ann::on_invalidate(conn, memory_id);
+    // v2.6: drop the entity rows too, so the graph stops routing traffic
+    // through a memory retrieval already excludes.
+    let _ = crate::graph::forget_entities(conn, memory_id);
     Ok(())
 }
 
@@ -1049,6 +1058,10 @@ fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()
     // 5. Remove from ANN index (embeddings feature only).
     #[cfg(feature = "embeddings")]
     crate::ann::on_supersede(conn, memory_id);
+
+    // 5b. v2.6: and from the entity index — the member is no longer a
+    //     retrievable destination, so it should not anchor new edges either.
+    let _ = crate::graph::forget_entities(conn, memory_id);
 
     // 6. S5.2: insert a `supersedes` edge from survivor → member into the
     //    typed-edge projection table so graph-lite traversal can follow it.
@@ -1324,7 +1337,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v3.0 #3: concurrent writers to ONE on-disk brain.db must not lose
+    // v2.6 #3: concurrent writers to ONE on-disk brain.db must not lose
     // updates. Independent Connections behave like independent processes for
     // SQLite locking, so this exercises the IMMEDIATE-transaction + busy-retry
     // write path under real contention.

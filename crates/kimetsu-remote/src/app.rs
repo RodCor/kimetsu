@@ -222,6 +222,13 @@ mod tests {
         // SAFETY: tests run single-threaded; no other thread reads env concurrently.
         unsafe { std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1") };
         let tmp = tempfile::tempdir().unwrap();
+        // The write lands in `<root>/web`, and project discovery walks *up*
+        // from there. Without a boundary it escapes the tempdir entirely and
+        // finds the developer's own `~/.kimetsu/project.toml` — which fails
+        // outright when that file's schema is newer than this build expects,
+        // and, worse, would write a test memory into a real brain when it is
+        // not. A git dir is what `ProjectPaths::discover` stops at.
+        kimetsu_core::paths::git_init_boundary(&tmp.path().join("web"));
         let app = build_router(state_with(tmp.path())); // server_node defaults to "remote"
         let resp = app
             .oneshot(post(

@@ -23,7 +23,7 @@ pub struct AppState {
     /// `None` on lean builds or when `--reranker off` is passed.
     /// Wrapped in `Arc` so `AppState` stays cheaply `Clone`.
     pub reranker: Option<Arc<dyn kimetsu_brain::embeddings::Reranker>>,
-    /// v3.0 #3 Slice C: this server's node id (the HLC node + the machine part of
+    /// v2.6 #3 Slice C: this server's node id (the HLC node + the machine part of
     /// each write's `origin`, `<server_node>/user:<name>`). Set from `--node`.
     pub server_node: Arc<String>,
 }

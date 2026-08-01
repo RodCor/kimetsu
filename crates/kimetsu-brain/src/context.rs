@@ -279,6 +279,22 @@ pub struct ContextRequest {
     pub stage: String,
     pub query: String,
     pub budget_tokens: u32,
+    /// v2.6: per-request override for how the lexical and semantic rankings
+    /// are merged (`"linear"` / `"rrf"`; see [`crate::fusion`]).
+    ///
+    /// Empty (the default) means "use `[broker] fusion`". This exists so
+    /// `kimetsu brain tune` can sweep the two rules against one corpus in one
+    /// process — the reason the shipped default is still `linear` is that
+    /// nothing had measured the alternative on a real brain.
+    pub fusion: String,
+    /// v2.6: per-request override for how `raw_relevance` is normalized into
+    /// the `relevance` term (`"per_kind"` / `"global"`; see
+    /// [`Normalization`]).
+    ///
+    /// Empty (the default) means "use `[broker] normalization`". Exists for
+    /// the same reason `fusion` does: the alternative had to be measurable on
+    /// one corpus in one process before it could be argued for.
+    pub normalization: String,
     /// v0.6: domain-hint tags. Capsules whose text or kind contains any
     /// of these strings receive a 1.4× score boost, pushing on-domain
     /// capsules above the `min_score` threshold when they would otherwise
@@ -341,6 +357,172 @@ pub struct ContextBundle {
     /// v0.6: best composite score observed before the skip check.
     /// Useful for diagnostics ("why was the brain silent?").
     pub top_score: f32,
+    /// v2.6: what fraction of the query's discriminating power the returned
+    /// capsules cover, *collectively*, in `[0, 1]`.
+    ///
+    /// Kimetsu already abstains at the bundle level — nothing above
+    /// `min_score` means an empty bundle and zero tokens. What it never did is
+    /// say anything about a bundle it *does* return, so a reader handed three
+    /// capsules that touch half the question has no way to tell that from
+    /// three that answer it, and confabulates the rest. That is what BEAM's
+    /// abstention track measures, and where Kimetsu scores worst (45% / 30%).
+    ///
+    /// IDF-weighted against the corpus, so a query term present in every
+    /// memory contributes nothing and a rare one dominates — the same weighting
+    /// the per-memory lexical floor uses, applied to the bundle as a whole.
+    /// 1.0 when there is no discriminating term to measure against.
+    pub evidence_coverage: f32,
+    /// v2.6: the discriminating query terms *no* returned capsule mentions.
+    ///
+    /// The actionable half of `evidence_coverage`: a reader can be told
+    /// precisely what memory does not know about, rather than being handed a
+    /// number. Empty when coverage is complete or unmeasurable.
+    pub uncovered_terms: Vec<String>,
+    /// v2.6: true when the query asked about order and the capsules were
+    /// re-rendered chronologically, oldest first, each carrying its date.
+    ///
+    /// The reader needs to be told, or a time-ordered bundle looks like a
+    /// relevance-ranked one whose ranking has gone wrong. See
+    /// [`crate::ordering`] for why ordering is rendered rather than retrieved.
+    pub chronological: bool,
+}
+
+/// Discriminating weight per query token, for *bundle* coverage.
+///
+/// Deliberately not [`corpus_token_idf`]. That one zeroes a token the corpus
+/// has never seen (`df == 0`), because for the per-memory floor an
+/// out-of-corpus word would sink every candidate — the on-topic memory that
+/// matches the rare in-corpus word would be wrongly pruned.
+///
+/// For coverage the same fact means the opposite. A query term that appears in
+/// **no** memory is the strongest possible evidence that memory does not cover
+/// this question, which is precisely what the reader needs to be told. Zeroing
+/// it would make "how do I checkpoint the WAL during a Kubernetes rollout"
+/// report full coverage on the strength of the WAL half alone — the exact
+/// confabulation this is meant to prevent.
+///
+/// So `df == 0` gets the maximal weight, and only `df == N` (present in every
+/// memory, e.g. the project name) is zeroed.
+fn coverage_token_idf(conn: &Connection, tokens: &[String]) -> KimetsuResult<HashMap<String, f32>> {
+    let mut idf = HashMap::new();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if n == 0 {
+        return Ok(idf);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT COUNT(*) FROM memories \
+         WHERE invalidated_at IS NULL AND lower(text) LIKE ?1 ESCAPE '\\'",
+    )?;
+    for token in tokens {
+        let pattern = format!("%{}%", escape_like(token));
+        let df: i64 = stmt
+            .query_row(params![pattern], |row| row.get(0))
+            .unwrap_or(0);
+        // ln((N+1)/(df+1)): maximal at df == 0, zero at df == N.
+        let weight = (((n + 1) as f32) / ((df + 1) as f32)).ln().max(0.0);
+        idf.insert(token.clone(), weight);
+    }
+    Ok(idf)
+}
+
+/// Render the partial-evidence warning for a bundle, if it needs one.
+///
+/// The point is to let a reader abstain on Kimetsu's advice rather than
+/// confabulate from partial evidence. Naming the missing terms is what makes
+/// that actionable — "memory does not cover X" is a fact the reader can act on,
+/// where a coverage number is not.
+///
+/// Returns `None` when coverage is adequate, so a complete bundle costs nothing.
+pub fn partial_evidence_notice(bundle: &ContextBundle) -> Option<String> {
+    if bundle.skipped || bundle.capsules.is_empty() {
+        return None; // an empty bundle already says everything it can
+    }
+    if bundle.evidence_coverage > PARTIAL_EVIDENCE_COVERAGE || bundle.uncovered_terms.is_empty() {
+        return None;
+    }
+    // Cap the list: naming twenty terms is noise, and the first few are the
+    // highest-IDF ones anyway (content_tokens preserves query order, and the
+    // uncovered list is filtered from it).
+    const MAX_NAMED: usize = 6;
+    let named: Vec<&str> = bundle
+        .uncovered_terms
+        .iter()
+        .take(MAX_NAMED)
+        .map(String::as_str)
+        .collect();
+    let more = bundle.uncovered_terms.len().saturating_sub(named.len());
+    let suffix = if more > 0 {
+        format!(" (and {more} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Partial memory: nothing above covers {}{}. Treat the rest as unknown \
+         rather than inferring it.",
+        named.join(", "),
+        suffix
+    ))
+}
+
+/// Coverage at or below which a bundle is worth flagging as partial.
+///
+/// Chosen to mirror `min_lexical_coverage`'s default (0.5): a bundle that
+/// collectively covers less of the query than a single memory would need to
+/// survive the per-memory floor is, by the system's own standard, thin.
+pub const PARTIAL_EVIDENCE_COVERAGE: f32 = 0.5;
+
+/// Measure how much of `query`'s discriminating power `capsules` collectively
+/// cover, and which terms none of them mention.
+///
+/// Deliberately computed over the *union* of the capsules rather than the best
+/// one: the question is whether the bundle answers the query, not whether any
+/// single memory does.
+pub(crate) fn evidence_coverage(
+    conn: &Connection,
+    query: &str,
+    capsules: &[ContextCapsule],
+) -> (f32, Vec<String>) {
+    let content = content_tokens(query);
+    if content.is_empty() {
+        return (1.0, Vec::new());
+    }
+    let Ok(idf) = coverage_token_idf(conn, &content) else {
+        return (1.0, Vec::new());
+    };
+    // Everything the bundle says, lowercased once.
+    let haystack = capsules
+        .iter()
+        .map(|c| c.summary.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut total = 0.0f32;
+    let mut hit = 0.0f32;
+    let mut uncovered = Vec::new();
+    for token in &content {
+        let weight = idf.get(token).copied().unwrap_or(0.0);
+        if weight <= 0.0 {
+            continue; // corpus-ubiquitous or out-of-corpus: no signal either way
+        }
+        total += weight;
+        if haystack.contains(token.as_str()) {
+            hit += weight;
+        } else {
+            uncovered.push(token.clone());
+        }
+    }
+    if total <= f32::EPSILON {
+        // No discriminating term to measure against — claiming a gap here
+        // would make every vague query look like a memory failure.
+        return (1.0, Vec::new());
+    }
+    (hit / total, uncovered)
 }
 
 /// S5.1: a single memory candidate produced by candidate generation and
@@ -362,6 +544,11 @@ pub(crate) struct Candidate {
     /// query embedding. Present when `embedding` is `Some`. Used for
     /// the absolute semantic relevance floor (min_semantic_score).
     pub(crate) cosine: Option<f32>,
+    /// v2.6: the memory's RFC 3339 creation time, carried so the bundle can be
+    /// re-rendered in time order when the query asks about sequence (see
+    /// [`crate::ordering`]). `None` for repo files and manifests, which have no
+    /// position in the memory timeline.
+    pub(crate) created_at: Option<String>,
 }
 
 pub fn retrieve_context(
@@ -433,7 +620,9 @@ pub fn retrieve_context_with_embedder(
         request,
         extra_memory_conns,
         embedder,
-        &crate::backend::FlatBackend,
+        &crate::backend::FlatBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        },
     )
 }
 
@@ -552,7 +741,11 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
     // For Feature (default), weights_for_task_kind returns the base unchanged.
     let stage_weights = weights_for_stage(weights, &request.stage);
     let effective_weights = weights_for_task_kind(stage_weights, request.task_kind);
-    normalize_and_score(&mut candidates, effective_weights);
+    normalize_and_score(
+        &mut candidates,
+        effective_weights,
+        Normalization::from_config(&request.normalization),
+    );
 
     // E3: merge task-kind prefer_role hints with caller-supplied prefer_roles.
     // For Feature the hints are empty so this is a no-op (neutral).
@@ -673,6 +866,23 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         candidates
     };
 
+    // v2.6: keep each memory's creation time keyed by its stable handle before
+    // the candidates are consumed. Only built when the question is actually
+    // about order — on every other query it would be a map nobody reads.
+    let created_at_by_handle: std::collections::HashMap<String, String> =
+        if crate::ordering::is_ordering_query(&request.query) {
+            candidates
+                .iter()
+                .filter_map(|c| {
+                    c.created_at
+                        .clone()
+                        .map(|ts| (c.capsule.expansion_handle.clone(), ts))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let mut capsules = candidates
         .into_iter()
         .map(|candidate| candidate.capsule)
@@ -709,6 +919,11 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             excluded: capsules,
             skipped: true,
             top_score,
+            // A skipped bundle covers nothing, by construction.
+            evidence_coverage: 0.0,
+            uncovered_terms: Vec::new(),
+            // Nothing was rendered, so nothing was rendered in time order.
+            chronological: false,
         });
     }
 
@@ -740,6 +955,23 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         }
     }
 
+    let (coverage, uncovered_terms) = evidence_coverage(conn, &request.query, &included);
+
+    // v2.6: presentation only, and last — the budget has already decided which
+    // capsules ship, so re-rendering can neither admit one it rejected nor drop
+    // one it chose. Coverage is measured before the date prefixes are added so
+    // the score describes the memories, not their timestamps.
+    //
+    // `used_tokens` is recomputed because the prefixes are real tokens.
+    let chronological = !created_at_by_handle.is_empty();
+    let included = if chronological {
+        let dated = crate::ordering::render_chronologically(included, &created_at_by_handle);
+        used_tokens = dated.iter().map(|c| c.token_estimate).sum();
+        dated
+    } else {
+        included
+    };
+
     Ok(ContextBundle {
         stage: request.stage,
         budget_tokens: request.budget_tokens,
@@ -748,6 +980,9 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         excluded,
         skipped: false,
         top_score,
+        evidence_coverage: coverage,
+        uncovered_terms,
+        chronological,
     })
 }
 
@@ -910,7 +1145,7 @@ fn memory_ann_candidates(
     let sql = format!(
         "SELECT memory_id, scope, kind, text, confidence, created_at,
                 use_count, usefulness_score, embedding, embedding_model,
-                last_useful_at
+                last_useful_at, provenance_snapshot_json
          FROM   memories
          WHERE  invalidated_at IS NULL
            AND  superseded_by IS NULL
@@ -938,6 +1173,7 @@ fn memory_ann_candidates(
             row.get::<_, Option<Vec<u8>>>(8)?,
             row.get::<_, Option<String>>(9)?,
             row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
 
@@ -955,6 +1191,7 @@ fn memory_ann_candidates(
             embedding,
             embedding_model,
             last_useful_at,
+            provenance_snapshot,
         ) = row?;
         let (cosine, row_vec) =
             compute_cosine_and_vec(Some(qe), embedding.as_deref(), embedding_model.as_deref());
@@ -969,6 +1206,7 @@ fn memory_ann_candidates(
             use_count,
             usefulness_score,
             last_useful_at,
+            provenance_snapshot,
             half_life_days,
             None, // no raw FTS relevance override — cosine drives ranking
             cosine,
@@ -990,22 +1228,32 @@ pub(crate) fn memory_candidates_flat(
     query: &str,
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
+    fusion: crate::fusion::Fusion,
 ) -> KimetsuResult<Vec<Candidate>> {
-    memory_candidates(conn, query, query_embedding, half_life_days)
+    memory_candidates(conn, query, query_embedding, half_life_days, fusion)
 }
 
+/// Build the flat candidate pool, merging the lexical and semantic rankings
+/// with `fusion`.
+///
+/// The two sources — FTS5 and the ANN index — are independent rankings over the
+/// same corpus, and how they are merged is a real ranking decision rather than
+/// plumbing. See [`crate::fusion`].
 fn memory_candidates(
     conn: &Connection,
     query: &str,
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
+    // Read only on the embeddings build: the lean path has a single ranking,
+    // so there is nothing to fuse and any rule is the identity.
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))] fusion: crate::fusion::Fusion,
 ) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
 
     // D1c: on embeddings builds with a real query vector, run BOTH FTS and
-    // ANN, then union-dedup by memory_id (keeping the higher-scored instance).
-    // This replaces the recency-bounded latest_memory_candidates fallback as
-    // the semantic-recall source when embeddings are active.
+    // ANN and fuse the two rankings. This replaces the recency-bounded
+    // latest_memory_candidates fallback as the semantic-recall source when
+    // embeddings are active.
     #[cfg(feature = "embeddings")]
     if let Some(qe) = query_embedding {
         // FTS candidates (may be empty if no lexical matches).
@@ -1025,33 +1273,11 @@ fn memory_candidates(
         // ANN candidates — top-80 nearest neighbours from the usearch index.
         let ann_candidates = memory_ann_candidates(conn, qe, 80, &query_tokens, half_life_days)?;
 
-        // Union the two sets, deduped by memory_id.  When a memory appears
-        // in both, keep the instance with the higher raw_relevance so
-        // candidates that both lexically and semantically match the query
-        // get the best score.
-        let mut seen: HashMap<String, usize> = HashMap::new();
-        let mut merged: Vec<Candidate> = Vec::new();
-
-        for candidate in fts_candidates.into_iter().chain(ann_candidates) {
-            // Extract memory_id from the expansion_handle "memory:<id>".
-            let mid = candidate
-                .capsule
-                .expansion_handle
-                .strip_prefix("memory:")
-                .unwrap_or(&candidate.capsule.expansion_handle)
-                .to_string();
-            if let Some(&idx) = seen.get(&mid) {
-                // Keep the higher-scored instance.
-                if candidate.raw_relevance > merged[idx].raw_relevance {
-                    merged[idx] = candidate;
-                }
-            } else {
-                seen.insert(mid, merged.len());
-                merged.push(candidate);
-            }
-        }
-
-        return Ok(merged);
+        // Both sources return best-first, which is what rank-based fusion needs.
+        return Ok(crate::fusion::fuse(
+            fusion,
+            vec![fts_candidates, ann_candidates],
+        ));
     }
 
     // Lean (NoopEmbedder) path: unchanged — FTS then recency fallback.
@@ -1093,7 +1319,7 @@ fn latest_memory_candidates(
         "
         SELECT memory_id, scope, kind, text, confidence, created_at,
                use_count, usefulness_score, embedding, embedding_model,
-               last_useful_at
+               last_useful_at, provenance_snapshot_json
         FROM memories
         WHERE invalidated_at IS NULL
           AND superseded_by IS NULL
@@ -1116,6 +1342,7 @@ fn latest_memory_candidates(
             row.get::<_, Option<Vec<u8>>>(8)?,
             row.get::<_, Option<String>>(9)?,
             row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
 
@@ -1133,6 +1360,7 @@ fn latest_memory_candidates(
             embedding,
             embedding_model,
             last_useful_at,
+            provenance_snapshot,
         ) = row?;
         let (cosine, row_vec) = compute_cosine_and_vec(
             query_embedding,
@@ -1150,6 +1378,7 @@ fn latest_memory_candidates(
             use_count,
             usefulness_score,
             last_useful_at,
+            provenance_snapshot,
             half_life_days,
             None,
             cosine,
@@ -1173,7 +1402,8 @@ fn memory_fts_candidates(
         "
         SELECT m.memory_id, m.scope, m.kind, m.text, m.confidence, m.created_at,
                m.use_count, m.usefulness_score, bm25(memories_fts) AS rank,
-               m.embedding, m.embedding_model, m.last_useful_at
+               m.embedding, m.embedding_model, m.last_useful_at,
+               m.provenance_snapshot_json
         FROM memories_fts
         JOIN memories m
           ON m.memory_id = memories_fts.memory_id
@@ -1200,6 +1430,7 @@ fn memory_fts_candidates(
             row.get::<_, Option<Vec<u8>>>(9)?,
             row.get::<_, Option<String>>(10)?,
             row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<String>>(12)?,
         ))
     })?;
 
@@ -1218,6 +1449,7 @@ fn memory_fts_candidates(
             embedding,
             embedding_model,
             last_useful_at,
+            provenance_snapshot,
         ) = row?;
         let fts_relevance = (-rank as f32).max(0.0);
         let (cosine, row_vec) = compute_cosine_and_vec(
@@ -1236,6 +1468,7 @@ fn memory_fts_candidates(
             use_count,
             usefulness_score,
             last_useful_at,
+            provenance_snapshot,
             half_life_days,
             Some(fts_relevance),
             cosine,
@@ -1310,6 +1543,9 @@ fn memory_row_to_candidate(
     use_count: i64,
     usefulness_score: f64,
     last_useful_at: Option<String>,
+    // v2.6: the memory's stored provenance snapshot, classified into a trust
+    // multiplier. See `crate::trust`.
+    provenance_snapshot: Option<String>,
     half_life_days: f32,
     raw_relevance_override: Option<f32>,
     cosine_score: Option<f32>,
@@ -1361,10 +1597,25 @@ fn memory_row_to_candidate(
     let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
     let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
     let biased_relevance = apply_usefulness_boost(raw_relevance, multiplier);
+
+    // v2.6: discount by origin, unless the memory has proven itself here.
+    //
+    // `last_useful_at` is set only on a citation in a *successful* run, so its
+    // presence is exactly "this has been tested on this machine" — at which
+    // point where it was written stops being the most informative thing about
+    // it, whatever that was. Applied after the usefulness boost so it is the
+    // last word: a memory of unknown origin cannot boost its way past the
+    // discount, but a corroborated one carries none.
+    let provenance =
+        crate::trust::Provenance::from_snapshot(provenance_snapshot.as_deref().unwrap_or("{}"));
+    let trusted_relevance =
+        biased_relevance * crate::trust::trust_multiplier(provenance, last_useful_at.is_some());
+
     Some(Candidate {
-        raw_relevance: biased_relevance,
+        raw_relevance: trusted_relevance,
         embedding: row_embedding,
         cosine: cosine_score,
+        created_at: Some(created_at),
         capsule: ContextCapsule {
             id: new_id().to_string(),
             kind: "memory".to_string(),
@@ -1503,6 +1754,8 @@ fn repo_file_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            // A repo file has no position in the memory timeline.
+            created_at: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_file".to_string(),
@@ -1569,6 +1822,8 @@ fn manifest_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            // A repo file has no position in the memory timeline.
+            created_at: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_manifest".to_string(),
@@ -1627,6 +1882,8 @@ fn manifest_fts_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            // A repo file has no position in the memory timeline.
+            created_at: None,
             capsule: ContextCapsule {
                 id: new_id().to_string(),
                 kind: "repo_manifest".to_string(),
@@ -1649,20 +1906,79 @@ fn manifest_fts_candidates(
     Ok(candidates)
 }
 
-fn normalize_and_score(candidates: &mut [Candidate], weights: StageWeights) {
+/// v2.6: how `raw_relevance` becomes the `relevance` term of the composite
+/// score.
+///
+/// ## Per-kind (the rule through v2.5)
+///
+/// Each `kind` is normalized against the best `raw_relevance` *of that kind*.
+/// The consequence is that the top memory and the top repo_file both score
+/// `relevance = 1.0` no matter how good either actually is: on a query where
+/// memory has the answer and no file is relevant, the best of the irrelevant
+/// files is still promoted to a perfect relevance and competes for budget on
+/// the strength of the other three score terms alone.
+///
+/// That is the distortion the lexical and semantic *floors* exist to
+/// compensate for — they prune the weak candidate before normalization can
+/// flatter it. A floor is a blunt instrument for this: it is a fixed
+/// threshold standing in for a comparison the normalizer could just make.
+///
+/// ## Global
+///
+/// One max over all candidates, so `relevance` means the same thing across
+/// kinds and a candidate that is merely the best of a bad kind keeps a low
+/// relevance. Nothing else in the pipeline changes.
+///
+/// ## Which one runs
+///
+/// Selectable, defaulting to `per_kind`. Global normalization is the more
+/// principled rule and it is *still* not the default here, for the same
+/// reason RRF is not: the house rule is that a ranking change ships with a
+/// measurement on a real corpus, and an argument from first principles is not
+/// one. `[broker] normalization` and the per-request override are how a
+/// corpus gets to settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Normalization {
+    /// Normalize within each capsule kind. Kimetsu's behaviour through v2.5.
+    #[default]
+    PerKind,
+    /// Normalize against a single max over every candidate.
+    Global,
+}
+
+impl Normalization {
+    /// Parse from config. Unknown values fall back to the default, matching
+    /// how `[broker] fusion` treats an unrecognized rule — a typo in a config
+    /// file must not silently change ranking.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "global" => Self::Global,
+            _ => Self::PerKind,
+        }
+    }
+}
+
+fn normalize_and_score(
+    candidates: &mut [Candidate],
+    weights: StageWeights,
+    normalization: Normalization,
+) {
+    // The per-kind rule keys on the capsule kind; the global rule uses one
+    // bucket for everything. Sharing the map keeps a single scoring loop.
     let mut max_by_kind = HashMap::<String, f32>::new();
+    let bucket = |candidate: &Candidate| match normalization {
+        Normalization::PerKind => candidate.capsule.kind.clone(),
+        Normalization::Global => String::new(),
+    };
     for candidate in candidates.iter() {
         max_by_kind
-            .entry(candidate.capsule.kind.clone())
+            .entry(bucket(candidate))
             .and_modify(|max| *max = (*max).max(candidate.raw_relevance))
             .or_insert(candidate.raw_relevance);
     }
 
     for candidate in candidates {
-        let max = max_by_kind
-            .get(&candidate.capsule.kind)
-            .copied()
-            .unwrap_or(0.0);
+        let max = max_by_kind.get(&bucket(candidate)).copied().unwrap_or(0.0);
         let relevance = if max <= f32::EPSILON {
             if candidate.raw_relevance > 0.0 {
                 1.0
@@ -1748,6 +2064,19 @@ const STOPWORDS: &[&str] = &[
     "please", "tell", "give", "show", "want", "need", "get", "got", "use", "using", "there",
     "their", "they", "them", "then", "than", "some", "any", "all", "more", "most", "such", "via",
     "per",
+    // v2.6: the function words this list had always meant to cover. The
+    // comment in `content_tokens` cited "during" as the reason stemming runs
+    // after the stopword check, and "during" was not actually in the list —
+    // harmless while these tokens only nudged a floor, but v2.6 shows uncovered
+    // terms to the user by name, and "nothing above covers during" is noise.
+    // These also reconcile this list with `graph::STOPWORDS`, which had a
+    // different set; two disagreeing stopword lists in one codebase is its own
+    // small defect.
+    "during", "while", "until", "unless", "before", "after", "again", "against", "above", "below",
+    "between", "through", "under", "over", "because", "also", "just", "only", "very", "much",
+    "many", "each", "both", "same", "other", "another", "always", "never", "still", "even", "ever",
+    "every", "first", "found", "thing", "things", "value", "default", "if", "so", "up", "out",
+    "off", "down", "no", "yes",
 ];
 
 /// v1.0.0: tokenize a query into deduped CONTENT tokens — the same word
@@ -1861,15 +2190,40 @@ fn weighted_coverage(content: &[String], idf: &HashMap<String, f32>, summary: &s
 /// discriminating word. Haystacks stay raw; only query tokens are stemmed.
 /// Conservative: a suffix is stripped only when ≥4 chars remain, and only
 /// one suffix is stripped.
+///
+/// v2.6: plus the English y→ies rule, which the suffix list alone gets wrong in
+/// both directions. `"retries"` strips `es` to `retri`; `"retry"` matches no
+/// suffix and stays `retry`; neither is a prefix of the other, so a query
+/// asking about `retry` treats a corpus that says `retries` as not mentioning
+/// it at all. BrainBench's sycophancy track found this by flagging a gap on a
+/// question the memories plainly answered — the same defect silently costs the
+/// lexical floor its IDF weight on any `-y` word (`query`, `policy`, `memory`,
+/// `binary`), which is a large share of the vocabulary this corpus is made of.
+///
+/// Stripping a trailing `y`/`i` after a consonant collapses both forms onto the
+/// shared prefix (`retry`, `retries` → `retr`), which is what substring and
+/// FTS-prefix matching need. Only after a consonant, so `day`/`key` keep their
+/// vowel-`y`, and only with ≥4 chars remaining, so short words are left alone.
 fn light_stem(token: &str) -> &str {
+    let mut stem = token;
     for suffix in ["ing", "ed", "es", "s"] {
-        if let Some(stem) = token.strip_suffix(suffix)
-            && stem.len() >= 4
+        if let Some(stripped) = token.strip_suffix(suffix)
+            && stripped.len() >= 4
         {
-            return stem;
+            stem = stripped;
+            break;
         }
     }
-    token
+    if stem.len() >= 5
+        && let Some(trimmed) = stem.strip_suffix('y').or_else(|| stem.strip_suffix('i'))
+        && trimmed
+            .chars()
+            .next_back()
+            .is_some_and(|c| !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
+    {
+        return trimmed;
+    }
+    stem
 }
 
 fn query_tokens(query: &str) -> Vec<String> {
@@ -4368,6 +4722,92 @@ mod tests {
 
     /// E3-2: weight renormalization — weights_for_task_kind(w, Debug) sums
     /// to approximately the same total as the input weights.
+    /// v2.6 (2b): build two candidates of different kinds where the memory is
+    /// a strong match and the repo_file is a weak one.
+    fn two_kinds_one_strong() -> Vec<Candidate> {
+        let mk = |kind: &str, raw: f32| Candidate {
+            capsule: ContextCapsule {
+                id: format!("{kind}-1"),
+                kind: kind.to_string(),
+                summary: String::new(),
+                token_estimate: 0,
+                expansion_handle: String::new(),
+                provenance: Vec::new(),
+                confidence: 0.0,
+                freshness: 0.0,
+                relevance: 0.0,
+                scope_weight: 0.0,
+                score: 0.0,
+            },
+            raw_relevance: raw,
+            embedding: None,
+            cosine: None,
+            created_at: None,
+        };
+        vec![mk("memory", 0.9), mk("repo_file", 0.1)]
+    }
+
+    /// The behaviour 2b exists to describe: per-kind normalization promotes
+    /// the best of an irrelevant kind to a perfect relevance.
+    #[test]
+    fn per_kind_normalization_flatters_the_best_of_a_weak_kind() {
+        let mut candidates = two_kinds_one_strong();
+        let weights = StageWeights {
+            relevance: 1.0,
+            confidence: 0.0,
+            freshness: 0.0,
+            scope: 0.0,
+        };
+        normalize_and_score(&mut candidates, weights, Normalization::PerKind);
+        assert!((candidates[0].capsule.relevance - 1.0).abs() < 1e-6);
+        assert!(
+            (candidates[1].capsule.relevance - 1.0).abs() < 1e-6,
+            "per-kind gives the lone weak repo_file relevance 1.0, got {}",
+            candidates[1].capsule.relevance
+        );
+    }
+
+    /// Global normalization keeps relevance comparable across kinds: the weak
+    /// repo_file stays weak because it is measured against the same max.
+    #[test]
+    fn global_normalization_keeps_relevance_comparable_across_kinds() {
+        let mut candidates = two_kinds_one_strong();
+        let weights = StageWeights {
+            relevance: 1.0,
+            confidence: 0.0,
+            freshness: 0.0,
+            scope: 0.0,
+        };
+        normalize_and_score(&mut candidates, weights, Normalization::Global);
+        assert!((candidates[0].capsule.relevance - 1.0).abs() < 1e-6);
+        let weak = candidates[1].capsule.relevance;
+        assert!(
+            (weak - (0.1 / 0.9)).abs() < 1e-6,
+            "global normalizes against the single max, got {weak}"
+        );
+        assert!(weak < candidates[0].capsule.relevance);
+    }
+
+    /// An unknown or empty value must not silently change ranking — a typo in
+    /// project.toml falls back to the shipped rule.
+    #[test]
+    fn unknown_normalization_falls_back_to_per_kind() {
+        assert_eq!(Normalization::from_config(""), Normalization::PerKind);
+        assert_eq!(
+            Normalization::from_config("per_kind"),
+            Normalization::PerKind
+        );
+        assert_eq!(
+            Normalization::from_config("nonsense"),
+            Normalization::PerKind
+        );
+        assert_eq!(Normalization::from_config("global"), Normalization::Global);
+        assert_eq!(
+            Normalization::from_config("  GLOBAL "),
+            Normalization::Global
+        );
+    }
+
     #[test]
     fn weights_for_task_kind_renormalizes_to_unit_sum() {
         let base = StageWeights {
@@ -5080,6 +5520,477 @@ mod tests {
             reduction >= 0.25,
             "compression must reduce tokens by >=25% on long memories; \
              raw={raw_tokens} compressed={compressed_tokens} reduction={reduction:.2}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn conn_with(texts: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().expect("open");
+        crate::schema::initialize(&conn).expect("schema");
+        for (i, text) in texts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO memories
+                 (memory_id, scope, kind, text, normalized_text, confidence,
+                  provenance_snapshot_json, created_at)
+                 VALUES (?1, 'project', 'fact', ?2, ?2, 0.9, '{}', '2026-01-01T00:00:00Z')",
+                rusqlite::params![format!("m{i}"), text],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    fn capsule(summary: &str) -> ContextCapsule {
+        ContextCapsule {
+            id: String::new(),
+            kind: "memory".to_string(),
+            summary: summary.to_string(),
+            token_estimate: 10,
+            expansion_handle: format!("memory:{summary}"),
+            provenance: Vec::new(),
+            confidence: 0.9,
+            freshness: 0.5,
+            relevance: 0.0,
+            scope_weight: 0.9,
+            score: 0.5,
+        }
+    }
+
+    fn bundle(capsules: Vec<ContextCapsule>, coverage: f32, uncovered: &[&str]) -> ContextBundle {
+        ContextBundle {
+            stage: "localization".to_string(),
+            budget_tokens: 2000,
+            used_tokens: 20,
+            capsules,
+            excluded: Vec::new(),
+            skipped: false,
+            top_score: 0.7,
+            evidence_coverage: coverage,
+            uncovered_terms: uncovered.iter().map(|s| s.to_string()).collect(),
+            chronological: false,
+        }
+    }
+
+    /// A bundle that answers the question fully must report full coverage and
+    /// name nothing — a complete answer should cost zero extra tokens.
+    #[test]
+    fn full_coverage_names_nothing() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "vacuum reclaims dead pages",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint wal",
+            &[capsule(
+                "project:fact - checkpoint the wal before copying brain.db",
+            )],
+        );
+        assert!(coverage > 0.99, "got {coverage}");
+        assert!(uncovered.is_empty(), "got {uncovered:?}");
+    }
+
+    /// The case that matters: capsules that touch part of the query. The
+    /// reader must be told which part memory does not cover, rather than being
+    /// left to infer it.
+    #[test]
+    fn partial_coverage_names_the_missing_terms() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "the migration runner snapshots before each step",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint wal migration",
+            &[capsule(
+                "project:fact - checkpoint the wal before copying brain.db",
+            )],
+        );
+        assert!(coverage < 1.0, "coverage should be partial: {coverage}");
+        assert!(
+            uncovered.iter().any(|t| t.starts_with("migrat")),
+            "the uncovered term must be named: {uncovered:?}"
+        );
+    }
+
+    /// Coverage is measured over the union of the capsules, not the best one:
+    /// the question is whether the bundle answers the query.
+    #[test]
+    fn coverage_is_collective_not_per_capsule() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "the migration runner snapshots before each step",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint migration",
+            &[
+                capsule("project:fact - checkpoint the wal before copying"),
+                capsule("project:fact - the migration runner snapshots first"),
+            ],
+        );
+        assert!(
+            coverage > 0.99,
+            "neither capsule covers both terms, but together they do: {coverage}"
+        );
+        assert!(uncovered.is_empty(), "got {uncovered:?}");
+    }
+
+    /// A query of nothing but stopwords has no content to measure. Claiming a
+    /// gap there would make every vague question look like a memory failure.
+    #[test]
+    fn an_unmeasurable_query_does_not_claim_a_gap() {
+        let conn = conn_with(&["checkpoint the wal"]);
+        let (coverage, uncovered) =
+            evidence_coverage(&conn, "the and of", &[capsule("project:fact - checkpoint")]);
+        assert_eq!(coverage, 1.0);
+        assert!(uncovered.is_empty());
+    }
+
+    /// The case that made this need its own IDF. A query term the corpus has
+    /// never seen is the *strongest* evidence memory does not cover the
+    /// question — but the per-memory floor's IDF zeroes exactly those, because
+    /// there an out-of-corpus word would sink every candidate. Reusing it here
+    /// made "checkpoint the wal during a kubernetes rollout" report full
+    /// coverage on the strength of the WAL half alone.
+    #[test]
+    fn a_term_the_corpus_has_never_seen_counts_as_a_gap() {
+        let conn = conn_with(&[
+            "checkpoint the wal before copying brain.db",
+            "vacuum reclaims dead pages",
+        ]);
+        let (coverage, uncovered) = evidence_coverage(
+            &conn,
+            "checkpoint the wal during a kubernetes rollout",
+            &[capsule(
+                "project:fact - checkpoint the wal before copying brain.db",
+            )],
+        );
+        assert!(
+            coverage <= PARTIAL_EVIDENCE_COVERAGE,
+            "an unknown half of the question must read as thin, not complete: {coverage}"
+        );
+        assert!(
+            uncovered.iter().any(|t| t.starts_with("kubernet")),
+            "the unknown term must be named: {uncovered:?}"
+        );
+    }
+
+    /// …and the mirror: a term in *every* memory (the project name) carries no
+    /// signal either way and must not inflate coverage.
+    #[test]
+    fn a_ubiquitous_term_carries_no_weight() {
+        let conn = conn_with(&["kimetsu checkpoint wal", "kimetsu vacuum pages"]);
+        let (coverage, _) = evidence_coverage(
+            &conn,
+            "kimetsu vacuum",
+            &[capsule("project:fact - kimetsu vacuum pages")],
+        );
+        assert!(coverage > 0.99, "got {coverage}");
+    }
+
+    #[test]
+    fn an_empty_query_does_not_claim_a_gap() {
+        let conn = conn_with(&["checkpoint the wal"]);
+        assert_eq!(evidence_coverage(&conn, "", &[]).0, 1.0);
+    }
+
+    // ── The rendered notice ──────────────────────────────────────────────
+
+    #[test]
+    fn a_complete_bundle_gets_no_notice() {
+        assert!(partial_evidence_notice(&bundle(vec![capsule("a")], 1.0, &[])).is_none());
+        assert!(
+            partial_evidence_notice(&bundle(vec![capsule("a")], 0.9, &["x"])).is_none(),
+            "above the threshold is not partial"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_skipped_bundle_gets_no_notice() {
+        let mut skipped = bundle(Vec::new(), 0.0, &["x"]);
+        skipped.skipped = true;
+        assert!(
+            partial_evidence_notice(&skipped).is_none(),
+            "an empty bundle already says everything it can"
+        );
+        assert!(partial_evidence_notice(&bundle(Vec::new(), 0.0, &["x"])).is_none());
+    }
+
+    #[test]
+    fn a_partial_bundle_names_what_is_missing_and_tells_the_reader_what_to_do() {
+        let notice =
+            partial_evidence_notice(&bundle(vec![capsule("a")], 0.3, &["migration", "rollback"]))
+                .expect("a thin bundle must be flagged");
+        assert!(notice.contains("migration"), "got: {notice}");
+        assert!(notice.contains("rollback"), "got: {notice}");
+        assert!(
+            notice.contains("unknown"),
+            "the notice must tell the reader to abstain, not just report a gap: {notice}"
+        );
+    }
+
+    /// Naming twenty terms is noise.
+    #[test]
+    fn the_notice_caps_how_many_terms_it_names() {
+        let terms: Vec<String> = (0..12).map(|i| format!("term{i}")).collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let notice =
+            partial_evidence_notice(&bundle(vec![capsule("a")], 0.1, &refs)).expect("flagged");
+        assert!(notice.contains("and 6 more"), "got: {notice}");
+        assert!(!notice.contains("term9"), "got: {notice}");
+    }
+
+    // ── v2.6: light stemming ─────────────────────────────────────────────
+
+    /// The defect BrainBench's sycophancy track surfaced: a query asking about
+    /// `retry` treated a corpus saying `retries` as not mentioning it, because
+    /// the two stemmed to `retry` and `retri` and neither prefixes the other.
+    #[test]
+    fn the_y_ies_pair_shares_a_stem() {
+        for (a, b) in [
+            ("retry", "retries"),
+            ("query", "queries"),
+            ("policy", "policies"),
+            ("memory", "memories"),
+            ("binary", "binaries"),
+            ("registry", "registries"),
+        ] {
+            assert_eq!(
+                light_stem(a),
+                light_stem(b),
+                "{a}/{b} stemmed to {:?}/{:?}",
+                light_stem(a),
+                light_stem(b)
+            );
+        }
+    }
+
+    /// Vowel-`y` is part of the word, not an inflection: `day` is not `da`.
+    #[test]
+    fn a_vowel_y_is_not_stripped() {
+        assert_eq!(light_stem("delay"), "delay");
+        assert_eq!(light_stem("gateway"), "gateway");
+        // "journeys" strips the s (7 chars remain), and the y survives because
+        // a vowel precedes it.
+        assert_eq!(light_stem("journeys"), "journey");
+    }
+
+    /// Short words are left alone: over-stemming a four-letter token leaves a
+    /// prefix that matches half the corpus.
+    #[test]
+    fn short_words_keep_their_ending() {
+        assert_eq!(light_stem("body"), "body");
+        assert_eq!(light_stem("copy"), "copy");
+    }
+
+    /// The pre-existing behaviour must be unchanged — this rule is additive.
+    #[test]
+    fn the_original_suffix_rules_still_hold() {
+        assert_eq!(light_stem("benchmarked"), "benchmark");
+        assert_eq!(light_stem("benchmarking"), "benchmark");
+        assert_eq!(light_stem("migrations"), "migration");
+        assert_eq!(light_stem("run"), "run");
+    }
+
+    /// End to end, which is the form the defect actually took: a bundle must
+    /// not report a gap on a term the corpus inflects differently.
+    #[test]
+    fn an_inflected_corpus_term_counts_as_covered() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let text = "the ingest worker retries a failed batch three times before giving up";
+        let normalized = kimetsu_core::memory::normalize_memory_text(text);
+        conn.execute(
+            "
+            INSERT INTO memories (
+                memory_id, scope, kind, text, normalized_text, confidence,
+                source_event_id, provenance_snapshot_json, created_at
+            )
+            VALUES ('m_retry', 'project', 'fact', ?1, ?2, 1.0, NULL, '{}',
+                    '2026-01-01T00:00:00Z')
+            ",
+            rusqlite::params![text, normalized],
+        )
+        .expect("insert memory");
+        conn.execute(
+            "INSERT INTO memories_fts (memory_id, text, kind, scope)
+             VALUES ('m_retry', ?1, 'fact', 'project')",
+            rusqlite::params![text],
+        )
+        .expect("insert fts");
+
+        let bundle = retrieve_context_with_embedder(
+            &conn,
+            "/fake-repo",
+            &kimetsu_core::config::BrokerWeights::default(),
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: "how many times does the ingest worker retry a failed batch".to_string(),
+                budget_tokens: 4000,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve");
+
+        assert!(
+            !bundle.uncovered_terms.iter().any(|t| t.starts_with("retr")),
+            "`retry` must match a corpus that says `retries`; uncovered: {:?}",
+            bundle.uncovered_terms
+        );
+    }
+
+    // ── v2.6: event ordering (crate::ordering) ──────────────────────────
+
+    /// Seed two memories on the same topic, written months apart, and retrieve
+    /// them. The end-to-end proof that `crate::ordering` is actually reachable
+    /// from the broker — the unit tests there operate on capsules the broker
+    /// never handed them.
+    fn ordering_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        for (mid, created, text) in [
+            (
+                "m_late",
+                "2026-06-01T09:00:00Z",
+                "switched the error type to thiserror",
+            ),
+            (
+                "m_early",
+                "2026-01-15T10:00:00Z",
+                "ran the thiserror schema migration",
+            ),
+        ] {
+            let normalized = kimetsu_core::memory::normalize_memory_text(text);
+            conn.execute(
+                "
+                INSERT INTO memories (
+                    memory_id, scope, kind, text, normalized_text, confidence,
+                    source_event_id, provenance_snapshot_json, created_at
+                )
+                VALUES (?1, 'project', 'fact', ?2, ?3, 1.0, NULL, '{}', ?4)
+                ",
+                rusqlite::params![mid, text, normalized, created],
+            )
+            .expect("insert memory");
+            conn.execute(
+                "INSERT INTO memories_fts (memory_id, text, kind, scope)
+                 VALUES (?1, ?2, 'fact', 'project')",
+                rusqlite::params![mid, text],
+            )
+            .expect("insert fts");
+        }
+        conn
+    }
+
+    fn ordering_bundle(conn: &rusqlite::Connection, query: &str) -> ContextBundle {
+        retrieve_context_with_embedder(
+            conn,
+            "/fake-repo",
+            &kimetsu_core::config::BrokerWeights::default(),
+            ContextRequest {
+                stage: "localization".to_string(),
+                query: query.to_string(),
+                budget_tokens: 4000,
+                ..Default::default()
+            },
+            &[],
+            &embeddings::NoopEmbedder,
+        )
+        .expect("retrieve")
+    }
+
+    /// The fix, end to end: asked which came first, the reader is handed the
+    /// memories oldest-first with the dates it needs to answer.
+    #[test]
+    fn an_ordering_query_returns_a_dated_chronological_bundle() {
+        let conn = ordering_conn();
+        let bundle = ordering_bundle(&conn, "did we run the thiserror migration before or after");
+
+        assert!(bundle.chronological, "the query asked about order");
+        let order: Vec<&str> = bundle
+            .capsules
+            .iter()
+            .filter_map(|c| c.expansion_handle.strip_prefix("memory:"))
+            .collect();
+        assert_eq!(order, vec!["m_early", "m_late"], "oldest first");
+        for (capsule, date) in bundle.capsules.iter().zip(["2026-01-15", "2026-06-01"]) {
+            assert!(
+                capsule.summary.contains(&format!("[{date}]")),
+                "every capsule carries its date; got: {}",
+                capsule.summary
+            );
+        }
+    }
+
+    /// The narrow gate is the whole reason this is safe: an ordinary question
+    /// keeps relevance order and spends no tokens on dates.
+    #[test]
+    fn an_ordinary_query_is_untouched() {
+        let conn = ordering_conn();
+        let bundle = ordering_bundle(&conn, "how do we handle thiserror errors");
+
+        assert!(!bundle.chronological);
+        for capsule in &bundle.capsules {
+            assert!(
+                !capsule.summary.contains('['),
+                "no dates on a non-ordering query; got: {}",
+                capsule.summary
+            );
+        }
+    }
+
+    /// Presentation, not selection: reordering runs after the budget loop, so
+    /// the same capsules ship either way. If this ever diverges, ordering has
+    /// started changing *what* the reader sees rather than how.
+    #[test]
+    fn ordering_changes_the_rendering_not_the_selection() {
+        let conn = ordering_conn();
+        let ordered = ordering_bundle(&conn, "did we run the thiserror migration before or after");
+        let plain = ordering_bundle(&conn, "did we run the thiserror migration");
+
+        let mut got: Vec<&str> = ordered
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        let mut want: Vec<&str> = plain
+            .capsules
+            .iter()
+            .map(|c| c.expansion_handle.as_str())
+            .collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "same capsules, different order");
+    }
+
+    /// The dates are real tokens and the bundle's accounting has to say so,
+    /// or a budgeted caller under-counts what it just injected.
+    #[test]
+    fn the_dates_are_counted_against_the_budget() {
+        let conn = ordering_conn();
+        let ordered = ordering_bundle(&conn, "did we run the thiserror migration before or after");
+        let plain = ordering_bundle(&conn, "did we run the thiserror migration");
+        assert!(
+            ordered.used_tokens > plain.used_tokens,
+            "dated: {} vs plain: {}",
+            ordered.used_tokens,
+            plain.used_tokens
+        );
+        assert_eq!(
+            ordered.used_tokens,
+            ordered
+                .capsules
+                .iter()
+                .map(|c| c.token_estimate)
+                .sum::<u32>(),
+            "used_tokens must match what was actually rendered"
         );
     }
 }

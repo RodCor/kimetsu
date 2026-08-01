@@ -12,7 +12,7 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar for Claude Code and Codex. It accumulates generalizable knowledge across sessions and retrieves it on demand. Recommended workflow: (1) Call kimetsu_brain_context early on non-trivial tasks — if skipped:true is returned, the brain has nothing relevant and you paid zero overhead. (2) After solving a non-obvious problem that took real effort, call kimetsu_brain_record with a concrete lesson and 2-5 domain tags. Do NOT call for trivial or well-known knowledge. (3) When a retrieved memory materially helped, call kimetsu_brain_cite with its memory_id — this closes the ground-truth loop and powers self-tuning. (4) For Terminal-Bench tasks, call kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. Use kimetsu_bridge_status and kimetsu_skills_search when portable skills may help. Brain tools retrieve and curate durable context; bridge tools discover capabilities.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant and the call cost nothing, so a call that returns empty is not a wasted one — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations are the brain's only evidence about which memories earn their place; an uncited memory reads as unused. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
@@ -655,11 +655,53 @@ fn parse_shared_retrieval_args(
     }
 }
 
+/// Latch for the once-per-session warm start on the stdio MCP path.
+///
+/// One `kimetsu mcp serve` process is one host session, which makes a process
+/// latch a session latch. Deliberately not consulted by the remote server: one
+/// `kimetsu-remote` process fans out across many sessions and repos.
+static WARM_START_SERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the session's warm-start block, or `None` if it has already been served
+/// (or there is nothing to serve).
+///
+/// The latch is only set once a block actually exists, so a call made against a
+/// cold brain does not burn the session's one chance at a warm start.
+fn take_session_warm_start(workspace: &Path) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    if WARM_START_SERVED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let block = kimetsu_brain::digest::warm_start_block(workspace)?;
+    if WARM_START_SERVED.swap(true, Ordering::SeqCst) {
+        return None; // lost the race — another call is already emitting it
+    }
+    Some(block)
+}
+
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    match brain_context_tool(workspace, arguments, None) {
+    let mut value = match brain_context_tool(workspace, arguments, None) {
         Ok(v) => v,
         Err(e) => brain_unavailable_json(workspace, &e),
+    };
+
+    // Hosts with a session-start hook (Claude Code) or a per-turn hook (Codex,
+    // Pi, OpenClaw) already receive the warm-start block out of band. Cursor
+    // has neither — it only speaks MCP — so the session's first context call is
+    // the one place the repo digest and episodic resume can reach it. Attached
+    // as a sibling field so the retrieval response shape stays untouched.
+    if let Some(block) = take_session_warm_start(workspace) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "warm_start".into(),
+                json!({
+                    "context": block,
+                    "how_to_use": "First context call of this session: what this repo is, and where you left off last time. Read it before planning. It is not repeated on later calls."
+                }),
+            );
+        }
     }
+    value
 }
 
 /// Candidate pool the remote reranker judges before truncating to the caller's
@@ -810,7 +852,7 @@ pub fn brain_context_tool(
                 "skipped": false,
                 "top_score": bundle.top_score,
                 "usage": {
-                    "how_to_use": "Read capsule summaries before planning. Memory capsules are durable Kimetsu brain state; repo_file and repo_manifest capsules point to likely relevant files/manifests.",
+                    "how_to_use": kimetsu_brain::framing::MCP_HOW_TO_USE,
                     "next_steps": [
                         "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
                         "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
@@ -826,6 +868,20 @@ pub fn brain_context_tool(
                 "used_tokens": bundle.used_tokens,
                 "capsule_count": bundle.capsules.len(),
                 "excluded_count": bundle.excluded.len(),
+                // v2.6: how much of the query these capsules collectively
+                // cover, and what none of them mention. A reader that knows
+                // memory is thin here can abstain instead of inferring.
+                "evidence_coverage": bundle.evidence_coverage,
+                "uncovered_terms": bundle.uncovered_terms,
+                "partial_evidence_notice":
+                    kimetsu_brain::context::partial_evidence_notice(&bundle),
+                // v2.6: true when the question was about order, so the capsules
+                // are oldest-first and each carries the date it was recorded —
+                // without which a time-ordered bundle reads as a broken ranking.
+                "chronological": bundle.chronological,
+                "chronological_note": bundle
+                    .chronological
+                    .then_some(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE),
                 "capsules": bundle.capsules,
                 "excluded": bundle.excluded,
             }))
@@ -2317,12 +2373,26 @@ mod tests {
             &SkillConfig::default(),
         )
         .expect("initialize");
-        assert!(
-            result["instructions"]
-                .as_str()
-                .unwrap()
-                .contains("Recommended workflow")
-        );
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("persistent brain sidecar"));
+        // v2.6: the instructions must state when to reach for each tool, and
+        // must not carry a prohibition. From Opus 4.7 onward a conservative
+        // bar ("do NOT call for trivial…") is honoured literally, so it
+        // suppresses the write path on exactly the newest models — and the
+        // brain's learning loop runs on what gets written.
+        for tool in [
+            "kimetsu_brain_context",
+            "kimetsu_brain_record",
+            "kimetsu_brain_cite",
+        ] {
+            assert!(instructions.contains(tool), "must say when to use {tool}");
+        }
+        for prohibition in ["Do NOT", "do not call", "non-trivial"] {
+            assert!(
+                !instructions.contains(prohibition),
+                "instructions must not carry a filter a literal reader over-applies: {prohibition}"
+            );
+        }
     }
 
     #[test]

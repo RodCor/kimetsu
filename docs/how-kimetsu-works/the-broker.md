@@ -9,6 +9,16 @@ embeddings build the broker also queries a **usearch HNSW** index (a
 the FTS set, so a memory whose meaning matches can surface without sharing a
 word with the query.
 
+The default backend is **graph-lite**: on top of that flat set it walks up to
+two hops over `memory_edges`, so a memory one edge from the best hit can be
+pulled in even when the query never mentions it. Graph-reached candidates enter
+at a hop-decayed share of the seed's relevance (`×0.6` per hop), so they rank
+below the hit that surfaced them. The candidate set is a strict superset of
+flat's, which is why the default is safe: broader recall, never a displaced
+result. Edges are written as each memory lands, from the entities it shares
+with the existing corpus — no `kimetsu brain graph build` required, though that
+command still rebuilds the whole graph if you want it re-derived.
+
 The score is a weighted sum plus two multipliers:
 
 ```
@@ -30,6 +40,50 @@ returns nothing rather than padding the prompt. Key knobs in `[broker]`:
 `max_capsules` (8), `budget_floor_tokens` (1500), `budget_run_cap_tokens`
 (8000).
 
+**Abstention.** A bundle carries `evidence_coverage`: the IDF-weighted share
+of the query's discriminating terms the returned capsules cover *collectively*.
+Below 0.5 the injection is followed by an explicit line naming what none of them
+mention — "nothing above covers kubernetes, rollout. Treat the rest as unknown
+rather than inferring it." Kimetsu already abstained at the bundle level (top
+score below `min_score` → empty bundle, zero tokens); this is the signal for a
+bundle it *does* return, so a reader handed three capsules that touch half the
+question can tell that from three that answer it. The same fields are exposed on
+`kimetsu_brain_context`.
+
+The weighting is deliberately not the one the per-memory floor uses: there a
+query term absent from the whole corpus is zeroed (it would sink every
+candidate), while here it is the *strongest* evidence of a gap, and weighs most.
+
+**Event ordering.** Memories carry `created_at`; capsules did not, so a bundle
+rendered in score order with no dates gave a reader asked "did we switch to
+`thiserror` before or after the migration?" nothing to order the answer *by*. At
+two events that is a coin flip, which is roughly what the 32.5% BEAM ordering
+score looked like. Nothing about retrieval was wrong — the memories were found
+and selected, and then the ordering information was thrown away at render time.
+
+So when the query contains an ordering marker (`before`, `after`, `first`,
+`when`, `timeline`, …), the bundle is re-rendered oldest-first with each memory's
+date in front of its text, under a line telling the reader that is what they are
+looking at. Repo files and manifests have no position in the memory timeline;
+they keep their relative order after the dated ones rather than being dropped or
+given a date they do not have.
+
+This runs **after** the budget loop, so it is presentation and not selection: it
+cannot admit a capsule the broker rejected or drop one it chose. `used_tokens` is
+recomputed because the dates are real tokens. The marker gate is deliberately
+narrow — timestamping every capsule on every query would spend tokens on the
+large majority of questions that are not about time, and reordering an ordinary
+bundle away from relevance would bury the best answer. `chronological` and
+`chronological_note` are exposed on `kimetsu_brain_context`.
+
+**Budgeting.** Capsules are filled greedily in score order against **half** of
+the requested `budget_tokens` — the other half is headroom for the rest of the
+bundle (repo files, manifests, the render-time framing) and for the chars/4
+token estimate being an approximation rather than a count. So a request for
+2000 tokens fills capsules up to ~1000. Overflow lands in `excluded` rather
+than being dropped silently, and `max_capsules` caps the count before the
+token check.
+
 ## Embeddings vs lean builds
 
 - **Embeddings** (the CLI default): ships fastembed + ONNX. Cosine retrieval,
@@ -47,8 +101,9 @@ returns nothing rather than padding the prompt. Key knobs in `[broker]`:
 
 ## The agent brain (proactive + cost-shrinking)
 
-For the autonomous agent pipeline, an adaptive layer sits on top of
-retrieval:
+For the autonomous agent pipeline (`kimetsu run`), an adaptive layer sits on
+top of retrieval. The tools named below (`expand_capsule`, `cite_memory`) are
+that pipeline's own tools, not part of the MCP surface a host agent sees:
 
 - **Task-kind routing.** A cheap deterministic classifier sorts each task
   into Debug / Feature / Refactor / Docs / Investigation, and a weight layer

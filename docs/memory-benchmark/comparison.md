@@ -43,7 +43,7 @@ Cognee's [BEAM figures](https://github.com/topoteretes/cognee), the
 
 ## What we do not yet claim
 
-- Multi-hop retrieval of obliquely relevant memories is v3.0 work; the
+- Multi-hop retrieval of obliquely relevant memories is v2.6 work; the
   LongMemEval preference result (63%) is that ceiling on a public benchmark.
 - The LongMemEval number is a 200-question stratified slice with a specific
   reader, not the full 500.

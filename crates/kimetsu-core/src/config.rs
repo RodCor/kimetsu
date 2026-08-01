@@ -66,6 +66,7 @@ impl ProjectConfig {
                 schema_version: KIMETSU_CONFIG_VERSION,
                 use_user_brain: default_true(),
                 mcp_write_tools: default_true(),
+                tier: None,
             },
             model: ModelSection::default(),
             broker: BrokerSection::default(),
@@ -163,6 +164,58 @@ impl ProjectConfig {
         None
     }
 
+    /// v2.6: resolve the effective product tier.
+    ///
+    /// Resolution order (first wins):
+    ///   1. `KIMETSU_TIER` env var (`free` / `deep`; an unparseable value is
+    ///      ignored rather than fatal — a typo in a shell profile must not
+    ///      break retrieval).
+    ///   2. `[kimetsu] tier`, when set explicitly.
+    ///   3. Auto: Deep when a cheap model is configured, Free otherwise.
+    ///
+    /// **`deep` downgrades to `free` when [`Self::cheap_model`] resolves to
+    /// `None`.** Deep with no reachable model is not a third state: it is Free
+    /// with a misleading label, and every consumer would have to re-check.
+    /// Resolving it here means a caller can branch on the tier alone; use
+    /// [`Self::tier_downgraded`] when you want to *report* the discrepancy.
+    pub fn tier(&self) -> Tier {
+        match self.tier_requested() {
+            Some(Tier::Deep) if self.cheap_model().is_some() => Tier::Deep,
+            Some(Tier::Deep) => Tier::Free,
+            Some(Tier::Free) => Tier::Free,
+            // Auto: a brain that already has a cheap model configured is
+            // already making model calls. Calling that "free" would be a lie.
+            None if self.cheap_model().is_some() => Tier::Deep,
+            None => Tier::Free,
+        }
+    }
+
+    /// The tier the user explicitly asked for, if any. `None` means auto.
+    pub fn tier_requested(&self) -> Option<Tier> {
+        match std::env::var("KIMETSU_TIER") {
+            Ok(raw) => raw.parse::<Tier>().ok().or(self.kimetsu.tier),
+            Err(_) => self.kimetsu.tier,
+        }
+    }
+
+    /// True when Deep was asked for but no cheap model is reachable, so the
+    /// brain is silently running Free. `kimetsu doctor` surfaces this: the
+    /// failure mode it guards against is paying attention to a `deep` label
+    /// while none of the Deep features can actually run.
+    pub fn tier_downgraded(&self) -> bool {
+        self.tier_requested() == Some(Tier::Deep) && self.cheap_model().is_none()
+    }
+
+    /// The single gate every Deep-only code path must consult before making a
+    /// model call in the memory pipeline.
+    ///
+    /// Equivalent to `self.tier().allows_model()`, named for the invariant it
+    /// enforces: on Free this returns false, and the "zero LLM calls" claim is
+    /// exactly the statement that no memory-pipeline call site proceeds past it.
+    pub fn allows_model_in_pipeline(&self) -> bool {
+        self.tier().allows_model()
+    }
+
     pub fn from_toml(value: &str) -> KimetsuResult<Self> {
         Ok(toml::from_str(value)?)
     }
@@ -200,6 +253,86 @@ pub struct KimetsuSection {
     /// stays env-only, default-deny.
     #[serde(default = "default_true")]
     pub mcp_write_tools: bool,
+    /// v2.6: which product tier this brain runs as.
+    ///
+    /// `"free"` (default) is the headline claim — **zero LLM calls anywhere in
+    /// the memory pipeline**. Ingest, store, retrieve and rerank are FTS5 +
+    /// local embeddings + a local cross-encoder, and every capability has a
+    /// deterministic or statistical implementation.
+    ///
+    /// `"deep"` opts into a local small model in the loop for the handful of
+    /// features that are genuinely better with one (see [`Tier`]). Every Deep
+    /// feature has a Free fallback that *is* the Free behaviour, so flipping
+    /// the tier can add quality but can never remove a capability.
+    ///
+    /// Absent (the default) means **auto**: a brain with a cheap model
+    /// configured is already making model calls, so it reads as Deep; a brain
+    /// without one reads as Free. That keeps every pre-v2.6 `project.toml`
+    /// behaving exactly as it did while making the label honest. Set it
+    /// explicitly to force the tier — `"free"` is a durable opt-out of model
+    /// calls even when credentials are present.
+    ///
+    /// Precedence: `KIMETSU_TIER` env > this field > auto.
+    /// Resolve it with [`ProjectConfig::tier`], never by reading this field —
+    /// the resolver also downgrades `deep` to `free` when no model is actually
+    /// reachable, which would otherwise be a label over a no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+}
+
+/// v2.6: the product tier. See [`KimetsuSection::tier`].
+///
+/// | Feature | Free | Deep |
+/// |---|---|---|
+/// | write-time lesson distillation | rule-based capture | model-distilled lessons |
+/// | repo digest | rule-based assembly | model-distilled summary |
+/// | reflection over memory clusters | not run | synthesized general principles |
+/// | contradiction detection | cosine proximity | entailment adjudication |
+/// | proactive inject-or-stay-silent | locally-fit statistical policy | model adjudication |
+/// | idle-time work | consolidation, pruning, tuning | the above plus query anticipation |
+///
+/// The benchmark tables in `docs/memory-benchmark/` report both columns
+/// separately: Free is what the "model-free" claim is measured on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Model-free. The default, and what the published claims measure.
+    #[default]
+    Free,
+    /// A local small model in the loop for the features listed on [`Tier`].
+    Deep,
+}
+
+impl Tier {
+    /// True when this tier permits a model call in the memory pipeline.
+    pub fn allows_model(self) -> bool {
+        matches!(self, Tier::Deep)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Free => "free",
+            Tier::Deep => "deep",
+        }
+    }
+}
+
+impl std::str::FromStr for Tier {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "free" => Ok(Tier::Free),
+            "deep" => Ok(Tier::Deep),
+            other => Err(format!("unknown tier `{other}` (expected free or deep)")),
+        }
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// v0.8: embedding-model selection. `model` is one of the curated
@@ -503,19 +636,41 @@ impl CheapModelSection {
 pub struct StorageSection {
     /// Which retrieval backend to use.
     ///
-    /// | Value         | Behaviour                                             |
-    /// |---------------|-------------------------------------------------------|
-    /// | `"flat"`      | FTS + usearch HNSW ANN (current, default)             |
-    /// | `"graph-lite"`| TODO (S5.2): graph-augmented FTS + ANN               |
-    /// | `"graph"`     | TODO (future): full graph traversal                   |
+    /// | Value         | Behaviour                                              |
+    /// |---------------|--------------------------------------------------------|
+    /// | `"flat"`      | FTS + usearch HNSW ANN (default)                       |
+    /// | `"graph-lite"`| flat, plus 2-hop BFS over `memory_edges` with hop decay |
+    /// | `"graph"`     | petgraph backend (feature `graph`; remote server only)  |
     ///
     /// Unknown values fall back to `"flat"` with a warning.
+    ///
+    /// All three are implemented in `kimetsu_brain::backend`. Note that
+    /// `graph-lite` only differs from `flat` once the edge table has
+    /// non-`supersedes` edges in it — run `kimetsu brain graph build` first,
+    /// or it degenerates to flat retrieval. The published BEAM 100K figure
+    /// (73.3%, vs 62.3% flat) was measured on `graph-lite` with edges built.
     #[serde(default = "default_storage_backend")]
     pub backend: String,
 }
 
+/// v2.6: `graph-lite`, not `flat`.
+///
+/// The published BEAM 100K figure (73.3%) was measured on graph-lite; `flat`
+/// scored 62.3% on the same set. Shipping `flat` as the default meant the
+/// advertised number described a configuration almost nobody was running.
+///
+/// It was the right default until now only because the graph was empty in
+/// practice: `relates_to` edges existed solely if a user remembered to run
+/// `kimetsu brain graph build`, so graph-lite paid for a traversal that found
+/// nothing. Now that the write path links each memory as it lands (see
+/// `crate::graph::incremental_edges_for_memory`), the traversal has something
+/// to traverse.
+///
+/// Safe by construction: graph-lite's candidate set is a superset of flat's,
+/// and graph-reached candidates enter with `raw_relevance = 0.0`, so they rank
+/// below every direct hit and can only fill slots flat would have left empty.
 fn default_storage_backend() -> String {
-    "flat".to_string()
+    "graph-lite".to_string()
 }
 
 impl Default for StorageSection {
@@ -635,6 +790,40 @@ pub struct BrokerSection {
     /// loading with the floor active.
     #[serde(default = "default_min_lexical_coverage")]
     pub min_lexical_coverage: f32,
+    /// v2.6: how the broker merges candidate lists from different retrieval
+    /// strategies (lexical FTS, semantic ANN, graph traversal).
+    ///
+    /// * `"linear"` (default) — union the lists, keeping each memory's best
+    ///   `raw_relevance`, itself a linear blend of BM25 and cosine at α = 0.5.
+    ///   Kimetsu's behaviour through v2.5.
+    /// * `"rrf"` — reciprocal rank fusion. Uses only each candidate's rank in
+    ///   each list, so the fact that BM25 is unbounded and corpus-dependent
+    ///   while cosine is bounded and tightly clustered stops mattering, and a
+    ///   memory both lists rank highly beats one a single list loves.
+    ///
+    /// Defaults to `linear` because the house rule is that every claim ships
+    /// with a measurement, and "RRF is the 2026 default" is not one for *this*
+    /// corpus. `kimetsu brain tune` sweeps both against your own query history.
+    /// Unknown values fall back to `linear`.
+    #[serde(default = "default_fusion")]
+    pub fusion: String,
+    /// v2.6: how a candidate's raw relevance is normalized into the
+    /// `relevance` term of the composite score.
+    ///
+    /// * `"per_kind"` (default) — normalize within each capsule kind, so the
+    ///   best memory and the best repo_file each land at `relevance = 1.0`
+    ///   however good either is. Kimetsu's behaviour through v2.5.
+    /// * `"global"` — one max across every candidate, so relevance means the
+    ///   same thing across kinds and the best of an irrelevant kind stays low.
+    ///
+    /// Per-kind normalization is the reason the lexical and semantic floors
+    /// have to exist: they prune weak candidates before normalization can
+    /// flatter them to 1.0. Global is the more principled rule, and it is
+    /// still not the default, because a ranking change ships with a
+    /// measurement on a corpus and not with an argument. Unknown values fall
+    /// back to `per_kind`.
+    #[serde(default = "default_normalization")]
+    pub normalization: String,
     /// v2.5 (graph-ranking): composite-score floor for the whole retrieval. When
     /// set above zero and the TOP direct candidate's final score is below it, the
     /// context bundle comes back empty (`skipped`) so the reader abstains instead
@@ -732,9 +921,19 @@ pub struct BrokerSection {
     /// throttle) all apply — this is additive only.
     ///
     /// Default false (OFF): the PreToolUse hook behaviour is identical to
-    /// before this flag existed. Graduating to default-on waits for regret
-    /// data (Epic S2) to confirm that file-path-augmented queries don't
-    /// increase noise. Enable per-project in project.toml once comfortable.
+    /// before this flag existed.
+    ///
+    /// v2.6: graduating to default-on has always been stated to depend on
+    /// evidence that file-path-augmented queries do not increase noise — and
+    /// nothing was recording which hook surface an injection came from, so
+    /// that evidence could not accumulate and the flag could not graduate on
+    /// any timescale. Injections now carry their surface
+    /// (`inject_policy::Surface`), and `kimetsu brain policy` reports
+    /// acceptance per surface, so the prefetch surface can be compared against
+    /// the ones that react to something observed rather than predicted. The
+    /// default stays off until that comparison is made on a real brain; the
+    /// point of this change is that it is now makeable. Enable per-project in
+    /// project.toml meanwhile.
     ///
     /// `#[serde(default)]` keeps all pre-F3 project.toml files loading with
     /// the feature OFF (zero behaviour change for existing users).
@@ -748,6 +947,14 @@ fn default_max_capsules() -> usize {
 
 fn default_min_semantic_score() -> f32 {
     -1.0
+}
+
+fn default_fusion() -> String {
+    "linear".to_string()
+}
+
+fn default_normalization() -> String {
+    "per_kind".to_string()
 }
 
 fn default_min_lexical_coverage() -> f32 {
@@ -786,6 +993,8 @@ impl Default for BrokerSection {
             max_capsules: default_max_capsules(),
             min_semantic_score: default_min_semantic_score(),
             min_lexical_coverage: default_min_lexical_coverage(),
+            fusion: default_fusion(),
+            normalization: default_normalization(),
             abstain_min_score: default_abstain_min_score(),
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
@@ -1069,7 +1278,7 @@ pub struct SyncSection {
     /// set; the CLI generates one on first use).
     #[serde(default)]
     pub machine_id: String,
-    /// v3.0 #3 Slice B: when `dir` is configured, automatically run a full sync
+    /// v2.6 #3 Slice B: when `dir` is configured, automatically run a full sync
     /// (push + pull + converge) at session end. Defaults to `true` — set
     /// `auto = false` to keep sync manual (`kimetsu brain sync`).
     #[serde(default = "default_sync_auto")]
@@ -1180,6 +1389,117 @@ impl Default for LifecycleSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── v2.6: Free/Deep tier resolution ──────────────────────────────────
+    //
+    // These deliberately do not touch KIMETSU_TIER: env is process-global and
+    // the suite runs in parallel by default. The env branch is a one-line
+    // `parse().ok().or(field)`; the interesting logic is the field × model
+    // matrix below.
+
+    fn enabled_cheap_model() -> CheapModelSection {
+        CheapModelSection {
+            enabled: true,
+            ..CheapModelSection::default()
+        }
+    }
+
+    /// A brand-new project with no model configured is Free, which is what the
+    /// "zero LLM calls in the memory pipeline" claim is measured on.
+    #[test]
+    fn tier_defaults_to_free_without_a_model() {
+        let config = ProjectConfig::default_for_project("test");
+        assert_eq!(config.tier(), Tier::Free);
+        assert!(!config.tier_downgraded());
+    }
+
+    /// Auto: a brain with a cheap model configured is already making model
+    /// calls. Reporting that as Free would be a lie, so it resolves to Deep
+    /// without anyone having to edit project.toml — which is also what keeps
+    /// every pre-v2.6 config behaving exactly as it did.
+    #[test]
+    fn tier_auto_resolves_to_deep_when_a_model_is_configured() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.cheap_model = Some(enabled_cheap_model());
+        assert_eq!(config.tier_requested(), None, "field left at auto");
+        assert_eq!(config.tier(), Tier::Deep);
+    }
+
+    /// Back-compat: an enabled `[learning.distiller]` is a cheap model by the
+    /// existing resolver, so it lights up Deep the same way.
+    #[test]
+    fn tier_auto_follows_the_legacy_distiller_alias() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.learning.distiller.enabled = true;
+        assert_eq!(config.tier(), Tier::Deep);
+    }
+
+    /// `tier = "free"` is a durable opt-out: credentials present, model calls
+    /// off. Without this the only way to stop the distiller would be to remove
+    /// the credentials.
+    #[test]
+    fn explicit_free_overrides_a_configured_model() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.cheap_model = Some(enabled_cheap_model());
+        config.kimetsu.tier = Some(Tier::Free);
+        assert_eq!(config.tier(), Tier::Free);
+        assert!(!config.allows_model_in_pipeline());
+    }
+
+    /// Deep with nothing to run on is Free with a misleading label. Resolve it
+    /// down, and flag it so `doctor` can say so out loud.
+    #[test]
+    fn deep_without_a_model_downgrades_and_is_flagged() {
+        let mut config = ProjectConfig::default_for_project("test");
+        config.kimetsu.tier = Some(Tier::Deep);
+        assert_eq!(config.tier(), Tier::Free, "no model — nothing to run");
+        assert!(
+            config.tier_downgraded(),
+            "the discrepancy must be reportable, not silent"
+        );
+    }
+
+    /// The tier round-trips through TOML, and an absent field stays absent
+    /// (auto) rather than being written back as an explicit choice.
+    #[test]
+    fn tier_round_trips_and_auto_stays_unwritten() {
+        let config = ProjectConfig::default_for_project("test");
+        let toml = config.to_toml().expect("to_toml");
+        assert!(
+            !toml.contains("tier"),
+            "auto must not serialize a tier field; got:\n{toml}"
+        );
+
+        let mut deep = ProjectConfig::default_for_project("test");
+        deep.kimetsu.tier = Some(Tier::Deep);
+        let toml = deep.to_toml().expect("to_toml");
+        assert!(toml.contains("tier = \"deep\""), "got:\n{toml}");
+        let parsed = ProjectConfig::from_toml(&toml).expect("from_toml");
+        assert_eq!(parsed.kimetsu.tier, Some(Tier::Deep));
+    }
+
+    /// A pre-v2.6 project.toml has no `tier` field at all: it must load, and
+    /// it must land on Free rather than on a serde error.
+    #[test]
+    fn missing_tier_field_loads_cleanly() {
+        let mut written = ProjectConfig::default_for_project("legacy");
+        written.kimetsu.tier = Some(Tier::Deep);
+        let toml = written.to_toml().expect("to_toml");
+        // Strip the tier line to simulate a config written before the field existed.
+        let legacy: String = toml
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("tier ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !legacy.contains("tier ="),
+            "fixture must have no tier field"
+        );
+
+        let config = ProjectConfig::from_toml(&legacy).expect("legacy config must load");
+        assert_eq!(config.kimetsu.tier, None);
+        assert_eq!(config.tier(), Tier::Free);
+    }
 
     /// A pre-v0.8 project.toml has no `[embedder]` table. The
     /// `#[serde(default)]` on the field must keep it loading cleanly,
@@ -1314,11 +1634,13 @@ max_total_cost_usd = 250.0
             config.broker.warm_start,
             "broker.warm_start must default to true"
         );
-        // S5.1: a pre-S5 project.toml without [storage] must load cleanly
-        // and default to backend = "flat" (the existing FTS + ANN path).
+        // S5.1: a pre-S5 project.toml without [storage] must load cleanly.
+        // v2.6 flipped the default from "flat" to "graph-lite" — the config
+        // the published benchmark numbers were measured on, and safe because
+        // graph-lite's candidate set is a superset of flat's.
         assert_eq!(
-            config.storage.backend, "flat",
-            "storage.backend must default to \"flat\" when absent"
+            config.storage.backend, "graph-lite",
+            "storage.backend must default to \"graph-lite\" when absent"
         );
         // F3 Pass B (3.3): a pre-F3 project.toml without broker.answer_grade_min_score
         // must load cleanly and receive the conservative default (0.92).
@@ -1836,13 +2158,17 @@ max_total_cost_usd = 250.0
         }
     }
 
-    /// S5.1-b: `default_for_project` uses `backend = "flat"`.
+    /// v2.6: `default_for_project` uses `backend = "graph-lite"`.
+    ///
+    /// Guards the thing that made the old default wrong: the published BEAM
+    /// 100K figure was measured on graph-lite (73.3%) while `flat` — what
+    /// users actually got — scored 62.3% on the same set.
     #[test]
-    fn s5_1_default_for_project_uses_flat_backend() {
+    fn default_for_project_uses_the_benchmarked_backend() {
         let config = ProjectConfig::default_for_project("demo");
         assert_eq!(
-            config.storage.backend, "flat",
-            "default project config must use flat backend"
+            config.storage.backend, "graph-lite",
+            "default project config must use the backend the benchmarks measure"
         );
     }
 

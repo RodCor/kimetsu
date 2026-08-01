@@ -84,7 +84,7 @@ pub struct Event {
     /// across rebuild and sync replication.
     #[serde(default)]
     pub origin: Option<String>,
-    /// v3.0 #3 Slice B: Hybrid Logical Clock timestamp (canonical string) giving
+    /// v2.6 #3 Slice B: Hybrid Logical Clock timestamp (canonical string) giving
     /// a globally-deterministic, causal total order for convergent team sync.
     /// `None` for events created before HLC tracking (schema < v9); the v9
     /// migration backfills those from `(ts, rowid)`. Auto-stamped by

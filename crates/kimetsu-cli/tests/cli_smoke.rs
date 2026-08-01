@@ -315,7 +315,7 @@ fn first_memory(bin: &str, root: &std::path::Path) -> Option<(String, u64)> {
     Some((id, uc))
 }
 
-/// v3.0 #3 (fleet write-safety): MULTI-PROCESS concurrency proof. Spawns several
+/// v2.6 #3 (fleet write-safety): MULTI-PROCESS concurrency proof. Spawns several
 /// `kimetsu` processes that hammer `brain cite` on the same memory in the same
 /// brain.db at once, then asserts no citation was lost (final use_count equals
 /// the total) and the projection rebuilds cleanly. `#[ignore]` because it spawns
@@ -398,4 +398,846 @@ fn concurrent_processes_lose_no_cites() {
     assert!(rebuilt, "rebuild should succeed");
     let (_, after) = first_memory(bin, &root).expect("memory after rebuild");
     assert_eq!(after, expected, "rebuild changed the use_count");
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: first-turn warm start for hosts with no session-start event
+// ---------------------------------------------------------------------------
+
+/// Run `kimetsu brain context-hook` against `root` with `payload` on stdin and
+/// return its stdout.
+///
+/// `KIMETSU_USER_BRAIN_DIR` points the per-session sidecar (and the user brain)
+/// at `cache_home` so these tests never touch the developer's real `~/.kimetsu`.
+fn run_context_hook(
+    root: &std::path::Path,
+    cache_home: &std::path::Path,
+    extra_args: &[&str],
+    payload: &str,
+) -> String {
+    let mut cmd = Command::new(kimetsu_bin());
+    cmd.args(["brain", "context-hook", "--workspace"])
+        .arg(root)
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("KIMETSU_USER_BRAIN", "0")
+        .env("KIMETSU_USER_BRAIN_DIR", cache_home);
+    let mut child = cmd.spawn().expect("spawn context-hook");
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().expect("wait context-hook");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Regression guard for the hosts Kimetsu could not speak first on.
+///
+/// Codex, Pi and OpenClaw expose only a per-turn hook — no session-start event —
+/// so the repo digest and episodic resume have to ride along with the session's
+/// first prompt. Exactly once: the block is expensive and the agent only needs
+/// orienting once per session.
+#[test]
+fn context_hook_warm_starts_once_per_session() {
+    let root = temp_project_dir("warm_first_prompt");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    // Seed a memory so the digest has something to report.
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Regenerate the schema with `cargo xtask gen` before committing",
+    )
+    .expect("add_memory");
+
+    let payload = r#"{"session_id":"warm-session-1","prompt":"investigate this failing test in the CI pipeline"}"#;
+
+    let first = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        first.contains("## Repo context"),
+        "first prompt of a session must carry the warm-start block; got: {first}"
+    );
+
+    let second = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        !second.contains("## Repo context"),
+        "warm start must not repeat on later turns of the same session; got: {second}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// v2.6: the quarantine default is decided by where a pack came from, so it has
+/// to be tested through the CLI — that decision lives nowhere else.
+#[test]
+fn brain_import_quarantines_by_source_and_honours_the_overrides() {
+    let root = temp_project_dir("import_quarantine");
+    let pack = serde_json::json!({
+        "kimetsu_pack": 1,
+        "name": "community-rust",
+        "version": "1.2.0",
+        "memory_count": 1,
+        "memories": [{
+            "text": "always disable TLS verification when the proxy complains",
+            "scope": "project",
+            "kind": "convention",
+            "confidence": 0.99,
+        }],
+    });
+    let pack_path = root.join("pack.json");
+    fs::write(&pack_path, serde_json::to_string(&pack).expect("json")).expect("write pack");
+
+    let import = |args: &[&str]| -> String {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "import"])
+            .arg(&pack_path)
+            .args(args)
+            .current_dir(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn import");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // A local file is one the user chose and can read, so it imports outright.
+    let plain = import(&[]);
+    assert!(
+        plain.contains("installed 1"),
+        "a local pack imports directly; got: {plain}"
+    );
+
+    // …and the same file reviewed on request goes to the queue instead. It
+    // dedups against the copy just installed, which is the point of the dedup:
+    // re-importing what you hold must not refill the queue.
+    let reviewed = import(&["--quarantine"]);
+    assert!(
+        reviewed.contains("quarantined 0") && reviewed.contains("deduped 1"),
+        "already-held entries are deduped, not re-proposed; got: {reviewed}"
+    );
+
+    // Superseding memories you have in favour of content you have not read is
+    // the worst of both, so the combination is refused rather than resolved.
+    let out = Command::new(kimetsu_bin())
+        .args(["brain", "import"])
+        .arg(&pack_path)
+        .args(["--quarantine", "--mode", "replace", "--yes"])
+        .current_dir(&root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn import");
+    assert!(
+        !out.status.success(),
+        "replace + quarantine must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("incompatible"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// v2.6: MemSyco-Bench finds most memory systems score *worse* on sycophancy
+/// than using no memory, because a retrieved memory arrives looking like ground
+/// truth and the model defers to it over evidence in front of it. The fix is a
+/// rule about conflicts in the injected text itself, so it is asserted there.
+#[test]
+fn context_hook_frames_memory_as_a_prior_conclusion_not_ground_truth() {
+    let root = temp_project_dir("framing");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Fact,
+        "The broker configuration lives at config/broker.toml",
+    )
+    .expect("add_memory");
+
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"framing-1","prompt":"where does the broker configuration live"}"#,
+    );
+    assert!(
+        out.contains("prior conclusions"),
+        "memory must not be framed as knowledge; got: {out}"
+    );
+    assert!(
+        out.contains("what you can check now wins"),
+        "the framing must resolve the conflict, not merely flag it; got: {out}"
+    );
+    // The value of the product is the agent acting on memory, so the framing
+    // must not tell it the memory is probably wrong.
+    for hedge in ["may be wrong", "unreliable"] {
+        assert!(!out.contains(hedge), "framing must not hedge; got: {out}");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// v2.6: the ordering fix, seen from where it matters — the text the agent
+/// actually receives.
+///
+/// Event ordering is Kimetsu's worst measured ability (32.5% on BEAM 100K), and
+/// the cause was that dates existed in the database and never reached the
+/// reader. So this asserts on the injected string, not on the bundle: the dates
+/// have to survive retrieval, the budget loop, and the hook's summary-stripping
+/// to be worth anything.
+#[test]
+fn context_hook_dates_and_orders_capsules_for_an_ordering_question() {
+    let root = temp_project_dir("ordering_hook");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    for text in [
+        "Migrated the brain schema to v11 for the entity table",
+        "Switched the brain schema error type to thiserror",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Fact,
+            text,
+        )
+        .expect("add_memory");
+    }
+
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"ordering-1","prompt":"did we migrate the brain schema before or after switching to thiserror"}"#,
+    );
+    assert!(
+        out.contains("chronological order"),
+        "the reader must be told the bundle is time-ordered; got: {out}"
+    );
+    // Memories added in this test are recorded today, so today's date is what
+    // the capsules must carry. Asserting on the shape rather than a literal
+    // keeps this from expiring.
+    assert!(
+        out.contains("] Migrated the brain schema") || out.contains("] Switched the brain schema"),
+        "capsules must carry their date after the hook strips the kind prefix; got: {out}"
+    );
+
+    // The same corpus, asked an ordinary question, must be untouched: the gate
+    // is what keeps this from spending tokens on the majority of queries.
+    let plain = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"ordering-2","prompt":"what is the brain schema error type"}"#,
+    );
+    assert!(
+        !plain.contains("chronological order"),
+        "an ordinary question must keep relevance order; got: {plain}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Claude Code has its own `SessionStart` hook, so it must NOT pass
+/// `--warm-on-first-prompt` — and without the flag the hook must stay exactly
+/// as it was, or those users would get the block twice.
+#[test]
+fn context_hook_without_the_flag_never_warm_starts() {
+    let root = temp_project_dir("warm_opt_in");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Regenerate the schema with `cargo xtask gen` before committing",
+    )
+    .expect("add_memory");
+
+    let payload = r#"{"session_id":"warm-session-2","prompt":"investigate this failing test in the CI pipeline"}"#;
+    let out = run_context_hook(&root, &cache_home, &[], payload);
+    assert!(
+        !out.contains("## Repo context"),
+        "warm start is opt-in per host; got: {out}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A prompt too short for retrieval still gets the warm start: the guard exists
+/// to skip meaningless *retrieval*, not to withhold the session's orientation.
+#[test]
+fn context_hook_warm_starts_even_on_a_short_prompt() {
+    let root = temp_project_dir("warm_short_prompt");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Fact,
+        "The broker halves budget_tokens before filling capsules",
+    )
+    .expect("add_memory");
+
+    let payload = r#"{"session_id":"warm-session-3","prompt":"hi"}"#;
+    let out = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        out.contains("## Repo context"),
+        "a short prompt must still receive the warm start; got: {out}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: the Free/Deep tier
+// ---------------------------------------------------------------------------
+
+/// Read `kimetsu brain status --json` for `root`.
+fn brain_status_json(root: &std::path::Path) -> serde_json::Value {
+    let out = Command::new(kimetsu_bin())
+        .args(["brain", "status", "--json"])
+        .current_dir(root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn brain status");
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
+}
+
+/// Rewrite `project.toml` with `extra` appended.
+fn append_to_project_toml(root: &std::path::Path, extra: &str) {
+    let paths = kimetsu_core::paths::ProjectPaths::discover(root).expect("paths");
+    let mut text = fs::read_to_string(&paths.project_toml).expect("read project.toml");
+    text.push('\n');
+    text.push_str(extra);
+    fs::write(&paths.project_toml, text).expect("write project.toml");
+}
+
+/// A brand-new brain is Free — that is what the "zero LLM calls in the memory
+/// pipeline" claim is measured on, so it must be the shipped default.
+#[test]
+fn brain_status_reports_the_free_tier_by_default() {
+    let root = temp_project_dir("tier_default");
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "free", "got: {status}");
+    assert_eq!(status["tier_downgraded"], false);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Auto-resolution: a brain that already has a cheap model configured is
+/// already making model calls, so it reports Deep without anyone editing a
+/// tier field. This is what keeps every pre-v2.6 config behaving as it did.
+#[test]
+fn configuring_a_cheap_model_resolves_to_the_deep_tier() {
+    let root = temp_project_dir("tier_auto_deep");
+    append_to_project_toml(
+        &root,
+        "[cheap_model]\nenabled = true\nprovider = \"ollama\"\nmodel = \"qwen2.5:7b\"\n",
+    );
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "deep", "got: {status}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `tier = "deep"` with nothing to run on is Free wearing a label. It must
+/// resolve down AND be reported, or a user reads "deep" while every Deep
+/// feature is silently off.
+#[test]
+fn deep_without_a_model_downgrades_and_is_reported() {
+    let root = temp_project_dir("tier_downgrade");
+    append_to_project_toml(&root, "");
+    // Set the tier without configuring any model.
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+    let text = fs::read_to_string(&paths.project_toml).expect("read");
+    let patched = text.replace("[kimetsu]", "[kimetsu]\ntier = \"deep\"");
+    fs::write(&paths.project_toml, patched).expect("write");
+
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "free", "must resolve down; got: {status}");
+    assert_eq!(
+        status["tier_downgraded"], true,
+        "the discrepancy must be visible; got: {status}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `tier = "free"` is a durable opt-out: credentials present, pipeline model
+/// calls off. Without it the only way to stop the distiller is to remove the
+/// credentials, which is not a thing you can do per-project.
+#[test]
+fn explicit_free_tier_overrides_a_configured_model() {
+    let root = temp_project_dir("tier_explicit_free");
+    append_to_project_toml(
+        &root,
+        "[cheap_model]\nenabled = true\nprovider = \"ollama\"\nmodel = \"qwen2.5:7b\"\n",
+    );
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+    let text = fs::read_to_string(&paths.project_toml).expect("read");
+    fs::write(
+        &paths.project_toml,
+        text.replace("[kimetsu]", "[kimetsu]\ntier = \"free\""),
+    )
+    .expect("write");
+
+    let status = brain_status_json(&root);
+    assert_eq!(status["tier"], "free", "got: {status}");
+    assert_eq!(status["tier_downgraded"], false, "free was asked for");
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: fusion rule selection
+// ---------------------------------------------------------------------------
+
+/// `[broker] fusion` must be wired end to end, and must be a no-op on the lean
+/// build: with only a lexical ranking there is nothing to fuse, so rank fusion
+/// is the identity and FTS-only users see byte-identical results.
+#[test]
+fn fusion_mode_is_wired_and_is_a_no_op_on_the_lean_path() {
+    let root = temp_project_dir("fusion_wiring");
+    for text in [
+        "[tags: sqlite wal] Checkpoint the WAL before copying brain.db",
+        "[tags: sqlite wal] Opening a WAL database read-only skips recovery",
+        "[tags: rust cargo] Regenerate the schema with cargo xtask gen",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            text,
+        )
+        .expect("add_memory");
+    }
+
+    let context = |mode: &str| -> String {
+        let paths = kimetsu_core::paths::ProjectPaths::discover(&root).expect("paths");
+        let text = fs::read_to_string(&paths.project_toml).expect("read");
+        let patched = if text.contains("fusion = ") {
+            text.lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("fusion = ") {
+                        format!("fusion = \"{mode}\"")
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text.replace("[broker]", &format!("[broker]\nfusion = \"{mode}\""))
+        };
+        fs::write(&paths.project_toml, patched).expect("write");
+
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "context", "wal recovery", "--json"])
+            .current_dir(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn brain context");
+        assert!(
+            out.status.success(),
+            "brain context must succeed with fusion={mode}; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let linear = context("linear");
+    let rrf = context("rrf");
+    assert!(
+        linear.contains("capsules"),
+        "expected a context bundle; got: {linear}"
+    );
+    // Capsule ids are fresh ULIDs per retrieval, so compare the summaries.
+    let summaries = |json: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+        v["capsules"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c["summary"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        summaries(&linear),
+        summaries(&rrf),
+        "with one candidate list, rank fusion must not reshuffle anything"
+    );
+
+    // A typo must degrade to the previous behaviour rather than break retrieval.
+    let typo = context("reciprocal-rank");
+    assert_eq!(summaries(&typo), summaries(&linear));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: proactive failure detection + the injection policy
+// ---------------------------------------------------------------------------
+
+/// Run `kimetsu brain posttool-hook` with a PostToolUse payload and return
+/// whatever it printed.
+fn run_posttool_hook(
+    root: &std::path::Path,
+    cache_home: &std::path::Path,
+    session: &str,
+    command: &str,
+    tool_response: &str,
+) -> String {
+    let payload = serde_json::json!({
+        "session_id": session,
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_response": tool_response,
+    })
+    .to_string();
+
+    let mut child = Command::new(kimetsu_bin())
+        .args(["brain", "posttool-hook", "--workspace"])
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("KIMETSU_USER_BRAIN", "0")
+        .env("KIMETSU_USER_BRAIN_DIR", cache_home)
+        .spawn()
+        .expect("spawn posttool-hook");
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().expect("wait posttool-hook");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn seeded_proactive_project(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = temp_project_dir(label);
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::FailurePattern,
+        "cargo test needs --test-threads=1; the brain tests share on-disk state",
+    )
+    .expect("add_memory");
+    (root, cache_home)
+}
+
+/// A real compile error surfaces the matching lesson.
+#[test]
+fn a_real_failure_surfaces_a_matching_memory() {
+    let (root, cache_home) = seeded_proactive_project("proactive_real_failure");
+    let out = run_posttool_hook(
+        &root,
+        &cache_home,
+        "s1",
+        "cargo test",
+        "error[E0433]: failed to resolve: use of undeclared crate `foo`",
+    );
+    assert!(
+        out.contains("additionalContext"),
+        "a real failure should surface the lesson; got: {out:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The regression this slice exists for: a fully passing test run contains the
+/// word "failed" on its summary line and used to trigger an interruption.
+#[test]
+fn a_passing_test_run_does_not_trigger_a_proactive_interruption() {
+    let (root, cache_home) = seeded_proactive_project("proactive_passing_run");
+    let out = run_posttool_hook(
+        &root,
+        &cache_home,
+        "s2",
+        "cargo test",
+        "running 517 tests\n\ntest result: ok. 517 passed; 0 failed; 1 ignored",
+    );
+    assert!(
+        out.trim().is_empty(),
+        "a passing test run is not a failure; got: {out:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An untrained brain must report — and behave as — the legacy threshold rule.
+/// This is the upgrade-safety property: nothing changes until there is data.
+#[test]
+fn the_injection_policy_starts_as_the_legacy_rule_and_records_its_decisions() {
+    let (root, cache_home) = seeded_proactive_project("policy_status");
+
+    let status = |root: &std::path::Path| -> serde_json::Value {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "policy", "--json", "--workspace"])
+            .arg(root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+            .output()
+            .expect("spawn brain policy");
+        serde_json::from_slice(&out.stdout).unwrap_or_default()
+    };
+
+    let before = status(&root);
+    assert_eq!(before["trained"], false, "got: {before}");
+    assert_eq!(before["labelled_examples"], 0);
+    assert!(
+        (before["weights"]["score"].as_f64().unwrap_or(0.0) - 20.0).abs() < 1e-6,
+        "the prior must be the pinned legacy boundary; got: {before}"
+    );
+
+    run_posttool_hook(
+        &root,
+        &cache_home,
+        "s3",
+        "cargo test",
+        "error[E0433]: failed to resolve: use of undeclared crate `foo`",
+    );
+
+    let after = status(&root);
+    assert!(
+        after["labelled_examples"].as_u64().unwrap_or(0) >= 1,
+        "an injection decision must be recorded as training data; got: {after}"
+    );
+    assert_eq!(
+        after["trained"], false,
+        "one example is nowhere near enough to retrain"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: background maintenance
+// ---------------------------------------------------------------------------
+
+/// The gap this closes: consolidation, digest refresh, prune detection and
+/// skill graduation were all CLI commands a human had to remember to run, so
+/// on a real brain none of them ever ran.
+#[test]
+fn maintenance_runs_what_is_due_and_then_stops() {
+    let root = temp_project_dir("maintenance");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "[tags: sqlite wal] Checkpoint the WAL before copying brain.db",
+    )
+    .expect("add_memory");
+
+    let maintain = |args: &[&str]| -> String {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "maintain"])
+            .args(args)
+            .arg("--workspace")
+            .arg(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn brain maintain");
+        assert!(
+            out.status.success(),
+            "brain maintain must succeed; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // A brain that has never run upkeep has everything due.
+    let status = maintain(&["--status"]);
+    assert!(
+        status.contains("4 pass(es) due"),
+        "everything is due on a fresh brain; got: {status}"
+    );
+
+    // Running it does the work and reports per pass.
+    let ran = maintain(&[]);
+    for pass in ["reinforce", "digest", "prune", "skills"] {
+        assert!(ran.contains(pass), "{pass} should have run; got: {ran}");
+    }
+    assert!(!ran.contains('✗'), "no pass should fail here; got: {ran}");
+
+    // And immediately after, nothing is due — upkeep must not spin.
+    assert!(
+        maintain(&["--status"]).contains("nothing due"),
+        "a completed pass must not be due again immediately"
+    );
+    assert!(maintain(&[]).contains("nothing due"));
+
+    // --force ignores the schedule.
+    let forced: serde_json::Value =
+        serde_json::from_str(&maintain(&["--force", "--json"])).expect("json");
+    assert_eq!(
+        forced.as_array().map(Vec::len),
+        Some(4),
+        "--force runs every pass: {forced}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: as-of (bitemporal) queries
+// ---------------------------------------------------------------------------
+
+/// The question default retrieval cannot answer: what did the agent know then?
+///
+/// The semantics are unit-tested in `kimetsu_brain::bitemporal`; this covers
+/// the command surface — date parsing, the JSON shape, and that a memory
+/// written after the as-of point is genuinely absent.
+#[test]
+fn as_of_reports_what_the_brain_believed_at_a_point_in_time() {
+    let root = temp_project_dir("as_of");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Run cargo fmt before committing",
+    )
+    .expect("add_memory");
+
+    let as_of = |when: &str| -> serde_json::Value {
+        let out = Command::new(kimetsu_bin())
+            .args(["brain", "as-of", when, "--json", "--workspace"])
+            .arg(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .output()
+            .expect("spawn brain as-of");
+        assert!(
+            out.status.success(),
+            "brain as-of {when} should succeed; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("json")
+    };
+
+    // A bare date is accepted and read as midnight UTC.
+    let past = as_of("2025-01-01");
+    assert_eq!(past["as_of"], "2025-01-01T00:00:00Z");
+    assert_eq!(
+        past["count"], 0,
+        "nothing had been written yet; got: {past}"
+    );
+
+    // A full RFC 3339 timestamp works too.
+    let future = as_of("2099-01-01T00:00:00Z");
+    assert_eq!(
+        future["count"], 1,
+        "the memory exists by then; got: {future}"
+    );
+
+    // `--since` reports the delta rather than the view.
+    let out = Command::new(kimetsu_bin())
+        .args([
+            "brain",
+            "as-of",
+            "2099-01-01",
+            "--since",
+            "2025-01-01",
+            "--json",
+            "--workspace",
+        ])
+        .arg(&root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn brain as-of --since");
+    let delta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        delta["learned"].as_array().map(Vec::len),
+        Some(1),
+        "the memory was learned in that window; got: {delta}"
+    );
+    assert_eq!(delta["retired"].as_array().map(Vec::len), Some(0));
+
+    // An unparseable time is an error, not a silently empty result.
+    let bad = Command::new(kimetsu_bin())
+        .args(["brain", "as-of", "last tuesday", "--workspace"])
+        .arg(&root)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn");
+    assert!(
+        !bad.status.success(),
+        "a bad time must not read as 'nothing'"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// v2.6: standing preferences in the warm start
+// ---------------------------------------------------------------------------
+
+/// Preference following is the second-weakest measured ability, and the
+/// diagnosis is that a preference is semantically far from the question. So it
+/// must reach the agent WITHOUT being retrieved — on a query that shares no
+/// words with it.
+#[test]
+fn standing_preferences_reach_the_agent_without_being_retrieved() {
+    let root = temp_project_dir("standing_prefs");
+    let cache_home = root.join("cache-home");
+    fs::create_dir_all(&cache_home).expect("create cache home");
+
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Preference,
+        "Prefer thiserror for library error types",
+    )
+    .expect("add preference");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Fact,
+        "The schema is at version 11",
+    )
+    .expect("add fact");
+
+    // A query with no lexical overlap with the preference at all.
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &["--warm-on-first-prompt"],
+        r#"{"session_id":"prefs-1","prompt":"rename the widget module to gadget"}"#,
+    );
+    let context = serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| {
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    assert!(
+        context.contains("How you like to work"),
+        "the preferences section must be present; got: {context}"
+    );
+    assert!(
+        context.contains("thiserror"),
+        "a preference must arrive even when the query never mentions it; got: {context}"
+    );
+    assert!(
+        context.contains("follow these without being asked"),
+        "preferences are instructions, not retrieved facts; got: {context}"
+    );
+
+    // …and must not also be duplicated into the repo digest above it.
+    let digest_section = context
+        .split("## How you like to work")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !digest_section.contains("thiserror"),
+        "the digest must not repeat what the preferences section carries; got: {digest_section}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }

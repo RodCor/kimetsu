@@ -89,7 +89,7 @@ pub fn redact_secrets(text: &str) -> RedactionResult {
     merge_and_redact(text, collect_spans(text, patterns()))
 }
 
-/// v3.0 #4 (knowledge packs): scrub credentials AND PII (email / phone / SSN /
+/// v2.6 #4 (knowledge packs): scrub credentials AND PII (email / phone / SSN /
 /// credit-card) from a memory before it ships in a shareable pack. A published
 /// pack must never carry secrets or personal data. Fast (regex over the text;
 /// credit-card candidates are Luhn-gated to avoid false positives), no model.
@@ -349,7 +349,7 @@ mod tests {
         assert!(r.summary().is_empty());
     }
 
-    // v3.0 #4: scrub_for_export adds PII on top of credentials.
+    // v2.6 #4: scrub_for_export adds PII on top of credentials.
     #[test]
     fn scrub_for_export_redacts_pii_and_credentials() {
         let raw = "contact alice@example.com or 415-555-0142; ssn 123-45-6789; \
