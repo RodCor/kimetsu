@@ -7,6 +7,51 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v2.6.1: Dependency security sweep
+
+A security-only patch release. Clears every open advisory against the
+repository's dependency tree — all 15 of which were npm packages in
+`website-fumadocs`, the documentation site.
+
+**No changes to the shipped CLI, brain, or remote server.** The Rust crate
+sources are byte-identical to v2.6.0; the workspace version moves only so the
+release carries a single coherent number. Nothing in `kimetsu-ai`,
+`kimetsu-remote`, or the published crates was reachable from any of these
+advisories — neither npm package has third-party runtime dependencies (both
+declare only `optionalDependencies` on their own platform binaries), and
+`cargo audit` reports zero vulnerabilities against the Rust tree before and
+after.
+
+### Security
+
+Docs-site dependencies moved to patched versions (`website-fumadocs`):
+
+- `next` 16.2.9 → 16.2.11 — clears nine advisories (GHSA-6gpp-xcg3-4w24,
+  GHSA-p9j2-gv94-2wf4, GHSA-89xv-2m56-2m9x, GHSA-m99w-x7hq-7vfj,
+  GHSA-4c39-4ccg-62r3, GHSA-68g3-v927-f742, GHSA-4633-3j49-mh5q,
+  GHSA-q8wf-6r8g-63ch, GHSA-955p-x3mx-jcvp).
+- `postcss` 8.5.16 → 8.5.25 (GHSA-r28c-9q8g-f849).
+- `sharp` 0.34.5 → 0.35.3 (GHSA-f88m-g3jw-g9cj), transitive via `next`.
+- `js-yaml` 5.2.0 → 5.2.3 (GHSA-pm4m-ph32-ghv5, GHSA-724g-mxrg-4qvm),
+  transitive via `fumadocs-core` / `fumadocs-mdx`.
+- `fast-uri` 3.1.3 → 3.1.5 (GHSA-v2hh-gcrm-f6hx), transitive via `serve` →
+  `ajv`.
+- `brace-expansion` 1.1.15 → 1.1.18 (GHSA-3jxr-9vmj-r5cp), transitive via
+  `serve` → `serve-handler` → `minimatch`.
+
+The four transitive bumps are pinned through `overrides` in
+`website-fumadocs/package.json`, since no direct dependency had yet released a
+manifest pointing at the patched versions. Drop each override once its parent
+ships a release that resolves above the floor on its own. Note that
+`brace-expansion` is pinned to `^1.1.16`, a 1.x-only range: today the tree
+holds exactly one instance (under `minimatch@3`), but a future dependency
+wanting 2.x or 4.x would collide with this pin.
+
+`sharp` crossing a major (0.34 → 0.35) is the one bump with real breakage
+risk, as `next` uses it for build-time image optimization. Verified by a full
+`npm run build`: 72 static pages including the `/og/docs/**/image.png`
+Open Graph routes, which are the paths that actually exercise `sharp`.
+
 ## v2.6.0: Speak first on every host
 
 The README says Kimetsu "speaks first." An audit found that true on Claude Code,
