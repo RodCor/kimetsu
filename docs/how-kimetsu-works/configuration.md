@@ -7,6 +7,7 @@ Project config lives in `<project>/project.toml`:
 project_id = "my-project"
 schema_version = 1            # config-format version, NOT the brain.db schema
 use_user_brain = true         # false: per-project opt-out of the global brain
+# tier = "free"               # omit for auto; see "Free and Deep" below
 
 [model]
 provider = "anthropic"        # or "claude_code", "openai", "bedrock"
@@ -26,6 +27,8 @@ default_budget_tokens = 6000  # flat fallback; the adaptive budget supersedes it
 ambient = true                # false: no workspace context appended to queries
 max_capsules = 8              # hard cap on capsules per prompt
 min_semantic_score = -1.0     # AUTO (bge: 0.35, others: off); >0 sets a floor
+fusion = "linear"             # "linear" | "rrf" — how the lexical and semantic
+                              # rankings are merged; swept by `brain tune`
 budget_floor_tokens = 1500    # small tasks are never starved
 budget_run_cap_tokens = 8000  # per-run ceiling on injected tokens
 compress_capsules = true      # strip tags, cap at 3 sentences; ranking unaffected
@@ -35,7 +38,7 @@ answer_grade_min_score = 0.92 # top capsule >= this gets a "Verified answer" pre
 proactive_prefetch = false    # opt-in trajectory-based pre-fetch at PreToolUse
 
 [storage]
-backend = "flat"              # "flat" | "graph-lite" | "graph" (remote only).
+backend = "graph-lite"        # "flat" | "graph-lite" | "graph" (remote only).
                               # Switching re-projects from the event log.
 
 [cheap_model]                 # one optional model for digest / resume / ask /
@@ -89,6 +92,39 @@ base_url_env = "ANTHROPIC_BASE_URL"
 The agent model and the distiller are configured independently: the agent can
 run on AWS Bedrock while the harvester stays on direct Claude or OpenAI.
 
+## Free and Deep
+
+`[kimetsu] tier` picks which of two pipelines the brain runs.
+
+**Free** is the default and what the published benchmarks measure: **zero LLM
+calls anywhere in the memory pipeline.** Ingest, store, retrieve and rerank are
+FTS5 + local embeddings + a local cross-encoder, and every capability has a
+deterministic or statistical implementation.
+
+**Deep** adds a local small model to the handful of features that are genuinely
+better with one. Every Deep feature falls back to the Free behaviour, so
+switching tiers can add quality but never removes a capability:
+
+| Feature | Free | Deep |
+|---------|------|------|
+| write-time lesson capture | rule-based | model-distilled lessons |
+| repo digest | rule-based assembly | model-distilled summary |
+| reflection over memory clusters | not run | synthesized general principles |
+| contradiction detection | cosine proximity | entailment adjudication |
+| HyDE query expansion | not run | hypothetical-answer expansion |
+
+Leave `tier` unset for **auto**: a brain with a cheap model configured is
+already making model calls, so it resolves to Deep; a brain without one
+resolves to Free. That keeps every pre-v2.6 config behaving exactly as before.
+Set it explicitly to force the choice — `tier = "free"` is a durable opt-out of
+model calls even when credentials are present, and `tier = "deep"` with no
+reachable model resolves back down to Free and says so in `kimetsu doctor` and
+`kimetsu brain status`.
+
+Commands you invoke by name (`kimetsu ask`, `brain reflect`, `brain distill`,
+`brain skills --draft`) are explicit requests, not pipeline behaviour, and are
+not gated by the tier.
+
 **Off-switches.** Every optional feature can be turned off in `project.toml`,
 with precedence env override > config > default. Every field is
 `#[serde(default)]`, so a partial or older file loads cleanly and gains new
@@ -103,3 +139,4 @@ Environment overrides:
 | `KIMETSU_USER_BRAIN=0` | Disable the user brain |
 | `KIMETSU_BRAIN_EMBEDDER=noop\|bge\|jina-v2-base-code\|...` | Pick or disable the embedder |
 | `KIMETSU_BRAIN_AMBIENT=off` | Disable ambient workspace context |
+| `KIMETSU_TIER=free\|deep` | Force the product tier for this process |

@@ -8,6 +8,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use kimetsu_brain::inject_policy;
 use kimetsu_brain::project;
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::memory::{MemoryKind, MemoryScope};
@@ -54,9 +55,35 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         None => String::new(),
     };
 
-    // Too short to be meaningful
+    // v1.5 (Story 2.3): session-scoped cross-turn state, loaded here rather
+    // than just before rendering because the warm-start fallback below has to
+    // consult it ahead of every early return.
+    let state_path = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .map(|p| {
+            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
+            proactive_state::session_path(&cache_dir, session_id.as_deref())
+        });
+    let mut state = state_path
+        .as_deref()
+        .map(proactive_state::load)
+        .unwrap_or_default();
+
+    // v2.6: warm-start fallback for hosts with no session-start event (Codex,
+    // Pi, OpenClaw). Those harnesses only expose a per-turn hook, so the repo
+    // digest and episodic resume ride along with the session's first prompt
+    // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
+    // gets the identical block from `brain session-start-hook`.
+    let warm_start_block = if args.warm_on_first_prompt && state.warm_started_unix == 0 {
+        warm_start_context(&workspace)
+    } else {
+        None
+    };
+
+    // Too short for retrieval to mean anything — but a first turn still
+    // deserves its warm start, so hand that over before bailing.
     if prompt.len() < 10 {
-        return Ok(());
+        return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
     }
 
     let request = ContextRequest {
@@ -131,7 +158,9 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     }
 
     if bundle.skipped || bundle.capsules.is_empty() {
-        return Ok(()); // Nothing relevant — zero output
+        // Nothing relevant to retrieve — zero output, except that the
+        // warm-start block is not conditional on retrieval finding anything.
+        return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
     }
 
     // v1.5 / F3 Pass B: load broker render-flags best-effort.
@@ -149,21 +178,10 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             })
             .unwrap_or((true, true, 0.92));
 
-    // v1.5 (Story 2.3): session-scoped cross-turn dedupe.
-    // Load the proactive-state sidecar (already used by proactive hooks) to
-    // track which capsule handles were injected earlier this session.
-    // The context hook has session_id from the hook payload (Change B).
-    let state_path = kimetsu_core::paths::ProjectPaths::discover(&workspace)
-        .ok()
-        .map(|p| {
-            let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
-            proactive_state::session_path(&cache_dir, session_id.as_deref())
-        });
-    let mut state = state_path
-        .as_deref()
-        .map(proactive_state::load)
-        .unwrap_or_default();
-
+    // v1.5 (Story 2.3): session-scoped cross-turn dedupe, using the
+    // proactive-state sidecar loaded above (also used by the proactive hooks)
+    // to track which capsule handles were injected earlier this session.
+    //
     // Apply soft dedupe: filter already-surfaced handles, but fall back to the
     // full set if filtering would leave nothing (a repeated top memory may still
     // be the right context). Uses the pure `dedupe_filter` function.
@@ -228,7 +246,25 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             }
         });
 
-    let mut additional_context = String::from("Kimetsu brain relevant knowledge for this task:");
+    let mut additional_context = String::new();
+    // v2.6: on hosts without a session-start event, the warm-start block leads
+    // — the agent needs to know the repo before it is told what to recall.
+    if let Some(block) = &warm_start_block {
+        additional_context.push_str(block);
+        additional_context.push_str("\n\n");
+    }
+    // v2.6: memory arrives looking like ground truth unless the framing says
+    // otherwise, and MemSyco-Bench finds that deference is what makes most
+    // memory systems score worse than no memory at all. See
+    // `kimetsu_brain::framing`.
+    additional_context.push_str(kimetsu_brain::framing::CONTEXT_HEADER);
+    // v2.6: a time-ordered bundle looks like a relevance-ranked one whose
+    // ranking has gone wrong unless the reader is told. Goes above the capsules
+    // because it describes how to read them.
+    if bundle.chronological {
+        additional_context.push('\n');
+        additional_context.push_str(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE);
+    }
     for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
@@ -254,6 +290,16 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push_str(&text);
     }
 
+    // v2.6: when the bundle collectively covers only part of the question, say
+    // so and name what is missing. Without this a reader handed three capsules
+    // that touch half the query cannot tell that from three that answer it,
+    // and fills the gap by inference — which is what BEAM's abstention track
+    // measures, and where Kimetsu scores worst.
+    if let Some(notice) = kimetsu_brain::context::partial_evidence_notice(&bundle) {
+        additional_context.push('\n');
+        additional_context.push_str(&notice);
+    }
+
     print_user_prompt_submit_context(&additional_context)?;
 
     // v1.5 (Story 2.3): persist newly surfaced handles so subsequent prompts
@@ -265,11 +311,39 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
                 state.mark_surfaced(&capsule.expansion_handle);
             }
         }
+    }
+    if warm_start_block.is_some() {
+        state.warm_started_unix = proactive_state::now_unix();
+    }
+    if session_dedupe || warm_start_block.is_some() {
         if let Some(ref path) = state_path {
             proactive_state::save(path, &state);
         }
     }
 
+    Ok(())
+}
+
+/// Emit a warm-start-only injection and mark the session warmed.
+///
+/// Used by [`brain_context_hook`]'s early returns: a short prompt, or a
+/// retrieval that found nothing, must not swallow the first-turn warm start on
+/// hosts that have no session-start event. A `None` block (not a first turn, or
+/// the host has its own session-start hook) makes this a silent no-op, which is
+/// the pre-v2.6 behaviour.
+fn flush_warm_start(
+    block: Option<String>,
+    state: &mut proactive_state::SessionState,
+    state_path: Option<&Path>,
+) -> KimetsuResult<()> {
+    let Some(block) = block else {
+        return Ok(());
+    };
+    print_user_prompt_submit_context(&block)?;
+    state.warm_started_unix = proactive_state::now_unix();
+    if let Some(path) = state_path {
+        proactive_state::save(path, state);
+    }
     Ok(())
 }
 
@@ -431,7 +505,7 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .and_then(|p| project::load_config(p).ok())
         .map(|c| c.learning.auto_harvest)
         .unwrap_or(true);
-    let distiller_enabled = distiller::resolve_distiller(&workspace).is_some();
+    let distiller_enabled = distiller::resolve_pipeline_distiller(&workspace).is_some();
     let state_path = paths.as_ref().map(|p| {
         let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
         proactive_state::session_path(&cache_dir, sid)
@@ -720,6 +794,9 @@ pub(crate) struct HookToolInput {
     tool_name: Option<String>,
     command: Option<String>,
     tool_response: Option<String>,
+    /// v2.6: the tool's exit code when the harness reports one. Authoritative
+    /// for failure detection — see [`crate::tool_outcome`].
+    exit_code: Option<i64>,
     /// F3 Pass B (3.5): file path from `tool_input.file_path` (ReadFile,
     /// EditFile, etc.). Absent for Bash and other non-file tools. Used by
     /// the proactive pre-fetch path when `broker.proactive_prefetch = true`
@@ -757,12 +834,23 @@ pub(crate) fn parse_hook_tool_input(raw: &str) -> HookToolInput {
         Some(serde_json::Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
     };
+    // v2.6: an exit code, when the harness reports one, settles the
+    // did-it-fail question outright. Harnesses spell it differently and may
+    // nest it under `tool_response`, so check the spellings we have seen.
+    let exit_code = ["exit_code", "exitCode", "returncode", "status"]
+        .iter()
+        .find_map(|key| {
+            v.get(key)
+                .or_else(|| v.get("tool_response").and_then(|tr| tr.get(key)))
+                .and_then(serde_json::Value::as_i64)
+        });
     HookToolInput {
         session_id: str_field("session_id"),
         tool_name: str_field("tool_name"),
         command,
         tool_response,
         tool_file_path,
+        exit_code,
     }
 }
 
@@ -838,7 +926,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
     // moment). Cue the agent (throttled) to harvest the lesson, then exit.
     if matches!(event, ProactiveEvent::PostTool) {
         let resp = hook.tool_response.as_deref().unwrap_or("");
-        if !proactive_state::looks_like_failure(resp) {
+        if !crate::tool_outcome::classify(resp, hook.exit_code).failed {
             let norm = proactive_state::normalize_command(hook.command.as_deref().unwrap_or(""));
             if auto_harvest
                 && !norm.is_empty()
@@ -872,6 +960,12 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
     // PreToolUse behaviour is identical to before this flag existed. The same
     // floors (min_score, refractory, dedupe) gate the result — this is strictly
     // additive. Default-on graduation waits for regret data (Epic S2).
+    // How strong the evidence of failure was, as a policy feature. PreToolUse
+    // is a prediction rather than an observation, so it carries none.
+    let mut evidence = 0.0f32;
+    // v2.6: which surface this injection came from, recorded so the surfaces
+    // can be judged separately. See `inject_policy::surface_acceptance`.
+    let mut surface = inject_policy::Surface::PreToolCommand;
     let (query, kinds, error_sig): (String, &[&str], Option<String>) = match event {
         ProactiveEvent::PreTool => {
             // F3 Pass B (3.5): build the PreToolUse query from command and/or
@@ -892,6 +986,12 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
             } else {
                 None
             };
+            // The file path is what makes this a *prediction* rather than a
+            // reaction, so any query it contributed to is a prefetch — that is
+            // the surface whose noise the flag's graduation turns on.
+            if fp_opt.is_some() {
+                surface = inject_policy::Surface::PreToolPrefetch;
+            }
             let query = match (cmd_opt, fp_opt) {
                 (Some(cmd), Some(fp)) => format!("{cmd} {fp}"),
                 (Some(cmd), None) => cmd.to_string(),
@@ -901,15 +1001,31 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
             (query, &["failure_pattern", "convention"], None)
         }
         ProactiveEvent::PostTool => {
+            surface = inject_policy::Surface::PostTool;
             let resp = hook.tool_response.as_deref().unwrap_or("");
-            if !proactive_state::looks_like_failure(resp) {
+            // v2.6: exit code > toolchain parser > substring scan. The old
+            // ten-word scan fired on every passing test suite, because
+            // "0 failed" contains "failed".
+            let outcome = crate::tool_outcome::classify(resp, hook.exit_code);
+            if !outcome.failed {
                 return Ok(()); // only react to failures
             }
             let cmd = hook.command.as_deref().unwrap_or("");
+            // A toolchain parser extracts the actual diagnostic, which is a far
+            // better retrieval query than the first line containing "error".
+            let query = match outcome.signature.as_deref() {
+                Some(sig) => format!("{sig} {cmd}"),
+                None => format!("{resp} {cmd}"),
+            };
+            evidence = match outcome.evidence {
+                crate::tool_outcome::Evidence::Heuristic => 0.0,
+                crate::tool_outcome::Evidence::Toolchain => 0.5,
+                crate::tool_outcome::Evidence::ExitCode => 1.0,
+            };
             (
-                format!("{resp} {cmd}"),
+                query,
                 &["failure_pattern", "command", "convention"],
-                proactive_state::error_signature(resp),
+                outcome.signature,
             )
         }
     };
@@ -927,17 +1043,22 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         return Ok(());
     }
 
-    let min_score = if loop_mode {
-        args.loop_min_score
-    } else {
-        args.min_score
-    };
+    // v2.6: retrieve down to a permissive recall floor and let the injection
+    // policy make the call, instead of hard-coding the threshold into
+    // retrieval. The floor still abstains on obvious noise, so the cheap path
+    // stays cheap; what changes is that the *decision* is now learned rather
+    // than a constant. The CLI flags remain the floor's lower bound so an
+    // operator who raises them still gets a stricter hook.
+    let recall_floor = args
+        .min_score
+        .min(args.loop_min_score)
+        .min(inject_policy::POLICY_RECALL_FLOOR);
 
     let request = ContextRequest {
         stage: "localization".to_string(),
         query,
         budget_tokens: 600,
-        min_score,
+        min_score: recall_floor,
         max_capsules: args.max_capsules.max(1),
         kinds: kinds.iter().map(|k| k.to_string()).collect(),
         ..Default::default()
@@ -962,6 +1083,47 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         return Ok(());
     };
 
+    // Is this worth interrupting for? An untrained brain answers exactly as
+    // the old fixed threshold did; a trained one has learned from which of its
+    // past injections the agent actually went on to cite.
+    let features = inject_policy::Features {
+        score: capsule.score,
+        loop_mode: if loop_mode { 1.0 } else { 0.0 },
+        is_failure_pattern: if capsule.summary.contains("failure_pattern") {
+            1.0
+        } else {
+            0.0
+        },
+        novelty: if state.injection_count() == 0 {
+            1.0
+        } else {
+            1.0 / (1.0 + state.injection_count() as f32)
+        },
+        repeat_count: (seen_count.min(5) as f32) / 5.0,
+        recovery: state.recovery_fraction(now, args.refractory_secs),
+        evidence,
+    };
+    let policy = inject_policy::load(&paths.kimetsu_dir);
+    let should_inject = policy.should_inject(&features);
+
+    // Record the decision either way: a suppressed injection is as much a
+    // training sample as one that fired, provided it is labelled as such.
+    inject_policy::record_injection(
+        &workspace,
+        capsule
+            .expansion_handle
+            .strip_prefix("memory:")
+            .unwrap_or(&capsule.expansion_handle),
+        &features,
+        should_inject,
+        surface,
+    );
+
+    if !should_inject {
+        proactive_state::save(&state_path, &state);
+        return Ok(());
+    }
+
     // v1.5 (Story 2.1): render-time compression for the proactive hook.
     // Runs AFTER retrieval — ranking and stored text are unaffected.
     let rendered: String = if compress_capsules {
@@ -975,7 +1137,13 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         .map(str::to_string)
         .unwrap_or(rendered);
     let header = proactive_header(event, loop_mode);
-    let additional_context = format!("{header}\n{body}");
+    // The suffix rather than a second line: this hook interrupts work already
+    // underway on a one-capsule budget, and a preamble longer than the memory
+    // reads as noise.
+    let additional_context = format!(
+        "{header}{}\n{body}",
+        kimetsu_brain::framing::PROACTIVE_SUFFIX
+    );
 
     print_tool_use_context(event, &additional_context)?;
 

@@ -85,9 +85,9 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
             let hyde_enabled = args.hyde || hyde_from_level;
             // Advanced level leans on a capable cheap model; nudge the user if
             // none is configured (non-fatal; the raw query is still used).
-            if hyde_from_level && distiller::resolve_distiller(&cwd).is_none() {
+            if hyde_from_level && distiller::resolve_pipeline_distiller(&cwd).is_none() {
                 eprintln!(
-                    "kimetsu: retrieval level 'advanced' works best with a capable cheap model (OpenAI/Anthropic or a larger local model like qwen2.5:14b); set [cheap_model] in project.toml."
+                    "kimetsu: retrieval level 'advanced' needs the deep tier and a capable cheap model (OpenAI/Anthropic or a larger local model like qwen2.5:14b); set [cheap_model] in project.toml."
                 );
             }
             let effective_query = if hyde_enabled {
@@ -110,6 +110,17 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
                         "used_tokens": bundle.used_tokens,
                         "capsule_count": bundle.capsules.len(),
                         "excluded_count": bundle.excluded.len(),
+                        // v2.6: the bundle's own judgement of itself, which the
+                        // MCP surface has exposed since abstention landed. It
+                        // belongs here too — a JSON caller cannot tell a bundle
+                        // that answers the question from one that touches half
+                        // of it without these, and that is exactly the
+                        // difference BrainBench's sycophancy track scores.
+                        "top_score": bundle.top_score,
+                        "skipped": bundle.skipped,
+                        "evidence_coverage": bundle.evidence_coverage,
+                        "uncovered_terms": bundle.uncovered_terms,
+                        "chronological": bundle.chronological,
                         "capsules": bundle.capsules,
                         "excluded": bundle.excluded,
                     }))?
@@ -169,6 +180,11 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
             // `[sync] dir` is configured (and `auto` not disabled). Best-effort:
             // a sync failure must never break session shutdown.
             auto_sync_at_session_end(&workspace);
+            // v2.6: the other upkeep tick. Codex, Pi and OpenClaw have no
+            // session-start event, so session end is where their brains get
+            // their maintenance — and on Claude Code it is a second chance
+            // after a long session moved the corpus.
+            spawn_maintenance_if_due(&workspace);
             Ok(())
         }
         BrainCommand::SessionStartHook(args) => {
@@ -194,12 +210,18 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Bench(args) => brain_bench(args),
         BrainCommand::Roi(args) => brain_roi(args),
         BrainCommand::Tune(args) => brain_tune(args),
+        BrainCommand::Policy(args) => brain_policy(args),
+        BrainCommand::Maintain(args) => brain_maintain(args),
+        BrainCommand::Audit(args) => brain_audit(args),
+        BrainCommand::Drift(args) => brain_drift(args),
+        BrainCommand::AsOf(args) => brain_as_of(args),
         BrainCommand::Consolidate(args) => brain_consolidate(args),
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Forget(args) => brain_forget(args),
         BrainCommand::Cite(args) => brain_cite(args),
         BrainCommand::Reinforce(args) => brain_reinforce(args),
+        BrainCommand::BenchmarkCredit(args) => brain_benchmark_credit(args),
         BrainCommand::Regret(args) => brain_regret(args),
         BrainCommand::Distill(args) => brain_distill(args),
         BrainCommand::Graph { command } => brain_graph(command),
@@ -489,42 +511,15 @@ pub(crate) fn reindex_brain(args: ReindexArgs) -> KimetsuResult<()> {
 /// Gated by `[broker] warm_start` (default true).
 /// Silent when no digest AND no live episode.
 pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
-    // Gate: load warm_start from config (best-effort; default ON).
-    let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
-        .ok()
-        .and_then(|paths| kimetsu_brain::project::load_config(&paths).ok())
-        .map(|cfg| cfg.broker.warm_start)
-        .unwrap_or(true);
+    // v2.6: session start is the natural upkeep tick — the agent is about to
+    // work, so anything overdue should run alongside rather than in front of
+    // it. Detached, so this returns immediately. Before the warm-start guard
+    // below: a brain with nothing to say still needs its upkeep.
+    spawn_maintenance_if_due(workspace);
 
-    if !warm_start_enabled {
+    let Some(additional_context) = warm_start_context(workspace) else {
         return Ok(());
-    }
-
-    // 1. Repo digest (story 1.1).
-    let digest = kimetsu_brain::digest::build_or_load_digest(workspace, false);
-
-    // 2. Episodic resume (Pass A, story 1.4).
-    let resume = kimetsu_brain::episode::render_resume_context(workspace);
-
-    // Silent when neither has content.
-    if digest.is_none() && resume.is_none() {
-        return Ok(());
-    }
-
-    // Assemble additionalContext.
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(d) = &digest {
-        parts.push(format!("## Repo context\n{d}"));
-    }
-    if let Some(r) = &resume {
-        parts.push(format!("## Your prior session\n{r}"));
-    }
-    let additional_context = parts.join("\n\n");
-
-    // ROI attribution (best-effort).
-    let digest_chars = digest.as_ref().map(|d| d.len()).unwrap_or(0);
-    let resume_chars = resume.as_ref().map(|r| r.len()).unwrap_or(0);
-    kimetsu_brain::digest::record_warmstart_served(workspace, digest_chars, resume_chars);
+    };
 
     // Emit Claude Code SessionStart additionalContext JSON.
     let output = serde_json::json!({
@@ -535,6 +530,598 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
         },
     });
     println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// Assemble the warm-start block: repo digest + episodic resume.
+///
+/// Thin wrapper over [`kimetsu_brain::digest::warm_start_block`], which the
+/// MCP server shares so Cursor — no hooks, no session-start surface — gets the
+/// same block on its first `kimetsu_brain_context` call.
+pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
+    kimetsu_brain::digest::warm_start_block(workspace)
+}
+
+/// Normalize a user-supplied time into RFC 3339.
+///
+/// Accepts a bare `YYYY-MM-DD` because that is how people actually name a day,
+/// and a full RFC 3339 timestamp for precision. A date alone means midnight
+/// UTC — the start of that day, so "what did it know on the 3rd" excludes
+/// everything learned during the 3rd, which is the conservative reading.
+fn normalize_as_of(when: &str) -> KimetsuResult<String> {
+    let trimmed = when.trim();
+    if trimmed.len() == 10 && trimmed.matches('-').count() == 2 {
+        return Ok(format!("{trimmed}T00:00:00Z"));
+    }
+    // Anything else must already be a timestamp the DB can compare
+    // lexicographically, which for RFC 3339 in UTC is the same as temporally.
+    if trimmed.len() >= 20 && trimmed.contains('T') {
+        return Ok(trimmed.to_string());
+    }
+    Err(format!(
+        "could not read `{trimmed}` as a time — use YYYY-MM-DD or a full RFC 3339 timestamp \
+         like 2026-03-01T00:00:00Z"
+    )
+    .into())
+}
+
+/// `kimetsu brain as-of <WHEN> [--since <WHEN>] [--limit N] [--json]`
+pub(crate) fn brain_as_of(args: AsOfArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::bitemporal;
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (_paths, _config, conn) = project::load_project_readonly(&workspace)?;
+    let when = normalize_as_of(&args.when)?;
+
+    if let Some(since) = args.since.as_deref() {
+        let from = normalize_as_of(since)?;
+        let delta = bitemporal::belief_delta(&conn, &from, &when)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "from": from,
+                    "to": when,
+                    "learned": delta.learned.iter().map(as_of_json).collect::<Vec<_>>(),
+                    "retired": delta.retired.iter().map(as_of_json).collect::<Vec<_>>(),
+                }))?
+            );
+            return Ok(());
+        }
+        println!("Between {from} and {when}:");
+        println!();
+        println!("  learned ({}):", delta.learned.len());
+        for m in delta.learned.iter().take(args.limit.max(1) as usize) {
+            println!("    + [{}] {}", m.kind, m.text);
+        }
+        println!("  retired ({}):", delta.retired.len());
+        for m in delta.retired.iter().take(args.limit.max(1) as usize) {
+            let why = m.retired_reason.as_deref().unwrap_or("no longer believed");
+            println!("    - [{}] {} ({why})", m.kind, m.text);
+        }
+        return Ok(());
+    }
+
+    let memories = bitemporal::memories_as_of(&conn, &when, args.limit)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "as_of": when,
+                "count": memories.len(),
+                "memories": memories.iter().map(as_of_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "The brain believed {} memor{} at {when}:",
+        memories.len(),
+        if memories.len() == 1 { "y" } else { "ies" }
+    );
+    println!();
+    for m in &memories {
+        match m.retired_reason.as_deref() {
+            // Flag the interesting ones: beliefs that were live then and are
+            // not now. That contrast is the reason to run this at all.
+            Some(reason) => println!("  [{}] {}  — since {reason}", m.kind, m.text),
+            None => println!("  [{}] {}", m.kind, m.text),
+        }
+    }
+    Ok(())
+}
+
+fn as_of_json(m: &kimetsu_brain::bitemporal::AsOfMemory) -> serde_json::Value {
+    serde_json::json!({
+        "memory_id": m.memory_id,
+        "scope": m.scope,
+        "kind": m.kind,
+        "text": m.text,
+        "created_at": m.created_at,
+        "retired_at": m.retired_at,
+        "retired_reason": m.retired_reason,
+    })
+}
+
+/// `kimetsu brain audit [--json]`
+///
+/// Where the corpus came from, and how much of it nobody has vetted.
+///
+/// Deliberately read-only. An automated purge keyed on "many writes in one
+/// minute" would delete a legitimate bulk import — a worse outcome than the
+/// attack it guards against — so this reports and a human decides.
+pub(crate) fn brain_audit(args: AuditArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (_paths, _config, conn) = project::load_project_readonly(&workspace)?;
+    let report = kimetsu_brain::trust::audit(&conn)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("Corpus: {} active memories", report.total);
+    if report.groups.is_empty() {
+        return Ok(());
+    }
+    println!();
+    println!(
+        "{:<12} {:>8} {:>14} {:>9}",
+        "origin", "total", "corroborated", "unvetted"
+    );
+    for group in &report.groups {
+        println!(
+            "{:<12} {:>8} {:>14} {:>9}",
+            group.provenance, group.total, group.corroborated, group.unvetted
+        );
+    }
+
+    let unvetted: usize = report.groups.iter().map(|g| g.unvetted).sum();
+    if unvetted > 0 {
+        println!();
+        println!(
+            "{unvetted} memor{} of external origin {} never been cited in a successful run \
+             here, so {} still carrying an origin discount in retrieval. Review with \
+             `kimetsu brain memory list`.",
+            if unvetted == 1 { "y" } else { "ies" },
+            if unvetted == 1 { "has" } else { "have" },
+            if unvetted == 1 { "it is" } else { "they are" },
+        );
+    }
+
+    if !report.bursts.is_empty() {
+        println!();
+        println!(
+            "Write bursts (>= {} in one minute):",
+            kimetsu_brain::trust::BURST_THRESHOLD
+        );
+        for burst in &report.bursts {
+            println!("  {}  {} writes", burst.minute, burst.writes);
+        }
+        println!(
+            "A burst is the shape a bulk import leaves — and also the shape induced \
+             poisoning leaves. Worth confirming you recognise each one."
+        );
+    }
+    Ok(())
+}
+
+/// `kimetsu brain drift [--limit N] [--json]`
+///
+/// Which recent sessions wandered off the task they opened with. See
+/// [`kimetsu_brain::drift`] for what this can and cannot see — Kimetsu observes
+/// user prompts, not agent actions, so this is a claim about the session's
+/// topic and not about the agent's behaviour.
+pub(crate) fn brain_drift(args: DriftArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let (_paths, config, conn) = project::load_project_readonly(&workspace)?;
+    let sessions = kimetsu_brain::drift::recent_sessions(&conn, args.limit)?;
+
+    // The signal is cosine against an anchor, so a build with no embedder has
+    // nothing to compute. Saying so is the only honest output — a lexical
+    // stand-in would report a number on a different scale under the same
+    // threshold, which is worse than reporting none.
+    let embedder = kimetsu_brain::embeddings::open_embedder_for(config.embedder.enabled);
+    if embedder.is_noop() {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "reason": "no embedder: drift is cosine against an anchor",
+                    "sessions_available": sessions.len(),
+                })
+            );
+        } else {
+            println!(
+                "Drift is measured as cosine against the session's opening turn, and this \
+                 build has no embedder, so there is nothing to compute. {} recent session{} \
+                 would be scorable on an embeddings build.",
+                sessions.len(),
+                if sessions.len() == 1 { "" } else { "s" }
+            );
+        }
+        return Ok(());
+    }
+
+    let mut reports = Vec::new();
+    for session in &sessions {
+        let mut embedded = Vec::with_capacity(session.queries.len());
+        for query in &session.queries {
+            match embedder.embed(query) {
+                Ok(vector) => embedded.push(vector),
+                // One unembeddable turn must not silently shorten the sequence
+                // and shift every index after it.
+                Err(_) => {
+                    embedded.clear();
+                    break;
+                }
+            }
+        }
+        if embedded.is_empty() {
+            continue;
+        }
+        reports.push(kimetsu_brain::drift::analyze(
+            &session.session_id,
+            &embedded,
+        ));
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "sessions": reports.iter().map(|r| serde_json::json!({
+                    "session_id": r.session_id,
+                    "turns": r.similarity.len(),
+                    "similarity": r.similarity,
+                    "drifted_at": r.drifted_at,
+                    "min_similarity": r.min_similarity(),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    if reports.is_empty() {
+        println!(
+            "No scorable sessions. Drift needs at least two stored prompts from one \
+             session; `[learning] store_queries = false` keeps only a hash."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:>6} {:>8} {:>10}",
+        "session", "turns", "closest", "turned at"
+    );
+    for report in &reports {
+        println!(
+            "{:<24} {:>6} {:>8.2} {:>10}",
+            report.session_id,
+            report.similarity.len(),
+            report.min_similarity(),
+            match report.drifted_at {
+                Some(idx) => format!("turn {}", idx + 1),
+                None => "-".to_string(),
+            }
+        );
+    }
+
+    let drifted = reports.iter().filter(|r| r.drifted()).count();
+    if drifted > 0 {
+        println!();
+        println!(
+            "{drifted} session{} moved away from the question {} opened with and stayed \
+             there for {} turns. Retrieval still anchors on the whole session, so its \
+             opening turns are steering results toward a task nobody is working on.",
+            if drifted == 1 { "" } else { "s" },
+            if drifted == 1 { "it" } else { "they" },
+            kimetsu_brain::drift::SUSTAINED_TURNS
+        );
+    }
+    Ok(())
+}
+
+/// `kimetsu brain maintain [--force] [--status] [--only ...] [--json]`
+///
+/// The brain's upkeep, on a schedule instead of on a human remembering. Fired
+/// detached by the session hooks when a pass is overdue; see
+/// [`kimetsu_brain::maintain`] for why this is not a resident daemon.
+pub(crate) fn brain_maintain(args: MaintainArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::maintain::{self, Pass};
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+    let now = maintain::now_unix();
+    let mut state = maintain::load_state(&paths.kimetsu_dir);
+
+    let selected: Vec<Pass> = if args.only.trim().is_empty() {
+        if args.force {
+            Pass::ALL.to_vec()
+        } else {
+            maintain::due_passes(&state, now)
+        }
+    } else {
+        let mut chosen = Vec::new();
+        for name in args.only.split(',').filter(|s| !s.trim().is_empty()) {
+            chosen.push(name.parse::<Pass>()?);
+        }
+        chosen
+    };
+
+    if args.status {
+        if args.json {
+            let passes: Vec<serde_json::Value> = Pass::ALL
+                .into_iter()
+                .map(|pass| {
+                    serde_json::json!({
+                        "pass": pass.as_str(),
+                        "interval_secs": pass.interval_secs(),
+                        "last_run_unix": state.last_run(pass),
+                        "due": selected.contains(&pass),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&passes)?);
+        } else if selected.is_empty() {
+            println!("Maintenance: nothing due.");
+        } else {
+            println!(
+                "Maintenance: {} pass(es) due — {}",
+                selected.len(),
+                selected
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(());
+    }
+
+    if selected.is_empty() {
+        if args.json {
+            println!("[]");
+        } else {
+            println!("Maintenance: nothing due.");
+        }
+        return Ok(());
+    }
+
+    let outcomes = maintain::run_passes(&workspace, &selected);
+    for (pass, outcome) in selected.iter().zip(&outcomes) {
+        // Only a pass that succeeded counts as having run: a failed pass should
+        // be retried on the next tick, not silently skipped for its interval.
+        if outcome.ok {
+            state.mark_ran(*pass, now);
+        }
+    }
+    // Best-effort: failing to persist the schedule means the next tick repeats
+    // the work, which is wasteful but harmless.
+    let _ = maintain::save_state(&paths.kimetsu_dir, &state);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    } else {
+        for outcome in &outcomes {
+            let mark = if outcome.ok { "✓" } else { "✗" };
+            println!("{mark} {:<10} {}", outcome.pass, outcome.detail);
+        }
+    }
+    Ok(())
+}
+
+/// Fire `kimetsu brain maintain` detached when a pass is overdue.
+///
+/// Called from the session hooks. Fully detached with null stdio, mirroring the
+/// embed daemon and the digest refresh: an inherited stdout pipe would hold the
+/// host's hook open until its timeout, which is exactly the failure this design
+/// exists to avoid.
+pub(crate) fn spawn_maintenance_if_due(workspace: &Path) {
+    use kimetsu_brain::maintain;
+
+    let Ok(paths) = kimetsu_core::paths::ProjectPaths::discover(workspace) else {
+        return;
+    };
+    let state = maintain::load_state(&paths.kimetsu_dir);
+    if maintain::due_passes(&state, maintain::now_unix()).is_empty() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["brain", "maintain", "--workspace"])
+        .arg(workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let _ = cmd.spawn();
+}
+
+/// `kimetsu brain policy [--train] [--reset] [--json]`
+///
+/// The proactive-injection policy decides whether a mid-task recall is worth
+/// interrupting for. This is the surface that makes it inspectable: a linear
+/// model whose weights you can read is the reason it is a linear model.
+pub(crate) fn brain_policy(args: PolicyArgs) -> KimetsuResult<()> {
+    use kimetsu_brain::inject_policy;
+
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace)?;
+
+    if args.reset {
+        inject_policy::reset(&paths.kimetsu_dir)?;
+        println!("Injection policy reset to the legacy threshold rule.");
+        return Ok(());
+    }
+
+    let (_paths, _config, conn) = project::load_project_readonly(&workspace)?;
+    let examples = inject_policy::collect_examples(&conn).unwrap_or_default();
+    let current = inject_policy::load(&paths.kimetsu_dir);
+
+    let policy = if args.train {
+        let fitted = inject_policy::fit(&examples);
+        if fitted.is_prior() {
+            println!(
+                "Not enough signal to train: {} labelled injection{} \
+                 (need {}, with both outcomes present). Keeping the legacy rule.",
+                examples.len(),
+                if examples.len() == 1 { "" } else { "s" },
+                inject_policy::MIN_TRAINING_EXAMPLES
+            );
+            return Ok(());
+        }
+        let stamped = kimetsu_brain::inject_policy::Policy {
+            trained_at: Some(
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            ..fitted
+        };
+        inject_policy::save(&paths.kimetsu_dir, &stamped)?;
+        stamped
+    } else {
+        current
+    };
+
+    let prior = inject_policy::Policy::prior();
+    let policy_accuracy = inject_policy::accuracy(&policy, &examples);
+    let prior_accuracy = inject_policy::accuracy(&prior, &examples);
+    // v2.6: acceptance per hook surface. `broker.proactive_prefetch` has been
+    // default-off since it shipped, waiting on exactly this number, and nothing
+    // was recording it — so the flag could never graduate. See
+    // `inject_policy::surface_acceptance`.
+    let surfaces = inject_policy::surface_acceptance(&conn).unwrap_or_default();
+
+    if args.json {
+        let weights: serde_json::Map<String, serde_json::Value> = inject_policy::Features::NAMES
+            .iter()
+            .zip(&policy.weights)
+            .map(|(name, w)| (name.to_string(), serde_json::json!(w)))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "trained": !policy.is_prior(),
+                "trained_on": policy.trained_on,
+                "trained_at": policy.trained_at,
+                "bias": policy.bias,
+                "weights": weights,
+                "labelled_examples": examples.len(),
+                "useful_examples": examples.iter().filter(|e| e.useful).count(),
+                "accuracy": policy_accuracy,
+                "legacy_rule_accuracy": prior_accuracy,
+                "surfaces": surfaces.iter().map(|s| serde_json::json!({
+                    "surface": s.surface,
+                    "injected": s.injected,
+                    "cited": s.cited,
+                    "acceptance": s.acceptance(),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    if policy.is_prior() {
+        println!(
+            "Injection policy: the legacy threshold rule (inject at score >= {:.2}, \
+             {:.2} when looping).",
+            inject_policy::LEGACY_MIN_SCORE,
+            inject_policy::LEGACY_LOOP_MIN_SCORE
+        );
+    } else {
+        println!(
+            "Injection policy: trained on {} injection{}{}.",
+            policy.trained_on,
+            if policy.trained_on == 1 { "" } else { "s" },
+            policy
+                .trained_at
+                .as_deref()
+                .map(|ts| format!(" at {ts}"))
+                .unwrap_or_default()
+        );
+    }
+    println!("weights:");
+    for (name, weight) in inject_policy::Features::NAMES.iter().zip(&policy.weights) {
+        println!("  {name:<20} {weight:>8.3}");
+    }
+    println!("  {:<20} {:>8.3}", "(bias)", policy.bias);
+
+    let useful = examples.iter().filter(|e| e.useful).count();
+    println!(
+        "history: {} labelled injection{} ({} cited, {} unused)",
+        examples.len(),
+        if examples.len() == 1 { "" } else { "s" },
+        useful,
+        examples.len() - useful
+    );
+    if !examples.is_empty() {
+        println!(
+            "accuracy on that history: {:.1}% (legacy rule: {:.1}%)",
+            policy_accuracy * 100.0,
+            prior_accuracy * 100.0
+        );
+    }
+    if !surfaces.is_empty() {
+        println!("acceptance by hook surface (cited / injected):");
+        for stats in &surfaces {
+            println!(
+                "  {:<20} {:>3} / {:<3}  {:>5.1}%",
+                stats.surface,
+                stats.cited,
+                stats.injected,
+                stats.acceptance() * 100.0
+            );
+        }
+        // The prefetch surface is the one with a decision riding on it: it
+        // predicts from a file path rather than reacting to a failure, and
+        // `broker.proactive_prefetch` stays default-off until its acceptance is
+        // not materially below the surfaces that react to something observed.
+        let prefetch = surfaces
+            .iter()
+            .find(|s| s.surface == inject_policy::Surface::PreToolPrefetch.as_str());
+        let reactive: Vec<_> = surfaces
+            .iter()
+            .filter(|s| s.surface != inject_policy::Surface::PreToolPrefetch.as_str())
+            .collect();
+        if let Some(prefetch) = prefetch
+            && !reactive.is_empty()
+        {
+            let reactive_injected: usize = reactive.iter().map(|s| s.injected).sum();
+            let reactive_cited: usize = reactive.iter().map(|s| s.cited).sum();
+            let reactive_acceptance = reactive_cited as f32 / reactive_injected as f32;
+            println!(
+                "  prefetch vs reactive: {:.1}% vs {:.1}% — `broker.proactive_prefetch` \
+                 graduates to default-on when the gap closes on real history",
+                prefetch.acceptance() * 100.0,
+                reactive_acceptance * 100.0
+            );
+        }
+    }
+    if policy.is_prior() && examples.len() >= inject_policy::MIN_TRAINING_EXAMPLES {
+        println!("hint: run `kimetsu brain policy --train` to fit from this history");
+    }
     Ok(())
 }
 
@@ -775,6 +1362,29 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         }
     };
 
+    // v2.6: whether the pack is held for review rather than entering
+    // retrieval. The default is decided by where the pack came from, because
+    // that is what the threat model turns on: a URL is content authored
+    // elsewhere by someone else, fetched over the network, which `trust.rs`
+    // names as the widest attack surface Kimetsu has. A local file is one the
+    // user chose and can open. Either default is overridable.
+    let from_url = args.file.starts_with("http://") || args.file.starts_with("https://");
+    let quarantine = if args.quarantine {
+        true
+    } else if args.no_quarantine {
+        false
+    } else {
+        from_url
+    };
+    if quarantine && replace {
+        return Err(
+            "brain import: --mode replace and --quarantine are incompatible — replace \
+             supersedes memories you have in favour of content you have not reviewed. \
+             Review the pack first, or pass --no-quarantine to accept it outright."
+                .into(),
+        );
+    }
+
     // Read raw bytes from a path, stdin (`-`), or an http(s):// URL.
     let bytes: Vec<u8> = if args.file == "-" {
         use std::io::Read;
@@ -813,6 +1423,7 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         scope_override,
         replace,
         Some(&pack_ref),
+        quarantine,
     )?;
 
     let label = match (&pack_ref.name, &pack_ref.version) {
@@ -820,7 +1431,23 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         (Some(n), None) => format!(" (pack {n})"),
         _ => String::new(),
     };
-    if summary.superseded > 0 {
+    if quarantine {
+        println!(
+            "quarantined {}, deduped {}{label}",
+            summary.quarantined, summary.deduped
+        );
+        if summary.quarantined > 0 {
+            println!(
+                "Nothing from this pack can reach a session until you accept it. \
+                 Review with `kimetsu brain memory proposals`{}.",
+                if from_url && !args.quarantine {
+                    " (quarantined because it came from a URL; pass --no-quarantine to skip review)"
+                } else {
+                    ""
+                }
+            );
+        }
+    } else if summary.superseded > 0 {
         println!(
             "installed {}, deduped {}, superseded {}{label}",
             summary.imported, summary.deduped, summary.superseded
@@ -1222,6 +1849,16 @@ pub(crate) fn try_daemon_retrieve(
     request: &kimetsu_brain::context::ContextRequest,
 ) -> Option<kimetsu_brain::context::ContextBundle> {
     use embed_daemon::{client, proto};
+    // v2.6: an ordering query needs each memory's `created_at`, and the wire
+    // protocol carries summary/kind/score only — no handle to look a date up
+    // by. Rather than widen the protocol for a rare query shape, decline the
+    // daemon entirely and let the caller fall back to the in-process path,
+    // which has the dates and renders them. Semantic ranking is worth less
+    // here than the dates are: "which came first" is answered by the ordering,
+    // not by which memory ranks top.
+    if kimetsu_brain::ordering::is_ordering_query(&request.query) {
+        return None;
+    }
     let model = resolve_daemon_model(workspace)?;
     let args = proto::RetrieveArgs {
         v: proto::PROTOCOL_VERSION,
@@ -1239,7 +1876,7 @@ pub(crate) fn try_daemon_retrieve(
             skipped,
             top_score,
         }) => Some(daemon_capsules_to_bundle(
-            request, capsules, skipped, top_score,
+            workspace, request, capsules, skipped, top_score,
         )),
         _ => {
             // Unreachable/errored: we already know it didn't answer, so spawn
@@ -1264,16 +1901,26 @@ pub(crate) fn try_daemon_retrieve(
 /// rendering code path.
 #[cfg(feature = "embeddings")]
 pub(crate) fn daemon_capsules_to_bundle(
+    workspace: &std::path::Path,
     request: &kimetsu_brain::context::ContextRequest,
     capsules: Vec<embed_daemon::proto::Capsule>,
     skipped: bool,
     top_score: f32,
 ) -> kimetsu_brain::context::ContextBundle {
     use kimetsu_brain::context::{ContextBundle, ContextCapsule};
-    let capsules = capsules
+    let capsules: Vec<ContextCapsule> = capsules
         .into_iter()
         .map(|c| ContextCapsule::wire_minimal(c.summary, c.kind, c.score))
         .collect();
+    // v2.6: measure coverage here too. The in-process path does it during
+    // finalization, which this path skips — so without this the "memory does
+    // not cover X" line was dead on exactly the builds that run a daemon.
+    // A skipped bundle covers nothing, matching the in-process rule.
+    let (evidence_coverage, uncovered_terms) = if skipped {
+        (0.0, Vec::new())
+    } else {
+        project::evidence_coverage_readonly(workspace, &request.query, &capsules)
+    };
     ContextBundle {
         stage: request.stage.clone(),
         budget_tokens: request.budget_tokens,
@@ -1282,6 +1929,11 @@ pub(crate) fn daemon_capsules_to_bundle(
         excluded: Vec::new(),
         skipped,
         top_score,
+        evidence_coverage,
+        uncovered_terms,
+        // Ordering queries never reach the daemon (`try_daemon_retrieve`
+        // declines them), so a bundle from here is never time-ordered.
+        chronological: false,
     }
 }
 
@@ -1365,16 +2017,18 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
         .collect();
 
     // F3 Stories 3.2 & 3.4: regret-flagged memories + invalidations by reason.
-    let (regret_flagged, inv_by_reason) = match project::load_project(&cwd) {
+    // v2.6: also report the resolved tier — which pipeline the numbers above
+    // were produced by is not something a user should have to infer.
+    let (regret_flagged, inv_by_reason, tier, tier_downgraded) = match project::load_project(&cwd) {
         Ok((_paths, config, conn)) => {
             let threshold = config.lifecycle.regret_flag_threshold;
             let regret = kimetsu_brain::lifecycle::regret_flagged_memories(&conn, threshold)
                 .map(|v| v.len())
                 .unwrap_or(0);
             let inv = kimetsu_brain::lifecycle::invalidations_by_reason(&conn).unwrap_or_default();
-            (regret, inv)
+            (regret, inv, config.tier(), config.tier_downgraded())
         }
-        Err(_) => (0, vec![]),
+        Err(_) => (0, vec![], kimetsu_core::config::Tier::Free, false),
     };
 
     if json {
@@ -1396,6 +2050,8 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
                 "top_domains": top_domains,
                 "regret_flagged": regret_flagged,
                 "invalidations_by_reason": inv_json,
+                "tier": tier.as_str(),
+                "tier_downgraded": tier_downgraded,
             }))?
         );
     } else {
@@ -1406,6 +2062,20 @@ pub(crate) fn brain_status(json: bool) -> KimetsuResult<()> {
             conflicts.len()
         );
         println!("schema version: {schema_ver}");
+        match tier {
+            kimetsu_core::config::Tier::Free => {
+                println!("tier:    free (no LLM calls in the memory pipeline)")
+            }
+            kimetsu_core::config::Tier::Deep => {
+                println!("tier:    deep (a local/cheap model assists ingest and retrieval)")
+            }
+        }
+        if tier_downgraded {
+            println!(
+                "hint: tier = \"deep\" is configured but no cheap model is reachable — \
+                 running free. See `kimetsu doctor`."
+            );
+        }
         if !top_domains.is_empty() {
             println!("domains: {}", top_domains.join(", "));
         }
@@ -1985,6 +2655,7 @@ pub(crate) fn brain_tune_sweep(
         min_lexical_coverage: config.broker.min_lexical_coverage,
         min_semantic_score: config.broker.min_semantic_score,
         reranker_id: config.embedder.reranker.clone(),
+        fusion: config.broker.fusion.clone(),
     };
 
     // Choose eval cases: personal if READY, else fall back to fixture.
@@ -2099,6 +2770,7 @@ pub(crate) fn brain_tune_sweep(
                     max_capsules: pool,
                     min_semantic_score: combo.min_semantic_score,
                     min_lexical_coverage: combo.min_lexical_coverage,
+                    fusion: combo.fusion.clone(),
                     ..Default::default()
                 };
                 let mut bundle =
@@ -2268,12 +2940,14 @@ pub(crate) fn brain_tune_sweep(
             );
         }
         println!(
-            "DRY RUN — to apply floor changes: kimetsu brain tune --apply\n\
-             (floor changes: lex {:.2}→{:.2}, sem {:.3}→{:.3})",
+            "DRY RUN — to apply: kimetsu brain tune --apply\n\
+             (lex {:.2}→{:.2}, sem {:.3}→{:.3}, fusion {}→{})",
             current_combo.min_lexical_coverage,
             winner.combo.min_lexical_coverage,
             current_combo.min_semantic_score,
             winner.combo.min_semantic_score,
+            current_combo.fusion,
+            winner.combo.fusion,
         );
         return Ok(());
     }
@@ -2295,6 +2969,15 @@ pub(crate) fn brain_tune_sweep(
         &mut doc,
         "broker.min_semantic_score",
         &toml::Value::Float(winner.combo.min_semantic_score as f64),
+    )
+    .map_err(|e| format!("tune --apply: {e}"))?;
+    // v2.6: the fusion rule is swept alongside the floors, so --apply writes
+    // it too. Kimetsu ships `linear`; this is the path by which a corpus that
+    // prefers rank fusion actually gets it.
+    set_toml_edit_path(
+        &mut doc,
+        "broker.fusion",
+        &toml::Value::String(winner.combo.fusion.clone()),
     )
     .map_err(|e| format!("tune --apply: {e}"))?;
     std::fs::write(&paths.project_toml, doc.to_string())?;
@@ -2352,11 +3035,20 @@ pub(crate) fn brain_tune_revert(workspace: &std::path::Path) -> KimetsuResult<()
         &toml::Value::Float(entry.before.min_semantic_score as f64),
     )
     .map_err(|e| format!("tune revert: {e}"))?;
+    set_toml_edit_path(
+        &mut doc,
+        "broker.fusion",
+        &toml::Value::String(entry.before.fusion.clone()),
+    )
+    .map_err(|e| format!("tune revert: {e}"))?;
     std::fs::write(&paths.project_toml, doc.to_string())?;
 
     println!(
-        "Reverted: lex_coverage={:.2}, sem_score={:.3} (from tune at {})",
-        entry.before.min_lexical_coverage, entry.before.min_semantic_score, entry.timestamp
+        "Reverted: lex_coverage={:.2}, sem_score={:.3}, fusion={} (from tune at {})",
+        entry.before.min_lexical_coverage,
+        entry.before.min_semantic_score,
+        entry.before.fusion,
+        entry.timestamp
     );
     Ok(())
 }
@@ -2756,7 +3448,7 @@ pub(crate) fn brain_forget(args: ForgetArgs) -> KimetsuResult<()> {
                     c.use_count,
                     c.usefulness_score,
                     c.age_days,
-                    &c.text_preview
+                    c.text_preview
                 );
             }
         }
@@ -2892,6 +3584,30 @@ pub(crate) fn brain_reinforce(args: ReinforceArgs) -> KimetsuResult<()> {
         summary.staples_created,
         summary.routes_built,
         summary.routes_embedded
+    );
+    Ok(())
+}
+
+pub(crate) fn brain_benchmark_credit(args: BenchmarkCreditArgs) -> KimetsuResult<()> {
+    let workspace = args
+        .workspace
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let credited = kimetsu_brain::reinforce::credit_benchmark_outcome(
+        &workspace,
+        &args.task,
+        args.passed,
+        args.top_k,
+    )?;
+    println!(
+        "benchmark-credit: {} memor{} cited for task \"{}\" ({})",
+        credited,
+        if credited == 1 { "y" } else { "ies" },
+        args.task,
+        if args.passed {
+            "passed"
+        } else {
+            "not passed — no citation"
+        }
     );
     Ok(())
 }
@@ -3124,12 +3840,17 @@ pub(crate) fn enrich_typed_edges(
 
 /// HyDE query expansion: append a hypothetical answer passage (from the cheap
 /// model) to `query`, so semantic retrieval matches the answer's vector rather
-/// than the question's. Falls back to the raw query when no cheap model is
-/// configured or the model call fails (graceful, never errors retrieval).
+/// than the question's. Falls back to the raw query when the tier forbids model
+/// calls, when no cheap model is configured, or when the model call fails
+/// (graceful, never errors retrieval).
+///
+/// HyDE is a model call *inside retrieval*, so it resolves through the tier
+/// gate: on Free the raw query is used.
 pub(crate) fn hyde_augment_query(workspace: &Path, query: &str) -> String {
-    let Some(resolved) = distiller::resolve_distiller(workspace) else {
+    let Some(resolved) = distiller::resolve_pipeline_distiller(workspace) else {
         eprintln!(
-            "kimetsu: --hyde requested but no [cheap_model] configured; using the raw query."
+            "kimetsu: HyDE needs the deep tier and a [cheap_model]; using the raw query. \
+             (`kimetsu config set kimetsu.tier deep`)"
         );
         return query.to_string();
     };

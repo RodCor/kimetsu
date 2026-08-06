@@ -106,7 +106,7 @@ impl ModelProvider for AnthropicProvider {
         // Pass Some(model) — the direct API needs the model in the body.
         // anthropic-version is carried in the HTTP header for the direct API,
         // so we pass None here; the header is set explicitly below.
-        let body = build_anthropic_body(Some(&self.model), None, &request);
+        let body = build_anthropic_body(Some(&self.model), &self.model, None, &request);
         let url = messages_url(&self.base_url);
         let response = self
             .client
@@ -135,6 +135,51 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+/// v2.6: does this Anthropic model still accept a `temperature`?
+///
+/// Sampling parameters were **removed** from the Claude line: `temperature`,
+/// `top_p` and `top_k` return a hard 400 on Opus 4.7 and every model after it,
+/// and Sonnet 5 rejects any non-default value. Kimetsu sends a deliberately
+/// low temperature (0.1–0.3) on every pipeline call, so on those models every
+/// Deep-tier request fails outright — the distiller, `ask`, and reflection are
+/// dead, not degraded.
+///
+/// The list is an **allowlist of models known to accept it**, and an unknown
+/// model omits the parameter. That direction is deliberate. Getting it wrong
+/// by omitting costs a little determinism on one distillation; getting it
+/// wrong by sending costs the entire feature, loudly, on a model that did not
+/// exist when this code was written. Sampling removal has only ever moved one
+/// way across the Claude line, so "unknown means newer" is the safer read.
+///
+/// Ids arrive in several shapes — bare (`claude-opus-5`), Bedrock
+/// (`anthropic.claude-opus-5`), and Bedrock cross-region inference profiles
+/// (`us.anthropic.claude-opus-5`). Rather than strip a fixed prefix, match from
+/// the first `claude-`, which is common to all of them.
+pub(crate) fn accepts_temperature(model: &str) -> bool {
+    let lowered = model.trim().to_ascii_lowercase();
+    let Some(start) = lowered.find("claude-") else {
+        // Not a Claude id at all (a proxy alias, say). Omit, per the rule above.
+        return false;
+    };
+    let id = &lowered[start..];
+    // Everything at or below the Opus 4.6 / Sonnet 4.6 generation still takes
+    // sampling parameters. Opus 4.7 is where they were removed.
+    const ACCEPTS: [&str; 8] = [
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
+        "claude-opus-4-0",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-0",
+        "claude-haiku-4-5",
+    ];
+    ACCEPTS.iter().any(|prefix| id.starts_with(prefix))
+        // Claude 3.x and 2.x predate the removal entirely.
+        || id.starts_with("claude-3")
+        || id.starts_with("claude-2")
+}
+
 /// Build the JSON body for an Anthropic-wire request.
 ///
 /// - `model`: when `Some`, injects `"model": <value>` into the body (direct
@@ -143,8 +188,13 @@ impl ModelProvider for AnthropicProvider {
 /// - `anthropic_version`: when `Some`, injects `"anthropic_version": <value>`
 ///   (Bedrock requires `"bedrock-2023-05-31"` here). Pass `None` for the direct
 ///   API — the version is carried in the `anthropic-version` HTTP header there.
+/// - `model_id`: the model's identity, used only to decide which parameters it
+///   accepts. Separate from `model` because Bedrock puts the id in the URL and
+///   omits it from the body — but the body still has to be built *for* that
+///   model. Always pass the real id.
 pub(crate) fn build_anthropic_body(
     model: Option<&str>,
+    model_id: &str,
     anthropic_version: Option<&str>,
     request: &ModelRequest,
 ) -> Value {
@@ -180,9 +230,14 @@ pub(crate) fn build_anthropic_body(
 
     let mut body = json!({
         "max_tokens": request.max_output_tokens,
-        "temperature": request.temperature,
         "messages": messages,
     });
+
+    // Omitted entirely on models that removed sampling parameters — sending it
+    // there is a 400, not a soft fallback. See `accepts_temperature`.
+    if accepts_temperature(model_id) {
+        body["temperature"] = json!(request.temperature);
+    }
 
     if let Some(m) = model {
         body["model"] = json!(m);
@@ -221,7 +276,7 @@ pub(crate) fn build_anthropic_body(
 /// Kept for back-compat within this module's tests (see below).
 #[cfg(test)]
 fn build_request_body(model: &str, request: &ModelRequest) -> Value {
-    build_anthropic_body(Some(model), None, request)
+    build_anthropic_body(Some(model), model, None, request)
 }
 
 fn map_content_block(content: &MessageContent) -> Option<Value> {
@@ -367,6 +422,85 @@ impl From<AnthropicUsage> for TokenUsage {
 mod tests {
     use super::*;
     use crate::model::{ModelMessage, ToolDefinition};
+
+    /// v2.6: every current frontier Claude model rejects `temperature` with a
+    /// 400. Kimetsu sends 0.1–0.3 on every pipeline call, so before this gate
+    /// the whole Deep tier was dead on anything from Opus 4.7 onward.
+    #[test]
+    fn temperature_is_omitted_on_models_that_reject_it() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-sonnet-5",
+            "anthropic.claude-opus-5", // Bedrock id
+        ] {
+            assert!(
+                !accepts_temperature(model),
+                "{model} rejects sampling params; sending temperature is a 400"
+            );
+        }
+    }
+
+    /// The older generation still takes it, and silently dropping it there
+    /// would cost the determinism the low temperature was chosen for.
+    #[test]
+    fn temperature_is_kept_on_models_that_accept_it() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+            "anthropic.claude-sonnet-4-6",
+            // Bedrock legacy ARN-style and cross-region inference-profile ids.
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-sonnet-4-5",
+        ] {
+            assert!(accepts_temperature(model), "{model} accepts temperature");
+        }
+    }
+
+    /// The cross-region form must not be misread as a *new* model and silently
+    /// lose the temperature it is entitled to.
+    #[test]
+    fn a_region_prefixed_frontier_id_still_omits_temperature() {
+        assert!(!accepts_temperature("us.anthropic.claude-opus-5"));
+        assert!(!accepts_temperature("eu.anthropic.claude-opus-4-7"));
+    }
+
+    /// A model this build has never heard of is assumed to be newer than the
+    /// removal, because that is the failure that costs less: omitting loses a
+    /// little determinism, sending loses the entire request.
+    #[test]
+    fn an_unknown_model_omits_temperature() {
+        assert!(!accepts_temperature("claude-opus-6"));
+        assert!(!accepts_temperature("some-future-model"));
+        assert!(!accepts_temperature(""));
+    }
+
+    /// The gate has to reach the wire, not just the helper.
+    #[test]
+    fn the_request_body_drops_temperature_for_a_frontier_model() {
+        let req = ModelRequest {
+            messages: vec![ModelMessage::user_text("hi")],
+            temperature: 0.2,
+            max_output_tokens: 512,
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            metadata: serde_json::Value::Null,
+        };
+        let frontier = build_anthropic_body(Some("claude-opus-5"), "claude-opus-5", None, &req);
+        assert!(
+            frontier.get("temperature").is_none(),
+            "temperature must not reach a model that 400s on it: {frontier}"
+        );
+        let older = build_anthropic_body(Some("claude-opus-4-6"), "claude-opus-4-6", None, &req);
+        let sent = older["temperature"].as_f64().expect("temperature present");
+        assert!((sent - 0.2).abs() < 1e-6, "got {sent}");
+    }
 
     /// v0.4.9 regression guard. Mirror of the ClaudeCodeProvider
     /// test — `#[derive(Debug)]` must not leak `api_key`.

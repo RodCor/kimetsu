@@ -59,6 +59,21 @@ cargo test --workspace
 cargo deny check            # optional: cargo install cargo-deny
 ```
 
+The semantic flavor is a separate build and CI gates on it, so run it too
+before opening a PR — a `#[cfg(feature = "embeddings")]` block cannot be
+compiled by any lean build, and defects there survive a fully green lean run:
+
+```bash
+cargo clippy --workspace --all-targets --features embeddings -- -D warnings
+cargo test --workspace --features embeddings -j 4 -- --test-threads=1
+```
+
+`-j 4` is not decoration. On a 16-core / 32 GB machine the default job count
+exhausts the page file linking the test binaries, and the failure arrives as
+`os error 1455` ("the paging file is too small") or as
+`STATUS_STACK_BUFFER_OVERRUN` inside `rustc` — which reads like a compiler bug
+and is not one.
+
 ## Pull requests
 
 - Target `develop` for features/fixes; target `main` only for releases

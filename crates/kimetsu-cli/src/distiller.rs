@@ -619,6 +619,35 @@ pub fn resolve_distiller(workspace: &Path) -> Option<ResolvedDistiller> {
     resolve_distiller_with(workspace, global_dir)
 }
 
+/// v2.6: [`resolve_distiller`], gated on the Free/Deep tier.
+///
+/// **Every automatic model call in the memory pipeline must resolve through
+/// this, not through [`resolve_distiller`].** On the Free tier it returns
+/// `None`, and each caller falls back to the rule-based path it already has —
+/// which is what makes "zero LLM calls in the memory pipeline" a property of
+/// the code rather than a claim about configuration.
+///
+/// The ungated [`resolve_distiller`] stays for surfaces the user invokes by
+/// name (`kimetsu ask`, `brain reflect`, `brain skills --draft`, `doctor`).
+/// Those are explicit requests, not pipeline behaviour, and silently refusing
+/// them on Free would be a worse lie than the one this gate prevents.
+pub fn resolve_pipeline_distiller(workspace: &Path) -> Option<ResolvedDistiller> {
+    if !tier_allows_model(workspace) {
+        return None;
+    }
+    resolve_distiller(workspace)
+}
+
+/// Best-effort tier lookup for `workspace`. An unreadable or missing config
+/// means Free: the safe direction is fewer model calls, not more.
+pub fn tier_allows_model(workspace: &Path) -> bool {
+    ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|config| config.allows_model_in_pipeline())
+        .unwrap_or(false)
+}
+
 /// Testable core: `global_dir` is injected (the `~/.kimetsu` dir, or `None`).
 fn resolve_distiller_with(
     workspace: &Path,
@@ -811,8 +840,9 @@ pub fn capture_episode_now(workspace: &Path, transcript_path: &str, note: &str) 
         build_transcript_view(transcript_path, MAX_VIEW_CHARS)
     };
 
-    // Try cheap model first; fall back to rule-based.
-    let episode_payload = if let Some(resolved) = resolve_distiller(workspace) {
+    // Try cheap model first; fall back to rule-based. Episode capture is
+    // automatic (SessionEnd), so it goes through the tier gate.
+    let episode_payload = if let Some(resolved) = resolve_pipeline_distiller(workspace) {
         distill_episode_with_model(&view, &resolved, &repo_root, note)
             .unwrap_or_else(|| kimetsu_brain::episode::rule_based_episode(&view, &repo_root, note))
     } else {
@@ -1008,7 +1038,8 @@ pub fn make_provider_for_resolved(resolved: &ResolvedDistiller) -> Option<Box<dy
 /// SessionEnd hooks where available, and by Codex Stop hooks because current
 /// Codex releases expose Stop but not SessionEnd.
 pub fn run_distiller_for_transcript(workspace: &Path, transcript_path: &str) -> Option<usize> {
-    let resolved = resolve_distiller(workspace)?;
+    // Automatic end-of-session harvesting: tier-gated.
+    let resolved = resolve_pipeline_distiller(workspace)?;
     let view = build_transcript_view(transcript_path, MAX_VIEW_CHARS);
     if view.trim().is_empty() {
         return Some(0);
@@ -1159,7 +1190,7 @@ mod tests {
         let json = r#"[
             {"lesson": "works on Python 3.11", "tags": ["python"], "kind": "convention",
              "confidence": 0.9, "valid_from": "2023-04-05T00:00:00Z", "valid_to": null},
-            {"lesson": "deprecated in v3.0", "tags": ["api"], "kind": "semantic_operator",
+            {"lesson": "deprecated in v2.6", "tags": ["api"], "kind": "semantic_operator",
              "confidence": 0.8, "valid_from": null, "valid_to": "2025-01-01T00:00:00Z"},
             {"lesson": "timeless fact", "tags": ["rust"], "confidence": 0.85}
         ]"#;

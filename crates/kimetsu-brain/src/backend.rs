@@ -123,7 +123,10 @@ pub(crate) trait RetrievalBackend {
 ///
 /// This is a pure refactor-in-place: identical SQL, identical ANN calls,
 /// identical candidate set.
-pub(crate) struct FlatBackend;
+pub(crate) struct FlatBackend {
+    /// How this backend merges its FTS and ANN rankings. See [`crate::fusion`].
+    pub(crate) fusion: crate::fusion::Fusion,
+}
 
 impl RetrievalBackend for FlatBackend {
     fn memory_candidates(
@@ -133,7 +136,13 @@ impl RetrievalBackend for FlatBackend {
         query_embedding: Option<&QueryEmbedding>,
         half_life_days: f32,
     ) -> KimetsuResult<Vec<Candidate>> {
-        crate::context::memory_candidates_flat(conn, query, query_embedding, half_life_days)
+        crate::context::memory_candidates_flat(
+            conn,
+            query,
+            query_embedding,
+            half_life_days,
+            self.fusion,
+        )
     }
 }
 
@@ -170,13 +179,18 @@ impl RetrievalBackend for FlatBackend {
 ///
 /// # Scoring
 ///
-/// Graph-reached candidates have `raw_relevance = 0.0` pre-scoring because
-/// they weren't matched by the query directly.  The broker's per-kind max
-/// normalisation will therefore assign them `relevance = 0.0 / max` and they
-/// will rank below any flat hit that had a positive signal.  If the caller
-/// has a `min_score` floor they may be filtered out — which is correct
-/// behaviour: the broker still controls final admission.
-pub(crate) struct GraphLiteBackend;
+/// Graph-reached candidates were not matched by the query directly, so they
+/// inherit a hop-decayed share of the best flat signal:
+/// `raw_relevance = max_flat_relevance * HOP_DECAY^hops`. A 1-hop neighbour of
+/// the top hit therefore enters at 60% of it — below every strong flat hit, but
+/// above a weak one, which is the point: a memory two words away from the query
+/// but one edge from its best answer is often the better capsule. If the caller
+/// has a `min_score` floor they may still be filtered out — the broker controls
+/// final admission.
+pub(crate) struct GraphLiteBackend {
+    /// How the flat seed set is fused before graph expansion runs on top of it.
+    pub(crate) fusion: crate::fusion::Fusion,
+}
 
 /// Maximum hops to traverse from the flat hit set.
 const MAX_HOPS: usize = 2;
@@ -202,8 +216,13 @@ impl RetrievalBackend for GraphLiteBackend {
         half_life_days: f32,
     ) -> KimetsuResult<Vec<Candidate>> {
         // 1. Start with the flat candidate set (FTS + ANN / FTS + recency).
-        let flat =
-            crate::context::memory_candidates_flat(conn, query, query_embedding, half_life_days)?;
+        let flat = crate::context::memory_candidates_flat(
+            conn,
+            query,
+            query_embedding,
+            half_life_days,
+            self.fusion,
+        )?;
 
         // 2. Collect the memory_ids already in the flat set.
         let mut seen_ids: HashSet<String> = flat
@@ -426,6 +445,7 @@ fn fetch_graph_candidates(
             raw_relevance,
             embedding: None,
             cosine: None,
+            created_at: Some(created_at),
             capsule: ContextCapsule {
                 id: kimetsu_core::ids::new_id().to_string(),
                 kind: "memory".to_string(),
@@ -468,6 +488,8 @@ pub(crate) struct PetgraphBackend {
     graph: petgraph::Graph<String, String>,
     /// Maps memory_id → NodeIndex for O(1) node lookup.
     node_map: std::collections::HashMap<String, petgraph::graph::NodeIndex>,
+    /// How the flat seed set is fused before graph expansion runs on top of it.
+    fusion: crate::fusion::Fusion,
 }
 
 #[cfg(feature = "graph")]
@@ -477,7 +499,10 @@ impl PetgraphBackend {
     /// This is called at server startup (or on demand). The graph is a point-in-
     /// time snapshot — it does not update incrementally. Re-construct it after
     /// `rebuild_in_place` if you need a fresh view.
-    pub(crate) fn from_conn(conn: &Connection) -> KimetsuResult<Self> {
+    pub(crate) fn from_conn(
+        conn: &Connection,
+        fusion: crate::fusion::Fusion,
+    ) -> KimetsuResult<Self> {
         use petgraph::Graph;
         use std::collections::HashMap;
 
@@ -509,7 +534,11 @@ impl PetgraphBackend {
             graph.add_edge(src_idx, dst_idx, edge_type);
         }
 
-        Ok(Self { graph, node_map })
+        Ok(Self {
+            graph,
+            node_map,
+            fusion,
+        })
     }
 
     /// Degree centrality for each node: `(in_degree, out_degree)` by memory_id.
@@ -675,8 +704,13 @@ impl RetrievalBackend for PetgraphBackend {
         half_life_days: f32,
     ) -> KimetsuResult<Vec<Candidate>> {
         // 1. Flat candidate set (FTS + ANN or FTS + recency).
-        let flat =
-            crate::context::memory_candidates_flat(conn, query, query_embedding, half_life_days)?;
+        let flat = crate::context::memory_candidates_flat(
+            conn,
+            query,
+            query_embedding,
+            half_life_days,
+            self.fusion,
+        )?;
 
         // 2. Collect seen ids from the flat set.
         let mut seen_ids: HashSet<String> = flat
@@ -727,10 +761,13 @@ impl RetrievalBackend for PetgraphBackend {
 ///     expansion (just without the petgraph in-memory cache and algorithms).
 ///   * Anything else → [`FlatBackend`] with an eprintln warning so a typo is
 ///     surfaced without crashing the process.
-pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sync> {
+pub(crate) fn backend_for(
+    backend: &str,
+    fusion: crate::fusion::Fusion,
+) -> Box<dyn RetrievalBackend + Send + Sync> {
     match backend {
-        "flat" => Box::new(FlatBackend),
-        "graph-lite" => Box::new(GraphLiteBackend),
+        "flat" => Box::new(FlatBackend { fusion }),
+        "graph-lite" => Box::new(GraphLiteBackend { fusion }),
         "graph" => {
             // S5.3: PetgraphBackend when the `graph` feature is enabled.
             // Falls back to GraphLiteBackend (not flat) so that lean builds
@@ -741,11 +778,11 @@ pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sy
                 // `backend_for` is called without a conn (before any query), we
                 // return a deferred variant that constructs the petgraph on the
                 // first `memory_candidates` call.
-                Box::new(DeferredPetgraphBackend::new())
+                Box::new(DeferredPetgraphBackend::new(fusion))
             }
             #[cfg(not(feature = "graph"))]
             {
-                Box::new(GraphLiteBackend)
+                Box::new(GraphLiteBackend { fusion })
             }
         }
         other => {
@@ -753,7 +790,7 @@ pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sy
                 "kimetsu-brain: unknown storage.backend {:?}; falling back to \"flat\"",
                 other
             );
-            Box::new(FlatBackend)
+            Box::new(FlatBackend { fusion })
         }
     }
 }
@@ -773,13 +810,15 @@ pub(crate) fn backend_for(backend: &str) -> Box<dyn RetrievalBackend + Send + Sy
 #[cfg(feature = "graph")]
 struct DeferredPetgraphBackend {
     inner: std::sync::Mutex<Option<PetgraphBackend>>,
+    fusion: crate::fusion::Fusion,
 }
 
 #[cfg(feature = "graph")]
 impl DeferredPetgraphBackend {
-    fn new() -> Self {
+    fn new(fusion: crate::fusion::Fusion) -> Self {
         Self {
             inner: std::sync::Mutex::new(None),
+            fusion,
         }
     }
 }
@@ -801,7 +840,7 @@ impl RetrievalBackend for DeferredPetgraphBackend {
         // is fast relative to the SQLite hydration it triggers.
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            *guard = Some(PetgraphBackend::from_conn(conn)?);
+            *guard = Some(PetgraphBackend::from_conn(conn, self.fusion)?);
         }
         guard.as_ref().expect("just initialised").memory_candidates(
             conn,
@@ -848,19 +887,190 @@ mod tests {
 
     // ── S5.1 smoke tests (unchanged) ─────────────────────────────────────────
 
-    /// backend_for("flat") resolves to FlatBackend (smoke test — exercises the
+    /// backend_for("flat", crate::fusion::Fusion::Linear) resolves to FlatBackend (smoke test — exercises the
     /// selection point without hitting SQLite).
     #[test]
     fn backend_for_flat_resolves() {
-        let _b = backend_for("flat");
+        let _b = backend_for("flat", crate::fusion::Fusion::Linear);
     }
 
     /// All variant strings resolve without panicking.
     #[test]
     fn backend_for_all_known_variants_no_panic() {
         for variant in &["flat", "graph-lite", "graph", "unknown-typo"] {
-            let _b = backend_for(variant);
+            let _b = backend_for(variant, crate::fusion::Fusion::Linear);
         }
+    }
+
+    // ── v2.6: the no-regression gate for the default flip ────────────────────
+
+    /// The gate on making `graph-lite` the default backend: on a realistic
+    /// corpus, with edges actually present, graph-lite must return a SUPERSET
+    /// of flat's candidates, and every flat candidate must keep its
+    /// `raw_relevance` unchanged.
+    ///
+    /// That is the whole safety argument. Graph-reached candidates enter with
+    /// `raw_relevance = 0.0`, so they rank below every direct hit and can only
+    /// occupy slots flat would have left empty — which means flipping the
+    /// default can broaden recall but cannot displace a result.
+    #[test]
+    fn graph_lite_is_a_superset_of_flat_with_edges_present() {
+        let conn = make_conn();
+        let corpus = [
+            (
+                "mem-a",
+                "convention",
+                "[tags: sqlite wal] checkpoint the WAL before copying brain.db",
+            ),
+            (
+                "mem-b",
+                "failure_pattern",
+                "[tags: sqlite wal] opening a WAL database read-only skips recovery",
+            ),
+            (
+                "mem-c",
+                "command",
+                "[tags: rust cargo] regenerate the schema with cargo xtask gen",
+            ),
+            (
+                "mem-d",
+                "fact",
+                "[tags: rust cargo] the workspace pins edition 2024",
+            ),
+            (
+                "mem-e",
+                "preference",
+                "[tags: search] prefer ripgrep over grep for large trees",
+            ),
+        ];
+        for (id, kind, text) in corpus {
+            insert_memory(&conn, id, kind, text);
+            crate::graph::project_entities(&conn, id, text).expect("project entities");
+        }
+        // Link the corpus exactly the way the write path does.
+        for (id, _, _) in corpus {
+            let edges = crate::graph::incremental_edges_for_memory(&conn, id, 0).expect("edges");
+            let tuples: Vec<(String, String, String)> = edges
+                .into_iter()
+                .map(|e| (e.src_id, e.dst_id, e.edge_type))
+                .collect();
+            projector::add_memory_edges(&conn, &tuples).expect("persist edges");
+        }
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_edges WHERE edge_type='relates_to'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            edge_count > 0,
+            "fixture must actually have edges, or this proves nothing"
+        );
+
+        for query in [
+            "wal checkpoint",
+            "cargo schema",
+            "ripgrep",
+            "sqlite recovery read-only",
+            "something entirely unrelated to this corpus",
+        ] {
+            let flat = FlatBackend {
+                fusion: crate::fusion::Fusion::Linear,
+            }
+            .memory_candidates(&conn, query, None, 90.0)
+            .expect("flat");
+            let graph = GraphLiteBackend {
+                fusion: crate::fusion::Fusion::Linear,
+            }
+            .memory_candidates(&conn, query, None, 90.0)
+            .expect("graph-lite");
+
+            for candidate in &flat {
+                let same = graph
+                    .iter()
+                    .find(|g| g.capsule.expansion_handle == candidate.capsule.expansion_handle)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "graph-lite dropped a flat candidate for {query:?}: {}",
+                            candidate.capsule.expansion_handle
+                        )
+                    });
+                assert!(
+                    (same.raw_relevance - candidate.raw_relevance).abs() < f32::EPSILON,
+                    "graph-lite changed a flat candidate's relevance for {query:?}: \
+                     {} vs {}",
+                    same.raw_relevance,
+                    candidate.raw_relevance
+                );
+            }
+            assert!(
+                graph.len() >= flat.len(),
+                "graph-lite must never shrink the pool for {query:?}: {} < {}",
+                graph.len(),
+                flat.len()
+            );
+        }
+    }
+
+    /// The corollary: a graph-reached candidate enters at a hop-decayed share
+    /// of the best flat signal, never at full strength — so it ranks below the
+    /// hit that pulled it in.
+    #[test]
+    fn graph_reached_candidates_are_hop_decayed_below_their_seed() {
+        let conn = make_conn();
+        for (id, kind, text) in [
+            (
+                "mem-a",
+                "convention",
+                "[tags: sqlite wal] checkpoint the WAL before copying",
+            ),
+            (
+                "mem-b",
+                "fact",
+                "[tags: sqlite wal] recovery is skipped on read-only opens",
+            ),
+        ] {
+            insert_memory(&conn, id, kind, text);
+            crate::graph::project_entities(&conn, id, text).expect("entities");
+        }
+        projector::add_memory_edges(
+            &conn,
+            &[(
+                "mem-a".to_string(),
+                "mem-b".to_string(),
+                "relates_to".to_string(),
+            )],
+        )
+        .expect("edge");
+
+        // "checkpoint" hits mem-a directly; mem-b arrives only via the edge.
+        let graph = GraphLiteBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        }
+        .memory_candidates(&conn, "checkpoint", None, 90.0)
+        .expect("graph-lite");
+        let reached = graph
+            .iter()
+            .find(|c| c.capsule.expansion_handle.contains("mem-b"))
+            .expect("mem-b must be reachable through the edge");
+        let seed = graph
+            .iter()
+            .find(|c| c.capsule.expansion_handle.contains("mem-a"))
+            .expect("mem-a is the direct hit");
+        assert!(
+            reached.raw_relevance < seed.raw_relevance,
+            "a graph-reached candidate must rank below the hit that pulled it in: \
+             {} vs {}",
+            reached.raw_relevance,
+            seed.raw_relevance
+        );
+        let expected = seed.raw_relevance * HOP_DECAY;
+        assert!(
+            (reached.raw_relevance - expected).abs() < 1e-4,
+            "one hop must decay by HOP_DECAY: got {}, expected {expected}",
+            reached.raw_relevance
+        );
     }
 
     // ── S5.2 correctness bars ─────────────────────────────────────────────────
@@ -877,8 +1087,12 @@ mod tests {
         insert_memory(&conn, "mem-a", "fact", "cargo build compiles rust code");
         insert_memory(&conn, "mem-b", "preference", "use ripgrep for searching");
 
-        let flat_backend = FlatBackend;
-        let graph_backend = GraphLiteBackend;
+        let flat_backend = FlatBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        };
+        let graph_backend = GraphLiteBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        };
 
         let flat_candidates = flat_backend
             .memory_candidates(&conn, "cargo rust", None, 90.0)
@@ -1035,9 +1249,11 @@ mod tests {
         .expect("insert edge");
 
         // Flat backend: only mem-survivor should be in the result.
-        let flat = FlatBackend
-            .memory_candidates(&conn, "cargo fmt", None, 90.0)
-            .expect("flat");
+        let flat = FlatBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        }
+        .memory_candidates(&conn, "cargo fmt", None, 90.0)
+        .expect("flat");
         let flat_ids: HashSet<String> = flat
             .iter()
             .filter_map(|c| {
@@ -1057,9 +1273,11 @@ mod tests {
         );
 
         // Graph-lite backend: must add mem-connected via the 1-hop edge.
-        let graph = GraphLiteBackend
-            .memory_candidates(&conn, "cargo fmt", None, 90.0)
-            .expect("graph");
+        let graph = GraphLiteBackend {
+            fusion: crate::fusion::Fusion::Linear,
+        }
+        .memory_candidates(&conn, "cargo fmt", None, 90.0)
+        .expect("graph");
         let graph_ids: HashSet<String> = graph
             .iter()
             .filter_map(|c| {
@@ -1102,14 +1320,14 @@ mod tests {
         }
     }
 
-    /// S5.2-D: `backend_for("graph-lite")` now resolves to `GraphLiteBackend`
+    /// S5.2-D: `backend_for("graph-lite", crate::fusion::Fusion::Linear)` now resolves to `GraphLiteBackend`
     /// (not the old FlatBackend stub).  Verify it returns a backend that calls
     /// `graph_expand` (indirectly: confirm it compiles and doesn't panic on
     /// an empty DB, which the old stub also didn't — but the wiring is now live).
     #[test]
     fn backend_for_graph_lite_resolves_to_graph_lite_backend() {
         let conn = make_conn();
-        let backend = backend_for("graph-lite");
+        let backend = backend_for("graph-lite", crate::fusion::Fusion::Linear);
         // Must not panic on an empty brain.
         let result = backend.memory_candidates(&conn, "some query", None, 90.0);
         assert!(
@@ -1126,7 +1344,8 @@ mod tests {
     #[test]
     fn petgraph_backend_from_conn_empty_db() {
         let conn = make_conn();
-        let backend = PetgraphBackend::from_conn(&conn).expect("from_conn");
+        let backend =
+            PetgraphBackend::from_conn(&conn, crate::fusion::Fusion::Linear).expect("from_conn");
         // Empty graph → no centrality entries.
         let centrality = backend.node_centrality();
         assert!(centrality.is_empty(), "empty graph → empty centrality");
@@ -1157,7 +1376,8 @@ mod tests {
         )
         .expect("insert edges");
 
-        let backend = PetgraphBackend::from_conn(&conn).expect("from_conn");
+        let backend =
+            PetgraphBackend::from_conn(&conn, crate::fusion::Fusion::Linear).expect("from_conn");
 
         // Centrality: node-a has out=1 in=0; node-b has out=1 in=1; node-c has out=0 in=1.
         let centrality = backend.node_centrality();
@@ -1223,7 +1443,8 @@ mod tests {
         )
         .expect("insert edge");
 
-        let backend = PetgraphBackend::from_conn(&conn).expect("from_conn");
+        let backend =
+            PetgraphBackend::from_conn(&conn, crate::fusion::Fusion::Linear).expect("from_conn");
 
         let candidates = backend
             .memory_candidates(&conn, "cargo fmt", None, 90.0)
@@ -1249,13 +1470,13 @@ mod tests {
         );
     }
 
-    /// S5.3-D: `backend_for("graph")` returns a `DeferredPetgraphBackend` (wrapped
+    /// S5.3-D: `backend_for("graph", crate::fusion::Fusion::Linear)` returns a `DeferredPetgraphBackend` (wrapped
     /// as Box<dyn RetrievalBackend>) that works on an empty brain without panicking.
     #[cfg(feature = "graph")]
     #[test]
     fn backend_for_graph_resolves_to_petgraph_backend() {
         let conn = make_conn();
-        let backend = backend_for("graph");
+        let backend = backend_for("graph", crate::fusion::Fusion::Linear);
         // Must not panic on an empty brain.
         let result = backend.memory_candidates(&conn, "some query", None, 90.0);
         assert!(
@@ -1264,13 +1485,13 @@ mod tests {
         );
     }
 
-    /// S5.3-E: without the `graph` feature, `backend_for("graph")` falls back to
+    /// S5.3-E: without the `graph` feature, `backend_for("graph", crate::fusion::Fusion::Linear)` falls back to
     /// `GraphLiteBackend` (not flat) — the fallback is the next-best backend.
     #[cfg(not(feature = "graph"))]
     #[test]
     fn backend_for_graph_falls_back_to_graph_lite_without_feature() {
         let conn = make_conn();
-        let backend = backend_for("graph");
+        let backend = backend_for("graph", crate::fusion::Fusion::Linear);
         // Must still work (graph-lite fallback).
         let result = backend.memory_candidates(&conn, "some query", None, 90.0);
         assert!(

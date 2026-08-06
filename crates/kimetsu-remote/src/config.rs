@@ -77,7 +77,7 @@ pub struct ServeArgs {
     #[arg(long, default_value = "jina-reranker-v1-tiny-en")]
     pub reranker: String,
 
-    /// v3.0 #3 Slice C: this server's node id — the HLC node and the machine part
+    /// v2.6 #3 Slice C: this server's node id — the HLC node and the machine part
     /// of each write's `origin` (`<node>/user:<name>`). Defaults to the hostname,
     /// else "remote". Keep it stable + unique per server so a synced team brain can
     /// attribute and order server-written events.
@@ -95,7 +95,7 @@ struct TokensFile {
     global: Vec<String>,
     #[serde(default)]
     per_repo: HashMap<String, Vec<String>>,
-    /// v3.0 #3 Slice C: token → display name for per-user write attribution.
+    /// v2.6 #3 Slice C: token → display name for per-user write attribution.
     /// Optional `[names]` table; absent in pre-Slice-C tokens files.
     #[serde(default)]
     names: HashMap<String, String>,

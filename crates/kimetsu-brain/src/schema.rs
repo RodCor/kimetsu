@@ -315,7 +315,7 @@ pub(crate) fn migrate_v1_to_v2(conn: &Connection) -> KimetsuResult<()> {
         CREATE INDEX IF NOT EXISTS idx_conflicts_new_memory
             ON memory_conflicts (new_memory_id);
 
-        -- v3.0 #3 Slice B: concurrent-supersede conflicts surfaced during team
+        -- v2.6 #3 Slice B: concurrent-supersede conflicts surfaced during team
         -- sync (a member superseded to two DIFFERENT survivors by concurrent
         -- edits). HLC replay still picks a deterministic winner; this records the
         -- collision for human review. A PROJECTION — cleared + repopulated by
@@ -492,7 +492,7 @@ pub(crate) fn migrate_v6_to_v7(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v3.0 #3 (fleet write-safety): add a per-event `origin` column so every event
+/// v2.6 #3 (fleet write-safety): add a per-event `origin` column so every event
 /// records the device + agent that wrote it (`<machine_id>/<agent>`). Nullable;
 /// pre-v8 events read back as `origin = NULL` ("unknown"). Rebuild-safe and
 /// sync-ready (the origin is replicated verbatim).
@@ -501,7 +501,7 @@ pub(crate) fn migrate_v7_to_v8(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// v3.0 #3 Slice B (team sync): add a per-event `hlc` column (Hybrid Logical
+/// v2.6 #3 Slice B (team sync): add a per-event `hlc` column (Hybrid Logical
 /// Clock, canonical string) for globally-deterministic total-order replay.
 /// Existing rows are backfilled as `0000000000000.{rowid:010}.local` — `wall = 0`
 /// so all pre-v9 events sort BEFORE any new HLC event, ordered among themselves by
@@ -550,6 +550,46 @@ pub(crate) fn migrate_v9_to_v10(conn: &Connection) -> KimetsuResult<()> {
             ON query_routes(memory_id);
         ",
     )?;
+    Ok(())
+}
+
+/// v2.6 (RFC phase 2c): `memory_entities` — tags and salient terms as rows.
+///
+/// Until now tags lived inline in the memory text as `[tags: …]` and were
+/// re-parsed on every read, and the tag boost was a substring match on the
+/// rendered summary. Promoting them to a table buys three things:
+///
+///   * the graph layer can find "other memories mentioning X" with an index
+///     lookup instead of an O(n²) scan over the whole corpus, which is what
+///     made edge-building a batch job rather than something the write path
+///     could afford;
+///   * `source` distinguishes an author-supplied tag from a salient term the
+///     extractor guessed, so ranking can weight them differently;
+///   * a tag match becomes an equality test rather than a substring one.
+///
+/// It is a pure projection of `memories.text` — `kimetsu brain rebuild`
+/// repopulates it from the event log, and nothing here needs its own events.
+pub(crate) fn migrate_v10_to_v11(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_entities (
+            memory_id  TEXT NOT NULL,
+            entity     TEXT NOT NULL,
+            source     TEXT NOT NULL DEFAULT 'term',
+            PRIMARY KEY (memory_id, entity)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+            ON memory_entities(entity);
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
+            ON memory_entities(memory_id);
+        ",
+    )?;
+    // Backfill from the existing corpus so an upgraded brain has a usable
+    // entity index immediately, rather than only for memories written after
+    // the upgrade. Best-effort: on a synthetic or partial DB (migration tests,
+    // tooling) the `memories` table may not be there, and a missing backfill is
+    // recoverable with `kimetsu brain rebuild` — a failed migration is not.
+    let _ = crate::graph::reproject_all_entities(conn);
     Ok(())
 }
 

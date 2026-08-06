@@ -57,6 +57,45 @@ pub struct ReinforceSummary {
     pub routes_embedded: usize,
 }
 
+/// Close the benchmark learning loop for one graded task (v2.5.2): when a
+/// task PASSES, the memories most relevant to it get a grouped, query-linked
+/// citation — the exact signal consolidation consumes (usefulness +1.0 each,
+/// query-routes from task -> those memories, and staples from their
+/// co-citation). Driven host-side by the benchmark harness after grading, so
+/// the learning signal never depends on the in-container agent calling any
+/// tool. Failures produce no citation (the retrieved memories are not
+/// necessarily to blame). Returns how many memories were credited.
+///
+/// Why this exists: the MCP `kimetsu_brain_cite` tool routes through the
+/// SINGLETON `record_mcp_citation` path (one id, no query, fresh run) which
+/// feeds none of the three consumers. This routes through the grouped
+/// `record_citations` path, which feeds all three.
+pub fn credit_benchmark_outcome(
+    start: &Path,
+    task: &str,
+    passed: bool,
+    top_k: usize,
+) -> KimetsuResult<usize> {
+    if !passed {
+        return Ok(0);
+    }
+    // Retrieve the memories most relevant to this task, then credit the top
+    // few as "in context when the task was solved". search_memories ranks by
+    // BM25 over the task text across project + user brains.
+    let hits = crate::project::search_memories(start, task, top_k.max(1) as u32, 0, None, None)?;
+    let ids: Vec<String> = hits.into_iter().take(top_k).map(|h| h.memory_id).collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    crate::project::record_citations(
+        start,
+        &ids,
+        Some("benchmark: in context when task passed"),
+        Some(task),
+    )?;
+    Ok(ids.len())
+}
+
 /// Run the offline consolidation pass: staple qualifying co-citations and/or
 /// rebuild the query-routes table. Both idempotent; safe to run every
 /// session end or between benchmark iterations.
@@ -377,6 +416,7 @@ mod tests {
             raw_relevance: 0.50,
             embedding: None,
             cosine: None,
+            created_at: None,
             capsule: crate::context::ContextCapsule {
                 id: "x".into(),
                 kind: "memory".into(),

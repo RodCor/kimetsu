@@ -50,7 +50,7 @@ hf-hub = { version = "0.5", optional = true, default-features = false, features 
 # already native (ort). The lean build never links it.
 usearch = { version = "2", optional = true }
 ignore.workspace = true
-kimetsu-core = { path = "../kimetsu-core", version = "2.5.2" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.6.0" }
 # v0.4.5: regex backs the secret-redaction patterns in
 # `kimetsu_brain::redact`. The crate is already a workspace pin
 # elsewhere; we just opt this crate into it now.

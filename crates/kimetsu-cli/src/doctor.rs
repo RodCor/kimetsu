@@ -419,7 +419,19 @@ fn check_embedder_default() -> CheckReport {
                 name: "default embedder loads",
                 category: "retrieval",
                 outcome: Outcome::Warn {
-                    reason: "no `embeddings` feature - semantic retrieval off. Reinstall with `cargo install kimetsu-cli` for the default semantic build.".into(),
+                    // The old wording here told users to run
+                    // `cargo install kimetsu-cli` "for the default semantic
+                    // build" — but that is exactly the command that produces
+                    // THIS build: kimetsu-cli's default feature set is empty,
+                    // deliberately, so the crates.io install works on targets
+                    // where `ort` ships no prebuilt. Say what actually helps.
+                    reason: "lean build: no `embeddings` feature, so retrieval is FTS-only — \
+                             no cosine, no ANN, no reranker, and semantic dedup and \
+                             conflict detection are silent no-ops. Install the semantic \
+                             build with `npm install -g kimetsu-ai` (recommended), or \
+                             `cargo install kimetsu-cli --features embeddings` on a target \
+                             with ONNX Runtime prebuilts."
+                        .into(),
                 },
                 detail: Some("NoopEmbedder (FTS-only retrieval)".into()),
             }
@@ -442,6 +454,29 @@ fn check_cheap_model(workspace: &Path) -> CheckReport {
     const NAME: &str = "cheap model (distiller / harvester)";
     const CATEGORY: &str = "learning";
 
+    // v2.6: the tier is the umbrella gate. Deep asked for but unreachable is
+    // the one case worth shouting about — the label says model calls are on
+    // while nothing can actually run.
+    let config = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| kimetsu_brain::project::load_config(&paths).ok());
+    if let Some(ref cfg) = config
+        && cfg.tier_downgraded()
+    {
+        return CheckReport {
+            name: NAME,
+            category: CATEGORY,
+            outcome: Outcome::Warn {
+                reason: "tier = \"deep\" but no cheap model is reachable, so the brain is \
+                         running free: distillation, reflection, HyDE and entailment \
+                         conflict checks are all off. Configure [cheap_model] (or \
+                         [learning.distiller]), or set tier = \"free\" to make it explicit."
+                    .into(),
+            },
+            detail: None,
+        };
+    }
+
     // Resolve the cheap model config.
     let resolved = resolve_distiller(workspace);
     let Some(ref r) = resolved else {
@@ -449,14 +484,35 @@ fn check_cheap_model(workspace: &Path) -> CheckReport {
             name: NAME,
             category: CATEGORY,
             outcome: Outcome::Skip {
-                reason: "no cheap model configured — session-end distillation and \
-                         consolidation distillation will not run. Configure \
-                         [cheap_model] or [learning.distiller] to enable."
+                reason: "no cheap model configured — running the free tier: storage and \
+                         retrieval are model-free, and session-end distillation, \
+                         reflection and HyDE do not run. Configure [cheap_model] or \
+                         [learning.distiller] to move to the deep tier."
                     .into(),
             },
             detail: None,
         };
     };
+
+    // An explicit `tier = "free"` is a durable opt-out: credentials are
+    // present but the pipeline must not call a model. Say so, rather than
+    // reporting a model that will never be used.
+    if let Some(ref cfg) = config
+        && !cfg.allows_model_in_pipeline()
+    {
+        return CheckReport {
+            name: NAME,
+            category: CATEGORY,
+            outcome: Outcome::Skip {
+                reason: format!(
+                    "tier = \"free\" — {} {} is configured but the memory pipeline will \
+                     not call it. This is the zero-LLM-calls guarantee, on purpose.",
+                    r.provider, r.model
+                ),
+            },
+            detail: None,
+        };
+    }
 
     // For non-ollama providers: the credential check already happened in
     // resolve_distiller; report configured + provider/model.

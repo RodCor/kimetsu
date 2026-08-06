@@ -7,6 +7,399 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v2.6.0: Speak first on every host
+
+The README says Kimetsu "speaks first." An audit found that true on Claude Code,
+thin on Codex, and absent on Cursor, Pi and OpenClaw. This closes that gap and
+files the v2.6 plan behind it.
+
+### Fixed — the semantic build, and what it was silently dropping
+
+- **`--features embeddings` did not compile, and the reason on record was
+  wrong.** The RFC listed four open items as blocked on an unreachable ONNX
+  Runtime prebuilt. `ort` fetches fine and every model was already cached; the
+  build failed on `E0063` in Kimetsu's own code. `daemon_capsules_to_bundle`
+  sits inside `#[cfg(feature = "embeddings")]` and never supplied the three
+  `ContextBundle` fields that the ordering and coverage work added, so no lean
+  build could see it. CI does run `cargo test --features embeddings` — the
+  branch had simply never been pushed.
+
+- **Ordering and evidence-coverage never reached anyone on a semantic build.**
+  This is the part that mattered. On a build with a live embed daemon,
+  `try_daemon_retrieve` answers first and the in-process retrieval — which
+  measures coverage and renders capsules in date order — runs only on a miss.
+  So the daemon path, the *default* proactive path on the semantic flavor, was
+  serving bundles with neither. Two features the RFC listed as landed and
+  tested reached nobody on the flavor where retrieval is good enough to trust
+  them. Now: ordering queries decline the daemon outright, because the wire
+  protocol carries no date to order by and the in-process path does; and
+  coverage is measured on the daemon path too, degrading to "no claim" rather
+  than to a false "memory does not cover X" when the brain will not open.
+
+- **The Deep tier could not talk to any current frontier Claude model.** The
+  Anthropic provider sent `"temperature"` on every request, hardcoded to
+  0.1–0.3 across the pipeline. Sampling parameters were removed from the Claude
+  line at Opus 4.7: `temperature`, `top_p` and `top_k` now return a **400** on
+  Opus 4.7, Opus 4.8, Opus 5 and Fable 5, and Sonnet 5 rejects any non-default
+  value. So configuring any of those as the distiller, `ask`, or reflection
+  model failed outright — not degraded output, no output. Anything at or below
+  the Opus 4.6 / Sonnet 4.6 generation was unaffected, which is why it went
+  unnoticed.
+
+  The parameter is now omitted for models that reject it. The gate is an
+  *allowlist* of models known to accept it, so a model this build has never
+  heard of omits it: guessing wrong by omitting costs a little determinism on
+  one distillation, and guessing wrong by sending costs the entire request.
+  Sampling removal has only ever moved one way across the Claude line. Matching
+  starts at the first `claude-`, so bare, Bedrock (`anthropic.claude-…`) and
+  cross-region inference-profile (`us.anthropic.claude-…`) ids all resolve the
+  same way.
+
+- **A test wrote into the developer's own brain.**
+  `remote_write_is_attributed_to_the_token_user` let project discovery walk out
+  of its tempdir and into `~/.kimetsu`. On this machine it failed loudly on a
+  schema mismatch, which was the lucky outcome — on a machine where the schemas
+  agree it passes, having written a test memory into a real brain.
+
+### Added
+
+- **A TypeScript SDK** at `npm/kimetsu-sdk`, published as `@kimetsu-ai/sdk`. The
+  ecosystem Kimetsu integrates with — Pi extensions, OpenClaw plugins, Cursor,
+  VS Code, MCP clients — is TypeScript, and every one of those integrations was
+  shelling out to the binary and parsing its text output. That is how the Pi
+  extension and its published npm copy drifted apart without anyone noticing:
+  there was no shared typed surface for them to share. It mirrors the Python
+  SDK method-for-method (`memory`, `config`, `models`, `benchmark`, plus
+  `context` / `record` / `status` / `insights` / `cite`), reads the same
+  `KIMETSU_REMOTE_*` variables, and keeps the same four error classes so a
+  caller can tell "retry this" from "re-authenticate" from "the answer is no".
+  Zero runtime dependencies — Node 18's `fetch` — because an embedded client's
+  dependencies become its host's. One client rather than a sync/async pair,
+  since in JavaScript every call is already a promise. `client.call()` reaches
+  tools newer than the SDK, so a version mismatch never sends anyone back to
+  parsing text.
+
+- **`kimetsu brain drift`** reports which recent sessions wandered off the task
+  they opened with — cosine of each turn against the session's first prompt,
+  which is what it set out to do. Nautilus Compass gets ROC AUC 0.83 on this
+  shape of signal against real Claude Code traces with no model in the loop, and
+  Kimetsu already keeps a warm embedder, so the marginal cost is one embedding
+  per turn. What it sees is narrower than the paper's setting and the docs say
+  so: Compass reads agent traces, a memory sidecar reads user prompts, so this is
+  a claim about the session's topic and not about the agent's behaviour.
+  Divergence must be sustained across three consecutive turns — one tangential
+  question is a question — and the anchor is the opening turn rather than a
+  rolling window, since a rolling anchor lets a session walk anywhere one step at
+  a time without registering. Report-only: retrieval is not silently re-anchored
+  on a signal with no measured operating point. On a build with no embedder the
+  command says there is nothing to compute rather than substituting a lexical
+  stand-in on a different scale.
+
+- **Injected memory is framed as a prior conclusion, not as knowledge.**
+  MemSyco-Bench reports most memory systems scoring *worse* on sycophancy than
+  using no memory at all: a retrieved memory arrives looking like ground truth,
+  so the model defers to it over evidence directly in front of it. Kimetsu's
+  header read "Kimetsu brain relevant knowledge for this task" — and *knowledge*
+  is the wrong word for what was recorded at some past moment by someone who
+  believed it then. The injection now states which questions memory settles
+  (what was decided, learned, or preferred — the repository does not record why)
+  and which it does not (what the code currently is), and resolves the conflict
+  case explicitly: prefer what you can check now over what was recorded then.
+  The memory itself is never hedged — an agent told "this might be wrong"
+  ignores memory, which is the whole product — only outranked. The proactive
+  hook gets a short suffix rather than a preamble, since it interrupts work
+  already underway on a one-capsule budget. MCP clients get the same rule
+  through `usage.how_to_use`.
+
+- **`brain import` quarantines packs from the network.** Provenance-weighted
+  trust discounts a poisoned pack; it does not stop one. Memory poisoning is
+  worth stopping rather than ranking down precisely because, unlike prompt
+  injection, it persists across every future session. So an imported pack is now
+  held in the review queue `brain memory proposals` already drives, and nothing
+  in it can reach a session until you accept it. On by default for `http(s)://`
+  sources — content authored elsewhere and fetched over the network is the widest
+  attack surface here — and off for a local file or stdin, which you chose and
+  can open; `--quarantine` / `--no-quarantine` override either way. `--mode
+  replace` alongside quarantine is refused, since superseding memories you have
+  in favour of content you have not read is the worst of both. Entries matching a
+  memory you already hold are deduped rather than proposed, because a review
+  queue nobody can face is not a safety mechanism. Nothing reaches backward:
+  packs imported before this stay live and stay discounted by origin.
+
+### Fixed
+
+- **`retry` now matches a corpus that says `retries`.** The light query stemmer
+  stripped `-ing/-ed/-es/-s` but had no y→ies rule, so `retries` reduced to
+  `retri`, `retry` matched no suffix at all, and neither prefixed the other.
+  Since matching downstream is substring and FTS-prefix, a query about `retry`
+  treated a corpus that plainly said `retries` as never mentioning it — losing
+  the term's IDF weight in the lexical floor and, since v2.6, reporting it to the
+  user as a gap in coverage. It affects every `-y` word: `query`, `policy`,
+  `memory`, `binary`, `registry` — a large share of the vocabulary this corpus is
+  made of. A trailing `y`/`i` after a consonant is now stripped so both forms
+  land on the shared prefix. Vowel-`y` (`delay`, `gateway`, `journeys`) is left
+  alone, as are short words. Found by BrainBench's new sycophancy track, which
+  flagged a gap on a question the fixture memories answered outright.
+
+- **The skills loop tells you it is waiting.** A memory cited across three
+  distinct runs earns skill status, and detection has run on the maintenance
+  schedule since the daemon landed — into a log file nobody opens. So a memory
+  could cross the threshold and sit there indefinitely, because closing the loop
+  needed a person who was never told there was anything to close.
+  `find_synthesis_candidates` having exactly one caller was the same fact stated
+  as a call graph. The warm start now carries one line naming what is waiting and
+  the command that acts on it: candidates with no draft yet, and drafts awaiting
+  a decision. A candidate that already has a proposal is not counted as a
+  candidate — the loop has moved on. Silent when there is nothing to act on.
+- **Proactive injections are scored per hook surface.** `broker.proactive_prefetch`
+  has been default-off since it shipped, its doc comment saying graduation waits
+  on evidence that file-path-augmented queries do not add noise — while nothing
+  recorded which surface an injection came from, so that evidence could never
+  accumulate and the flag could never graduate on any timescale. Injections now
+  carry their surface, and `kimetsu brain policy` reports acceptance (injected
+  vs. subsequently cited) for each: `posttool`, which reacts to a command that
+  observably failed; `pretool_command`; and `pretool_prefetch`, which predicts
+  from a file path alone. Scored apart, so a strong surface cannot launder a weak
+  one's noise. Events from before this change carry no surface and are dropped
+  rather than bucketed into a default, which would credit one surface with
+  another's history. The default stays off until the comparison is made on a real
+  brain — what changed is that it can be.
+
+- **Ordering questions get dated, ordered memories.** Memories carry
+  `created_at` and capsules did not, so a bundle rendered in score order with no
+  dates gave a reader asked "did we switch to `thiserror` before or after the
+  migration?" nothing to order the answer by — the reason event ordering was the
+  weakest measured ability (32.5% on BEAM 100K). Retrieval was never at fault:
+  the memories were found and selected, and the ordering was thrown away at
+  render time. When a query carries an ordering marker (`before`, `after`,
+  `first`, `when`, `timeline`, …) the bundle is now re-rendered oldest-first with
+  each memory's date in front of its text, under a line telling the reader that
+  is what they are looking at. It runs after the budget loop, so it is
+  presentation and not selection — it cannot admit a capsule the broker rejected
+  or drop one it chose — and `used_tokens` is recomputed because the dates cost
+  tokens. Repo files, which have no position in the memory timeline, keep their
+  relative order after the dated ones rather than being dropped or dated. The
+  marker gate is narrow on purpose: dating every capsule on every query would
+  spend tokens on the majority of questions that are not about time. Exposed as
+  `chronological` / `chronological_note` on `kimetsu_brain_context`.
+
+- **Pi and OpenClaw now inject anything at all.** Both generated extensions
+  spawned `kimetsu` with `stdio: "ignore"`, so the context hook read an empty
+  stdin (bailing on its minimum-prompt guard) and its output went to
+  `/dev/null`. Kimetsu was write-only on those hosts. The extensions now pipe
+  stdio, feed the hook payload in, and return the parsed context through the
+  host's own contract — Pi's `before_agent_start` message, OpenClaw's
+  `agent_turn_prepare` `prependContext`. Every failure mode stays a silent
+  no-op: missing binary, hung binary, crash, unparseable output.
+- **One source of truth for integration assets.** The Pi and OpenClaw templates
+  moved out of string literals in `bridge.rs` into
+  `crates/kimetsu-chat/assets/`, pulled in with `include_str!`. The published
+  `kimetsu-pi` npm copy is vendored from the same file by
+  `scripts/sync-pi-package.sh`, and a new CI job diffs the two. The drift this
+  prevents was real: the npm copy had timeout hardening the installed copy
+  never got, so a hung binary could stall a Pi lifecycle hook indefinitely.
+- **`digest::is_stale()` is wired up.** It was implemented and documented as
+  driving a detached rebuild, with no production caller — so a moved corpus put
+  a synchronous digest rebuild in front of the agent's first turn. The cached
+  digest is now served immediately and the rebuild spawns detached.
+
+### Added
+
+- **Warm start on every host.** `kimetsu brain context-hook
+  --warm-on-first-prompt` prepends the repo digest and episodic resume to the
+  first turn of a session, exactly once — covering Codex (which has no
+  `SessionStart` event), Pi, OpenClaw, and any future host with only a per-turn
+  hook. Claude Code does not pass the flag and keeps its `SessionStart` route,
+  so nobody receives the block twice. A short prompt still gets the warm start:
+  the length guard exists to skip meaningless retrieval, not to withhold
+  orientation.
+- **Cursor warm start over MCP.** Cursor has no hook surface at all, so the
+  first `kimetsu_brain_context` call of a session now returns a `warm_start`
+  field alongside the capsules, and the installed Cursor rule tells the agent to
+  make that call at task start. Scoped to the stdio path only — one
+  `kimetsu-remote` process fans out across many sessions.
+### Measured — an agentic re-run that does not reproduce the 13x claim
+
+`kbench` was run end-to-end for this release: 12 Terminal-Bench tasks
+stratified across all nine families of `prog-families-v1`, `claude+km` against
+`claude`, 24 trials on Claude Opus 5, no grading or quota errors.
+
+| | wins | cost | cost/win | input tokens |
+|---|---|---|---|---|
+| `claude+km` | 8/12 | $82.19 | $10.27 | 13.9M |
+| `claude` | 9/12 | $67.32 | $7.48 | 11.4M |
+
+The win-rate difference is a single task and is **not** a result — discordant
+pairs are 1 vs 2, one flip reverses the ranking, and a repeat of the same task
+inside this session scored differently between runs. What n=12 supports is *no
+detectable difference in win rate*, not that the brain hurts.
+
+The cost difference is firmer, because token counts are measured rather than
+sampled: 22% more tokens overall, 37% more per win. That is the opposite
+direction from the ~13x cost-per-win advantage recorded in
+`docs/ROI-METHODOLOGY.md`, which is now caveated in place rather than quietly
+left standing. That figure was measured on Sonnet 3.5 against a different,
+unenumerated slice, so this is not a like-for-like refutation — but it is
+enough that 13x should not be quoted without the caveat.
+
+Worth stating because it is the fairest reading and still not an excuse:
+Terminal-Bench gives every task a fresh container and unrelated neighbours, so
+there is almost no prior-session knowledge for a cross-session memory system to
+retrieve. It is the weakest setting for Kimetsu's thesis. It is also the
+instrument the 13x number came from, so it cannot be used to dismiss this
+result while retaining that one.
+
+### Measured — BrainBench re-run, and two safety tracks that now exist
+
+Full 264-scenario BrainBench re-run on the semantic build, plus the sycophancy
+and poisoning tracks this release had to withdraw a claim about.
+
+**dedup 77.0% (published 77%) and forgetting 87.8% (published 88%) reproduce
+almost exactly.** Two independent measurements landing on the same number is the
+useful result — it says the harness and the brain are both stable. Importance
+gained ~16 points, outside its confidence interval and apparently real.
+
+**Calibration reads 99.7% at n=122, and that is a problem rather than a win.**
+BrainBench's own published standard is that a benchmark returning ~100% measures
+nothing; a ±0.3% interval means the track has stopped discriminating. Those
+scenarios are synthesized from a retrieval pool rather than authored, and they
+have become too easy to be informative.
+
+**The Overall Brain Quality Index is not comparable across the two runs**, and
+the docs now say so rather than banking the delta. It is an unweighted mean over
+whatever ran; the mix changed from 142 scenarios to 264, with calibration alone
+now 46% of the run at 99.7%. A mean dominated by a saturated dimension rises
+whether or not anything improved. The published 80.0% stands as the figure it
+was, over the set it was measured on.
+
+The new tracks are `poisoning` and `render-contract`, in `kimetsu-bench`. They
+confirm three shipped defences work: 4b import quarantine, 4a trust-weighted
+ranking, and `brain audit` write-burst detection. Both score 100%, which is
+again a weakness and is documented as one — five scenarios covering the
+straightforward case, with no adversarial case that breaks.
+
+`render-contract` is deliberately not named "sycophancy": MemSyco measures a
+*reader* over-deferring to memory, BrainBench has no reader, and a number
+labelled sycophancy sitting next to `dedup 77%` is exactly the claim this
+release already had to withdraw once. Neither safety dimension is folded into
+any Overall Brain Quality Index.
+
+### Changed — the installed instructions, restructured (and a claim withdrawn)
+
+Kimetsu's own guidance — the MCP server instructions, the CLAUDE.md block, and
+the Cursor / Pi / OpenClaw skill files — was written in 2025-era style: numbered
+steps plus a conservative filter on the write path (*"Do NOT call for trivial or
+well-known knowledge"*, *"before non-trivial tasks"*, *"things that required real
+effort"*). It now states when to reach for each tool rather than fencing off when
+not to, drops the step-numbering, and tells the retrieval path plainly that an
+empty result cost nothing.
+
+**The behavioural claim behind this change did not survive being measured, and
+the honest version is the useful one.** The prediction was that stacked
+conservative qualifiers suppress `brain_record` on models that follow
+instructions literally, so removing them would raise the write rate. An A/B on
+`claude-opus-5` — three instruction variants × 10 scenarios × 5 repetitions,
+each a fresh headless session — says otherwise:
+
+| variant | clear-record | ambiguous middle | clear-skip |
+|---|---|---|---|
+| old text | 100% | 23% | 0% |
+| new text | 100% | **17%** | 0% |
+| new text, minus one clause | 100% | 23% | 0% |
+
+Two findings, neither of them the one expected. The write rate did not rise; the
+only measurable movement was **downward**, and it came from a clause this release
+itself introduced — *"well-known facts and things the repository already states
+are already available next session"*. Removing that clause returns behaviour
+exactly to the old text, which isolates it as the sole active ingredient: every
+other change was inert on this measurement. The clause is therefore gone.
+
+The second finding is the more interesting one. The rewrite replaced a
+prohibition with a reason on the theory that a literal reader applies a reason
+narrowly and a prohibition broadly. The model's own stated rationales show the
+opposite: under the old text it cited *"no real effort"*, and under the new one
+it cited the new clause almost verbatim — *"repo already states it"*. A reason
+that is **easier to evaluate** ("is this in the repository?") anchors harder than
+a vague bar ("did this require real effort?"). Reason-versus-prohibition was the
+wrong axis; specificity was the axis that mattered.
+
+Scope of the evidence, stated plainly: this measured the *record* decision only,
+via an explicit policy judgement rather than observed tool use inside a real
+agent loop, at n=5 with 8 of 10 scenarios unanimous across all three variants.
+The middle-band difference is 2 decisions out of 30 — small enough that "no
+detectable loosening" is the safe reading rather than "a proven regression". The
+retrieval-side change was not measured at all. What the release claims is
+therefore only that the text is structurally cleaner, not that it performs
+better.
+
+The `_REQUIRED` bridge and delegate variants are deliberately untouched: forcing
+the tool is what that mode is for, and the benchmark harness depends on it. A
+regression test asserts the instructions name each tool and carry no
+prohibition.
+
+- **`[broker] normalization`** selects how a candidate's raw relevance becomes
+  the `relevance` term: `per_kind` (the rule through v2.5) or `global`. Per-kind
+  normalizes within each capsule kind, so the best memory and the best repo_file
+  each reach `relevance = 1.0` however good either actually is — which is why
+  the lexical and semantic floors have to exist, pruning weak candidates before
+  normalization can flatter them. Global uses one max, so relevance means the
+  same thing across kinds. Ships with a per-request override so both rules can
+  be compared in one process against one corpus.
+
+  The default stays `per_kind`, and the reason is unusual enough to state: the
+  eval fixture is 18 memories of a single kind, and on a single-kind corpus the
+  two rules are *arithmetically identical*. `brain bench` cannot tell them
+  apart. Settling this needs a mixed-kind corpus that does not exist yet, and
+  building it inside the release that flips the default would be authoring the
+  instrument and the measurement together.
+
+- **CI builds and tests the TypeScript SDK**, and the release workflow
+  publishes it. `@kimetsu-ai/sdk` shipped in this release series with neither:
+  no job compiled it, and no step pushed it to npm. The whole argument for an
+  SDK is that integrations call a typed client instead of parsing text, which
+  only holds if the types compile. It publishes at its own package.json
+  version rather than the git tag — its API moves independently of the
+  binary's, and its PyPI sibling is versioned the same way.
+
+Two corrections that belong in the record even though the planning document
+carrying them is not published:
+
+- The reason given for the `embeddings` flavor not building was an unreachable
+  ONNX Runtime prebuilt. It was not; see **Fixed** above. Anyone who reads that
+  diagnosis somewhere else should ignore it.
+- Sycophancy and poisoning tracks were described as landed in `kimetsu-bench`.
+  They are not there. The *feature* is real and asserted end-to-end in
+  `cli_smoke.rs` — that test is what caught the y→ies stemmer bug — but the
+  benchmark tracks were never built and remain open.
+
+### Docs
+
+- `interfaces.md` listed `kimetsu_skill`, `cite_memory` and `expand_capsule` as
+  MCP tools. The first does not exist; the other two belong to the autonomous
+  agent pipeline, and are now documented there instead.
+- `the-broker.md` documents that capsules fill against **half** of the requested
+  `budget_tokens` — every published budget number read as double the real one.
+- `[storage] backend` no longer carries stale TODOs for `graph-lite` and
+  `graph`; both are implemented, and the doc now says what they do and notes
+  that `graph-lite` needs `kimetsu brain graph build` before it differs from
+  `flat` at all.
+
+## v2.5.3: Close the benchmark learning loop
+
+A focused follow-up to v2.5.2. Adds the host-side path that lets a graded
+task feed its outcome back into the brain, so the consolidation machinery
+(usefulness, query-routes, staples) receives a real signal on every solve.
+
+### Added
+
+- `kimetsu brain benchmark-credit --task <t> --passed`: on a pass, groups a
+  citation for the memories most relevant to the task and routes it through
+  the same grouped, query-linked path consolidation consumes. Driven by a
+  benchmark harness after grading, so the learning signal never depends on
+  the agent inside the sandbox calling a tool. This is what makes an
+  iterated-benchmark learning loop actually reach the brain; before it, the
+  benchmark memory path recorded outcomes but never exercised consolidation.
+
 ## v2.5.2: The brain that learns from its own outcomes
 
 Consolidation v1: the first release where citation outcomes reshape the brain

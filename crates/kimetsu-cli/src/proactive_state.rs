@@ -54,6 +54,17 @@ pub struct SessionState {
     /// non-trivial session that recorded nothing). `0` = never cued.
     #[serde(default)]
     pub harvest_cued_unix: u64,
+    /// v2.6: unix time this session was handed the warm-start block (repo
+    /// digest + episodic resume) by the per-turn context hook. Hosts with
+    /// no session-start event get it prepended to their first prompt
+    /// instead; this flag keeps it to exactly one turn. `0` = not yet warmed.
+    #[serde(default)]
+    pub warm_started_unix: u64,
+    /// v2.6: how many proactive injections this session has already made.
+    /// Feeds the injection policy's novelty feature — the tenth interruption
+    /// is worth less than the first.
+    #[serde(default)]
+    pub injections: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,41 +178,13 @@ pub fn normalize_command(cmd: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Derive a short, stable signature from failing tool output: the
-/// first line that looks like an error, truncated. Used to tell apart
-/// "same command, same failure" (a real loop) from incidental reruns.
-pub fn error_signature(tool_response: &str) -> Option<String> {
-    let line = tool_response
-        .lines()
-        .find(|l| {
-            let lc = l.to_ascii_lowercase();
-            FAILURE_MARKERS.iter().any(|m| lc.contains(m))
-        })
-        .or_else(|| tool_response.lines().find(|l| !l.trim().is_empty()))?;
-    let sig: String = line.trim().chars().take(80).collect();
-    if sig.is_empty() { None } else { Some(sig) }
-}
-
-/// Substrings that mark tool output as a failure. Shared by
-/// [`error_signature`] and the hook's failure gate.
-pub const FAILURE_MARKERS: &[&str] = &[
-    "error",
-    "failed",
-    "fatal",
-    "panic",
-    "exception",
-    "traceback",
-    "denied",
-    "not found",
-    "cannot",
-    "no such",
-];
-
-/// True when tool output looks like a failure (case-insensitive).
-pub fn looks_like_failure(tool_response: &str) -> bool {
-    let lc = tool_response.to_ascii_lowercase();
-    FAILURE_MARKERS.iter().any(|m| lc.contains(m))
-}
+// v2.6: failure detection moved to `crate::tool_outcome`.
+//
+// It used to live here as a case-insensitive substring scan for ten words,
+// which fired on every passing test suite ("0 failed" contains "failed") and
+// on every crate named `error-chain`. The replacement reads the exit code when
+// the harness reports one, parses the toolchain summary line when it can, and
+// only falls back to the substring scan when there is nothing better.
 
 // -----------------------------------------------------------------------
 // v1.5 (Story 2.3): session-scoped cross-turn capsule dedupe
@@ -258,6 +241,26 @@ impl SessionState {
 
     pub fn record_injection(&mut self, now: u64) {
         self.last_injection_unix = now;
+        self.injections = self.injections.saturating_add(1);
+    }
+
+    /// v2.6: how many proactive injections this session has already made.
+    pub fn injection_count(&self) -> u32 {
+        self.injections
+    }
+
+    /// v2.6: how far past the refractory window we are, in `[0, 1]`.
+    ///
+    /// 0 immediately after an injection, 1 once well clear of it. A feature
+    /// rather than a gate: the refractory check is still a hard rule, but the
+    /// policy can learn that an injection *just* past the window is worth less
+    /// than one after a long quiet stretch.
+    pub fn recovery_fraction(&self, now: u64, refractory_secs: u64) -> f32 {
+        if self.last_injection_unix == 0 || refractory_secs == 0 {
+            return 1.0;
+        }
+        let elapsed = now.saturating_sub(self.last_injection_unix) as f32;
+        (elapsed / refractory_secs as f32).clamp(0.0, 1.0)
     }
 
     /// v0.8.5: True when `norm` was seen failing earlier this session
@@ -459,12 +462,20 @@ mod tests {
         assert!(!s.harvest_in_refractory(100 + HARVEST_REFRACTORY_SECS, HARVEST_REFRACTORY_SECS));
     }
 
+    /// Kept here (rather than moved wholesale) because it is the behaviour the
+    /// loop detector depends on: the same command failing the same way twice
+    /// has to produce the same signature.
     #[test]
-    fn error_signature_picks_error_line() {
-        let sig =
-            error_signature("compiling...\nerror: linker `link.exe` not found\nmore").unwrap();
+    fn error_signature_picks_the_error_line() {
+        use crate::tool_outcome::classify;
+        let sig = classify(
+            "compiling...\nerror: linker `link.exe` not found\nmore",
+            None,
+        )
+        .signature
+        .expect("a failing build must yield a signature");
         assert!(sig.to_ascii_lowercase().contains("linker"));
-        assert!(error_signature("").is_none());
+        assert!(classify("", None).signature.is_none());
     }
 
     // ── v1.5 Story 2.3: dedupe_filter unit tests ─────────────────────────────
