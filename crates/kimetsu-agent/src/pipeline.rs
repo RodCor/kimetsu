@@ -249,6 +249,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -261,6 +262,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -3148,6 +3150,8 @@ mod tests {
             relevance: 0.8,
             scope_weight: 1.0,
             score: 0.75,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 
@@ -3160,6 +3164,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.75,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -3528,6 +3533,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: true,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -3547,6 +3553,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,

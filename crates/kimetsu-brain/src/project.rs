@@ -445,11 +445,16 @@ impl BrainSession {
         if request.min_semantic_score == 0.0 {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
-        // v2.5: whole-retrieval abstention floor (top direct candidate's score).
-        // The gate in context.rs returns an empty bundle when top_score is below
-        // this, so a weak retrieval makes the reader abstain. 0.0 = off.
-        if request.min_score == 0.0 {
-            request.min_score = self.config.broker.abstain_min_score;
+        // v2.7: whole-retrieval abstention floor, now on the ABSOLUTE evidence
+        // cosine scale rather than the
+        // normalized composite — the composite's top candidate always carries
+        // relevance 1.0, so no composite threshold can express "nothing here
+        // is relevant" (measured: false-injection 1.00 on the workflow bench).
+        // 0.0 = off; explicit request values win; -1.0 in config = per-model
+        // auto. The env var exists so benchmarks can sweep without config
+        // edits.
+        if request.abstain_evidence == 0.0 {
+            request.abstain_evidence = self.resolved_abstain_evidence();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
@@ -494,6 +499,12 @@ impl BrainSession {
         }
         let model = embeddings::resolve_embedder_id(Some(self.config.embedder.model.as_str()));
         if model.starts_with("bge") { 0.35 } else { 0.0 }
+    }
+
+    /// v2.7: resolve the absolute abstention floor for this session's config.
+    /// See [`resolved_abstain_evidence_for`].
+    pub fn resolved_abstain_evidence(&self) -> f32 {
+        resolved_abstain_evidence_for(&self.config)
     }
 
     /// v0.8: proactive (mid-work) retrieval. Pins [`NoopEmbedder`] so
@@ -603,11 +614,16 @@ impl BrainSession {
         if request.min_semantic_score == 0.0 {
             request.min_semantic_score = self.resolved_min_semantic_score();
         }
-        // v2.5: whole-retrieval abstention floor (top direct candidate's score).
-        // The gate in context.rs returns an empty bundle when top_score is below
-        // this, so a weak retrieval makes the reader abstain. 0.0 = off.
-        if request.min_score == 0.0 {
-            request.min_score = self.config.broker.abstain_min_score;
+        // v2.7: whole-retrieval abstention floor, now on the ABSOLUTE evidence
+        // cosine scale rather than the
+        // normalized composite — the composite's top candidate always carries
+        // relevance 1.0, so no composite threshold can express "nothing here
+        // is relevant" (measured: false-injection 1.00 on the workflow bench).
+        // 0.0 = off; explicit request values win; -1.0 in config = per-model
+        // auto. The env var exists so benchmarks can sweep without config
+        // edits.
+        if request.abstain_evidence == 0.0 {
+            request.abstain_evidence = self.resolved_abstain_evidence();
         }
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
@@ -1546,6 +1562,40 @@ pub fn retrieve_context(
     budget_tokens: u32,
 ) -> KimetsuResult<ContextBundle> {
     BrainSession::open(start)?.retrieve_context(stage, query, budget_tokens)
+}
+
+/// v2.7: resolve the absolute abstention floor from a config alone — free
+/// function so post-retrieval band arbitration (CLI, MCP, daemon) can resolve
+/// it without holding a session. Same shape as the `min_semantic_score`
+/// resolution because it measures the same model-dependent quantity (raw
+/// query cosine): the `KIMETSU_ABSTAIN_EVIDENCE` env override wins (benchmark
+/// sweeps), an explicit non-negative config value is used as-is, and the AUTO
+/// sentinel (-1.0) applies a per-family calibrated floor.
+///
+/// Calibration provenance: 0.55 was swept on the workflow benchmark against
+/// `jina-v2-base-code` (the `deep`-level default — relevant matches ~0.6-0.8
+/// raw cosine, plausible-but-wrong dev text 0.35-0.55; the floor cut
+/// false-injection 1.00 → 0.21 at useful-hit 0.63 pre-band). bge-family
+/// models share that separation shape, so they get the same floor
+/// provisionally. Other families are uncalibrated and auto disables the gate
+/// for them rather than guessing.
+pub fn resolved_abstain_evidence_for(config: &kimetsu_core::config::ProjectConfig) -> f32 {
+    if let Some(env) = std::env::var("KIMETSU_ABSTAIN_EVIDENCE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        return env;
+    }
+    let configured = config.broker.abstain_min_score;
+    if configured >= 0.0 {
+        return configured;
+    }
+    let model = embeddings::resolve_embedder_id(Some(config.embedder.model.as_str()));
+    if model.starts_with("jina-v2") || model.starts_with("bge") {
+        0.55
+    } else {
+        0.0
+    }
 }
 
 pub fn retrieve_context_readonly(

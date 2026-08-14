@@ -687,6 +687,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -782,6 +783,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -822,6 +824,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -860,6 +863,7 @@ mod tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.0,
+            top_abs_evidence: 0.0,
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
@@ -904,6 +908,8 @@ mod tests {
             relevance: 1.0,
             scope_weight: 1.0,
             score,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 }

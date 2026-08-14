@@ -429,6 +429,8 @@ mod tests {
                 relevance: 0.0,
                 scope_weight: 0.7,
                 score: 0.0,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
             },
         }
     }
