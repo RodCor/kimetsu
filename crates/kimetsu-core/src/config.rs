@@ -69,7 +69,18 @@ impl ProjectConfig {
                 tier: None,
             },
             model: ModelSection::default(),
-            broker: BrokerSection::default(),
+            // NEW projects ship with the absolute abstention floor on AUTO
+            // (-1.0): the per-model resolver applies the benchmark-swept
+            // jina-v2/bge floor (0.55 — held useful-hit 0.63 while cutting
+            // false-injection 1.00 → 0.21 and trap-hit 0.24 → 0.08) and
+            // disables the gate for uncalibrated embedder families, the same
+            // rule `min_semantic_score` follows. Existing project.toml files
+            // that omit the key keep 0.0 (gate off) via serde default,
+            // matching the retrieval-level precedent for upgrades.
+            broker: BrokerSection {
+                abstain_min_score: -1.0,
+                ..BrokerSection::default()
+            },
             shell: ShellSection::default(),
             ingestion: IngestionSection::default(),
             run: RunSection::default(),
@@ -824,13 +835,28 @@ pub struct BrokerSection {
     /// back to `per_kind`.
     #[serde(default = "default_normalization")]
     pub normalization: String,
-    /// v2.5 (graph-ranking): composite-score floor for the whole retrieval. When
-    /// set above zero and the TOP direct candidate's final score is below it, the
-    /// context bundle comes back empty (`skipped`) so the reader abstains instead
-    /// of answering from weak matches. Keyed off the strongest DIRECT hit (graph
-    /// candidates rank below their seed), so multi-hop expansion never masks a
-    /// genuine "nothing matched". 0.0 disables. `#[serde(default = …)]` keeps
-    /// older project.toml files loading unchanged.
+    /// Abstention floor for the whole retrieval, on the ABSOLUTE evidence
+    /// scale (v2.7): the best raw query-cosine any memory candidate achieved.
+    /// When set above zero and no cosine-backed memory candidate clears it —
+    /// and the bundle would contain only memory capsules — the context bundle
+    /// comes back empty (`skipped`) so the reader abstains instead of answering
+    /// from weak matches. Lean builds and cross-model rows have no comparable
+    /// cosine verdict and are exempt rather than judged on a lexical scale.
+    ///
+    /// History: v2.5 introduced this as a floor on the NORMALIZED composite,
+    /// which could never fire — normalization hands the top candidate
+    /// relevance 1.0, putting the composite's floor at ~0.57 regardless of
+    /// match quality (the workflow benchmark measured false-injection 1.00 at
+    /// a 60-memory corpus). The evidence scale is corpus-size-independent.
+    /// For jina-v2/bge-family embedders, genuinely-relevant matches typically
+    /// sit at raw cosine 0.6+, unrelated dev text at 0.35-0.55. 0.0 disables;
+    /// -1.0 = per-model AUTO (0.55 for jina-v2 — swept on the workflow
+    /// benchmark — and bge provisionally; off for uncalibrated families, the
+    /// same rule as `min_semantic_score`). The band one width below the floor
+    /// is arbitrated by the cross-encoder where one is available.
+    /// `KIMETSU_ABSTAIN_EVIDENCE` overrides at retrieval time (sweeps).
+    /// `#[serde(default = …)]` keeps older project.toml files loading
+    /// unchanged (off).
     #[serde(default = "default_abstain_min_score")]
     pub abstain_min_score: f32,
     /// F3: floor for the adaptive per-stage brain budget. Small tasks

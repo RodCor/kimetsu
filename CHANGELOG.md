@@ -7,6 +7,58 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## v2.7.0: Retrieval that knows when to stay silent
+
+This release hardens the semantic broker around the cases that ordinary
+retrieval benchmarks miss: unrelated memories that should not be injected,
+near-miss traps, cited incumbents that have been superseded, and ranking policy
+that used to disappear whenever a cross-encoder reranker ran.
+
+The final release candidate raises comprehensive BrainBench from **91.3% to
+92.4%** over 264 scenarios. Its importance dimension moves **92.1% → 97.4%**
+and retrieval **56.6% → 97.0%**, with calibration and dedup unchanged. On the
+new workflow fixtures it scores **79.0%** over a stratified 150-scenario slice;
+the 100-scenario update stream reaches **89.3%** overall and resolves the newer
+fact over its cited incumbent in **33/33** applicable cases.
+
+### Added
+
+- **Absolute-evidence abstention for new brains.** The old whole-bundle gate
+  read a normalized composite whose best candidate was strong by construction,
+  so it could not distinguish a useful hit from the best item in an unrelated
+  corpus. New project configs use a per-embedder auto floor on raw cosine.
+  Existing configs keep the gate off unless they opt in, and lean/cross-model
+  retrieval is exempt because lexical relevance is not on the calibrated
+  cosine scale.
+- **Cross-encoder arbitration for borderline bundles.** The evidence band is
+  now resolved by the reranker, and the same implementation is used by the CLI,
+  MCP server, and warm embed daemon. A rejected bundle becomes a true skipped,
+  zero-token result instead of leaking low-confidence capsules downstream.
+- **Supersession-aware ranking.** Newer near-restatements beat older cited
+  incumbents, with correction-language and lexical-identity support for larger
+  rewrites. Same-batch co-writes are protected, and ambiguous low-similarity
+  pairs consult query relevance so historical questions still retrieve the
+  fact that was true at the requested time.
+- **Post-rerank usefulness policy.** Learned citation/regret tiers and
+  supersession hints ride on each capsule and are reapplied after cross-encoder
+  scoring. This prevents relevance-only rerankers from silently erasing broker
+  policy while retaining their ordering within each policy tier.
+
+### Fixed
+
+- The CLI now has reranker parity with the MCP and daemon paths; semantic
+  benchmark runs no longer measure a different ranking pipeline from shipped
+  commands.
+- Reranker initialization failures are reported before Kimetsu fails open to
+  bi-encoder ordering, instead of silently making an intended cross-encoder run
+  look successful.
+- User-defined Hugging Face rerankers honor `HF_HOME`, allowing benchmark and
+  sandbox workspaces to share one cache instead of repeatedly downloading the
+  same model into each current working directory.
+- Reranker retention and band admission are evaluated on raw cross-encoder
+  evidence before supersession penalties, usefulness ordering, or output caps,
+  so policy cannot accidentally change whether a bundle is admitted.
+
 ## v2.6.1: Dependency security sweep
 
 A security-only patch release. Clears every open advisory against the

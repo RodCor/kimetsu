@@ -244,6 +244,20 @@ pub struct ContextCapsule {
     pub relevance: f32,
     pub scope_weight: f32,
     pub score: f32,
+    /// v2.7: set by [`apply_supersession_penalty`] when a newer near-duplicate
+    /// sibling was also a candidate. Carried on the capsule so the penalty can
+    /// be REAPPLIED after cross-encoder reranking — the reranker scores pure
+    /// query relevance and would otherwise resurrect the older twin whenever
+    /// the query's wording happens to match it better (measured: resolution
+    /// 0.58 → 0.36 when reranking landed without this flag).
+    #[serde(default)]
+    pub superseded_hint: bool,
+    /// v2.7: learned-usefulness tier carried across final-stage reranking.
+    /// Cross-encoders score query relevance only and their sigmoid scale can be
+    /// arbitrarily extreme, so policy is lexicographic rather than multiplied:
+    /// cited (+1), neutral (0), regretted (-1). Superseded capsules ignore it.
+    #[serde(default)]
+    pub rerank_policy_tier: i8,
 }
 
 impl ContextCapsule {
@@ -263,6 +277,8 @@ impl ContextCapsule {
             relevance: 0.0,
             scope_weight: 0.0,
             score,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 }
@@ -342,6 +358,21 @@ pub struct ContextRequest {
     /// construction is unchanged — Feature does NOT alter weights or
     /// prefer_roles. Set by the pipeline via `classify_task` at intake.
     pub task_kind: TaskKind,
+    /// v2.7: ABSOLUTE abstention floor. `min_score` above compares against the
+    /// normalized composite, whose top candidate always carries relevance 1.0
+    /// — it can rank candidates but cannot express "nothing here is genuinely
+    /// relevant", so it never abstains on a plausible-but-wrong corpus (the
+    /// workflow benchmark measured false-injection 1.00 at a 60-memory brain).
+    /// This floor gates on absolute evidence instead: the best raw cosine any
+    /// memory candidate achieved. When > 0.0 and no cosine-backed memory
+    /// candidate clears it — and the bundle would contain only memory capsules
+    /// — the retrieval returns `skipped: true` with zero tokens injected.
+    /// Lexical-only and cross-model candidates are unmeasured on this scale and
+    /// therefore exempt. Repo-file/manifest capsules also suppress the gate: an
+    /// FTS hit on real repo content is its own evidence the bundle is useful.
+    /// 0.0 (default) disables the gate. Populated from
+    /// `BrokerSection.abstain_min_score` by the pipeline.
+    pub abstain_evidence: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +388,13 @@ pub struct ContextBundle {
     /// v0.6: best composite score observed before the skip check.
     /// Useful for diagnostics ("why was the brain silent?").
     pub top_score: f32,
+    /// v2.7: best ABSOLUTE cosine evidence any memory candidate achieved.
+    /// Unlike `top_score` this is not normalized, so "0.42" means the same
+    /// thing on a 3-memory brain and a 3000-memory brain. `-1.0` means no
+    /// comparable cosine was available (lean builds or cross-model rows), so
+    /// the cosine-calibrated gate has no verdict. Exposed for diagnostics and
+    /// threshold sweeps.
+    pub top_abs_evidence: f32,
     /// v2.6: what fraction of the query's discriminating power the returned
     /// capsules cover, *collectively*, in `[0, 1]`.
     ///
@@ -801,6 +839,16 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         }
     }
 
+    // v2.7: newer-wins supersession penalty. The workflow benchmark measured
+    // that a cited incumbent buries its own replacement: the usefulness boost
+    // feeds the relevance axis, freshness cannot distinguish memories written
+    // minutes apart (30-day half-life), and nothing at ranking time knows two
+    // candidates conflict. When two memory candidates are near-duplicates by
+    // embedding cosine, the OLDER one is penalized so the newer statement of
+    // the same topic wins the ordering regardless of its sibling's citations.
+    // Inert on lean builds (no embeddings) and for genuinely distinct memories.
+    apply_supersession_penalty(&mut candidates);
+
     // D1e-2: absolute semantic relevance floor. On embeddings builds
     // (query_embedding is Some), drop candidates whose cosine to the
     // query is strictly below min_semantic_score. This ensures a
@@ -883,6 +931,27 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             std::collections::HashMap::new()
         };
 
+    // v2.7: best absolute evidence over the surviving memory candidates —
+    // COSINE ONLY. Lexical relevance lives on a different scale (token
+    // overlap, ~0.2-0.6 for good matches) and comparing it against a
+    // cosine-calibrated floor silently killed every lexical-only retrieval
+    // (lean builds, cross-model rows). When no candidate carries a cosine the
+    // gate has no verdict: -1.0 = "unmeasured", and both the hard gate below
+    // and the band arbitration treat it as exempt.
+    let top_abs_evidence = candidates
+        .iter()
+        .filter(|c| c.capsule.kind == "memory")
+        .filter_map(|c| c.cosine)
+        .fold(f32::NAN, f32::max);
+    let top_abs_evidence = if top_abs_evidence.is_nan() {
+        -1.0
+    } else {
+        top_abs_evidence
+    };
+    // Repo-file/manifest capsules suppress the evidence gate: an FTS hit on
+    // real repo content is its own evidence the bundle is useful.
+    let memory_only = candidates.iter().all(|c| c.capsule.kind == "memory");
+
     let mut capsules = candidates
         .into_iter()
         .map(|candidate| candidate.capsule)
@@ -909,8 +978,25 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
 
     // v0.6: confidence-aware skip — if the top score is below the caller's
     // threshold, return an empty bundle immediately. Zero tokens injected.
+    //
+    // v2.7: joined by the absolute abstention gate. `top_score` is normalized
+    // (the best candidate always carries relevance 1.0), so `min_score` ranks
+    // but cannot abstain; `abstain_evidence` compares the best RAW cosine /
+    // relevance against an absolute floor, so a corpus with nothing genuinely
+    // relevant stays silent instead of shipping its best-of-a-bad-lot.
     let top_score = capsules.first().map(|c| c.score).unwrap_or(0.0);
-    if request.min_score > 0.0 && top_score < request.min_score {
+    let composite_skip = request.min_score > 0.0 && top_score < request.min_score;
+    // The hard floor sits one band-width BELOW the configured threshold: the
+    // [threshold - width, threshold) band is not decided here but by
+    // [`rerank_and_arbitrate`] at the call sites that own a cross-encoder —
+    // raw bi-encoder cosine under-scores paraphrased matches, and the band is
+    // exactly where those live. Callers without a reranker fail the band
+    // closed, which reproduces the plain hard-gate behavior.
+    let evidence_skip = request.abstain_evidence > 0.0
+        && memory_only
+        && top_abs_evidence >= 0.0
+        && top_abs_evidence < (request.abstain_evidence - abstain_band_width()).max(0.0);
+    if composite_skip || evidence_skip {
         return Ok(ContextBundle {
             stage: request.stage,
             budget_tokens: request.budget_tokens,
@@ -919,6 +1005,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             excluded: capsules,
             skipped: true,
             top_score,
+            top_abs_evidence,
             // A skipped bundle covers nothing, by construction.
             evidence_coverage: 0.0,
             uncovered_terms: Vec::new(),
@@ -980,6 +1067,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         excluded,
         skipped: false,
         top_score,
+        top_abs_evidence,
         evidence_coverage: coverage,
         uncovered_terms,
         chronological,
@@ -1072,6 +1160,8 @@ pub fn search_memories_including_expired(
             relevance: 0.0,
             scope_weight,
             score: 0.0,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         });
     }
     Ok(capsules)
@@ -1597,7 +1687,16 @@ fn memory_row_to_candidate(
     let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
     let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
     let biased_relevance = apply_usefulness_boost(raw_relevance, multiplier);
-
+    // Carry only the learned usefulness policy across reranking. It is a tier,
+    // not a score multiplier: cross-encoder probabilities can differ by 100x
+    // for equally useful paraphrases, so multiplication cannot preserve policy.
+    let rerank_policy_tier = if multiplier > 1.0 + f32::EPSILON {
+        1
+    } else if multiplier < 1.0 - f32::EPSILON {
+        -1
+    } else {
+        0
+    };
     // v2.6: discount by origin, unless the memory has proven itself here.
     //
     // `last_useful_at` is set only on a citation in a *successful* run, so its
@@ -1632,6 +1731,8 @@ fn memory_row_to_candidate(
             relevance: 0.0,
             scope_weight,
             score: 0.0,
+            superseded_hint: false,
+            rerank_policy_tier,
         },
     })
 }
@@ -1772,6 +1873,8 @@ fn repo_file_candidates(
                 relevance: 0.0,
                 scope_weight: 0.9,
                 score: 0.0,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
             },
         });
     }
@@ -1840,6 +1943,8 @@ fn manifest_candidates(
                 relevance: 0.0,
                 scope_weight: 0.9,
                 score: 0.0,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
             },
         });
     }
@@ -1900,6 +2005,8 @@ fn manifest_fts_candidates(
                 relevance: 0.0,
                 scope_weight: 0.9,
                 score: 0.0,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
             },
         });
     }
@@ -1993,6 +2100,195 @@ fn normalize_and_score(
             + weights.confidence * candidate.capsule.confidence
             + weights.freshness * candidate.capsule.freshness
             + weights.scope * candidate.capsule.scope_weight;
+    }
+}
+
+/// v2.7: two memory candidates whose embeddings agree at least this much are
+/// treated as statements of the same topic for the newer-wins rule. High on
+/// purpose — complementary-but-distinct lessons on one subject must not
+/// penalize each other; only near-restatements qualify.
+pub(crate) const SUPERSESSION_MIN_COSINE: f32 = 0.85;
+
+/// Explicit correction language supplies extra evidence that two moderately
+/// similar memories are successive versions of one fact. The 0.82 floor admits
+/// the measured "no longer uses replica-1" update pair (cosine 0.837) without
+/// broadening the rule for ordinary memories, which still require 0.85.
+pub(crate) const SUPERSESSION_CUE_MIN_COSINE: f32 = 0.82;
+
+/// A correction can also identify a rewritten update whose embedding moved
+/// substantially because the replacement contains new implementation detail.
+/// Require both several shared content tokens and dense overlap with the
+/// smaller text; the cue alone is never sufficient.
+pub(crate) const SUPERSESSION_CUE_MIN_SHARED_TOKENS: usize = 3;
+pub(crate) const SUPERSESSION_CUE_MIN_LEXICAL_OVERLAP: f32 = 0.35;
+
+/// v2.7: score multiplier applied (once) to the older member of a
+/// near-duplicate pair. Sized from the workflow benchmark's measured failure:
+/// a cited incumbent's usefulness boost gives it a ~1.08× composite advantage
+/// over its fresher replacement, so 0.80 flips the ordering with margin while
+/// leaving genuinely-unrelated rankings untouched.
+pub(crate) const SUPERSESSION_PENALTY: f32 = 0.80;
+
+/// v2.7: minimum age gap for the newer-wins rule. Supersession implies
+/// temporal SUCCESSION — a near-duplicate written milliseconds apart is one
+/// authoring event (a batch ingest, two variants of one lesson), not an
+/// update, and penalizing the "older" of the pair broke the importance
+/// dimension's cited-must-outrank assertion (92.1% → 81.6% on the
+/// comprehensive A/B). One second cleanly separates same-batch co-writes
+/// (Δ≈ms) from genuine cross-task updates (Δ≥ seconds); explicit correction
+/// language provides the narrow exception for ordered batch imports.
+pub(crate) const SUPERSESSION_MIN_AGE_GAP_SECS: f64 = 1.0;
+
+/// Text can establish succession even when storage timestamps cannot. This is
+/// intentionally a narrow phrase list: it only applies to near-duplicate
+/// memory pairs, and only when exactly one side carries an explicit correction
+/// cue. Generic recency words such as "new" are excluded because they appear
+/// in ordinary co-written lessons too often.
+fn has_explicit_supersession_signal(text: &str) -> bool {
+    // Normalize punctuation to word boundaries before matching. Correction
+    // language commonly appears parenthesized ("(switched from tabs)"); a
+    // literal-space matcher misses it even though the words are unambiguous.
+    // Keeping outer spaces prevents the single-word cues from matching inside
+    // unrelated words (for example `now` inside `known`).
+    let words = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>();
+    let text = format!(
+        " {} ",
+        words.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    [
+        " now ",
+        " no longer ",
+        " renamed from ",
+        " switched from ",
+        " as of ",
+        " currently ",
+        " after the ",
+        " supersedes ",
+        " replaced by ",
+        " silently breaks ",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+}
+
+fn has_supersession_lexical_identity(a: &str, b: &str) -> bool {
+    let a = content_tokens(a);
+    let b = content_tokens(b);
+    let smaller = a.len().min(b.len());
+    if smaller == 0 {
+        return false;
+    }
+    let shared = a.iter().filter(|token| b.contains(token)).count();
+    shared >= SUPERSESSION_CUE_MIN_SHARED_TOKENS
+        && shared as f32 / smaller as f32 >= SUPERSESSION_CUE_MIN_LEXICAL_OVERLAP
+}
+
+/// v2.7: newer-wins supersession pass. Strong embedding near-duplicates
+/// qualify directly; moderately similar or rewritten pairs must also carry
+/// exactly one explicit correction cue and enough lexical identity. For
+/// lexical-only rewrites, the replacement must be at least as relevant to the
+/// current query so historical questions can still retrieve the old fact.
+/// The OLDER candidate is multiplied by `SUPERSESSION_PENALTY` at most once,
+/// however many newer siblings it has. Runs after normalization and boosts so
+/// the penalty is the last word: a heavily-cited incumbent cannot out-boost
+/// its own replacement.
+///
+/// Requires both embeddings and both parseable `created_at` timestamps; pairs
+/// missing either are left alone (lean builds are unaffected end to end).
+pub(crate) fn apply_supersession_penalty(candidates: &mut [Candidate]) {
+    let parsed: Vec<Option<OffsetDateTime>> = candidates
+        .iter()
+        .map(|c| {
+            if c.capsule.kind != "memory" || c.embedding.is_none() {
+                return None;
+            }
+            c.created_at.as_deref().and_then(|ts| {
+                OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
+            })
+        })
+        .collect();
+
+    let mut penalized = vec![false; candidates.len()];
+    for i in 0..candidates.len() {
+        let Some(ti) = parsed[i] else { continue };
+        for j in (i + 1)..candidates.len() {
+            let Some(tj) = parsed[j] else { continue };
+            let (Some(ei), Some(ej)) = (&candidates[i].embedding, &candidates[j].embedding) else {
+                continue;
+            };
+            let signals = (
+                has_explicit_supersession_signal(&candidates[i].capsule.summary),
+                has_explicit_supersession_signal(&candidates[j].capsule.summary),
+            );
+            let exactly_one_signal = signals.0 ^ signals.1;
+            let similarity = crate::embeddings::cosine_similarity(ei, ej);
+            let cue_related = exactly_one_signal
+                && (similarity >= SUPERSESSION_CUE_MIN_COSINE
+                    || has_supersession_lexical_identity(
+                        &candidates[i].capsule.summary,
+                        &candidates[j].capsule.summary,
+                    ));
+            if similarity < SUPERSESSION_MIN_COSINE && !cue_related {
+                continue;
+            }
+            // Sub-second gaps (incl. identical timestamps) are normally one
+            // authoring event, not a supersession. A single explicit
+            // correction cue can still establish direction for batch imports;
+            // if both or neither carry one, there is no defensible winner.
+            let gap = (ti - tj).abs();
+            let subsecond = (gap.whole_milliseconds().unsigned_abs() as f64)
+                < SUPERSESSION_MIN_AGE_GAP_SECS * 1000.0;
+            let older = if subsecond {
+                match signals {
+                    (true, false) => j,
+                    (false, true) => i,
+                    _ => continue,
+                }
+            } else {
+                match ti.cmp(&tj) {
+                    Ordering::Less => i,
+                    Ordering::Greater => j,
+                    Ordering::Equal => continue,
+                }
+            };
+            if similarity < SUPERSESSION_CUE_MIN_COSINE {
+                // Lexical-only rewrites below the cue-qualified cosine floor
+                // can be related facts rather than mutually exclusive
+                // restatements. Apply newer-wins only when the replacement is
+                // at least as relevant to THIS query. This preserves historical
+                // questions such as "which embedder reached MRR 1.0?" while
+                // still resolving "what is preferred now?" to the newer
+                // recommendation. Cue-marked pairs at 0.82+ are close enough
+                // to use the ordinary newer-wins policy directly.
+                let replacement = if older == i { j } else { i };
+                let replacement_has_signal = if replacement == i {
+                    signals.0
+                } else {
+                    signals.1
+                };
+                let query_favors_replacement =
+                    match (candidates[replacement].cosine, candidates[older].cosine) {
+                        (Some(replacement_cosine), Some(older_cosine)) => {
+                            replacement_cosine >= older_cosine
+                        }
+                        _ => false,
+                    };
+                if !replacement_has_signal || !query_favors_replacement {
+                    continue;
+                }
+            }
+            if !penalized[older] {
+                penalized[older] = true;
+                candidates[older].capsule.score *= SUPERSESSION_PENALTY;
+                // Mark it so post-retrieval reranking can reapply the penalty
+                // on the cross-encoder's score domain.
+                candidates[older].capsule.superseded_hint = true;
+            }
+        }
     }
 }
 
@@ -2791,6 +3087,109 @@ pub fn resolve_capsule(
 /// to `cap` (0 = no cap). Fail-open: on a rerank error the input ordering
 /// is returned unchanged (truncated to `cap`) — a broken reranker must
 /// never lose retrieval entirely.
+/// v2.7: width of the evidence band below `abstain_evidence` in which the
+/// cross-encoder arbitrates instead of the raw cosine. Below
+/// `abstain_evidence - ABSTAIN_BAND_WIDTH` the retrieval hard-abstains.
+pub const ABSTAIN_BAND_WIDTH: f32 = 0.10;
+
+fn abstain_band_width() -> f32 {
+    std::env::var("KIMETSU_ABSTAIN_BAND_WIDTH")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(ABSTAIN_BAND_WIDTH)
+        .clamp(0.0, 1.0)
+}
+
+/// v2.7: default cross-encoder score a band bundle must reach to be injected.
+/// Swept on the workflow benchmark (ms-marco-tinybert, n=150/floor): recall
+/// was FLAT from 0.3 through 0.95 (useful-hit 0.80 → 0.79) while
+/// false-injection fell monotonically (0.32 → 0.24) — genuinely relevant band
+/// bundles saturate the tinybert sigmoid, junk does not. 0.9 takes most of
+/// that precision and leaves margin for cross-encoders whose scores don't
+/// saturate as hard. Overridable via `KIMETSU_ABSTAIN_RERANK_FLOOR`.
+pub const ABSTAIN_RERANK_FLOOR: f32 = 0.9;
+
+fn abstain_rerank_floor() -> f32 {
+    std::env::var("KIMETSU_ABSTAIN_RERANK_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(ABSTAIN_RERANK_FLOOR)
+}
+
+/// v2.7: post-retrieval reranking + evidence-band arbitration, shared by every
+/// call site that owns a cross-encoder (CLI `brain context`, MCP server, embed
+/// daemon).
+///
+/// The retrieval pipeline hard-abstains below `abstain_evidence -`
+/// [`ABSTAIN_BAND_WIDTH`] and returns bundles above it. This helper decides
+/// the band in between: the cross-encoder rescoring recognizes paraphrased
+/// matches that raw bi-encoder cosine under-scores, so a band bundle whose
+/// best rerank score clears [`ABSTAIN_RERANK_FLOOR`] is injected and one that
+/// doesn't is converted to a skipped (zero-token) bundle. Out-of-band bundles
+/// are reranked for ordering but never converted.
+///
+/// With no reranker available the band FAILS CLOSED (skipped) — equivalent to
+/// the plain hard gate at `abstain_evidence` — so a lean build is never
+/// noisier than the gate promises. Bundles containing non-memory capsules are
+/// never converted (repo evidence stands on its own), and `abstain_evidence
+/// <= 0` disables arbitration entirely.
+pub fn rerank_and_arbitrate(
+    query: &str,
+    mut bundle: ContextBundle,
+    reranker: Option<&dyn crate::embeddings::Reranker>,
+    abstain_evidence: f32,
+    rerank_floor: f32,
+    rerank_cap: usize,
+) -> ContextBundle {
+    if bundle.skipped || bundle.capsules.is_empty() {
+        return bundle;
+    }
+    let memory_only = bundle.capsules.iter().all(|c| c.kind == "memory");
+    // top_abs_evidence < 0.0 means "no cosine evidence exists" (lean builds,
+    // cross-model rows) — the band is a cosine construct, so it is exempt.
+    let in_band = abstain_evidence > 0.0
+        && memory_only
+        && bundle.top_abs_evidence >= 0.0
+        && bundle.top_abs_evidence < abstain_evidence;
+
+    let to_skipped = |mut bundle: ContextBundle| -> ContextBundle {
+        let rejected = std::mem::take(&mut bundle.capsules);
+        bundle.excluded.extend(rejected);
+        bundle.skipped = true;
+        bundle.used_tokens = 0;
+        bundle.evidence_coverage = 0.0;
+        bundle.uncovered_terms = Vec::new();
+        bundle.chronological = false;
+        bundle
+    };
+
+    match reranker {
+        Some(rr) => {
+            let reranked = rerank_capsules_with_diagnostics(
+                query,
+                std::mem::take(&mut bundle.capsules),
+                rr,
+                rerank_floor,
+                rerank_cap,
+            );
+            // Admission is calibrated on the RAW cross-encoder score, before
+            // ranking policy is applied. Otherwise usefulness or supersession
+            // could silently alter abstention behavior.
+            let best_raw_rerank = reranked.best_raw_score.unwrap_or(0.0);
+            bundle.capsules = reranked.capsules;
+            bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
+            if in_band && best_raw_rerank < abstain_rerank_floor() {
+                to_skipped(bundle)
+            } else {
+                bundle
+            }
+        }
+        // No arbiter: the band fails closed, matching the hard gate.
+        None if in_band => to_skipped(bundle),
+        None => bundle,
+    }
+}
+
 pub fn rerank_capsules(
     query: &str,
     capsules: Vec<ContextCapsule>,
@@ -2798,8 +3197,39 @@ pub fn rerank_capsules(
     floor: f32,
     cap: usize,
 ) -> Vec<ContextCapsule> {
+    rerank_capsules_with_diagnostics(query, capsules, reranker, floor, cap).capsules
+}
+
+struct RerankOutcome {
+    capsules: Vec<ContextCapsule>,
+    /// Best raw cross-encoder score among capsules that survived the ranking
+    /// floor.
+    /// `None` means the reranker did not produce a usable verdict.
+    best_raw_score: Option<f32>,
+}
+
+fn effective_rerank_policy_tier(capsule: &ContextCapsule) -> i8 {
+    // A superseded memory must not retain a historic citation advantage over
+    // its replacement. Its explicit post-rerank penalty carries that policy.
+    if capsule.superseded_hint {
+        0
+    } else {
+        capsule.rerank_policy_tier
+    }
+}
+
+fn rerank_capsules_with_diagnostics(
+    query: &str,
+    capsules: Vec<ContextCapsule>,
+    reranker: &dyn crate::embeddings::Reranker,
+    floor: f32,
+    cap: usize,
+) -> RerankOutcome {
     if capsules.is_empty() {
-        return capsules;
+        return RerankOutcome {
+            capsules,
+            best_raw_score: None,
+        };
     }
 
     // Rerank on the FULL summary. Truncating to a snippet was tried for
@@ -2820,32 +3250,63 @@ pub fn rerank_capsules(
             if cap > 0 && out.len() > cap {
                 out.truncate(cap);
             }
-            return out;
+            return RerankOutcome {
+                capsules: out,
+                best_raw_score: None,
+            };
         }
     };
 
-    let mut ranked: Vec<ContextCapsule> = capsules
+    // Learned usefulness is a policy tier above cross-encoder relevance, not a
+    // multiplier on it. TinyBERT assigned two useful paraphrases 0.998 vs
+    // 0.0098 in BrainBench; no bounded multiplier can preserve a citation
+    // policy on that scale. Within each tier the cross-encoder owns ordering.
+    // Supersession is likewise reapplied here, after the cross-encoder, so all
+    // callers (including benchmark-only direct calls) get the same policy.
+    let mut ranked: Vec<(ContextCapsule, f32)> = capsules
         .into_iter()
         .zip(scores)
         .map(|(mut c, s)| {
             c.score = s;
-            c
+            if c.superseded_hint {
+                c.score *= SUPERSESSION_PENALTY;
+            }
+            (c, s)
         })
         .collect();
 
     ranked.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        effective_rerank_policy_tier(&b.0)
+            .cmp(&effective_rerank_policy_tier(&a.0))
+            .then_with(|| {
+                b.0.score
+                    .partial_cmp(&a.0.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
-    ranked.retain(|c| c.score >= floor);
+    // This is the ordinary per-capsule retention floor. The separate
+    // evidence-band decision reads `best_raw_score` before the supersession
+    // policy is reapplied, because its 0.9 threshold was calibrated on the
+    // cross-encoder's sigmoid scale.
+    ranked.retain(|(_, raw_score)| *raw_score >= floor);
+
+    // Admission evidence is independent of policy ordering and output cap.
+    // A high-confidence neutral capsule displaced by a cited one still proves
+    // that the in-band bundle has relevant evidence.
+    let best_raw_score = ranked
+        .iter()
+        .map(|(_, raw_score)| *raw_score)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     if cap > 0 && ranked.len() > cap {
         ranked.truncate(cap);
     }
 
-    ranked
+    RerankOutcome {
+        capsules: ranked.into_iter().map(|(c, _)| c).collect(),
+        best_raw_score,
+    }
 }
 
 #[cfg(test)]
@@ -2865,6 +3326,8 @@ mod tests {
             relevance: 1.0,
             scope_weight: 1.0,
             score: 1.0,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 
@@ -3170,6 +3633,66 @@ mod tests {
                 .map(|c| &c.expansion_handle)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// v2.7: the absolute abstention gate. `top_abs_evidence` carries the best
+    /// raw cosine; a floor above it skips the bundle entirely, a floor below
+    /// it (or 0.0) lets the bundle through. Self-calibrating: the test reads
+    /// the achieved evidence first rather than hard-coding a stub cosine.
+    #[test]
+    fn abstain_evidence_gate_skips_on_weak_absolute_evidence() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        crate::schema::initialize(&conn).expect("init schema");
+        let stub = embeddings::StubEmbedder::new();
+        insert_memory_with_embedding(&conn, "m_rg", "use ripgrep for code search", &stub);
+
+        let weights = kimetsu_core::config::BrokerWeights::default();
+        let retrieve = |abstain: f32| {
+            retrieve_context_with_embedder(
+                &conn,
+                "/fake-repo",
+                &weights,
+                ContextRequest {
+                    stage: "localization".to_string(),
+                    query: "ripgrep search".to_string(),
+                    budget_tokens: 4000,
+                    abstain_evidence: abstain,
+                    ..Default::default()
+                },
+                &[],
+                &stub,
+            )
+            .expect("retrieve")
+        };
+
+        let open = retrieve(0.0);
+        assert!(!open.skipped, "gate off must not skip");
+        assert!(
+            open.top_abs_evidence > 0.0,
+            "a matching memory must report positive absolute evidence"
+        );
+
+        // The retrieval-internal gate hard-abstains one band-width below the
+        // configured floor (the band itself is decided by the caller's
+        // cross-encoder via rerank_and_arbitrate).
+        let above = retrieve(open.top_abs_evidence + ABSTAIN_BAND_WIDTH + 0.05);
+        assert!(
+            above.skipped,
+            "a floor a full band above the best evidence must hard-abstain (evidence {})",
+            open.top_abs_evidence
+        );
+        assert!(above.capsules.is_empty(), "skipped bundle injects nothing");
+
+        // In the band: retrieval itself does NOT skip — the arbiter decides.
+        let in_band = retrieve(open.top_abs_evidence + 0.05);
+        assert!(
+            !in_band.skipped,
+            "an in-band bundle passes through for arbitration"
+        );
+
+        let below = retrieve((open.top_abs_evidence - 0.05).max(0.01));
+        assert!(!below.skipped, "a floor below the best evidence passes");
+        assert!(!below.capsules.is_empty());
     }
 
     /// v0.4.2: when a row's stored `embedding_model` doesn't match
@@ -4738,6 +5261,8 @@ mod tests {
                 relevance: 0.0,
                 scope_weight: 0.0,
                 score: 0.0,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
             },
             raw_relevance: raw,
             embedding: None,
@@ -4786,6 +5311,256 @@ mod tests {
             "global normalizes against the single max, got {weak}"
         );
         assert!(weak < candidates[0].capsule.relevance);
+    }
+
+    /// v2.7: candidate builder for the supersession tests — a memory with an
+    /// embedding, a creation time, and a pre-set score.
+    fn superseding_candidate(
+        id: &str,
+        embedding: Vec<f32>,
+        created_at: &str,
+        score: f32,
+    ) -> Candidate {
+        Candidate {
+            capsule: ContextCapsule {
+                id: id.to_string(),
+                kind: "memory".to_string(),
+                summary: id.to_string(),
+                token_estimate: 0,
+                expansion_handle: format!("memory:{id}"),
+                provenance: Vec::new(),
+                confidence: 0.0,
+                freshness: 0.0,
+                relevance: 0.0,
+                scope_weight: 0.0,
+                score,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
+            },
+            raw_relevance: score,
+            embedding: Some(embedding),
+            // Query relevance for relaxed, cue-qualified supersession tests.
+            cosine: Some(score),
+            created_at: Some(created_at.to_string()),
+        }
+    }
+
+    /// v2.7: near-duplicate pair — the OLDER one is penalized so the newer
+    /// statement of the topic outranks it even when citations boosted it.
+    #[test]
+    fn supersession_penalizes_the_older_near_duplicate() {
+        let mut candidates = vec![
+            // Old, cited, currently winning (score 0.94 > 0.87).
+            superseding_candidate("old", vec![1.0, 0.0], "2026-08-01T10:00:00Z", 0.94),
+            superseding_candidate("new", vec![0.99, 0.14], "2026-08-01T10:10:00Z", 0.87),
+        ];
+        apply_supersession_penalty(&mut candidates);
+        let old_score = candidates[0].capsule.score;
+        let new_score = candidates[1].capsule.score;
+        assert!(
+            (old_score - 0.94 * SUPERSESSION_PENALTY).abs() < 1e-6,
+            "older twin must carry the penalty, got {old_score}"
+        );
+        assert!((new_score - 0.87).abs() < 1e-6, "newer twin untouched");
+        assert!(
+            new_score > old_score,
+            "the update must now outrank the incumbent"
+        );
+    }
+
+    /// Distinct memories (low mutual cosine) must not penalize each other,
+    /// and the penalty applies at most once however many newer siblings exist.
+    #[test]
+    fn supersession_ignores_distinct_memories_and_applies_once() {
+        let mut candidates = vec![
+            superseding_candidate("old", vec![1.0, 0.0], "2026-08-01T10:00:00Z", 0.90),
+            // Orthogonal embedding — different topic entirely.
+            superseding_candidate("other", vec![0.0, 1.0], "2026-08-02T10:00:00Z", 0.80),
+            // Two newer near-duplicates of `old`.
+            superseding_candidate("new1", vec![0.99, 0.14], "2026-08-03T10:00:00Z", 0.70),
+            superseding_candidate("new2", vec![0.98, 0.19], "2026-08-04T10:00:00Z", 0.60),
+        ];
+        apply_supersession_penalty(&mut candidates);
+        assert!(
+            (candidates[0].capsule.score - 0.90 * SUPERSESSION_PENALTY).abs() < 1e-6,
+            "penalty applies exactly once, got {}",
+            candidates[0].capsule.score
+        );
+        assert!(
+            (candidates[1].capsule.score - 0.80).abs() < 1e-6,
+            "orthogonal memory untouched"
+        );
+        // new1 is itself older than new2 and near-duplicate of it.
+        assert!(
+            (candidates[2].capsule.score - 0.70 * SUPERSESSION_PENALTY).abs() < 1e-6,
+            "a middle sibling is old relative to a newer one"
+        );
+        assert!(
+            (candidates[3].capsule.score - 0.60).abs() < 1e-6,
+            "newest untouched"
+        );
+    }
+
+    /// Lean builds (no embeddings) and unparseable timestamps are inert.
+    #[test]
+    fn supersession_is_inert_without_embeddings_or_timestamps() {
+        let mut no_embedding = vec![
+            Candidate {
+                embedding: None,
+                ..superseding_candidate("a", vec![], "2026-08-01T10:00:00Z", 0.9)
+            },
+            Candidate {
+                embedding: None,
+                ..superseding_candidate("b", vec![], "2026-08-02T10:00:00Z", 0.8)
+            },
+        ];
+        apply_supersession_penalty(&mut no_embedding);
+        assert!((no_embedding[0].capsule.score - 0.9).abs() < 1e-6);
+
+        let mut bad_ts = vec![
+            superseding_candidate("a", vec![1.0, 0.0], "not-a-date", 0.9),
+            superseding_candidate("b", vec![1.0, 0.0], "2026-08-02T10:00:00Z", 0.8),
+        ];
+        apply_supersession_penalty(&mut bad_ts);
+        assert!(
+            (bad_ts[0].capsule.score - 0.9).abs() < 1e-6,
+            "unparseable ts skipped"
+        );
+        assert!((bad_ts[1].capsule.score - 0.8).abs() < 1e-6);
+
+        // Identical timestamps: no defensible "older", both untouched.
+        let mut same_ts = vec![
+            superseding_candidate("a", vec![1.0, 0.0], "2026-08-01T10:00:00Z", 0.9),
+            superseding_candidate("b", vec![1.0, 0.0], "2026-08-01T10:00:00Z", 0.8),
+        ];
+        apply_supersession_penalty(&mut same_ts);
+        assert!((same_ts[0].capsule.score - 0.9).abs() < 1e-6);
+        assert!((same_ts[1].capsule.score - 0.8).abs() < 1e-6);
+
+        // Sub-second gap: one authoring event (same batch ingest), not a
+        // supersession — both untouched even though one is nominally older.
+        let mut batch = vec![
+            superseding_candidate("a", vec![1.0, 0.0], "2026-08-01T10:00:00.100Z", 0.9),
+            superseding_candidate("b", vec![1.0, 0.0], "2026-08-01T10:00:00.900Z", 0.8),
+        ];
+        apply_supersession_penalty(&mut batch);
+        assert!(
+            (batch[0].capsule.score - 0.9).abs() < 1e-6,
+            "millisecond-apart co-writes must not be penalized"
+        );
+        assert!((batch[1].capsule.score - 0.8).abs() < 1e-6);
+
+        // A batch-imported correction can establish direction in its text.
+        // Timestamp order is deliberately reversed here: the explicit cue,
+        // not arbitrary JSONL order, identifies the replacement.
+        let mut explicit_update = vec![
+            superseding_candidate(
+                "the project uses spaces (switched from tabs)",
+                vec![1.0, 0.0],
+                "2026-08-01T10:00:00.100Z",
+                0.9,
+            ),
+            superseding_candidate(
+                "the project uses tabs for indentation",
+                // Cosine 0.83: below the ordinary 0.85 floor, above the
+                // cue-qualified 0.82 floor.
+                vec![0.83, 0.557_8],
+                "2026-08-01T10:00:00.900Z",
+                0.8,
+            ),
+        ];
+        apply_supersession_penalty(&mut explicit_update);
+        assert!((explicit_update[0].capsule.score - 0.9).abs() < 1e-6);
+        assert!(
+            (explicit_update[1].capsule.score - 0.8 * SUPERSESSION_PENALTY).abs() < 1e-6,
+            "the unmarked incumbent must lose to the explicit correction"
+        );
+        assert!(explicit_update[1].capsule.superseded_hint);
+
+        // Rewritten updates can move far in embedding space while retaining a
+        // dense lexical identity. Correction cue + overlap recovers direction.
+        let mut rewritten_update = vec![
+            superseding_candidate(
+                "as of v2 the preferred kimetsu embedder is jina, replacing bge",
+                vec![1.0, 0.0],
+                "2026-08-01T10:00:00.100Z",
+                0.9,
+            ),
+            superseding_candidate(
+                "the recommended kimetsu embedder for retrieval is bge",
+                vec![0.71, 0.704_2],
+                "2026-08-01T10:00:00.900Z",
+                0.8,
+            ),
+        ];
+        apply_supersession_penalty(&mut rewritten_update);
+        assert!((rewritten_update[0].capsule.score - 0.9).abs() < 1e-6);
+        assert!((rewritten_update[1].capsule.score - 0.8 * SUPERSESSION_PENALTY).abs() < 1e-6);
+
+        // The same pair asked as a historical question favors the incumbent
+        // by query cosine, so the relaxed relationship must not penalize it.
+        let mut historical_query = vec![
+            Candidate {
+                cosine: Some(0.70),
+                ..superseding_candidate(
+                    "as of v2 the preferred kimetsu embedder is jina, replacing bge",
+                    vec![1.0, 0.0],
+                    "2026-08-01T10:00:00.100Z",
+                    0.9,
+                )
+            },
+            Candidate {
+                cosine: Some(0.90),
+                ..superseding_candidate(
+                    "the recommended kimetsu embedder for retrieval is bge",
+                    vec![0.71, 0.704_2],
+                    "2026-08-01T10:00:00.900Z",
+                    0.8,
+                )
+            },
+        ];
+        apply_supersession_penalty(&mut historical_query);
+        assert!((historical_query[0].capsule.score - 0.9).abs() < 1e-6);
+        assert!((historical_query[1].capsule.score - 0.8).abs() < 1e-6);
+
+        // A cue is evidence of direction, not permission to join unrelated
+        // topics: below the cue-qualified similarity floor both remain intact.
+        let mut too_distant = vec![
+            superseding_candidate(
+                "the project now uses spaces",
+                vec![1.0, 0.0],
+                "2026-08-01T10:00:00.100Z",
+                0.9,
+            ),
+            superseding_candidate(
+                "database backup retention is seven days",
+                vec![0.81, 0.586_4],
+                "2026-08-01T10:00:00.900Z",
+                0.8,
+            ),
+        ];
+        apply_supersession_penalty(&mut too_distant);
+        assert!((too_distant[0].capsule.score - 0.9).abs() < 1e-6);
+        assert!((too_distant[1].capsule.score - 0.8).abs() < 1e-6);
+
+        // Two update-like variants are ambiguous and remain untouched.
+        let mut ambiguous = vec![
+            superseding_candidate(
+                "the setting is now cheap_model",
+                vec![1.0, 0.0],
+                "2026-08-01T10:00:00.100Z",
+                0.9,
+            ),
+            superseding_candidate(
+                "as of v2 the setting is cheap_model",
+                vec![1.0, 0.0],
+                "2026-08-01T10:00:00.900Z",
+                0.8,
+            ),
+        ];
+        apply_supersession_penalty(&mut ambiguous);
+        assert!((ambiguous[0].capsule.score - 0.9).abs() < 1e-6);
+        assert!((ambiguous[1].capsule.score - 0.8).abs() < 1e-6);
     }
 
     /// An unknown or empty value must not silently change ranking — a typo in
@@ -5274,6 +6049,8 @@ mod tests {
             relevance: 1.0,
             scope_weight: 1.0,
             score,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 
@@ -5359,6 +6136,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rerank_reapplies_usefulness_but_not_to_superseded_capsules() {
+        let neutral = make_capsule("neutral", 0.0);
+        let mut useful = make_capsule("useful", 0.0);
+        useful.rerank_policy_tier = 1;
+
+        let out = rerank_capsules(
+            "q",
+            vec![neutral.clone(), useful.clone()],
+            &TwoScoreReranker(0.60, 0.50),
+            0.0,
+            0,
+        );
+        assert_eq!(out[0].summary, "useful", "usefulness survives reranking");
+
+        useful.superseded_hint = true;
+        useful.rerank_policy_tier = 1;
+        let out = rerank_capsules(
+            "q",
+            vec![neutral, useful],
+            &TwoScoreReranker(0.60, 0.50),
+            0.0,
+            0,
+        );
+        assert_eq!(
+            out[0].summary, "neutral",
+            "superseded memories must not keep their historic usefulness boost"
+        );
+        assert!(
+            (out[1].score - 0.40).abs() < 1e-6,
+            "supersession must be reapplied to the raw rerank score"
+        );
+    }
+
     /// RR-4: fail-open — a broken reranker returns Err; input order is preserved.
     #[test]
     fn rerank_capsules_fail_open_preserves_input_order() {
@@ -5399,6 +6210,191 @@ mod tests {
         use crate::embeddings::StubReranker;
         let out = rerank_capsules("query", vec![], &StubReranker, 0.0, 0);
         assert!(out.is_empty());
+    }
+
+    // ── v2.7: evidence-band arbitration ─────────────────────────────────────
+
+    /// Reranker that returns one fixed score per doc, for band tests.
+    struct FixedReranker(f32);
+    impl crate::embeddings::Reranker for FixedReranker {
+        fn rerank(
+            &self,
+            _query: &str,
+            docs: &[&str],
+        ) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {
+            Ok(vec![self.0; docs.len()])
+        }
+        fn model_id(&self) -> &str {
+            "fixed-reranker"
+        }
+    }
+
+    struct TwoScoreReranker(f32, f32);
+    impl crate::embeddings::Reranker for TwoScoreReranker {
+        fn rerank(
+            &self,
+            _query: &str,
+            _docs: &[&str],
+        ) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {
+            Ok(vec![self.0, self.1])
+        }
+        fn model_id(&self) -> &str {
+            "two-score"
+        }
+    }
+
+    fn band_bundle(top_abs_evidence: f32) -> ContextBundle {
+        let mut capsule = make_capsule("a memory lesson", 0.9);
+        capsule.kind = "memory".to_string();
+        capsule.token_estimate = 10;
+        ContextBundle {
+            stage: "localization".into(),
+            budget_tokens: 4000,
+            used_tokens: 10,
+            capsules: vec![capsule],
+            excluded: vec![],
+            skipped: false,
+            top_score: 0.9,
+            top_abs_evidence,
+            evidence_coverage: 1.0,
+            uncovered_terms: vec![],
+            chronological: false,
+        }
+    }
+
+    /// In-band + cross-encoder approves → injected (recall recovered).
+    /// In-band + cross-encoder rejects → converted to a skipped bundle.
+    #[test]
+    fn band_arbitration_follows_the_cross_encoder() {
+        let approve = FixedReranker(ABSTAIN_RERANK_FLOOR + 0.2);
+        let out = rerank_and_arbitrate("q", band_bundle(0.50), Some(&approve), 0.55, 0.0, 0);
+        assert!(!out.skipped, "approved band bundle must inject");
+        assert_eq!(out.capsules.len(), 1);
+
+        let reject = FixedReranker(ABSTAIN_RERANK_FLOOR - 0.2);
+        let out = rerank_and_arbitrate("q", band_bundle(0.50), Some(&reject), 0.55, 0.0, 0);
+        assert!(out.skipped, "rejected band bundle must convert to skipped");
+        assert!(out.capsules.is_empty());
+        assert_eq!(out.used_tokens, 0);
+        assert_eq!(out.excluded.len(), 1, "rejected capsules land in excluded");
+    }
+
+    /// The evidence-band threshold is calibrated on raw cross-encoder scores,
+    /// before the supersession policy is reapplied to ordering.
+    #[test]
+    fn band_arbitration_uses_raw_rerank_evidence() {
+        let mut bundle = band_bundle(0.50);
+        bundle.capsules[0].superseded_hint = true;
+        bundle
+            .capsules
+            .push(make_capsule("irrelevant distractor", 1.0));
+
+        let reranker = TwoScoreReranker(0.95, 0.0);
+        let out = rerank_and_arbitrate("q", bundle, Some(&reranker), 0.55, 0.0, 0);
+        assert!(!out.skipped, "raw rerank evidence above 0.9 must admit");
+        assert_eq!(out.capsules[0].summary, "a memory lesson");
+        assert!(
+            out.capsules[0].score < ABSTAIN_RERANK_FLOOR,
+            "the regression requires post-policy score below the raw-score floor"
+        );
+    }
+
+    /// Admission evidence is computed before policy ordering and output cap.
+    /// A cited low-score capsule may own the only output slot, but a high raw
+    /// score elsewhere in the candidate pool still proves the bundle useful.
+    #[test]
+    fn band_arbitration_uses_raw_evidence_before_policy_cap() {
+        let mut bundle = band_bundle(0.50);
+        bundle.capsules[0].rerank_policy_tier = 1;
+        bundle
+            .capsules
+            .push(make_capsule("high-confidence neutral", 1.0));
+
+        let reranker = TwoScoreReranker(0.50, 0.95);
+        let out = rerank_and_arbitrate("q", bundle, Some(&reranker), 0.55, 0.0, 1);
+        assert!(!out.skipped, "raw evidence outside the cap must admit");
+        assert_eq!(out.capsules.len(), 1);
+        assert_eq!(out.capsules[0].summary, "a memory lesson");
+    }
+
+    /// Above the band the cross-encoder reorders but never converts, even
+    /// when its scores are low.
+    #[test]
+    fn band_arbitration_never_converts_out_of_band_bundles() {
+        let reject = FixedReranker(0.0);
+        let out = rerank_and_arbitrate("q", band_bundle(0.70), Some(&reject), 0.55, 0.0, 0);
+        assert!(
+            !out.skipped,
+            "evidence above the threshold is not arbitrated"
+        );
+        assert_eq!(out.capsules.len(), 1);
+    }
+
+    /// No reranker: the band FAILS CLOSED — equivalent to the plain hard gate.
+    /// Out-of-band bundles pass through untouched.
+    #[test]
+    fn band_fails_closed_without_a_reranker() {
+        let out = rerank_and_arbitrate("q", band_bundle(0.50), None, 0.55, 0.0, 0);
+        assert!(out.skipped, "band without an arbiter must abstain");
+        let out = rerank_and_arbitrate("q", band_bundle(0.70), None, 0.55, 0.0, 0);
+        assert!(!out.skipped);
+        // Gate disabled: nothing converts.
+        let out = rerank_and_arbitrate("q", band_bundle(0.10), None, 0.0, 0.0, 0);
+        assert!(!out.skipped);
+    }
+
+    /// Reranker that scores docs by position: first doc highest. Used to
+    /// simulate the cross-encoder preferring the OLD twin's wording.
+    struct PositionReranker;
+    impl crate::embeddings::Reranker for PositionReranker {
+        fn rerank(
+            &self,
+            _query: &str,
+            docs: &[&str],
+        ) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {
+            Ok((0..docs.len()).map(|i| 0.99 - 0.01 * i as f32).collect())
+        }
+        fn model_id(&self) -> &str {
+            "position-reranker"
+        }
+    }
+
+    /// The supersession penalty must survive reranking: the cross-encoder
+    /// judges pure query relevance, so without reapplying the penalty on its
+    /// scores an older twin whose wording matches the query better would be
+    /// resurrected above its replacement (measured: resolution 0.58 → 0.36).
+    #[test]
+    fn supersession_penalty_survives_reranking() {
+        let mut old = make_capsule("deploy via make deploy-staging", 0.7);
+        old.superseded_hint = true; // marked by apply_supersession_penalty
+        let new = make_capsule("deploy via make deploy-preview since the migration", 0.9);
+        let mut bundle = band_bundle(0.70); // out of band: no conversion risk
+        bundle.capsules = vec![old, new];
+
+        // PositionReranker scores the OLD twin (first doc) highest: 0.99 vs
+        // 0.98. The reapplied ×0.80 penalty must drop it below the new one.
+        let out = rerank_and_arbitrate("q", bundle, Some(&PositionReranker), 0.55, 0.0, 0);
+        assert!(!out.skipped);
+        assert_eq!(out.capsules.len(), 2);
+        assert!(
+            out.capsules[0].summary.contains("deploy-preview"),
+            "the replacement must outrank the penalized incumbent after reranking; got {:?}",
+            out.capsules.iter().map(|c| &c.summary).collect::<Vec<_>>()
+        );
+        assert!(out.capsules[1].superseded_hint);
+    }
+
+    /// A bundle with a non-memory capsule is never converted: repo evidence
+    /// stands on its own.
+    #[test]
+    fn band_spares_bundles_with_repo_evidence() {
+        let mut bundle = band_bundle(0.50);
+        let mut repo = make_capsule("README excerpt", 0.4);
+        repo.kind = "repo_file".to_string();
+        bundle.capsules.push(repo);
+        let reject = FixedReranker(0.0);
+        let out = rerank_and_arbitrate("q", bundle, Some(&reject), 0.55, 0.0, 0);
+        assert!(!out.skipped, "repo capsules suppress band conversion");
     }
 
     // ── v1.5 Story 2.1: compress_for_render unit tests ──────────────────────
@@ -5557,6 +6553,8 @@ mod evidence_tests {
             relevance: 0.0,
             scope_weight: 0.9,
             score: 0.5,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 
@@ -5569,6 +6567,7 @@ mod evidence_tests {
             excluded: Vec::new(),
             skipped: false,
             top_score: 0.7,
+            top_abs_evidence: 0.0,
             evidence_coverage: coverage,
             uncovered_terms: uncovered.iter().map(|s| s.to_string()).collect(),
             chronological: false,

@@ -208,6 +208,8 @@ mod tests {
                 relevance: 0.0,
                 scope_weight: 0.9,
                 score: 0.0,
+                superseded_hint: false,
+                rerank_policy_tier: 0,
             },
             raw_relevance: relevance,
             embedding: None,

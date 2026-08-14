@@ -407,6 +407,8 @@ mod tests {
             relevance: 0.8,
             scope_weight: 1.0,
             score: 0.9,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         }
     }
 

@@ -97,6 +97,30 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
             };
             let bundle =
                 project::retrieve_context(&cwd, &args.stage, &effective_query, args.budget_tokens)?;
+            // v2.7: cross-encoder parity with the MCP/daemon paths + evidence
+            // -band arbitration. Without this the CLI (and every benchmark
+            // driving it) measured the bi-encoder alone while `deep` configs
+            // promised a reranker, and the abstention band always failed
+            // closed. Floor 0.0 / cap 0: pure reorder — no capsule dropped by
+            // the reranker itself, arbitration is the only conversion.
+            #[cfg(feature = "embeddings")]
+            let bundle = {
+                let reranker = context_config.as_ref().and_then(|cfg| {
+                    kimetsu_brain::embeddings::open_reranker_for_model(&cfg.embedder.reranker)
+                });
+                let abstain = context_config
+                    .as_ref()
+                    .map(project::resolved_abstain_evidence_for)
+                    .unwrap_or(0.0);
+                kimetsu_brain::context::rerank_and_arbitrate(
+                    &effective_query,
+                    bundle,
+                    reranker.as_deref(),
+                    abstain,
+                    0.0,
+                    0,
+                )
+            };
             if args.json {
                 println!(
                     "{}",
@@ -117,6 +141,7 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
                         // of it without these, and that is exactly the
                         // difference BrainBench's sycophancy track scores.
                         "top_score": bundle.top_score,
+                        "top_abs_evidence": bundle.top_abs_evidence,
                         "skipped": bundle.skipped,
                         "evidence_coverage": bundle.evidence_coverage,
                         "uncovered_terms": bundle.uncovered_terms,
@@ -1929,6 +1954,9 @@ pub(crate) fn daemon_capsules_to_bundle(
         excluded: Vec::new(),
         skipped,
         top_score,
+        // The daemon wire protocol does not carry the absolute-evidence
+        // signal; 0.0 here means "unreported", not "no evidence".
+        top_abs_evidence: 0.0,
         evidence_coverage,
         uncovered_terms,
         // Ordering queries never reach the daemon (`try_daemon_retrieve`

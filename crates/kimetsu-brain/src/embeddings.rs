@@ -320,19 +320,40 @@ pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
         ];
 
         if CURATED.contains(&v.as_str()) {
-            return fastembed_backend::FastembedReranker::try_open(model_id)
-                .ok()
-                .map(|r| Box::new(r) as Box<dyn Reranker>);
+            return match fastembed_backend::FastembedReranker::try_open(model_id) {
+                Ok(r) => Some(Box::new(r) as Box<dyn Reranker>),
+                Err(err) => {
+                    eprintln!(
+                        "kimetsu-brain: reranker {model_id:?} unavailable ({err}); \
+                         continuing without cross-encoder reranking"
+                    );
+                    None
+                }
+            };
         }
         if USER_DEFINED_ALIASES.contains(&v.as_str()) || v.contains('/') {
-            return fastembed_backend::FastembedReranker::try_open_user_defined(model_id)
-                .ok()
-                .map(|r| Box::new(r) as Box<dyn Reranker>);
+            return match fastembed_backend::FastembedReranker::try_open_user_defined(model_id) {
+                Ok(r) => Some(Box::new(r) as Box<dyn Reranker>),
+                Err(err) => {
+                    eprintln!(
+                        "kimetsu-brain: reranker {model_id:?} unavailable ({err}); \
+                         continuing without cross-encoder reranking"
+                    );
+                    None
+                }
+            };
         }
         // Unknown → fallback to default curated turbo.
-        fastembed_backend::FastembedReranker::try_open("jina-reranker-v1-turbo-en")
-            .ok()
-            .map(|r| Box::new(r) as Box<dyn Reranker>)
+        match fastembed_backend::FastembedReranker::try_open("jina-reranker-v1-turbo-en") {
+            Ok(r) => Some(Box::new(r) as Box<dyn Reranker>),
+            Err(err) => {
+                eprintln!(
+                    "kimetsu-brain: fallback reranker unavailable ({err}); \
+                     continuing without cross-encoder reranking"
+                );
+                None
+            }
+        }
     }
     #[cfg(not(feature = "embeddings"))]
     {
@@ -617,7 +638,7 @@ mod fastembed_backend {
     fn download_user_defined_reranker(
         model_id: &str,
     ) -> Result<(fastembed::OnnxSource, fastembed::TokenizerFiles), EmbedderError> {
-        use hf_hub::api::sync::Api;
+        use hf_hub::api::sync::ApiBuilder;
 
         let lowercased = model_id.trim().to_ascii_lowercase();
         let repo_id: String = if let Some(alias) = hf_repo_for_alias(&lowercased) {
@@ -631,8 +652,12 @@ mod fastembed_backend {
             )));
         };
 
-        let api = Api::new()
-            .map_err(|e| EmbedderError::LoadFailed(format!("hf-hub Api::new failed: {e}")))?;
+        // `Api::new()` always uses the OS user's default cache and ignores
+        // `HF_HOME`. Benchmark workspaces and sandboxed hosts rely on an
+        // explicit shared cache; honor it just as fastembed does.
+        let api = ApiBuilder::from_env().build().map_err(|e| {
+            EmbedderError::LoadFailed(format!("hf-hub ApiBuilder::from_env failed: {e}"))
+        })?;
         let repo = api.model(repo_id.clone());
 
         // Helper: download a required file or return LoadFailed.

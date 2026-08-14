@@ -100,17 +100,19 @@ impl DaemonState {
             ..Default::default()
         };
         match session.retrieve_context_with_injected_embedder(request, self.embedder.as_ref()) {
-            Ok(mut bundle) => {
-                // Apply cross-encoder reranking when a reranker is present.
-                if let Some(rr) = &self.reranker {
-                    bundle.capsules = kimetsu_brain::context::rerank_capsules(
-                        &query,
-                        bundle.capsules,
-                        rr.as_ref(),
-                        RERANK_FLOOR,
-                        cap,
-                    );
-                }
+            Ok(bundle) => {
+                // v2.7: rerank + evidence-band arbitration (see
+                // `rerank_and_arbitrate`). A band bundle the cross-encoder
+                // rejects goes back over the wire as skipped, exactly like a
+                // hard-gated one.
+                let bundle = kimetsu_brain::context::rerank_and_arbitrate(
+                    &query,
+                    bundle,
+                    self.reranker.as_deref(),
+                    session.resolved_abstain_evidence(),
+                    RERANK_FLOOR,
+                    cap,
+                );
                 proto::Response::Capsules {
                     capsules: bundle
                         .capsules

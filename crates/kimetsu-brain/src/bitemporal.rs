@@ -174,6 +174,8 @@ pub fn as_of_capsules(memories: &[AsOfMemory]) -> Vec<ContextCapsule> {
             relevance: 0.0,
             scope_weight: 0.0,
             score: 0.0,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
         })
         .collect()
 }

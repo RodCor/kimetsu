@@ -727,7 +727,7 @@ pub fn brain_context_tool(
     arguments: &serde_json::Value,
     reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
 ) -> Result<serde_json::Value, String> {
-    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
+    use kimetsu_brain::context::ContextRequest;
 
     let query = arguments
         .get("query")
@@ -809,28 +809,38 @@ pub fn brain_context_tool(
     };
 
     match project::retrieve_context_readonly_with_request(workspace, request) {
-        Ok(bundle) if bundle.skipped => Ok(json!({
-            "ok": true,
-            "skipped": true,
-            "top_score": bundle.top_score,
-            "min_score": min_score,
-            "capsule_count": 0,
-            "capsules": [],
-            "usage": {
-                "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
+        // v2.7: rerank + evidence-band arbitration before the skipped check —
+        // a band bundle the cross-encoder rejects becomes a skipped bundle
+        // here, taking the same zero-token path a hard-gated retrieval does.
+        Ok(bundle) => {
+            let abstain = kimetsu_core::paths::ProjectPaths::discover(workspace)
+                .ok()
+                .and_then(|paths| project::load_config(&paths).ok())
+                .map(|cfg| kimetsu_brain::project::resolved_abstain_evidence_for(&cfg))
+                .unwrap_or(0.0);
+            let bundle = kimetsu_brain::context::rerank_and_arbitrate(
+                &effective_query,
+                bundle,
+                reranker,
+                abstain,
+                REMOTE_RERANK_FLOOR,
+                cap,
+            );
+            if bundle.skipped {
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": true,
+                    "top_score": bundle.top_score,
+                    "top_abs_evidence": bundle.top_abs_evidence,
+                    "min_score": min_score,
+                    "capsule_count": 0,
+                    "capsules": [],
+                    "usage": {
+                        "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
+                    }
+                }));
             }
-        })),
-        Ok(mut bundle) => {
-            // Apply cross-encoder reranking when a reranker is present.
-            if let Some(rr) = reranker {
-                bundle.capsules = rerank_capsules(
-                    &effective_query,
-                    bundle.capsules,
-                    rr,
-                    REMOTE_RERANK_FLOOR,
-                    cap,
-                );
-            }
+            let mut bundle = bundle;
 
             // v1.5 (Story 2.1): render-time compression. Load compress_capsules
             // best-effort — any config error means no compression (safe default).
