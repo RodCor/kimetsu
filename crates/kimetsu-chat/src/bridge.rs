@@ -318,9 +318,10 @@ Run `kimetsu brain context <query>` when you start a task and read the returned
 capsules before deciding on a plan. An empty result means the brain held nothing
 relevant and cost nothing — retrieving is cheaper than rediscovering.
 
-Run `kimetsu brain record` once you know something a later session would
-otherwise have to work out again, with a concrete, actionable lesson and 2-5
-domain tags.
+Run `kimetsu brain memory add --scope project --kind <kind> "<lesson>"` once
+you know something a later session would otherwise have to work out again.
+Choose `fact`, `preference`, `convention`, `command`, or `failure_pattern` for
+`<kind>`.
 
 `kimetsu brain status` reports whether the brain is initialized, has accepted
 memories, or has pending proposals.
@@ -5234,8 +5235,26 @@ mod tests {
             "silent no-op on missing binary"
         );
         assert!(ts.contains("session_start"), "hooks session_start");
+        assert!(
+            ts.contains("sessionManager?.getSessionId"),
+            "uses current Pi session identity"
+        );
+        assert!(
+            ts.contains("sessionManager?.getSessionFile"),
+            "passes Pi's persisted transcript to lifecycle hooks"
+        );
         assert!(ts.contains("agent_end"), "hooks agent_end");
         assert!(ts.contains("session_shutdown"), "hooks session_shutdown");
+
+        let skill = fs::read_to_string(pi.join("skills/kimetsu-brain/SKILL.md")).unwrap();
+        assert!(
+            skill.contains("kimetsu brain memory add --scope project"),
+            "skill documents the current v2.7 memory command"
+        );
+        assert!(
+            !skill.contains("kimetsu brain record"),
+            "skill must not teach a removed command"
+        );
 
         fs::remove_dir_all(ws).ok();
     }
