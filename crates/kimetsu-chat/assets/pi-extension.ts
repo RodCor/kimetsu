@@ -14,6 +14,7 @@
 // crash, unparseable output. Kimetsu is a sidecar — it must never break Pi.
 
 import { spawn } from "node:child_process";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Hard cap on any single kimetsu invocation. A hung binary must not stall a turn. */
 const EXEC_TIMEOUT_MS = 10000;
@@ -98,11 +99,44 @@ function parseAdditionalContext(stdout: string): string | undefined {
 
 /** Best-effort session id from Pi's handler context, across naming variants. */
 function sessionIdOf(ctx: any): string {
+  // Current Pi exposes the durable id through SessionManager. Prefer it over
+  // historical context-field variants so /new, /resume, and /fork each get a
+  // distinct Kimetsu session even when they happen in the same Pi process.
+  const getSessionId = ctx?.sessionManager?.getSessionId;
+  if (typeof getSessionId === "function") {
+    try {
+      const id = getSessionId.call(ctx.sessionManager);
+      if (typeof id === "string" && id.trim() !== "") return id;
+    } catch {
+      // A third-party/legacy SessionManager must not break the host.
+    }
+  }
   const candidates = [ctx?.sessionId, ctx?.sessionID, ctx?.session_id, ctx?.session?.id];
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim() !== "") return candidate;
   }
   return FALLBACK_SESSION_ID;
+}
+
+/** Current Pi's persisted JSONL transcript, when the session is not ephemeral. */
+function transcriptPathOf(ctx: any): string | undefined {
+  const getSessionFile = ctx?.sessionManager?.getSessionFile;
+  if (typeof getSessionFile !== "function") return undefined;
+  try {
+    const path = getSessionFile.call(ctx.sessionManager);
+    return typeof path === "string" && path.trim() !== "" ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Host-neutral hook payload understood by Kimetsu v2.7. */
+function lifecyclePayload(ctx: any, transcript?: unknown[]): string {
+  const payload: Record<string, unknown> = { session_id: sessionIdOf(ctx) };
+  const transcriptPath = transcriptPathOf(ctx);
+  if (transcriptPath !== undefined) payload.transcript_path = transcriptPath;
+  else if (Array.isArray(transcript)) payload.transcript = transcript;
+  return JSON.stringify(payload);
 }
 
 /** `--workspace <cwd>` when Pi tells us the working directory, else nothing
@@ -112,12 +146,12 @@ function workspaceArgs(ctx: any): string[] {
   return typeof cwd === "string" && cwd.trim() !== "" ? ["--workspace", cwd] : [];
 }
 
-export default function (pi: any) {
+export default function (pi: ExtensionAPI) {
   // session_start fires once when Pi starts up or a new session begins.
   // Warming spawns the embedder daemon so the first real retrieval is semantic
   // rather than falling back to lexical FTS.
   // (`brain warm` takes no --workspace: it resolves the project from its cwd.)
-  pi.on("session_start", async (_event: any, _ctx: any) => {
+  pi.on("session_start", async (_event, _ctx) => {
     await kimetsuRun(["brain", "warm"]);
   });
 
@@ -126,7 +160,7 @@ export default function (pi: any) {
   // context is injected. Pi has no session-start context surface, so
   // --warm-on-first-prompt folds the repo digest and episodic resume into the
   // first turn of each session.
-  pi.on("before_agent_start", async (event: any, ctx: any) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const payload = JSON.stringify({
       session_id: sessionIdOf(ctx),
       prompt: typeof event?.prompt === "string" ? event.prompt : "",
@@ -147,12 +181,18 @@ export default function (pi: any) {
   });
 
   // agent_end fires after the LLM turn completes (maps to Kimetsu stop-hook).
-  pi.on("agent_end", async (_event: any, ctx: any) => {
-    await kimetsuRun(["brain", "stop-hook", ...workspaceArgs(ctx)]);
+  pi.on("agent_end", async (event, ctx) => {
+    await kimetsuRun(
+      ["brain", "stop-hook", ...workspaceArgs(ctx)],
+      lifecyclePayload(ctx, event.messages),
+    );
   });
 
   // session_shutdown fires on clean session close (maps to session-end-hook).
-  pi.on("session_shutdown", async (_event: any, ctx: any) => {
-    await kimetsuRun(["brain", "session-end-hook", ...workspaceArgs(ctx)]);
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await kimetsuRun(
+      ["brain", "session-end-hook", ...workspaceArgs(ctx)],
+      lifecyclePayload(ctx),
+    );
   });
 }
