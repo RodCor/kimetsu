@@ -7,6 +7,13 @@ onward the project follows SemVer normally: patch releases are
 bug-fix-only, minor releases are backward-compatible additions, and
 breaking changes require a major bump.
 
+## Unreleased
+
+### Security
+
+- Updated transitive `h2` from 0.4.14 to 0.4.16, fixing
+  `RUSTSEC-2026-0258` (unbounded empty HTTP/2 DATA frames).
+
 ## v2.7.0: Retrieval that knows when to stay silent
 
 This release hardens the semantic broker around the cases that ordinary
