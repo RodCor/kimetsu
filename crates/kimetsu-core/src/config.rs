@@ -302,7 +302,7 @@ pub struct KimetsuSection {
 /// | proactive inject-or-stay-silent | locally-fit statistical policy | model adjudication |
 /// | idle-time work | consolidation, pruning, tuning | the above plus query anticipation |
 ///
-/// The benchmark tables in `docs/memory-benchmark/` report both columns
+/// The benchmark tables at <https://kimetsu.dev/docs/memory-benchmark/> report both columns
 /// separately: Free is what the "model-free" claim is measured on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

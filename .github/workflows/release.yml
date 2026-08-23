@@ -132,11 +132,7 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/kimetsu" "dist/$NAME/"
           fi
-          MIT_LICENSE="LICENSE-MIT"
-          APACHE_LICENSE="LICENSE-APACHE"
-          [ -f "$MIT_LICENSE" ] || MIT_LICENSE="docs/LICENSE-MIT"
-          [ -f "$APACHE_LICENSE" ] || APACHE_LICENSE="docs/LICENSE-APACHE"
-          cp "$MIT_LICENSE" "$APACHE_LICENSE" README.md "dist/$NAME/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$NAME/"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path $NAME -DestinationPath $NAME.zip"
@@ -156,11 +152,7 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/kimetsu-remote" "dist/$NAME/"
           fi
-          MIT_LICENSE="LICENSE-MIT"
-          APACHE_LICENSE="LICENSE-APACHE"
-          [ -f "$MIT_LICENSE" ] || MIT_LICENSE="docs/LICENSE-MIT"
-          [ -f "$APACHE_LICENSE" ] || APACHE_LICENSE="docs/LICENSE-APACHE"
-          cp "$MIT_LICENSE" "$APACHE_LICENSE" npm/kimetsu-remote/README.md "dist/$NAME/"
+          cp LICENSE-MIT LICENSE-APACHE npm/kimetsu-remote/README.md "dist/$NAME/"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path $NAME -DestinationPath $NAME.zip"

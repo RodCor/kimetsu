@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/kimetsu-logo.png" alt="Kimetsu logo" width="200" />
+<img src="https://kimetsu.dev/kimetsu-logo.png" alt="Kimetsu logo" width="200" />
 
 # Kimetsu
 
@@ -12,7 +12,7 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-informational)](https://www.rust-lang.org)
 
-<img src="docs/assets/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="720" />
+<img src="https://kimetsu.dev/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="720" />
 
 </div>
 
@@ -82,7 +82,7 @@ Other install paths (cargo, prebuilt archives) and host-wiring details are in
 
 ## How it works
 
-<img src="docs/assets/how-it-works.svg" alt="How Kimetsu works: the host agent asks the broker for context, the broker scores candidates from brain.db by relevance, usefulness, freshness, and scope, injects the top memories into the agent run, and the run cites what helped so cited memories rise and stale ones decay" width="960" />
+<img src="https://kimetsu.dev/how-it-works.svg" alt="How Kimetsu works: the host agent asks the broker for context, the broker scores candidates from brain.db by relevance, usefulness, freshness, and scope, injects the top memories into the agent run, and the run cites what helped so cited memories rise and stale ones decay" width="960" />
 
 1. **Before a task**, the broker walks your project brain and your
    cross-project user brain, scores every candidate, and injects the top few
@@ -215,5 +215,5 @@ ingest, TLS, Prometheus metrics, and a server-side reranker. Full setup in
 
 ## License
 
-Dual-licensed under [MIT](docs/LICENSE-MIT) or [Apache-2.0](docs/LICENSE-APACHE),
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
 your choice.

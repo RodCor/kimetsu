@@ -10,7 +10,7 @@
 //! lower-bound estimate of the avoided exploration cost for that memory
 //! kind.  We never inflate the numbers: the goal is that a user who sees
 //! a "net positive" result can trust it.  The methodology document at
-//! `docs/ROI-METHODOLOGY.md` explains the calibration approach and the
+//! <https://kimetsu.dev/docs/roi-methodology/> explains the calibration approach and the
 //! Terminal-Bench sanity anchor.
 
 use kimetsu_core::{KimetsuResult, memory::MemoryKind};
@@ -76,7 +76,7 @@ pub const SAVED_TOKENS_PER_SKILL_SERVED: u64 = 300;
 /// kind.  These are deliberate *under*-estimates of the exploration cost the
 /// model would have incurred without the brain context.
 ///
-/// Calibration methodology (see `docs/ROI-METHODOLOGY.md` for details):
+/// Calibration methodology (see <https://kimetsu.dev/docs/roi-methodology/> for details):
 /// - `failure_pattern`: avoids the "try → fail → diagnose → fix" loop.
 ///   Typical loop: ~3 tool calls × ~500 tokens/call = ~1 500 tokens.
 /// - `command`: avoids a web/docs lookup or `--help` trial.  ~1–2 tool
