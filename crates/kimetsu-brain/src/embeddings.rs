@@ -620,6 +620,27 @@ mod fastembed_backend {
     };
     use std::sync::{Arc, Mutex, OnceLock};
 
+    /// Opt-in process-wide pool configured before any local model session.
+    /// With no setting, leave the embedding application's ORT environment alone.
+    /// ORT disables per-session pools when a global pool is installed, so this
+    /// overrides FastEmbed's per-session available_parallelism setting as well.
+    fn configure_runtime_threads() -> Result<(), EmbedderError> {
+        static CONFIGURED: OnceLock<Result<(), String>> = OnceLock::new();
+        CONFIGURED.get_or_init(|| {
+            let raw = std::env::var("KIMETSU_INTRA_THREADS").ok();
+            let Some(threads) = super::parse_runtime_threads(raw.as_deref())? else { return Ok(()) };
+            let pool = ort::environment::GlobalThreadPoolOptions::default()
+                .with_intra_threads(threads).map_err(|e| e.to_string())?
+                .with_inter_threads(1).map_err(|e| e.to_string())?
+                .with_spin_control(false).map_err(|e| e.to_string())?;
+            if !ort::init().with_global_thread_pool(pool).commit() {
+                return Err("KIMETSU_INTRA_THREADS cannot take effect: ONNX environment already configured; set it before the first model load".into());
+            }
+            eprintln!("kimetsu-brain: ONNX shared intra-op threads={threads}, inter-op=1, spinning=off");
+            Ok(())
+        }).clone().map_err(EmbedderError::LoadFailed)
+    }
+
     // ── HF Hub download helper (user-defined ONNX rerankers) ─────────────────
 
     /// Alias table: lowercased stable id → HuggingFace repo id.
@@ -707,6 +728,7 @@ mod fastembed_backend {
 
     impl FastembedEmbedder {
         pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            configure_runtime_threads()?;
             let (kind, model_id, dim) = match builtin_id {
                 "bge-m3" => (EmbeddingModel::BGEM3, "bge-m3", 1024),
                 "jina-v2-base-code" => (
@@ -827,6 +849,7 @@ mod fastembed_backend {
         /// initialize a `TextRerank` engine. Unknown ids fall back to the
         /// jina-reranker-v1-turbo-en default.
         pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            configure_runtime_threads()?;
             let (kind, stable_id) = match builtin_id {
                 "bge-reranker-base" => (RerankerModel::BGERerankerBase, "bge-reranker-base"),
                 "bge-reranker-v2-m3" => (RerankerModel::BGERerankerV2M3, "bge-reranker-v2-m3"),
@@ -857,6 +880,7 @@ mod fastembed_backend {
         /// the normalized alias (e.g. `"jina-reranker-v1-tiny-en"`) or the raw
         /// repo id, lower-cased, so it is stable across calls.
         pub fn try_open_user_defined(alias_or_repo: &str) -> Result<Self, EmbedderError> {
+            configure_runtime_threads()?;
             use fastembed::{RerankInitOptionsUserDefined, UserDefinedRerankingModel};
 
             let (onnx_source, tokenizer_files) = download_user_defined_reranker(alias_or_repo)?;
@@ -1054,9 +1078,35 @@ pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuRes
     Ok(out)
 }
 
+#[cfg(any(test, feature = "embeddings"))]
+fn parse_runtime_threads(raw: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let threads = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "KIMETSU_INTRA_THREADS must be an integer from 1 to 1024".to_string())?;
+    if !(1..=1024).contains(&threads) {
+        return Err("KIMETSU_INTRA_THREADS must be an integer from 1 to 1024".into());
+    }
+    Ok(Some(threads))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_threads_are_explicit_bounded_and_invalid_values_are_errors() {
+        assert_eq!(parse_runtime_threads(None).unwrap(), None);
+        assert_eq!(parse_runtime_threads(Some(" 4 ")).unwrap(), Some(4));
+        assert_eq!(parse_runtime_threads(Some("1")).unwrap(), Some(1));
+        for value in ["0", "-1", "abc", "1025", "999999999999999999999999"] {
+            assert!(
+                parse_runtime_threads(Some(value)).is_err(),
+                "invalid setting: {value}"
+            );
+        }
+    }
 
     #[test]
     fn map_builtin_id_maps_aliases_and_defaults_unknown() {

@@ -20,7 +20,7 @@ categories = ["database", "development-tools"]
 # retrieval that v0.4.2 ships, so `cargo install kimetsu-cli`
 # without --features embeddings never downloads a model.
 default = []
-embeddings = ["dep:fastembed", "dep:usearch", "dep:hf-hub"]
+embeddings = ["dep:fastembed", "dep:usearch", "dep:hf-hub", "dep:ort"]
 # S5.3 (remote-only): full petgraph Tier-2 backend — centrality,
 # shortest-path, community detection for candidate expansion.
 # NEVER in default. Enabled by kimetsu-remote so the local CLI never
@@ -41,6 +41,8 @@ blake3.workspace = true
 # Optional so the lean/CLI build never links it. `graph` feature gate.
 petgraph = { version = "0.6", optional = true }
 fastembed = { version = "5", optional = true }
+# Must share FastEmbed's ORT instance so its sessions use the configured pool.
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "api-24"] }
 # v1.0.0 reranker bench: user-defined ONNX model download via HuggingFace Hub.
 # Mirrors fastembed's own hf-hub usage (ureq sync API, no tokio).
 hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }

@@ -2016,6 +2016,7 @@ dependencies = [
  "hf-hub",
  "ignore",
  "kimetsu-core",
+ "ort",
  "petgraph",
  "regex",
  "rusqlite",
