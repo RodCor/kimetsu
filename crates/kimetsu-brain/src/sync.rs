@@ -72,6 +72,7 @@ const SYNC_ALLOWED_KINDS: &[&str] = &[
     "memory.proposed",
     "memory.rejected",
     "memory.invalidated",
+    "memory.corrected",
     "memory.cited",
     "memory.superseded",
 ];
@@ -171,7 +172,7 @@ impl TryFrom<SyncEvent> for Event {
 fn redact_event_payload(event: &Event) -> serde_json::Value {
     if !matches!(
         event.kind.as_str(),
-        "memory.accepted" | "memory.proposed" | "memory.cited"
+        "memory.accepted" | "memory.proposed" | "memory.cited" | "memory.corrected"
     ) {
         return event.payload.clone();
     }

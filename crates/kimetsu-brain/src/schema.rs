@@ -1201,3 +1201,19 @@ mod tests {
         );
     }
 }
+
+/// Retain correction lineage and invalidate indexes across connections.
+pub fn migrate_v11_to_v12(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_revisions (
+        revision_id INTEGER PRIMARY KEY, memory_id TEXT NOT NULL,
+        event_id TEXT NOT NULL UNIQUE, text TEXT NOT NULL, kind TEXT NOT NULL,
+        known_at TEXT NOT NULL, effective_at TEXT NOT NULL,
+        confidence REAL NOT NULL, use_count INTEGER NOT NULL, usefulness_score REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_memory_revisions_time ON memory_revisions(memory_id, known_at, effective_at);
+        CREATE TABLE IF NOT EXISTS corpus_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+        INSERT OR IGNORE INTO corpus_revision VALUES (1,0);
+        CREATE TRIGGER IF NOT EXISTS corpus_insert AFTER INSERT ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;
+        CREATE TRIGGER IF NOT EXISTS corpus_delete AFTER DELETE ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;
+        CREATE TRIGGER IF NOT EXISTS corpus_update AFTER UPDATE OF embedding, embedding_model, text, invalidated_at, superseded_by ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;")?;
+    Ok(())
+}

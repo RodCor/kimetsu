@@ -2009,20 +2009,9 @@ pub struct UndoneMemory {
     pub kind: String,
 }
 
-/// QoL: edit an existing active memory in-place, preserving its usefulness history.
-///
-/// - `new_text`: if given, the text (and normalized_text) are updated, the FTS
-///   index row is refreshed, and a new embedding is stored via the configured
-///   embedder (no-op in lean builds). Secret-redaction is applied at the same
-///   boundary as `add_memory`.
-/// - `new_kind`: if given, the `kind` column is updated.
-///
-/// At least one of `new_text` / `new_kind` must be `Some`; otherwise an error
-/// is returned. `use_count`, `usefulness_score`, `confidence`, and `created_at`
-/// are intentionally left unchanged — the whole point of edit-in-place is to
-/// preserve the memory's learned history.
-///
-/// Errors if the memory id is unknown or already invalidated.
+/// Record a durable correction to an active memory. Text changes reset
+/// claim-specific evidence and invalidate embeddings atomically with FTS.
+/// Kind-only changes preserve evidence; all corrections retain text lineage.
 pub fn edit_memory(
     start: &Path,
     memory_id: &str,
@@ -2034,92 +2023,35 @@ pub fn edit_memory(
     }
 
     let (paths, config, conn) = load_project(start)?;
-
-    // Verify memory exists and is active (not invalidated).
-    let row: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT scope, kind, invalidated_at FROM memories WHERE memory_id = ?1",
-            params![memory_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2).unwrap_or_default(),
-                ))
-            },
-        )
-        .optional()?;
-
-    let (scope, current_kind, invalidated_at) = match row {
-        None => return Err(format!("memory not found: {memory_id}").into()),
-        Some(r) => r,
-    };
-    if !invalidated_at.is_empty() {
-        return Err(format!("memory {memory_id} is already invalidated").into());
-    }
-
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory edit", Some(run_id))?;
-
-    // Apply text update.
-    if let Some(raw_text) = new_text {
-        let redaction = redact::redact_secrets(raw_text);
-        if redaction.was_redacted() {
-            eprintln!("kimetsu-brain: {}", redaction.summary());
-        }
-        let text = &redaction.text;
-        let normalized = normalize_memory_text(text);
-
-        conn.execute(
-            "UPDATE memories SET text = ?1, normalized_text = ?2 WHERE memory_id = ?3",
-            params![text, normalized, memory_id],
-        )?;
-
-        // Refresh the FTS index row.
-        conn.execute(
-            "DELETE FROM memories_fts WHERE memory_id = ?1",
+    let corrected = Event::new(
+        run_id,
+        "memory.corrected",
+        serde_json::json!({
+            "memory_id": memory_id,
+            "text": new_text.map(|text| redact::redact_secrets(text).text),
+            "kind": new_kind.map(|kind| kind.to_string()),
+        }),
+    );
+    projector::apply_events(
+        &conn,
+        &[
+            admin_started_event(&paths, &config, run_id, "memory edit")?,
+            corrected,
+            admin_finished_event(run_id),
+        ],
+    )?;
+    // Correction and vector invalidation are committed together. Re-embedding
+    // is recoverable derived work and cannot leave an old vector on new text.
+    if new_text.is_some() {
+        let text: String = conn.query_row(
+            "SELECT text FROM memories WHERE memory_id=?1",
             params![memory_id],
+            |r| r.get(0),
         )?;
-        let kind_for_fts = new_kind
-            .as_ref()
-            .map(|k| k.to_string())
-            .unwrap_or(current_kind.clone());
-        conn.execute(
-            "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
-            params![memory_id, text, kind_for_fts, scope],
-        )?;
-
-        // Re-embed so semantic retrieval reflects the corrected text.
         let embedder = embeddings::open_embedder_for(config.embedder.enabled);
-        embeddings::embed_and_persist(&conn, memory_id, text, embedder)?;
-        // (return value not needed here — no conflict scan after an edit)
-    }
-
-    // Apply kind update (FTS row may need refreshing if text wasn't also changed).
-    if let Some(kind) = new_kind {
-        conn.execute(
-            "UPDATE memories SET kind = ?1 WHERE memory_id = ?2",
-            params![kind.to_string(), memory_id],
-        )?;
-
-        // Only refresh FTS kind column if we didn't already rebuild it above.
-        if new_text.is_none() {
-            // Re-read the current text from DB to rebuild the FTS row with
-            // the new kind (text unchanged).
-            let current_text: String = conn.query_row(
-                "SELECT text FROM memories WHERE memory_id = ?1",
-                params![memory_id],
-                |row| row.get(0),
-            )?;
-            conn.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?1",
-                params![memory_id],
-            )?;
-            conn.execute(
-                "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
-                params![memory_id, current_text, kind.to_string(), scope],
-            )?;
-        }
+        embeddings::embed_and_persist(&conn, memory_id, &text, embedder)?;
     }
 
     Ok(())
@@ -5609,10 +5541,10 @@ max_total_cost_usd = 250.0
                 assert_eq!(text, "corrected text for edit test");
                 assert!(!normalized.is_empty(), "normalized_text must not be empty");
                 // History preserved.
-                assert_eq!(use_count, 7, "use_count must not be reset");
+                assert_eq!(use_count, 0, "changed claim must reset evidence");
                 assert!(
-                    (usefulness_score - 3.5).abs() < 0.01,
-                    "usefulness_score must not be reset"
+                    usefulness_score.abs() < 0.01,
+                    "changed claim must reset usefulness"
                 );
             }
 

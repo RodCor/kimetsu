@@ -192,6 +192,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
         DELETE FROM runs;
         DELETE FROM sources;
         DELETE FROM memories;
+        DELETE FROM memory_revisions;
         DELETE FROM memory_proposals;
         DELETE FROM memories_fts;
         DELETE FROM memory_citations;
@@ -253,6 +254,7 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // the edge is re-derived by replaying this event.
         "memory.edge" => apply_memory_edge(conn, event),
         // Flagship 1 / Story 1.4: temporal validity — stamp valid_from / valid_to.
+        "memory.corrected" => apply_memory_corrected(conn, event),
         "memory.temporal" => apply_memory_temporal(conn, event),
         // Flagship 1 / Story 1.3: episodic work-resume.
         "work.episode" => crate::episode::project_work_episode(conn, event),
@@ -263,7 +265,7 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 fn redact_memory_event(event: &Event) -> Cow<'_, Event> {
     if !matches!(
         event.kind.as_str(),
-        "memory.accepted" | "memory.proposed" | "memory.cited"
+        "memory.accepted" | "memory.proposed" | "memory.cited" | "memory.corrected"
     ) {
         return Cow::Borrowed(event);
     }
@@ -2387,5 +2389,241 @@ mod tests {
             (post - success_conf).abs() < 1e-9,
             "calibrated confidence must reproduce after rebuild: {post} vs {success_conf}"
         );
+    }
+}
+
+fn apply_memory_corrected(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let id = event
+        .payload
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or("correction requires memory_id")?;
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_revisions WHERE event_id=?1)",
+        params![event.event_id.to_string()],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let old: Option<(String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT text, kind, invalidated_at FROM memories WHERE memory_id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (old_text, old_kind, invalidated) = old.ok_or_else(|| format!("memory not found: {id}"))?;
+    if invalidated.is_some() {
+        return Err(format!("memory {id} is already invalidated").into());
+    }
+    let text = event.payload.get("text").and_then(|v| v.as_str());
+    let kind = event.payload.get("kind").and_then(|v| v.as_str());
+    if text.is_none() && kind.is_none() {
+        return Err("correction requires text or kind".into());
+    }
+    if text.is_some_and(|t| t.trim().is_empty()) {
+        return Err("correction text cannot be empty".into());
+    }
+    if let Some(k) = kind {
+        k.parse::<kimetsu_core::memory::MemoryKind>()?;
+    }
+    let now = ts_text(event)?;
+    let effective = event
+        .payload
+        .get("effective_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&now);
+    OffsetDateTime::parse(effective, &Rfc3339)?;
+    conn.execute("INSERT OR IGNORE INTO memory_revisions (memory_id,event_id,text,kind,known_at,effective_at,confidence,use_count,usefulness_score)
+        SELECT memory_id, 'baseline:' || memory_id, text,kind,created_at,COALESCE(valid_from,'0001-01-01T00:00:00Z'),confidence,use_count,usefulness_score FROM memories WHERE memory_id=?1", params![id])?;
+    // Freeze accumulated evidence on the retiring revision before resetting it.
+    conn.execute(
+        "UPDATE memory_revisions SET
+        confidence=(SELECT confidence FROM memories WHERE memory_id=?1),
+        use_count=(SELECT use_count FROM memories WHERE memory_id=?1),
+        usefulness_score=(SELECT usefulness_score FROM memories WHERE memory_id=?1)
+        WHERE revision_id=(SELECT MAX(revision_id) FROM memory_revisions WHERE memory_id=?1)",
+        params![id],
+    )?;
+    let changed = text.is_some_and(|t| t != old_text);
+    if changed {
+        conn.execute("UPDATE memories SET confidence=1.0,use_count=0,usefulness_score=0,last_used_at=NULL,last_useful_at=NULL,embedding=NULL,embedding_model=NULL WHERE memory_id=?1", params![id])?;
+        conn.execute(
+            "DELETE FROM memory_citations WHERE memory_id=?1",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM query_routes WHERE memory_id=?1", params![id])?;
+    }
+    let text = text.unwrap_or(&old_text);
+    let kind = kind.unwrap_or(&old_kind);
+    conn.execute(
+        "UPDATE memories SET text=?2,normalized_text=?3,kind=?4 WHERE memory_id=?1",
+        params![
+            id,
+            text,
+            kimetsu_core::memory::normalize_memory_text(text),
+            kind
+        ],
+    )?;
+    conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", params![id])?;
+    conn.execute("INSERT INTO memories_fts(memory_id,text,kind,scope) SELECT memory_id,text,kind,scope FROM memories WHERE memory_id=?1", params![id])?;
+    crate::graph::project_entities(conn, id, text)?;
+    conn.execute("INSERT INTO memory_revisions (memory_id,event_id,text,kind,known_at,effective_at,confidence,use_count,usefulness_score)
+        SELECT memory_id,?2,text,kind,?3,?4,confidence,use_count,usefulness_score FROM memories WHERE memory_id=?1", params![id,event.event_id.to_string(),now,effective])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod correction_regressions {
+    use super::*;
+    fn event(kind: &str, payload: serde_json::Value, at: &str) -> Event {
+        let mut e = Event::new(RunId::new(), kind, payload);
+        e.ts = OffsetDateTime::parse(at, &Rfc3339).unwrap();
+        e
+    }
+    fn seed(c: &Connection) {
+        schema::initialize(c).unwrap();
+        apply_events(c, &[event("memory.accepted", serde_json::json!({"memory_id":"m", "scope":"project", "kind":"fact", "text":"original quokka"}), "2026-01-01T00:00:00Z")]).unwrap();
+    }
+    #[test]
+    fn correction_validation_rolls_back_events_text_and_fts() {
+        let c = Connection::open_in_memory().unwrap();
+        seed(&c);
+        let before: i64 = c
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        let bad = event(
+            "memory.corrected",
+            serde_json::json!({"memory_id":"m", "text":"changed narwhal", "kind":"invalid-kind"}),
+            "2026-03-01T00:00:00Z",
+        );
+        assert!(apply_events(&c, &[bad]).is_err());
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            c.query_row("SELECT text FROM memories", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "original quokka"
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'quokka'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        // Force a failure after the text update: the entire projection must roll back.
+        c.execute_batch("CREATE TRIGGER fail_correction BEFORE INSERT ON memory_revisions WHEN NEW.event_id NOT LIKE 'baseline:%' BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        let valid = event(
+            "memory.corrected",
+            serde_json::json!({"memory_id":"m", "text":"changed narwhal"}),
+            "2026-03-01T00:00:00Z",
+        );
+        assert!(apply_events(&c, &[valid]).is_err());
+        assert_eq!(
+            c.query_row("SELECT text FROM memories", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "original quokka"
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'quokka'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn correction_history_separates_known_and_effective_time_and_replays() {
+        let c = Connection::open_in_memory().unwrap();
+        seed(&c);
+        apply_events(&c, &[event("memory.corrected", serde_json::json!({"memory_id":"m", "text":"corrected narwhal", "effective_at":"2026-02-01T00:00:00Z"}), "2026-03-01T00:00:00Z")]).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                crate::bitemporal::memories_at(
+                    &c,
+                    "2026-02-15T00:00:00Z",
+                    "2026-02-15T00:00:00Z",
+                    0
+                )
+                .unwrap()[0]
+                    .text,
+                "original quokka"
+            );
+            assert_eq!(
+                crate::bitemporal::memories_at(
+                    &c,
+                    "2026-02-15T00:00:00Z",
+                    "2026-04-01T00:00:00Z",
+                    0
+                )
+                .unwrap()[0]
+                    .text,
+                "corrected narwhal"
+            );
+            assert_eq!(
+                crate::bitemporal::memories_at(
+                    &c,
+                    "2026-01-15T00:00:00Z",
+                    "2026-04-01T00:00:00Z",
+                    0
+                )
+                .unwrap()[0]
+                    .text,
+                "original quokka"
+            );
+            rebuild_in_place(&c).unwrap();
+        }
+        let (_, jsonl) = crate::sync::export_events(&c, 0, None, false).unwrap();
+        let imported = Connection::open_in_memory().unwrap();
+        schema::initialize(&imported).unwrap();
+        crate::sync::import_events(&imported, &jsonl.unwrap(), false).unwrap();
+        rebuild_in_place(&imported).unwrap();
+        assert_eq!(
+            imported
+                .query_row("SELECT text FROM memories WHERE memory_id='m'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "corrected narwhal"
+        );
+    }
+    #[test]
+    fn corpus_revision_observes_existing_embedding_updates_from_another_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let reader = Connection::open(&db).unwrap();
+        seed(&reader);
+        let writer = Connection::open(&db).unwrap();
+        let revision = || {
+            reader
+                .query_row("SELECT revision FROM corpus_revision", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let before = revision();
+        writer
+            .execute(
+                "UPDATE memories SET embedding=?1,embedding_model='stub' WHERE memory_id='m'",
+                params![vec![0u8; 8]],
+            )
+            .unwrap();
+        assert!(revision() > before);
+        let before = revision();
+        writer
+            .execute(
+                "UPDATE memories SET embedding=?1 WHERE memory_id='m'",
+                params![vec![1u8; 8]],
+            )
+            .unwrap();
+        assert!(revision() > before);
     }
 }
