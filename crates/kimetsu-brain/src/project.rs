@@ -371,6 +371,44 @@ pub struct BrainSession {
 }
 
 impl BrainSession {
+    pub fn config(&self) -> &ProjectConfig {
+        &self.config
+    }
+
+    /// Resolve explicit overrides before legacy sentinels. The explicit zero
+    /// survives a second resolution at the injected/production boundary.
+    pub fn resolve_request_floors(&self, request: &mut ContextRequest) {
+        let semantic = request.min_semantic_score_override.unwrap_or_else(|| {
+            if request.min_semantic_score == 0.0 {
+                self.config.broker.min_semantic_score
+            } else {
+                request.min_semantic_score
+            }
+        });
+        request.min_semantic_score = if semantic < 0.0 {
+            let model = embeddings::resolve_embedder_id(Some(&self.config.embedder.model));
+            if model.starts_with("bge") { 0.35 } else { 0.0 }
+        } else {
+            semantic
+        };
+        request.min_lexical_coverage = request.min_lexical_coverage_override.unwrap_or_else(|| {
+            if request.min_lexical_coverage == 0.0 {
+                self.config.broker.min_lexical_coverage
+            } else {
+                request.min_lexical_coverage
+            }
+        });
+        request.abstain_evidence = match request.abstain_evidence_override {
+            Some(v) if v >= 0.0 => v,
+            Some(_) => {
+                let mut cfg = self.config.clone();
+                cfg.broker.abstain_min_score = -1.0;
+                resolved_abstain_evidence_for(&cfg)
+            }
+            None if request.abstain_evidence == 0.0 => self.resolved_abstain_evidence(),
+            None => request.abstain_evidence,
+        };
+    }
     pub fn open(start: &Path) -> KimetsuResult<Self> {
         let (paths, config, conn) = load_project(start)?;
         // Read/write user brain — created on demand so a v0.4 binary
@@ -437,25 +475,7 @@ impl BrainSession {
         &self,
         mut request: ContextRequest,
     ) -> KimetsuResult<ContextBundle> {
-        // v1.0.0: drive the lexical + semantic relevance floors from config
-        // unless the caller set its own (non-zero) values.
-        if request.min_lexical_coverage == 0.0 {
-            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
-        }
-        if request.min_semantic_score == 0.0 {
-            request.min_semantic_score = self.resolved_min_semantic_score();
-        }
-        // v2.7: whole-retrieval abstention floor, now on the ABSOLUTE evidence
-        // cosine scale rather than the
-        // normalized composite — the composite's top candidate always carries
-        // relevance 1.0, so no composite threshold can express "nothing here
-        // is relevant" (measured: false-injection 1.00 on the workflow bench).
-        // 0.0 = off; explicit request values win; -1.0 in config = per-model
-        // auto. The env var exists so benchmarks can sweep without config
-        // edits.
-        if request.abstain_evidence == 0.0 {
-            request.abstain_evidence = self.resolved_abstain_evidence();
-        }
+        self.resolve_request_floors(&mut request);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -482,23 +502,6 @@ impl BrainSession {
             embeddings::open_embedder_for(self.config.embedder.enabled),
             backend.as_ref(),
         )
-    }
-
-    /// v1.0.0: resolve the semantic floor for this session's embedder. The
-    /// config default is the AUTO sentinel (-1.0): cosine scales are
-    /// MODEL-DEPENDENT — 0.35 suits bge-family distributions, but the remote
-    /// benchmark showed the same floor killing relevant jina-v2 results
-    /// outright (MRR 0.90 → 0.77, recall@2 == recall@4) — so auto applies
-    /// the bge-calibrated floor only to bge models and disables it
-    /// elsewhere (jina-v2's own precision keeps noise low without it).
-    /// Explicit non-negative config values are used as-is for any model.
-    fn resolved_min_semantic_score(&self) -> f32 {
-        let configured = self.config.broker.min_semantic_score;
-        if configured >= 0.0 {
-            return configured;
-        }
-        let model = embeddings::resolve_embedder_id(Some(self.config.embedder.model.as_str()));
-        if model.starts_with("bge") { 0.35 } else { 0.0 }
     }
 
     /// v2.7: resolve the absolute abstention floor for this session's config.
@@ -606,25 +609,7 @@ impl BrainSession {
         mut request: ContextRequest,
         embedder: &dyn embeddings::Embedder,
     ) -> KimetsuResult<ContextBundle> {
-        if request.min_lexical_coverage == 0.0 {
-            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
-        }
-        // v1.0.0: semantic floor from config too — this is the daemon's path,
-        // where a real query embedding makes the cosine floor effective.
-        if request.min_semantic_score == 0.0 {
-            request.min_semantic_score = self.resolved_min_semantic_score();
-        }
-        // v2.7: whole-retrieval abstention floor, now on the ABSOLUTE evidence
-        // cosine scale rather than the
-        // normalized composite — the composite's top candidate always carries
-        // relevance 1.0, so no composite threshold can express "nothing here
-        // is relevant" (measured: false-injection 1.00 on the workflow bench).
-        // 0.0 = off; explicit request values win; -1.0 in config = per-model
-        // auto. The env var exists so benchmarks can sweep without config
-        // edits.
-        if request.abstain_evidence == 0.0 {
-            request.abstain_evidence = self.resolved_abstain_evidence();
-        }
+        self.resolve_request_floors(&mut request);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.

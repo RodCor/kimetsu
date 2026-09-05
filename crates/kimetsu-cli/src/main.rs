@@ -1125,8 +1125,8 @@ struct EvalArgs {
     #[arg(long, default_value = "")]
     rerankers: String,
     /// Candidate-pool size handed to the reranker before truncating to the
-    /// cap (mirrors the daemon's RERANK_POOL; 12 is the production value).
-    #[arg(long, default_value_t = 12)]
+    /// cap (the canonical default is 6).
+    #[arg(long, default_value_t = 6)]
     pool: usize,
     /// HyDE: expand each case query with a hypothetical answer from the cheap
     /// model before retrieval, to measure the recall lift on oblique queries.
@@ -1141,19 +1141,16 @@ struct BrainBenchArgs {
     #[arg(long, default_value = "bench/dataset.json")]
     dataset: PathBuf,
     /// Comma-separated embedder ids to sweep.
-    #[arg(long, default_value = "bge-small-en-v1.5,jina-v2-base-code")]
+    #[arg(long, default_value = "bge-small-en-v1.5")]
     embedders: String,
     /// Comma-separated reranker ids to sweep.
-    #[arg(
-        long,
-        default_value = "off,jina-reranker-v1-turbo-en,jina-reranker-v1-tiny-en,ms-marco-tinybert-l-2-v2,ms-marco-minilm-l-4-v2"
-    )]
+    #[arg(long, default_value = "ms-marco-tinybert-l-2-v2")]
     rerankers: String,
     /// Candidate-pool size passed to retrieval before reranking.
-    #[arg(long, default_value_t = 12usize)]
+    #[arg(long, default_value_t = 6usize)]
     pool: usize,
     /// Final capsule cap after reranking.
-    #[arg(long, default_value_t = 4usize)]
+    #[arg(long, default_value_t = 3usize)]
     cap: usize,
     /// Directory to write per-combo JSON files and summary.md.
     #[arg(long, default_value = "bench/results")]
@@ -1371,9 +1368,9 @@ struct TuneArgs {
     /// Show personal eval-set statistics without running the sweep.
     #[arg(long)]
     status: bool,
-    /// Cost penalty weight per estimated token injected per query.
-    /// Default 0.005 ≈ one MRR rank position ≈ 200 tokens.
-    #[arg(long, default_value_t = 0.005f64)]
+    /// Cost penalty per serialized UTF-8 byte upper bound, not billed tokens.
+    /// Default is explicit policy lambda 0.05 / delivery budget 6000.
+    #[arg(long, default_value_t = kimetsu_brain::tune::DEFAULT_COST_WEIGHT)]
     cost_weight: f64,
     /// Apply the winning config to project.toml (without this flag, dry-run only).
     #[arg(long)]

@@ -45,6 +45,7 @@ pub mod reinforce;
 pub mod roi;
 pub mod schema;
 pub(crate) mod scoring;
+pub mod serving;
 pub mod skill_synthesis;
 /// Epic S3: personal brain sync — event-log replication.
 pub mod sync;

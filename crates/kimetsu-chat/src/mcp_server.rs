@@ -681,13 +681,38 @@ fn take_session_warm_start(workspace: &Path, arguments: &Value) -> Option<String
 }
 
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    brain_context_tool_with_warm(
+    stdio_brain_context_with_loader(
         workspace,
         arguments,
-        None,
-        take_session_warm_start(workspace, arguments),
+        kimetsu_brain::embeddings::open_cached_reranker,
     )
-    .unwrap_or_else(|e| {
+}
+
+fn stdio_brain_context_with_loader(
+    workspace: &Path,
+    arguments: &Value,
+    load: impl FnOnce(
+        &str,
+    )
+        -> Result<Option<std::sync::Arc<dyn kimetsu_brain::embeddings::Reranker>>, String>,
+) -> Value {
+    let result = (|| -> Result<Value, String> {
+        let paths =
+            kimetsu_core::paths::ProjectPaths::discover(workspace).map_err(|e| e.to_string())?;
+        let config = project::load_config(&paths).map_err(|e| e.to_string())?;
+        let reranker = if kimetsu_brain::embeddings::reranker_is_off(&config.embedder.reranker) {
+            None
+        } else {
+            load(&config.embedder.reranker)?
+        };
+        brain_context_tool_with_warm(
+            workspace,
+            arguments,
+            reranker.as_deref(),
+            take_session_warm_start(workspace, arguments),
+        )
+    })();
+    result.unwrap_or_else(|e| {
         bounded_context_error(arguments, 6000, brain_unavailable_json(workspace, &e))
     })
 }
@@ -731,11 +756,11 @@ fn record_context_delivery(
 
 /// Candidate pool the remote reranker judges before truncating to the caller's
 /// cap. Mirrors `RERANK_POOL` in `kimetsu-cli/src/embed_daemon/server.rs`.
-pub const REMOTE_RERANK_POOL: usize = 6;
+pub const REMOTE_RERANK_POOL: usize = kimetsu_brain::serving::RERANK_POOL;
 
 /// Sigmoid-score floor for the remote reranker — capsules scored below this
 /// are noise. Mirrors `RERANK_FLOOR` in `kimetsu-cli/src/embed_daemon/server.rs`.
-pub const REMOTE_RERANK_FLOOR: f32 = 0.30;
+pub const REMOTE_RERANK_FLOOR: f32 = kimetsu_brain::serving::RERANK_FLOOR;
 
 /// Transport-agnostic body of the `kimetsu_brain_context` tool.
 ///
@@ -826,98 +851,57 @@ fn brain_context_tool_with_warm(
         config_ambient,
     );
 
-    // When reranking, over-fetch a larger candidate pool so the cross-encoder
-    // sees enough diversity before truncating to `cap`, and bump the token
-    // budget so the pool isn't starved. Same logic as the embed daemon.
-    let (fetch_cap, fetch_budget) = if reranker.is_some() {
-        (cap.max(REMOTE_RERANK_POOL), budget_tokens.max(6000))
-    } else {
-        (cap, budget_tokens)
-    };
-
-    let request = ContextRequest {
-        stage: stage.to_string(),
-        query: effective_query.clone(),
-        budget_tokens: fetch_budget,
-        tags,
-        min_score,
-        max_capsules: fetch_cap,
-        prefer_roles,
+    let policy = kimetsu_brain::serving::ServingPolicy {
+        budget: budget_tokens,
+        cap,
         ..Default::default()
     };
-
-    match project::retrieve_context_readonly_with_request(workspace, request) {
-        // v2.7: rerank + evidence-band arbitration before the skipped check —
-        // a band bundle the cross-encoder rejects becomes a skipped bundle
-        // here, taking the same zero-token path a hard-gated retrieval does.
-        Ok(bundle) => {
-            let abstain = kimetsu_core::paths::ProjectPaths::discover(workspace)
-                .ok()
-                .and_then(|paths| project::load_config(&paths).ok())
-                .map(|cfg| kimetsu_brain::project::resolved_abstain_evidence_for(&cfg))
-                .unwrap_or(0.0);
-            let bundle = kimetsu_brain::context::rerank_and_arbitrate(
-                &effective_query,
-                bundle,
-                reranker,
-                abstain,
-                REMOTE_RERANK_FLOOR,
-                cap,
-            );
-            let mut bundle = bundle;
-
-            // v1.5 (Story 2.1): render-time compression. Load compress_capsules
-            // best-effort — any config error means no compression (safe default).
-            // Ranking is NEVER affected; this runs after retrieval + reranking.
-            let compress = kimetsu_core::paths::ProjectPaths::discover(workspace)
-                .ok()
-                .and_then(|paths| project::load_config(&paths).ok())
-                .map(|cfg| cfg.broker.compress_capsules)
-                .unwrap_or(false);
-            if compress {
-                use kimetsu_brain::context::compress_for_render;
-                for capsule in &mut bundle.capsules {
-                    capsule.summary = compress_for_render(&capsule.summary, 3);
-                }
-            }
-
-            use kimetsu_brain::context::delivery::{
-                add_optional_field, compact_capsules, fit_json,
-            };
-            let exposure = kimetsu_core::event::Event::new(
-                kimetsu_core::ids::RunId::new(),
-                "context.injected",
-                json!({}),
-            );
-            let count = bundle.capsules.len();
-            let mut delivery = fit_json(bundle.capsules.clone(), budget_tokens, |capsules| {
-                json!({
-                    "ok": true,
-                    "skipped": capsules.is_empty(),
-                    "exposure_id": exposure.event_id.to_string(),
-                    "capsule_count": capsules.len(),
-                    "excluded_count": bundle.excluded.len() + count - capsules.len(),
-                    "capsules": compact_capsules(capsules),
-                    "partial_evidence": bundle.evidence_coverage < 1.0 || capsules.len() < count,
-                })
-            });
-            if let Some(block) = warm_start {
-                add_optional_field(
-                    &mut delivery,
-                    "warm_start",
-                    json!({"context":block}),
-                    budget_tokens,
-                );
-            }
-            record_context_delivery(workspace, arguments, &delivery, "brain_context", exposure);
-            Ok(delivery.payload)
-        }
-        Err(err) => Ok(bounded_context_error(
-            arguments,
-            6000,
-            brain_unavailable_json(workspace, &err.to_string()),
-        )),
+    let request = ContextRequest {
+        stage: stage.to_string(),
+        query: effective_query,
+        tags,
+        min_score,
+        prefer_roles,
+        min_semantic_score_override: arguments
+            .get("min_semantic_score")
+            .and_then(Value::as_f64)
+            .map(|v| v as f32),
+        min_lexical_coverage_override: arguments
+            .get("min_lexical_coverage")
+            .and_then(Value::as_f64)
+            .map(|v| v as f32),
+        abstain_evidence_override: arguments
+            .get("abstain_evidence")
+            .and_then(Value::as_f64)
+            .map(|v| v as f32),
+        ..Default::default()
+    };
+    let session = kimetsu_brain::project::BrainSession::open_readonly(workspace)
+        .map_err(|e| e.to_string())?;
+    let exposure = kimetsu_core::event::Event::new(
+        kimetsu_core::ids::RunId::new(),
+        "context.injected",
+        json!({}),
+    );
+    let mut delivery = policy
+        .retrieve(
+            &session,
+            request,
+            kimetsu_brain::embeddings::open_embedder_for(session.config().embedder.enabled),
+            reranker,
+            &exposure.event_id.to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(block) = warm_start {
+        kimetsu_brain::context::delivery::add_optional_field(
+            &mut delivery,
+            "warm_start",
+            json!({"context":block}),
+            budget_tokens,
+        );
     }
+    record_context_delivery(workspace, arguments, &delivery, "brain_context", exposure);
+    Ok(delivery.payload)
 }
 
 /// v0.6: general-purpose capture tool. Records a concrete, reusable
@@ -2000,6 +1984,9 @@ fn tool_definitions() -> Value {
                     },
                     "budget_tokens": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "Final serialized MCP content budget, accounted as a conservative UTF-8 byte upper bound. Impossible tiny budgets return budget_too_small with the actual response bound." },
                     "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Skip threshold — if the best capsule scores below this, return no capsules. Response framing still consumes tokens. Default 0.15." },
+                    "min_semantic_score": {"type":"number","minimum":-1.0,"maximum":1.0,"description":"Omit to inherit config; 0 explicitly disables; -1 selects model auto; positive sets cosine floor."},
+                    "min_lexical_coverage": {"type":"number","minimum":0.0,"maximum":1.0,"description":"Omit to inherit config; 0 explicitly disables; positive sets lexical coverage floor."},
+                    "abstain_evidence": {"type":"number","minimum":-1.0,"maximum":1.0,"description":"Omit to inherit config; 0 explicitly disables; -1 selects model auto; positive sets evidence floor."},
                     "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Hard cap on returned capsules. Default 3." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
                     "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "Boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
@@ -2512,10 +2499,17 @@ mod tests {
     fn context_tool_catalog_advertises_episode_identity_lanes() {
         let definitions = super::tool_definitions();
         for name in ["kimetsu_brain_context", "kimetsu_benchmark_context"] {
-            let tool = definitions.as_array().unwrap().iter().find(|t|t["name"] == name).unwrap();
+            let tool = definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap();
             for field in ["task_id", "session_id", "worktree_id"] {
-                assert_eq!(tool["inputSchema"]["properties"][field]["type"], "string",
-                    "{name} must advertise the supported {field} lane");
+                assert_eq!(
+                    tool["inputSchema"]["properties"][field]["type"], "string",
+                    "{name} must advertise the supported {field} lane"
+                );
             }
         }
     }
@@ -2909,6 +2903,57 @@ mod tests {
                 );
             }
             fs::remove_dir_all(root).expect("remove temp root");
+        });
+    }
+
+    #[test]
+    fn stdio_uses_configured_reranker_off_and_initialization_error_explicitly() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("stdio-configured-reranker");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "ripgrep search files efficiently",
+            )
+            .unwrap();
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
+            let mut config = project::load_config(&paths).unwrap();
+            config.embedder.reranker = "chosen-model".into();
+            config.retrieval.level = "custom".into();
+            fs::write(
+                &paths.project_toml,
+                toml::to_string_pretty(&config).unwrap(),
+            )
+            .unwrap();
+            let arguments =
+                json!({"query":"ripgrep search","include_ambient":false,"budget_tokens":6000});
+            let result = stdio_brain_context_with_loader(&root, &arguments, |id| {
+                assert_eq!(id, "chosen-model");
+                Ok(Some(std::sync::Arc::new(
+                    kimetsu_brain::embeddings::StubReranker,
+                )))
+            });
+            assert_eq!(result["capsule_count"], 1);
+            let failed = stdio_brain_context_with_loader(&root, &arguments, |_| {
+                Err("model initialization failed".into())
+            });
+            assert!(failed.get("error").is_some());
+            assert!(failed.to_string().contains("model initialization failed"));
+            config.embedder.reranker = "off".into();
+            config.retrieval.level = "deep".into();
+            fs::write(
+                &paths.project_toml,
+                toml::to_string_pretty(&config).unwrap(),
+            )
+            .unwrap();
+            let off = stdio_brain_context_with_loader(&root, &arguments, |_| {
+                panic!("explicit off must bypass loader")
+            });
+            assert_eq!(off["ok"], true);
+            assert_eq!(off["capsule_count"], 1);
         });
     }
 

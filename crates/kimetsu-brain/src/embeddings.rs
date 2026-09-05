@@ -343,22 +343,97 @@ pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
                 }
             };
         }
-        // Unknown → fallback to default curated turbo.
-        match fastembed_backend::FastembedReranker::try_open("jina-reranker-v1-turbo-en") {
-            Ok(r) => Some(Box::new(r) as Box<dyn Reranker>),
-            Err(err) => {
-                eprintln!(
-                    "kimetsu-brain: fallback reranker unavailable ({err}); \
-                     continuing without cross-encoder reranking"
-                );
-                None
-            }
-        }
+        eprintln!("kimetsu-brain: unknown reranker {model_id:?}");
+        None
     }
     #[cfg(not(feature = "embeddings"))]
     {
         let _ = v;
         None
+    }
+}
+
+pub fn reranker_is_off(model_id: &str) -> bool {
+    matches!(
+        model_id.trim().to_ascii_lowercase().as_str(),
+        "" | "off" | "none" | "noop"
+    )
+}
+
+/// Evaluation must never label a failed initialization as a measured CE run.
+pub fn open_reranker_checked(model_id: &str) -> Result<Option<Box<dyn Reranker>>, String> {
+    if reranker_is_off(model_id) {
+        return Ok(None);
+    }
+    open_reranker_for_model(model_id).map(Some).ok_or_else(|| {
+        format!("requested reranker {model_id:?} unavailable; no cross-encoder measurement")
+    })
+}
+
+type CachedReranker = Result<Option<std::sync::Arc<dyn Reranker>>, String>;
+#[derive(Default)]
+struct RerankerCache(std::sync::Mutex<std::collections::HashMap<String, CachedReranker>>);
+impl RerankerCache {
+    fn get(&self, id: &str, load: impl FnOnce(&str) -> CachedReranker) -> CachedReranker {
+        if reranker_is_off(id) {
+            return Ok(None);
+        }
+        let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .entry(id.trim().to_string())
+            .or_insert_with(|| load(id))
+            .clone()
+    }
+}
+/// Process cache keyed by configured model, including failed loads. Explicit off
+/// bypasses the cache. Lean serving is explicitly FTS-only; checked evaluation
+/// above still rejects any requested CE measurement on lean builds.
+pub fn open_cached_reranker(model_id: &str) -> CachedReranker {
+    static CACHE: std::sync::OnceLock<RerankerCache> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(RerankerCache::default)
+        .get(model_id, |id| {
+            #[cfg(feature = "embeddings")]
+            {
+                open_reranker_checked(id).map(|r| r.map(std::sync::Arc::from))
+            }
+            #[cfg(not(feature = "embeddings"))]
+            {
+                let _ = id;
+                Ok(None)
+            }
+        })
+}
+
+#[cfg(test)]
+mod configured_reranker_tests {
+    use super::*;
+    #[test]
+    fn configured_cache_reuses_model_and_off_never_loads() {
+        let cache = RerankerCache::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let load = |_: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(
+                std::sync::Arc::new(StubReranker) as std::sync::Arc<dyn Reranker>
+            ))
+        };
+        let first = cache.get("configured", load).unwrap().unwrap();
+        let second = cache.get("configured", load).unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            cache
+                .get("off", |_| panic!("off must not load"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get("failed", |_| Err("unavailable".into())).is_err());
+        assert!(
+            cache
+                .get("failed", |_| panic!("failure must remain explicit"))
+                .is_err()
+        );
     }
 }
 
@@ -441,6 +516,14 @@ pub fn open_embedder_for(config_enabled: bool) -> &'static dyn Embedder {
 /// embedder cached). Returns [`NoopEmbedder`] on the lean build or if
 /// the model fails to load.
 pub fn open_embedder_for_model(model_id: &str) -> Box<dyn Embedder + Send + Sync> {
+    let model_id = match canonical_embedder_id(model_id) {
+        Ok("noop") => return Box::new(NoopEmbedder),
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("{error}");
+            return Box::new(NoopEmbedder);
+        }
+    };
     #[cfg(feature = "embeddings")]
     {
         match fastembed_backend::FastembedEmbedder::try_open(model_id) {
@@ -458,6 +541,44 @@ pub fn open_embedder_for_model(model_id: &str) -> Box<dyn Embedder + Send + Sync
         let _ = model_id;
     }
     Box::new(NoopEmbedder)
+}
+
+/// Explicit model selection for evaluators. Unknown values are errors, never a
+/// differently named BGE measurement. Aliases match the environment resolver.
+pub fn canonical_embedder_id(id: &str) -> Result<&'static str, EmbedderError> {
+    match id.trim().to_ascii_lowercase().as_str() {
+        "noop" | "off" | "none" | "0" | "false" | "no" => Ok("noop"),
+        "" | "default" | "bge-small" | "bge-small-en-v1.5" => Ok("bge-small-en-v1.5"),
+        "bge-m3" | "m3" => Ok("bge-m3"),
+        "jina-code" | "jina-v2-base-code" | "jina-embeddings-v2-base-code" => {
+            Ok("jina-v2-base-code")
+        }
+        _ => Err(EmbedderError::LoadFailed(format!(
+            "unknown requested embedder {id:?}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod explicit_embedder_tests {
+    use super::*;
+    #[test]
+    fn aliases_and_disable_have_one_effective_model_identity() {
+        assert_eq!(
+            canonical_embedder_id("jina-code").unwrap(),
+            "jina-v2-base-code"
+        );
+        assert_eq!(canonical_embedder_id("m3").unwrap(), "bge-m3");
+        assert_eq!(
+            canonical_embedder_id("bge-small").unwrap(),
+            "bge-small-en-v1.5"
+        );
+        for off in ["off", "noop", "false", "none", "0"] {
+            assert_eq!(canonical_embedder_id(off).unwrap(), "noop");
+            assert!(open_embedder_for_model(off).is_noop());
+        }
+        assert!(canonical_embedder_id("typo-not-a-model").is_err());
+    }
 }
 
 /// v0.4.3: env-driven kill switch. Truthy values (1/true/yes/on)

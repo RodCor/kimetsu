@@ -122,6 +122,12 @@ impl ProjectConfig {
         if !self.embedder.enabled {
             return;
         }
+        // An explicit reranker opt-out outranks presets just like the embedder
+        // opt-out above. Nondefault models still require level="custom".
+        let reranker_off = matches!(
+            self.embedder.reranker.trim().to_ascii_lowercase().as_str(),
+            "" | "off" | "none" | "noop"
+        );
         match self.retrieval.level.as_str() {
             "basic" => {
                 self.embedder.enabled = false;
@@ -140,6 +146,9 @@ impl ProjectConfig {
                 self.embedder.reranker = "ms-marco-tinybert-l-2-v2".to_string();
             }
             _ => {} // "custom" or unknown: leave as configured
+        }
+        if reranker_off {
+            self.embedder.reranker = "off".into();
         }
     }
 
@@ -1784,6 +1793,18 @@ max_total_cost_usd = 250.0
         unknown.embedder.enabled = false;
         unknown.apply_retrieval_level();
         assert!(!unknown.embedder.enabled, "unknown level must be a no-op");
+    }
+
+    #[test]
+    fn retrieval_level_never_reenables_explicit_reranker_off() {
+        for level in ["deep", "advanced"] {
+            let mut config = ProjectConfig::default_for_project("off");
+            config.retrieval.level = level.into();
+            config.embedder.reranker = "off".into();
+            config.apply_retrieval_level();
+            assert_eq!(config.embedder.reranker, "off");
+            assert!(config.embedder.enabled);
+        }
     }
 
     /// The `[embedder] enabled = false` off-switch outranks every level

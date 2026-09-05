@@ -82,7 +82,15 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     // On lean builds `open_reranker_for_model` always returns None.
     #[cfg(feature = "embeddings")]
     let reranker = {
-        let rr = kimetsu_brain::embeddings::open_reranker_for_model(&args.reranker);
+        if kimetsu_brain::embeddings::embedder_enabled_for_config(true)
+            && kimetsu_brain::embeddings::open_default_embedder().is_noop()
+        {
+            return Err(
+                "requested embedder failed to initialize; refusing a mislabeled semantic server"
+                    .into(),
+            );
+        }
+        let rr = kimetsu_brain::embeddings::open_reranker_checked(&args.reranker)?;
         match &rr {
             Some(r) => tracing::info!(
                 model = r.model_id(),

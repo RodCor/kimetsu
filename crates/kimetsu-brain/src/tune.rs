@@ -14,7 +14,8 @@
 //!   - RERANK_POOL (compile-time const in the daemon) — deferred.
 //!
 //! Objective (S2.3):
-//!   mean_MRR - cost_weight * mean_injected_tokens - REGRET_PENALTY_WEIGHT * regret_rate
+//!   quality - cost_weight * mean_final_serialized_UTF8_bound
+//! Default cost_weight = 0.05 / 6000; historical regret is diagnostic only.
 //!
 //! S2.1 Re-tune triggers:
 //!   - Corpus milestone: ≥50 memories added since last tune.
@@ -41,22 +42,9 @@ pub const RETUNE_REGRET_RATE_THRESHOLD: f64 = 0.10;
 /// Used to report the cost of a full embedder switch in the advisor output.
 pub const REINDEX_TOKENS_PER_1K_MEMORIES: u64 = 2_000;
 
-/// S2.3 Regret penalty weight in the tune objective.
-///
-/// Weighting rationale:
-///   A floor config that generates a regret has caused the model to work
-///   harder than necessary (re-discover context that the brain dropped).
-///   We penalise the *rate* of regrets (regrets / served events) rather than
-///   the raw count so that the penalty is comparable across eval sets of
-///   different sizes.
-///
-///   Weight = 0.5 was chosen so that a 100 % regret rate (pathological)
-///   shifts the objective by −0.5, roughly equivalent to a 0.5-rank MRR
-///   drop.  At realistic rates (< 10 %) the penalty is < 0.05 — meaningful
-///   signal without overwhelming the MRR term.
-pub const REGRET_PENALTY_WEIGHT: f64 = 0.5;
-
-// ─── Sweep parameter space ────────────────────────────────────────────────────
+/// Explicit policy, not a fitted optimum: a full delivery budget costs 0.05 quality units.
+pub const DEFAULT_COST_LAMBDA: f64 = 0.05;
+pub const DEFAULT_COST_WEIGHT: f64 = DEFAULT_COST_LAMBDA / 6000.0;
 
 pub const LEXICAL_FLOORS: &[f32] = &[0.3, 0.4, 0.5, 0.6];
 pub const SEMANTIC_FLOORS: &[f32] = &[-1.0, 0.0, 0.25, 0.35, 0.45];
@@ -123,7 +111,7 @@ pub struct ComboResult {
     pub combo: TuneCombo,
     pub mean_mrr: f64,
     pub mean_tokens: f64,
-    /// mean_mrr − cost_weight * mean_tokens
+    /// quality minus per-unit cost weight times final serialized UTF-8 bound
     pub objective: f64,
 }
 
@@ -142,6 +130,9 @@ pub struct TuneHistoryEntry {
     /// `None` for history entries written before S2 (backward compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_count_at_tune: Option<u64>,
+    /// None marks historical objectives whose units/policy were not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<serde_json::Value>,
 }
 
 // ─── S2.1: Re-tune trigger state ─────────────────────────────────────────────
@@ -220,7 +211,7 @@ pub fn compute_retune_trigger(
     )?;
 
     let recent_served_count: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE kind = 'context.served' AND ts >= ?1",
+        "SELECT COUNT(*) FROM events WHERE ts>=?1 AND kind=CASE WHEN EXISTS(SELECT 1 FROM events WHERE kind='context.injected' AND ts>=?1) THEN 'context.injected' ELSE 'context.served' END",
         rusqlite::params![cutoff_iso],
         |r| r.get(0),
     )?;
@@ -343,40 +334,27 @@ pub fn compute_model_advisor(
 
 /// Compute the tuning objective for a combo result.
 ///
-/// `objective = mean_mrr - cost_weight * mean_tokens`
+/// `objective = quality - cost_weight * mean_final_bound`; legacy callers retain
+/// their explicit per-unit coefficient. CLI uses DEFAULT_COST_WEIGHT.
 pub fn compute_objective(mean_mrr: f64, mean_tokens: f64, cost_weight: f64) -> f64 {
     mean_mrr - cost_weight * mean_tokens
 }
 
-/// S2.3: Compute the tuning objective with a regret penalty term.
-///
-/// Extended objective:
-/// ```text
-/// objective = mean_mrr
-///           - cost_weight   * mean_tokens
-///           - REGRET_PENALTY_WEIGHT * regret_rate
-/// ```
-///
-/// `regret_rate` = regrets_for_this_combo / total_served_events.
-/// A floor configuration that drops capsules later cited by the model
-/// incurs a higher `regret_rate` and is penalised.
-///
-/// Weight: [`REGRET_PENALTY_WEIGHT`] = 0.5 — see module docs for
-/// calibration rationale.
+/// Compatibility wrapper. Historical regret is diagnostic only: it is not
+/// candidate-specific evidence and cannot affect candidate scores.
 pub fn compute_objective_with_regret(
-    mean_mrr: f64,
-    mean_tokens: f64,
+    quality: f64,
+    mean_bound: f64,
     cost_weight: f64,
-    regret_rate: f64,
+    _regret_rate: f64,
 ) -> f64 {
-    mean_mrr - cost_weight * mean_tokens - REGRET_PENALTY_WEIGHT * regret_rate
+    compute_objective(quality, mean_bound, cost_weight)
 }
 
 /// Count `retrieval.regret` events in `conn` within an optional ISO-8601
 /// timestamp window `[since, until]`.
 ///
-/// Used by the sweep to collect regret signal per evaluation window so the
-/// objective function can penalise floor configs that generated regrets.
+/// Historical diagnostic and retune trigger only; never a candidate objective term.
 pub fn count_regret_events(
     conn: &rusqlite::Connection,
     since: Option<&str>,
@@ -413,11 +391,11 @@ pub fn count_regret_events(
 /// Split cases into (train, holdout) using a deterministic seed derived from
 /// `case_count`. 80 % train, 20 % holdout. Indices into `cases` are returned.
 ///
-/// The split is stable: the same set of N cases always produces the same
-/// train/holdout partition regardless of case order.
+/// Legacy index-only API. Evaluation uses grouped_train_holdout_split, which
+/// accepts case identities and prevents family leakage.
 pub fn train_holdout_split(case_count: usize) -> (Vec<usize>, Vec<usize>) {
-    if case_count == 0 {
-        return (Vec::new(), Vec::new());
+    if case_count < 2 {
+        return ((0..case_count).collect(), Vec::new());
     }
     let holdout_size = (case_count / 5).max(1); // ≥1 holdout
     // Deterministic: pick every 5th index as holdout.
@@ -425,6 +403,85 @@ pub fn train_holdout_split(case_count: usize) -> (Vec<usize>, Vec<usize>) {
     let train: Vec<usize> = (0..case_count).filter(|i| i % 5 != 0).collect();
     let _ = holdout_size; // used via filter logic above
     (train, holdout)
+}
+
+/// Connected components join aliases sharing task family, normalized query,
+/// or any relevant/stale ID. Sorting component identities makes the 80/20 split
+/// deterministic under input permutations. One component has no holdout.
+#[derive(Debug)]
+pub struct FamilySplit {
+    pub train: Vec<usize>,
+    pub holdout: Vec<usize>,
+    pub family_count: usize,
+}
+pub fn grouped_train_holdout_split(cases: &[crate::eval::EvalCase]) -> FamilySplit {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut parents: Vec<usize> = (0..cases.len()).collect();
+    fn root(parents: &[usize], mut i: usize) -> usize {
+        while parents[i] != i {
+            i = parents[i]
+        }
+        i
+    }
+    let mut owners = BTreeMap::<String, usize>::new();
+    let keys: Vec<BTreeSet<String>> = cases
+        .iter()
+        .map(|c| {
+            let mut keys = BTreeSet::new();
+            keys.insert(format!(
+                "q:{}",
+                c.query
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            ));
+            if !c.family.trim().is_empty() {
+                keys.insert(format!("f:{}", c.family.trim()));
+            }
+            for id in c.relevant.iter().chain(&c.stale) {
+                keys.insert(format!("m:{id}"));
+            }
+            keys
+        })
+        .collect();
+    for (i, case_keys) in keys.iter().enumerate() {
+        for key in case_keys {
+            if let Some(&other) = owners.get(key) {
+                let a = root(&parents, i);
+                let b = root(&parents, other);
+                parents[a] = b;
+            } else {
+                owners.insert(key.clone(), i);
+            }
+        }
+    }
+    let mut components = BTreeMap::<usize, (BTreeSet<String>, Vec<usize>)>::new();
+    for (i, case_keys) in keys.into_iter().enumerate() {
+        let entry = components.entry(root(&parents, i)).or_default();
+        entry
+            .0
+            .extend(case_keys.into_iter().filter(|k| !k.starts_with("m:")));
+        entry.1.push(i);
+    }
+    let mut groups: Vec<_> = components.into_values().collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    let count = groups.len();
+    let mut split = FamilySplit {
+        train: Vec::new(),
+        holdout: Vec::new(),
+        family_count: count,
+    };
+    for (i, (_, ids)) in groups.into_iter().enumerate() {
+        if count > 1 && i % 5 == 0 {
+            split.holdout.extend(ids)
+        } else {
+            split.train.extend(ids)
+        }
+    }
+    split.train.sort_unstable();
+    split.holdout.sort_unstable();
+    split
 }
 
 /// Select the best combo from a slice of `ComboResult` by objective score.
@@ -543,6 +600,63 @@ mod tests {
     }
 
     #[test]
+    fn single_family_cannot_supply_an_independent_holdout() {
+        let (train, holdout) = train_holdout_split(1);
+        assert_eq!(train, vec![0]);
+        assert!(holdout.is_empty());
+    }
+
+    #[test]
+    fn split_membership_is_independent_of_input_order() {
+        let queries = ["alpha", "bravo", "charlie", "delta", "echo"];
+        let mut reversed = queries;
+        reversed.reverse();
+        let held = |q: &[&str]| {
+            let cases: Vec<_> = q
+                .iter()
+                .map(|query| {
+                    serde_json::from_value(serde_json::json!({"query":query,"relevant":[]}))
+                        .unwrap()
+                })
+                .collect();
+            let indexes = grouped_train_holdout_split(&cases).holdout;
+            indexes
+                .into_iter()
+                .map(|i| q[i].to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(held(&queries), held(&reversed));
+    }
+
+    #[test]
+    fn overlapping_aliases_and_task_families_never_leak_into_holdout() {
+        let cases: Vec<crate::eval::EvalCase> = serde_json::from_value(serde_json::json!([
+            {"query":"a","relevant":["one"]},
+            {"query":"b","relevant":["two"],"stale":["one"]},
+            {"query":"c","relevant":["two"],"family":"task"},
+            {"query":"d","relevant":[],"family":"task"},
+            {"query":"e","relevant":[]}
+        ]))
+        .unwrap();
+        let split = grouped_train_holdout_split(&cases);
+        assert_eq!(split.family_count, 2);
+        let in_holdout = split.holdout.contains(&0);
+        for i in 1..4 {
+            assert_eq!(split.holdout.contains(&i), in_holdout);
+        }
+        let one = grouped_train_holdout_split(&cases[..4]);
+        assert!(one.holdout.is_empty());
+        assert_eq!(one.train.len(), 4);
+    }
+
+    #[test]
+    fn explicit_default_cost_policy_uses_budget_fraction_units() {
+        let score = compute_objective(0.75, 512.0, DEFAULT_COST_WEIGHT);
+        assert!((score - 0.7457333333333333).abs() < 1e-12);
+        assert_eq!(compute_objective(1.0, 6000.0, DEFAULT_COST_WEIGHT), 0.95);
+    }
+
+    #[test]
     fn select_winner_picks_highest_objective() {
         let combos = vec![
             ComboResult {
@@ -596,6 +710,7 @@ mod tests {
             holdout_mrr: 0.70,
             baseline_holdout_objective: 0.45,
             memory_count_at_tune: None,
+            measurement: None,
         };
 
         append_tune_history(&tmp, entry.clone()).unwrap();
@@ -628,29 +743,17 @@ mod tests {
     }
 
     #[test]
-    fn compute_objective_with_regret_penalises_high_rate() {
+    fn historical_regret_cannot_change_candidate_objective() {
         let base = compute_objective(0.75, 500.0, 0.005);
         let with_regret = compute_objective_with_regret(0.75, 500.0, 0.005, 0.10);
-        // penalty = 0.5 * 0.10 = 0.05
-        assert!(
-            with_regret < base,
-            "positive regret_rate must reduce the objective"
-        );
-        assert!(
-            (base - with_regret - REGRET_PENALTY_WEIGHT * 0.10).abs() < 1e-9,
-            "penalty term must equal REGRET_PENALTY_WEIGHT * regret_rate"
-        );
+        assert_eq!(with_regret, base);
     }
 
     #[test]
-    fn compute_objective_with_regret_full_rate_shifts_by_weight() {
-        // regret_rate = 1.0 → penalty = REGRET_PENALTY_WEIGHT
+    fn even_full_historical_regret_is_diagnostic_only() {
         let base = compute_objective(0.8, 0.0, 0.0);
         let with_full = compute_objective_with_regret(0.8, 0.0, 0.0, 1.0);
-        assert!(
-            (base - with_full - REGRET_PENALTY_WEIGHT).abs() < 1e-9,
-            "100% regret rate shifts objective by REGRET_PENALTY_WEIGHT"
-        );
+        assert_eq!(with_full, base);
     }
 
     // ─── S2.1: RetuneTriggerState ─────────────────────────────────────────────
@@ -716,6 +819,7 @@ mod tests {
                 holdout_mrr: 0.7,
                 baseline_holdout_objective: 0.45,
                 memory_count_at_tune: Some(0),
+                measurement: None,
             };
             append_tune_history(&paths.kimetsu_dir, entry).expect("append");
 
@@ -754,7 +858,7 @@ mod tests {
             let run_id = RunId::new();
             let served_ev = Event::new(
                 run_id,
-                "context.served",
+                "context.injected",
                 serde_json::json!({"query_hash":"abc","capsule_count":1,"skipped":false}),
             );
             projector::apply_events(&conn, &[served_ev]).expect("seed served");
@@ -858,6 +962,7 @@ mod tests {
             holdout_mrr: 0.70,
             baseline_holdout_objective: 0.45,
             memory_count_at_tune: Some(123),
+            measurement: None,
         };
 
         append_tune_history(&tmp, entry).unwrap();

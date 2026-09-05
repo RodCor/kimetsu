@@ -1,171 +1,91 @@
-//! v1.5: personal eval-set builder for `kimetsu brain tune`.
-//!
-//! Walks `context.served` events that carry a raw `query` field (present when
-//! `store_queries = true` in `project.toml`). Joins to `memory_citations` via
-//! `session_id` (exact match) or, when session_id is absent, a ±30-minute
-//! time window. A served event becomes a POSITIVE eval case when ≥1 citation
-//! occurred in that window. Zero-citation served events are counted as noise
-//! (used only for cost statistics; they do NOT appear in the `cases` vec).
-//!
-//! Deduplication: when the same query text appears multiple times (the same
-//! task is worked on across sessions), only the latest served event is kept.
-
-use rusqlite::Connection;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-
+//! Personal weak reliance labels from exact delivered exposure + claim revision.
+//! Uncited observations are unknown, never negative gold. Raw queries exist only
+//! after learning.store_queries opt-in at the producer. Legacy time joins are ignored.
 use crate::eval::EvalCase;
 use kimetsu_core::KimetsuResult;
+use rusqlite::Connection;
+#[cfg(test)]
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-/// Output of [`build_personal_eval`].
 #[derive(Debug, Clone, Default)]
 pub struct PersonalEval {
-    /// Positive eval cases (query + relevant memory ids).
+    /// Weak reliance labels, not verified relevance.
     pub cases: Vec<EvalCase>,
-    /// Number of served events with zero subsequent citations (noise pool).
+    /// Compatibility name: count of unknown uncited/unusable observations, NOT noise gold.
     pub noise_count: usize,
-    /// RFC-3339 timestamp of the oldest positive served event, if any.
     pub oldest: Option<String>,
-    /// RFC-3339 timestamp of the newest positive served event, if any.
     pub newest: Option<String>,
 }
 
-/// Build a personal eval set from the events already in `conn`.
-///
-/// Parameters:
-/// - `window_secs`: maximum seconds between a served event and a citation for
-///   them to be considered linked when no `session_id` is available (default 1800 = 30 min).
-pub fn build_personal_eval(conn: &Connection, window_secs: i64) -> KimetsuResult<PersonalEval> {
-    // 1. Collect served events that carry a query.
-    let mut stmt = conn.prepare(
-        "SELECT payload_json, ts FROM events
-         WHERE kind = 'context.served'
-         ORDER BY ts DESC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+/// window_secs is retained for source compatibility and intentionally ignored.
+pub fn build_personal_eval(conn: &Connection, _window_secs: i64) -> KimetsuResult<PersonalEval> {
+    let mut stmt = conn.prepare("SELECT event_id,run_id,payload_json,ts FROM events WHERE kind='context.injected' ORDER BY ts DESC,event_id DESC")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
     })?;
-
-    // Dedup by query text: keep latest ts for each unique query.
-    let mut seen_queries: std::collections::HashMap<String, (String, serde_json::Value)> =
-        std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = PersonalEval::default();
     for row in rows {
-        let (payload_json, ts) = row?;
-        let payload: serde_json::Value =
-            serde_json::from_str(&payload_json).unwrap_or(serde_json::Value::Null);
-        let Some(query) = payload.get("query").and_then(|v| v.as_str()) else {
-            continue; // no raw query stored → skip
+        let (exposure, run, payload, ts) = row?;
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        let Some(query) = payload["query"].as_str().filter(|q| !q.trim().is_empty()) else {
+            continue;
         };
-        if !seen_queries.contains_key(query) {
-            seen_queries.insert(query.to_string(), (ts, payload));
+        if !seen.insert(query.to_string()) {
+            continue;
         }
-    }
-
-    if seen_queries.is_empty() {
-        return Ok(PersonalEval::default());
-    }
-
-    // 2. For each unique served event, find citations in-window.
-    let mut cases: Vec<EvalCase> = Vec::new();
-    let mut noise_count = 0usize;
-    let mut oldest: Option<String> = None;
-    let mut newest: Option<String> = None;
-
-    for (query, (ts, payload)) in &seen_queries {
-        let session_id = payload.get("session_id").and_then(|v| v.as_str());
-
-        // Find citation memory_ids linked to this served event.
-        let relevant = citations_for_served(conn, ts, session_id, window_secs)?;
-
+        let mut citations = conn.prepare("SELECT payload_json FROM events WHERE kind='memory.cited' AND run_id=?1 AND json_extract(payload_json,'$.exposure_id')=?2 AND json_extract(payload_json,'$.evidence_kind')='reliance'")?;
+        let cited =
+            citations.query_map(rusqlite::params![run, exposure], |r| r.get::<_, String>(0))?;
+        let mut relevant = std::collections::BTreeSet::new();
+        for cited in cited {
+            let cited: serde_json::Value = serde_json::from_str(&cited?)?;
+            let Some(id) = cited["memory_id"].as_str() else {
+                continue;
+            };
+            let Some(revision) = cited["revision_event_id"].as_str() else {
+                continue;
+            };
+            if payload["memory_revisions"][id].as_str() != Some(revision)
+                || !payload["memory_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|x| x.as_str() == Some(id)))
+                || crate::projector::claim_revision_at(conn, id, None)? != revision
+            {
+                continue;
+            }
+            relevant.insert(id.to_string());
+        }
         if relevant.is_empty() {
-            noise_count += 1;
-        } else {
-            // Track oldest/newest timestamps.
-            if oldest.as_deref().map(|o| ts.as_str() < o).unwrap_or(true) {
-                oldest = Some(ts.clone());
-            }
-            if newest.as_deref().map(|n| ts.as_str() > n).unwrap_or(true) {
-                newest = Some(ts.clone());
-            }
-            cases.push(EvalCase {
-                query: query.clone(),
-                relevant,
-                kind: Default::default(),
-                stale: Vec::new(),
-            });
+            result.noise_count += 1;
+            continue;
         }
-    }
-
-    Ok(PersonalEval {
-        cases,
-        noise_count,
-        oldest,
-        newest,
-    })
-}
-
-/// Collect distinct memory_ids cited in-window relative to a served event.
-///
-/// Strategy:
-///   1. If session_id is present: find all `memory.cited` events whose
-///      payload `session_id` matches. (Citation events emitted by the MCP
-///      `kimetsu_brain_cite` tool carry `session_id` in their payload.)
-///      → NOT currently stored there; fall through to time-window.
-///   2. Time-window fallback: find `memory_citations` rows whose `cited_at`
-///      falls within [ts − window_secs, ts + window_secs].
-///
-/// Note on design: `memory_citations` has `cited_at` (RFC-3339 text) and
-/// `run_id`. We cannot reliably join on `run_id` for MCP cites (sentinel
-/// run_id shared by all). So the primary join key is `session_id` from the
-/// event payload when available; otherwise the time window is used.
-fn citations_for_served(
-    conn: &Connection,
-    served_ts: &str,
-    session_id: Option<&str>,
-    window_secs: i64,
-) -> KimetsuResult<Vec<String>> {
-    // Try session_id join first (citations from the same Claude Code session).
-    if let Some(sid) = session_id {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT mc.memory_id
-             FROM memory_citations mc
-             JOIN events e ON e.run_id = mc.run_id
-                          AND e.kind = 'memory.cited'
-             WHERE json_extract(e.payload_json, '$.session_id') = ?1",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map([sid], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        if !ids.is_empty() {
-            return Ok(ids);
+        if result.oldest.as_ref().is_none_or(|old| &ts < old) {
+            result.oldest = Some(ts.clone())
         }
-        // Fall through: session_id join found nothing (MCP cites without session_id
-        // in payload, or old agent cites) — use time window below.
+        if result.newest.as_ref().is_none_or(|new| &ts > new) {
+            result.newest = Some(ts.clone())
+        }
+        result.cases.push(EvalCase {
+            query: query.into(),
+            relevant: relevant.into_iter().collect(),
+            family: payload["task_id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("")
+                .into(),
+            kind: Default::default(),
+            stale: Vec::new(),
+        });
     }
-
-    // Time-window fallback: parse the served ts, compute bounds.
-    let served_dt = OffsetDateTime::parse(served_ts, &Rfc3339)
-        .map_err(|e| format!("parse served_ts {served_ts:?}: {e}"))?;
-    let lo = (served_dt - time::Duration::seconds(window_secs))
-        .format(&Rfc3339)
-        .map_err(|e| format!("format lo: {e}"))?;
-    let hi = (served_dt + time::Duration::seconds(window_secs))
-        .format(&Rfc3339)
-        .map_err(|e| format!("format hi: {e}"))?;
-
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT memory_id FROM memory_citations
-         WHERE cited_at >= ?1 AND cited_at <= ?2",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map([&lo, &hi], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(ids)
+    result.cases.sort_by(|a, b| a.query.cmp(&b.query));
+    Ok(result)
 }
-
-// ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -283,11 +203,9 @@ mod tests {
             seed_memory_cited(&conn, &mid, 5 * 60);
 
             let eval = build_personal_eval(&conn, 1800).expect("build");
-            assert_eq!(eval.cases.len(), 1, "should have 1 positive case");
-            assert_eq!(eval.cases[0].query, "find files fast");
             assert!(
-                eval.cases[0].relevant.contains(&mid),
-                "memory_id must be in relevant"
+                eval.cases.is_empty(),
+                "nearby legacy citations are not linked evidence"
             );
             assert_eq!(eval.noise_count, 0);
             std::fs::remove_dir_all(&root).ok();
@@ -314,7 +232,10 @@ mod tests {
                 0,
                 "out-of-window citation → no positive case"
             );
-            assert_eq!(eval.noise_count, 1, "should count 1 noise entry");
+            assert_eq!(
+                eval.noise_count, 0,
+                "legacy retrieval is not a canonical exposure"
+            );
             std::fs::remove_dir_all(&root).ok();
         });
     }
@@ -337,8 +258,66 @@ mod tests {
 
             let eval = build_personal_eval(&conn, 1800).expect("build");
             // Dedup: both map to same query string → one case (the latest ts kept).
-            assert_eq!(eval.cases.len(), 1, "dedup must produce exactly 1 case");
+            assert_eq!(
+                eval.cases.len(),
+                0,
+                "legacy time joins cannot produce labels"
+            );
             std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    #[test]
+    fn exact_exposure_citation_labels_only_its_query_and_current_claim() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).unwrap();
+            let mid = add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "the durable label",
+            )
+            .unwrap();
+            let (_, _, conn) = crate::project::load_project(&root).unwrap();
+            let revision = projector::claim_revision_at(&conn, &mid, None).unwrap();
+            let exposed = |query: &str| {
+                Event::new(
+                    RunId::new(),
+                    "context.injected",
+                    serde_json::json!({
+                        "query":query,"memory_ids":[mid],"memory_revisions":{mid.clone():revision},
+                        "session_id":"shared-session","task_id":"shared-task"
+                    }),
+                )
+            };
+            let a = exposed("cited query");
+            let b = exposed("uncited query");
+            crate::project::record_context_exposure(&root, &a).unwrap();
+            crate::project::record_context_exposure(&root, &b).unwrap();
+            crate::project::record_exposure_citation(
+                &root,
+                &a.event_id.to_string(),
+                &mid,
+                Some("used"),
+            )
+            .unwrap();
+            let eval = build_personal_eval(&conn, 1800).unwrap();
+            assert_eq!(eval.cases.len(), 1);
+            assert_eq!(eval.cases[0].query, "cited query");
+            assert_eq!(eval.cases[0].relevant, vec![mid.clone()]);
+            assert_eq!(
+                eval.noise_count, 1,
+                "uncited is unknown, never a negative gold label"
+            );
+            crate::project::edit_memory(&root, &mid, Some("a corrected proposition"), None)
+                .unwrap();
+            let revised = build_personal_eval(&conn, 1800).unwrap();
+            assert!(
+                revised.cases.is_empty(),
+                "old reliance cannot label a corrected proposition"
+            );
+            assert_eq!(revised.noise_count, 2);
         });
     }
 }

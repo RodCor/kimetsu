@@ -378,6 +378,9 @@ pub struct ContextRequest {
     /// from `BrokerSection.min_semantic_score` by the pipeline; callers
     /// that don't set it get the prior behaviour automatically.
     pub min_semantic_score: f32,
+    /// Explicit public override: None preserves legacy zero=inherited; Some(0)
+    /// disables, Some(-1) selects model auto, Some(positive) sets a floor.
+    pub min_semantic_score_override: Option<f32>,
     /// v1.0.0: absolute *lexical* relevance floor for memory candidates,
     /// as the fraction of the query's IDF-weighted discriminating power a
     /// memory must cover. Unlike `min_semantic_score` this needs no query
@@ -388,6 +391,8 @@ pub struct ContextRequest {
     /// `..Default::default()` construction is unchanged. Populated from
     /// `BrokerSection.min_lexical_coverage` by the pipeline.
     pub min_lexical_coverage: f32,
+    /// Some(0) explicitly disables the lexical floor; None inherits legacy behavior.
+    pub min_lexical_coverage_override: Option<f32>,
     /// E3: inferred kind of the current task. Defaults to `Feature`
     /// (the neutral kind) so every existing `..Default::default()`
     /// construction is unchanged — Feature does NOT alter weights or
@@ -408,6 +413,8 @@ pub struct ContextRequest {
     /// 0.0 (default) disables the gate. Populated from
     /// `BrokerSection.abstain_min_score` by the pipeline.
     pub abstain_evidence: f32,
+    /// Some(0) disables abstention; Some(-1) uses model auto; None inherits.
+    pub abstain_evidence_override: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
