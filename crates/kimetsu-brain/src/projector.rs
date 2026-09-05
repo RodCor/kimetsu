@@ -109,7 +109,7 @@ pub fn rebuild_in_place(conn: &Connection) -> KimetsuResult<usize> {
 }
 
 /// Caller holds the SQLite writer lock across snapshot, reset and replay.
-fn replay_locked(conn: &Connection) -> KimetsuResult<usize> {
+pub(crate) fn replay_locked(conn: &Connection) -> KimetsuResult<usize> {
     let events = read_events_ordered(conn)?;
     let existing = {
         let mut stmt = conn.prepare("SELECT memory_id FROM memories")?;

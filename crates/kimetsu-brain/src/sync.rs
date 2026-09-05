@@ -10,6 +10,8 @@
 /// - `memory.proposed`
 /// - `memory.rejected`
 /// - `memory.invalidated`
+/// - `memory.restored`
+/// - `memory.corrected`
 /// - `memory.cited`
 /// - `memory.superseded`
 ///
@@ -45,7 +47,7 @@
 ///   2. For every OTHER subdirectory (= other machine), read batches after
 ///      the locally stored cursor for that machine, import them (idempotent),
 ///      and advance the cursor.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -72,6 +74,7 @@ const SYNC_ALLOWED_KINDS: &[&str] = &[
     "memory.proposed",
     "memory.rejected",
     "memory.invalidated",
+    "memory.restored",
     "memory.corrected",
     "memory.cited",
     "memory.superseded",
@@ -353,12 +356,15 @@ pub struct ImportSummary {
 /// dedup; we additionally count skips for reporting.
 ///
 /// When `dry_run` is true, parse and count but do NOT write anything.
+/// Otherwise, stage the entire batch and replay the merged durable log under
+/// one writer lock. Historical edits must not project against today's state.
 pub fn import_events(
     conn: &Connection,
     jsonl: &str,
     dry_run: bool,
 ) -> KimetsuResult<ImportSummary> {
-    let mut summary = ImportSummary::default();
+    let mut excluded = 0;
+    let mut events = Vec::new();
     for (line_no, line) in jsonl.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -371,39 +377,57 @@ pub fn import_events(
         // already filters, but a hand-crafted batch might not).
         if !is_sync_allowed(&se.kind) {
             // Skip silently — telemetry/local kinds should never appear.
-            summary.skipped += 1;
+            excluded += 1;
             continue;
         }
 
         let event: Event = Event::try_from(se)
             .map_err(|e| format!("sync import: invalid event on line {}: {e}", line_no + 1))?;
 
-        // Check whether event_id already exists.
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM events WHERE event_id = ?1",
-                rusqlite::params![event.event_id.to_string()],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
+        events.push(event);
+    }
 
-        if exists {
-            summary.skipped += 1;
-            continue;
-        }
+    let mut summary = ImportSummary::default();
+    let mut import = |c: &Connection| -> KimetsuResult<()> {
+        summary = ImportSummary {
+            applied: 0,
+            skipped: excluded,
+        };
+        let mut seen = BTreeSet::new();
+        for event in &events {
+            // Both the count and insertion run under the writer lock. Include
+            // in-batch duplicates in dry-run counts without writing them.
+            let exists: bool = !seen.insert(event.event_id.to_string())
+                || c.query_row(
+                    "SELECT 1 FROM events WHERE event_id = ?1",
+                    rusqlite::params![event.event_id.to_string()],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
 
-        if dry_run {
+            if exists {
+                summary.skipped += 1;
+                continue;
+            }
+            if !dry_run {
+                let redacted = Event {
+                    payload: redact_event_payload(event),
+                    ..event.clone()
+                };
+                projector::insert_event(c, &redacted)?;
+            }
             summary.applied += 1;
-            continue;
         }
-
-        // Apply through the projector: inserts into events table + projects
-        // into derived tables.  The projector's `apply_events` wraps in a
-        // transaction; we call it one event at a time to keep the
-        // applied/skipped tally accurate.
-        projector::apply_events(conn, &[event])?;
-        summary.applied += 1;
+        if !dry_run && summary.applied > 0 {
+            projector::replay_locked(c)?;
+        }
+        Ok(())
+    };
+    if dry_run {
+        import(conn)?;
+    } else {
+        projector::with_write_txn(conn, import)?;
     }
     Ok(summary)
 }
@@ -422,6 +446,10 @@ pub fn import_events_from_file(
     path: &Path,
     dry_run: bool,
 ) -> KimetsuResult<ImportSummary> {
+    import_events(conn, &read_batch_file(path)?, dry_run)
+}
+
+fn read_batch_file(path: &Path) -> KimetsuResult<String> {
     let file = fs::File::open(path)
         .map_err(|e| format!("sync import: cannot open {:?}: {e}", path.display()))?;
     let reader = BufReader::new(file);
@@ -431,7 +459,7 @@ pub fn import_events_from_file(
         buf.push_str(&l);
         buf.push('\n');
     }
-    import_events(conn, &buf, dry_run)
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,9 +576,20 @@ pub fn pull_machine_batches(
     since_cursor: i64,
     dry_run: bool,
 ) -> KimetsuResult<(ImportSummary, i64)> {
+    let (jsonl, cursor) = read_machine_batches(sync_dir, source_machine_id, since_cursor)?;
+    Ok((import_events(conn, &jsonl, dry_run)?, cursor))
+}
+
+/// Read every pending batch before importing: prerequisites can be in a later
+/// batch or on another peer, so directory sync merges these before replay.
+fn read_machine_batches(
+    sync_dir: &Path,
+    source_machine_id: &str,
+    since_cursor: i64,
+) -> KimetsuResult<(String, i64)> {
     let machine_dir = sync_dir.join(source_machine_id);
     if !machine_dir.exists() {
-        return Ok((ImportSummary::default(), since_cursor));
+        return Ok((String::new(), since_cursor));
     }
 
     // Collect batch files, parse their numeric stem (= the export cursor at
@@ -579,17 +618,15 @@ pub fn pull_machine_batches(
     }
     batches.sort_by_key(|(c, _)| *c);
 
-    let mut total = ImportSummary::default();
+    let mut jsonl = String::new();
     let mut new_cursor = since_cursor;
     for (cursor_val, batch_path) in &batches {
-        let batch_summary = import_events_from_file(conn, batch_path, dry_run)?;
-        total.applied += batch_summary.applied;
-        total.skipped += batch_summary.skipped;
+        jsonl.push_str(&read_batch_file(batch_path)?);
         if *cursor_val > new_cursor {
             new_cursor = *cursor_val;
         }
     }
-    Ok((total, new_cursor))
+    Ok((jsonl, new_cursor))
 }
 
 /// Full sync cycle:
@@ -637,31 +674,28 @@ pub fn sync_dir(
         }
         other_machines.sort(); // deterministic order
 
+        let mut incoming = String::new();
         for other_id in &other_machines {
             let since = cursors.cursor_for(other_id);
-            let (pull_summary, new_cursor) =
-                pull_machine_batches(conn, sync_dir, other_id, since, dry_run)?;
-            total_applied += pull_summary.applied;
-            total_skipped += pull_summary.skipped;
+            let (jsonl, new_cursor) = read_machine_batches(sync_dir, other_id, since)?;
             if !dry_run && new_cursor > since {
                 cursors.set_cursor(other_id, new_cursor);
                 machines_pulled.push(other_id.clone());
-            } else if dry_run && (pull_summary.applied + pull_summary.skipped) > 0 {
+            } else if dry_run && !jsonl.trim().is_empty() {
                 machines_pulled.push(other_id.clone());
             }
+            incoming.push_str(&jsonl);
         }
+
+        // Commit all peer events and their causal projection together before
+        // advancing pull cursors. A failed import leaves both unchanged.
+        let pull_summary = import_events(conn, &incoming, dry_run)?;
+        total_applied = pull_summary.applied;
+        total_skipped = pull_summary.skipped;
 
         if !dry_run && !machines_pulled.is_empty() {
             cursors.save(cursors_path)?;
         }
-    }
-
-    // Slice B: total-order replay. After importing peer events (which were
-    // applied incrementally in arrival order), re-project the merged log in HLC
-    // order so this brain converges to the SAME state every peer reaches,
-    // independent of import order. Skipped when nothing was pulled.
-    if !dry_run && total_applied > 0 {
-        projector::rebuild_in_place(conn)?;
     }
 
     Ok(SyncReport {
@@ -820,6 +854,284 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open_in_memory");
         schema::initialize(&conn).expect("schema init");
         conn
+    }
+
+    fn wire(events: &[Event]) -> String {
+        events
+            .iter()
+            .map(|event| serde_json::to_string(&SyncEvent::from(event)).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn sync_replays_historical_correction_before_local_retirement() {
+        for reason in ["retired", "forgotten/archived"] {
+            let a = make_conn();
+            let b = make_conn();
+            let run = RunId::new();
+            let accepted = Event::new(
+                run,
+                "memory.accepted",
+                json!({"memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"}),
+            );
+            apply_events(&a, std::slice::from_ref(&accepted)).unwrap();
+            apply_events(&b, &[accepted]).unwrap();
+            let exposure = Event::new(run, "context.injected", json!({"memory_ids":["m"]}));
+            apply_events(&b, std::slice::from_ref(&exposure)).unwrap();
+            let correction = Event::new(
+                run,
+                "memory.corrected",
+                json!({"memory_id":"m", "text":"corrected claim"}),
+            );
+            apply_events(&a, std::slice::from_ref(&correction)).unwrap();
+            apply_events(
+                &b,
+                &[Event::new(
+                    run,
+                    "memory.invalidated",
+                    json!({"memory_id":"m", "reason":reason}),
+                )],
+            )
+            .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let sd = tmp.path().join("sync");
+            push_machine_batch(&a, &sd, "a", 0, false).unwrap();
+            let cp = tmp.path().join("b-cursors.json");
+            let report = sync_dir(&b, &sd, "b", &cp, false)
+                .expect("historical correction must replay before retirement");
+            assert_eq!((report.pulled_applied, report.pulled_skipped), (1, 1));
+            for _ in 0..2 {
+                let state: (String, String) = b
+                    .query_row(
+                        "SELECT text, invalidated_reason FROM memories WHERE memory_id='m'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(state, ("corrected claim".into(), reason.into()));
+                let binding: String = b.query_row("SELECT json_extract(payload_json,'$.memory_revisions.m') FROM events WHERE event_id=?1", [exposure.event_id.to_string()], |r| r.get(0)).unwrap();
+                assert_eq!(binding, "baseline:m");
+                assert_eq!(
+                    b.query_row(
+                        "SELECT count(*) FROM memories_fts WHERE memory_id='m'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                projector::rebuild_in_place(&b).unwrap();
+            }
+            assert_eq!(SyncCursors::load(&cp).unwrap().cursor_for("a"), 2);
+            assert_eq!(
+                sync_dir(&b, &sd, "b", &cp, false).unwrap().pulled_applied,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn sync_archive_restore_round_trip() {
+        let a = make_conn();
+        let b = make_conn();
+        let run = RunId::new();
+        apply_events(&a, &[Event::new(run, "memory.accepted", json!({"memory_id":"m", "text":"restorable claim", "scope":"project", "kind":"fact"}))]).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = tmp.path().join("sync");
+        let ca = tmp.path().join("a.json");
+        let cb = tmp.path().join("b.json");
+        sync_dir(&a, &sd, "a", &ca, false).unwrap();
+        sync_dir(&b, &sd, "b", &cb, false).unwrap();
+        for (kind, archived) in [("memory.invalidated", true), ("memory.restored", false)] {
+            apply_events(
+                &a,
+                &[Event::new(
+                    run,
+                    kind,
+                    json!({"memory_id":"m", "reason":"forgotten/archived"}),
+                )],
+            )
+            .unwrap();
+            assert!(sync_dir(&a, &sd, "a", &ca, false).unwrap().pushed > 0);
+            assert_eq!(
+                sync_dir(&b, &sd, "b", &cb, false).unwrap().pulled_applied,
+                1
+            );
+            let actual: bool = b
+                .query_row(
+                    "SELECT invalidated_at IS NOT NULL FROM memories WHERE memory_id='m'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, archived);
+            assert_eq!(
+                b.query_row(
+                    "SELECT count(*) FROM memories_fts WHERE memory_id='m'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                if archived { 0 } else { 1 }
+            );
+        }
+        assert_eq!(
+            sync_dir(&b, &sd, "b", &cb, false).unwrap().pulled_applied,
+            0
+        );
+    }
+
+    #[test]
+    fn sync_import_failure_rolls_back_entire_batch() {
+        for malformed_json in [false, true] {
+            let conn = make_conn();
+            let run = RunId::new();
+            let accepted = Event::new(
+                run,
+                "memory.accepted",
+                json!({"memory_id":"m", "text":"kept claim", "scope":"project", "kind":"fact"}),
+            );
+            let bad = Event::new(
+                run,
+                "memory.corrected",
+                json!({"memory_id":"missing", "text":"bad claim"}),
+            );
+            let input = if malformed_json {
+                format!("{}\n{{bad", wire(&[accepted]))
+            } else {
+                wire(&[accepted, bad])
+            };
+            assert!(import_events(&conn, &input, false).is_err());
+            for table in ["events", "memories", "memory_revisions", "memories_fts"] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0,
+                    "{table} must roll back"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_directory_merges_peer_dependencies_before_replay() {
+        let conn = make_conn();
+        let run = RunId::new();
+        let accepted = Event::new(
+            run,
+            "memory.accepted",
+            json!({"memory_id":"m", "text":"old", "scope":"project", "kind":"fact"}),
+        );
+        let correction = Event::new(
+            run,
+            "memory.corrected",
+            json!({"memory_id":"m", "text":"new"}),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = tmp.path().join("sync");
+        atomic_write(&sd.join("a/2.jsonl"), wire(&[correction]).as_bytes()).unwrap();
+        atomic_write(&sd.join("z/1.jsonl"), wire(&[accepted]).as_bytes()).unwrap();
+        let cp = tmp.path().join("cursors.json");
+        let report = sync_dir(&conn, &sd, "local", &cp, false)
+            .expect("replay must include all peers before resolving dependencies");
+        assert_eq!(report.pulled_applied, 2);
+        assert_eq!(
+            conn.query_row("SELECT text FROM memories WHERE memory_id='m'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "new"
+        );
+        let cursors = SyncCursors::load(&cp).unwrap();
+        assert_eq!((cursors.cursor_for("a"), cursors.cursor_for("z")), (2, 1));
+    }
+
+    #[test]
+    fn sync_directory_failure_preserves_projection_and_pull_cursors() {
+        let conn = make_conn();
+        let run = RunId::new();
+        let accepted = Event::new(
+            run,
+            "memory.accepted",
+            json!({"memory_id":"m", "text":"old", "scope":"project", "kind":"fact"}),
+        );
+        apply_events(&conn, &[accepted]).unwrap();
+        let correction = Event::new(
+            run,
+            "memory.corrected",
+            json!({"memory_id":"m", "text":"new"}),
+        );
+        let bad = Event::new(
+            run,
+            "memory.corrected",
+            json!({"memory_id":"missing", "text":"bad"}),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = tmp.path().join("sync");
+        atomic_write(&sd.join("a/2.jsonl"), wire(&[correction]).as_bytes()).unwrap();
+        atomic_write(&sd.join("z/3.jsonl"), wire(&[bad]).as_bytes()).unwrap();
+        let cp = tmp.path().join("cursors.json");
+        assert!(sync_dir(&conn, &sd, "local", &cp, false).is_err());
+        assert_eq!(
+            conn.query_row("SELECT text FROM memories WHERE memory_id='m'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "old"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let cursors = SyncCursors::load(&cp).unwrap();
+        assert_eq!((cursors.cursor_for("a"), cursors.cursor_for("z")), (0, 0));
+    }
+
+    #[test]
+    fn sync_import_refuses_to_erase_unlogged_memory() {
+        let conn = make_conn();
+        conn.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at) VALUES ('legacy','global_user','fact','original','original',0.7,'{}','2020-01-01T00:00:00Z')", []).unwrap();
+        let accepted = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({"memory_id":"m", "text":"new", "scope":"project", "kind":"fact"}),
+        );
+        let error = import_events(&conn, &wire(&[accepted]), false).unwrap_err();
+        assert!(error.to_string().contains("absent from replay"));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT text FROM memories WHERE memory_id='legacy'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn sync_import_counts_duplicate_lines_in_dry_run_and_commit() {
+        let conn = make_conn();
+        let accepted = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({"memory_id":"m", "text":"new", "scope":"project", "kind":"fact"}),
+        );
+        let input = wire(&[accepted.clone(), accepted]);
+        for dry in [true, false] {
+            let summary = import_events(&conn, &input, dry).unwrap();
+            assert_eq!((summary.applied, summary.skipped), (1, 1));
+        }
+        let summary = import_events(&conn, &input, false).unwrap();
+        assert_eq!((summary.applied, summary.skipped), (0, 2));
     }
 
     fn seed_events(conn: &Connection) -> (RunId, String, String) {
