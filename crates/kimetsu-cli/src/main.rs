@@ -701,10 +701,9 @@ enum BrainCommand {
     /// makes VACUUM actually shrink the file. Note: they will no longer appear
     /// in audit/blame output.
     ///
-    /// --trim-events-older-than <dur>: deletes events older than the given
-    /// duration (e.g. 30d, 7d, 24h). WARNING: this shrinks the rebuild
-    /// history window. Materialized memories (projection rows) are NOT
-    /// affected — only the raw event log is trimmed.
+    /// --trim-events-older-than <dur>: deletes expendable telemetry older
+    /// than the given duration (e.g. 30d, 7d, 24h). Durable claim, exposure,
+    /// outcome and correction history is retained for safe rebuilds.
     ///
     /// Examples:
     ///   kimetsu brain compact
@@ -1623,9 +1622,8 @@ struct CompactArgs {
     /// audit/blame output after this operation.
     #[arg(long)]
     purge_invalidated: bool,
-    /// Trim events older than this duration before VACUUM (e.g. 30d, 7d, 24h).
-    /// WARNING: reduces the rebuild history window. Materialized memories
-    /// (projection rows) are NOT affected — only the raw event log is trimmed.
+    /// Trim expendable telemetry older than this duration (e.g. 30d, 7d, 24h).
+    /// Retains claim, exposure and outcome history required by rebuilds.
     #[arg(long, value_name = "DUR")]
     trim_events_older_than: Option<String>,
     /// Emit machine-readable JSON instead of the human summary.

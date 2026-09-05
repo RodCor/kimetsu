@@ -1186,9 +1186,8 @@ pub(crate) fn brain_compact(args: CompactArgs) -> KimetsuResult<()> {
     // Print warnings before performing any destructive operations.
     if let Some(ref dur_str) = args.trim_events_older_than {
         eprintln!(
-            "WARNING: --trim-events-older-than {dur_str} will delete events older than \
-             {dur_str} from the durable event log. Materialized memories are unaffected, \
-             but the rebuild history window will be reduced."
+            "Trimming expendable telemetry older than {dur_str}; retaining durable \
+             claim, exposure and outcome history for rebuilds."
         );
     }
     if args.purge_invalidated {

@@ -5935,13 +5935,7 @@ max_total_cost_usd = 250.0
         });
     }
 
-    /// Q8-3: event trim removes old events but materialized memories survive.
-    ///
-    /// Uses trim_events_older_than = Duration::ZERO so ALL events are
-    /// classified as "old" relative to `now`. After trim:
-    ///   - events_trimmed > 0
-    ///   - list_memories still returns the seeded memory (projection survives)
-    ///   - memories are NOT deleted by event trimming
+    /// Compaction removes expendable telemetry while retaining claim history.
     #[test]
     fn compact_brain_event_trim_keeps_materialized_memories() {
         with_user_brain_disabled(|| {
@@ -5956,10 +5950,7 @@ max_total_cost_usd = 250.0
             )
             .expect("add memory");
 
-            // Trim with a 1-second Duration — but we add a 2-second sleep
-            // alternative: use Duration::from_secs(0) which means cutoff =
-            // now, so events older than "right now" are ALL deleted.
-            // Using 0 ensures even events written 1ms ago are trimmed.
+            seed_old_compaction_telemetry(&root);
             let trim_dur = std::time::Duration::from_secs(0);
 
             // Small sleep to ensure events are definitively in the past
@@ -5990,17 +5981,22 @@ max_total_cost_usd = 250.0
         });
     }
 
-    /// Q8-4: rebuild_projection after event trim does not error.
-    ///
-    /// Even with a partially trimmed event log, rebuild_in_place can complete —
-    /// it replays whatever events remain without panicking or returning an error.
+    fn seed_old_compaction_telemetry(root: &std::path::Path) {
+        let (_, _, conn) = load_project(root).unwrap();
+        let mut telemetry = Event::new(RunId::new(), "context.served", serde_json::json!({}));
+        telemetry.ts = time::OffsetDateTime::from_unix_timestamp(946684800).unwrap();
+        crate::projector::apply_events(&conn, &[telemetry]).unwrap();
+        conn.execute("UPDATE events SET ts='2000-01-01T00:00:00Z'", []).unwrap();
+    }
+
+    /// A successful rebuild must preserve the memory, not merely avoid errors.
     #[test]
     fn compact_brain_event_trim_then_rebuild_is_consistent() {
         with_user_brain_disabled(|| {
             let root = test_root();
             init_project(&root, false).expect("init");
 
-            add_memory(
+            let mid = add_memory(
                 &root,
                 MemoryScope::Project,
                 MemoryKind::Fact,
@@ -6008,20 +6004,16 @@ max_total_cost_usd = 250.0
             )
             .expect("add memory");
 
-            // Trim all events (cutoff = now).
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            seed_old_compaction_telemetry(&root);
             let report = compact_brain(&root, Some(std::time::Duration::from_secs(0)), false)
                 .expect("compact_brain");
             assert!(report.events_trimmed > 0, "events must have been trimmed");
 
-            // rebuild_projection must not error — it replays whatever events remain.
             let replayed =
                 rebuild_projection(&root, false).expect("rebuild_projection after event trim");
-            // The events are gone so the replay count should be 0 (empty log).
-            assert_eq!(
-                replayed, 0,
-                "replayed should be 0 after all events are trimmed"
-            );
+            assert!(replayed > 0, "durable claim history must survive trim");
+            assert!(list_memories(&root).unwrap().iter().any(|m| m.memory_id == mid),
+                "compaction followed by rebuild erased the memory");
         });
     }
 

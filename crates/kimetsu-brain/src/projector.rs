@@ -83,8 +83,14 @@ fn upcast_event(event: &Event) -> Cow<'_, Event> {
 }
 
 pub fn rebuild(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
-    reset_projection(conn)?;
-    apply_events(conn, events)
+    with_write_txn(conn, |c| {
+        // Trace import supplements the durable log. It must not replace claims
+        // written directly to that log, nor leave an empty projection on error.
+        for event in events {
+            apply_event(c, event)?;
+        }
+        replay_locked(c).map(|_| ())
+    })
 }
 
 /// Rebuild the projection from the durable events table (in place). Reads
@@ -92,14 +98,33 @@ pub fn rebuild(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
 /// re-inserting events (so no duplication). Returns the number of events
 /// replayed.
 pub fn rebuild_in_place(conn: &Connection) -> KimetsuResult<usize> {
-    let events = read_events_ordered(conn)?;
+    let mut count = 0;
     with_write_txn(conn, |c| {
-        reset_projection(c)?;
-        for event in &events {
-            project_event(c, event)?;
-        }
+        count = replay_locked(c)?;
         Ok(())
     })?;
+    Ok(count)
+}
+
+/// Caller holds the SQLite writer lock across snapshot, reset and replay.
+fn replay_locked(conn: &Connection) -> KimetsuResult<usize> {
+    let events = read_events_ordered(conn)?;
+    let existing = {
+        let mut stmt = conn.prepare("SELECT memory_id FROM memories")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+    };
+    reset_projection(conn)?;
+    for event in &events {
+        project_event(conn, event)?;
+    }
+    let mut stmt = conn.prepare("SELECT memory_id FROM memories")?;
+    let restored = stmt.query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let missing = existing.difference(&restored).count();
+    if missing > 0 {
+        return Err(format!("rebuild refused: {missing} existing memories absent from replay; transaction rolled back. Back up the brain and recover missing events before rebuilding; legacy unlogged rows require migration.").into());
+    }
     Ok(events.len())
 }
 
@@ -1422,6 +1447,76 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open_in_memory");
         schema::initialize(&conn).expect("schema::initialize");
         conn
+    }
+
+    #[test]
+    fn rebuild_import_failure_preserves_existing_projection() {
+        let conn = make_conn();
+        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
+            "memory_id":"kept", "text":"keep my evidence", "scope":"project", "kind":"fact"
+        }));
+        apply_events(&conn, &[accepted]).unwrap();
+        let malformed = Event::new(RunId::new(), "memory.accepted", json!({
+            "memory_id":"broken", "text":"bad validity", "scope":"project", "kind":"fact", "valid_from":"nonsense"
+        }));
+        assert!(super::rebuild(&conn, &[malformed]).is_err());
+        let text: String = conn.query_row("SELECT text FROM memories WHERE memory_id='kept'", [], |r|r.get(0)).unwrap();
+        assert_eq!(text, "keep my evidence");
+    }
+
+    #[test]
+    fn rebuild_import_keeps_durable_events_missing_from_trace() {
+        let conn = make_conn();
+        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
+            "memory_id":"kept", "text":"durable but not in trace", "scope":"project", "kind":"fact"
+        }));
+        apply_events(&conn, &[accepted]).unwrap();
+        super::rebuild(&conn, &[]).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM memories WHERE memory_id='kept'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn rebuild_refuses_to_erase_unlogged_legacy_user_memory() {
+        let conn = make_conn();
+        conn.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at) VALUES ('legacy','global_user','fact','original','original',0.7,'{\"source\":\"user_brain\"}','2020-01-01T00:00:00Z')", []).unwrap();
+        let error = rebuild_in_place(&conn).unwrap_err();
+        assert!(error.to_string().contains("absent from replay"));
+        assert_eq!(conn.query_row("SELECT text FROM memories WHERE memory_id='legacy'", [], |r|r.get::<_,String>(0)).unwrap(), "original");
+        assert!(super::rebuild(&conn, &[]).is_err());
+    }
+
+    #[test]
+    fn rebuild_reads_events_after_acquiring_writer_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WAITING: AtomicBool = AtomicBool::new(false);
+        fn busy(_: i32) -> bool {
+            WAITING.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        }
+        WAITING.store(false, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebuild.db");
+        let writer = Connection::open(&path).unwrap();
+        schema::initialize(&writer).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        let rebuilding = Connection::open(&path).unwrap();
+        rebuilding.busy_handler(Some(busy)).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let event = Event::new(RunId::new(), "memory.accepted", json!({
+            "memory_id":"concurrent", "text":"committed while rebuild waits", "scope":"project", "kind":"fact"
+        }));
+        super::apply_event(&writer, &event).unwrap();
+        let worker = std::thread::spawn(move || rebuild_in_place(&rebuilding).map_err(|e|e.to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !WAITING.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let was_waiting = WAITING.load(Ordering::SeqCst);
+        writer.execute_batch("COMMIT").unwrap();
+        assert!(was_waiting, "rebuild did not reach the contested write lock");
+        assert_eq!(worker.join().unwrap().unwrap(), 1);
+        assert_eq!(writer.query_row("SELECT count(*) FROM memories WHERE memory_id='concurrent'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
     }
 
     fn make_event(run_id: RunId, kind: &str, payload: serde_json::Value) -> Event {

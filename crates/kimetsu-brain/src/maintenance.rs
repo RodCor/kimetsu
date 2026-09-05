@@ -212,7 +212,7 @@ pub struct CompactReport {
 ///
 /// 1. Acquires the project lock (same as `rebuild_projection`).
 /// 2. Optionally purges invalidated memory rows (`purge_invalidated`).
-/// 3. Optionally trims old events (`trim_events_older_than`).
+/// 3. Optionally trims old non-projecting telemetry (`trim_events_older_than`).
 /// 4. Runs `VACUUM` (outside any transaction) to rebuild the file in-place.
 /// 5. Checkpoints the WAL before measuring `bytes_after` so the measurement
 ///    reflects the on-disk file, not the shadow WAL.
@@ -245,37 +245,16 @@ pub fn compact_brain(
         0
     };
 
-    // Step 4: trim old events (optional, gated by caller).
+    // Only these non-projecting telemetry kinds may be dropped. Unknown kinds
+    // are retained so future state/evidence events cannot silently lose history.
     let events_trimmed = if let Some(dur) = trim_events_older_than {
-        // Compute the cutoff as an RFC 3339 string (UTC) so it compares
-        // correctly against the TEXT `ts` column.
-        let cutoff_secs = dur.as_secs();
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let cutoff_unix = now_unix.saturating_sub(cutoff_secs);
-        // Format as a naive UTC RFC 3339 string (matches the stored format).
-        let cutoff_rfc3339 = {
-            let secs = cutoff_unix as i64;
-            // Use the `time` crate (already a dependency of projector.rs).
-            use time::OffsetDateTime;
-            use time::format_description::well_known::Rfc3339;
-            OffsetDateTime::from_unix_timestamp(secs)
-                .map_err(|e| format!("compact_brain: invalid cutoff timestamp: {e}"))?
-                .format(&Rfc3339)
-                .map_err(|e| format!("compact_brain: failed to format cutoff: {e}"))?
-        };
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE ts < ?1",
-            rusqlite::params![cutoff_rfc3339],
-            |r| r.get(0),
-        )?;
+        let age_seconds = dur.as_secs().min(i64::MAX as u64) as i64;
         conn.execute(
-            "DELETE FROM events WHERE ts < ?1",
-            rusqlite::params![cutoff_rfc3339],
-        )?;
-        count as u64
+            "DELETE FROM events
+             WHERE kind IN ('context.served','retrieval.stats','digest_served','resume_served')
+             AND julianday(ts) < julianday('now') - CAST(?1 AS REAL) / 86400.0",
+            rusqlite::params![age_seconds],
+        )? as u64
     } else {
         0
     };
