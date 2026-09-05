@@ -348,6 +348,11 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let exposed = run_claim_revision(conn, &event.run_id.to_string(), memory_id)?;
     // A citation without a revision or exposure is ambiguous after a text
     // correction. Keep its durable event, but do not credit the new claim.
+    let exposed = match exposed {
+        ClaimExposure::Unbound => return Ok(()),
+        ClaimExposure::Absent => None,
+        ClaimExposure::Bound(revision) => Some(revision),
+    };
     let evidence_revision = explicit.map(str::to_owned).or(exposed);
     if evidence_revision
         .as_ref()
@@ -651,7 +656,13 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
     };
 
     for memory_id in &retrieved {
-        if let Some(exposed_revision) = run_claim_revision(conn, &run_id, memory_id)? {
+        let exposure = run_claim_revision(conn, &run_id, memory_id)?;
+        if matches!(exposure, ClaimExposure::Unbound) {
+            // An explicit delivery map is authoritative: missing/ambiguous IDs
+            // have no safely attributable claim, including the baseline claim.
+            continue;
+        }
+        if let ClaimExposure::Bound(exposed_revision) = exposure {
             if exposed_revision != claim_revision_at(conn, memory_id, None)? {
                 // The run saw the old proposition. Its delayed outcome belongs
                 // to that retained revision, even if correction removed the
@@ -2533,6 +2544,84 @@ mod correction_regressions {
         apply_events(c, &[event("memory.accepted", serde_json::json!({"memory_id":"m", "scope":"project", "kind":"fact", "text":"original quokka"}), "2026-01-01T00:00:00Z")]).unwrap();
     }
     #[test]
+    fn explicit_unbound_exposure_never_credits_a_claim() {
+        for corrected in [false, true] {
+            for bindings in [
+                serde_json::json!({}),
+                serde_json::json!({"other":"baseline:other"}),
+            ] {
+                let c = Connection::open_in_memory().unwrap();
+                seed(&c);
+                if corrected {
+                    apply_events(
+                        &c,
+                        &[event(
+                            "memory.corrected",
+                            serde_json::json!({"memory_id":"m","text":"new claim"}),
+                            "2026-01-02T00:00:00Z",
+                        )],
+                    )
+                    .unwrap();
+                }
+                let run = RunId::new();
+                let mut events = vec![
+                    event(
+                        "run.started",
+                        serde_json::json!({"project_id":"p","task":"t"}),
+                        "2026-01-03T00:00:00Z",
+                    ),
+                    event(
+                        "context.injected",
+                        serde_json::json!({"memory_ids":["m"],"memory_revisions":bindings}),
+                        "2026-01-04T00:00:00Z",
+                    ),
+                    event(
+                        "memory.cited",
+                        serde_json::json!({"memory_id":"m","turn":1}),
+                        "2026-01-05T00:00:00Z",
+                    ),
+                    event(
+                        "run.finished",
+                        serde_json::json!({"total_cost_usd":0}),
+                        "2026-01-06T00:00:00Z",
+                    ),
+                ];
+                for e in &mut events {
+                    e.run_id = run;
+                }
+                apply_events(&c, &events).unwrap();
+                for _ in 0..2 {
+                    let current: (i64, f64) = c
+                        .query_row(
+                            "SELECT use_count,usefulness_score FROM memories WHERE memory_id='m'",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        current,
+                        (0, 0.0),
+                        "explicit unbound exposure must not fall back to current claim"
+                    );
+                    let citations: i64 = c
+                        .query_row("SELECT count(*) FROM memory_citations", [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(citations, 0);
+                    let revision_uses: i64 = c
+                        .query_row(
+                            "SELECT COALESCE(SUM(use_count),0) FROM memory_revisions",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(revision_uses, 0);
+                    rebuild_in_place(&c).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn delayed_run_evidence_stays_on_the_retiring_claim() {
         let c = Connection::open_in_memory().unwrap();
         seed(&c);
@@ -2767,6 +2856,13 @@ pub(crate) fn claim_revision_at(
     Ok(revision.unwrap_or_else(|| format!("baseline:{memory_id}")))
 }
 
+/// Distinguish a legacy absent exposure from an explicitly unbound delivery.
+enum ClaimExposure {
+    Absent,
+    Unbound,
+    Bound(String),
+}
+
 /// Legacy injections identify IDs only. Attribute an in-flight run to its
 /// earliest exposure rather than silently transferring old evidence on edit.
 /// For legacy unbound events, equal-time corrections are conservatively treated
@@ -2775,7 +2871,7 @@ fn run_claim_revision(
     conn: &Connection,
     run_id: &str,
     memory_id: &str,
-) -> KimetsuResult<Option<String>> {
+) -> KimetsuResult<ClaimExposure> {
     let exposure = conn
         .query_row(
             "SELECT ts,payload_json FROM events e WHERE run_id=?1 AND kind='context.injected'
@@ -2786,17 +2882,29 @@ fn run_claim_revision(
         )
         .optional()?;
     match exposure {
-        None => Ok(None),
+        None => Ok(ClaimExposure::Absent),
         Some((at, payload)) => {
             let payload: serde_json::Value = serde_json::from_str(&payload)?;
-            if let Some(revision) = payload
-                .get("memory_revisions")
-                .and_then(|v| v.get(memory_id))
-                .and_then(|v| v.as_str())
-            {
-                Ok(Some(revision.to_string()))
+            if let Some(bindings) = payload.get("memory_revisions") {
+                // Presence (even malformed/empty/partial) means the producer
+                // supplied an authoritative hydration map. Never invent a later
+                // claim identity for an omitted or ambiguous entry.
+                Ok(
+                    match bindings
+                        .get(memory_id)
+                        .and_then(|v| v.as_str())
+                        .filter(|r| !r.is_empty())
+                    {
+                        Some(revision) => ClaimExposure::Bound(revision.to_string()),
+                        None => ClaimExposure::Unbound,
+                    },
+                )
             } else {
-                Ok(Some(claim_revision_at(conn, memory_id, Some(&at))?))
+                Ok(ClaimExposure::Bound(claim_revision_at(
+                    conn,
+                    memory_id,
+                    Some(&at),
+                )?))
             }
         }
     }
