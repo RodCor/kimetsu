@@ -241,9 +241,9 @@ async fn dispatch_request(
         return match res {
             Ok(Ok(value)) => {
                 // Wrap in the same `{content:[{type,text}]}` envelope that
-                // generic dispatch produces for tools/call results.
-                let text =
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                // generic dispatch produces for tools/call results. Compact JSON
+                // must match context::delivery's final budget accounting.
+                let text = value.to_string();
                 (
                     Outcome::Ok,
                     jsonrpc_ok(

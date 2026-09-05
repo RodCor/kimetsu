@@ -183,3 +183,60 @@ async fn reranker_in_appstate_intercepts_brain_context() {
     // Confirm the Arc<dyn Reranker> round-trips through Clone correctly.
     let _ = Arc::new(StubReranker);
 }
+
+#[tokio::test]
+async fn hardening_remote_reranker_empty_reply_obeys_final_budget() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut request = context("unknown deployment");
+    request["params"]["arguments"]["budget_tokens"] = json!(250);
+    request["params"]["arguments"]["include_ambient"] = json!(false);
+    let response = send_with_reranker(tmp.path(), "empty-budget", request).await;
+    let payload = inner(&response);
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["capsule_count"], 0);
+    let actual = response["result"].to_string().len() as u64;
+    assert_eq!(
+        payload["used_tokens"].as_u64(),
+        Some(actual),
+        "remote envelope differs from accounted content"
+    );
+    assert!(
+        actual <= 250,
+        "remote content exceeded tight budget: {actual}"
+    );
+}
+
+#[tokio::test]
+async fn hardening_remote_reranker_escaped_capsule_obeys_final_budget() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let lesson = "deployment restart flushing path \"C:\\cache\\字\"";
+    let recorded = send(tmp.path(), "escaped-budget", record(lesson)).await;
+    assert_eq!(inner(&recorded)["ok"], true);
+    let mut request = context("deployment restart flushing");
+    request["params"]["arguments"]["include_ambient"] = json!(false);
+    let initial = inner(&send_with_reranker(tmp.path(), "escaped-budget", request.clone()).await);
+    assert_eq!(
+        initial["capsule_count"], 1,
+        "fixture must actually deliver escaped evidence: {initial}"
+    );
+    // Allow only small numeric freshness variations across retrievals.
+    let budget = initial["used_tokens"].as_u64().unwrap() + 16;
+    request["params"]["arguments"]["budget_tokens"] = json!(budget);
+    let response = send_with_reranker(tmp.path(), "escaped-budget", request).await;
+    let payload = inner(&response);
+    assert_eq!(payload["capsule_count"], 1);
+    let summary = payload["capsules"][0]["summary"].as_str().unwrap();
+    assert!(summary.contains('字') && summary.contains('"') && summary.contains('\\'));
+    let actual = response["result"].to_string().len() as u64;
+    assert_eq!(
+        payload["used_tokens"].as_u64(),
+        Some(actual),
+        "escaping and MCP envelope must be included"
+    );
+    assert!(
+        actual <= budget,
+        "remote content {actual} exceeded {budget}"
+    );
+}
