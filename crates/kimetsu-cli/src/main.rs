@@ -2614,10 +2614,22 @@ mod tests {
     }
 
     #[test]
+    fn hardening_free_never_requests_host_harvesting() {
+        let config = kimetsu_core::config::ProjectConfig::default_for_project("free-hooks");
+        assert!(!should_emit_stop_harvest_cue(&config, false));
+    }
+
+    #[test]
     fn stop_cue_suppressed_when_distiller_enabled() {
-        assert!(should_emit_stop_harvest_cue(true, false));
-        assert!(!should_emit_stop_harvest_cue(true, true));
-        assert!(!should_emit_stop_harvest_cue(false, false));
+        let mut config = kimetsu_core::config::ProjectConfig::default_for_project("deep-hooks");
+        config.cheap_model = Some(kimetsu_core::config::CheapModelSection {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(should_emit_stop_harvest_cue(&config, false));
+        assert!(!should_emit_stop_harvest_cue(&config, true));
+        config.learning.auto_harvest = false;
+        assert!(!should_emit_stop_harvest_cue(&config, false));
     }
 
     // ── Stop-hook output must be valid JSON (CC validates stdout as the
@@ -4148,6 +4160,9 @@ scope = 0.1
             ..Default::default()
         };
         let wire = vec![crate::embed_daemon::proto::Capsule {
+            id: "m1".into(),
+            expansion_handle: "memory:m1".into(),
+            claim_revision: Some("rev1".into()),
             summary: "repo:fact - x".to_string(),
             kind: "memory".to_string(),
             score: 0.9,
@@ -4159,6 +4174,9 @@ scope = 0.1
         let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9);
         assert_eq!(bundle.capsules.len(), 1);
         assert_eq!(bundle.capsules[0].summary, "repo:fact - x");
+        assert_eq!(bundle.capsules[0].id, "m1");
+        assert_eq!(bundle.capsules[0].expansion_handle, "memory:m1");
+        assert_eq!(bundle.capsules[0].claim_revision.as_deref(), Some("rev1"));
         assert_eq!(bundle.capsules[0].kind, "memory");
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);

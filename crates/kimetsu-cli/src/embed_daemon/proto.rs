@@ -62,6 +62,12 @@ pub enum Response {
 /// `ContextCapsule` — only what the hook needs to render the injection).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Capsule {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub expansion_handle: String,
+    #[serde(default)]
+    pub claim_revision: Option<String>,
     pub summary: String,
     pub kind: String,
     pub score: f32,
@@ -95,6 +101,15 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn legacy_capsule_is_explicitly_unbound() {
+        let c: Capsule =
+            serde_json::from_str(r#"{"summary":"legacy", "kind":"memory", "score":0.8}"#).unwrap();
+        assert!(c.id.is_empty());
+        assert!(c.expansion_handle.is_empty());
+        assert!(c.claim_revision.is_none());
+    }
+
+    #[test]
     fn request_round_trips_through_a_line() {
         let req = Request::Retrieve(RetrieveArgs {
             v: 1,
@@ -125,6 +140,9 @@ mod tests {
     fn response_round_trips() {
         let resp = Response::Capsules {
             capsules: vec![Capsule {
+                id: "m1".into(),
+                expansion_handle: "memory:m1".into(),
+                claim_revision: Some("rev1".into()),
                 summary: "repo:fact - x".into(),
                 kind: "memory".into(),
                 score: 0.9,

@@ -1241,3 +1241,70 @@ fn standing_preferences_reach_the_agent_without_being_retrieved() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn hardening_free_hooks_never_cue_host_after_resolution_or_stop() {
+    for configured_model in [false, true] {
+        let (root, cache_home) = seeded_proactive_project(if configured_model {
+            "free_configured_hooks"
+        } else {
+            "free_default_hooks"
+        });
+        let (paths, mut config, conn) = brain_project::load_project(&root).unwrap();
+        drop(conn);
+        config.kimetsu.tier = Some(kimetsu_core::config::Tier::Free);
+        config.cheap_model = configured_model.then(|| kimetsu_core::config::CheapModelSection {
+            enabled: true,
+            ..Default::default()
+        });
+        fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+        run_posttool_hook(
+            &root,
+            &cache_home,
+            "free-resolution",
+            "cargo test",
+            "error[E0433]: failed to resolve crate",
+        );
+        let success = run_posttool_hook(
+            &root,
+            &cache_home,
+            "free-resolution",
+            "cargo test",
+            "test result: ok. 1 passed; 0 failed",
+        );
+        assert!(
+            success.trim().is_empty(),
+            "Free resolution must not invoke host learning: {success}"
+        );
+        let payload = serde_json::json!({"session_id":"free-stop", "transcript": vec![serde_json::json!({"role":"assistant","content":"work"}); 14]});
+        let mut child = Command::new(kimetsu_bin())
+            .args(["brain", "stop-hook", "--distill-on-stop", "--workspace"])
+            .arg(&root)
+            .env("KIMETSU_TIER", "free")
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "Free Stop must not request learning: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

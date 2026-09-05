@@ -12,11 +12,11 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant and the call cost nothing, so a call that returns empty is not a wasted one — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations are the brain's only evidence about which memories earn their place; an uncited memory reads as unused. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant; the reply still has a small input-token cost — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations are the brain's only evidence about which memories earn their place; an uncited memory reads as unused. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
-const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Returns skipped:true (zero tokens) when no capsule is relevant above min_score threshold — safe to call on every non-trivial task without overhead concern.";
+const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Returns skipped:true when no capsule is delivered. Responses have a small framing cost; used_tokens reports a conservative bound on the complete serialized MCP content.";
 
 // TODO (v0.6+): fold benchmark-tag filtering + semantic_operator/anti_pattern
 // preference into kimetsu_brain_context so kimetsu_benchmark_context becomes
@@ -218,7 +218,7 @@ pub fn dispatch(
             Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                    "text": value.to_string(),
                 }]
             }))
         }
@@ -650,7 +650,7 @@ fn parse_shared_retrieval_args(
             .filter(|v| !v.trim().is_empty())
             .unwrap_or("localization")
             .to_string(),
-        budget_tokens: u32_arg(arguments, "budget_tokens", default_budget, 500, 30000),
+        budget_tokens: u32_arg(arguments, "budget_tokens", default_budget, 0, 30000),
         max_capsules: u32_arg(arguments, "max_capsules", default_max_capsules, 1, 20) as usize,
     }
 }
@@ -680,28 +680,38 @@ fn take_session_warm_start(workspace: &Path) -> Option<String> {
 }
 
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
-    let mut value = match brain_context_tool(workspace, arguments, None) {
-        Ok(v) => v,
-        Err(e) => brain_unavailable_json(workspace, &e),
-    };
+    brain_context_tool_with_warm(
+        workspace,
+        arguments,
+        None,
+        take_session_warm_start(workspace),
+    )
+    .unwrap_or_else(|e| {
+        bounded_context_error(arguments, 6000, brain_unavailable_json(workspace, &e))
+    })
+}
 
-    // Hosts with a session-start hook (Claude Code) or a per-turn hook (Codex,
-    // Pi, OpenClaw) already receive the warm-start block out of band. Cursor
-    // has neither — it only speaks MCP — so the session's first context call is
-    // the one place the repo digest and episodic resume can reach it. Attached
-    // as a sibling field so the retrieval response shape stays untouched.
-    if let Some(block) = take_session_warm_start(workspace) {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "warm_start".into(),
-                json!({
-                    "context": block,
-                    "how_to_use": "First context call of this session: what this repo is, and where you left off last time. Read it before planning. It is not repeated on later calls."
-                }),
-            );
-        }
+fn bounded_context_error(arguments: &Value, default_budget: u32, error: Value) -> Value {
+    let budget = parse_shared_retrieval_args(arguments, default_budget, 1).budget_tokens;
+    kimetsu_brain::context::delivery::fit_json(Vec::new(), budget, |_| error.clone()).payload
+}
+
+fn record_context_delivery(
+    workspace: &Path,
+    arguments: &Value,
+    delivery: &kimetsu_brain::context::delivery::Delivery,
+    surface: &str,
+) {
+    if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() == Ok("0") {
+        return;
     }
-    value
+    let mut payload = kimetsu_brain::context::delivery::injected_payload(
+        &delivery.capsules,
+        delivery.payload["used_tokens"].as_u64().unwrap_or(0) as u32,
+    );
+    payload["surface"] = json!(surface);
+    payload["session_id"] = arguments.get("session_id").cloned().unwrap_or(Value::Null);
+    let _ = project::log_telemetry_event(workspace, "context.injected", payload);
 }
 
 /// Candidate pool the remote reranker judges before truncating to the caller's
@@ -720,13 +730,22 @@ pub const REMOTE_RERANK_FLOOR: f32 = 0.30;
 /// - bumps `budget_tokens` to at least 6000 so the pool isn't token-starved
 /// - retrieves, then calls `rerank_capsules` before serialising
 ///
-/// The JSON response shape is byte-compatible with the `None` path so
-/// existing tests and the stdio consumer are unaffected.
+/// Both paths share compact serialization and the final output budget. Rejected
+/// summaries and ranking diagnostics are never serialized on this surface.
 pub fn brain_context_tool(
     workspace: &Path,
     arguments: &serde_json::Value,
     reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
 ) -> Result<serde_json::Value, String> {
+    brain_context_tool_with_warm(workspace, arguments, reranker, None)
+}
+
+fn brain_context_tool_with_warm(
+    workspace: &Path,
+    arguments: &Value,
+    reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
+    warm_start: Option<String>,
+) -> Result<Value, String> {
     use kimetsu_brain::context::ContextRequest;
 
     let query = arguments
@@ -735,11 +754,15 @@ pub fn brain_context_tool(
         .unwrap_or("")
         .trim();
     if query.is_empty() {
-        return Ok(json!({
-            "ok": false,
-            "error": "missing `query`",
-            "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
-        }));
+        return Ok(bounded_context_error(
+            arguments,
+            6000,
+            json!({
+                "ok": false,
+                "error": "missing `query`",
+                "usage": "Pass a concise task description, e.g. {\"query\":\"terminal-bench mips interpreter create frame.bmp\",\"stage\":\"implementation\"}."
+            }),
+        ));
     }
     let shared = parse_shared_retrieval_args(arguments, 6000, 3);
     let stage = shared.stage.as_str();
@@ -780,7 +803,7 @@ pub fn brain_context_tool(
     // W3.2: load broker.ambient from the project config (best-effort;
     // default true keeps existing behavior when config is missing).
     let config_ambient = load_config_ambient(workspace);
-    let (effective_query, ambient_payload) = augment_with_ambient(
+    let (effective_query, _ambient_payload) = augment_with_ambient(
         workspace,
         query,
         arguments,
@@ -826,20 +849,6 @@ pub fn brain_context_tool(
                 REMOTE_RERANK_FLOOR,
                 cap,
             );
-            if bundle.skipped {
-                return Ok(json!({
-                    "ok": true,
-                    "skipped": true,
-                    "top_score": bundle.top_score,
-                    "top_abs_evidence": bundle.top_abs_evidence,
-                    "min_score": min_score,
-                    "capsule_count": 0,
-                    "capsules": [],
-                    "usage": {
-                        "how_to_use": "Brain has no capsules above the relevance threshold for this query. Proceed without brain context — this call cost nothing."
-                    }
-                }));
-            }
             let mut bundle = bundle;
 
             // v1.5 (Story 2.1): render-time compression. Load compress_capsules
@@ -857,46 +866,36 @@ pub fn brain_context_tool(
                 }
             }
 
-            Ok(json!({
-                "ok": true,
-                "skipped": false,
-                "top_score": bundle.top_score,
-                "usage": {
-                    "how_to_use": kimetsu_brain::framing::MCP_HOW_TO_USE,
-                    "next_steps": [
-                        "Use returned expansion_handle values as provenance when deciding what files or memories matter.",
-                        "If capsule_count is 0 or repo capsules are missing, call kimetsu_brain_status and then kimetsu_brain_ingest_repo if repo_indexed_files_for_current_root is 0.",
-                        "Continue with the host harness's normal file/shell/edit tools.",
-                        "If a memory is stale or harmful, call kimetsu_brain_memory_invalidate with its memory id."
-                    ]
-                },
-                "stage": bundle.stage,
-                "query": query,
-                "augmented_query": effective_query,
-                "ambient": ambient_payload,
-                "budget_tokens": bundle.budget_tokens,
-                "used_tokens": bundle.used_tokens,
-                "capsule_count": bundle.capsules.len(),
-                "excluded_count": bundle.excluded.len(),
-                // v2.6: how much of the query these capsules collectively
-                // cover, and what none of them mention. A reader that knows
-                // memory is thin here can abstain instead of inferring.
-                "evidence_coverage": bundle.evidence_coverage,
-                "uncovered_terms": bundle.uncovered_terms,
-                "partial_evidence_notice":
-                    kimetsu_brain::context::partial_evidence_notice(&bundle),
-                // v2.6: true when the question was about order, so the capsules
-                // are oldest-first and each carries the date it was recorded —
-                // without which a time-ordered bundle reads as a broken ranking.
-                "chronological": bundle.chronological,
-                "chronological_note": bundle
-                    .chronological
-                    .then_some(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE),
-                "capsules": bundle.capsules,
-                "excluded": bundle.excluded,
-            }))
+            use kimetsu_brain::context::delivery::{
+                add_optional_field, compact_capsules, fit_json,
+            };
+            let count = bundle.capsules.len();
+            let mut delivery = fit_json(bundle.capsules.clone(), budget_tokens, |capsules| {
+                json!({
+                    "ok": true,
+                    "skipped": capsules.is_empty(),
+                    "capsule_count": capsules.len(),
+                    "excluded_count": bundle.excluded.len() + count - capsules.len(),
+                    "capsules": compact_capsules(capsules),
+                    "partial_evidence": bundle.evidence_coverage < 1.0 || capsules.len() < count,
+                })
+            });
+            if let Some(block) = warm_start {
+                add_optional_field(
+                    &mut delivery,
+                    "warm_start",
+                    json!({"context":block}),
+                    budget_tokens,
+                );
+            }
+            record_context_delivery(workspace, arguments, &delivery, "brain_context");
+            Ok(delivery.payload)
         }
-        Err(err) => Ok(brain_unavailable_json(workspace, &err.to_string())),
+        Err(err) => Ok(bounded_context_error(
+            arguments,
+            6000,
+            brain_unavailable_json(workspace, &err.to_string()),
+        )),
     }
 }
 
@@ -1079,11 +1078,15 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
         .unwrap_or("")
         .trim();
     if task.is_empty() {
-        return json!({
-            "ok": false,
-            "error": "missing `task`",
-            "usage": "Pass the Terminal-Bench instruction text, e.g. {\"task\":\"compile-compcert build task\",\"dataset\":\"terminal-bench/terminal-bench-2\"}."
-        });
+        return bounded_context_error(
+            arguments,
+            2500,
+            json!({
+                "ok": false,
+                "error": "missing `task`",
+                "usage": "Pass the Terminal-Bench instruction text, e.g. {\"task\":\"compile-compcert build task\",\"dataset\":\"terminal-bench/terminal-bench-2\"}."
+            }),
+        );
     }
 
     let dataset = optional_string_arg(arguments, "dataset")
@@ -1133,42 +1136,58 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
         ambient_suffix.as_deref(),
     ) {
         Ok(context) => {
-            let ok = context.required_ok;
-            let error = if ok {
-                None
-            } else {
-                Some("required exact-slug or generalized benchmark memory was not retrieved")
-            };
-            json!({
-                "ok": ok,
-                "error": error,
-                "usage": {
-                    "how_to_use": "Read playbook_markdown before broad exploration. The playbook prioritizes accepted semantic_operator and anti_pattern memories first, exact episodic run summaries as evidence, then repo snippets.",
-                    "required_mode": "When require_benchmark_memory=true, ok=false means retrieval worked but no exact-slug or generalized benchmark memory was usable. Seed or record benchmark outcome memory before using strict required mode.",
-                    "after_attempt": "Call kimetsu_benchmark_record_outcome with status, commands, pitfalls, verification, and optional generalized_memory so future benchmark runs retrieve a better playbook."
-                },
-                "dataset": context.dataset,
-                "task": context.task,
-                "task_slug": context.task_slug,
-                "warm_policy": context.warm_policy.as_str(),
-                "query": context.query,
-                "ambient": ambient_ctx,
-                "stage": context.stage,
-                "budget_tokens": context.budget_tokens,
-                "used_tokens": context.used_tokens,
-                "capsule_count": context.capsule_count,
-                "memory_capsule_count": context.memory_capsule_count,
-                "benchmark_memory_count": context.benchmark_memory_count,
-                "generalizable_memory_count": context.generalizable_memory_count,
-                "episodic_memory_count": context.episodic_memory_count,
-                "required_ok": context.required_ok,
-                "playbook_markdown": context.playbook_markdown,
-                "capsules": context.capsules,
-                "excluded_count": context.excluded.len(),
-                "excluded": context.excluded,
-            })
+            use kimetsu_brain::context::delivery::{compact_capsules, fit_json};
+            let original_count = context.capsules.len();
+            let delivery = fit_json(context.capsules.clone(), budget_tokens, |capsules| {
+                let memory_count = capsules.iter().filter(|c| c.kind == "memory").count();
+                let benchmark_count = capsules
+                    .iter()
+                    .filter(|c| {
+                        benchmark::benchmark_memory_matches(c, context.task_slug.as_deref())
+                    })
+                    .count();
+                let generalizable_count = capsules
+                    .iter()
+                    .filter(|c| {
+                        benchmark::benchmark_memory_role(c).is_some_and(|r| r.is_generalizable())
+                    })
+                    .count();
+                let episodic_count = capsules
+                    .iter()
+                    .filter(|c| {
+                        benchmark::benchmark_memory_role(c)
+                            == Some(benchmark::BenchmarkMemoryRole::Episodic)
+                    })
+                    .count();
+                let required_ok =
+                    !require_benchmark_memory || benchmark_count > 0 || generalizable_count > 0;
+                let mut playbook = String::from("# Kimetsu Benchmark Playbook\n");
+                for capsule in capsules {
+                    playbook.push_str(&format!(
+                        "- {} [{}]\n",
+                        capsule.summary, capsule.expansion_handle
+                    ));
+                }
+                json!({
+                    "ok": required_ok, "required_ok": required_ok,
+                    "dataset": context.dataset, "task_slug": context.task_slug,
+                    "warm_policy": context.warm_policy.as_str(),
+                    "capsule_count": capsules.len(), "memory_capsule_count": memory_count,
+                    "benchmark_memory_count": benchmark_count,
+                    "generalizable_memory_count": generalizable_count,
+                    "episodic_memory_count": episodic_count,
+                    "playbook_markdown": playbook, "capsules": compact_capsules(capsules),
+                    "excluded_count": context.excluded.len() + original_count - capsules.len(),
+                })
+            });
+            record_context_delivery(workspace, arguments, &delivery, "benchmark_context");
+            delivery.payload
         }
-        Err(err) => brain_unavailable_json(workspace, &err.to_string()),
+        Err(err) => bounded_context_error(
+            arguments,
+            2500,
+            brain_unavailable_json(workspace, &err.to_string()),
+        ),
     }
 }
 
@@ -1896,7 +1915,7 @@ fn u32_arg(arguments: &Value, name: &str, default: u32, min: u32, max: u32) -> u
             _ => None,
         })
         .unwrap_or(default as u64);
-    (value as u32).clamp(min, max)
+    value.clamp(u64::from(min), u64::from(max)) as u32
 }
 
 fn tool_definitions() -> Value {
@@ -1917,8 +1936,8 @@ fn tool_definitions() -> Value {
                         "type": "string",
                         "enum": ["localization", "patch_plan", "implementation", "verification", "review"]
                     },
-                    "budget_tokens": { "type": "integer", "minimum": 500, "maximum": 30000 },
-                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Skip threshold — if the best capsule scores below this, return empty (zero tokens injected). Default 0.15." },
+                    "budget_tokens": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "Final serialized MCP content budget, accounted as a conservative UTF-8 byte upper bound. Impossible tiny budgets return budget_too_small with the actual response bound." },
+                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Skip threshold — if the best capsule scores below this, return no capsules. Response framing still consumes tokens. Default 0.15." },
                     "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Hard cap on returned capsules. Default 3." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Domain-hint tags. Capsules whose text contains any of these get a 1.4× score boost." },
                     "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "Boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
@@ -1976,7 +1995,7 @@ fn tool_definitions() -> Value {
                         "type": "string",
                         "enum": ["localization", "patch_plan", "implementation", "verification", "review", "harbor"]
                     },
-                    "budget_tokens": { "type": "integer", "minimum": 500, "maximum": 30000 },
+                    "budget_tokens": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "Final serialized MCP content budget, accounted as a conservative UTF-8 byte upper bound. Impossible tiny budgets return budget_too_small with the actual response bound." },
                     "max_capsules": { "type": "integer", "minimum": 1, "maximum": 20 },
                     "require_benchmark_memory": { "type": "boolean", "description": "When true, ok=false unless at least one exact-slug episodic memory or generalized semantic/anti-pattern benchmark memory is in the playbook." }
                 },
@@ -2521,6 +2540,166 @@ mod tests {
                 "hit_rate must be null (C7 not yet landed)"
             );
             fs::remove_dir_all(root).expect("remove temp root");
+        });
+    }
+
+    #[test]
+    fn hardening_context_final_payload_excludes_rejected_and_is_bounded() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("hardening-mcp-budget");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            for i in 0..12 {
+                project::add_memory(
+                    &root,
+                    MemoryScope::Repo,
+                    MemoryKind::Convention,
+                    &format!(
+                        "ripgrep search files advice {i} {}",
+                        "字\"\\no_space_identifier".repeat(45)
+                    ),
+                )
+                .unwrap();
+            }
+            let result = brain_context_tool(
+                &root,
+                &json!({"query":"ripgrep search files", "budget_tokens":500,
+                "max_capsules":1,"min_score":0.0,"include_ambient":false}),
+                None,
+            )
+            .unwrap();
+            assert!(
+                result.get("excluded").is_none(),
+                "rejected summaries must never reach normal MCP"
+            );
+            let wire = json!({"content":[{"type":"text","text":result.to_string()}]}).to_string();
+            assert!(
+                wire.len() <= 500,
+                "full output exceeds budget: {}",
+                wire.len()
+            );
+            assert_eq!(result["used_tokens"].as_u64(), Some(wire.len() as u64));
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn hardening_served_ids_and_revisions_match_final_mcp_payload() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("hardening-mcp-delivered");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Convention,
+                "ripgrep search files before broad reads",
+            )
+            .unwrap();
+            let args = json!({"query":"ripgrep search files", "budget_tokens":1200,
+                "max_capsules":1,"min_score":0.0,"include_ambient":false});
+            let result = brain_context_tool_with_warm(
+                &root,
+                &args,
+                None,
+                Some("huge warm start 字".repeat(1000)),
+            )
+            .unwrap();
+            assert_eq!(result["capsules"].as_array().unwrap().len(), 1);
+            assert!(result.get("warm_start").is_none());
+            assert!(kimetsu_brain::context::delivery::serialized_output_tokens(&result) <= 1200);
+            let (_, _, conn) = project::load_project(&root).unwrap();
+            let payload: String = conn.query_row("SELECT payload_json FROM events WHERE kind='context.injected' ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+            let event: Value = serde_json::from_str(&payload).unwrap();
+            let id = result["capsules"][0]["expansion_handle"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("memory:")
+                .unwrap();
+            assert_eq!(event["memory_ids"], json!([id]));
+            assert_eq!(event["memory_revisions"].as_object().unwrap().len(), 1);
+            assert!(event["memory_revisions"][id].as_str().is_some());
+            assert_eq!(event["used_tokens"], result["used_tokens"]);
+            drop(conn);
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn hardening_normal_output_does_not_grow_with_rejected_summary_size() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("hardening-mcp-excluded-growth");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Convention,
+                "ripgrep search files before broad reads",
+            )
+            .unwrap();
+            let args = json!({"query":"ripgrep search files", "budget_tokens":1200,
+                "max_capsules":1,"min_score":0.0,"include_ambient":false});
+            let before = brain_context_tool(&root, &args, None).unwrap();
+            for i in 0..8 {
+                project::add_memory(
+                    &root,
+                    MemoryScope::Repo,
+                    MemoryKind::Fact,
+                    &format!(
+                        "ripgrep search files rejected_pool_{i} {}",
+                        "do_not_leak_long_identifier".repeat(250)
+                    ),
+                )
+                .unwrap();
+            }
+            let after = brain_context_tool(&root, &args, None).unwrap();
+            assert_eq!(
+                before["capsules"][0]["expansion_handle"],
+                after["capsules"][0]["expansion_handle"]
+            );
+            assert_eq!(
+                before["capsules"][0]["summary"],
+                after["capsules"][0]["summary"]
+            );
+            assert!(after["excluded_count"].as_u64().unwrap() > 0);
+            // Capsule instance IDs and freshness scores change on retrieval;
+            // permit bounded numeric metadata, never rejected summary growth.
+            assert!(after.to_string().len() <= before.to_string().len() + 32);
+            assert!(!after.to_string().contains("do_not_leak_long_identifier"));
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn hardening_benchmark_budget_recomputes_required_evidence() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("hardening-benchmark-budget");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Command,
+                &format!(
+                    "[terminal-bench:compile-compcert] build CompCert {}",
+                    "字\\\"".repeat(700)
+                ),
+            )
+            .unwrap();
+            let result = kimetsu_benchmark_context(
+                &root,
+                &json!({"task":"compile-compcert build CompCert", "budget_tokens":1200,
+                "require_benchmark_memory":true,"include_ambient":false}),
+            );
+            assert!(result.get("excluded").is_none());
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["required_ok"], false);
+            assert_eq!(result["capsule_count"], 0);
+            assert_eq!(result["benchmark_memory_count"], 0);
+            assert!(!result["playbook_markdown"].as_str().unwrap().contains("字"));
+            assert!(kimetsu_brain::context::delivery::serialized_output_tokens(&result) <= 1200);
+            fs::remove_dir_all(root).unwrap();
         });
     }
 

@@ -227,6 +227,13 @@ impl ProjectConfig {
         self.tier().allows_model()
     }
 
+    /// Automatic harvesting may ask either a configured model or the host to
+    /// generate lessons. Both obey the same Free/Deep policy; a missing model
+    /// is Free, never an implicit host-generation fallback.
+    pub fn allows_automatic_harvest(&self) -> bool {
+        self.learning.auto_harvest && self.allows_model_in_pipeline()
+    }
+
     pub fn from_toml(value: &str) -> KimetsuResult<Self> {
         Ok(toml::from_str(value)?)
     }
@@ -1425,6 +1432,25 @@ mod tests {
         CheapModelSection {
             enabled: true,
             ..CheapModelSection::default()
+        }
+    }
+
+    #[test]
+    fn hardening_automatic_harvest_policy_matrix() {
+        for tier in [None, Some(Tier::Free), Some(Tier::Deep)] {
+            for model in [false, true] {
+                for automatic in [false, true] {
+                    let mut config = ProjectConfig::default_for_project("harvest-matrix");
+                    config.kimetsu.tier = tier;
+                    config.cheap_model = model.then(enabled_cheap_model);
+                    config.learning.auto_harvest = automatic;
+                    assert_eq!(
+                        config.allows_automatic_harvest(),
+                        automatic && model && tier != Some(Tier::Free),
+                        "tier={tier:?} model={model} automatic={automatic}"
+                    );
+                }
+            }
         }
     }
 

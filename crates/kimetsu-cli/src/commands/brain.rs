@@ -1935,7 +1935,13 @@ pub(crate) fn daemon_capsules_to_bundle(
     use kimetsu_brain::context::{ContextBundle, ContextCapsule};
     let capsules: Vec<ContextCapsule> = capsules
         .into_iter()
-        .map(|c| ContextCapsule::wire_minimal(c.summary, c.kind, c.score))
+        .map(|c| {
+            let mut capsule = ContextCapsule::wire_minimal(c.summary, c.kind, c.score);
+            capsule.id = c.id;
+            capsule.expansion_handle = c.expansion_handle;
+            capsule.claim_revision = c.claim_revision;
+            capsule
+        })
         .collect();
     // v2.6: measure coverage here too. The in-process path does it during
     // finalization, which this path skips — so without this the "memory does

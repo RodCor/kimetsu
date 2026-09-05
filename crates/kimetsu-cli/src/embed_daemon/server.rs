@@ -118,6 +118,9 @@ impl DaemonState {
                         .capsules
                         .iter()
                         .map(|c| proto::Capsule {
+                            id: c.id.clone(),
+                            expansion_handle: c.expansion_handle.clone(),
+                            claim_revision: c.claim_revision.clone(),
                             summary: c.summary.clone(),
                             kind: c.kind.clone(),
                             score: c.score,

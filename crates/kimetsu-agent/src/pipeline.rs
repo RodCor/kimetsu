@@ -1912,6 +1912,7 @@ fn emit_context_injected(
                 "stage": stage.as_str(),
                 "capsule_handles": capsule_handles,
                 "memory_ids": memory_ids,
+                "memory_revisions": context::memory_revision_bindings(&bundle.capsules),
                 "prior_run_ids": prior_run_ids,
                 "file_paths": file_paths,
                 "used_tokens": bundle.used_tokens,

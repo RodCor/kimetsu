@@ -302,6 +302,15 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
 
     print_user_prompt_submit_context(&additional_context)?;
 
+    let delivered: Vec<_> = capsules_to_render.iter().map(|c| (*c).clone()).collect();
+    record_hook_delivery(
+        &workspace,
+        &delivered,
+        &additional_context,
+        session_id.as_deref(),
+        "user_prompt",
+    );
+
     // v1.5 (Story 2.3): persist newly surfaced handles so subsequent prompts
     // in the same session skip them. Best-effort — state write must never
     // break the hook's primary output.
@@ -500,11 +509,7 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace).ok();
-    let auto_harvest = paths
-        .as_ref()
-        .and_then(|p| project::load_config(p).ok())
-        .map(|c| c.learning.auto_harvest)
-        .unwrap_or(true);
+    let config = paths.as_ref().and_then(|p| project::load_config(p).ok());
     let distiller_enabled = distiller::resolve_pipeline_distiller(&workspace).is_some();
     let state_path = paths.as_ref().map(|p| {
         let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
@@ -530,7 +535,9 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    if should_emit_stop_harvest_cue(auto_harvest, distiller_enabled)
+    if config
+        .as_ref()
+        .is_some_and(|c| should_emit_stop_harvest_cue(c, distiller_enabled))
         && !stop_active
         && let Some(paths) = paths.as_ref()
     {
@@ -545,6 +552,14 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
             proactive_state::save(&state_path, &state);
             return Ok(());
         }
+    }
+
+    // Strict Free (including config-load failure) does not cue host learning.
+    if !config
+        .as_ref()
+        .is_some_and(|c| c.allows_automatic_harvest())
+    {
+        return Ok(());
     }
 
     emit_stop_hook_json(stop_no_lessons_json_with_savings_and_tune(
@@ -706,8 +721,11 @@ pub(crate) fn stop_lessons_recorded_json_with_savings_and_tune(
 
 /// The end-of-session harvest cue fires only when auto-harvest is on AND
 /// the credentialed distiller is not handling end-of-session itself.
-pub(crate) fn should_emit_stop_harvest_cue(auto_harvest: bool, distiller_enabled: bool) -> bool {
-    auto_harvest && !distiller_enabled
+pub(crate) fn should_emit_stop_harvest_cue(
+    config: &kimetsu_core::config::ProjectConfig,
+    distiller_enabled: bool,
+) -> bool {
+    config.allows_automatic_harvest() && !distiller_enabled
 }
 
 /// Count `kimetsu_brain_record` tool-use blocks across transcript
@@ -878,13 +896,13 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         Ok(config) => {
             kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
             (
-                config.learning.auto_harvest,
+                config.allows_automatic_harvest(),
                 config.broker.compress_capsules,
                 config.broker.proactive_prefetch,
             )
         }
         // Fallback: safe defaults — proactive_prefetch OFF (zero behaviour change)
-        Err(_) => (true, true, false),
+        Err(_) => (false, true, false),
     };
 
     let mut input = String::new();
@@ -1147,10 +1165,37 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
 
     print_tool_use_context(event, &additional_context)?;
 
+    record_hook_delivery(
+        &workspace,
+        std::slice::from_ref(capsule),
+        &additional_context,
+        hook.session_id.as_deref(),
+        "proactive",
+    );
+
     state.mark_surfaced(&capsule.expansion_handle);
     state.record_injection(now);
     proactive_state::save(&state_path, &state);
     Ok(())
+}
+
+fn record_hook_delivery(
+    workspace: &std::path::Path,
+    capsules: &[kimetsu_brain::context::ContextCapsule],
+    text: &str,
+    session_id: Option<&str>,
+    surface: &str,
+) {
+    if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() == Ok("0") {
+        return;
+    }
+    let mut payload = kimetsu_brain::context::delivery::injected_payload(
+        capsules,
+        u32::try_from(text.len()).unwrap_or(u32::MAX),
+    );
+    payload["session_id"] = serde_json::json!(session_id);
+    payload["surface"] = serde_json::json!(surface);
+    let _ = project::log_telemetry_event(workspace, "context.injected", payload);
 }
 
 pub(crate) fn proactive_header(event: ProactiveEvent, loop_mode: bool) -> &'static str {
