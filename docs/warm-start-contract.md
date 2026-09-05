@@ -1,6 +1,6 @@
 # Warm-start delivery
 
-Warm starts validate current digest inputs before reusing cached text. Corrections, retirement, future starts and expiry apply to both digest facts and standing preferences. This adds a synchronous database read and, when needed, a rule-based rebuild. It prevents a stale cache from reintroducing facts excluded by ordinary retrieval; it makes no constant-time scaling claim.
+Warm starts gather current inputs and assemble the bounded rule-based digest for delivery. Corrections, retirement, future starts and expiry apply to both digest facts and standing preferences. Matching cached text only avoids an unchanged disk write; it never replaces the freshly assembled result. This also prevents separate text/metadata cache publishers from mixing generations in model output. The synchronous database read makes no constant-time scaling claim.
 
 The shared repo digest contains facts and manifests. Task titles and progress appear only in the caller-selected task/session/worktree resume lane. Global preferences use the normal read-only user-brain opener, including project and environment opt-outs.
 

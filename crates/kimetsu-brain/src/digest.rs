@@ -88,17 +88,21 @@ fn build_or_load_digest_inner(
     let cache_path = paths.kimetsu_dir.join("digest.md");
     let meta_path = paths.kimetsu_dir.join("digest-meta.json");
 
-    // 4. Check cache validity.
-    if !force_rebuild {
-        if let Some(cached) = try_load_cache(&cache_path, &meta_path, hash) {
-            return Ok(Some(cached));
-        }
-    }
-
-    // 5. Build the digest (cheap-model optional; rule-based otherwise).
+    // The rule-based assembly is cheap and binds delivery to this exact input
+    // snapshot. Separate diagnostic cache publishers can mix text/metadata
+    // generations, so an input-hash match alone cannot authorize cached text.
     let digest_text = assemble_rule_based(&inputs, &config)?;
     if digest_text.trim().is_empty() {
         return Ok(None);
+    }
+
+    // 4. Reuse the disk cache only as a reason to skip an unchanged write.
+    if !force_rebuild {
+        if let Some(cached) = try_load_cache(&cache_path, &meta_path, hash) {
+            if cached == digest_text {
+                return Ok(Some(digest_text));
+            }
+        }
     }
 
     // 6. Write cache atomically.
@@ -591,6 +595,16 @@ mod tests {
                 "stale cache must never reintroduce corrected text"
             );
             assert!(block.contains("CORRECTED"));
+            // Separate cache-file publishers can leave old text with current
+            // input metadata. Delivery must bind to the gathered inputs anyway.
+            let (paths, _, conn) = load_project_readonly(&dir).unwrap();
+            std::fs::write(paths.kimetsu_dir.join("digest.md"), "ORIGINAL port is 4001").unwrap();
+            let mixed = warm_start_block_scoped(&dir, "lane-a").unwrap();
+            assert!(
+                mixed.contains("CORRECTED") && !mixed.contains("ORIGINAL"),
+                "mixed cache generations leaked: {mixed}"
+            );
+            drop(conn);
             project::invalidate_memory(&dir, &id, Some("wrong claim")).unwrap();
             assert!(
                 !warm_start_block_scoped(&dir, "lane-a")
