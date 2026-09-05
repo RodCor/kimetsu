@@ -1982,13 +1982,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kimetsu_brain_status",
             "description": BRAIN_STATUS_DESCRIPTION,
-            "inputSchema": { "type": "object", "properties": {
-                    "task_id": {"type":"string","description":"Optional task lane; takes precedence over session/worktree identity."},
-                    "session_id": {"type":"string","description":"Optional session lane when task_id is absent."},
-                    "worktree_id": {"type":"string","description":"Optional worktree lane when task/session identity is absent."},
-                    "task_id": {"type":"string","description":"Optional task lane; takes precedence over session/worktree identity."},
-                    "session_id": {"type":"string","description":"Optional session lane when task_id is absent."},
-                    "worktree_id": {"type":"string","description":"Optional worktree lane when task/session identity is absent."},} }
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "kimetsu_brain_context",
@@ -1996,6 +1990,9 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "task_id": {"type":"string","description":"Optional task lane; takes precedence over session/worktree identity."},
+                    "session_id": {"type":"string","description":"Optional session lane when task_id is absent."},
+                    "worktree_id": {"type":"string","description":"Optional worktree lane when task/session identity is absent."},
                     "query": { "type": "string" },
                     "stage": {
                         "type": "string",
@@ -2048,6 +2045,9 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "task_id": {"type":"string","description":"Optional task lane; takes precedence over session/worktree identity."},
+                    "session_id": {"type":"string","description":"Optional session lane when task_id is absent."},
+                    "worktree_id": {"type":"string","description":"Optional worktree lane when task/session identity is absent."},
                     "task": { "type": "string" },
                     "query": { "type": "string", "description": "Alias for task for compatibility with generic brain helpers." },
                     "dataset": { "type": "string", "default": "terminal-bench/terminal-bench-2" },
@@ -2506,6 +2506,18 @@ mod tests {
         .expect("brain status");
         assert_eq!(result["initialized"].as_bool(), Some(false));
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn context_tool_catalog_advertises_episode_identity_lanes() {
+        let definitions = super::tool_definitions();
+        for name in ["kimetsu_brain_context", "kimetsu_benchmark_context"] {
+            let tool = definitions.as_array().unwrap().iter().find(|t|t["name"] == name).unwrap();
+            for field in ["task_id", "session_id", "worktree_id"] {
+                assert_eq!(tool["inputSchema"]["properties"][field]["type"], "string",
+                    "{name} must advertise the supported {field} lane");
+            }
+        }
     }
 
     #[test]
