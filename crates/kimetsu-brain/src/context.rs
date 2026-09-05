@@ -252,12 +252,41 @@ pub struct ContextCapsule {
     /// 0.58 → 0.36 when reranking landed without this flag).
     #[serde(default)]
     pub superseded_hint: bool,
-    /// v2.7: learned-usefulness tier carried across final-stage reranking.
-    /// Cross-encoders score query relevance only and their sigmoid scale can be
-    /// arbitrarily extreme, so policy is lexicographic rather than multiplied:
-    /// cited (+1), neutral (0), regretted (-1). Superseded capsules ignore it.
+    /// Legacy serialized usefulness sign; bounded when reranking old capsules.
     #[serde(default)]
     pub rerank_policy_tier: i8,
+    /// Claim identity read in the same SQLite snapshot as the hydrated text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_revision: Option<String>,
+    /// Decayed usefulness multiplier and provenance discount carried to reranking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_usefulness: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_trust: Option<f32>,
+}
+
+/// Revision bindings for the actual delivered capsules. Conflicting versions of
+/// one ID are omitted because the legacy event map can represent only one claim.
+pub fn memory_revision_bindings(
+    capsules: &[ContextCapsule],
+) -> std::collections::BTreeMap<String, String> {
+    let mut bindings = std::collections::BTreeMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for c in capsules {
+        if let (Some(id), Some(revision)) = (
+            c.expansion_handle.strip_prefix("memory:"),
+            c.claim_revision.as_ref(),
+        ) {
+            if bindings.get(id).is_some_and(|old| old != revision) {
+                ambiguous.insert(id.to_string());
+            }
+            bindings.insert(id.to_string(), revision.clone());
+        }
+    }
+    for id in ambiguous {
+        bindings.remove(&id);
+    }
+    bindings
 }
 
 impl ContextCapsule {
@@ -279,6 +308,9 @@ impl ContextCapsule {
             score,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 }
@@ -442,31 +474,7 @@ pub struct ContextBundle {
 /// So `df == 0` gets the maximal weight, and only `df == N` (present in every
 /// memory, e.g. the project name) is zeroed.
 fn coverage_token_idf(conn: &Connection, tokens: &[String]) -> KimetsuResult<HashMap<String, f32>> {
-    let mut idf = HashMap::new();
-    let n: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    if n == 0 {
-        return Ok(idf);
-    }
-    let mut stmt = conn.prepare_cached(
-        "SELECT COUNT(*) FROM memories \
-         WHERE invalidated_at IS NULL AND lower(text) LIKE ?1 ESCAPE '\\'",
-    )?;
-    for token in tokens {
-        let pattern = format!("%{}%", escape_like(token));
-        let df: i64 = stmt
-            .query_row(params![pattern], |row| row.get(0))
-            .unwrap_or(0);
-        // ln((N+1)/(df+1)): maximal at df == 0, zero at df == N.
-        let weight = (((n + 1) as f32) / ((df + 1) as f32)).ln().max(0.0);
-        idf.insert(token.clone(), weight);
-    }
-    Ok(idf)
+    token_idf(conn, tokens, false)
 }
 
 /// Render the partial-evidence warning for a bundle, if it needs one.
@@ -1115,9 +1123,6 @@ pub fn search_memories_including_expired(
         ))
     })?;
     let now_utc = OffsetDateTime::now_utc();
-    let now_rfc3339 = now_utc
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
     let mut capsules = Vec::new();
     for row in rows {
         let (
@@ -1136,7 +1141,9 @@ pub fn search_memories_including_expired(
         let scope_weight = scope_weight(&scope);
         // Annotate expired memories so callers can identify them in history output.
         let suffix = if let Some(ref vt) = valid_to {
-            if vt.as_str() < now_rfc3339.as_str() {
+            if OffsetDateTime::parse(vt, &time::format_description::well_known::Rfc3339)
+                .is_ok_and(|end| end <= now_utc)
+            {
                 format!(" [expired valid_to={vt}]")
             } else {
                 format!(" [valid_to={vt}]")
@@ -1144,6 +1151,7 @@ pub fn search_memories_including_expired(
         } else {
             String::new()
         };
+        let claim_revision = Some(crate::projector::claim_revision_at(conn, &memory_id, None)?);
         capsules.push(ContextCapsule {
             id: new_id().to_string(),
             kind: "memory".to_string(),
@@ -1162,6 +1170,9 @@ pub fn search_memories_including_expired(
             score: 0.0,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision,
+            rerank_usefulness: None,
+            rerank_trust: None,
         });
     }
     Ok(capsules)
@@ -1239,7 +1250,8 @@ fn memory_ann_candidates(
          FROM   memories
          WHERE  invalidated_at IS NULL
            AND  superseded_by IS NULL
-           AND  (valid_to IS NULL OR valid_to > datetime('now'))
+           AND  (valid_from IS NULL OR julianday(valid_from) <= julianday('now'))
+          AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))
            AND  embedding_model = ?{model_param}
            AND  rowid IN ({placeholders})",
         model_param = knn_rowids.len() + 1
@@ -1285,7 +1297,8 @@ fn memory_ann_candidates(
         ) = row?;
         let (cosine, row_vec) =
             compute_cosine_and_vec(Some(qe), embedding.as_deref(), embedding_model.as_deref());
-        if let Some(candidate) = memory_row_to_candidate(
+        let claim_revision = crate::projector::claim_revision_at(conn, &memory_id, None)?;
+        if let Some(mut candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
             scope,
@@ -1302,6 +1315,7 @@ fn memory_ann_candidates(
             cosine,
             row_vec,
         ) {
+            candidate.capsule.claim_revision = Some(claim_revision);
             candidates.push(candidate);
         }
     }
@@ -1413,7 +1427,8 @@ fn latest_memory_candidates(
         FROM memories
         WHERE invalidated_at IS NULL
           AND superseded_by IS NULL
-          AND (valid_to IS NULL OR valid_to > datetime('now'))
+          AND (valid_from IS NULL OR julianday(valid_from) <= julianday('now'))
+          AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))
         ORDER BY created_at DESC
         LIMIT ?1
         ",
@@ -1457,7 +1472,8 @@ fn latest_memory_candidates(
             embedding.as_deref(),
             embedding_model.as_deref(),
         );
-        if let Some(candidate) = memory_row_to_candidate(
+        let claim_revision = crate::projector::claim_revision_at(conn, &memory_id, None)?;
+        if let Some(mut candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
             scope,
@@ -1474,6 +1490,7 @@ fn latest_memory_candidates(
             cosine,
             row_vec,
         ) {
+            candidate.capsule.claim_revision = Some(claim_revision);
             candidates.push(candidate);
         }
     }
@@ -1499,7 +1516,8 @@ fn memory_fts_candidates(
           ON m.memory_id = memories_fts.memory_id
         WHERE m.invalidated_at IS NULL
           AND m.superseded_by IS NULL
-          AND (m.valid_to IS NULL OR m.valid_to > datetime('now'))
+          AND (m.valid_from IS NULL OR julianday(m.valid_from) <= julianday('now'))
+          AND (m.valid_to IS NULL OR julianday(m.valid_to) > julianday('now'))
           AND memories_fts MATCH ?1
         ORDER BY rank
         LIMIT ?2
@@ -1547,7 +1565,8 @@ fn memory_fts_candidates(
             embedding.as_deref(),
             embedding_model.as_deref(),
         );
-        if let Some(candidate) = memory_row_to_candidate(
+        let claim_revision = crate::projector::claim_revision_at(conn, &memory_id, None)?;
+        if let Some(mut candidate) = memory_row_to_candidate(
             query_tokens,
             memory_id,
             scope,
@@ -1564,6 +1583,7 @@ fn memory_fts_candidates(
             cosine,
             row_vec,
         ) {
+            candidate.capsule.claim_revision = Some(claim_revision);
             candidates.push(candidate);
         }
     }
@@ -1687,9 +1707,7 @@ fn memory_row_to_candidate(
     let decay = usefulness_decay(last_useful_at.as_deref(), &created_at, half_life_days);
     let multiplier = 1.0 + (raw_multiplier - 1.0) * decay;
     let biased_relevance = apply_usefulness_boost(raw_relevance, multiplier);
-    // Carry only the learned usefulness policy across reranking. It is a tier,
-    // not a score multiplier: cross-encoder probabilities can differ by 100x
-    // for equally useful paraphrases, so multiplication cannot preserve policy.
+    // Retain the sign for older serialized consumers. New capsules carry the full multiplier.
     let rerank_policy_tier = if multiplier > 1.0 + f32::EPSILON {
         1
     } else if multiplier < 1.0 - f32::EPSILON {
@@ -1733,6 +1751,12 @@ fn memory_row_to_candidate(
             score: 0.0,
             superseded_hint: false,
             rerank_policy_tier,
+            claim_revision: None,
+            rerank_usefulness: Some(multiplier),
+            rerank_trust: Some(crate::trust::trust_multiplier(
+                provenance,
+                last_useful_at.is_some(),
+            )),
         },
     })
 }
@@ -1875,6 +1899,9 @@ fn repo_file_candidates(
                 score: 0.0,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision: None,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
         });
     }
@@ -1945,6 +1972,9 @@ fn manifest_candidates(
                 score: 0.0,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision: None,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
         });
     }
@@ -2007,6 +2037,9 @@ fn manifest_fts_candidates(
                 score: 0.0,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision: None,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
         });
     }
@@ -2338,7 +2371,9 @@ fn freshness(created_at: &str) -> f32 {
     };
     let age = OffsetDateTime::now_utc() - created_at;
     let age_days = age.whole_seconds().max(0) as f32 / 86_400.0;
-    (-age_days / 30.0).exp().clamp(0.0, 1.0)
+    (-std::f32::consts::LN_2 * age_days / 30.0)
+        .exp()
+        .clamp(0.0, 1.0)
 }
 
 /// v1.0.0: a memory whose cosine to the query clears this bar is kept by
@@ -2412,28 +2447,36 @@ fn content_tokens(query: &str) -> Vec<String> {
 /// Everything in between gets `idf = ln((N+1)/(df+1))` — rarer ⇒ larger.
 /// Best-effort: a query/count failure yields 0 for that token (fail-open).
 fn corpus_token_idf(conn: &Connection, tokens: &[String]) -> KimetsuResult<HashMap<String, f32>> {
+    token_idf(conn, tokens, true)
+}
+
+/// Prefix MATCH uses the same FTS tokenizer as candidate retrieval. Each matched
+/// memory counts once even when its text repeats a token. N and df both refer to
+/// non-invalidated indexed documents, including historical/superseded documents.
+/// One indexed posting-list lookup per unique token replaces per-term text scans.
+fn token_idf(
+    conn: &Connection,
+    tokens: &[String],
+    zero_absent: bool,
+) -> KimetsuResult<HashMap<String, f32>> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories_fts JOIN memories m USING(memory_id) WHERE m.invalidated_at IS NULL",
+        [], |r| r.get(0))?;
     let mut idf = HashMap::new();
-    let n: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
     if n == 0 {
         return Ok(idf);
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT COUNT(*) FROM memories \
-         WHERE invalidated_at IS NULL AND lower(text) LIKE ?1 ESCAPE '\\'",
+        "SELECT COUNT(DISTINCT m.memory_id) FROM memories_fts JOIN memories m USING(memory_id)
+         WHERE memories_fts MATCH ?1 AND m.invalidated_at IS NULL",
     )?;
     for token in tokens {
-        let pattern = format!("%{}%", escape_like(token));
-        let df: i64 = stmt
-            .query_row(params![pattern], |row| row.get(0))
-            .unwrap_or(0);
-        // df == 0 → out-of-corpus, can't discriminate → weight 0.
-        let weight = if df == 0 {
+        if idf.contains_key(token) {
+            continue;
+        }
+        let pattern = format!("text : \"{}\"*", token.replace('"', "\"\""));
+        let df: i64 = stmt.query_row(params![pattern], |r| r.get(0))?;
+        let weight = if zero_absent && df == 0 {
             0.0
         } else {
             (((n + 1) as f32) / ((df + 1) as f32)).ln().max(0.0)
@@ -2441,15 +2484,6 @@ fn corpus_token_idf(conn: &Connection, tokens: &[String]) -> KimetsuResult<HashM
         idf.insert(token.clone(), weight);
     }
     Ok(idf)
-}
-
-/// Escape SQL `LIKE` wildcards in a token so a literal `%`/`_` in a query
-/// word can't widen the document-frequency match. Pairs with `ESCAPE '\'`.
-fn escape_like(token: &str) -> String {
-    token
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 /// v1.0.0: the IDF-weighted fraction of the query's discriminating power that
@@ -2478,8 +2512,8 @@ fn weighted_coverage(content: &[String], idf: &HashMap<String, f32>, summary: &s
 
 /// v1.0.0: light query-side stemming — strip the common English inflection
 /// suffixes so "benchmarked"/"benchmarking" reduce to "benchmark". Because
-/// downstream matching is substring (`lexical_relevance`, the IDF `LIKE`
-/// document-frequency count) and FTS-prefix (`fts_query` appends `*`), the
+/// downstream matching uses substring lexical hints and FTS-prefix document
+/// frequencies (`fts_query` also appends `*`), the
 /// stem matches every variant in the corpus while the inflected form matches
 /// none of them — an unstemmed "benchmarked" gets df=0, loses all IDF
 /// weight, and the relevance floor goes blind on the query's one
@@ -3257,17 +3291,19 @@ fn rerank_capsules_with_diagnostics(
         }
     };
 
-    // Learned usefulness is a policy tier above cross-encoder relevance, not a
-    // multiplier on it. TinyBERT assigned two useful paraphrases 0.998 vs
-    // 0.0098 in BrainBench; no bounded multiplier can preserve a citation
-    // policy on that scale. Within each tier the cross-encoder owns ordering.
-    // Supersession is likewise reapplied here, after the cross-encoder, so all
-    // callers (including benchmark-only direct calls) get the same policy.
+    // Apply bounded usefulness, then trust and supersession; admission uses raw scores.
     let mut ranked: Vec<(ContextCapsule, f32)> = capsules
         .into_iter()
         .zip(scores)
         .map(|(mut c, s)| {
-            c.score = s;
+            let multiplier = if c.superseded_hint {
+                1.0
+            } else {
+                c.rerank_usefulness
+                    .unwrap_or(1.0 + 0.5 * effective_rerank_policy_tier(&c) as f32)
+            };
+            c.score = apply_usefulness_boost(s, multiplier.clamp(0.5, 1.5))
+                * c.rerank_trust.unwrap_or(1.0).clamp(0.0, 1.0);
             if c.superseded_hint {
                 c.score *= SUPERSESSION_PENALTY;
             }
@@ -3275,15 +3311,7 @@ fn rerank_capsules_with_diagnostics(
         })
         .collect();
 
-    ranked.sort_by(|a, b| {
-        effective_rerank_policy_tier(&b.0)
-            .cmp(&effective_rerank_policy_tier(&a.0))
-            .then_with(|| {
-                b.0.score
-                    .partial_cmp(&a.0.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
+    ranked.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
 
     // This is the ordinary per-capsule retention floor. The separate
     // evidence-band decision reads `best_raw_score` before the supersession
@@ -3328,6 +3356,9 @@ mod tests {
             score: 1.0,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 
@@ -4522,12 +4553,6 @@ mod tests {
         assert!(cov_topical > 0.6, "got {cov_topical}");
     }
 
-    #[test]
-    fn escape_like_neutralizes_wildcards() {
-        assert_eq!(escape_like("a_b%c"), "a\\_b\\%c");
-        assert_eq!(escape_like("plain"), "plain");
-    }
-
     /// The reported regression, reproduced end-to-end on the FTS-only path:
     /// a corpus of unrelated debugging war-stories that all happen to contain
     /// the project name "kimetsu", queried with a broad conceptual prompt.
@@ -5263,6 +5288,9 @@ mod tests {
                 score: 0.0,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision: None,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
             raw_relevance: raw,
             embedding: None,
@@ -5336,6 +5364,9 @@ mod tests {
                 score,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision: None,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
             raw_relevance: score,
             embedding: Some(embedding),
@@ -6051,6 +6082,9 @@ mod tests {
             score,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 
@@ -6137,6 +6171,58 @@ mod tests {
     }
 
     #[test]
+    fn hardening_usefulness_cannot_dominate_relevance() {
+        let neutral = make_capsule("neutral", 0.0);
+        let mut useful = make_capsule("useful", 0.0);
+        useful.rerank_policy_tier = 1;
+        let out = rerank_capsules(
+            "q",
+            vec![neutral, useful],
+            &TwoScoreReranker(0.99, 0.31),
+            0.30,
+            0,
+        );
+        assert_eq!(out[0].summary, "neutral");
+        assert!(out[1].score <= 0.410001);
+    }
+
+    #[test]
+    fn hardening_rerank_preserves_decayed_usefulness_and_trust() {
+        let neutral = make_capsule("neutral", 0.0);
+        let mut stale_useful = make_capsule("stale", 0.0);
+        stale_useful.rerank_policy_tier = 1;
+        stale_useful.rerank_usefulness = Some(1.0001);
+        let out = rerank_capsules(
+            "q",
+            vec![neutral.clone(), stale_useful],
+            &TwoScoreReranker(0.9, 0.85),
+            0.0,
+            0,
+        );
+        assert_eq!(out[0].summary, "neutral");
+        let mut imported = make_capsule("imported", 0.0);
+        imported.rerank_usefulness = Some(1.5);
+        imported.rerank_trust = Some(0.5);
+        let out = rerank_capsules(
+            "q",
+            vec![neutral, imported],
+            &TwoScoreReranker(0.8, 0.9),
+            0.0,
+            0,
+        );
+        assert_eq!(out[0].summary, "neutral");
+        assert!((out[1].score - 0.5).abs() < 0.00001);
+    }
+
+    #[test]
+    fn hardening_freshness_has_thirty_day_half_life() {
+        let past = (OffsetDateTime::now_utc() - time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        assert!((freshness(&past) - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
     fn rerank_reapplies_usefulness_but_not_to_superseded_capsules() {
         let neutral = make_capsule("neutral", 0.0);
         let mut useful = make_capsule("useful", 0.0);
@@ -6145,7 +6231,7 @@ mod tests {
         let out = rerank_capsules(
             "q",
             vec![neutral.clone(), useful.clone()],
-            &TwoScoreReranker(0.60, 0.50),
+            &TwoScoreReranker(0.59, 0.50),
             0.0,
             0,
         );
@@ -6156,7 +6242,7 @@ mod tests {
         let out = rerank_capsules(
             "q",
             vec![neutral, useful],
-            &TwoScoreReranker(0.60, 0.50),
+            &TwoScoreReranker(0.59, 0.50),
             0.0,
             0,
         );
@@ -6300,8 +6386,7 @@ mod tests {
     }
 
     /// Admission evidence is computed before policy ordering and output cap.
-    /// A cited low-score capsule may own the only output slot, but a high raw
-    /// score elsewhere in the candidate pool still proves the bundle useful.
+    /// Bounded usefulness cannot displace clearly stronger raw evidence.
     #[test]
     fn band_arbitration_uses_raw_evidence_before_policy_cap() {
         let mut bundle = band_bundle(0.50);
@@ -6314,7 +6399,7 @@ mod tests {
         let out = rerank_and_arbitrate("q", bundle, Some(&reranker), 0.55, 0.0, 1);
         assert!(!out.skipped, "raw evidence outside the cap must admit");
         assert_eq!(out.capsules.len(), 1);
-        assert_eq!(out.capsules[0].summary, "a memory lesson");
+        assert_eq!(out.capsules[0].summary, "high-confidence neutral");
     }
 
     /// Above the band the cross-encoder reorders but never converts, even
@@ -6536,6 +6621,8 @@ mod evidence_tests {
                 rusqlite::params![format!("m{i}"), text],
             )
             .expect("insert");
+            conn.execute("INSERT INTO memories_fts(memory_id,text,kind,scope) VALUES (?1,?2,'fact','project')",
+                params![format!("m{i}"),text]).unwrap();
         }
         conn
     }
@@ -6555,6 +6642,9 @@ mod evidence_tests {
             score: 0.5,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 
@@ -6991,5 +7081,146 @@ mod evidence_tests {
                 .sum::<u32>(),
             "used_tokens must match what was actually rendered"
         );
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn corpus() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        for (id, text) in [
+            ("live", "routing routing routes"),
+            ("future", "routing"),
+            ("expired", "routing"),
+            ("offset", "routing"),
+            ("other", "rerouting unrelated"),
+        ] {
+            conn.execute("INSERT INTO memories (memory_id,scope,kind,text,normalized_text,confidence,created_at,provenance_snapshot_json)
+                VALUES (?1,'project','fact',?2,?2,1,'2020-01-01T00:00:00Z','{}')", params![id,text]).unwrap();
+            conn.execute("INSERT INTO memories_fts(memory_id,text,kind,scope) VALUES (?1,?2,'fact','project')",params![id,text]).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn hardening_live_lexical_and_recency_apply_both_time_bounds() {
+        let conn = corpus();
+        let now = OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let future = (now + time::Duration::hours(1)).format(fmt).unwrap();
+        let expired = (now - time::Duration::seconds(2)).format(fmt).unwrap();
+        let offset = (now - time::Duration::seconds(2))
+            .to_offset(time::UtcOffset::from_hms(12, 0, 0).unwrap())
+            .format(fmt)
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET valid_from=?1 WHERE memory_id='future'",
+            params![future],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET valid_to=?1 WHERE memory_id='expired'",
+            params![expired],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET valid_to=?1 WHERE memory_id='offset'",
+            params![offset],
+        )
+        .unwrap();
+        for candidates in [
+            memory_fts_candidates(&conn, &["routing".into()], "routing*", 80, None, 30.0).unwrap(),
+            latest_memory_candidates(&conn, &["routing".into()], 200, None, 30.0).unwrap(),
+        ] {
+            let ids: Vec<_> = candidates
+                .iter()
+                .map(|c| c.capsule.expansion_handle.as_str())
+                .collect();
+            assert!(ids.contains(&"memory:live"));
+            for id in ["memory:future", "memory:expired", "memory:offset"] {
+                assert!(!ids.contains(&id), "returned {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn hardening_hydration_binds_text_revision_before_later_correction() {
+        let conn = corpus();
+        let candidates =
+            memory_fts_candidates(&conn, &["routing".into()], "routing*", 80, None, 30.0).unwrap();
+        let capsules: Vec<_> = candidates.into_iter().map(|c| c.capsule).collect();
+        assert_eq!(memory_revision_bindings(&capsules)["live"], "baseline:live");
+        conn.execute("INSERT INTO memory_revisions(memory_id,event_id,text,kind,known_at,effective_at,confidence,use_count,usefulness_score)
+            VALUES ('live','corrected','changed claim','fact','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',1,0,0)",[]).unwrap();
+        conn.execute(
+            "UPDATE memories SET text='changed claim' WHERE memory_id='live'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::projector::claim_revision_at(&conn, "live", None).unwrap(),
+            "corrected"
+        );
+        assert_eq!(memory_revision_bindings(&capsules)["live"], "baseline:live");
+        assert!(
+            capsules
+                .iter()
+                .find(|c| c.expansion_handle == "memory:live")
+                .unwrap()
+                .summary
+                .contains("routing routing")
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hardening_ann_hydration_filters_time_bounds() {
+        let conn = corpus();
+        let blob = crate::embeddings::encode_embedding(&[1.0, 0.0]);
+        conn.execute(
+            "UPDATE memories SET embedding=?1,embedding_model='test'",
+            params![blob],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET valid_from='2099-01-01T00:00:00Z' WHERE memory_id='future'",
+            [],
+        )
+        .unwrap();
+        let expired = (OffsetDateTime::now_utc() - time::Duration::seconds(2))
+            .to_offset(time::UtcOffset::from_hms(12, 0, 0).unwrap())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET valid_to=?1 WHERE memory_id IN ('expired','offset')",
+            params![expired],
+        )
+        .unwrap();
+        let qe = QueryEmbedding {
+            vector: vec![1.0, 0.0],
+            model_id: "test".into(),
+        };
+        let out = memory_ann_candidates(&conn, &qe, 80, &["routing".into()], 30.0).unwrap();
+        assert_eq!(out.len(), 2);
+        for c in out {
+            assert!(matches!(
+                c.capsule.expansion_handle.as_str(),
+                "memory:live" | "memory:other"
+            ));
+        }
+    }
+
+    #[test]
+    fn hardening_idf_counts_prefix_documents_not_occurrences_or_substrings() {
+        let conn = corpus();
+        let tokens = vec!["rout".into(), "absent".into()];
+        let coverage = coverage_token_idf(&conn, &tokens).unwrap();
+        // Four prefix-matching documents out of five; repeated terms count once.
+        assert!((coverage["rout"] - (6.0_f32 / 5.0).ln()).abs() < 0.00001);
+        assert!((coverage["absent"] - 6.0_f32.ln()).abs() < 0.00001);
+        assert_eq!(corpus_token_idf(&conn, &tokens).unwrap()["absent"], 0.0);
     }
 }

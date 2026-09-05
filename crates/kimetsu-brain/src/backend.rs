@@ -396,7 +396,8 @@ fn fetch_graph_candidates(
          FROM memories
          WHERE invalidated_at IS NULL
            AND superseded_by IS NULL
-           AND (valid_to IS NULL OR valid_to > datetime('now'))
+           AND (valid_from IS NULL OR julianday(valid_from) <= julianday('now'))
+           AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))
            AND memory_id IN ({placeholders})"
     );
 
@@ -441,6 +442,7 @@ fn fetch_graph_candidates(
         let scope_weight = crate::context::scope_weight_pub(&scope);
         let token_estimate = crate::context::estimate_tokens(&text) + 8;
 
+        let claim_revision = Some(crate::projector::claim_revision_at(conn, &memory_id, None)?);
         candidates.push(Candidate {
             raw_relevance,
             embedding: None,
@@ -464,6 +466,9 @@ fn fetch_graph_candidates(
                 score: 0.0,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
         });
     }
@@ -861,6 +866,40 @@ mod tests {
     use super::*;
     use crate::projector;
     use crate::schema;
+
+    #[test]
+    fn hardening_graph_hydration_checks_future_and_offset_expiry() {
+        let conn = make_conn();
+        for id in ["live", "future", "expired"] {
+            insert_memory(&conn, id, "fact", "graph fact");
+        }
+        conn.execute(
+            "UPDATE memories SET valid_from='2099-01-01T00:00:00Z' WHERE memory_id='future'",
+            [],
+        )
+        .unwrap();
+        let expired = (time::OffsetDateTime::now_utc() - time::Duration::seconds(2))
+            .to_offset(time::UtcOffset::from_hms(12, 0, 0).unwrap())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET valid_to=?1 WHERE memory_id='expired'",
+            rusqlite::params![expired],
+        )
+        .unwrap();
+        let ids = vec![
+            ("live".into(), 1),
+            ("future".into(), 1),
+            ("expired".into(), 1),
+        ];
+        let out = fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].capsule.expansion_handle, "memory:live");
+        assert_eq!(
+            out[0].capsule.claim_revision.as_deref(),
+            Some("baseline:live")
+        );
+    }
 
     /// Helper: open an in-memory brain with the current schema.
     fn make_conn() -> Connection {

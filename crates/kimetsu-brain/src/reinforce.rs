@@ -19,7 +19,7 @@
 //!   activation budget and power-law decay.
 //!
 //! Both run OFFLINE via `kimetsu brain reinforce` (never in the retrieval
-//! hot path); the boost lookup at retrieval time is one indexed SQL read.
+//! hot path); retrieval reads a bounded shortlist through indexed query/candidate keys.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -318,35 +318,39 @@ pub(crate) fn apply_query_routing(
     query_embedding: Option<&QueryEmbedding>,
     candidates: &mut [crate::context::Candidate],
 ) {
-    // Table may not exist on old brains mid-migration; treat errors as "no routes".
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT query_norm, memory_id, cites, last_cited_at, query_embedding
-         FROM query_routes WHERE cites >= ?1",
-    ) else {
-        return;
-    };
-    let rows: Vec<RouteRow> = match stmt.query_map(params![ROUTE_MIN_CITES], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-        ))
-    }) {
-        Ok(mapped) => mapped.flatten().collect(),
-        Err(_) => return,
-    };
-    if rows.is_empty() {
-        return;
-    }
-
     let query_norm = query.trim().to_lowercase();
+    // Bounded shortlist: exact query routes first (primary key), then at most
+    // 32 indexed routes for each of 64 deterministic candidate IDs. This is
+    // candidate-local semantic routing, not global nearest-neighbor search.
+    let mut ids: Vec<_> = candidates
+        .iter()
+        .filter_map(|c| c.capsule.expansion_handle.strip_prefix("memory:"))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(64);
+    let mut rows: BTreeMap<(String, String), RouteRow> = BTreeMap::new();
+    for (sql, keys) in [
+        ("SELECT query_norm,memory_id,cites,last_cited_at,query_embedding FROM query_routes
+          WHERE query_norm=?1 ORDER BY memory_id LIMIT 64", vec![query_norm.as_str()]),
+        ("SELECT query_norm,memory_id,cites,last_cited_at,query_embedding FROM query_routes INDEXED BY idx_query_routes_memory
+          WHERE memory_id=?1 ORDER BY rowid LIMIT 32", ids),
+    ] {
+        let Ok(mut stmt) = conn.prepare_cached(sql) else { return; };
+        for key in keys {
+            let Ok(mapped) = stmt.query_map(params![key], |row| Ok((row.get::<_,String>(0)?,
+                row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,
+                row.get::<_,Option<Vec<u8>>>(4)?))) else { continue; };
+            for row in mapped.flatten() {
+                if row.2 >= i64::from(ROUTE_MIN_CITES) { rows.insert((row.0.clone(),row.1.clone()),row); }
+            }
+        }
+    }
     let now = OffsetDateTime::now_utc();
 
     // Aggregate weight per memory across all matching routes.
     let mut weights: BTreeMap<String, f32> = BTreeMap::new();
-    for (route_q, memory_id, cites, last_cited_at, blob) in rows {
+    for (route_q, memory_id, cites, last_cited_at, blob) in rows.into_values() {
         let sim = if route_q == query_norm {
             1.0
         } else {
@@ -431,8 +435,36 @@ mod tests {
                 score: 0.0,
                 superseded_hint: false,
                 rerank_policy_tier: 0,
+                claim_revision: None,
+                rerank_usefulness: None,
+                rerank_trust: None,
             },
         }
+    }
+
+    #[test]
+    fn hardening_semantic_routes_ignore_unrelated_candidate_ids() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let blob = encode_embedding(&[1.0, 0.0]);
+        for i in 0..200 {
+            conn.execute(
+                "INSERT INTO query_routes(query_norm,memory_id,cites,last_cited_at,query_embedding)
+                VALUES (?1,?2,3,?3,?4)",
+                params![format!("route{i}"), format!("m{i}"), now, blob],
+            )
+            .unwrap();
+        }
+        let qe = QueryEmbedding {
+            vector: vec![1.0, 0.0],
+            model_id: "test".into(),
+        };
+        let mut candidates = vec![mem_candidate("m0")];
+        apply_query_routing(&conn, "different paraphrase", Some(&qe), &mut candidates);
+        assert!((candidates[0].raw_relevance - (0.5 + ROUTING_BOOST_CAP)).abs() < 0.00001);
     }
 
     /// Two memories cited together twice -> ONE staple containing both texts,

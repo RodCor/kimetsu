@@ -167,6 +167,9 @@ mod tests {
             score: 0.5,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 
