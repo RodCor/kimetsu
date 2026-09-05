@@ -54,17 +54,26 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     let fixture: EvalFixture = serde_json::from_str(&fixture_text)
         .map_err(|e| format!("invalid fixture JSON in {}: {e}", fixture_path.display()))?;
 
-    // Validate: every relevant key must exist in memories.
+    // Validate every referenced key before seeding the temporary brain.
     let all_keys: std::collections::HashSet<&str> =
         fixture.memories.iter().map(|m| m.key.as_str()).collect();
     for case in &fixture.cases {
-        for rel in &case.relevant {
+        for rel in case.relevant.iter().chain(&case.stale) {
             if !all_keys.contains(rel.as_str()) {
                 return Err(format!(
                     "fixture validation error: relevant key {:?} in query {:?} does not exist in memories",
                     rel, case.query
                 )
                 .into());
+            }
+        }
+    }
+    for memory in &fixture.memories {
+        if let Some(survivor) = &memory.superseded_by_key {
+            if !all_keys.contains(survivor.as_str()) {
+                return Err(
+                    format!("fixture references missing superseding key {survivor:?}").into(),
+                );
             }
         }
     }
@@ -94,9 +103,31 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     );
     let mut key_to_id: HashMap<String, String> = HashMap::new();
     for mem in &fixture.memories {
-        let memory_id = add_memory(&tmp_root, MemoryScope::Project, MemoryKind::Fact, &mem.text)
-            .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
+        let memory_id = project::add_memory_with_validity(
+            &tmp_root,
+            MemoryScope::Project,
+            MemoryKind::Fact,
+            &mem.text,
+            None,
+            mem.valid_to.as_deref(),
+        )
+        .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
         key_to_id.insert(mem.key.clone(), memory_id);
+    }
+    // Match the worker/tuner fixture contract: expiry is recorded at capture;
+    // supersession is applied after all survivor keys have their generated IDs.
+    {
+        let (_, _, conn) = project::load_project(&tmp_root)?;
+        for mem in &fixture.memories {
+            if let Some(survivor) = &mem.superseded_by_key {
+                let id = &key_to_id[&mem.key];
+                conn.execute(
+                    "UPDATE memories SET superseded_by=?2 WHERE memory_id=?1",
+                    rusqlite::params![id, key_to_id[survivor]],
+                )?;
+                conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [id])?;
+            }
+        }
     }
 
     // Build key → id lookup from the map (for ranking back to keys).
