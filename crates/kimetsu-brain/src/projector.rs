@@ -87,7 +87,9 @@ pub fn rebuild(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
         // Trace import supplements the durable log. It must not replace claims
         // written directly to that log, nor leave an empty projection on error.
         for event in events {
-            apply_event(c, event)?;
+            // Historical events cannot be applied to today's final state:
+            // that could bind an old exposure to a newly corrected claim.
+            insert_event(c, redact_memory_event(event).as_ref())?;
         }
         replay_locked(c).map(|_| ())
     })
@@ -116,7 +118,14 @@ fn replay_locked(conn: &Connection) -> KimetsuResult<usize> {
     };
     reset_projection(conn)?;
     for event in &events {
-        project_event(conn, event)?;
+        // Upgrade legacy missing bindings at their causal replay position,
+        // preserving every explicitly supplied map (including empty maps).
+        let bound = bind_injected_revisions(conn, event)?;
+        if matches!(&bound, Cow::Owned(_)) {
+            conn.execute("UPDATE events SET payload_json=?2 WHERE event_id=?1",
+                params![event.event_id.to_string(), serde_json::to_string(&bound.payload)?])?;
+        }
+        project_event(conn, bound.as_ref())?;
     }
     let mut stmt = conn.prepare("SELECT memory_id FROM memories")?;
     let restored = stmt.query_map([], |r| r.get::<_, String>(0))?
@@ -1473,6 +1482,43 @@ mod tests {
         apply_events(&conn, &[accepted]).unwrap();
         super::rebuild(&conn, &[]).unwrap();
         assert_eq!(conn.query_row("SELECT count(*) FROM memories WHERE memory_id='kept'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn trace_import_binds_historical_exposure_before_later_correction() {
+        let conn = make_conn();
+        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
+            "memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"
+        }));
+        apply_events(&conn, std::slice::from_ref(&accepted)).unwrap();
+        let original_revision = super::claim_revision_at(&conn, "m", None).unwrap();
+        let exposure = Event::new(RunId::new(), "context.injected", json!({"memory_ids":["m"]}));
+        let corrected = Event::new(RunId::new(), "memory.corrected", json!({"memory_id":"m", "text":"new claim"}));
+        apply_events(&conn, &[corrected]).unwrap();
+        super::rebuild(&conn, std::slice::from_ref(&exposure)).unwrap();
+        for _ in 0..2 {
+            let revision: String = conn.query_row("SELECT json_extract(payload_json,'$.memory_revisions.m') FROM events WHERE event_id=?1", [exposure.event_id.to_string()], |r|r.get(0)).unwrap();
+            assert_eq!(revision, original_revision);
+            rebuild_in_place(&conn).unwrap();
+        }
+    }
+
+    #[test]
+    fn trace_import_replays_missing_correction_before_later_invalidation() {
+        let conn = make_conn();
+        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
+            "memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"
+        }));
+        apply_events(&conn, &[accepted]).unwrap();
+        let correction = Event::new(RunId::new(), "memory.corrected", json!({"memory_id":"m", "text":"historically corrected"}));
+        let invalidated = Event::new(RunId::new(), "memory.invalidated", json!({"memory_id":"m", "reason":"retired"}));
+        apply_events(&conn, &[invalidated]).unwrap();
+        super::rebuild(&conn, &[correction]).unwrap();
+        for _ in 0..2 {
+            let row: (String, bool) = conn.query_row("SELECT text,invalidated_at IS NOT NULL FROM memories WHERE memory_id='m'", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(row, ("historically corrected".into(), true));
+            rebuild_in_place(&conn).unwrap();
+        }
     }
 
     #[test]
