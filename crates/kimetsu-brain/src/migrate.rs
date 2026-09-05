@@ -109,6 +109,11 @@ fn migrations() -> &'static [Migration] {
             description: "durable correction revisions and corpus freshness",
             up: crate::schema::migrate_v11_to_v12,
         },
+        Migration {
+            version: 13,
+            description: "preserve proposal temporal applicability",
+            up: crate::schema::migrate_v12_to_v13,
+        },
     ]
 }
 

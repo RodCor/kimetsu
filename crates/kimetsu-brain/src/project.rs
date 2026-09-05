@@ -782,6 +782,19 @@ pub fn add_memory(
     kind: MemoryKind,
     text: &str,
 ) -> KimetsuResult<String> {
+    add_memory_with_validity(start, scope, kind, text, None, None)
+}
+
+/// Add with temporal bounds in the same durable write. Duplicate claims retain
+/// their original bounds; observing them again does not renew their lifetime.
+pub fn add_memory_with_validity(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<String> {
     // v0.4.5: redact secrets at the ingest boundary. The redaction
     // pipeline catches Anthropic/OpenAI/GitHub/AWS/Slack/Google
     // credentials, JWTs, PEM blocks, and generic `api_key=...` /
@@ -824,7 +837,9 @@ pub fn add_memory(
             .map(|cfg| cfg.kimetsu.use_user_brain)
             .unwrap_or(true);
         if let Some(user_conn) = user_brain::open_user_brain_for_config(use_user_brain)? {
-            return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
+            return user_brain::add_user_memory_with_validity(
+                &user_conn, kind, text, 1.0, valid_from, valid_to,
+            );
         }
         // User brain disabled/unreachable → fall through to the project DB
         // (which DOES require a valid project — same pre-P0 behavior for
@@ -837,7 +852,7 @@ pub fn add_memory(
 
     let embedder = embeddings::open_embedder_for(config.embedder.enabled);
     add_memory_inner(
-        &conn, &paths, &config, scope, kind, text, None, None, embedder,
+        &conn, &paths, &config, scope, kind, text, valid_from, valid_to, embedder,
     )
 }
 
@@ -931,6 +946,8 @@ fn add_memory_inner(
             "normalized_text": normalized,
             "confidence": DIRECT_ADD_CONFIDENCE,
             "initial_usefulness": initial_kind_weight,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "provenance_snapshot": build_provenance(run_id, text),
         }),
     );
@@ -947,12 +964,6 @@ fn add_memory_inner(
     );
 
     projector::apply_events(conn, &[started, accepted, finished])?;
-
-    // Flagship 1 / temporal: stamp valid_from / valid_to when requested.
-    // This is event-sourced (rebuild-safe) via mark_memory_temporal.
-    if valid_from.is_some() || valid_to.is_some() {
-        projector::mark_memory_temporal(conn, &memory_id, valid_from, valid_to)?;
-    }
 
     // v0.4.2: post-projection embedding write. v0.4.3 wired the
     // default embedder behind a feature flag — see
@@ -1225,6 +1236,20 @@ pub fn propose_memory(
     confidence: f32,
     rationale: &str,
 ) -> KimetsuResult<String> {
+    propose_memory_with_validity(start, scope, kind, text, confidence, rationale, None, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_memory_with_validity(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<String> {
     let redaction = redact::redact_secrets(text);
     if redaction.was_redacted() {
         eprintln!("kimetsu-brain: {}", redaction.summary());
@@ -1252,6 +1277,8 @@ pub fn propose_memory(
             "text": text,
             "rationale": rationale,
             "proposed_confidence": confidence.clamp(0.0, 1.0),
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "source_event_ids": [],
         }),
     );
@@ -1283,6 +1310,22 @@ pub fn propose_or_merge_memory(
     confidence: f32,
     rationale: &str,
 ) -> KimetsuResult<ProposeResult> {
+    propose_or_merge_memory_with_validity(
+        start, scope, kind, text, confidence, rationale, None, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_or_merge_memory_with_validity(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<ProposeResult> {
     let redaction = redact::redact_secrets(text);
     if redaction.was_redacted() {
         eprintln!("kimetsu-brain: {}", redaction.summary());
@@ -1311,10 +1354,12 @@ pub fn propose_or_merge_memory(
 
     // Related claims can disagree. Never append them or inflate use counts.
     if confidence >= 0.7 {
-        let memory_id = add_memory(start, scope, kind, text)?;
+        let memory_id = add_memory_with_validity(start, scope, kind, text, valid_from, valid_to)?;
         Ok(ProposeResult::Added(memory_id))
     } else {
-        let proposal_id = propose_memory(start, scope, kind, text, confidence, rationale)?;
+        let proposal_id = propose_memory_with_validity(
+            start, scope, kind, text, confidence, rationale, valid_from, valid_to,
+        )?;
         Ok(ProposeResult::Proposed(proposal_id))
     }
 }
@@ -1848,6 +1893,11 @@ pub fn accept_proposal(
 ) -> KimetsuResult<String> {
     let (paths, config, conn) = load_project(start)?;
     let proposal = load_pending_proposal(&conn, proposal_id)?;
+    let (valid_from, valid_to): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT valid_from, valid_to FROM memory_proposals WHERE proposal_id=?1",
+        [proposal_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory accept", Some(run_id))?;
     let memory_id = Ulid::new().to_string();
@@ -1874,6 +1924,8 @@ pub fn accept_proposal(
             "kind": proposal.kind,
             "text": proposal.text,
             "normalized_text": normalized,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "confidence": resolved_confidence,
             "provenance_snapshot": {
                 "source": "memory_proposal",

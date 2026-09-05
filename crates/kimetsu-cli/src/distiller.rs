@@ -409,11 +409,8 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// has no proposal queue, so this is add-or-dedup). Returns the count recorded.
 /// For `GlobalUser`, `start` is ignored (the user brain is global).
 ///
-/// Story 1.2 / Pass B: when a lesson carries `valid_from`/`valid_to` fields
-/// (model-detected temporal scope), the written memory is immediately stamped
-/// via `mark_memory_temporal` (event-sourced, rebuild-safe).  This is optional
-/// and cheap-model-gated — without a cheap model there are no temporal tags
-/// (graceful: most memories have no bound).
+/// Temporal bounds travel in the accepted/proposed event itself. Proposal
+/// acceptance preserves applicability and duplicate observations cannot renew it.
 pub fn distill_and_record(
     start: &Path,
     view: &str,
@@ -438,9 +435,18 @@ pub fn distill_and_record(
             .as_ref()
             .is_none_or(|cfg| cfg.ingestion.quality_filter_enabled);
         let conn_opt: Option<rusqlite::Connection> = if quality_enabled {
-            paths_ok
-                .as_ref()
-                .and_then(|paths| rusqlite::Connection::open(&paths.brain_db).ok())
+            let user = if scope == MemoryScope::GlobalUser {
+                kimetsu_brain::user_brain::open_user_brain_readonly_for_config(
+                    cfg_opt
+                        .as_ref()
+                        .is_none_or(|cfg| cfg.kimetsu.use_user_brain),
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            user.or_else(|| project::load_project(start).ok().map(|(_, _, conn)| conn))
         } else {
             None
         };
@@ -500,16 +506,24 @@ pub fn distill_and_record(
         let valid_to = lesson.valid_to.clone();
 
         let memory_id_opt: Option<String> = match scope {
-            MemoryScope::GlobalUser => {
-                project::add_memory(start, MemoryScope::GlobalUser, kind, text).ok()
-            }
-            _ => project::propose_or_merge_memory(
+            MemoryScope::GlobalUser => project::add_memory_with_validity(
+                start,
+                MemoryScope::GlobalUser,
+                kind,
+                text,
+                valid_from.as_deref(),
+                valid_to.as_deref(),
+            )
+            .ok(),
+            _ => project::propose_or_merge_memory_with_validity(
                 start,
                 scope,
                 kind,
                 text,
                 lesson.confidence.clamp(0.0, 1.0),
                 "auto-harvested at session end",
+                valid_from.as_deref(),
+                valid_to.as_deref(),
             )
             .ok()
             .and_then(|r| match r {
@@ -520,46 +534,7 @@ pub fn distill_and_record(
             }),
         };
 
-        if let Some(memory_id) = memory_id_opt {
-            // Story 1.2 / Pass B: stamp temporal bounds when the model emitted them.
-            // Only valid_from / valid_to that look like ISO-8601 dates are stamped;
-            // we skip the stamp when both are None (the common case) to avoid the
-            // round-trip cost. Best-effort: a stamp failure never blocks recording.
-            let has_temporal = valid_from.is_some() || valid_to.is_some();
-            if has_temporal {
-                // Load the project connection to stamp the memory.
-                // For GlobalUser scope the memory lives in the user brain DB;
-                // use the user-brain open path.
-                let stamp_result = if scope == MemoryScope::GlobalUser {
-                    kimetsu_brain::user_brain::open_user_brain()
-                        .ok()
-                        .flatten()
-                        .map(|conn| {
-                            kimetsu_brain::projector::mark_memory_temporal(
-                                &conn,
-                                &memory_id,
-                                valid_from.as_deref(),
-                                valid_to.as_deref(),
-                            )
-                        })
-                } else {
-                    // Project scope: load the project DB.
-                    kimetsu_core::paths::ProjectPaths::discover(start)
-                        .ok()
-                        .and_then(|paths| rusqlite::Connection::open(&paths.brain_db).ok())
-                        .map(|conn| {
-                            kimetsu_brain::projector::mark_memory_temporal(
-                                &conn,
-                                &memory_id,
-                                valid_from.as_deref(),
-                                valid_to.as_deref(),
-                            )
-                        })
-                };
-                if let Some(Err(e)) = stamp_result {
-                    eprintln!("kimetsu-distiller: temporal stamp failed for {memory_id}: {e}");
-                }
-            }
+        if memory_id_opt.is_some() {
             recorded += 1;
         }
     }
@@ -1271,6 +1246,101 @@ mod tests {
         assert!(build_transcript_view("/no/such.jsonl", 100).is_empty());
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn temporary_proposal_keeps_expiry_on_acceptance_and_rebuild() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("ttl-proposal-{}", ulid::Ulid::new()));
+            kimetsu_core::paths::git_init_boundary(&root);
+            project::init_project(&root, false).unwrap();
+            let mut provider = MockProvider::new([text_response(
+                r#"[{"lesson":"Temporarily bypass the cache for integration tests","confidence":0.5,"valid_to":"2099-01-01T00:00:00Z"}]"#,
+            )]);
+            distill_and_record(
+                &root,
+                "user: cache workaround",
+                &mut provider,
+                MemoryScope::Project,
+            );
+            let proposals =
+                project::list_proposals(&root, project::ProposalFilter::default()).unwrap();
+            assert_eq!(proposals.len(), 1);
+            let id = project::accept_proposal(
+                &root,
+                &proposals[0].proposal_id,
+                project::AcceptOverrides::default(),
+            )
+            .unwrap();
+            let (_, _, conn) = project::load_project(&root).unwrap();
+            for rebuild in [false, true] {
+                if rebuild {
+                    kimetsu_brain::projector::rebuild_in_place(&conn).unwrap();
+                }
+                let expiry: Option<String> = conn
+                    .query_row(
+                        "SELECT valid_to FROM memories WHERE memory_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(expiry.as_deref(), Some("2099-01-01T00:00:00Z"));
+            }
+        });
+    }
+
+    #[test]
+    fn temporary_user_brain_duplicates_do_not_renew_expiry() {
+        let dir = std::env::temp_dir().join(format!("ttl-user-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        with_user_brain_dir(&dir, || {
+            for expiry in ["2099-01-01T00:00:00Z", "2099-02-01T00:00:00Z"] {
+                let json = format!(
+                    r#"[{{"lesson":"Temporarily bypass the shared test cache","confidence":0.9,"valid_to":"{expiry}"}}]"#
+                );
+                let mut provider = MockProvider::new([text_response(&json)]);
+                distill_and_record(
+                    &dir,
+                    "user: cache workaround",
+                    &mut provider,
+                    MemoryScope::GlobalUser,
+                );
+            }
+            let conn = kimetsu_brain::user_brain::open_user_brain()
+                .unwrap()
+                .unwrap();
+            for rebuild in [false, true] {
+                if rebuild {
+                    kimetsu_brain::projector::rebuild_in_place(&conn).unwrap();
+                }
+                let expiry: Option<String> = conn.query_row("SELECT valid_to FROM memories WHERE text='Temporarily bypass the shared test cache'", [], |r| r.get(0)).unwrap();
+                assert_eq!(expiry.as_deref(), Some("2099-01-01T00:00:00Z"));
+            }
+        });
+    }
+
+    #[test]
+    fn temporary_global_fallback_keeps_expiry_and_duplicates_do_not_renew_it() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = std::env::temp_dir().join(format!("ttl-global-{}", ulid::Ulid::new()));
+            kimetsu_core::paths::git_init_boundary(&root);
+            project::init_project(&root, false).unwrap();
+            for expiry in ["2099-01-01T00:00:00Z", "2099-02-01T00:00:00Z"] {
+                let json = format!(
+                    r#"[{{"lesson":"Temporarily bypass the shared test cache","confidence":0.9,"valid_to":"{expiry}"}}]"#
+                );
+                let mut provider = MockProvider::new([text_response(&json)]);
+                distill_and_record(
+                    &root,
+                    "user: cache workaround",
+                    &mut provider,
+                    MemoryScope::GlobalUser,
+                );
+            }
+            let (_, _, conn) = project::load_project(&root).unwrap();
+            let expiry: Option<String> = conn.query_row("SELECT valid_to FROM memories WHERE text='Temporarily bypass the shared test cache'", [], |r| r.get(0)).unwrap();
+            assert_eq!(expiry.as_deref(), Some("2099-01-01T00:00:00Z"));
+        });
     }
 
     #[test]

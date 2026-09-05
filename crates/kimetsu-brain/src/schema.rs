@@ -1217,3 +1217,14 @@ pub fn migrate_v11_to_v12(conn: &Connection) -> KimetsuResult<()> {
         CREATE TRIGGER IF NOT EXISTS corpus_update AFTER UPDATE OF embedding, embedding_model, text, invalidated_at, superseded_by ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;")?;
     Ok(())
 }
+
+/// Keep proposed applicability through review and replay.
+pub fn migrate_v12_to_v13(conn: &Connection) -> KimetsuResult<()> {
+    // Synthetic partial schemas used by migration tooling may omit proposals.
+    if !table_has_column(conn, "memory_proposals", "proposal_id")? {
+        return Ok(());
+    }
+    add_column_if_missing(conn, "memory_proposals", "valid_from TEXT")?;
+    add_column_if_missing(conn, "memory_proposals", "valid_to TEXT")?;
+    Ok(())
+}

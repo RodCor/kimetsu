@@ -38,7 +38,6 @@ use kimetsu_core::paths::{
     user_brain_db_path, user_brain_enabled, user_brain_enabled_with, user_kimetsu_dir,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::conflict;
@@ -156,9 +155,8 @@ pub fn user_brain_path() -> Option<PathBuf> {
 
 /// Write a GlobalUser memory to the user brain.
 ///
-/// Differs from `project::add_memory` deliberately: we do NOT emit
-/// trace events, run rows, or take the project lock — the user brain
-/// has no project to attribute those to. We DO honor the same
+/// Uses durable acceptance events without project run rows or a project lock.
+/// The user brain has no project to attribute those to. We honor the same
 /// dedup-by-normalized-text rule so a user who imports the same
 /// reusable preference twice doesn't end up with duplicate rows.
 ///
@@ -169,6 +167,17 @@ pub fn add_user_memory(
     kind: MemoryKind,
     text: &str,
     confidence: f32,
+) -> KimetsuResult<String> {
+    add_user_memory_with_validity(conn, kind, text, confidence, None, None)
+}
+
+pub fn add_user_memory_with_validity(
+    conn: &Connection,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
 ) -> KimetsuResult<String> {
     // v0.4.5: defense-in-depth redaction for external callers who
     // bypass `project::add_memory` and write to the user brain
@@ -201,44 +210,19 @@ pub fn add_user_memory(
     }
 
     let memory_id = Ulid::new().to_string();
-    let created_at = OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| format!("timestamp format: {e}"))?;
-    // The provenance snapshot mirrors what `add_memory` writes for a
-    // manual_cli source. We use a synthesized RunId because user-brain
-    // writes don't live inside a run.
-    let provenance = serde_json::json!({
-        "source": "user_brain",
-        "run_id": RunId::new().to_string(),
-        "text": text,
-    })
-    .to_string();
-    conn.execute(
-        "
-        INSERT INTO memories (
-            memory_id, scope, kind, text, normalized_text,
-            confidence, provenance_snapshot_json, created_at,
-            use_count, usefulness_score
-        )
-        VALUES (?1, 'global_user', ?2, ?3, ?4, ?5, ?6, ?7, 0, 0.0)
-        ",
-        rusqlite::params![
-            memory_id,
-            kind.to_string(),
-            text,
-            normalized,
-            confidence,
-            provenance,
-            created_at,
-        ],
-    )?;
-    conn.execute(
-        "
-        INSERT INTO memories_fts (memory_id, text, kind, scope)
-        VALUES (?1, ?2, ?3, 'global_user')
-        ",
-        rusqlite::params![memory_id, text, kind.to_string()],
-    )?;
+    // User memories share the durable projector, including atomic FTS and
+    // validity. Rebuild must not erase their original accepted claim.
+    let event = kimetsu_core::event::Event::new(
+        RunId::new(),
+        "memory.accepted",
+        serde_json::json!({
+            "memory_id": memory_id, "scope": "global_user", "kind": kind.to_string(),
+            "text": text, "normalized_text": normalized, "confidence": confidence,
+            "valid_from": valid_from, "valid_to": valid_to,
+            "provenance_snapshot": {"source": "user_brain", "text": text},
+        }),
+    );
+    crate::projector::apply_events(conn, &[event])?;
 
     // v0.4.2: post-insert embedding update. v0.4.3 swapped the
     // default behind the `embeddings` feature flag — same Noop

@@ -807,6 +807,34 @@ fn collect_injected_memory_ids(conn: &Connection, run_id: &str) -> KimetsuResult
     Ok(seen.into_iter().collect())
 }
 
+/// Validate applicability before projecting any part of the claim.
+fn event_validity<'a>(
+    conn: &Connection,
+    event: &'a Event,
+) -> KimetsuResult<(Option<&'a str>, Option<&'a str>)> {
+    let endpoint = |name| -> KimetsuResult<Option<&'a str>> {
+        match event.payload.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => Ok(Some(value.as_str())),
+            _ => Err(format!("{name} must be a timestamp string or null").into()),
+        }
+    };
+    let from = endpoint("valid_from")?;
+    let to = endpoint("valid_to")?;
+    let (start, end): (Option<f64>, Option<f64>) = conn.query_row(
+        "SELECT julianday(?1),julianday(?2)",
+        params![from, to],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if (from.is_some() && start.is_none())
+        || (to.is_some() && end.is_none())
+        || matches!((start,end), (Some(a),Some(b)) if a >= b)
+    {
+        return Err("invalid or empty temporal validity interval".into());
+    }
+    Ok((from, to))
+}
+
 fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let Some(memory_id) = event
         .payload
@@ -815,6 +843,7 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     else {
         return Ok(());
     };
+    let (valid_from, valid_to) = event_validity(conn, event)?;
     let scope = event
         .payload
         .get("scope")
@@ -860,9 +889,9 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         INSERT OR REPLACE INTO memories (
             memory_id, scope, kind, text, normalized_text, confidence,
             source_event_id, provenance_snapshot_json, created_at, use_count,
-            usefulness_score
+            usefulness_score, valid_from, valid_to
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12)
         ",
         params![
             memory_id,
@@ -874,7 +903,9 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
             event.event_id.to_string(),
             serde_json::to_string(&provenance_snapshot)?,
             ts_text(event)?,
-            initial_usefulness
+            initial_usefulness,
+            valid_from,
+            valid_to
         ],
     )?;
 
@@ -891,6 +922,10 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     // Best-effort: an entity-index hiccup must not fail the write that carries
     // the user's actual memory.
     let _ = crate::graph::project_entities(conn, memory_id, text);
+    if let Some(proposal_id) = event.payload.get("proposal_id").and_then(|v| v.as_str()) {
+        conn.execute("UPDATE memory_proposals SET status='accepted', decided_at=?2, decided_by='cli' WHERE proposal_id=?1",
+            params![proposal_id,ts_text(event)?])?;
+    }
     Ok(())
 }
 
@@ -902,6 +937,7 @@ fn apply_memory_proposed(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     else {
         return Ok(());
     };
+    let (valid_from, valid_to) = event_validity(conn, event)?;
     let scope = event
         .payload
         .get("scope")
@@ -937,9 +973,9 @@ fn apply_memory_proposed(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         "
         INSERT OR REPLACE INTO memory_proposals (
             proposal_id, run_id, scope, kind, text, rationale,
-            proposed_confidence, source_event_ids_json, status
+            proposed_confidence, source_event_ids_json, status, valid_from, valid_to
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10)
         ",
         params![
             proposal_id,
@@ -949,7 +985,9 @@ fn apply_memory_proposed(conn: &Connection, event: &Event) -> KimetsuResult<()> 
             text,
             rationale,
             confidence,
-            serde_json::to_string(&source_event_ids)?
+            serde_json::to_string(&source_event_ids)?,
+            valid_from,
+            valid_to
         ],
     )?;
     Ok(())
