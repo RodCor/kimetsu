@@ -1,0 +1,3 @@
+# Preserve measured artifact bytes and fixture SHA-256 hashes across checkouts.
+*.json -text whitespace=cr-at-eol
+benchmark_idf_sql.py -text whitespace=cr-at-eol
