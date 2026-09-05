@@ -28,6 +28,19 @@ use time::format_description::well_known::Rfc3339;
 use crate::project::{load_project, load_project_readonly};
 use crate::projector;
 
+/// One caller-selected lane, preferring task, session, then worktree identity.
+/// Null, non-string and blank placeholders never hide a usable later key.
+pub fn requested_identity(payload: &serde_json::Value) -> Option<&str> {
+    ["task_id", "session_id", "worktree_id"]
+        .into_iter()
+        .find_map(|key| {
+            payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Episode data types
 // ---------------------------------------------------------------------------

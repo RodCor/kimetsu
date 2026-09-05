@@ -733,7 +733,9 @@ pub(crate) fn project_resolution(
         _ => None,
     };
     if let Some(loser) = loser {
-        conn.execute("UPDATE memories SET invalidated_at=COALESCE(invalidated_at,?2),invalidated_reason=COALESCE(invalidated_reason,?3) WHERE memory_id=?1",params![loser,ts,format!("conflict {id} resolved as {resolution}")])?;
+        // Explicit rejection ends archival eligibility. Keeping a previous
+        // `forgotten` reason would let restore resurrect the rejected claim.
+        conn.execute("UPDATE memories SET invalidated_at=COALESCE(invalidated_at,?2),invalidated_reason=CASE WHEN invalidated_reason IS NULL OR invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived') THEN ?3 ELSE invalidated_reason END WHERE memory_id=?1",params![loser,ts,format!("conflict {id} resolved as {resolution}")])?;
         conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [loser])?;
         #[cfg(feature = "embeddings")]
         crate::ann::on_invalidate(conn, loser);

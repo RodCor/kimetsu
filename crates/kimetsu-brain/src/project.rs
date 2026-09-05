@@ -6443,10 +6443,9 @@ max_total_cost_usd = 250.0
         .expect("stats")
     }
 
-    // Story 2.4: a standalone citation raises use_count + usefulness (outcome
-    // signal applied because the run_id is the sentinel).
+    // Standalone reliance metadata does not imply a successful outcome.
     #[test]
-    fn standalone_cite_raises_usefulness() {
+    fn standalone_cite_records_reliance_without_outcome_credit() {
         with_user_brain_disabled(|| {
             let root = test_root();
             std::fs::create_dir_all(&root).expect("create root");
@@ -6463,14 +6462,18 @@ max_total_cost_usd = 250.0
             record_mcp_citation(&root, &memory_id, None).expect("cite");
             let (uc1, us1, cf1) = read_outcome_stats(&root, &memory_id);
 
-            assert_eq!(uc1, uc0 + 1, "use_count must increment on standalone cite");
-            assert!(us1 > us0, "usefulness must rise: {us0} -> {us1}");
-            // A fresh memory starts below the ceiling (DIRECT_ADD_CONFIDENCE), so a
-            // positive outcome nudges confidence UP toward 1.0 — letting a proven
-            // memory outrank a never-evaluated one.
-            assert!(
-                cf1 > cf0,
-                "confidence must rise toward 1.0 on a positive outcome: {cf0} -> {cf1}"
+            assert_eq!((uc1, us1, cf1), (uc0, us0, cf0));
+            rebuild_projection(&root, false).unwrap();
+            assert_eq!(read_outcome_stats(&root, &memory_id), (uc0, us0, cf0));
+            let (_, _, conn) = load_project(&root).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM memory_citations WHERE memory_id=?1",
+                    [&memory_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
             );
             std::fs::remove_dir_all(&root).ok();
         });

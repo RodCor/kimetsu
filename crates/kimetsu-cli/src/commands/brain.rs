@@ -564,12 +564,7 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
     use std::io::Read;
     let _ = std::io::stdin().read_to_string(&mut input);
     let payload: serde_json::Value = serde_json::from_str(input.trim()).unwrap_or_default();
-    let identity = payload
-        .get("task_id")
-        .or_else(|| payload.get("session_id"))
-        .or_else(|| payload.get("worktree_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let identity = kimetsu_brain::episode::requested_identity(&payload).unwrap_or("");
     let Some(additional_context) =
         kimetsu_brain::digest::warm_start_block_scoped(workspace, identity)
     else {

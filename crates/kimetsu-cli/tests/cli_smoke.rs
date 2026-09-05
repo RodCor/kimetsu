@@ -1334,6 +1334,26 @@ fn hardening_episode_cli_identity_and_archive_restore() {
     assert!(run(&["resume", "--task-id", "alpha"]).contains("lane alpha"));
     assert!(!run(&["resume", "--task-id", "alpha"]).contains("lane beta"));
     assert!(!run(&["resume", "--task-id", "missing"]).contains("lane beta"));
+    run(&["checkpoint", "unrelated legacy lane"]);
+    for (payload, expected, rejected) in [
+        (
+            r#"{"prompt":"hi","worktree_id":"alpha"}"#,
+            "lane alpha",
+            "lane beta",
+        ),
+        (
+            r#"{"prompt":"hi","task_id":null,"session_id":null,"worktree_id":"beta"}"#,
+            "lane beta",
+            "lane alpha",
+        ),
+    ] {
+        let text = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+        assert!(
+            text.contains(expected),
+            "missing explicit lane {expected}: {text}"
+        );
+        assert!(!text.contains(rejected) && !text.contains("unrelated legacy lane"));
+    }
     let added = run(&[
         "brain",
         "memory",

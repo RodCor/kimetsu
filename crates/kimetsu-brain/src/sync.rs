@@ -874,7 +874,7 @@ mod tests {
         use kimetsu_core::event::Event;
         let a = make_conn();
         let b = make_conn();
-        let run = RunId(ulid::Ulid::nil()); // sentinel → standalone cite outcome
+        let run = RunId(ulid::Ulid::nil()); // legacy standalone reliance metadata
         let (m1, s1, s2) = ("mem-m1", "mem-s1", "mem-s2");
 
         // Shared base: identical accepted events on both brains.
@@ -946,7 +946,7 @@ mod tests {
             "later-HLC supersede wins deterministically"
         );
 
-        // Additive field (use_count) converges; both cites counted.
+        // Reliance metadata converges without manufacturing outcome credit.
         let use_count = |c: &Connection| -> i64 {
             c.query_row(
                 "SELECT use_count FROM memories WHERE memory_id = ?1",
@@ -956,7 +956,16 @@ mod tests {
             .unwrap()
         };
         assert_eq!(use_count(&a), use_count(&b), "use_count must converge");
-        assert_eq!(use_count(&a), 2, "both brains' cites counted");
+        assert_eq!(use_count(&a), 0, "citations alone are not outcome credit");
+        for brain in [&a, &b] {
+            assert_eq!(
+                brain
+                    .query_row("SELECT count(*) FROM memory_citations", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
 
         // Even order-sensitive confidence converges (same HLC replay order).
         let confidence = |c: &Connection| -> f64 {

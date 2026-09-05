@@ -672,12 +672,7 @@ fn take_session_warm_start(workspace: &Path, arguments: &Value) -> Option<String
     if WARM_START_SERVED.load(Ordering::SeqCst) {
         return None;
     }
-    let identity = arguments
-        .get("task_id")
-        .or_else(|| arguments.get("session_id"))
-        .or_else(|| arguments.get("worktree_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let identity = kimetsu_brain::episode::requested_identity(&arguments).unwrap_or("");
     let block = kimetsu_brain::digest::warm_start_block_scoped(workspace, identity)?;
     if WARM_START_SERVED.swap(true, Ordering::SeqCst) {
         return None; // lost the race — another call is already emitting it
@@ -1987,7 +1982,13 @@ fn tool_definitions() -> Value {
         {
             "name": "kimetsu_brain_status",
             "description": BRAIN_STATUS_DESCRIPTION,
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": { "type": "object", "properties": {
+                    "task_id": {"type":"string","description":"Optional task lane; takes precedence over session/worktree identity."},
+                    "session_id": {"type":"string","description":"Optional session lane when task_id is absent."},
+                    "worktree_id": {"type":"string","description":"Optional worktree lane when task/session identity is absent."},
+                    "task_id": {"type":"string","description":"Optional task lane; takes precedence over session/worktree identity."},
+                    "session_id": {"type":"string","description":"Optional session lane when task_id is absent."},
+                    "worktree_id": {"type":"string","description":"Optional worktree lane when task/session identity is absent."},} }
         },
         {
             "name": "kimetsu_brain_context",
@@ -2191,7 +2192,7 @@ fn tool_definitions() -> Value {
                     "memory_id": { "type": "string" },
                     "reason": { "type": "string" }
                 },
-                "required": ["memory_id", "exposure_id"]
+                "required": ["memory_id"]
             }
         },
         {
@@ -2505,6 +2506,29 @@ mod tests {
         .expect("brain status");
         assert_eq!(result["initialized"].as_bool(), Some(false));
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn tool_required_arguments_are_declared_in_their_schema() {
+        let result = handle_mcp_method(
+            "tools/list",
+            json!({}),
+            Path::new("."),
+            &SkillConfig::default(),
+        )
+        .unwrap();
+        for tool in result["tools"].as_array().unwrap() {
+            if let Some(required) = tool["inputSchema"]["required"].as_array() {
+                for field in required {
+                    let name = field.as_str().expect("required argument name");
+                    assert!(
+                        tool["inputSchema"]["properties"].get(name).is_some(),
+                        "tool {} requires undeclared argument {name}",
+                        tool["name"]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

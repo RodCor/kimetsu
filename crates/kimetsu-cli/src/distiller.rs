@@ -761,12 +761,7 @@ pub fn run_session_end_hook(workspace: &Path) {
 
     // Story 1.3: auto-capture episode at SessionEnd (best-effort, never fails
     // the hook).
-    let identity = payload
-        .get("task_id")
-        .or_else(|| payload.get("session_id"))
-        .or_else(|| payload.get("worktree_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let identity = kimetsu_brain::episode::requested_identity(&payload).unwrap_or("");
     capture_episode_now_scoped(workspace, transcript_path.unwrap_or(""), "", identity);
 }
 

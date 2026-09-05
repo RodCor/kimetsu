@@ -43,6 +43,9 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
+    let episode_identity = hook_payload
+        .as_ref()
+        .and_then(kimetsu_brain::episode::requested_identity);
 
     // Extract the prompt text from the hook payload
     let prompt = match &hook_payload {
@@ -62,7 +65,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .ok()
         .map(|p| {
             let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
-            proactive_state::session_path(&cache_dir, session_id.as_deref())
+            proactive_state::session_path(&cache_dir, episode_identity)
         });
     let mut state = state_path
         .as_deref()
@@ -75,15 +78,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
     // gets the identical block from `brain session-start-hook`.
     let warm_start_block = if args.warm_on_first_prompt && state.warm_started_unix == 0 {
-        kimetsu_brain::digest::warm_start_block_scoped(
-            &workspace,
-            hook_payload
-                .as_ref()
-                .and_then(|p| p.get("task_id"))
-                .and_then(|v| v.as_str())
-                .or(session_id.as_deref())
-                .unwrap_or(""),
-        )
+        kimetsu_brain::digest::warm_start_block_scoped(&workspace, episode_identity.unwrap_or(""))
     } else {
         None
     };

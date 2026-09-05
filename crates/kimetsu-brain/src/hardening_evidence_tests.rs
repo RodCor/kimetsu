@@ -17,6 +17,27 @@ fn accepted(id: &str) -> Event {
     )
 }
 #[test]
+fn hardening_identity_uses_first_usable_task_session_or_worktree() {
+    for (payload, expected) in [
+        (
+            json!({"task_id":"task","session_id":"session","worktree_id":"tree"}),
+            Some("task"),
+        ),
+        (
+            json!({"task_id":null,"session_id":"session","worktree_id":"tree"}),
+            Some("session"),
+        ),
+        (
+            json!({"task_id":42,"session_id":" ","worktree_id":"tree"}),
+            Some("tree"),
+        ),
+        (json!({"task_id":"","session_id":null}), None),
+    ] {
+        assert_eq!(episode::requested_identity(&payload), expected);
+    }
+}
+
+#[test]
 fn hardening_concurrent_episode_lanes_replay() {
     let c = conn();
     for (lane, note) in [
@@ -128,6 +149,38 @@ fn hardening_archive_restore_replay_preserves_expiry_and_invalidity() {
         );
     }
 }
+#[test]
+fn hardening_manual_conflict_rejection_cannot_restore_archived_loser() {
+    let c = conn();
+    projector::apply_events(
+        &c,
+        &[
+            accepted("a"),
+            accepted("b"),
+            event(
+                "memory.invalidated",
+                json!({"memory_id":"b","reason":"forgotten"}),
+            ),
+        ],
+    )
+    .unwrap();
+    c.execute("INSERT INTO memory_conflicts(conflict_id,new_memory_id,existing_memory_id,scope,kind,similarity,detected_at) VALUES('ab','a','b','project','fact',0.95,'2026-01-01T00:00:00Z')", []).unwrap();
+    assert!(crate::conflict::resolve_conflict(&c, "ab", "kept_new").unwrap());
+    for _ in 0..2 {
+        projector::apply_events(&c, &[event("memory.restored", json!({"memory_id":"b"}))]).unwrap();
+        assert!(
+            c.query_row(
+                "SELECT invalidated_at IS NOT NULL FROM memories WHERE memory_id='b'",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+            "explicitly rejected conflict loser regained validity through archive restore"
+        );
+        projector::rebuild_in_place(&c).unwrap();
+    }
+}
+
 #[test]
 fn hardening_manual_conflict_replay_and_atomic_validation() {
     let c = conn();
