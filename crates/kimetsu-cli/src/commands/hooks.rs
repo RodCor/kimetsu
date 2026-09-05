@@ -288,7 +288,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         // guard. Only the first rendered capsule (idx == 0) can be answer-grade
         // (it's the top-ranked capsule); subsequent capsules are never marked.
         if idx == 0 && answer_grade_handle.is_some() {
-            additional_context.push_str("Verified answer from project memory: ");
+            additional_context.push_str("Relevant project memory (not independently verified): ");
         }
         additional_context.push_str(&text);
     }

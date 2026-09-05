@@ -12,7 +12,7 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant; the reply still has a small input-token cost — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations are the brain's only evidence about which memories earn their place; an uncited memory reads as unused. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant; the reply still has a small input-token cost — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations record reliance, not verification. Missing citations leave usefulness unknown; observed outcomes are associations with the delivered evidence. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
@@ -32,7 +32,7 @@ const BENCHMARK_RECORD_OUTCOME_DESCRIPTION: &str = "Record a benchmark attempt i
 
 const BRAIN_MEMORY_LIST_DESCRIPTION: &str = "List recent accepted Kimetsu memories with confidence, use count, and usefulness score. Use when you need to understand the durable memory pool or pick a memory id for invalidation.";
 
-const BRAIN_MEMORY_TOP_DESCRIPTION: &str = "List outcome-ranked Kimetsu memories by usefulness_score/use_count. Use this to see which memories have actually helped previous runs and should be trusted more than fresh or low-signal memories.";
+const BRAIN_MEMORY_TOP_DESCRIPTION: &str = "List outcome-ranked Kimetsu memories by usefulness_score/use_count. Use this to inspect outcome associations; these scores do not independently verify claims or override their origin.";
 
 const BRAIN_MEMORY_ADD_DESCRIPTION: &str = "Add a durable Kimetsu memory manually. Use only when the user states a reusable preference, convention, command, failure pattern, or fact that should influence future runs. This writes a memory.accepted event.";
 
@@ -655,29 +655,45 @@ fn parse_shared_retrieval_args(
     }
 }
 
-/// Latch for the once-per-session warm start on the stdio MCP path.
-///
-/// One `kimetsu mcp serve` process is one host session, which makes a process
-/// latch a session latch. Deliberately not consulted by the remote server: one
-/// `kimetsu-remote` process fans out across many sessions and repos.
-static WARM_START_SERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The stdio loop is sequential. Keep a bounded recent-lane delivery cache;
+/// remote requests use their own session policy and do not consult this cache.
+type WarmStartKey = (PathBuf, String);
+static WARM_START_SERVED: std::sync::Mutex<std::collections::VecDeque<WarmStartKey>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const MAX_WARM_START_LANES: usize = 256;
 
-/// Take the session's warm-start block, or `None` if it has already been served
-/// (or there is nothing to serve).
-///
-/// The latch is only set once a block actually exists, so a call made against a
-/// cold brain does not burn the session's one chance at a warm start.
-fn take_session_warm_start(workspace: &Path, arguments: &Value) -> Option<String> {
-    use std::sync::atomic::Ordering;
-    if WARM_START_SERVED.load(Ordering::SeqCst) {
+fn take_session_warm_start(
+    workspace: &Path,
+    arguments: &Value,
+) -> Option<(WarmStartKey, kimetsu_brain::digest::PreparedWarmStart)> {
+    let identity = kimetsu_brain::episode::requested_identity(arguments).unwrap_or("");
+    let root = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()?
+        .repo_root;
+    let key = (root, identity.to_owned());
+    if WARM_START_SERVED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&key)
+    {
         return None;
     }
-    let identity = kimetsu_brain::episode::requested_identity(&arguments).unwrap_or("");
-    let block = kimetsu_brain::digest::warm_start_block_scoped(workspace, identity)?;
-    if WARM_START_SERVED.swap(true, Ordering::SeqCst) {
-        return None; // lost the race — another call is already emitting it
+    let block = kimetsu_brain::digest::prepare_warm_start_block_scoped(workspace, identity)?;
+    Some((key, block))
+}
+
+fn mark_session_warm_start_served(key: WarmStartKey) {
+    // Extremely large client identities remain usable but are not retained.
+    if key.0.as_os_str().len() + key.1.len() > 4096 {
+        return;
     }
-    Some(block)
+    let mut served = WARM_START_SERVED.lock().unwrap_or_else(|p| p.into_inner());
+    if !served.contains(&key) {
+        if served.len() >= MAX_WARM_START_LANES {
+            served.pop_front();
+        }
+        served.push_back(key);
+    }
 }
 
 fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
@@ -705,12 +721,24 @@ fn stdio_brain_context_with_loader(
         } else {
             load(&config.embedder.reranker)?
         };
-        brain_context_tool_with_warm(
+        let warm = take_session_warm_start(workspace, arguments);
+        let output = brain_context_tool_with_warm(
             workspace,
             arguments,
             reranker.as_deref(),
-            take_session_warm_start(workspace, arguments),
-        )
+            warm.as_ref().map(|(_, block)| block.context.clone()),
+        )?;
+        if let Some((key, block)) = warm {
+            if output["warm_start"]["context"].as_str() == Some(block.context.as_str()) {
+                mark_session_warm_start_served(key);
+                kimetsu_brain::digest::record_warmstart_served(
+                    workspace,
+                    block.digest_chars,
+                    block.resume_chars,
+                );
+            }
+        }
+        Ok(output)
     })();
     result.unwrap_or_else(|e| {
         bounded_context_error(arguments, 6000, brain_unavailable_json(workspace, &e))
@@ -2678,6 +2706,72 @@ mod tests {
             );
             assert_eq!(result["used_tokens"].as_u64(), Some(wire.len() as u64));
             fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn hardening_mcp_warm_identity_and_retry_after_budget_omission() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("hardening-mcp-warm-lanes");
+            project::init_project(&root, false).unwrap();
+            for lane in ["ALPHA", "BETA", "GAMMA"] {
+                kimetsu_brain::episode::capture_episode(
+                    &root,
+                    kimetsu_brain::episode::EpisodePayload {
+                        identity: lane.into(),
+                        task: format!("{lane} task"),
+                        summary: format!("{lane} progress {}", "state details ".repeat(30)),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            let ask = |lane: &str, budget: u32| {
+                stdio_brain_context_with_loader(
+                    &root,
+                    &json!({"query":"unrelated query","task_id":lane,"include_ambient":false,"budget_tokens":budget}),
+                    |_| Ok(None),
+                )
+            };
+            let alpha = ask("ALPHA", 6000);
+            assert!(
+                alpha["warm_start"]["context"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("ALPHA"),
+                "{alpha}"
+            );
+            let beta = ask("BETA", 6000);
+            assert!(
+                beta["warm_start"]["context"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("BETA"),
+                "one lane must not consume another's warm start: {beta}"
+            );
+            assert!(ask("ALPHA", 6000).get("warm_start").is_none());
+            let (_, _, conn) = project::load_project_readonly(&root).unwrap();
+            let count = || {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind IN ('digest_served','resume_served')",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+            let before = count();
+            assert!(ask("GAMMA", 512).get("warm_start").is_none());
+            assert_eq!(count(), before, "omitted warm text is not a served event");
+            let gamma = ask("GAMMA", 6000);
+            assert!(
+                gamma["warm_start"]["context"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("GAMMA"),
+                "budget omission must leave a retry: {gamma}"
+            );
+            drop(conn);
+            std::fs::remove_dir_all(root).unwrap();
         });
     }
 

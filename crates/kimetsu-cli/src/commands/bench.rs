@@ -333,8 +333,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         struct RankerBenchRow {
             label: String,
             load_ms: u128,
-            rerank_mean_ms: f64,
-            rerank_max_ms: u128,
+            delivery_mean_ms: f64,
+            delivery_max_ms: u128,
             r2: f64,
             r4: f64,
             mrr: f64,
@@ -366,7 +366,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
             let rr = reranker_ref.unwrap();
 
             let mut per_case_ranked: Vec<Vec<String>> = Vec::new();
-            let mut rerank_times_ms: Vec<u128> = Vec::new();
+            let mut delivery_times_ms: Vec<u128> = Vec::new();
 
             for case in fixture.cases.iter() {
                 let policy = kimetsu_brain::serving::ServingPolicy {
@@ -388,7 +388,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
                     Some(rr),
                     kimetsu_brain::serving::EVAL_EXPOSURE_ID,
                 )?;
-                rerank_times_ms.push(rr_start.elapsed().as_millis());
+                delivery_times_ms.push(rr_start.elapsed().as_millis());
 
                 let ranked_keys: Vec<String> = bundle
                     .capsules
@@ -405,12 +405,12 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
 
             let (r2, r4, mrr_val, noise) = compute_metrics(&per_case_ranked);
 
-            let rerank_mean_ms = if rerank_times_ms.is_empty() {
+            let delivery_mean_ms = if delivery_times_ms.is_empty() {
                 0.0
             } else {
-                rerank_times_ms.iter().sum::<u128>() as f64 / rerank_times_ms.len() as f64
+                delivery_times_ms.iter().sum::<u128>() as f64 / delivery_times_ms.len() as f64
             };
-            let rerank_max_ms = rerank_times_ms.into_iter().max().unwrap_or(0);
+            let delivery_max_ms = delivery_times_ms.into_iter().max().unwrap_or(0);
 
             // Try to find the ONNX file size on disk (best-effort, no panic on miss).
             let onnx_kb: Option<u64> = {
@@ -462,8 +462,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
             Ok(RankerBenchRow {
                 label: rr_id.to_string(),
                 load_ms,
-                rerank_mean_ms,
-                rerank_max_ms,
+                delivery_mean_ms,
+                delivery_max_ms,
                 r2,
                 r4,
                 mrr: mrr_val,
@@ -473,7 +473,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         };
 
         println!();
-        println!("=== Reranker benchmark (semantic base + per-reranker) ===");
+        println!("=== Reranker comparison (full query-to-delivery latency) ===");
         println!();
 
         // Print the semantic-only baseline row for comparison.
@@ -482,8 +482,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
             "{:<col_w$} {:>9} {:>14} {:>13} {:>10} {:>10} {:>10} {:>8} {:>10}",
             "reranker",
             "load_ms",
-            "rerank_mean_ms",
-            "rerank_max_ms",
+            "delivery_mean_ms",
+            "delivery_max_ms",
             "recall@2",
             "recall@4",
             "MRR",
@@ -513,8 +513,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
                 "{:<col_w$} {:>9} {:>14.1} {:>13} {:>10.3} {:>10.3} {:>10.3} {:>8.1} {:>10}",
                 row.label,
                 row.load_ms,
-                row.rerank_mean_ms,
-                row.rerank_max_ms,
+                row.delivery_mean_ms,
+                row.delivery_max_ms,
                 row.r2,
                 row.r4,
                 row.mrr,
