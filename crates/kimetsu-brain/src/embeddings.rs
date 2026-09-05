@@ -507,6 +507,41 @@ pub fn open_embedder_for(config_enabled: bool) -> &'static dyn Embedder {
     }
 }
 
+/// Serving/evaluation must distinguish an explicitly lexical configuration from
+/// a requested model whose cached initialization fell back to Noop.
+pub fn open_embedder_for_checked(config_enabled: bool) -> Result<&'static dyn Embedder, String> {
+    let embedder = open_embedder_for(config_enabled);
+    validate_requested_embedder(
+        embedder,
+        embedder_enabled_for_config(config_enabled),
+        cfg!(feature = "embeddings"),
+    )?;
+    Ok(embedder)
+}
+
+fn validate_requested_embedder(
+    embedder: &dyn Embedder,
+    enabled: bool,
+    available: bool,
+) -> Result<(), String> {
+    if available && enabled && embedder.is_noop() {
+        return Err("requested embedder unavailable after initialization; no semantic measurement (explicitly disable embeddings for lexical-only serving)".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod checked_serving_loader_tests {
+    use super::*;
+    #[test]
+    fn failed_requested_model_is_not_an_intentional_lexical_measurement() {
+        assert!(validate_requested_embedder(&NoopEmbedder, true, true).is_err());
+        assert!(validate_requested_embedder(&NoopEmbedder, false, true).is_ok());
+        assert!(validate_requested_embedder(&NoopEmbedder, true, false).is_ok());
+        assert!(validate_requested_embedder(&StubEmbedder::default(), true, true).is_ok());
+    }
+}
+
 /// v0.8: open a FRESH (uncached) embedder for an explicit built-in
 /// model id. Unlike [`open_default_embedder`], this bypasses the
 /// process-static cache AND the env/override resolution — the caller

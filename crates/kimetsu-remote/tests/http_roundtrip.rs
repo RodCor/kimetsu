@@ -193,7 +193,10 @@ async fn hardening_remote_reranker_empty_reply_obeys_final_budget() {
     request["params"]["arguments"]["include_ambient"] = json!(false);
     let response = send_with_reranker(tmp.path(), "empty-budget", request).await;
     let payload = inner(&response);
-    assert_eq!(payload["ok"], true);
+    // The canonical exposure envelope no longer fits in 250 bytes. The compact
+    // error must still be truthfully accounted, rather than claiming success.
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"], "budget_too_small");
     assert_eq!(payload["capsule_count"], 0);
     let actual = response["result"].to_string().len() as u64;
     assert_eq!(

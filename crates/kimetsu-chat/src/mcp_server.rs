@@ -712,6 +712,23 @@ fn stdio_brain_context_with_loader(
     )
         -> Result<Option<std::sync::Arc<dyn kimetsu_brain::embeddings::Reranker>>, String>,
 ) -> Value {
+    stdio_brain_context_with_model_loaders(
+        workspace,
+        arguments,
+        load,
+        kimetsu_brain::embeddings::open_embedder_for_checked,
+    )
+}
+
+fn stdio_brain_context_with_model_loaders(
+    workspace: &Path,
+    arguments: &Value,
+    load: impl FnOnce(
+        &str,
+    )
+        -> Result<Option<std::sync::Arc<dyn kimetsu_brain::embeddings::Reranker>>, String>,
+    load_embedder: impl FnOnce(bool) -> Result<&'static dyn kimetsu_brain::embeddings::Embedder, String>,
+) -> Value {
     let result = (|| -> Result<Value, String> {
         let paths =
             kimetsu_core::paths::ProjectPaths::discover(workspace).map_err(|e| e.to_string())?;
@@ -722,11 +739,12 @@ fn stdio_brain_context_with_loader(
             load(&config.embedder.reranker)?
         };
         let warm = take_session_warm_start(workspace, arguments);
-        let output = brain_context_tool_with_warm(
+        let output = brain_context_tool_with_embedder_loader(
             workspace,
             arguments,
             reranker.as_deref(),
             warm.as_ref().map(|(_, block)| block.context.clone()),
+            load_embedder,
         )?;
         if let Some((key, block)) = warm {
             if output["warm_start"]["context"].as_str() == Some(block.context.as_str()) {
@@ -813,6 +831,22 @@ fn brain_context_tool_with_warm(
     arguments: &Value,
     reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
     warm_start: Option<String>,
+) -> Result<Value, String> {
+    brain_context_tool_with_embedder_loader(
+        workspace,
+        arguments,
+        reranker,
+        warm_start,
+        kimetsu_brain::embeddings::open_embedder_for_checked,
+    )
+}
+
+fn brain_context_tool_with_embedder_loader(
+    workspace: &Path,
+    arguments: &Value,
+    reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
+    warm_start: Option<String>,
+    load_embedder: impl FnOnce(bool) -> Result<&'static dyn kimetsu_brain::embeddings::Embedder, String>,
 ) -> Result<Value, String> {
     use kimetsu_brain::context::ContextRequest;
 
@@ -915,7 +949,7 @@ fn brain_context_tool_with_warm(
         .retrieve(
             &session,
             request,
-            kimetsu_brain::embeddings::open_embedder_for(session.config().embedder.enabled),
+            load_embedder(session.config().embedder.enabled)?,
             reranker,
             &exposure.event_id.to_string(),
         )
@@ -2770,6 +2804,44 @@ mod tests {
                     .contains("GAMMA"),
                 "budget omission must leave a retry: {gamma}"
             );
+            drop(conn);
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn hardening_failed_embedder_load_is_bounded_and_has_no_success_exposure() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("hardening-mcp-embedder-failure");
+            project::init_project(&root, false).unwrap();
+            let result = stdio_brain_context_with_model_loaders(
+                &root,
+                &json!({"query":"unrelated","include_ambient":false,"budget_tokens":1200}),
+                |_| Ok(None),
+                |_| Err("requested embedder unavailable".into()),
+            );
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("requested embedder unavailable"),
+                "{result}"
+            );
+            assert_ne!(result["ok"], true);
+            assert_eq!(
+                result["used_tokens"].as_u64(),
+                Some(kimetsu_brain::context::delivery::serialized_output_tokens(&result) as u64)
+            );
+            assert!(result["used_tokens"].as_u64().unwrap() <= 1200);
+            let (_, _, conn) = project::load_project_readonly(&root).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='context.injected'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
             drop(conn);
             std::fs::remove_dir_all(root).unwrap();
         });

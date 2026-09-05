@@ -2693,7 +2693,7 @@ pub(crate) fn brain_tune_sweep(
 ) -> KimetsuResult<()> {
     use kimetsu_brain::{
         context::ContextRequest,
-        embeddings::{open_embedder_for, open_reranker_checked},
+        embeddings::{open_embedder_for_checked, open_reranker_checked},
         eval::{EvaluationMetrics, summarize_deliveries},
         project::BrainSession,
         serving::{EVAL_EXPOSURE_ID, ServingPolicy},
@@ -2708,7 +2708,7 @@ pub(crate) fn brain_tune_sweep(
         return Err("cost_weight must be finite and nonnegative".into());
     }
     let config = project::load_config(paths)?;
-    let embedder = open_embedder_for(config.embedder.enabled);
+    let embedder = open_embedder_for_checked(config.embedder.enabled)?;
     let policy = ServingPolicy::default();
     let current_combo = TuneCombo {
         min_lexical_coverage: config.broker.min_lexical_coverage,
