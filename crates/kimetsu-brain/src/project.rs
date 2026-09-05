@@ -1499,16 +1499,14 @@ pub fn ingest_repo_at_root(
     brain_root: &Path,
     files_root: &Path,
 ) -> KimetsuResult<RepoIngestSummary> {
-    let (mut paths, config, conn) = load_project_at_root(brain_root)?;
-    // Walk the checkout, but keep the brain/lock under brain_root.
-    paths.repo_root = files_root
-        .canonicalize()
-        .unwrap_or_else(|_| files_root.to_path_buf());
+    let (paths, config, conn) = load_project_at_root(brain_root)?;
+    // Keep the storage identity/lock at the brain root; traverse the checkout
+    // separately so retrieval uses the same key as file and manifest indexing.
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain ingest-repo (remote)", Some(run_id))?;
 
     let started = admin_started_event(&paths, &config, run_id, "repo ingest")?;
-    let summary = ingest::ingest_repo(&conn, &paths, &config)?;
+    let summary = ingest::ingest_repo_from_root(&conn, &paths, &config, files_root)?;
     let ingested = Event::new(
         run_id,
         "repo.ingested",

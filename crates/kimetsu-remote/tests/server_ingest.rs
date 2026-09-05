@@ -142,7 +142,11 @@ async fn registered_repo_ingests_and_files_are_retrievable() {
         .await,
     );
     assert!(
-        ctx.to_string().contains("snorblax"),
+        ctx["capsules"].as_array().is_some_and(|capsules| capsules
+            .iter()
+            .any(|c| c["kind"] == "repo_file"
+                && c["expansion_handle"] == "file:README.md"
+                && c["summary"].as_str().unwrap_or("").contains("snorblax"))),
         "context did not surface the ingested file: {ctx}"
     );
 
