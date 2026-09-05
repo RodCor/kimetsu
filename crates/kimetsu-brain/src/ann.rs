@@ -23,7 +23,7 @@ use kimetsu_core::KimetsuResult;
 /// makes an old sidecar unsafe to load — forces a rebuild. v2: the manifest
 /// gained a `quant` field AND the default index scalar changed f32→f16, so all
 /// pre-v2 (f32) sidecars must be rebuilt.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// HNSW graph degree (M). Higher = better recall, more memory.
 const CONNECTIVITY: usize = 16;
@@ -49,6 +49,7 @@ struct Manifest {
     /// sidecar must NOT be loaded under a different quantization (silent
     /// corruption), so `try_load` rejects a mismatch and forces a rebuild.
     quant: String,
+    index_digest: String,
 }
 
 /// Index scalar quantization. f16 is the default — it ~halves the index's
@@ -529,18 +530,15 @@ impl AnnIndex {
             corpus_revision: self.corpus_revision,
             count: self.len(),
             quant: scalar_kind_id(ann_scalar_kind()).to_string(),
+            index_digest: String::new(),
         }
     }
 
     /// Serialize the index + manifest to the sidecar (no-op for in-memory DBs).
     ///
-    /// Concurrency-safe for fleet writers: each file is written to a
-    /// process-unique temp path and atomically `rename`d into place, so a
-    /// concurrent reader (another process opening the same brain) never observes
-    /// a torn `.usearch`. The manifest is renamed LAST — a reader that sees the
-    /// new manifest is guaranteed to also see the new index, and the reverse
-    /// (new index + old manifest) is caught by the `size != count` check on load
-    /// and degrades to a rebuild rather than serving stale hits.
+    /// A digest binds the manifest revision to the exact serialized index.
+    /// Concurrent two-file publications may mix generations; readers reject
+    /// those pairs and rebuild, including equal-count vector updates.
     pub fn save(&self) -> KimetsuResult<()> {
         let Some(sidecar) = &self.sidecar else {
             return Ok(());
@@ -551,6 +549,10 @@ impl AnnIndex {
         self.index
             .save(index_tmp.to_string_lossy().as_ref())
             .map_err(|e| format!("usearch save: {e}"))?;
+        // Digest the exact generation before publishing either file.
+        let index_digest = blake3::hash(&std::fs::read(&index_tmp)?)
+            .to_hex()
+            .to_string();
         std::fs::rename(&index_tmp, sidecar).map_err(|e| {
             let _ = std::fs::remove_file(&index_tmp);
             format!("usearch rename: {e}")
@@ -559,8 +561,10 @@ impl AnnIndex {
         // 2. Manifest LAST → temp → atomic rename.
         let manifest_path = Self::manifest_path(sidecar);
         let manifest_tmp = Self::tmp_sibling(&manifest_path);
+        let mut generation = self.manifest();
+        generation.index_digest = index_digest;
         let manifest =
-            serde_json::to_vec(&self.manifest()).map_err(|e| format!("manifest serialize: {e}"))?;
+            serde_json::to_vec(&generation).map_err(|e| format!("manifest serialize: {e}"))?;
         std::fs::write(&manifest_tmp, manifest).map_err(|e| format!("manifest write: {e}"))?;
         std::fs::rename(&manifest_tmp, &manifest_path).map_err(|e| {
             let _ = std::fs::remove_file(&manifest_tmp);
@@ -609,8 +613,16 @@ impl AnnIndex {
             return Ok(None);
         }
         let index = Index::new(&index_options(dim)).map_err(|e| format!("usearch new: {e}"))?;
-        if index.load(sidecar.to_string_lossy().as_ref()).is_err() {
-            return Ok(None); // corrupt sidecar → rebuild
+        // Read once: validating a path and then reopening it for load would
+        // permit a concurrent rename between validation and use.
+        let bytes = match std::fs::read(sidecar) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        if blake3::hash(&bytes).to_hex().as_str() != manifest.index_digest
+            || index.load_from_buffer(&bytes).is_err()
+        {
+            return Ok(None); // Mixed generation or corrupt sidecar.
         }
         if index.size() != manifest.count {
             return Ok(None);
@@ -819,6 +831,32 @@ mod tests {
             total += k;
         }
         hit as f32 / total as f32
+    }
+
+    #[test]
+    fn mixed_equal_count_sidecar_generations_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let c = Connection::open(&db).unwrap();
+        crate::schema::initialize(&c).unwrap();
+        c.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at,embedding,embedding_model) VALUES ('m','project','fact','t','t',1,'{}','2026-01-01T00:00:00Z',?1,'stub')",rusqlite::params![encode_embedding(&[1.0,0.0])]).unwrap();
+        let old = AnnIndex::open_or_build(&c, 2, "stub").unwrap();
+        old.save().unwrap();
+        let path = db.with_extension("usearch");
+        let old_bytes = std::fs::read(&path).unwrap();
+        c.execute(
+            "UPDATE memories SET embedding=?1",
+            rusqlite::params![encode_embedding(&[0.0, 1.0])],
+        )
+        .unwrap();
+        let new = AnnIndex::open_or_build(&c, 2, "stub").unwrap();
+        new.save().unwrap();
+        // Deterministically materialize older index + newer manifest, equal size.
+        std::fs::write(&path, old_bytes).unwrap();
+        assert!(AnnIndex::try_load(&path, 2, "stub").unwrap().is_none());
+        let repaired = AnnIndex::open_or_build(&c, 2, "stub").unwrap();
+        assert!(!repaired.is_stale(&c).unwrap());
+        assert!(repaired.search(&[0.0, 1.0], 1).unwrap()[0].1 < 0.01);
     }
 
     #[test]

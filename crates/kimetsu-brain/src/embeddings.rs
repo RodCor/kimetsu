@@ -974,6 +974,16 @@ pub fn embed_and_persist(
     if embedder.is_noop() {
         return Ok(None);
     }
+    use rusqlite::OptionalExtension;
+    // Capture the claim generation before expensive inference. Text alone is
+    // insufficient for A -> B -> A corrections.
+    let expected_revision: Option<String> = conn.query_row(
+        "SELECT COALESCE((SELECT event_id FROM memory_revisions WHERE memory_id=?1 ORDER BY revision_id DESC LIMIT 1),'baseline:' || memory_id)
+         FROM memories WHERE memory_id=?1 AND text=?2 AND invalidated_at IS NULL AND superseded_by IS NULL",
+        rusqlite::params![memory_id,text], |r|r.get(0)).optional()?;
+    let Some(expected_revision) = expected_revision else {
+        return Ok(None);
+    };
     let vec = match embedder.embed(text) {
         Ok(v) => v,
         // NotImplemented is the contract for "skip silently". Treat
@@ -991,33 +1001,18 @@ pub fn embed_and_persist(
         .into());
     }
     let blob = encode_embedding(&vec);
-    conn.execute(
-        "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
-        rusqlite::params![blob, embedder.model_id(), memory_id],
+    let changed = conn.execute(
+        "UPDATE memories SET embedding=?1,embedding_model=?2 WHERE memory_id=?3 AND text=?4
+         AND invalidated_at IS NULL AND superseded_by IS NULL
+         AND COALESCE((SELECT event_id FROM memory_revisions WHERE memory_id=?3 ORDER BY revision_id DESC LIMIT 1),'baseline:' || memory_id)=?5",
+        rusqlite::params![blob,embedder.model_id(),memory_id,text,expected_revision],
     )?;
-
-    // Tier-3: keep the warm usearch index current at add time. For in-memory
-    // DBs there is no cached handle — the rebuild-on-query path picks the row
-    // up, so we safely skip. Best-effort: an index failure must not abort a
-    // successful memory write.
-    #[cfg(feature = "embeddings")]
-    if let Some(handle) = crate::ann::cached_handle(conn) {
-        let rowid: Option<i64> = conn
-            .query_row(
-                "SELECT rowid FROM memories WHERE memory_id = ?1",
-                rusqlite::params![memory_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(rowid) = rowid {
-            let mut guard = handle.write().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = guard.add(rowid, &vec) {
-                eprintln!(
-                    "kimetsu-brain: ann add failed for memory {memory_id}: {e} (index will reconcile on next open)"
-                );
-            }
-        }
+    if changed == 0 {
+        return Ok(None);
     }
+    // The corpus trigger makes cached ANN handles stale. Reconcile from the
+    // committed database on the next query; directly adding this vector could
+    // race a newer correction after the conditional write succeeded.
 
     Ok(Some(vec))
 }
@@ -1503,5 +1498,81 @@ mod tests {
             }
         }
         drop(lock);
+    }
+}
+
+#[cfg(test)]
+mod correction_race_tests {
+    use super::*;
+    #[test]
+    fn slow_embedding_cannot_overwrite_a_newer_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        crate::schema::initialize(&writer).unwrap();
+        let accepted = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "memory.accepted",
+            serde_json::json!({"memory_id":"m","scope":"project","kind":"fact","text":"claim A"}),
+        );
+        crate::projector::apply_events(&writer, &[accepted]).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        struct Blocking {
+            started: std::sync::mpsc::Sender<()>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Embedder for Blocking {
+            fn embed(&self, _: &str) -> Result<Vec<f32>, EmbedderError> {
+                self.started.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+                Ok(vec![1.0, 0.0])
+            }
+            fn model_id(&self) -> &str {
+                "stub"
+            }
+            fn dim(&self) -> usize {
+                2
+            }
+        }
+        let pending = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(db).unwrap();
+            embed_and_persist(
+                &conn,
+                "m",
+                "claim A",
+                &Blocking {
+                    started: started_tx,
+                    resume: std::sync::Mutex::new(resume_rx),
+                },
+            )
+            .unwrap()
+        });
+        started_rx.recv().unwrap();
+        let correction = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "memory.corrected",
+            serde_json::json!({"memory_id":"m","text":"claim B"}),
+        );
+        crate::projector::apply_events(&writer, &[correction]).unwrap();
+        writer
+            .execute(
+                "UPDATE memories SET embedding=?1,embedding_model='stub' WHERE memory_id='m'",
+                rusqlite::params![encode_embedding(&[0.0, 1.0])],
+            )
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(
+            pending.join().unwrap().is_none(),
+            "stale computation must not be published"
+        );
+        let blob: Vec<u8> = writer
+            .query_row(
+                "SELECT embedding FROM memories WHERE memory_id='m'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decode_embedding(&blob, Some(2)).unwrap(), vec![0.0, 1.0]);
     }
 }

@@ -208,6 +208,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
 
 fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let event = redact_memory_event(event);
+    let event = bind_injected_revisions(conn, event.as_ref())?;
     let event = event.as_ref();
     // Persist the event after memory payload redaction so durable replay tables
     // never become a second secret store.
@@ -326,6 +327,22 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         // keeps the run from breaking.
         return Ok(());
     };
+    let current_revision = claim_revision_at(conn, memory_id, None)?;
+    let explicit = event
+        .payload
+        .get("revision_event_id")
+        .and_then(|v| v.as_str());
+    let exposed = run_claim_revision(conn, &event.run_id.to_string(), memory_id)?;
+    // A citation without a revision or exposure is ambiguous after a text
+    // correction. Keep its durable event, but do not credit the new claim.
+    let evidence_revision = explicit.map(str::to_owned).or(exposed);
+    if evidence_revision
+        .as_ref()
+        .is_some_and(|r| r != &current_revision)
+        || (evidence_revision.is_none() && !current_revision.starts_with("baseline:"))
+    {
+        return Ok(());
+    }
     let turn = event
         .payload
         .get("turn")
@@ -621,6 +638,23 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
     };
 
     for memory_id in &retrieved {
+        if let Some(exposed_revision) = run_claim_revision(conn, &run_id, memory_id)? {
+            if exposed_revision != claim_revision_at(conn, memory_id, None)? {
+                // The run saw the old proposition. Its delayed outcome belongs
+                // to that retained revision, even if correction removed the
+                // old citation projection in the meantime.
+                let was_cited: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='memory.cited' AND json_extract(payload_json,'$.memory_id')=?2
+                     AND (json_extract(payload_json,'$.revision_event_id') IS NULL OR json_extract(payload_json,'$.revision_event_id')=?3)
+                     AND rowid <= (SELECT rowid FROM events WHERE event_id=?4))",
+                    params![run_id,memory_id,exposed_revision,event.event_id.to_string()], |r| r.get(0))?;
+                let delta = if was_cited { strong } else { weak };
+                conn.execute("UPDATE memory_revisions SET use_count=use_count+1,usefulness_score=usefulness_score+?2,
+                    confidence=CASE WHEN ?3 THEN MAX(0.1,MIN(0.99,confidence+?4*(?5-confidence))) ELSE confidence END
+                    WHERE event_id=?1 AND memory_id=?6", params![exposed_revision,delta,was_cited,CONF_ALPHA,conf_target.unwrap_or(1.0),memory_id])?;
+                continue;
+            }
+        }
         let is_cited = cited.contains(memory_id);
         let delta = if is_cited {
             if strong < 0.0 {
@@ -2486,6 +2520,75 @@ mod correction_regressions {
         apply_events(c, &[event("memory.accepted", serde_json::json!({"memory_id":"m", "scope":"project", "kind":"fact", "text":"original quokka"}), "2026-01-01T00:00:00Z")]).unwrap();
     }
     #[test]
+    fn delayed_run_evidence_stays_on_the_retiring_claim() {
+        let c = Connection::open_in_memory().unwrap();
+        seed(&c);
+        let run = RunId::new();
+        let mut events = vec![
+            event(
+                "run.started",
+                serde_json::json!({"project_id":"p","task":"t"}),
+                "2026-01-02T00:00:00Z",
+            ),
+            event(
+                "context.injected",
+                serde_json::json!({"memory_ids":["m"]}),
+                "2026-01-03T00:00:00Z",
+            ),
+            event(
+                "memory.cited",
+                serde_json::json!({"memory_id":"m","turn":1}),
+                "2026-01-04T00:00:00Z",
+            ),
+            event(
+                "memory.corrected",
+                serde_json::json!({"memory_id":"m","text":"new claim"}),
+                "2026-01-05T00:00:00Z",
+            ),
+            event(
+                "memory.cited",
+                serde_json::json!({"memory_id":"m","turn":2}),
+                "2026-01-06T00:00:00Z",
+            ),
+            event(
+                "run.finished",
+                serde_json::json!({"total_cost_usd":0}),
+                "2026-01-07T00:00:00Z",
+            ),
+        ];
+        for e in &mut events {
+            e.run_id = run;
+            e.ts = OffsetDateTime::parse("2026-01-02T00:00:00Z", &Rfc3339).unwrap();
+        }
+        apply_events(&c, &events).unwrap();
+        for _ in 0..2 {
+            let current: (i64, f64) = c
+                .query_row(
+                    "SELECT use_count,usefulness_score FROM memories WHERE memory_id='m'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(current, (0, 0.0));
+            let retired:(i64,f64)=c.query_row("SELECT use_count,usefulness_score FROM memory_revisions WHERE event_id='baseline:m'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(retired, (1, 1.0));
+            rebuild_in_place(&c).unwrap();
+        }
+        // Pre-binding events also must not transfer evidence at equal times.
+        c.execute("UPDATE events SET payload_json=json_remove(payload_json,'$.memory_revisions') WHERE kind='context.injected'",[]).unwrap();
+        rebuild_in_place(&c).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT use_count FROM memories WHERE memory_id='m'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn correction_validation_rolls_back_events_text_and_fts() {
         let c = Connection::open_in_memory().unwrap();
         seed(&c);
@@ -2626,4 +2729,85 @@ mod correction_regressions {
             .unwrap();
         assert!(revision() > before);
     }
+}
+
+/// Stable claim identity: kind-only revisions do not start a new claim.
+/// A -> B -> A does start a new claim, even though the text repeats.
+pub(crate) fn claim_revision_at(
+    conn: &Connection,
+    memory_id: &str,
+    known_at: Option<&str>,
+) -> KimetsuResult<String> {
+    let revision = conn
+        .query_row(
+            "SELECT event_id FROM (
+        SELECT event_id, known_at, revision_id, text,
+               LAG(text) OVER (ORDER BY revision_id) AS previous_text
+        FROM memory_revisions WHERE memory_id=?1)
+        WHERE (previous_text IS NULL OR text != previous_text)
+          AND (?2 IS NULL OR julianday(known_at)<julianday(?2))
+        ORDER BY revision_id DESC LIMIT 1",
+            params![memory_id, known_at],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(revision.unwrap_or_else(|| format!("baseline:{memory_id}")))
+}
+
+/// Legacy injections identify IDs only. Attribute an in-flight run to its
+/// earliest exposure rather than silently transferring old evidence on edit.
+/// For legacy unbound events, equal-time corrections are conservatively treated
+/// as later than the exposure; new bound events have exact revision identity.
+fn run_claim_revision(
+    conn: &Connection,
+    run_id: &str,
+    memory_id: &str,
+) -> KimetsuResult<Option<String>> {
+    let exposure = conn
+        .query_row(
+            "SELECT ts,payload_json FROM events e WHERE run_id=?1 AND kind='context.injected'
+        AND EXISTS(SELECT 1 FROM json_each(e.payload_json,'$.memory_ids') WHERE value=?2)
+        ORDER BY julianday(ts),rowid LIMIT 1",
+            params![run_id, memory_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match exposure {
+        None => Ok(None),
+        Some((at, payload)) => {
+            let payload: serde_json::Value = serde_json::from_str(&payload)?;
+            if let Some(revision) = payload
+                .get("memory_revisions")
+                .and_then(|v| v.get(memory_id))
+                .and_then(|v| v.as_str())
+            {
+                Ok(Some(revision.to_string()))
+            } else {
+                Ok(Some(claim_revision_at(conn, memory_id, Some(&at))?))
+            }
+        }
+    }
+}
+
+/// Bind exposures while their event is first persisted, not when a delayed
+/// outcome is projected. This also disambiguates equal-timestamp corrections.
+fn bind_injected_revisions<'a>(
+    conn: &Connection,
+    event: &'a Event,
+) -> KimetsuResult<Cow<'a, Event>> {
+    if event.kind != "context.injected" || event.payload.get("memory_revisions").is_some() {
+        return Ok(Cow::Borrowed(event));
+    }
+    let mut bound = event.clone();
+    let mut revisions = serde_json::Map::new();
+    if let Some(ids) = event.payload.get("memory_ids").and_then(|v| v.as_array()) {
+        for id in ids.iter().filter_map(|v| v.as_str()) {
+            revisions.insert(
+                id.to_string(),
+                serde_json::Value::String(claim_revision_at(conn, id, None)?),
+            );
+        }
+    }
+    bound.payload["memory_revisions"] = serde_json::Value::Object(revisions);
+    Ok(Cow::Owned(bound))
 }
