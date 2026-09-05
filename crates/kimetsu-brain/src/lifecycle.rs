@@ -236,27 +236,29 @@ fn query_forget_candidates(
     cutoff_iso: &str,
     protect_use_count: u32,
 ) -> KimetsuResult<Vec<ForgetCandidate>> {
-    // A memory qualifies when:
-    //   - active (not invalidated, not superseded)
-    //   - use_count < protect_use_count
-    //   - usefulness is low: score / max(use_count,1) <= floor
-    //   - stale: it has not been RETRIEVED, proven useful, or created within the
-    //     age window. The staleness reference is the most recent of
-    //     `last_used_at` (bumped on every retrieval), `last_useful_at` (bumped on
-    //     a successful citation), and `created_at`. Including `last_used_at` is
-    //     the v2.6 fix for recall-preservation: a memory that is still being
-    //     surfaced is in active use, so it must not be forgotten just because it
-    //     has a low usefulness score and was never explicitly cited.
+    // Popularity protects non-negative evidence only. Negative evidence cannot
+    // refresh its own lifetime by being repeatedly exposed. Preferences and
+    // conventions require explicit correction, not automatic forgetting.
+    // Compare actual instants and take the latest timestamp, not first non-null.
     let mut stmt = conn.prepare(
-        "SELECT memory_id, scope, kind, text, use_count, usefulness_score,
-                COALESCE(last_used_at, last_useful_at, created_at) AS ref_ts
-         FROM memories
-         WHERE invalidated_at IS NULL
-           AND superseded_by IS NULL
-           AND use_count < ?1
+        "WITH candidates AS (
+           SELECT *, MAX(
+             COALESCE(julianday(created_at), julianday('now')),
+             COALESCE(julianday(last_useful_at), 0),
+             CASE WHEN usefulness_score < 0 THEN 0
+                  ELSE COALESCE(julianday(last_used_at), 0) END
+           ) AS ref_day
+           FROM memories
+           WHERE invalidated_at IS NULL AND superseded_by IS NULL
+             AND kind NOT IN ('preference', 'convention')
+         )
+         SELECT memory_id, scope, kind, text, use_count, usefulness_score,
+                strftime('%Y-%m-%dT%H:%M:%fZ', ref_day) AS ref_ts
+         FROM candidates
+         WHERE (use_count < ?1 OR usefulness_score < 0)
            AND (CAST(usefulness_score AS REAL) / MAX(CAST(use_count AS REAL), 1.0)) <= ?2
-           AND COALESCE(last_used_at, last_useful_at, created_at) <= ?3
-         ORDER BY (CAST(usefulness_score AS REAL) / MAX(CAST(use_count AS REAL), 1.0)) ASC",
+           AND ref_day <= julianday(?3)
+         ORDER BY (CAST(usefulness_score AS REAL) / MAX(CAST(use_count AS REAL), 1.0)) ASC, memory_id",
     )?;
 
     let now = OffsetDateTime::now_utc();
@@ -679,8 +681,8 @@ mod tests {
     // Story 3.1: forget_brain dry-run identifies noise, not signal
     // -------------------------------------------------------------------------
 
-    /// Helper to directly set usefulness_score + last_useful_at on a memory
-    /// row (bypasses the event system for test speed).
+    /// Seed an aged memory and its usefulness (the fixtures represent memories
+    /// already existing at their last-useful timestamp, not created today).
     fn set_memory_usefulness(
         conn: &rusqlite::Connection,
         memory_id: &str,
@@ -689,7 +691,8 @@ mod tests {
         last_useful_at: Option<&str>,
     ) {
         conn.execute(
-            "UPDATE memories SET use_count=?2, usefulness_score=?3, last_useful_at=?4 WHERE memory_id=?1",
+            "UPDATE memories SET use_count=?2, usefulness_score=?3, last_useful_at=?4,
+                 created_at=COALESCE(?4,created_at) WHERE memory_id=?1",
             rusqlite::params![memory_id, use_count, usefulness_score, last_useful_at],
         )
         .expect("set_memory_usefulness");
@@ -757,6 +760,58 @@ mod tests {
 
             std::fs::remove_dir_all(&root).ok();
         });
+    }
+
+    #[test]
+    fn forgetting_uses_meaningful_recency_and_not_harmful_popularity() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        for (id, kind, created, used, useful, count, score) in [
+            (
+                "harmful-popular",
+                "fact",
+                "2020-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                20,
+                -10.0,
+            ),
+            (
+                "recently-useful",
+                "fact",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                1,
+                -0.5,
+            ),
+            (
+                "recently-created",
+                "fact",
+                "2026-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                1,
+                -0.5,
+            ),
+            (
+                "durable-preference",
+                "preference",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                1,
+                -0.5,
+            ),
+        ] {
+            conn.execute("INSERT INTO memories (memory_id,scope,kind,text,normalized_text,confidence,
+                provenance_snapshot_json,created_at,last_used_at,last_useful_at,use_count,usefulness_score)
+                VALUES (?1,'project',?2,?1,?1,0.5,'{}',?3,?4,?5,?6,?7)",
+                params![id,kind,created,used,useful,count,score]).unwrap();
+        }
+        let candidates = query_forget_candidates(&conn, -0.1, "2025-01-01T00:00:00Z", 10).unwrap();
+        let ids: Vec<_> = candidates.iter().map(|c| c.memory_id.as_str()).collect();
+        assert_eq!(ids, vec!["harmful-popular"]);
     }
 
     // v2.6 recall-preservation fix: a memory that was RETRIEVED recently

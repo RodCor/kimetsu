@@ -3,19 +3,12 @@
 //!
 //! # Near-duplicate merge (Story 3.1)
 //!
-//! For each memory with a stored embedding, find other memories (same
-//! `embedding_model`) whose cosine similarity exceeds a threshold (default
-//! 0.92). Union-find clusters the pairs; the survivor of each cluster is the
-//! memory with the highest `(usefulness_score × recency rank)`. Merge plan:
-//!   - Survivor keeps its text/id; `use_count` and `usefulness_score` become
-//!     cluster sums.
-//!   - Citations are reassigned to the survivor (`UPDATE memory_citations`).
-//!   - Members get `superseded_by = survivor_id` via a `memory.superseded`
-//!     event (so `brain rebuild` reproduces the merge).
-//!
-//! The cosine scan is brute-force O(N²) over decoded embeddings within the
-//! same `model_id`. This is intentionally simple and correct for the current
-//! scale (< 10k memories). A future optimisation would reuse the ANN index.
+//! Only identical text within the same scope, kind and embedding model can
+//! consolidate. Each member must meet the cosine threshold against its survivor;
+//! similarity chains cannot bridge unrelated vectors. Each pass performs at most
+//! 100,000 cosine comparisons. Survivor evidence counts stay unchanged: duplicate
+//! storage is not independent support. An atomic, revalidated event batch retires
+//! members and reassigns citations, preserving the operation on rebuild.
 //!
 //! # Cluster distillation (Story 3.2)
 //!
@@ -209,6 +202,7 @@ pub fn load_embeddable_rows(
          FROM memories
          WHERE invalidated_at IS NULL
            AND superseded_by IS NULL
+           AND valid_from IS NULL AND valid_to IS NULL
            AND embedding IS NOT NULL
            AND embedding_model IS NOT NULL
          ORDER BY created_at DESC",
@@ -330,51 +324,55 @@ fn pick_survivor(cluster: &[usize], rows: &[ConsolidateRow]) -> usize {
 /// Build merge clusters from `rows` with the given cosine threshold.
 /// Returns only clusters with ≥ 2 members (i.e. at least one merge needed).
 pub fn find_merge_clusters(rows: &[ConsolidateRow], threshold: f32) -> Vec<MergeCluster> {
-    let n = rows.len();
-    if n < 2 {
+    if rows.len() < 2 || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
         return Vec::new();
     }
-
-    let mut uf = UnionFind::new(n);
-
-    // Brute-force pairwise cosine — O(N²) fine for N < 10k.
-    // Future: replace with ANN index search for larger corpora.
-    for i in 0..n {
-        for j in (i + 1)..n {
-            // Only cluster within same model_id.
-            if rows[i].model_id != rows[j].model_id {
-                continue;
-            }
-            let sim = cosine(&rows[i].embedding, &rows[j].embedding);
-            if sim >= threshold {
-                uf.union(i, j);
-            }
+    // Similarity proposes related claims, not interchangeable text. Until claim
+    // identity is explicit, only identical text with identical applicability may
+    // be destructively consolidated. Do not normalize case/inner whitespace: code
+    // identifiers and quoted values may distinguish claims.
+    let mut buckets = std::collections::BTreeMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        if row.text.trim().is_empty() {
+            continue;
         }
+        buckets
+            .entry((&row.scope, &row.kind, &row.model_id, row.text.trim()))
+            .or_insert_with(Vec::new)
+            .push(i);
     }
-
-    // Collect root → members mapping.
-    let mut root_to_members: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..n {
-        let root = uf.find(i);
-        root_to_members.entry(root).or_default().push(i);
-    }
-
     let mut clusters = Vec::new();
-    for (_, members) in root_to_members {
-        if members.len() < 2 {
-            continue; // singleton — nothing to merge
+    // Bound pathological embedding-drift buckets. Unexamined rows remain intact.
+    let mut comparisons_left = 100_000usize;
+    for (_, mut pending) in buckets {
+        pending.sort_by(|&a, &b| rows[a].memory_id.cmp(&rows[b].memory_id));
+        while pending.len() > 1 && comparisons_left > 0 {
+            let survivor_idx = pick_survivor(&pending, rows);
+            let mut remaining = Vec::new();
+            let mut members = Vec::new();
+            for i in pending {
+                if i == survivor_idx {
+                    continue;
+                }
+                if comparisons_left == 0 {
+                    remaining.push(i);
+                    continue;
+                }
+                comparisons_left -= 1;
+                if cosine(&rows[survivor_idx].embedding, &rows[i].embedding) >= threshold {
+                    members.push(rows[i].clone());
+                } else {
+                    remaining.push(i);
+                }
+            }
+            if !members.is_empty() {
+                clusters.push(MergeCluster {
+                    survivor: rows[survivor_idx].clone(),
+                    members,
+                });
+            }
+            pending = remaining;
         }
-        let survivor_idx = pick_survivor(&members, rows);
-        let survivor = rows[survivor_idx].clone();
-        let member_rows: Vec<ConsolidateRow> = members
-            .iter()
-            .filter(|&&i| i != survivor_idx)
-            .map(|&i| rows[i].clone())
-            .collect();
-        clusters.push(MergeCluster {
-            survivor,
-            members: member_rows,
-        });
     }
 
     // Stable order for deterministic dry-run output.
@@ -388,37 +386,56 @@ pub fn find_merge_clusters(rows: &[ConsolidateRow], threshold: f32) -> Vec<Merge
 
 /// Apply one merge cluster to the database.
 ///
-/// Emits an enriched `memory.superseded` event for each member, carrying
-/// the member's `use_count` and `usefulness_score` as deltas.  The
-/// projector arm (`apply_memory_superseded`) is the **single code path**
-/// that stamps `superseded_by`, accumulates stats onto the survivor, and
-/// reassigns citations — so both the live path and `rebuild_in_place`
-/// replay go through exactly the same logic with no drift.
-///
-/// Returns the number of members merged.
+/// Consolidate an unchanged identical-claim plan atomically. Copies do not
+/// constitute independent evidence, so survivor counters are not increased.
+/// Durable events preserve supersession and citation reassignment on rebuild.
 pub fn apply_merge(
     conn: &Connection,
     cluster: &MergeCluster,
     run_id: kimetsu_core::ids::RunId,
 ) -> KimetsuResult<usize> {
-    // Emit one enriched memory.superseded event per member.  The projector
-    // arm handles: stamp, stat accumulation, citation reassignment, FTS/ANN
-    // removal.  No direct UPDATE on the survivor here — everything flows
-    // through apply_events so live path == replay path.
-    for member in &cluster.members {
-        let event = kimetsu_core::event::Event::new(
-            run_id,
-            "memory.superseded",
-            serde_json::json!({
-                "memory_id":       member.memory_id,
-                "survivor_id":     cluster.survivor.memory_id,
-                "use_count_delta": member.use_count,
-                "score_delta":     member.usefulness_score as f64,
-            }),
-        );
-        crate::projector::apply_events(conn, &[event])?;
-    }
-
+    let events: Vec<_> = cluster
+        .members
+        .iter()
+        .map(|member| {
+            kimetsu_core::event::Event::new(
+                run_id,
+                "memory.superseded",
+                serde_json::json!({
+                    "memory_id": member.memory_id,
+                    "survivor_id": cluster.survivor.memory_id,
+                    "use_count_delta": 0,
+                    "score_delta": 0.0,
+                }),
+            )
+        })
+        .collect();
+    crate::projector::apply_events_checked(conn, &events, |c| {
+        let mut ids = std::collections::HashSet::new();
+        for planned in std::iter::once(&cluster.survivor).chain(cluster.members.iter()) {
+            if !ids.insert(&planned.memory_id) {
+                return Err("merge plan repeats a memory ID".into());
+            }
+            let current: (String, String, String, bool) = c.query_row(
+                "SELECT scope, kind, text, invalidated_at IS NULL AND superseded_by IS NULL
+                    AND valid_from IS NULL AND valid_to IS NULL
+                 FROM memories WHERE memory_id = ?1",
+                [&planned.memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            if !current.3
+                || current.0 != planned.scope
+                || current.1 != planned.kind
+                || current.2 != planned.text
+                || current.0 != cluster.survivor.scope
+                || current.1 != cluster.survivor.kind
+                || current.2.trim() != cluster.survivor.text.trim()
+            {
+                return Err("merge plan is stale or combines distinct claims".into());
+            }
+        }
+        Ok(())
+    })?;
     Ok(cluster.members.len())
 }
 
@@ -897,7 +914,7 @@ mod tests {
             memory_id: id.to_string(),
             scope: "project".to_string(),
             kind: "fact".to_string(),
-            text: format!("text {id}"),
+            text: "Identical stored claim".to_string(),
             use_count: 1,
             usefulness_score: 1.0,
             last_useful_at: None,
@@ -922,6 +939,43 @@ mod tests {
             2,
             "two members (one is survivor)"
         );
+    }
+
+    #[test]
+    fn merge_preserves_scope_kind_and_distinct_claims() {
+        let mut base = make_row("a", vec![1.0, 0.0]);
+        base.text = "The development port is 4317.".into();
+        for variant in 0..3 {
+            let mut other = base.clone();
+            other.memory_id = "b".into();
+            match variant {
+                0 => other.scope = "user".into(),
+                1 => other.kind = "constraint".into(),
+                _ => other.text = "The production port is 4317.".into(),
+            }
+            assert!(
+                find_merge_clusters(&[base.clone(), other], 0.92).is_empty(),
+                "similarity must not erase distinct applicability or a unique claim"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_similarity_chain_cannot_bridge_distant_members() {
+        let mut rows = vec![
+            make_row("a", vec![1.0, 0.0]),
+            make_row("b", vec![0.9396926, 0.3420201]),
+            make_row("c", vec![0.7660444, 0.6427876]),
+        ];
+        for row in &mut rows {
+            row.text = "Identical claim with embedding drift".into();
+        }
+        let clusters = find_merge_clusters(&rows, 0.92);
+        assert!(clusters.iter().all(|c| {
+            c.members
+                .iter()
+                .all(|m| cosine(&c.survivor.embedding, &m.embedding) >= 0.92)
+        }));
     }
 
     #[test]
@@ -1011,7 +1065,7 @@ mod tests {
     // apply_merge (against in-memory SQLite)
     // ------------------------------------------------------------------
     #[test]
-    fn apply_merge_supersedes_members_and_updates_survivor_stats() {
+    fn apply_merge_preserves_evidence_without_counting_copies_as_independent() {
         use kimetsu_core::ids::RunId;
 
         let conn = rusqlite::Connection::open_in_memory().expect("open");
@@ -1024,7 +1078,7 @@ mod tests {
                    (memory_id, scope, kind, text, normalized_text, confidence,
                     provenance_snapshot_json, created_at, use_count, usefulness_score)
                  VALUES (?1,'project','fact',?2,?2,0.9,'{}','2026-01-01T00:00:00Z',?3,?4)",
-                params![id, format!("text {id}"), use_count, score],
+                params![id, "Identical stored claim", use_count, score],
             )
             .expect("insert");
         }
@@ -1033,7 +1087,7 @@ mod tests {
             memory_id: "survivor".to_string(),
             scope: "project".to_string(),
             kind: "fact".to_string(),
-            text: "text survivor".to_string(),
+            text: "Identical stored claim".to_string(),
             use_count: 3,
             usefulness_score: 5.0,
             last_useful_at: None,
@@ -1045,7 +1099,7 @@ mod tests {
             memory_id: "member".to_string(),
             scope: "project".to_string(),
             kind: "fact".to_string(),
-            text: "text member".to_string(),
+            text: "Identical stored claim".to_string(),
             use_count: 2,
             usefulness_score: 2.0,
             last_useful_at: None,
@@ -1070,8 +1124,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .expect("query survivor");
-        assert_eq!(use_count, 5, "use_count = 3 + 2");
-        assert!((score - 7.0).abs() < 0.01, "score = 5.0 + 2.0, got {score}");
+        assert_eq!(
+            use_count, 3,
+            "copying a claim cannot create independent observations"
+        );
+        assert!(
+            (score - 5.0).abs() < 0.01,
+            "keep survivor's evidence, got {score}"
+        );
 
         // Member superseded.
         let superseded_by: Option<String> = conn
@@ -1082,6 +1142,40 @@ mod tests {
             )
             .expect("query member");
         assert_eq!(superseded_by.as_deref(), Some("survivor"));
+    }
+
+    #[test]
+    fn stale_merge_plan_does_not_retire_any_member() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        for id in ["a", "b", "c"] {
+            conn.execute("INSERT INTO memories (memory_id,scope,kind,text,normalized_text,confidence,
+                provenance_snapshot_json,created_at) VALUES (?1,'project','fact','Identical stored claim',
+                'identical stored claim',0.5,'{}','2026-01-01T00:00:00Z')", params![id]).unwrap();
+        }
+        let cluster = MergeCluster {
+            survivor: make_row("a", vec![1.0, 0.0]),
+            members: vec![make_row("b", vec![1.0, 0.0]), make_row("c", vec![1.0, 0.0])],
+        };
+        conn.execute(
+            "UPDATE memories SET text='A corrected distinct claim' WHERE memory_id='c'",
+            [],
+        )
+        .unwrap();
+        assert!(apply_merge(&conn, &cluster, kimetsu_core::ids::RunId::new()).is_err());
+        let retired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 0, "the entire stale plan must roll back");
+        conn.execute("UPDATE memories SET text='Identical stored claim', valid_from='2099-01-01T00:00:00Z' WHERE memory_id='c'", []).unwrap();
+        assert!(
+            apply_merge(&conn, &cluster, kimetsu_core::ids::RunId::new()).is_err(),
+            "identical text with different applicability must not consolidate"
+        );
     }
 
     #[test]
@@ -1098,7 +1192,7 @@ mod tests {
                    (memory_id, scope, kind, text, normalized_text, confidence,
                     provenance_snapshot_json, created_at, use_count, usefulness_score)
                  VALUES (?1,'project','fact',?2,?2,0.9,'{}','2026-01-01T00:00:00Z',1,1.0)",
-                params![id, format!("text {id}")],
+                params![id, "Identical stored claim"],
             )
             .expect("insert memory");
         }
@@ -1116,7 +1210,7 @@ mod tests {
                 memory_id: "survivor".to_string(),
                 scope: "project".to_string(),
                 kind: "fact".to_string(),
-                text: "text survivor".to_string(),
+                text: "Identical stored claim".to_string(),
                 use_count: 1,
                 usefulness_score: 1.0,
                 last_useful_at: None,
@@ -1128,7 +1222,7 @@ mod tests {
                 memory_id: "member".to_string(),
                 scope: "project".to_string(),
                 kind: "fact".to_string(),
-                text: "text member".to_string(),
+                text: "Identical stored claim".to_string(),
                 use_count: 1,
                 usefulness_score: 1.0,
                 last_useful_at: None,
@@ -1342,7 +1436,10 @@ mod tests {
         )
         .expect("run.started");
 
-        for (mid, text) in [("survivor", "text survivor"), ("member", "text member")] {
+        for (mid, text) in [
+            ("survivor", "Identical stored claim"),
+            ("member", "Identical stored claim"),
+        ] {
             projector::apply_events(
                 &conn,
                 &[kimetsu_core::event::Event::new(
@@ -1399,7 +1496,7 @@ mod tests {
                 memory_id: "survivor".to_string(),
                 scope: "project".to_string(),
                 kind: "fact".to_string(),
-                text: "text survivor".to_string(),
+                text: "Identical stored claim".to_string(),
                 use_count: 3,
                 usefulness_score: 5.0,
                 last_useful_at: None,
@@ -1411,7 +1508,7 @@ mod tests {
                 memory_id: "member".to_string(),
                 scope: "project".to_string(),
                 kind: "fact".to_string(),
-                text: "text member".to_string(),
+                text: "Identical stored claim".to_string(),
                 use_count: 2,
                 usefulness_score: 2.0,
                 last_useful_at: None,
@@ -1422,16 +1519,8 @@ mod tests {
         };
         apply_merge(&conn, &cluster, RunId::new()).expect("apply_merge");
 
-        // Capture what the live path produced.  After consolidation:
-        //   survivor.use_count  = 3 (initial) + 2 (delta) = 5 — BUT only
-        //   the delta (2) is event-sourced; the initial 3 was set by
-        //   direct SQL and is wiped by rebuild.  So post-rebuild we expect
-        //   exactly the deltas contributed by the superseded members.
-        //
-        // The invariant we check: whatever consolidation produces MUST
-        // match what rebuild produces.  We capture from the DB rather than
-        // hard-coding so the test stays valid even if the initial SQL seeds
-        // change.
+        // SQL-seeded counters are intentionally not durable. Consolidation
+        // must neither pool those counters nor manufacture replay evidence.
         let (pre_uc, pre_score): (i64, f64) = conn
             .query_row(
                 "SELECT use_count, usefulness_score FROM memories \
@@ -1465,20 +1554,8 @@ mod tests {
             )
             .expect("query survivor after rebuild");
 
-        // The member's delta (use_count=2, score=2.0) must survive rebuild.
-        // pre_uc includes the direct-SQL initial value (3) which rebuild
-        // cannot restore (not event-sourced); we only assert the delta:
-        //   post_uc  ≥ member.use_count (2)
-        //   post_score ≥ member.usefulness_score (2.0)
-        // And more precisely, post_uc == member delta applied to 0 == 2.
-        assert_eq!(
-            post_uc, 2,
-            "post-rebuild: survivor use_count must contain member delta 2 (got {post_uc})"
-        );
-        assert!(
-            (post_score - 2.0).abs() < 0.01,
-            "post-rebuild: survivor score must contain member delta 2.0 (got {post_score})"
-        );
+        assert_eq!(post_uc, 0, "copies cannot manufacture replay evidence");
+        assert_eq!(post_score, 0.0);
 
         let post_cited: String = conn
             .query_row(
@@ -1492,16 +1569,8 @@ mod tests {
             "post-rebuild: citation must still point at survivor (got {post_cited:?})"
         );
 
-        // Bonus: pre_uc/pre_score must also contain the delta (live path
-        // sanity-check so the test still catches regressions there).
-        assert!(
-            pre_uc >= 2,
-            "pre-rebuild: survivor use_count must include member delta ≥2 (got {pre_uc})"
-        );
-        assert!(
-            pre_score >= 2.0,
-            "pre-rebuild: survivor score must include member delta ≥2.0 (got {pre_score})"
-        );
+        assert_eq!(pre_uc, 3);
+        assert_eq!(pre_score, 5.0);
     }
 
     // ------------------------------------------------------------------

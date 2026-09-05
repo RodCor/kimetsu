@@ -1179,20 +1179,10 @@ pub struct IngestionSection {
     /// Precedence: `KIMETSU_DETECT_CONFLICTS` env > this field > default.
     #[serde(default = "default_true")]
     pub detect_conflicts: bool,
-    /// v2.5 Pass B (Story 1.3): enable automatic contradiction resolution.
-    ///
-    /// When true (default), conflicting memory pairs are scored by
-    /// `confidence × recency`.  Clear winners (score gap ≥ 0.15) have the
-    /// loser's `valid_to` stamped to now via `mark_memory_temporal`
-    /// (event-sourced, rebuild-safe).  Near-ties are queued in
-    /// `memory_conflicts` for operator review, same as the v0.5.2 behavior.
-    ///
-    /// Set to false (or set env `KIMETSU_RESOLVE_CONFLICTS=0`) to revert to
-    /// detect-only mode: all conflicts are queued for the operator.
-    ///
-    /// Precedence: `KIMETSU_RESOLVE_CONFLICTS` env > this field > default.
-    /// Resolution only runs when `detect_conflicts` is also enabled.
-    #[serde(default = "default_true")]
+    /// Legacy resolution switch, default false. Both settings now queue
+    /// similarity candidates for explicit review when detection is enabled.
+    /// Neither similarity nor confidence/recency automatically retires a claim.
+    #[serde(default)]
     pub resolve_conflicts: bool,
 
     /// Flagship 2 / Story 2.1: seed a non-zero initial usefulness_score for
@@ -1208,15 +1198,14 @@ pub struct IngestionSection {
     pub initial_importance_scoring: bool,
 
     /// Flagship 2 / Story 2.2: quality-control filter in the distiller.
-    /// Drop lessons that are near-duplicates (cosine ≥ threshold), too long,
-    /// too short, or contain transience markers.  Default true.
+    /// Drop exact duplicates, overlong/short lessons and unbounded temporary
+    /// lessons. Similar corrections and temporally bounded workarounds pass.
     /// `#[serde(default = "default_true")]` keeps older configs loading cleanly.
     #[serde(default = "default_true")]
     pub quality_filter_enabled: bool,
 
-    /// Flagship 2 / Story 2.2: novelty threshold — cosine ≥ this value → DROP.
-    /// Default 0.9.  `#[serde(default)]` keeps older configs loading cleanly
-    /// (they get the default via the `Default` impl).
+    /// Legacy field retained for config compatibility; ignored. Cosine
+    /// similarity cannot safely prove a lesson duplicates an existing claim.
     #[serde(default = "default_quality_filter_novelty_threshold")]
     pub quality_filter_novelty_threshold: f32,
 
@@ -1229,6 +1218,14 @@ pub struct IngestionSection {
     /// Lessons longer than this are dropped.  Default 500.
     #[serde(default = "default_quality_filter_max_len")]
     pub quality_filter_max_len: usize,
+    /// Lifetime assigned to temporary lessons without an explicit expiry.
+    /// Default seven days; zero disables assignment, maximum applied is 365 days.
+    #[serde(default = "default_transient_ttl_days")]
+    pub transient_ttl_days: u32,
+}
+
+fn default_transient_ttl_days() -> u32 {
+    7
 }
 
 fn default_quality_filter_novelty_threshold() -> f32 {
@@ -1248,12 +1245,13 @@ impl Default for IngestionSection {
             extra_skip_dirs: Vec::new(),
             max_total_files: 50_000,
             detect_conflicts: true,
-            resolve_conflicts: true,
+            resolve_conflicts: false,
             initial_importance_scoring: true,
             quality_filter_enabled: true,
             quality_filter_novelty_threshold: default_quality_filter_novelty_threshold(),
             quality_filter_min_len: default_quality_filter_min_len(),
             quality_filter_max_len: default_quality_filter_max_len(),
+            transient_ttl_days: default_transient_ttl_days(),
         }
     }
 }
@@ -1355,7 +1353,7 @@ pub struct LifecycleSection {
     pub forget_usefulness_floor: f32,
 
     /// Evergreen protection threshold. Memories with
-    /// `use_count >= forget_protect_use_count` are NEVER archived regardless
+    /// Non-negative memories with `use_count >= forget_protect_use_count` are protected regardless
     /// of their usefulness ratio. Default 10.
     #[serde(default = "default_forget_protect_use_count")]
     pub forget_protect_use_count: u32,

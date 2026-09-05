@@ -176,7 +176,20 @@ fn read_events_ordered(conn: &Connection) -> KimetsuResult<Vec<Event>> {
 }
 
 pub fn apply_events(conn: &Connection, events: &[Event]) -> KimetsuResult<()> {
+    apply_events_checked(conn, events, |_| Ok(()))
+}
+
+/// Validate a read-derived plan under the same write lock as its events.
+pub(crate) fn apply_events_checked<F>(
+    conn: &Connection,
+    events: &[Event],
+    mut validate: F,
+) -> KimetsuResult<()>
+where
+    F: FnMut(&Connection) -> KimetsuResult<()>,
+{
     with_write_txn(conn, |c| {
+        validate(c)?;
         for event in events {
             apply_event(c, event)?;
         }

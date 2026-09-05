@@ -1271,16 +1271,10 @@ pub enum ProposeResult {
     Duplicate(String), // memory_id of the identical existing memory
 }
 
-/// v0.7: capture a lesson, automatically deduplicating against the existing brain.
-///
-/// Decision tree:
-/// 1. Exact normalized-text match → `Duplicate` (no write).
-/// 2. Cosine similarity ≥ 0.85 with an existing memory → `Merged` (append & re-embed).
-/// 3. confidence ≥ 0.7 and no close match → `Added` (direct acceptance).
-/// 4. confidence < 0.7 → `Proposed` (pending for human review).
-///
-/// Step 2 only fires when the embedder is active (bge-small or similar). In lean builds
-/// the cosine scan returns nothing and the function falls through to step 3/4.
+/// Capture a lesson without combining semantically similar claims. Exact
+/// duplicates reuse an ID; confidence >= 0.7 accepts a distinct claim, while
+/// lower-confidence lessons remain proposals. Similarity candidates are queued
+/// by the ordinary ingestion path for explicit review.
 pub fn propose_or_merge_memory(
     start: &Path,
     scope: MemoryScope,
@@ -1296,9 +1290,8 @@ pub fn propose_or_merge_memory(
     let text = redaction.text.as_str();
 
     // Step 1: exact normalized-text dedup (same as add_memory).
-    // W3.1: load config here so Step 2 can use open_embedder_for.
-    let (_, config, _) = {
-        let (paths, config, ro_conn) = load_project_readonly(start)?;
+    {
+        let (_, _, ro_conn) = load_project_readonly(start)?;
         let normalized = normalize_memory_text(text);
         let existing: Option<String> = ro_conn
             .query_row(
@@ -1314,48 +1307,9 @@ pub fn propose_or_merge_memory(
         if let Some(id) = existing {
             return Ok(ProposeResult::Duplicate(id));
         }
-        (paths, config, ro_conn)
-    };
-
-    // Step 2: semantic dedup — look for a high-cosine existing memory.
-    // W3.1: route through open_embedder_for so `[embedder] enabled = false`
-    // skips cosine dedup (NoopEmbedder → find_potential_conflicts returns 0).
-    // v1.0: honor the [ingestion] detect_conflicts off-switch so bulk-seeding
-    // skips the cosine scan (find_potential_conflicts returns empty → no merge).
-    let embedder = embeddings::open_embedder_for(config.embedder.enabled);
-    {
-        let (_, _, ro_conn) = load_project_readonly(start)?;
-        let conflicts = if conflict::conflict_detection_enabled(config.ingestion.detect_conflicts) {
-            conflict::find_potential_conflicts(&ro_conn, &scope, text, embedder, 1, 0.85)?
-        } else {
-            Vec::new()
-        };
-        if let Some(hit) = conflicts.into_iter().next() {
-            // Append the new lesson to the existing memory and re-embed it.
-            let (paths, _config, conn) = load_project(start)?;
-            let run_id = RunId::new();
-            let _lock = ProjectLock::acquire(&paths, "memory merge", Some(run_id))?;
-            let merged_text = format!("{}\n\nAlso: {text}", hit.existing_text);
-            let new_normalized = normalize_memory_text(&merged_text);
-            conn.execute(
-                "UPDATE memories
-                 SET text = ?1, normalized_text = ?2, use_count = use_count + 1
-                 WHERE memory_id = ?3",
-                rusqlite::params![merged_text, new_normalized, hit.existing_memory_id],
-            )?;
-            // Return value not needed — no conflict scan after a merge.
-            embeddings::embed_and_persist(&conn, &hit.existing_memory_id, &merged_text, embedder)?;
-            // v2.6: the merged text may carry entities the survivor did not
-            // have, so reproject and re-link. Skipping this would leave the
-            // absorbed lesson unreachable through the graph even though its
-            // words are now in the corpus.
-            let _ = crate::graph::project_entities(&conn, &hit.existing_memory_id, &merged_text);
-            link_memory_into_graph(&conn, &hit.existing_memory_id);
-            return Ok(ProposeResult::Merged(hit.existing_memory_id));
-        }
     }
 
-    // Step 3/4: no close match found — accept or propose based on confidence.
+    // Related claims can disagree. Never append them or inflate use counts.
     if confidence >= 0.7 {
         let memory_id = add_memory(start, scope, kind, text)?;
         Ok(ProposeResult::Added(memory_id))
@@ -2343,6 +2297,59 @@ mod tests {
     /// (e.g. a developer's `$HOME` git repo) — which would otherwise
     /// make parallel tests share one brain.db + project.lock. Without
     /// this, tests pass only when `TMP` points outside any git repo.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[ignore = "requires a cached local embedding model"]
+    fn similar_ingested_correction_preserves_both_claims_and_rebuild() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).unwrap();
+            let old = "For the Atlas integration service in the local staging environment, the HTTP listener uses port 4317 and binds to localhost.";
+            let new = "For the Atlas integration service in the local staging environment, the HTTP listener uses port 4318 and binds to localhost.";
+            let id = add_memory(&root, MemoryScope::Project, MemoryKind::Fact, old).unwrap();
+            let (_, config, conn) = load_project(&root).unwrap();
+            let embedder = embeddings::open_embedder_for(config.embedder.enabled);
+            assert!(
+                !embedder.is_noop(),
+                "this regression requires real semantic candidates"
+            );
+            let hits = conflict::find_potential_conflicts(
+                &conn,
+                &MemoryScope::Project,
+                new,
+                embedder,
+                1,
+                0.85,
+            )
+            .unwrap();
+            assert!(
+                !hits.is_empty(),
+                "fixture must trigger the former semantic merge"
+            );
+            assert!(matches!(
+                propose_or_merge_memory(
+                    &root,
+                    MemoryScope::Project,
+                    MemoryKind::Fact,
+                    new,
+                    0.9,
+                    "port correction"
+                )
+                .unwrap(),
+                ProposeResult::Added(_)
+            ));
+            let stored: String = conn
+                .query_row("SELECT text FROM memories WHERE memory_id=?1", [&id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(stored, old);
+            projector::rebuild_in_place(&conn).unwrap();
+            let count: i64 = conn.query_row("SELECT count(*) FROM memories WHERE text IN (?1,?2) AND invalidated_at IS NULL", [old,new], |r| r.get(0)).unwrap();
+            assert_eq!(count, 2);
+        });
+    }
+
     fn test_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
         kimetsu_core::paths::git_init_boundary(&root);

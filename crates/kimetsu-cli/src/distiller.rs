@@ -125,8 +125,6 @@ pub fn parse_lessons(text: &str) -> Vec<Lesson> {
 /// Configuration for the quality gate applied to distilled lessons.
 #[derive(Debug, Clone)]
 pub struct QualityGateConfig {
-    /// Cosine similarity ≥ this threshold → DROP (near-duplicate).  Default 0.9.
-    pub novelty_threshold: f32,
     /// Minimum lesson length in chars after trim.  Default 10.
     pub min_len: usize,
     /// Maximum lesson length in chars after trim.  Default 500.
@@ -136,7 +134,6 @@ pub struct QualityGateConfig {
 impl Default for QualityGateConfig {
     fn default() -> Self {
         Self {
-            novelty_threshold: 0.9,
             min_len: 10,
             max_len: 500,
         }
@@ -165,14 +162,14 @@ static TRANSIENCE_MARKERS: &[&str] = &[
 ///
 /// Checks (in order):
 /// 1. Length: < min_len or > max_len → DROP.
-/// 2. Transience: contains a transience marker → DROP.
-/// 3. Novelty: cosine to corpus ≥ novelty_threshold → DROP.
-///    Skipped when no embedder is active (graceful degradation).
+/// 2. Transience: markers require a future expiry.
+/// 3. Exact duplicates within scope and kind are dropped. Similarity alone
+///    cannot prove that a lesson duplicates an existing claim.
 pub fn quality_gate(
     lesson: &Lesson,
     conn: Option<&rusqlite::Connection>,
     scope: &MemoryScope,
-    embedder: &dyn kimetsu_brain::embeddings::Embedder,
+    _embedder: &dyn kimetsu_brain::embeddings::Embedder,
     config: &QualityGateConfig,
 ) -> QualityGateVerdict {
     let text = lesson.lesson.trim();
@@ -193,91 +190,51 @@ pub fn quality_gate(
     // 2. Transience check.
     let lower = text.to_ascii_lowercase();
     for marker in TRANSIENCE_MARKERS {
-        if lower.contains(marker) {
+        let expires = lesson
+            .valid_to
+            .as_deref()
+            .and_then(|s| {
+                time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+            })
+            .is_some_and(|end| end > time::OffsetDateTime::now_utc());
+        if lower.contains(marker) && !expires {
             return QualityGateVerdict::Drop {
                 reason: format!("transient marker found: {marker:?}"),
             };
         }
     }
 
-    // 3. Novelty check (requires embedder + DB connection).
-    if !embedder.is_noop() {
-        if let Some(conn) = conn {
-            if let Ok(vec) = embedder.embed(text) {
-                if !vec.is_empty() {
-                    // Check against corpus memories of the same scope.
-                    let scope_str = scope.to_string();
-                    let max_cos =
-                        max_cosine_to_scope(conn, &vec, &scope_str, config.novelty_threshold);
-                    if max_cos >= config.novelty_threshold {
-                        return QualityGateVerdict::Drop {
-                            reason: format!(
-                                "near-duplicate (cosine {max_cos:.3} ≥ threshold {:.3})",
-                                config.novelty_threshold
-                            ),
-                        };
-                    }
-                }
-            }
+    // Similarity does not establish duplicate meaning. An exact stored claim is
+    // the only deterministic reason to drop a candidate here; corrections pass.
+    if let Some(conn) = conn {
+        let normalized = kimetsu_core::memory::normalize_memory_text(text);
+        let duplicate = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE scope=?1 AND normalized_text=?2
+             AND text=?3 AND kind=?4 AND invalidated_at IS NULL AND superseded_by IS NULL)",
+            rusqlite::params![
+                scope.to_string(),
+                normalized,
+                text,
+                lesson_memory_kind(&lesson.kind).to_string()
+            ],
+            |r| r.get::<_, bool>(0),
+        );
+        if matches!(duplicate, Ok(true)) {
+            return QualityGateVerdict::Drop {
+                reason: "exact duplicate".into(),
+            };
         }
     }
 
     QualityGateVerdict::Pass
 }
 
-/// Scan the corpus for the highest cosine similarity to `query_vec` within
-/// `scope`.  Returns 0.0 on any error or when no embeddings exist.
-/// Stops early once a value ≥ `threshold` is found (short-circuit).
-fn max_cosine_to_scope(
-    conn: &rusqlite::Connection,
-    query_vec: &[f32],
-    scope: &str,
-    threshold: f32,
-) -> f32 {
-    let mut stmt = match conn.prepare(
-        "SELECT embedding FROM memories
-         WHERE scope = ?1
-           AND invalidated_at IS NULL
-           AND superseded_by IS NULL
-           AND embedding IS NOT NULL
-         ORDER BY created_at DESC
-         LIMIT 500",
-    ) {
-        Ok(s) => s,
-        Err(_) => return 0.0,
-    };
-    let rows = match stmt.query_map(rusqlite::params![scope], |row| row.get::<_, Vec<u8>>(0)) {
-        Ok(r) => r,
-        Err(_) => return 0.0,
-    };
-    let mut max_cos: f32 = 0.0;
-    for row in rows.flatten() {
-        if let Ok(vec) = kimetsu_brain::embeddings::decode_embedding(&row, None) {
-            if vec.len() == query_vec.len() {
-                let cos = cosine_for_gate(query_vec, &vec);
-                if cos > max_cos {
-                    max_cos = cos;
-                }
-                if max_cos >= threshold {
-                    return max_cos; // short-circuit
-                }
-            }
-        }
+fn lesson_memory_kind(kind: &str) -> MemoryKind {
+    match kind {
+        "anti_pattern" => MemoryKind::FailurePattern,
+        "convention" => MemoryKind::Convention,
+        _ => MemoryKind::Fact,
     }
-    max_cos
-}
-
-fn cosine_for_gate(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na < f32::EPSILON || nb < f32::EPSILON {
-        return 0.0;
-    }
-    (dot / (na * nb)).clamp(-1.0, 1.0)
 }
 
 /// Ask the model to distill lessons from a transcript view. Returns empty
@@ -466,7 +423,7 @@ pub fn distill_and_record(
     // Flagship 2 / Story 2.2: load config + open project DB for quality gate.
     // Best-effort: if config/DB can't be opened, quality gate runs in
     // degraded mode (no novelty check, only length + transience).
-    let (gate_config, gate_conn) = {
+    let (gate_config, gate_conn, transient_ttl_days) = {
         let paths_ok = kimetsu_core::paths::ProjectPaths::discover(start).ok();
         let cfg_opt = paths_ok
             .as_ref()
@@ -474,14 +431,12 @@ pub fn distill_and_record(
         let gate_config = cfg_opt
             .as_ref()
             .map_or_else(QualityGateConfig::default, |cfg| QualityGateConfig {
-                novelty_threshold: cfg.ingestion.quality_filter_novelty_threshold,
                 min_len: cfg.ingestion.quality_filter_min_len,
                 max_len: cfg.ingestion.quality_filter_max_len,
             });
         let quality_enabled = cfg_opt
             .as_ref()
             .is_none_or(|cfg| cfg.ingestion.quality_filter_enabled);
-        let embedder_enabled = cfg_opt.as_ref().is_none_or(|cfg| cfg.embedder.enabled);
         let conn_opt: Option<rusqlite::Connection> = if quality_enabled {
             paths_ok
                 .as_ref()
@@ -489,22 +444,48 @@ pub fn distill_and_record(
         } else {
             None
         };
-        let embedder = kimetsu_brain::embeddings::open_embedder_for(embedder_enabled);
+        let transient_ttl_days = cfg_opt
+            .as_ref()
+            .map_or(7, |cfg| cfg.ingestion.transient_ttl_days);
         (
             if quality_enabled {
-                Some((gate_config, embedder))
+                Some(gate_config)
             } else {
                 None
             },
             conn_opt,
+            transient_ttl_days,
         )
     };
 
     let mut recorded = 0;
-    for lesson in distill_lessons(view, provider) {
+    for mut lesson in distill_lessons(view, provider) {
+        // Temporary evidence is retained with an explicit lifetime. Existing
+        // authored bounds win; zero disables automatic TTL assignment.
+        if lesson.valid_to.is_none()
+            && transient_ttl_days > 0
+            && TRANSIENCE_MARKERS
+                .iter()
+                .any(|m| lesson.lesson.to_ascii_lowercase().contains(m))
+        {
+            let now = time::OffsetDateTime::now_utc();
+            lesson.valid_from.get_or_insert_with(|| {
+                now.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            });
+            lesson.valid_to = (now + time::Duration::days(i64::from(transient_ttl_days.min(365))))
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok();
+        }
         // Flagship 2 / Story 2.2: apply quality gate.
-        if let Some((ref qcfg, embedder)) = gate_config {
-            let verdict = quality_gate(&lesson, gate_conn.as_ref(), &scope, embedder, qcfg);
+        if let Some(ref qcfg) = gate_config {
+            let verdict = quality_gate(
+                &lesson,
+                gate_conn.as_ref(),
+                &scope,
+                &kimetsu_brain::embeddings::NoopEmbedder,
+                qcfg,
+            );
             if let QualityGateVerdict::Drop { reason } = verdict {
                 eprintln!("kimetsu-distiller: quality gate dropped lesson: {reason}");
                 continue;
@@ -512,11 +493,7 @@ pub fn distill_and_record(
         }
 
         // Mirror kimetsu_brain_record's MCP kind mapping; semantic_operator + default store as Fact.
-        let kind = match lesson.kind.as_str() {
-            "anti_pattern" => MemoryKind::FailurePattern,
-            "convention" => MemoryKind::Convention,
-            _ => MemoryKind::Fact,
-        };
+        let kind = lesson_memory_kind(&lesson.kind);
         let text = lesson.lesson.trim();
         // Capture temporal fields before moving `lesson`.
         let valid_from = lesson.valid_from.clone();
@@ -537,7 +514,8 @@ pub fn distill_and_record(
             .ok()
             .and_then(|r| match r {
                 project::ProposeResult::Added(id) | project::ProposeResult::Merged(id) => Some(id),
-                project::ProposeResult::Duplicate(id) => Some(id),
+                // A repeated observation must not rewrite an existing claim's validity.
+                project::ProposeResult::Duplicate(_) => None,
                 project::ProposeResult::Proposed(_) => None,
             }),
         };
@@ -1310,7 +1288,8 @@ mod tests {
         kimetsu_brain::user_brain::with_user_brain_disabled(|| {
             kimetsu_brain::project::init_project(&root, true).expect("init brain");
             let mut provider = MockProvider::new([text_response(
-                "[{\"lesson\":\"Set USERPROFILE for global installs\",\"tags\":[\"cargo\",\"windows\"],\"confidence\":0.9}]",
+                r#"[{"lesson":"Set USERPROFILE for global installs","tags":["cargo","windows"],"confidence":0.9},
+                    {"lesson":"Temporarily disable the cache for integration tests on version 3.1","confidence":0.9}]"#,
             )]);
             let n = distill_and_record(
                 &root,
@@ -1318,11 +1297,29 @@ mod tests {
                 &mut provider,
                 MemoryScope::Project,
             );
-            assert_eq!(n, 1);
+            assert_eq!(n, 2);
             let memories = kimetsu_brain::project::list_memories(&root).expect("list");
             assert!(
                 memories.iter().any(|m| m.text.contains("USERPROFILE")),
                 "distilled lesson was recorded"
+            );
+            let (_, _, conn) = project::load_project(&root).unwrap();
+            let expiry: String = conn
+                .query_row(
+                    "SELECT valid_to FROM memories WHERE text LIKE 'Temporarily%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let end = time::OffsetDateTime::parse(
+                &expiry,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            let remaining = (end - time::OffsetDateTime::now_utc()).whole_days();
+            assert!(
+                (0..=30).contains(&remaining),
+                "temporary lesson needs a bounded lifetime"
             );
         });
 
@@ -1683,6 +1680,46 @@ mod tests {
             novel,
             QualityGateVerdict::Pass,
             "novel lesson must pass the novelty gate"
+        );
+    }
+
+    #[test]
+    fn quality_gate_preserves_similar_corrections_and_bounded_workarounds() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        kimetsu_brain::projector::ensure_schema(&conn).unwrap();
+        seed_embedded_memory(&conn, "old", "project", "Service alpha calls service beta.");
+        let stub = kimetsu_brain::embeddings::StubEmbedder::new();
+        let corrected = lesson_with("Service beta calls service alpha.");
+        // Force identical vectors for opposite-direction claims: high cosine
+        // must never be the sole reason to discard a correction.
+        let vector = kimetsu_brain::embeddings::Embedder::embed(&stub, &corrected.lesson).unwrap();
+        conn.execute(
+            "UPDATE memories SET embedding=?1 WHERE memory_id='old'",
+            rusqlite::params![kimetsu_brain::embeddings::encode_embedding(&vector)],
+        )
+        .unwrap();
+        assert_eq!(
+            quality_gate(
+                &corrected,
+                Some(&conn),
+                &MemoryScope::Project,
+                &stub,
+                &QualityGateConfig::default()
+            ),
+            QualityGateVerdict::Pass
+        );
+        let mut temporary =
+            lesson_with("Temporarily disable the cache for this version's integration tests.");
+        temporary.valid_to = Some("2099-01-01T00:00:00Z".into());
+        assert_eq!(
+            quality_gate(
+                &temporary,
+                None,
+                &MemoryScope::Project,
+                &stub,
+                &QualityGateConfig::default()
+            ),
+            QualityGateVerdict::Pass
         );
     }
 }
