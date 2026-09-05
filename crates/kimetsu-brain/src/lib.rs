@@ -54,3 +54,6 @@ pub mod tune;
 pub mod tuneset;
 pub mod user_brain;
 pub mod user_profile;
+
+#[cfg(test)]
+mod hardening_evidence_tests;

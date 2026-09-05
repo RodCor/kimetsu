@@ -244,6 +244,24 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Forget(args) => brain_forget(args),
+        BrainCommand::Archives => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&kimetsu_brain::lifecycle::list_archived(
+                    &env::current_dir()?
+                )?)?
+            );
+            Ok(())
+        }
+        BrainCommand::Restore { memory_id } => {
+            let restored =
+                kimetsu_brain::lifecycle::restore_memory(&env::current_dir()?, &memory_id)?;
+            println!(
+                "{}",
+                serde_json::json!({"memory_id":memory_id,"restored":restored})
+            );
+            Ok(())
+        }
         BrainCommand::Cite(args) => brain_cite(args),
         BrainCommand::Reinforce(args) => brain_reinforce(args),
         BrainCommand::BenchmarkCredit(args) => brain_benchmark_credit(args),
@@ -542,7 +560,19 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
     // below: a brain with nothing to say still needs its upkeep.
     spawn_maintenance_if_due(workspace);
 
-    let Some(additional_context) = warm_start_context(workspace) else {
+    let mut input = String::new();
+    use std::io::Read;
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let payload: serde_json::Value = serde_json::from_str(input.trim()).unwrap_or_default();
+    let identity = payload
+        .get("task_id")
+        .or_else(|| payload.get("session_id"))
+        .or_else(|| payload.get("worktree_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Some(additional_context) =
+        kimetsu_brain::digest::warm_start_block_scoped(workspace, identity)
+    else {
         return Ok(());
     };
 
@@ -556,15 +586,6 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
     });
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
-}
-
-/// Assemble the warm-start block: repo digest + episodic resume.
-///
-/// Thin wrapper over [`kimetsu_brain::digest::warm_start_block`], which the
-/// MCP server shares so Cursor — no hooks, no session-start surface — gets the
-/// same block on its first `kimetsu_brain_context` call.
-pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
-    kimetsu_brain::digest::warm_start_block(workspace)
 }
 
 /// Normalize a user-supplied time into RFC 3339.
@@ -697,12 +718,12 @@ pub(crate) fn brain_audit(args: AuditArgs) -> KimetsuResult<()> {
     println!();
     println!(
         "{:<12} {:>8} {:>14} {:>9}",
-        "origin", "total", "corroborated", "unvetted"
+        "origin", "total", "associated", "unvetted"
     );
     for group in &report.groups {
         println!(
             "{:<12} {:>8} {:>14} {:>9}",
-            group.provenance, group.total, group.corroborated, group.unvetted
+            group.provenance, group.total, group.associated, group.unvetted
         );
     }
 
@@ -2336,7 +2357,12 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         let entries = per_memory_roi(&conn, window, limit)?;
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&entries)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"estimate_label":report.estimate_label,"model":report.model,"assumptions":report.assumptions,"memories":entries})
+                )?
+            );
             return Ok(());
         }
 
@@ -2344,13 +2370,13 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
             Some(d) => format!("last {d} days"),
             None => "all time".to_string(),
         };
-        println!("── ROI Top Memories ({window_label}, top {limit}) ─────");
+        println!("── Estimated ROI Top Memories ({window_label}, top {limit}) ─────");
         if entries.is_empty() {
             println!("  No citations recorded yet.");
         } else {
             for (i, e) in entries.iter().enumerate() {
                 println!(
-                    "  #{:>2}  [{:>15}]  cites={:>3}  saved={:>6} tok  {}",
+                    "  #{:>2}  [{:>15}]  cites={:>3}  estimated_saved={:>6} tok  {}",
                     i + 1,
                     e.kind,
                     e.citation_count,
@@ -2378,7 +2404,14 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         Some(d) => format!("last {d} days"),
         None => "all time".to_string(),
     };
-    println!("── ROI Ledger ({window_label}) ────────────────────────");
+    println!("── Estimated ROI Ledger ({window_label}) ────────────────────────");
+    println!("  {}", report.estimate_label);
+    println!("  model: {}", report.model);
+    println!("  assumptions: {}", report.assumptions);
+    println!(
+        "  delivered cost by unit: {:?}",
+        report.delivered_cost_by_unit
+    );
     println!("  served events:        {}", report.served_events);
     // S2.4(c): show warm-start events.
     if report.digest_served_events > 0 || report.resume_served_events > 0 {
@@ -2391,7 +2424,7 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     }
     println!("  citations:            {}", report.citations);
     println!(
-        "  injected tokens:      {}",
+        "  overhead estimate:      {}",
         format_token_count(report.injected_tokens)
     );
     // S2.4(b): output token estimate.
@@ -2404,7 +2437,10 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         format_token_count(report.estimated_saved_tokens)
     );
     let net_sign = if report.net_tokens >= 0 { "+" } else { "" };
-    println!("  net tokens:           {net_sign}{}", report.net_tokens);
+    println!(
+        "  estimated net tokens:           {net_sign}{}",
+        report.net_tokens
+    );
 
     if let Some(ref usd) = report.usd {
         println!(
@@ -2435,12 +2471,12 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     } else if report.net_tokens >= 0 {
         match &report.usd {
             Some(u) if u.net >= 0.0 => println!(
-                "  Net positive: kimetsu saved you ~{} tokens (~${:.4}) this window.",
+                "  Model estimate: potential savings ~{} tokens (~${:.4}) this window.",
                 format_token_count(report.estimated_saved_tokens),
                 u.net,
             ),
             _ => println!(
-                "  Net positive: kimetsu saved you ~{} tokens this window.",
+                "  Model estimate: potential savings ~{} tokens this window.",
                 format_token_count(report.estimated_saved_tokens),
             ),
         }
@@ -2448,7 +2484,7 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         // Honest negative.
         match &report.usd {
             Some(u) => println!(
-                "  Net negative: brain overhead exceeded savings by ~{} tokens (~${:.4}) this window.",
+                "  Model estimate: overhead exceeds assumed savings by ~{} tokens (~${:.4}) this window.",
                 format_token_count(
                     report
                         .injected_tokens
@@ -2457,7 +2493,7 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
                 (u.spent - u.saved).abs(),
             ),
             None => println!(
-                "  Net negative: brain overhead exceeded savings by ~{} tokens this window.",
+                "  Model estimate: overhead exceeds assumed savings by ~{} tokens this window.",
                 format_token_count(
                     report
                         .injected_tokens
@@ -3625,22 +3661,28 @@ pub(crate) fn brain_benchmark_credit(args: BenchmarkCreditArgs) -> KimetsuResult
     let workspace = args
         .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
-    let credited = kimetsu_brain::reinforce::credit_benchmark_outcome(
-        &workspace,
-        &args.task,
-        args.passed,
-        args.top_k,
-    )?;
+    let credited = if let Some(exposure) = args.exposure_id.as_deref() {
+        project::record_exposure_outcome(
+            &workspace,
+            exposure,
+            if args.passed {
+                Some(true)
+            } else if args.failed {
+                Some(false)
+            } else {
+                None
+            },
+        )?
+    } else {
+        kimetsu_brain::reinforce::credit_benchmark_outcome(
+            &workspace,
+            &args.task,
+            args.passed,
+            args.top_k,
+        )?
+    };
     println!(
-        "benchmark-credit: {} memor{} cited for task \"{}\" ({})",
-        credited,
-        if credited == 1 { "y" } else { "ies" },
-        args.task,
-        if args.passed {
-            "passed"
-        } else {
-            "not passed — no citation"
-        }
+        "benchmark-credit: {credited} delivered memories associated with explicit outcome; no citations or verification inferred"
     );
     Ok(())
 }
@@ -4093,6 +4135,7 @@ pub(crate) fn brain_ask(args: AskArgs) -> KimetsuResult<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
                 "question": question,
+                "exposure_id": result.exposure_id,
                 "answer": result.answer,
                 "citations": result.citations,
                 "grounded": result.grounded,

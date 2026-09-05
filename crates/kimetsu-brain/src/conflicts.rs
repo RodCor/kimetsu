@@ -57,11 +57,7 @@ pub fn list_conflicts(start: &Path, limit: u32) -> KimetsuResult<Vec<ScopedConfl
 /// "not found" fall through to user. Returns Ok(true) if a row was
 /// updated.
 ///
-/// We deliberately don't emit a `memory.invalidated` trace event here
-/// even though `kept_new` / `kept_existing` invalidates one side. The
-/// `memory_conflicts` row IS the audit trail; double-recording would
-/// duplicate state across two systems. Operators who want the trace-
-/// event-style record can use `kimetsu brain memory invalidate` instead.
+/// The explicit decision and losing-side retirement are one durable transaction.
 pub fn resolve_conflict(start: &Path, conflict_id: &str, resolution: &str) -> KimetsuResult<bool> {
     let (paths, config, project_conn) = load_project(start)?;
     let _lock = ProjectLock::acquire(&paths, "brain memory conflict resolve", None)?;

@@ -114,6 +114,11 @@ fn migrations() -> &'static [Migration] {
             description: "preserve proposal temporal applicability",
             up: crate::schema::migrate_v12_to_v13,
         },
+        Migration {
+            version: 14,
+            description: "scope work episodes by explicit identity",
+            up: crate::schema::migrate_v13_to_v14,
+        },
     ]
 }
 

@@ -185,6 +185,9 @@ fn is_stale_inner(workspace: &Path) -> KimetsuResult<bool> {
 /// Records ROI attribution as a side effect, so call it only when the block is
 /// actually going to be emitted.
 pub fn warm_start_block(workspace: &Path) -> Option<String> {
+    warm_start_block_scoped(workspace, "")
+}
+pub fn warm_start_block_scoped(workspace: &Path, identity: &str) -> Option<String> {
     // Gate: load warm_start from config (best-effort; default ON).
     let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
         .ok()
@@ -204,7 +207,7 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
         }
         None => build_or_load_digest(workspace, false),
     };
-    let resume = crate::episode::render_resume_context(workspace);
+    let resume = crate::episode::render_resume_context_scoped(workspace, identity);
 
     // v2.6: the user's standing preferences, delivered rather than retrieved.
     //

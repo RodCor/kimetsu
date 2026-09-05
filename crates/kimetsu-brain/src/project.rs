@@ -5986,7 +5986,8 @@ max_total_cost_usd = 250.0
         let mut telemetry = Event::new(RunId::new(), "context.served", serde_json::json!({}));
         telemetry.ts = time::OffsetDateTime::from_unix_timestamp(946684800).unwrap();
         crate::projector::apply_events(&conn, &[telemetry]).unwrap();
-        conn.execute("UPDATE events SET ts='2000-01-01T00:00:00Z'", []).unwrap();
+        conn.execute("UPDATE events SET ts='2000-01-01T00:00:00Z'", [])
+            .unwrap();
     }
 
     /// A successful rebuild must preserve the memory, not merely avoid errors.
@@ -6012,8 +6013,13 @@ max_total_cost_usd = 250.0
             let replayed =
                 rebuild_projection(&root, false).expect("rebuild_projection after event trim");
             assert!(replayed > 0, "durable claim history must survive trim");
-            assert!(list_memories(&root).unwrap().iter().any(|m| m.memory_id == mid),
-                "compaction followed by rebuild erased the memory");
+            assert!(
+                list_memories(&root)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.memory_id == mid),
+                "compaction followed by rebuild erased the memory"
+            );
         });
     }
 

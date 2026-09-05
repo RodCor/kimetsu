@@ -75,7 +75,15 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
     // gets the identical block from `brain session-start-hook`.
     let warm_start_block = if args.warm_on_first_prompt && state.warm_started_unix == 0 {
-        warm_start_context(&workspace)
+        kimetsu_brain::digest::warm_start_block_scoped(
+            &workspace,
+            hook_payload
+                .as_ref()
+                .and_then(|p| p.get("task_id"))
+                .and_then(|v| v.as_str())
+                .or(session_id.as_deref())
+                .unwrap_or(""),
+        )
     } else {
         None
     };
@@ -1195,7 +1203,14 @@ fn record_hook_delivery(
     );
     payload["session_id"] = serde_json::json!(session_id);
     payload["surface"] = serde_json::json!(surface);
-    let _ = project::log_telemetry_event(workspace, "context.injected", payload);
+    payload["cost_unit"] = serde_json::json!("rendered_utf8_bytes");
+    let mut exposure = kimetsu_core::event::Event::new(
+        kimetsu_core::ids::RunId::new(),
+        "context.injected",
+        payload,
+    );
+    exposure.payload["exposure_id"] = serde_json::json!(exposure.event_id.to_string());
+    let _ = project::record_context_exposure(workspace, &exposure);
 }
 
 pub(crate) fn proactive_header(event: ProactiveEvent, loop_mode: bool) -> &'static str {

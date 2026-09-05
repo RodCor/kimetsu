@@ -37,7 +37,7 @@ fn is_sqlite_busy(err: &(dyn std::error::Error + 'static)) -> bool {
 /// confidence) never interleave across writers. Retries the whole transaction on
 /// `SQLITE_BUSY`/`LOCKED` (which can only occur at `BEGIN`). `&Connection` can't
 /// use `transaction_with_behavior`, so the transaction is driven manually.
-fn with_write_txn<F>(conn: &Connection, mut body: F) -> KimetsuResult<()>
+pub(crate) fn with_write_txn<F>(conn: &Connection, mut body: F) -> KimetsuResult<()>
 where
     F: FnMut(&Connection) -> KimetsuResult<()>,
 {
@@ -122,13 +122,19 @@ fn replay_locked(conn: &Connection) -> KimetsuResult<usize> {
         // preserving every explicitly supplied map (including empty maps).
         let bound = bind_injected_revisions(conn, event)?;
         if matches!(&bound, Cow::Owned(_)) {
-            conn.execute("UPDATE events SET payload_json=?2 WHERE event_id=?1",
-                params![event.event_id.to_string(), serde_json::to_string(&bound.payload)?])?;
+            conn.execute(
+                "UPDATE events SET payload_json=?2 WHERE event_id=?1",
+                params![
+                    event.event_id.to_string(),
+                    serde_json::to_string(&bound.payload)?
+                ],
+            )?;
         }
         project_event(conn, bound.as_ref())?;
     }
     let mut stmt = conn.prepare("SELECT memory_id FROM memories")?;
-    let restored = stmt.query_map([], |r| r.get::<_, String>(0))?
+    let restored = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
     let missing = existing.difference(&restored).count();
     if missing > 0 {
@@ -253,7 +259,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
     Ok(())
 }
 
-fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+pub(crate) fn apply_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let event = redact_memory_event(event);
     let event = bind_injected_revisions(conn, event.as_ref())?;
     let event = event.as_ref();
@@ -281,6 +287,8 @@ fn project_event(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         "memory.proposed" => apply_memory_proposed(conn, event),
         "memory.rejected" => apply_memory_rejected(conn, event),
         "memory.invalidated" => apply_memory_invalidated(conn, event),
+        "memory.restored" => apply_memory_restored(conn, event),
+        "conflict.resolved" => crate::conflict::project_resolution(conn, event),
         // v0.5.1: per-turn memory citation. The model emits this
         // via the `cite_memory` tool when it consciously leveraged
         // a retrieved capsule. Best-effort — a missing or
@@ -379,7 +387,12 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         .payload
         .get("revision_event_id")
         .and_then(|v| v.as_str());
-    let exposed = run_claim_revision(conn, &event.run_id.to_string(), memory_id)?;
+    let exposed =
+        if let Some(exposure_id) = event.payload.get("exposure_id").and_then(|v| v.as_str()) {
+            exact_claim_exposure(conn, exposure_id, &event.run_id.to_string(), memory_id)?
+        } else {
+            run_claim_revision(conn, &event.run_id.to_string(), memory_id)?
+        };
     // A citation without a revision or exposure is ambiguous after a text
     // correction. Keep its durable event, but do not credit the new claim.
     let exposed = match exposed {
@@ -387,6 +400,12 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         ClaimExposure::Absent => None,
         ClaimExposure::Bound(revision) => Some(revision),
     };
+    if explicit
+        .zip(exposed.as_deref())
+        .is_some_and(|(explicit, delivered)| explicit != delivered)
+    {
+        return Ok(());
+    }
     let evidence_revision = explicit.map(str::to_owned).or(exposed);
     if evidence_revision
         .as_ref()
@@ -432,21 +451,7 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         )?;
     }
 
-    // Flagship 2 / Story 2.4: a STANDALONE citation (the `record_citations` /
-    // `brain cite` path, marked `standalone: true` — or the legacy nil
-    // sentinel run_id) is an explicit outcome signal with no run finalization
-    // behind it, so apply the cited-memory delta here. Citations tied to a
-    // REAL run keep metadata-only here and are bumped by
-    // `apply_memory_usefulness_for_run` on the terminal run event — the gate
-    // avoids double-counting.
-    let standalone = event
-        .payload
-        .get("standalone")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if standalone || event.run_id.0 == ulid::Ulid::nil() {
-        apply_cited_outcome(conn, memory_id, 1.0, 1.0, &cited_at, true)?;
-    }
+    // A citation records reliance only. Outcomes are credited separately.
     Ok(())
 }
 
@@ -1072,6 +1077,15 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
         .get("reason")
         .and_then(|value| value.as_str())
         .map(|s| s.to_string());
+    if reason
+        .as_deref()
+        .is_some_and(|r| matches!(r, "forgotten" | "forgotten/archived" | "forgotten_archived"))
+    {
+        let active:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE memory_id=?1 AND invalidated_at IS NULL AND superseded_by IS NULL)",[memory_id],|r|r.get(0))?;
+        if !active {
+            return Ok(());
+        }
+    }
     conn.execute(
         "
         UPDATE memories
@@ -1081,11 +1095,30 @@ fn apply_memory_invalidated(conn: &Connection, event: &Event) -> KimetsuResult<(
         ",
         params![memory_id, ts_text(event)?, reason],
     )?;
+    conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [memory_id])?;
     #[cfg(feature = "embeddings")]
     crate::ann::on_invalidate(conn, memory_id);
     // v2.6: drop the entity rows too, so the graph stops routing traffic
     // through a memory retrieval already excludes.
     let _ = crate::graph::forget_entities(conn, memory_id);
+    Ok(())
+}
+
+/// Restore only archived claims. Temporal expiry and supersession are preserved.
+fn apply_memory_restored(conn: &Connection, event: &Event) -> KimetsuResult<()> {
+    let Some(id) = event.payload.get("memory_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let changed = conn.execute(
+        "UPDATE memories SET invalidated_at=NULL, invalidated_reason=NULL
+      WHERE memory_id=?1 AND superseded_by IS NULL AND invalidated_at IS NOT NULL
+      AND invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived')",
+        [id],
+    )?;
+    if changed > 0 {
+        conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [id])?;
+        conn.execute("INSERT INTO memories_fts(memory_id,text,kind,scope) SELECT memory_id,text,kind,scope FROM memories WHERE memory_id=?1", [id])?;
+    }
     Ok(())
 }
 
@@ -1461,39 +1494,77 @@ mod tests {
     #[test]
     fn rebuild_import_failure_preserves_existing_projection() {
         let conn = make_conn();
-        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
-            "memory_id":"kept", "text":"keep my evidence", "scope":"project", "kind":"fact"
-        }));
+        let accepted = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({
+                "memory_id":"kept", "text":"keep my evidence", "scope":"project", "kind":"fact"
+            }),
+        );
         apply_events(&conn, &[accepted]).unwrap();
-        let malformed = Event::new(RunId::new(), "memory.accepted", json!({
-            "memory_id":"broken", "text":"bad validity", "scope":"project", "kind":"fact", "valid_from":"nonsense"
-        }));
+        let malformed = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({
+                "memory_id":"broken", "text":"bad validity", "scope":"project", "kind":"fact", "valid_from":"nonsense"
+            }),
+        );
         assert!(super::rebuild(&conn, &[malformed]).is_err());
-        let text: String = conn.query_row("SELECT text FROM memories WHERE memory_id='kept'", [], |r|r.get(0)).unwrap();
+        let text: String = conn
+            .query_row(
+                "SELECT text FROM memories WHERE memory_id='kept'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(text, "keep my evidence");
     }
 
     #[test]
     fn rebuild_import_keeps_durable_events_missing_from_trace() {
         let conn = make_conn();
-        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
-            "memory_id":"kept", "text":"durable but not in trace", "scope":"project", "kind":"fact"
-        }));
+        let accepted = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({
+                "memory_id":"kept", "text":"durable but not in trace", "scope":"project", "kind":"fact"
+            }),
+        );
         apply_events(&conn, &[accepted]).unwrap();
         super::rebuild(&conn, &[]).unwrap();
-        assert_eq!(conn.query_row("SELECT count(*) FROM memories WHERE memory_id='kept'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM memories WHERE memory_id='kept'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn trace_import_binds_historical_exposure_before_later_correction() {
         let conn = make_conn();
-        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
-            "memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"
-        }));
+        let accepted = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({
+                "memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"
+            }),
+        );
         apply_events(&conn, std::slice::from_ref(&accepted)).unwrap();
         let original_revision = super::claim_revision_at(&conn, "m", None).unwrap();
-        let exposure = Event::new(RunId::new(), "context.injected", json!({"memory_ids":["m"]}));
-        let corrected = Event::new(RunId::new(), "memory.corrected", json!({"memory_id":"m", "text":"new claim"}));
+        let exposure = Event::new(
+            RunId::new(),
+            "context.injected",
+            json!({"memory_ids":["m"]}),
+        );
+        let corrected = Event::new(
+            RunId::new(),
+            "memory.corrected",
+            json!({"memory_id":"m", "text":"new claim"}),
+        );
         apply_events(&conn, &[corrected]).unwrap();
         super::rebuild(&conn, std::slice::from_ref(&exposure)).unwrap();
         for _ in 0..2 {
@@ -1506,16 +1577,34 @@ mod tests {
     #[test]
     fn trace_import_replays_missing_correction_before_later_invalidation() {
         let conn = make_conn();
-        let accepted = Event::new(RunId::new(), "memory.accepted", json!({
-            "memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"
-        }));
+        let accepted = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({
+                "memory_id":"m", "text":"old claim", "scope":"project", "kind":"fact"
+            }),
+        );
         apply_events(&conn, &[accepted]).unwrap();
-        let correction = Event::new(RunId::new(), "memory.corrected", json!({"memory_id":"m", "text":"historically corrected"}));
-        let invalidated = Event::new(RunId::new(), "memory.invalidated", json!({"memory_id":"m", "reason":"retired"}));
+        let correction = Event::new(
+            RunId::new(),
+            "memory.corrected",
+            json!({"memory_id":"m", "text":"historically corrected"}),
+        );
+        let invalidated = Event::new(
+            RunId::new(),
+            "memory.invalidated",
+            json!({"memory_id":"m", "reason":"retired"}),
+        );
         apply_events(&conn, &[invalidated]).unwrap();
         super::rebuild(&conn, &[correction]).unwrap();
         for _ in 0..2 {
-            let row: (String, bool) = conn.query_row("SELECT text,invalidated_at IS NOT NULL FROM memories WHERE memory_id='m'", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            let row: (String, bool) = conn
+                .query_row(
+                    "SELECT text,invalidated_at IS NOT NULL FROM memories WHERE memory_id='m'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
             assert_eq!(row, ("historically corrected".into(), true));
             rebuild_in_place(&conn).unwrap();
         }
@@ -1527,7 +1616,15 @@ mod tests {
         conn.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at) VALUES ('legacy','global_user','fact','original','original',0.7,'{\"source\":\"user_brain\"}','2020-01-01T00:00:00Z')", []).unwrap();
         let error = rebuild_in_place(&conn).unwrap_err();
         assert!(error.to_string().contains("absent from replay"));
-        assert_eq!(conn.query_row("SELECT text FROM memories WHERE memory_id='legacy'", [], |r|r.get::<_,String>(0)).unwrap(), "original");
+        assert_eq!(
+            conn.query_row(
+                "SELECT text FROM memories WHERE memory_id='legacy'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "original"
+        );
         assert!(super::rebuild(&conn, &[]).is_err());
     }
 
@@ -1549,28 +1646,44 @@ mod tests {
         let rebuilding = Connection::open(&path).unwrap();
         rebuilding.busy_handler(Some(busy)).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let event = Event::new(RunId::new(), "memory.accepted", json!({
-            "memory_id":"concurrent", "text":"committed while rebuild waits", "scope":"project", "kind":"fact"
-        }));
+        let event = Event::new(
+            RunId::new(),
+            "memory.accepted",
+            json!({
+                "memory_id":"concurrent", "text":"committed while rebuild waits", "scope":"project", "kind":"fact"
+            }),
+        );
         super::apply_event(&writer, &event).unwrap();
-        let worker = std::thread::spawn(move || rebuild_in_place(&rebuilding).map_err(|e|e.to_string()));
+        let worker =
+            std::thread::spawn(move || rebuild_in_place(&rebuilding).map_err(|e| e.to_string()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !WAITING.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let was_waiting = WAITING.load(Ordering::SeqCst);
         writer.execute_batch("COMMIT").unwrap();
-        assert!(was_waiting, "rebuild did not reach the contested write lock");
+        assert!(
+            was_waiting,
+            "rebuild did not reach the contested write lock"
+        );
         assert_eq!(worker.join().unwrap().unwrap(), 1);
-        assert_eq!(writer.query_row("SELECT count(*) FROM memories WHERE memory_id='concurrent'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT count(*) FROM memories WHERE memory_id='concurrent'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     fn make_event(run_id: RunId, kind: &str, payload: serde_json::Value) -> Event {
         Event::new(run_id, kind, payload)
     }
 
-    /// The nil-ULID sentinel run id: a STANDALONE `memory.cited` (this run id)
-    /// applies a real outcome delta (+use_count) via `apply_cited_outcome`.
+    /// Legacy nil run identity used by manual regression fixtures.
     fn sentinel_run() -> RunId {
         RunId(ulid::Ulid::nil())
     }
@@ -1582,7 +1695,7 @@ mod tests {
     // write path under real contention.
     // ------------------------------------------------------------------
     #[test]
-    fn concurrent_cites_lose_no_updates() {
+    fn concurrent_manual_regrets_lose_no_updates() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Barrier};
 
@@ -1627,12 +1740,12 @@ mod tests {
                 for _ in 0..CITES_PER_THREAD {
                     let cited = Event::new(
                         sentinel_run(),
-                        "memory.cited",
-                        json!({ "memory_id": mem_id, "turn": 0 }),
+                        "retrieval.regret",
+                        json!({ "memory_id": mem_id, "source": "manual" }),
                     );
                     // Must not error under contention (busy-retry + IMMEDIATE).
                     apply_events(&conn, std::slice::from_ref(&cited))
-                        .expect("concurrent cite must succeed");
+                        .expect("concurrent explicit regret must succeed");
                 }
             }));
         }
@@ -1645,7 +1758,7 @@ mod tests {
         let conn = Connection::open(&db_path).expect("open verify");
         schema::initialize(&conn).expect("init verify");
 
-        // No lost increments: every concurrent cite landed.
+        // No lost increments: every concurrent explicit regret landed.
         let use_count: i64 = conn
             .query_row(
                 "SELECT use_count FROM memories WHERE memory_id = ?1",
@@ -3042,51 +3155,64 @@ enum ClaimExposure {
     Bound(String),
 }
 
-/// Legacy injections identify IDs only. Attribute an in-flight run to its
-/// earliest exposure rather than silently transferring old evidence on edit.
-/// For legacy unbound events, equal-time corrections are conservatively treated
-/// as later than the exposure; new bound events have exact revision identity.
+fn exact_claim_exposure(
+    conn: &Connection,
+    exposure_id: &str,
+    run_id: &str,
+    memory_id: &str,
+) -> KimetsuResult<ClaimExposure> {
+    let payload:Option<String>=conn.query_row("SELECT payload_json FROM events e WHERE event_id=?1 AND run_id=?2 AND kind='context.injected' AND EXISTS(SELECT 1 FROM json_each(e.payload_json,'$.memory_ids') WHERE value=?3)",params![exposure_id,run_id,memory_id],|r|r.get(0)).optional()?;
+    let Some(payload) = payload else {
+        return Ok(ClaimExposure::Unbound);
+    };
+    let payload: serde_json::Value = serde_json::from_str(&payload)?;
+    Ok(
+        match payload["memory_revisions"][memory_id]
+            .as_str()
+            .filter(|r| !r.is_empty())
+        {
+            Some(r) => ClaimExposure::Bound(r.to_string()),
+            None => ClaimExposure::Unbound,
+        },
+    )
+}
+
+/// A run can deliver several revisions. Ambiguous mixed-claim runs never
+/// transfer outcome credit onto whichever claim happens to be current.
 fn run_claim_revision(
     conn: &Connection,
     run_id: &str,
     memory_id: &str,
 ) -> KimetsuResult<ClaimExposure> {
-    let exposure = conn
-        .query_row(
-            "SELECT ts,payload_json FROM events e WHERE run_id=?1 AND kind='context.injected'
-        AND EXISTS(SELECT 1 FROM json_each(e.payload_json,'$.memory_ids') WHERE value=?2)
-        ORDER BY julianday(ts),rowid LIMIT 1",
-            params![run_id, memory_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    match exposure {
-        None => Ok(ClaimExposure::Absent),
-        Some((at, payload)) => {
-            let payload: serde_json::Value = serde_json::from_str(&payload)?;
-            if let Some(bindings) = payload.get("memory_revisions") {
-                // Presence (even malformed/empty/partial) means the producer
-                // supplied an authoritative hydration map. Never invent a later
-                // claim identity for an omitted or ambiguous entry.
-                Ok(
-                    match bindings
-                        .get(memory_id)
-                        .and_then(|v| v.as_str())
-                        .filter(|r| !r.is_empty())
-                    {
-                        Some(revision) => ClaimExposure::Bound(revision.to_string()),
-                        None => ClaimExposure::Unbound,
-                    },
-                )
-            } else {
-                Ok(ClaimExposure::Bound(claim_revision_at(
-                    conn,
-                    memory_id,
-                    Some(&at),
-                )?))
-            }
-        }
+    let mut stmt=conn.prepare("SELECT ts,payload_json FROM events e WHERE run_id=?1 AND kind='context.injected' AND EXISTS(SELECT 1 FROM json_each(e.payload_json,'$.memory_ids') WHERE value=?2) ORDER BY julianday(ts),rowid")?;
+    let rows = stmt
+        .query_map(params![run_id, memory_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut bound: Option<String> = None;
+    for (at, payload) in rows {
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        let revision = if let Some(map) = payload.get("memory_revisions") {
+            let Some(r) = map
+                .get(memory_id)
+                .and_then(|v| v.as_str())
+                .filter(|r| !r.is_empty())
+            else {
+                return Ok(ClaimExposure::Unbound);
+            };
+            r.to_string()
+        } else {
+            claim_revision_at(conn, memory_id, Some(&at))?
+        };
+        if bound.as_ref().is_some_and(|r| r != &revision) {
+            return Ok(ClaimExposure::Unbound);
+        };
+        bound = Some(revision);
     }
+    Ok(bound
+        .map(ClaimExposure::Bound)
+        .unwrap_or(ClaimExposure::Absent))
 }
 
 /// Bind exposures while their event is first persisted, not when a delayed

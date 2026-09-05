@@ -1228,3 +1228,11 @@ pub fn migrate_v12_to_v13(conn: &Connection) -> KimetsuResult<()> {
     add_column_if_missing(conn, "memory_proposals", "valid_to TEXT")?;
     Ok(())
 }
+
+/// Optional stable task identity. Empty string retains the original legacy lane.
+pub(crate) fn migrate_v13_to_v14(conn: &Connection) -> KimetsuResult<()> {
+    crate::episode::create_work_episodes_table(conn)?;
+    add_column_if_missing(conn, "work_episodes", "identity TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_episodes_identity ON work_episodes(repo_root, identity, superseded_by)")?;
+    Ok(())
+}

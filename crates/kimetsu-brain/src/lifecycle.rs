@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::project::{AcceptOverrides, invalidate_memory, reject_proposal};
+use crate::project::{AcceptOverrides, reject_proposal};
 
 // ---------------------------------------------------------------------------
 // Story 3.4 — Structured invalidation taxonomy
@@ -156,6 +156,7 @@ impl Default for ForgetOptions {
 /// One candidate identified by the forgetting pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct ForgetCandidate {
+    pub claim_revision: String,
     pub memory_id: String,
     pub scope: String,
     pub kind: String,
@@ -217,16 +218,77 @@ pub fn forget_brain(start: &Path, opts: ForgetOptions) -> KimetsuResult<ForgetSu
         return Ok(summary);
     }
 
-    // Archive each candidate via the event-sourced invalidate path.
-    for candidate in &candidates {
-        let reason = InvalidationReason::Forgotten.as_str();
-        match invalidate_memory(start, &candidate.memory_id, Some(reason)) {
-            Ok(()) => summary.archived += 1,
-            Err(_) => summary.failed += 1,
-        }
-    }
+    // Re-read eligibility while holding both the project and SQLite writer locks.
+    // The candidate scan is advisory; corrections/useful feedback may have landed.
+    let (paths, _, conn) = crate::project::load_project(start)?;
+    let _lock = crate::lock::ProjectLock::acquire(&paths, "archive", None)?;
+    crate::projector::with_write_txn(&conn, |conn| {
+        summary.archived = archive_candidates_locked(conn, &opts, &cutoff_iso, &candidates)?;
+        Ok(())
+    })?;
 
     Ok(summary)
+}
+
+/// Called only inside the SQLite write transaction; selection must be revalidated.
+fn archive_candidates_locked(
+    conn: &Connection,
+    opts: &ForgetOptions,
+    cutoff_iso: &str,
+    candidates: &[ForgetCandidate],
+) -> KimetsuResult<u32> {
+    let eligible = query_forget_candidates(
+        conn,
+        opts.usefulness_floor,
+        cutoff_iso,
+        opts.protect_use_count,
+    )?;
+    let mut archived = 0;
+    for candidate in candidates {
+        if !eligible.iter().any(|c| {
+            c.memory_id == candidate.memory_id && c.claim_revision == candidate.claim_revision
+        }) {
+            continue;
+        }
+        let event = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "memory.invalidated",
+            serde_json::json!({"memory_id":candidate.memory_id,"reason":"forgotten"}),
+        );
+        crate::projector::apply_event(conn, &event)?;
+        archived += 1;
+    }
+    Ok(archived)
+}
+
+/// Explicit archival status; invalidated/corrected/superseded claims are excluded.
+pub fn list_archived(start: &Path) -> KimetsuResult<Vec<serde_json::Value>> {
+    let (_, _, conn) = crate::project::load_project_readonly(start)?;
+    let mut stmt=conn.prepare("SELECT memory_id,text,invalidated_at,valid_to FROM memories WHERE invalidated_at IS NOT NULL AND superseded_by IS NULL AND invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived') ORDER BY invalidated_at DESC")?;
+    let rows=stmt.query_map([],|r|Ok(serde_json::json!({"memory_id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"archived_at":r.get::<_,String>(2)?,"valid_to":r.get::<_,Option<String>>(3)?,"status":"archived"})))?.collect::<Result<Vec<_>,_>>()?;
+    Ok(rows)
+}
+
+/// Restore archival state only; never reopen expiry or resurrect superseded claims.
+pub fn restore_memory(start: &Path, memory_id: &str) -> KimetsuResult<bool> {
+    let (paths, _, conn) = crate::project::load_project(start)?;
+    let _lock = crate::lock::ProjectLock::acquire(&paths, "restore", None)?;
+    let mut restored = false;
+    crate::projector::with_write_txn(&conn, |conn| {
+        let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE memory_id=?1 AND invalidated_at IS NOT NULL AND superseded_by IS NULL AND invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived'))",[memory_id],|r|r.get(0))?;
+        if !eligible {
+            return Ok(());
+        }
+        let event = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "memory.restored",
+            serde_json::json!({"memory_id":memory_id}),
+        );
+        crate::projector::apply_event(conn, &event)?;
+        restored = true;
+        Ok(())
+    })?;
+    Ok(restored)
 }
 
 /// Query candidates that meet the forget criteria.
@@ -294,6 +356,7 @@ fn query_forget_candidates(
         };
         let text_preview: String = text.chars().take(80).collect();
         candidates.push(ForgetCandidate {
+            claim_revision: crate::projector::claim_revision_at(conn, &memory_id, None)?,
             memory_id,
             scope,
             kind,
@@ -579,6 +642,7 @@ pub fn invalidations_by_reason(conn: &Connection) -> KimetsuResult<Vec<Invalidat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::invalidate_memory;
     use crate::{
         project::{add_memory, init_project, propose_memory},
         projector,
@@ -595,6 +659,56 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kimetsu-lc-test-{}", Ulid::new()));
         kimetsu_core::paths::git_init_boundary(&root);
         root
+    }
+
+    #[test]
+    fn hardening_archive_scan_revalidates_correction_and_recent_use() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&c).unwrap();
+        for id in ["corrected", "useful", "old"] {
+            let mut e = Event::new(
+                RunId::new(),
+                "memory.accepted",
+                serde_json::json!({"memory_id":id,"scope":"project","kind":"fact","text":id}),
+            );
+            e.ts = OffsetDateTime::parse("2020-01-01T00:00:00Z", &Rfc3339).unwrap();
+            projector::apply_events(&c, &[e]).unwrap();
+        }
+        let cutoff = "2025-01-01T00:00:00Z";
+        let opts = ForgetOptions {
+            usefulness_floor: 0.0,
+            ..Default::default()
+        };
+        let candidates = query_forget_candidates(&c, 0.0, cutoff, 10).unwrap();
+        assert_eq!(candidates.len(), 3);
+        projector::apply_events(
+            &c,
+            &[Event::new(
+                RunId::new(),
+                "memory.corrected",
+                serde_json::json!({"memory_id":"corrected","text":"new claim"}),
+            )],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE memories SET last_useful_at='2026-01-01T00:00:00Z' WHERE memory_id='useful'",
+            [],
+        )
+        .unwrap();
+        projector::with_write_txn(&c, |c| {
+            assert_eq!(archive_candidates_locked(c, &opts, cutoff, &candidates)?, 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT memory_id FROM memories WHERE invalidated_at IS NOT NULL",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "old"
+        );
     }
 
     // -------------------------------------------------------------------------

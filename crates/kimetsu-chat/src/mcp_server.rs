@@ -62,7 +62,7 @@ const BRIDGE_SYNC_DESCRIPTION: &str = "Bulk-import all discovered non-Kimetsu sk
 
 const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, the kimetsu-bridge skill, and the kimetsu-memory-harvester custom agent; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome. Set scope=workspace (default) to install into this workspace, or scope=global to install into the user's home (~/.claude, ~/.claude.json, ~/.codex) for all sessions. Existing user hooks are preserved (merged, not replaced).";
 
-const BRAIN_CITE_DESCRIPTION: &str = "Call when a retrieved Kimetsu memory materially helped you solve the current task. This records a ground-truth citation that powers Kimetsu's self-tuning: the brain learns which memories actually earn their keep. ROI: each citation trains the retrieval objective so future queries surface that memory sooner. Pass memory_id (from the capsule's provenance or kimetsu_brain_memory_list) and an optional note describing how it helped.";
+const BRAIN_CITE_DESCRIPTION: &str = "Record reliance on a memory actually delivered in context. Pass exposure_id from the context response and memory_id from its capsule handle. Reliance does not verify truth or prove success; origin penalties remain.";
 
 #[derive(Debug, Clone)]
 pub struct McpServeConfig {
@@ -667,12 +667,18 @@ static WARM_START_SERVED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 ///
 /// The latch is only set once a block actually exists, so a call made against a
 /// cold brain does not burn the session's one chance at a warm start.
-fn take_session_warm_start(workspace: &Path) -> Option<String> {
+fn take_session_warm_start(workspace: &Path, arguments: &Value) -> Option<String> {
     use std::sync::atomic::Ordering;
     if WARM_START_SERVED.load(Ordering::SeqCst) {
         return None;
     }
-    let block = kimetsu_brain::digest::warm_start_block(workspace)?;
+    let identity = arguments
+        .get("task_id")
+        .or_else(|| arguments.get("session_id"))
+        .or_else(|| arguments.get("worktree_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let block = kimetsu_brain::digest::warm_start_block_scoped(workspace, identity)?;
     if WARM_START_SERVED.swap(true, Ordering::SeqCst) {
         return None; // lost the race — another call is already emitting it
     }
@@ -684,7 +690,7 @@ fn kimetsu_brain_context(workspace: &Path, arguments: &Value) -> Value {
         workspace,
         arguments,
         None,
-        take_session_warm_start(workspace),
+        take_session_warm_start(workspace, arguments),
     )
     .unwrap_or_else(|e| {
         bounded_context_error(arguments, 6000, brain_unavailable_json(workspace, &e))
@@ -701,6 +707,7 @@ fn record_context_delivery(
     arguments: &Value,
     delivery: &kimetsu_brain::context::delivery::Delivery,
     surface: &str,
+    mut exposure: kimetsu_core::event::Event,
 ) {
     if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() == Ok("0") {
         return;
@@ -711,7 +718,20 @@ fn record_context_delivery(
     );
     payload["surface"] = json!(surface);
     payload["session_id"] = arguments.get("session_id").cloned().unwrap_or(Value::Null);
-    let _ = project::log_telemetry_event(workspace, "context.injected", payload);
+    if kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|p| project::load_config(&p).ok())
+        .is_some_and(|cfg| cfg.learning.store_queries)
+    {
+        if let Some(query) = arguments.get("query").or_else(|| arguments.get("task")) {
+            payload["query"] = query.clone();
+        }
+    }
+    payload["task_id"] = arguments.get("task_id").cloned().unwrap_or(Value::Null);
+    payload["exposure_id"] = json!(exposure.event_id.to_string());
+    payload["cost_unit"] = json!("serialized_utf8_byte_bound");
+    exposure.payload = payload;
+    let _ = project::record_context_exposure(workspace, &exposure);
 }
 
 /// Candidate pool the remote reranker judges before truncating to the caller's
@@ -869,11 +889,17 @@ fn brain_context_tool_with_warm(
             use kimetsu_brain::context::delivery::{
                 add_optional_field, compact_capsules, fit_json,
             };
+            let exposure = kimetsu_core::event::Event::new(
+                kimetsu_core::ids::RunId::new(),
+                "context.injected",
+                json!({}),
+            );
             let count = bundle.capsules.len();
             let mut delivery = fit_json(bundle.capsules.clone(), budget_tokens, |capsules| {
                 json!({
                     "ok": true,
                     "skipped": capsules.is_empty(),
+                    "exposure_id": exposure.event_id.to_string(),
                     "capsule_count": capsules.len(),
                     "excluded_count": bundle.excluded.len() + count - capsules.len(),
                     "capsules": compact_capsules(capsules),
@@ -888,7 +914,7 @@ fn brain_context_tool_with_warm(
                     budget_tokens,
                 );
             }
-            record_context_delivery(workspace, arguments, &delivery, "brain_context");
+            record_context_delivery(workspace, arguments, &delivery, "brain_context", exposure);
             Ok(delivery.payload)
         }
         Err(err) => Ok(bounded_context_error(
@@ -1005,7 +1031,7 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
     }
 }
 
-/// Record a ground-truth citation for a memory that materially helped.
+/// Record reliance on a delivered memory claim.
 /// Writes a `memory.cited` event with the all-zero sentinel run_id so
 /// it links to no active run — this is the MCP path (primary Claude Code usage)
 /// where there is no agent run in progress.
@@ -1019,12 +1045,17 @@ fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, Stri
         }
     };
     let note = arguments.get("note").and_then(Value::as_str);
-    match project::record_mcp_citation(workspace, memory_id, note) {
+    match arguments
+        .get("exposure_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "exposure_id from delivered context is required".into())
+        .and_then(|id| project::record_exposure_citation(workspace, id, memory_id, note))
+    {
         Ok(()) => Ok(json!({
             "ok": true,
             "memory_id": memory_id,
             "recorded": "memory.cited",
-            "usage": "Citation recorded. This closes the ground-truth loop and trains Kimetsu's self-tuning objective."
+            "usage": "Reliance recorded for the delivered claim; this is not verification."
         })),
         Err(err) => Ok(json!({ "ok": false, "error": err.to_string() })),
     }
@@ -1137,6 +1168,11 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
     ) {
         Ok(context) => {
             use kimetsu_brain::context::delivery::{compact_capsules, fit_json};
+            let exposure = kimetsu_core::event::Event::new(
+                kimetsu_core::ids::RunId::new(),
+                "context.injected",
+                json!({}),
+            );
             let original_count = context.capsules.len();
             let delivery = fit_json(context.capsules.clone(), budget_tokens, |capsules| {
                 let memory_count = capsules.iter().filter(|c| c.kind == "memory").count();
@@ -1170,6 +1206,7 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
                 }
                 json!({
                     "ok": required_ok, "required_ok": required_ok,
+                    "exposure_id": exposure.event_id.to_string(),
                     "dataset": context.dataset, "task_slug": context.task_slug,
                     "warm_policy": context.warm_policy.as_str(),
                     "capsule_count": capsules.len(), "memory_capsule_count": memory_count,
@@ -1180,7 +1217,13 @@ fn kimetsu_benchmark_context(workspace: &Path, arguments: &Value) -> Value {
                     "excluded_count": context.excluded.len() + original_count - capsules.len(),
                 })
             });
-            record_context_delivery(workspace, arguments, &delivery, "benchmark_context");
+            record_context_delivery(
+                workspace,
+                arguments,
+                &delivery,
+                "benchmark_context",
+                exposure,
+            );
             delivery.payload
         }
         Err(err) => bounded_context_error(
@@ -1221,10 +1264,16 @@ fn kimetsu_benchmark_record_outcome(workspace: &Path, arguments: &Value) -> Resu
         duration_seconds: optional_f32_arg(arguments, "duration_seconds"),
         generalization,
     };
+    let credited = match arguments.get("exposure_id").and_then(Value::as_str) {
+        Some(id) => project::record_exposure_outcome(workspace, id, outcome.passed)
+            .map_err(|e| e.to_string())?,
+        None => 0,
+    };
     let recorded = project::record_benchmark_outcome(workspace, outcome)
         .map_err(|err| format!("kimetsu benchmark record outcome: {err}"))?;
     Ok(json!({
         "ok": true,
+        "associated_delivered_memories": credited,
         "memory_id": recorded.memory_id,
         "task_slug": recorded.task_slug,
         "kind": recorded.kind.to_string(),
@@ -1675,7 +1724,7 @@ fn kimetsu_brain_prune(workspace: &Path, arguments: &Value) -> Result<Value, Str
 /// "Nothing in memory" when retrieval is empty.
 ///
 /// When `mark_helpful: true`, records a citation for every returned memory
-/// (closes the self-tuning ground-truth loop, same as kimetsu_brain_cite).
+/// (records reliance, not verification, same as kimetsu_brain_cite).
 fn kimetsu_brain_answer(workspace: &Path, arguments: &Value) -> Result<Value, String> {
     let question = match arguments.get("question").and_then(Value::as_str) {
         Some(q) if !q.trim().is_empty() => q.trim(),
@@ -1692,23 +1741,38 @@ fn kimetsu_brain_answer(workspace: &Path, arguments: &Value) -> Result<Value, St
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let result = crate::ask::compose_answer(workspace, question);
-
-    // Helpful-mark wiring (3.1 / tuning) — best-effort, never fails the tool.
-    if mark_helpful && result.grounded && !result.citations.is_empty() {
-        crate::ask::record_helpful_mark(workspace, &result.citations);
+    if mark_helpful {
+        let exposure_id = string_arg(arguments, "exposure_id")?;
+        let ids = string_list_arg(arguments, "memory_ids");
+        if ids.is_empty() {
+            return Err("mark_helpful requires original delivered memory_ids".into());
+        }
+        for id in &ids {
+            project::record_exposure_citation(
+                workspace,
+                &exposure_id,
+                id,
+                Some("marked helpful via answer"),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        return Ok(
+            json!({"ok":true,"exposure_id":exposure_id,"recorded":"reliance","memory_ids":ids}),
+        );
     }
+    let result = crate::ask::compose_answer(workspace, question);
 
     Ok(json!({
         "ok": true,
         "question": question,
+        "exposure_id": result.exposure_id,
         "answer": result.answer,
         "citations": result.citations,
         "grounded": result.grounded,
         "model_used": result.model_used,
         "verbatim": result.verbatim,
         "usage": {
-            "how_to_use": "The answer is grounded in project memories only. If it helped, pass mark_helpful:true on a follow-up call or call kimetsu_brain_cite with the relevant memory ids from citations[]."
+            "how_to_use": "The answer is grounded in project memories only. If it helped, call kimetsu_brain_cite with this exposure_id and relevant memory ids from citations[]."
         }
     }))
 }
@@ -1951,10 +2015,11 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "exposure_id": {"type":"string","description":"Exact exposure_id returned by context delivery."},
                     "memory_id": { "type": "string", "description": "The memory_id of the retrieved memory that helped (from capsule provenance or kimetsu_brain_memory_list)." },
                     "note": { "type": "string", "description": "Optional short description of how the memory helped." }
                 },
-                "required": ["memory_id"]
+                "required": ["memory_id", "exposure_id"]
             }
         },
         {
@@ -2008,6 +2073,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "exposure_id": {"type":"string","description":"Optional exact delivered exposure. Omission gives no automatic memory credit."},
                     "task": { "type": "string" },
                     "dataset": { "type": "string", "default": "terminal-bench/terminal-bench-2" },
                     "task_slug": { "type": "string" },
@@ -2125,7 +2191,7 @@ fn tool_definitions() -> Value {
                     "memory_id": { "type": "string" },
                     "reason": { "type": "string" }
                 },
-                "required": ["memory_id"]
+                "required": ["memory_id", "exposure_id"]
             }
         },
         {
@@ -2321,8 +2387,10 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "exposure_id": {"type":"string","description":"Original answer exposure required for mark_helpful."},
+                    "memory_ids": {"type":"array","items":{"type":"string"},"description":"Original delivered memories relied upon."},
                     "question": { "type": "string", "description": "The question to answer from project memory (e.g. 'how do I run the tests?' or 'what does the broker do?')." },
-                    "mark_helpful": { "type": "boolean", "description": "When true, record a citation for every memory in the returned answer, closing the self-tuning ground-truth loop. Default false." }
+                    "mark_helpful": { "type": "boolean", "description": "When true, record reliance on memory_ids from the original exposure_id; no new retrieval. Default false." }
                 },
                 "required": ["question"]
             }
@@ -2638,6 +2706,12 @@ mod tests {
                 "ripgrep search files before broad reads",
             )
             .unwrap();
+            // Keep query terms discriminative when adding matching rejected rows;
+            // otherwise corpus-wide IDF abstention changes the retrieval question.
+            let (_, _, fixture_conn) = project::load_project(&root).unwrap();
+            let ballast=(0..32).map(|i|kimetsu_core::event::Event::new(kimetsu_core::ids::RunId::new(),"memory.accepted",json!({"memory_id":format!("ballast-{i}"),"scope":"repo","kind":"fact","text":format!("unrelated ballast bananas {i}")}))).collect::<Vec<_>>();
+            kimetsu_brain::projector::apply_events(&fixture_conn, &ballast).unwrap();
+            drop(fixture_conn);
             let args = json!({"query":"ripgrep search files", "budget_tokens":1200,
                 "max_capsules":1,"min_score":0.0,"include_ambient":false});
             let before = brain_context_tool(&root, &args, None).unwrap();
@@ -3243,8 +3317,8 @@ mod tests {
             cite["description"]
                 .as_str()
                 .unwrap_or("")
-                .contains("self-tuning"),
-            "description must mention self-tuning"
+                .contains("Reliance"),
+            "description must distinguish reliance from verification"
         );
     }
 
@@ -3273,9 +3347,15 @@ mod tests {
             unsafe {
                 std::env::set_var("KIMETSU_MCP_ENABLE_WRITE_TOOLS", "1");
             }
+            let context=brain_context_tool(&root,&json!({"query":"cite MCP test memory","include_ambient":false,"min_score":0.0,"budget_tokens":2500}),None).unwrap();
+            assert!(
+                context["capsules"]
+                    .as_array()
+                    .is_some_and(|c| !c.is_empty())
+            );
             let result = call_tool(
                 "kimetsu_brain_cite",
-                json!({ "memory_id": memory_id, "note": "it helped" }),
+                json!({ "memory_id": memory_id, "note": "it helped", "exposure_id":context["exposure_id"] }),
                 &root,
                 &SkillConfig::default(),
             )

@@ -874,7 +874,11 @@ enum BrainCommand {
     ///   kimetsu brain forget --yes
     ///   kimetsu brain forget --yes --force-enabled
     Forget(ForgetArgs),
-    /// Record a ground-truth citation: mark that a memory materially helped.
+    /// List reversibly archived memories.
+    Archives,
+    /// Restore an archived memory without reopening temporal expiry.
+    Restore { memory_id: String },
+    /// Record explicit reliance on a memory; this does not verify its truth.
     ///
     /// Writes a `memory.cited` event (raising use_count / usefulness), the same
     /// signal the MCP `kimetsu_brain_cite` tool records — exposed on the CLI so
@@ -1256,6 +1260,9 @@ struct DigestArgs {
 /// Args for `kimetsu checkpoint`.
 #[derive(Debug, Args)]
 struct CheckpointArgs {
+    /// Stable task, session or worktree identity for this checkpoint lane.
+    #[arg(long, alias = "session-id", alias = "worktree-id")]
+    task_id: Option<String>,
     /// Optional note to attach to this checkpoint.
     #[arg(value_name = "NOTE")]
     note: Option<String>,
@@ -1267,6 +1274,9 @@ struct CheckpointArgs {
 /// Args for `kimetsu resume`.
 #[derive(Debug, Args)]
 struct ResumeArgs {
+    /// Resume this exact task lane; never fall back to another task.
+    #[arg(long, alias = "session-id", alias = "worktree-id")]
+    task_id: Option<String>,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1497,13 +1507,19 @@ struct ReinforceArgs {
 /// Args for `kimetsu brain benchmark-credit`.
 #[derive(Debug, Args)]
 struct BenchmarkCreditArgs {
+    /// Exact exposure_id from the context actually delivered before grading.
+    #[arg(long)]
+    exposure_id: Option<String>,
+    /// Explicit failure outcome; omission of both outcome flags is unknown.
+    #[arg(long, conflicts_with = "passed")]
+    failed: bool,
     /// The task description / query the graded task represents.
     #[arg(long)]
     task: String,
-    /// Mark the task as PASSED — only passes produce a citation.
+    /// Record an observed pass association; never invent citations.
     #[arg(long)]
     passed: bool,
-    /// How many top-ranked memories to credit on a pass.
+    /// Legacy compatibility option; no post-outcome retrieval is performed.
     #[arg(long, default_value_t = 3)]
     top_k: usize,
     /// Override the brain workspace path (defaults to current directory).

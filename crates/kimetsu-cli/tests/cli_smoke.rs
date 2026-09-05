@@ -1308,3 +1308,62 @@ fn hardening_free_hooks_never_cue_host_after_resolution_or_stop() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn hardening_episode_cli_identity_and_archive_restore() {
+    let (root, cache_home) = seeded_proactive_project("episode_archive");
+    let run = |args: &[&str]| {
+        let output = Command::new(kimetsu_bin())
+            .args(args)
+            .current_dir(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+            .env("KIMETSU_TIER", "free")
+            .env("KIMETSU_BRAIN_EMBEDDER", "noop")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&["checkpoint", "lane alpha", "--task-id", "alpha"]);
+    run(&["checkpoint", "lane beta", "--task-id", "beta"]);
+    assert!(run(&["resume", "--task-id", "alpha"]).contains("lane alpha"));
+    assert!(!run(&["resume", "--task-id", "alpha"]).contains("lane beta"));
+    assert!(!run(&["resume", "--task-id", "missing"]).contains("lane beta"));
+    let added = run(&[
+        "brain",
+        "memory",
+        "add",
+        "--scope",
+        "project",
+        "--kind",
+        "fact",
+        "archive-cli-quokka",
+    ]);
+    let (_, _, c) = brain_project::load_project(&root).unwrap();
+    let id: String = c
+        .query_row(
+            "SELECT memory_id FROM memories WHERE text='archive-cli-quokka'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("{e}: {added}"));
+    drop(c);
+    run(&[
+        "brain",
+        "memory",
+        "invalidate",
+        &id,
+        "--reason",
+        "forgotten",
+    ]);
+    assert!(run(&["brain", "archives"]).contains(&id));
+    assert!(run(&["brain", "restore", &id]).contains("true"));
+    assert!(!run(&["brain", "archives"]).contains(&id));
+    assert!(run(&["brain", "roi", "--json"]).contains("Assumption-based estimate"));
+    fs::remove_dir_all(root).unwrap();
+}

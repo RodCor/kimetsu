@@ -1082,9 +1082,6 @@ fn run_repl_inner<R: BufRead, W: Write>(
                 reasoning_effort.as_str()
             );
         }
-        let brain_context =
-            build_chat_brain_context(brain_session.as_ref(), &transcript, &loaded_skills, &task);
-
         if route == ChatRoute::TextOnly {
             if let Err(err) = hooks.run(HookEvent::PreTurn, &workspace, &session, Some(&user_line))
             {
@@ -1148,6 +1145,15 @@ fn run_repl_inner<R: BufRead, W: Write>(
             continue;
         }
 
+        let mut delivered_capsules = Vec::new();
+        let brain_context = build_chat_brain_context_with_delivery(
+            brain_session.as_ref(),
+            &transcript,
+            &loaded_skills,
+            &task,
+            &mut delivered_capsules,
+        );
+
         let mut turn_checkpoint = if route == ChatRoute::WorkspaceAgent {
             match create_checkpoint(&workspace, &transcript, "", "turn") {
                 Ok(checkpoint) => Some(checkpoint),
@@ -1194,6 +1200,24 @@ fn run_repl_inner<R: BufRead, W: Write>(
         };
         ui.write_thinking(&mut writer)?;
         writer.flush()?;
+        if !delivered_capsules.is_empty() {
+            let mut payload = kimetsu_brain::context::delivery::injected_payload(
+                &delivered_capsules,
+                brain_context
+                    .as_ref()
+                    .map(|c| c.len().min(u32::MAX as usize) as u32)
+                    .unwrap_or(0),
+            );
+            payload["session_id"] = serde_json::json!(session.id);
+            payload["surface"] = serde_json::json!("chat_repl");
+            payload["cost_unit"] = serde_json::json!("rendered_utf8_bytes");
+            let exposure = kimetsu_core::event::Event::new(
+                kimetsu_core::ids::RunId::new(),
+                "context.injected",
+                payload,
+            );
+            let _ = brain_project::record_context_exposure(&workspace, &exposure);
+        }
         let result = run_model_agent(
             &task,
             &mut runtime,
@@ -5542,11 +5566,28 @@ fn run_text_only_chat_with_system(
 /// The agent loop renders this whole string as a "Prior knowledge"
 /// block before the new user message. The model gets memory-pool
 /// retrieval AND conversational continuity through a single channel.
+#[cfg(test)]
 fn build_chat_brain_context(
     brain_session: Option<&brain_project::BrainSession>,
     transcript: &[TurnRecord],
     loaded_skills: &[LoadedSkill],
     task: &str,
+) -> Option<String> {
+    build_chat_brain_context_with_delivery(
+        brain_session,
+        transcript,
+        loaded_skills,
+        task,
+        &mut Vec::new(),
+    )
+}
+
+fn build_chat_brain_context_with_delivery(
+    brain_session: Option<&brain_project::BrainSession>,
+    transcript: &[TurnRecord],
+    loaded_skills: &[LoadedSkill],
+    task: &str,
+    delivered: &mut Vec<kimetsu_brain::context::ContextCapsule>,
 ) -> Option<String> {
     const TURN_CAP_BYTES: usize = 1200;
     const TRANSCRIPT_TAIL: usize = 10;
@@ -5571,6 +5612,7 @@ fn build_chat_brain_context(
                     bundle.used_tokens,
                     bundle.budget_tokens,
                 ));
+                delivered.extend(bundle.capsules.iter().cloned());
                 for (i, c) in bundle.capsules.iter().enumerate() {
                     out.push_str(&format!(
                         "  [{}] {} (score {:.2}, scope_weight {:.2})\n      {}\n",

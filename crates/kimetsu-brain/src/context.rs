@@ -1718,14 +1718,7 @@ pub(crate) fn memory_row_to_candidate(
     } else {
         0
     };
-    // v2.6: discount by origin, unless the memory has proven itself here.
-    //
-    // `last_useful_at` is set only on a citation in a *successful* run, so its
-    // presence is exactly "this has been tested on this machine" — at which
-    // point where it was written stops being the most informative thing about
-    // it, whatever that was. Applied after the usefulness boost so it is the
-    // last word: a memory of unknown origin cannot boost its way past the
-    // discount, but a corroborated one carries none.
+    // Reliance and outcome association do not verify a memory or erase origin.
     let provenance =
         crate::trust::Provenance::from_snapshot(provenance_snapshot.as_deref().unwrap_or("{}"));
     let trusted_relevance =

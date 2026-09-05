@@ -761,22 +761,22 @@ pub fn run_session_end_hook(workspace: &Path) {
 
     // Story 1.3: auto-capture episode at SessionEnd (best-effort, never fails
     // the hook).
-    capture_episode_at_session_end(workspace, transcript_path.unwrap_or(""));
+    let identity = payload
+        .get("task_id")
+        .or_else(|| payload.get("session_id"))
+        .or_else(|| payload.get("worktree_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    capture_episode_now_scoped(workspace, transcript_path.unwrap_or(""), "", identity);
 }
 
-/// Capture a work episode at SessionEnd.  Tries the cheap model first;
-/// degrades gracefully to the rule-based fallback if none is configured or
-/// if the model call fails.  Best-effort — silently swallows all errors so
-/// the session shutdown is never blocked.
-pub fn capture_episode_at_session_end(workspace: &Path, transcript_path: &str) {
-    capture_episode_now(workspace, transcript_path, "");
-}
-
-/// Capture an episode now (manual checkpoint or auto-capture).
-///
-/// `note` is an optional annotation from the user.
-/// Returns `true` if the episode was written successfully.
-pub fn capture_episode_now(workspace: &Path, transcript_path: &str, note: &str) -> bool {
+/// Capture a work episode within the exact caller-selected task/session lane.
+pub fn capture_episode_now_scoped(
+    workspace: &Path,
+    transcript_path: &str,
+    note: &str,
+    identity: &str,
+) -> bool {
     use kimetsu_brain::episode::{capture_episode, rule_based_episode};
     use kimetsu_core::paths::ProjectPaths;
 
@@ -795,13 +795,14 @@ pub fn capture_episode_now(workspace: &Path, transcript_path: &str, note: &str) 
 
     // Try cheap model first; fall back to rule-based. Episode capture is
     // automatic (SessionEnd), so it goes through the tier gate.
-    let episode_payload = if let Some(resolved) = resolve_pipeline_distiller(workspace) {
+    let mut episode_payload = if let Some(resolved) = resolve_pipeline_distiller(workspace) {
         distill_episode_with_model(&view, &resolved, &repo_root, note)
             .unwrap_or_else(|| kimetsu_brain::episode::rule_based_episode(&view, &repo_root, note))
     } else {
         rule_based_episode(&view, &repo_root, note)
     };
 
+    episode_payload.identity = identity.to_string();
     // Write the episode event.  Best-effort.
     match capture_episode(workspace, episode_payload) {
         Ok(_id) => true,
@@ -933,6 +934,7 @@ fn parse_episode_json(
         .to_string();
 
     Some(kimetsu_brain::episode::EpisodePayload {
+        identity: String::new(),
         task,
         summary,
         open_threads,

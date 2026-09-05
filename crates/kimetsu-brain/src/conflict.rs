@@ -669,65 +669,80 @@ pub fn resolve_conflict(
         )
         .into());
     }
-    // Pull the pair so we know which (if any) memory to invalidate.
+    let mut changed = false;
+    crate::projector::with_write_txn(conn, |conn| {
+        let metadata: Option<(String,String,String,String,f64,String)> = conn.query_row(
+            "SELECT new_memory_id,existing_memory_id,scope,kind,similarity,detected_at FROM memory_conflicts WHERE conflict_id=?1 AND resolved_at IS NULL",
+            [conflict_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+        let Some((new_id, existing_id, scope, kind, similarity, detected_at)) = metadata else {
+            return Ok(());
+        };
+        let event = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "conflict.resolved",
+            serde_json::json!({
+                "conflict_id":conflict_id,"new_memory_id":new_id,"existing_memory_id":existing_id,
+                "scope":scope,"kind":kind,"similarity":similarity,"detected_at":detected_at,"resolution":resolution
+            }),
+        );
+        crate::projector::apply_event(conn, &event)?;
+        changed = true;
+        Ok(())
+    })?;
+    Ok(changed)
+}
+
+/// Self-contained pair metadata makes explicit decisions replayable even when
+/// the original similarity detection was a derived-only row.
+pub(crate) fn project_resolution(
+    conn: &Connection,
+    event: &kimetsu_core::event::Event,
+) -> KimetsuResult<()> {
+    let field = |key| {
+        event
+            .payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("conflict.resolved missing {key}"))
+    };
+    let id = field("conflict_id")?;
+    let new_id = field("new_memory_id")?;
+    let existing_id = field("existing_memory_id")?;
+    let resolution = field("resolution")?;
+    if new_id == existing_id || !matches!(resolution, "kept_new" | "kept_existing" | "kept_both") {
+        return Err("invalid conflict pair or resolution".into());
+    }
     let pair: Option<(String, String)> = conn
         .query_row(
-            "
-            SELECT new_memory_id, existing_memory_id
-            FROM memory_conflicts
-            WHERE conflict_id = ?1 AND resolved_at IS NULL
-            ",
-            params![conflict_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            "SELECT new_memory_id,existing_memory_id FROM memory_conflicts WHERE conflict_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((new_memory_id, existing_memory_id)) = pair else {
-        return Ok(false);
-    };
-
-    let now = OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| format!("timestamp format: {e}"))?;
-
-    // Invalidate the losing side, if any. We do this BEFORE marking
-    // the conflict resolved so a crash mid-resolve leaves the row
-    // still actionable for the operator.
-    let invalidation_reason = format!("v0.5.2 conflict {conflict_id} resolved as {resolution}");
-    if resolution == "kept_new" {
-        conn.execute(
-            "
-            UPDATE memories
-            SET invalidated_at = COALESCE(invalidated_at, ?2),
-                invalidated_reason = COALESCE(invalidated_reason, ?3)
-            WHERE memory_id = ?1
-            ",
-            params![existing_memory_id, now, invalidation_reason],
-        )?;
-        #[cfg(feature = "embeddings")]
-        crate::ann::on_invalidate(conn, &existing_memory_id);
-    } else if resolution == "kept_existing" {
-        conn.execute(
-            "
-            UPDATE memories
-            SET invalidated_at = COALESCE(invalidated_at, ?2),
-                invalidated_reason = COALESCE(invalidated_reason, ?3)
-            WHERE memory_id = ?1
-            ",
-            params![new_memory_id, now, invalidation_reason],
-        )?;
-        #[cfg(feature = "embeddings")]
-        crate::ann::on_invalidate(conn, &new_memory_id);
+    if pair.is_some_and(|(a, b)| a != new_id || b != existing_id) {
+        return Err("conflict pair mismatch".into());
     }
-
-    let updated = conn.execute(
-        "
-        UPDATE memory_conflicts
-        SET resolved_at = ?2, resolution = ?3
-        WHERE conflict_id = ?1 AND resolved_at IS NULL
-        ",
-        params![conflict_id, now, resolution],
+    let ts = event
+        .ts
+        .format(&time::format_description::well_known::Rfc3339)?;
+    conn.execute("INSERT OR IGNORE INTO memory_conflicts(conflict_id,new_memory_id,existing_memory_id,scope,kind,similarity,detected_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![id,new_id,existing_id,field("scope")?,field("kind")?,event.payload["similarity"].as_f64().unwrap_or(0.0),field("detected_at")?])?;
+    let loser = match resolution {
+        "kept_new" => Some(existing_id),
+        "kept_existing" => Some(new_id),
+        _ => None,
+    };
+    if let Some(loser) = loser {
+        conn.execute("UPDATE memories SET invalidated_at=COALESCE(invalidated_at,?2),invalidated_reason=COALESCE(invalidated_reason,?3) WHERE memory_id=?1",params![loser,ts,format!("conflict {id} resolved as {resolution}")])?;
+        conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [loser])?;
+        #[cfg(feature = "embeddings")]
+        crate::ann::on_invalidate(conn, loser);
+    }
+    conn.execute(
+        "UPDATE memory_conflicts SET resolved_at=?2,resolution=?3 WHERE conflict_id=?1",
+        params![id, ts, resolution],
     )?;
-    Ok(updated > 0)
+    Ok(())
 }
 
 #[cfg(test)]

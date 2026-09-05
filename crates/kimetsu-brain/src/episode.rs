@@ -4,8 +4,8 @@
 //! # Design
 //!
 //! Episodes are event-sourced via `work.episode` events → the `work_episodes`
-//! projection table.  One live (non-superseded) episode per repo at a time;
-//! each new capture supersedes the prior.
+//! projection table. One live episode per repo and explicit identity lane;
+//! each new capture supersedes the prior in the same lane only.
 //!
 //! ## Story coverage
 //! * **1.3** — episode event + table; auto-capture at SessionEnd; optional
@@ -33,11 +33,15 @@ use crate::projector;
 // ---------------------------------------------------------------------------
 
 /// A serialized `work.episode` event payload (stored as JSON in the events
-/// table).  All fields are optional strings so a partial capture never fails.
+/// table). An empty identity preserves the legacy unscoped lane.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct EpisodePayload {
     /// Human-readable task description / goal.
     pub task: String,
+    /// Stable caller-selected task/session/worktree lane; empty is the legacy lane.
+    #[serde(default)]
+    pub identity: String,
     /// Narrative summary of what was done.
     pub summary: String,
     /// Things that remain to be done.
@@ -60,6 +64,7 @@ pub struct EpisodePayload {
 #[derive(Debug, Clone)]
 pub struct EpisodeRow {
     pub episode_id: String,
+    pub identity: String,
     pub repo_root: String,
     pub task: String,
     pub summary: String,
@@ -135,12 +140,12 @@ pub(crate) fn project_work_episode(
     let dead_ends_json = serde_json::to_string(&payload.dead_ends)?;
 
     // 1. Insert the new episode (OR IGNORE for replay-safety).
-    conn.execute(
+    let inserted = conn.execute(
         "
         INSERT OR IGNORE INTO work_episodes (
             episode_id, repo_root, task, summary, open_threads, dead_ends,
-            hypothesis, note, created_at, superseded_by
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
+            hypothesis, note, created_at, superseded_by, identity
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)
         ",
         params![
             episode_id,
@@ -152,8 +157,13 @@ pub(crate) fn project_work_episode(
             payload.hypothesis,
             payload.note,
             ts,
+            payload.identity,
         ],
     )?;
+
+    if inserted == 0 {
+        return Ok(());
+    }
 
     // 2. Supersede the prior live episode for this repo_root (if any).
     // We find the most-recent non-superseded episode that is NOT this one,
@@ -165,10 +175,11 @@ pub(crate) fn project_work_episode(
             WHERE repo_root = ?1
               AND superseded_by IS NULL
               AND episode_id != ?2
+              AND identity = ?3
             ORDER BY created_at DESC
             LIMIT 1
             ",
-            params![payload.repo_root, episode_id],
+            params![payload.repo_root, episode_id, payload.identity],
             |r| r.get(0),
         )
         .optional()?;
@@ -217,6 +228,15 @@ type EpisodeDbRow = (
 /// Load the live (non-superseded) episode for `repo_root`, or `None` when
 /// none exists.
 pub fn load_live_episode(conn: &Connection, repo_root: &str) -> KimetsuResult<Option<EpisodeRow>> {
+    load_live_episode_scoped(conn, repo_root, "")
+}
+
+/// Exact identity selection: never falls back to another task or legacy lane.
+pub fn load_live_episode_scoped(
+    conn: &Connection,
+    repo_root: &str,
+    identity: &str,
+) -> KimetsuResult<Option<EpisodeRow>> {
     let row: Option<EpisodeDbRow> = conn
         .query_row(
             "
@@ -224,11 +244,12 @@ pub fn load_live_episode(conn: &Connection, repo_root: &str) -> KimetsuResult<Op
                    hypothesis, note, created_at, superseded_by
             FROM work_episodes
             WHERE repo_root = ?1
+              AND identity = ?2
               AND superseded_by IS NULL
             ORDER BY created_at DESC
             LIMIT 1
             ",
-            params![repo_root],
+            params![repo_root, identity],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -266,6 +287,7 @@ pub fn load_live_episode(conn: &Connection, repo_root: &str) -> KimetsuResult<Op
     let dead_ends: Vec<String> = serde_json::from_str(&dead_ends_json).unwrap_or_default();
 
     Ok(Some(EpisodeRow {
+        identity: identity.to_string(),
         episode_id,
         repo_root: repo_root_val,
         task,
@@ -301,9 +323,15 @@ pub fn load_live_episode(conn: &Connection, repo_root: &str) -> KimetsuResult<Op
 /// Hypothesis: <hypothesis>.
 /// ```
 pub fn render_resume_context(workspace: &Path) -> Option<String> {
+    render_resume_context_scoped(workspace, "")
+}
+
+pub fn render_resume_context_scoped(workspace: &Path, identity: &str) -> Option<String> {
     let (paths, _config, conn) = load_project_readonly(workspace).ok()?;
     let repo_root = paths.repo_root.to_string_lossy().to_string();
-    let episode = load_live_episode(&conn, &repo_root).ok().flatten()?;
+    let episode = load_live_episode_scoped(&conn, &repo_root, identity)
+        .ok()
+        .flatten()?;
     Some(format_episode_for_context(&episode))
 }
 
@@ -387,8 +415,7 @@ pub fn capture_episode(workspace: &Path, payload: EpisodePayload) -> KimetsuResu
     let event_id = event.event_id.to_string();
 
     // Write into events table and project.
-    projector::insert_event(&conn, &event)?;
-    project_work_episode(&conn, &event)?;
+    projector::apply_events(&conn, &[event])?;
 
     Ok(event_id)
 }
@@ -456,6 +483,7 @@ pub fn rule_based_episode(transcript_view: &str, repo_root: &str, note: &str) ->
         .collect();
 
     EpisodePayload {
+        identity: String::new(),
         task: task.chars().take(200).collect(),
         summary: summary.chars().take(300).collect(),
         open_threads,
@@ -474,9 +502,15 @@ pub fn rule_based_episode(transcript_view: &str, repo_root: &str, note: &str) ->
 /// Convenience wrapper: load the live episode for `workspace` (resolves the
 /// repo_root from `ProjectPaths`).  Used by `kimetsu resume`.
 pub fn load_live_episode_for_workspace(workspace: &Path) -> KimetsuResult<Option<EpisodeRow>> {
+    load_live_episode_for_workspace_scoped(workspace, "")
+}
+pub fn load_live_episode_for_workspace_scoped(
+    workspace: &Path,
+    identity: &str,
+) -> KimetsuResult<Option<EpisodeRow>> {
     let (paths, _config, conn) = load_project_readonly(workspace)?;
     let repo_root = paths.repo_root.to_string_lossy().to_string();
-    load_live_episode(&conn, &repo_root)
+    load_live_episode_scoped(&conn, &repo_root, identity)
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +548,7 @@ mod tests {
         let conn = make_in_memory_conn();
         let run_id = kimetsu_core::ids::RunId::new();
         let payload = EpisodePayload {
+            identity: String::new(),
             task: "fix the build".to_string(),
             summary: "added missing feature flag".to_string(),
             open_threads: vec!["still need tests".to_string()],
@@ -614,6 +649,7 @@ mod tests {
         let conn = make_in_memory_conn();
         let run_id = kimetsu_core::ids::RunId::new();
         let payload = EpisodePayload {
+            identity: String::new(),
             task: "some task".to_string(),
             repo_root: "/repo/reset".to_string(),
             ..Default::default()
@@ -653,6 +689,7 @@ mod tests {
         let conn = make_in_memory_conn();
         let run_id = kimetsu_core::ids::RunId::new();
         let payload = EpisodePayload {
+            identity: String::new(),
             task: "rebuild test".to_string(),
             repo_root: "/repo/rebuild".to_string(),
             ..Default::default()
@@ -687,6 +724,7 @@ mod tests {
     #[test]
     fn render_resume_context_formats_episode() {
         let ep = EpisodeRow {
+            identity: String::new(),
             episode_id: "ep1".to_string(),
             repo_root: "/r".to_string(),
             task: "implement feature X".to_string(),
@@ -760,6 +798,7 @@ mod tests {
         let conn = make_in_memory_conn();
         let run_id = kimetsu_core::ids::RunId::new();
         let payload = EpisodePayload {
+            identity: String::new(),
             task: "edge test".to_string(),
             repo_root: "/repo/edges".to_string(),
             memory_ids: vec!["mem-abc".to_string(), "mem-xyz".to_string()],
