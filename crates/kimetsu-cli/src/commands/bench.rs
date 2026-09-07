@@ -184,7 +184,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
                 } else {
                     rerank_cap
                 },
-                ..Default::default()
+                ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
             };
             let request = ContextRequest {
                 stage: "localization".into(),
@@ -372,7 +372,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
                 let policy = kimetsu_brain::serving::ServingPolicy {
                     pool,
                     cap: rerank_cap,
-                    ..Default::default()
+                    ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
                 };
                 let request = ContextRequest {
                     stage: "localization".into(),
@@ -1866,7 +1866,7 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         let policy = kimetsu_brain::serving::ServingPolicy {
             pool: args.pool,
             cap: args.cap,
-            ..Default::default()
+            ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
         };
         let request = ContextRequest {
             stage: "localization".into(),
@@ -2083,7 +2083,7 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         "measurement_policy":"canonical_brain_context_v1",
         "ambient":false,"warm_start":false,
         "cost_unit":"serialized_utf8_byte_bound",
-        "budget":6000,"pool":args.pool,"cap":args.cap,"rerank_floor":kimetsu_brain::serving::RERANK_FLOOR,
+        "budget":6000,"pool":args.pool,"cap":args.cap,"rerank_floor":session.config().broker.rerank_min_score,
         "summary": {
             "positive_count":signal_cases.len(),"negative_count":noise_cases.len(),
             "negative_accuracy":if noise_cases.is_empty() {None}else{Some(noise_cases.iter().filter(|(_,r)|r.obtained.is_empty()).count() as f64/noise_cases.len() as f64)},

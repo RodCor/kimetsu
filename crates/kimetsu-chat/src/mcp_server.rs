@@ -913,10 +913,12 @@ fn brain_context_tool_with_embedder_loader(
         config_ambient,
     );
 
+    let session = kimetsu_brain::project::BrainSession::open_readonly(workspace)
+        .map_err(|e| e.to_string())?;
     let policy = kimetsu_brain::serving::ServingPolicy {
         budget: budget_tokens,
         cap,
-        ..Default::default()
+        ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
     };
     let request = ContextRequest {
         stage: stage.to_string(),
@@ -938,8 +940,6 @@ fn brain_context_tool_with_embedder_loader(
             .map(|v| v as f32),
         ..Default::default()
     };
-    let session = kimetsu_brain::project::BrainSession::open_readonly(workspace)
-        .map_err(|e| e.to_string())?;
     let exposure = kimetsu_core::event::Event::new(
         kimetsu_core::ids::RunId::new(),
         "context.injected",
@@ -3069,6 +3069,52 @@ mod tests {
                 );
             }
             fs::remove_dir_all(root).expect("remove temp root");
+        });
+    }
+
+    #[test]
+    fn configured_rerank_cutoff_controls_actual_mcp_admission() {
+        struct ModerateScore;
+        impl kimetsu_brain::embeddings::Reranker for ModerateScore {
+            fn model_id(&self) -> &str {
+                "fixed-admission-evidence"
+            }
+            fn rerank(
+                &self,
+                _: &str,
+                docs: &[&str],
+            ) -> Result<Vec<f32>, kimetsu_brain::embeddings::EmbedderError> {
+                Ok(vec![0.6; docs.len()])
+            }
+        }
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("configured-rerank-cutoff");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "Use ripgrep to search files before reading source code.",
+            )
+            .unwrap();
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
+            let original = fs::read_to_string(&paths.project_toml).unwrap();
+            let args = json!({"query":"ripgrep search files","include_ambient":false,"budget_tokens":6000});
+            for (floor, count) in [(0.75, 0), (0.0, 1)] {
+                let mut value: toml::Value = toml::from_str(&original).unwrap();
+                value["broker"]
+                    .as_table_mut()
+                    .unwrap()
+                    .insert("rerank_min_score".into(), toml::Value::Float(floor));
+                fs::write(&paths.project_toml, toml::to_string(&value).unwrap()).unwrap();
+                let result = brain_context_tool(&root, &args, Some(&ModerateScore)).unwrap();
+                assert_eq!(
+                    result["capsule_count"], count,
+                    "configured floor {floor}: {result}"
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
         });
     }
 

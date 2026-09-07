@@ -317,6 +317,7 @@ pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
             "jina-reranker-v1-tiny-en",
             "ms-marco-tinybert-l-2-v2",
             "ms-marco-minilm-l-4-v2",
+            "mmarco-minilm-l12-v2-int8",
         ];
 
         if CURATED.contains(&v.as_str()) {
@@ -805,6 +806,7 @@ mod fastembed_backend {
             "jina-reranker-v1-tiny-en" => Some("jinaai/jina-reranker-v1-tiny-en"),
             "ms-marco-tinybert-l-2-v2" => Some("Xenova/ms-marco-TinyBERT-L-2-v2"),
             "ms-marco-minilm-l-4-v2" => Some("Xenova/ms-marco-MiniLM-L-4-v2"),
+            "mmarco-minilm-l12-v2-int8" => Some("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"),
             _ => None,
         }
     }
@@ -835,7 +837,16 @@ mod fastembed_backend {
         let api = ApiBuilder::from_env().build().map_err(|e| {
             EmbedderError::LoadFailed(format!("hf-hub ApiBuilder::from_env failed: {e}"))
         })?;
-        let repo = api.model(repo_id.clone());
+        let multilingual_int8 = lowercased == "mmarco-minilm-l12-v2-int8";
+        let repo = if multilingual_int8 {
+            api.repo(hf_hub::Repo::with_revision(
+                repo_id.clone(),
+                hf_hub::RepoType::Model,
+                "1427fd652930e4ba29e8149678df786c240d8825".into(),
+            ))
+        } else {
+            api.model(repo_id.clone())
+        };
 
         // Helper: download a required file or return LoadFailed.
         let get_required = |filename: &str| -> Result<Vec<u8>, EmbedderError> {
@@ -853,14 +864,19 @@ mod fastembed_backend {
         let special_tokens_map_file = get_required("special_tokens_map.json")?;
 
         // Try `onnx/model.onnx` first, then `model.onnx` at root.
-        let onnx_path = repo
-            .get("onnx/model.onnx")
-            .or_else(|_| repo.get("model.onnx"))
-            .map_err(|e| {
-                EmbedderError::LoadFailed(format!(
-                    "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
-                ))
-            })?;
+        let onnx_path = if multilingual_int8 {
+            // Pin the tested compact CPU export; never silently fetch the
+            // much larger float32 checkpoint for this explicit model ID.
+            repo.get("onnx/model_quint8_avx2.onnx")
+        } else {
+            repo.get("onnx/model.onnx")
+                .or_else(|_| repo.get("model.onnx"))
+        }
+        .map_err(|e| {
+            EmbedderError::LoadFailed(format!(
+                "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
+            ))
+        })?;
 
         let tokenizer_files = fastembed::TokenizerFiles {
             tokenizer_file,

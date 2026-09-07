@@ -875,6 +875,13 @@ pub struct BrokerSection {
     /// unchanged (off).
     #[serde(default = "default_abstain_min_score")]
     pub abstain_min_score: f32,
+    /// Final cross-encoder admission floor. Scores are model-specific, not
+    /// calibrated probabilities. Zero disables this floor (not cosine gating).
+    #[serde(
+        default = "default_rerank_min_score",
+        deserialize_with = "deserialize_rerank_min_score"
+    )]
+    pub rerank_min_score: f32,
     /// F3: floor for the adaptive per-stage brain budget. Small tasks
     /// receive at least this many tokens so the brain is never starved.
     /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
@@ -1027,6 +1034,23 @@ fn default_answer_grade_min_score() -> f32 {
     0.92
 }
 
+fn default_rerank_min_score() -> f32 {
+    0.30
+}
+
+fn deserialize_rerank_min_score<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f32, D::Error> {
+    let value = f32::deserialize(deserializer)?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "rerank_min_score must be finite and between 0 and 1",
+        ))
+    }
+}
+
 impl Default for BrokerSection {
     fn default() -> Self {
         Self {
@@ -1038,6 +1062,7 @@ impl Default for BrokerSection {
             fusion: default_fusion(),
             normalization: default_normalization(),
             abstain_min_score: default_abstain_min_score(),
+            rerank_min_score: default_rerank_min_score(),
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
@@ -1428,6 +1453,20 @@ impl Default for LifecycleSection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rerank_cutoff_survives_configuration_roundtrip_and_rejects_invalid_values() {
+        let mut value = serde_json::to_value(ProjectConfig::default_for_project("cutoff")).unwrap();
+        value["broker"]["rerank_min_score"] = serde_json::json!(0.75);
+        let config: ProjectConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["broker"]["rerank_min_score"],
+            0.75
+        );
+        for invalid in [-0.1, 1.1] {
+            value["broker"]["rerank_min_score"] = serde_json::json!(invalid);
+            assert!(serde_json::from_value::<ProjectConfig>(value.clone()).is_err());
+        }
+    }
     use super::*;
 
     // ── v2.6: Free/Deep tier resolution ──────────────────────────────────

@@ -66,6 +66,12 @@ impl Default for ServingPolicy {
     }
 }
 impl ServingPolicy {
+    pub fn from_config(config: &kimetsu_core::config::ProjectConfig) -> Self {
+        Self {
+            rerank_floor: config.broker.rerank_min_score,
+            ..Self::default()
+        }
+    }
     pub fn prepare(&self, mut request: ContextRequest, reranking: bool) -> ContextRequest {
         request.budget_tokens = if reranking {
             self.budget.max(DEFAULT_BUDGET)
@@ -159,7 +165,9 @@ impl ServingPolicy {
                     .iter()
                     .any(|s| !s.is_finite() || !(0.0..=1.0).contains(s))
             {
-                return Err("reranker returned invalid scores; no cross-encoder measurement".into());
+                return Err(
+                    "reranker returned invalid scores; no cross-encoder measurement".into(),
+                );
             }
             Some(CheckedScores {
                 model: rr.model_id(),

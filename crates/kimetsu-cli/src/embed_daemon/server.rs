@@ -20,7 +20,6 @@ use std::time::Instant;
 const RERANK_POOL: usize = kimetsu_brain::serving::RERANK_POOL;
 
 /// Sigmoid-score floor — capsules the cross-encoder judges below this are noise.
-const RERANK_FLOOR: f32 = kimetsu_brain::serving::RERANK_FLOOR;
 
 /// Process-global state shared by all worker threads.
 pub struct DaemonState {
@@ -71,7 +70,7 @@ impl DaemonState {
             },
             cap,
             pool: RERANK_POOL,
-            rerank_floor: RERANK_FLOOR,
+            rerank_floor: session.config().broker.rerank_min_score,
         };
         let request = ContextRequest {
             stage: if args.stage.is_empty() {

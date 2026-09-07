@@ -2709,7 +2709,7 @@ pub(crate) fn brain_tune_sweep(
     }
     let config = project::load_config(paths)?;
     let embedder = open_embedder_for_checked(config.embedder.enabled)?;
-    let policy = ServingPolicy::default();
+    let policy = ServingPolicy::from_config(&config);
     let current_combo = TuneCombo {
         min_lexical_coverage: config.broker.min_lexical_coverage,
         min_semantic_score: config.broker.min_semantic_score,
