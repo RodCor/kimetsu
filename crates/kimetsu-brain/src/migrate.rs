@@ -119,6 +119,11 @@ fn migrations() -> &'static [Migration] {
             description: "scope work episodes by explicit identity",
             up: crate::schema::migrate_v13_to_v14,
         },
+        Migration {
+            version: 15,
+            description: "derive structured fact evidence from redacted memories",
+            up: crate::schema::migrate_v14_to_v15,
+        },
     ]
 }
 

@@ -691,6 +691,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
 
         let context = build_benchmark_context(
@@ -787,6 +788,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
 
         let context = build_benchmark_context(
@@ -828,6 +830,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
 
         let context = build_benchmark_context(
@@ -867,6 +870,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
 
         let context = build_benchmark_context(
@@ -911,6 +915,7 @@ mod tests {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         }

@@ -335,8 +335,12 @@ pub fn assess(query: &str, text: &str) -> FactEvidence {
 
 /// Apply the same explicit-fact policy to MCP and the lightweight hook.
 pub fn filter_bundle(query: &str, bundle: &mut crate::context::ContextBundle) {
+    let request = crate::fact_query::parse(query);
     for capsule in std::mem::take(&mut bundle.capsules) {
-        if assess(query, &capsule.summary) == FactEvidence::MissingValue {
+        let rejected = if let Some(request) = request.as_ref().filter(|_| !capsule.facts.is_empty()) {
+            !capsule.facts.iter().any(|fact| crate::fact_query::visible(&capsule, fact) && crate::fact_query::matches(request, &fact.claim))
+        } else { assess(query, &capsule.summary) == FactEvidence::MissingValue };
+        if rejected {
             bundle.excluded.push(capsule);
         } else {
             bundle.capsules.push(capsule);

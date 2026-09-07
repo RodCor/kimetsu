@@ -119,6 +119,10 @@ async fn record_then_context_round_trips() {
     // Query with words from the lesson but NOT the asserted token, so the match
     // can only come from the retrieved capsule (not the echoed query).
     let ctx = inner(&send(tmp.path(), "repo-a", context("deployment restart flushing")).await);
+    assert!(
+        ctx.get("warm_start").is_none(),
+        "remote requests must not use the stdio session cache: {ctx}"
+    );
     assert_eq!(ctx["skipped"], json!(false), "expected a hit: {ctx}");
     assert!(
         ctx["capsules"].to_string().contains("wobblecache"),

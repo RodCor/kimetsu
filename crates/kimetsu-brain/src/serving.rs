@@ -76,12 +76,15 @@ impl ServingPolicy {
         }
     }
     pub fn prepare(&self, mut request: ContextRequest, reranking: bool) -> ContextRequest {
+        request.include_fact_evidence |= self.explicit_fact_guard;
+        request.defer_fact_budget =
+            self.explicit_fact_guard && crate::fact_query::parse(&request.query).is_some();
         request.budget_tokens = if reranking {
             self.budget.max(DEFAULT_BUDGET)
         } else {
             self.budget
         };
-        request.max_capsules = if reranking {
+        request.max_capsules = if reranking || self.explicit_fact_guard {
             self.cap.max(self.pool)
         } else {
             self.cap
@@ -109,6 +112,11 @@ impl ServingPolicy {
         );
         if self.explicit_fact_guard {
             crate::answerability::filter_bundle(query, &mut bundle);
+            if let Some(assessment) = crate::fact_query::evaluate(query, &bundle.capsules) {
+                bundle.known_fact_conflicts.extend(assessment.conflicting);
+                bundle.known_fact_conflicts.sort();
+                bundle.known_fact_conflicts.dedup();
+            }
         }
         if self.cap > 0 {
             bundle.capsules.truncate(self.cap);
@@ -130,13 +138,36 @@ impl ServingPolicy {
         if compress {
             for capsule in &mut bundle.capsules {
                 capsule.summary = if self.explicit_fact_guard {
-                    crate::answerability::compress_preserving_evidence(query, &capsule.summary, 3)
+                    crate::fact_query::compress_capsule(query, capsule, 3)
                 } else {
                     crate::context::compress_for_render(&capsule.summary, 3)
                 };
             }
         }
-        self.render(bundle, false, exposure_id)
+        if !self.explicit_fact_guard {
+            return self.render(bundle, false, exposure_id);
+        }
+        let mut known_conflicts = bundle.known_fact_conflicts.clone();
+        if let Some(assessment) = crate::fact_query::evaluate(query, &bundle.capsules) {
+            known_conflicts.extend(assessment.conflicting);
+        }
+        known_conflicts.sort();
+        known_conflicts.dedup();
+        let count = bundle.capsules.len();
+        fit_json(bundle.capsules.clone(), self.budget, |capsules| {
+            let mut payload = json!({
+                "ok":true,"skipped":capsules.is_empty(),"exposure_id":exposure_id,
+                "capsule_count":capsules.len(),"excluded_count":bundle.excluded.len()+count-capsules.len(),
+                "capsules":compact_capsules(capsules),"partial_evidence":bundle.evidence_coverage<1.0 || capsules.len()<count,
+            });
+            if let Some(mut assessment) = crate::fact_query::evaluate(query, capsules) {
+                crate::fact_query::preserve_conflicts(&mut assessment, &known_conflicts);
+                payload["partial_evidence"] =
+                    json!(assessment.status != "supported" || payload["partial_evidence"] == true);
+                payload["answerability"] = json!(assessment);
+            }
+            payload
+        })
     }
     pub fn render(&self, mut bundle: ContextBundle, compress: bool, exposure_id: &str) -> Delivery {
         if compress {
@@ -401,6 +432,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: vec![],
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let policy = ServingPolicy {
             explicit_fact_guard: true,
@@ -431,6 +463,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: vec![],
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let policy = ServingPolicy {
             cap: 1,
@@ -466,6 +499,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: vec![],
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let policy = ServingPolicy::default();
         let selected = policy.arbitrate("wal checkpoint", bundle, Some(&StubReranker), 0.0);
@@ -474,5 +508,98 @@ mod tests {
         let delivery = policy.render(selected, false, EVAL_EXPOSURE_ID);
         assert_eq!(delivery.capsules.len(), 1);
         assert!(!delivery.payload.to_string().contains("remote network"));
+    }
+}
+
+#[cfg(test)]
+mod conflict_carry_tests {
+    use super::*;
+    use crate::context::ContextCapsule;
+    struct RejectSecond;
+    impl Reranker for RejectSecond {
+        fn rerank(
+            &self,
+            _: &str,
+            _: &[&str],
+        ) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {
+            Ok(vec![0.9, 0.0])
+        }
+        fn model_id(&self) -> &str {
+            "reject-second"
+        }
+    }
+    #[test]
+    fn guard_reserves_a_bounded_pool_before_the_final_cap() {
+        let policy = ServingPolicy {
+            cap: 1,
+            pool: 32,
+            explicit_fact_guard: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            policy
+                .prepare(ContextRequest::default(), false)
+                .max_capsules,
+            32
+        );
+    }
+    #[test]
+    fn capsule_cap_does_not_turn_conflicting_evidence_into_support() {
+        let capsules = [("a", "7319"), ("b", "7320")]
+            .into_iter()
+            .map(|(id, value)| {
+                let text = format!("Orchid gateway port is {value}.");
+                let mut c = ContextCapsule::wire_minimal(text.clone(), "memory".into(), 0.99);
+                c.expansion_handle = format!("memory:{id}");
+                c.claim_revision = Some(format!("baseline:{id}"));
+                c.facts = crate::facts::extract(&text)
+                    .into_iter()
+                    .map(|claim| crate::fact_store::StoredFact {
+                        memory_id: id.into(),
+                        claim_revision: format!("baseline:{id}"),
+                        source_event_id: "source".into(),
+                        valid_from: None,
+                        valid_to: None,
+                        claim,
+                    })
+                    .collect();
+                c
+            })
+            .collect();
+        let bundle = ContextBundle {
+            stage: "localization".into(),
+            budget_tokens: 6000,
+            used_tokens: 0,
+            capsules,
+            excluded: vec![],
+            skipped: false,
+            top_score: 0.99,
+            top_abs_evidence: 0.99,
+            evidence_coverage: 1.0,
+            uncovered_terms: vec![],
+            chronological: false,
+            known_fact_conflicts: vec![],
+        };
+        let policy = ServingPolicy {
+            cap: 1,
+            budget: 6000,
+            explicit_fact_guard: true,
+            ..Default::default()
+        };
+        let q = "What is the Orchid gateway port?";
+        let eligible = policy.arbitrate(q, bundle.clone(), Some(&RejectSecond), 0.0);
+        let eligible_delivery = policy.render_for_query(q, eligible, true, EVAL_EXPOSURE_ID);
+        assert_eq!(
+            eligible_delivery.payload["answerability"]["status"],
+            "supported"
+        );
+        let chosen = policy.arbitrate(q, bundle, None, 0.0);
+        assert_eq!(chosen.capsules.len(), 1);
+        let delivery = policy.render_for_query(q, chosen, true, EVAL_EXPOSURE_ID);
+        assert_eq!(delivery.payload["answerability"]["status"], "conflicting");
+        assert_eq!(
+            delivery.payload["answerability"]["conflicting"],
+            serde_json::json!(["port"])
+        );
     }
 }

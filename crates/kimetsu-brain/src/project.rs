@@ -378,6 +378,7 @@ impl BrainSession {
     /// Resolve explicit overrides before legacy sentinels. The explicit zero
     /// survives a second resolution at the injected/production boundary.
     pub fn resolve_request_floors(&self, request: &mut ContextRequest) {
+        request.include_fact_evidence |= self.config.broker.explicit_fact_guard;
         let semantic = request.min_semantic_score_override.unwrap_or_else(|| {
             if request.min_semantic_score == 0.0 {
                 self.config.broker.min_semantic_score

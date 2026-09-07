@@ -1236,3 +1236,23 @@ pub(crate) fn migrate_v13_to_v14(conn: &Connection) -> KimetsuResult<()> {
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_episodes_identity ON work_episodes(repo_root, identity, superseded_by)")?;
     Ok(())
 }
+
+/// Derived structured evidence is replayable and never replaces memory text.
+pub(crate) fn migrate_v14_to_v15(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_facts (
+        memory_id TEXT NOT NULL, claim_revision TEXT NOT NULL, ordinal INTEGER NOT NULL,
+        source_event_id TEXT NOT NULL, source_digest TEXT NOT NULL, claim_json TEXT NOT NULL,
+        PRIMARY KEY(memory_id,claim_revision,ordinal));",
+    )?;
+    // Migration tools/tests can intentionally provide incomplete old schemas.
+    for column in ["memory_id", "text", "source_event_id"] {
+        if !table_has_column(conn, "memories", column)? {
+            return Ok(());
+        }
+    }
+    if !table_has_column(conn, "memory_revisions", "revision_id")? {
+        return Ok(());
+    }
+    crate::fact_store::backfill(conn)
+}

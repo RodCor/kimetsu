@@ -89,7 +89,14 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
     }
 
+    let explicit_fact_guard = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.explicit_fact_guard)
+        .unwrap_or(false);
+
     let request = ContextRequest {
+        include_fact_evidence: explicit_fact_guard,
         stage: "localization".to_string(),
         query: prompt,
         budget_tokens: 2000,
@@ -98,23 +105,62 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         ..Default::default()
     };
 
+    let defer_fact_budget =
+        explicit_fact_guard && kimetsu_brain::fact_query::parse(&request.query).is_some();
+
     // Retrieval: try the warm daemon first (semantic); fall back to
     // floored-FTS on any miss (daemon disabled / unreachable / cold).
     let (mut bundle, retrieval_path) = match try_daemon_retrieve(&workspace, &request) {
         Some(b) => (b, "daemon"),
-        None => match project::retrieve_context_lexical_readonly(&workspace, request.clone()) {
+        None => match project::retrieve_context_lexical_readonly(&workspace, {
+            let mut fallback_request = request.clone();
+            fallback_request.defer_fact_budget = defer_fact_budget;
+            if explicit_fact_guard {
+                fallback_request.max_capsules = fallback_request
+                    .max_capsules
+                    .max(kimetsu_brain::serving::RERANK_POOL);
+            }
+            fallback_request
+        }) {
             Ok(b) => (b, "fts_fallback"),
             Err(_) => return Ok(()), // Brain not initialized — silent fail
         },
     };
 
-    let explicit_fact_guard = kimetsu_core::paths::ProjectPaths::discover(&workspace)
-        .ok()
-        .and_then(|paths| project::load_config(&paths).ok())
-        .map(|cfg| cfg.broker.explicit_fact_guard)
-        .unwrap_or(false);
     if explicit_fact_guard {
         kimetsu_brain::answerability::filter_bundle(&request.query, &mut bundle);
+        if let Some(assessment) =
+            kimetsu_brain::fact_query::evaluate(&request.query, &bundle.capsules)
+        {
+            bundle.known_fact_conflicts.extend(assessment.conflicting);
+            bundle.known_fact_conflicts.sort();
+            bundle.known_fact_conflicts.dedup();
+        }
+        if retrieval_path == "fts_fallback" && defer_fact_budget {
+            // Observe eligible contradictions first, then restore the hook's
+            // original half-budget and cap before any text is rendered.
+            let capsule_budget = request.budget_tokens / 2;
+            let mut used = 0u32;
+            for capsule in std::mem::take(&mut bundle.capsules) {
+                if (args.max_capsules == 0 || bundle.capsules.len() < args.max_capsules)
+                    && used.saturating_add(capsule.token_estimate) <= capsule_budget
+                {
+                    used += capsule.token_estimate;
+                    bundle.capsules.push(capsule);
+                } else {
+                    bundle.excluded.push(capsule);
+                }
+            }
+        } else if args.max_capsules > 0 {
+            bundle.capsules.truncate(args.max_capsules);
+        }
+        bundle.skipped |= bundle.capsules.is_empty();
+        bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
+        bundle.top_score = bundle
+            .capsules
+            .iter()
+            .map(|c| c.score)
+            .fold(0.0_f32, f32::max);
     }
 
     // C7: emit a context.served event BEFORE the early-return so misses are
@@ -277,16 +323,26 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push('\n');
         additional_context.push_str(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE);
     }
+    let known_fact_conflicts = if explicit_fact_guard {
+        let mut known = bundle.known_fact_conflicts.clone();
+        known.extend(
+            kimetsu_brain::fact_query::evaluate(&request.query, &bundle.capsules)
+                .map(|a| a.conflicting)
+                .unwrap_or_default(),
+        );
+        known.sort();
+        known.dedup();
+        known
+    } else {
+        Vec::new()
+    };
+    let mut rendered_fact_capsules = Vec::new();
     for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
         let rendered: String = if compress_capsules {
             if explicit_fact_guard {
-                kimetsu_brain::answerability::compress_preserving_evidence(
-                    &request.query,
-                    &capsule.summary,
-                    3,
-                )
+                kimetsu_brain::fact_query::compress_capsule(&request.query, capsule, 3)
             } else {
                 kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
             }
@@ -308,6 +364,21 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             additional_context.push_str("Relevant project memory (not independently verified): ");
         }
         additional_context.push_str(&text);
+        if explicit_fact_guard {
+            let mut visible = (**capsule).clone();
+            visible.summary = text;
+            rendered_fact_capsules.push(visible);
+        }
+    }
+    if explicit_fact_guard {
+        if let Some(notice) = kimetsu_brain::fact_query::notice_with_conflicts(
+            &request.query,
+            &rendered_fact_capsules,
+            &known_fact_conflicts,
+        ) {
+            additional_context.push('\n');
+            additional_context.push_str(&notice);
+        }
     }
 
     // v2.6: when the bundle collectively covers only part of the question, say

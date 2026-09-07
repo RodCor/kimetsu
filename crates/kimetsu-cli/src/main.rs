@@ -4174,6 +4174,7 @@ scope = 0.1
             id: "m1".into(),
             expansion_handle: "memory:m1".into(),
             claim_revision: Some("rev1".into()),
+            facts: vec![],
             summary: "repo:fact - x".to_string(),
             kind: "memory".to_string(),
             score: 0.9,
@@ -4182,7 +4183,7 @@ scope = 0.1
         // the neutral (1.0, []) — which is the point: an unmeasurable bundle
         // must render as no claim, never as a false "memory does not cover".
         let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-no-brain");
-        let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9);
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9, vec![]);
         assert_eq!(bundle.capsules.len(), 1);
         assert_eq!(bundle.capsules[0].summary, "repo:fact - x");
         assert_eq!(bundle.capsules[0].id, "m1");
@@ -4215,7 +4216,7 @@ scope = 0.1
             ..Default::default()
         };
         let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-skipped");
-        let bundle = daemon_capsules_to_bundle(&tmp, &request, Vec::new(), true, 0.1);
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, Vec::new(), true, 0.1, vec![]);
         assert!(bundle.skipped);
         assert_eq!(bundle.evidence_coverage, 0.0);
         assert!(bundle.uncovered_terms.is_empty());

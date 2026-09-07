@@ -246,6 +246,7 @@ fn reset_projection(conn: &Connection) -> KimetsuResult<()> {
         DELETE FROM sources;
         DELETE FROM memories;
         DELETE FROM memory_revisions;
+        DELETE FROM memory_facts;
         DELETE FROM memory_proposals;
         DELETE FROM memories_fts;
         DELETE FROM memory_citations;
@@ -965,6 +966,7 @@ fn apply_memory_accepted(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         conn.execute("UPDATE memory_proposals SET status='accepted', decided_at=?2, decided_by='cli' WHERE proposal_id=?1",
             params![proposal_id,ts_text(event)?])?;
     }
+    crate::fact_store::refresh(conn, memory_id)?;
     Ok(())
 }
 
@@ -1286,6 +1288,7 @@ fn apply_memory_temporal(conn: &Connection, event: &Event) -> KimetsuResult<()> 
         }
         (None, None) => {} // no-op
     }
+    crate::fact_store::refresh(conn, memory_id)?;
     Ok(())
 }
 
@@ -2820,6 +2823,7 @@ fn apply_memory_corrected(conn: &Connection, event: &Event) -> KimetsuResult<()>
     crate::graph::project_entities(conn, id, text)?;
     conn.execute("INSERT INTO memory_revisions (memory_id,event_id,text,kind,known_at,effective_at,confidence,use_count,usefulness_score)
         SELECT memory_id,?2,text,kind,?3,?4,confidence,use_count,usefulness_score FROM memories WHERE memory_id=?1", params![id,event.event_id.to_string(),now,effective])?;
+    crate::fact_store::refresh(conn, id)?;
     Ok(())
 }
 

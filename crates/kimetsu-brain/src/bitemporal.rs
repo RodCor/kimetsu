@@ -177,6 +177,7 @@ pub fn as_of_capsules(memories: &[AsOfMemory]) -> Vec<ContextCapsule> {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         })

@@ -100,6 +100,15 @@ impl DaemonState {
                     };
                 }
                 proto::Response::Capsules {
+                    known_fact_conflicts: bundle.payload["answerability"]["conflicting"]
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     capsules: bundle
                         .capsules
                         .iter()
@@ -107,6 +116,7 @@ impl DaemonState {
                             id: c.id.clone(),
                             expansion_handle: c.expansion_handle.clone(),
                             claim_revision: c.claim_revision.clone(),
+                            facts: c.facts.clone(),
                             summary: c.summary.clone(),
                             kind: c.kind.clone(),
                             score: c.score,

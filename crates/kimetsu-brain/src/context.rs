@@ -261,6 +261,9 @@ pub struct ContextCapsule {
     /// Claim identity read in the same SQLite snapshot as the hydrated text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_revision: Option<String>,
+    /// Structured evidence read alongside this capsule text and revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<crate::fact_store::StoredFact>,
     /// Decayed usefulness multiplier and provenance discount carried to reranking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_usefulness: Option<f32>,
@@ -312,6 +315,7 @@ impl ContextCapsule {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         }
@@ -327,6 +331,10 @@ pub struct ProvenanceRef {
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextRequest {
+    /// Hydrate structured evidence only for consumers that explicitly request it.
+    pub include_fact_evidence: bool,
+    /// Defer intermediate budgeting to a final evidence-aware renderer; requires a bounded pool.
+    pub defer_fact_budget: bool,
     pub stage: String,
     pub query: String,
     pub budget_tokens: u32,
@@ -465,6 +473,8 @@ pub struct ContextBundle {
     /// relevance-ranked one whose ranking has gone wrong. See
     /// [`crate::ordering`] for why ordering is rendered rather than retrieved.
     pub chronological: bool,
+    /// Conflicts observed in eligible evidence before delivery trimming.
+    pub known_fact_conflicts: Vec<String>,
 }
 
 /// Discriminating weight per query token, for *bundle* coverage.
@@ -711,6 +721,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         &request.query,
         query_embedding.as_ref(),
         half_life_days,
+        request.include_fact_evidence,
     )?);
     for extra in extra_memory_conns {
         candidates.extend(backend.memory_candidates(
@@ -718,6 +729,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             &request.query,
             query_embedding.as_ref(),
             half_life_days,
+            request.include_fact_evidence,
         )?);
     }
     // v2.5.2 consolidation v1: bounded query-association routing boost —
@@ -1029,6 +1041,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             uncovered_terms: Vec::new(),
             // Nothing was rendered, so nothing was rendered in time order.
             chronological: false,
+            known_fact_conflicts: vec![],
         });
     }
 
@@ -1052,8 +1065,10 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             excluded.push(capsule);
             continue;
         }
-        if used_tokens.saturating_add(capsule.token_estimate) <= capsule_budget {
-            used_tokens += capsule.token_estimate;
+        if (request.defer_fact_budget && request.max_capsules > 0)
+            || used_tokens.saturating_add(capsule.token_estimate) <= capsule_budget
+        {
+            used_tokens = used_tokens.saturating_add(capsule.token_estimate);
             included.push(capsule);
         } else {
             excluded.push(capsule);
@@ -1089,6 +1104,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         evidence_coverage: coverage,
         uncovered_terms,
         chronological,
+        known_fact_conflicts: vec![],
     })
 }
 
@@ -1161,7 +1177,9 @@ pub fn search_memories_including_expired(
         } else {
             String::new()
         };
-        let claim_revision = Some(crate::projector::claim_revision_at(conn, &memory_id, None)?);
+        let revision = crate::projector::claim_revision_at(conn, &memory_id, None)?;
+        let facts = crate::fact_store::load(conn, &memory_id, &revision)?;
+        let claim_revision = Some(revision);
         capsules.push(ContextCapsule {
             id: new_id().to_string(),
             kind: "memory".to_string(),
@@ -1181,6 +1199,7 @@ pub fn search_memories_including_expired(
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision,
+            facts,
             rerank_usefulness: None,
             rerank_trust: None,
         });
@@ -1231,6 +1250,7 @@ fn memory_ann_candidates(
     k: u32,
     query_tokens: &[String],
     half_life_days: f32,
+    include_facts: bool,
 ) -> KimetsuResult<Vec<Candidate>> {
     // Tier-3: ANN candidate generation via the usearch HNSW index.
     let handle = crate::ann::handle_for_query(conn, qe.vector.len(), &qe.model_id)?;
@@ -1326,10 +1346,28 @@ fn memory_ann_candidates(
             row_vec,
         ) {
             candidate.capsule.claim_revision = Some(claim_revision);
+            hydrate_fact_evidence(conn, &mut candidate, include_facts)?;
             candidates.push(candidate);
         }
     }
     Ok(candidates)
+}
+
+/// Attach evidence only after row eligibility, while the text SELECT holds its snapshot.
+pub(crate) fn hydrate_fact_evidence(
+    conn: &Connection,
+    candidate: &mut Candidate,
+    include_facts: bool,
+) -> KimetsuResult<()> {
+    if include_facts {
+        if let (Some(id), Some(revision)) = (
+            candidate.capsule.expansion_handle.strip_prefix("memory:"),
+            candidate.capsule.claim_revision.as_deref(),
+        ) {
+            candidate.capsule.facts = crate::fact_store::load(conn, id, revision)?;
+        }
+    }
+    Ok(())
 }
 
 /// S5.1: the flat memory candidate function exposed as `pub(crate)` so
@@ -1343,8 +1381,16 @@ pub(crate) fn memory_candidates_flat(
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
     fusion: crate::fusion::Fusion,
+    include_facts: bool,
 ) -> KimetsuResult<Vec<Candidate>> {
-    memory_candidates(conn, query, query_embedding, half_life_days, fusion)
+    memory_candidates(
+        conn,
+        query,
+        query_embedding,
+        half_life_days,
+        fusion,
+        include_facts,
+    )
 }
 
 /// Build the flat candidate pool, merging the lexical and semantic rankings
@@ -1361,6 +1407,7 @@ fn memory_candidates(
     // Read only on the embeddings build: the lean path has a single ranking,
     // so there is nothing to fuse and any rule is the identity.
     #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))] fusion: crate::fusion::Fusion,
+    include_facts: bool,
 ) -> KimetsuResult<Vec<Candidate>> {
     let query_tokens = query_tokens(query);
 
@@ -1379,13 +1426,15 @@ fn memory_candidates(
                 80,
                 Some(qe),
                 half_life_days,
+                include_facts,
             )?
         } else {
             Vec::new()
         };
 
         // ANN candidates — top-80 nearest neighbours from the usearch index.
-        let ann_candidates = memory_ann_candidates(conn, qe, 80, &query_tokens, half_life_days)?;
+        let ann_candidates =
+            memory_ann_candidates(conn, qe, 80, &query_tokens, half_life_days, include_facts)?;
 
         // Both sources return best-first, which is what rank-based fusion needs.
         return Ok(crate::fusion::fuse(
@@ -1403,13 +1452,21 @@ fn memory_candidates(
             80,
             query_embedding,
             half_life_days,
+            include_facts,
         )?;
         if !candidates.is_empty() {
             return Ok(candidates);
         }
     }
 
-    latest_memory_candidates(conn, &query_tokens, 200, query_embedding, half_life_days)
+    latest_memory_candidates(
+        conn,
+        &query_tokens,
+        200,
+        query_embedding,
+        half_life_days,
+        include_facts,
+    )
 }
 
 fn latest_memory_candidates(
@@ -1418,6 +1475,7 @@ fn latest_memory_candidates(
     limit: u32,
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
+    include_facts: bool,
 ) -> KimetsuResult<Vec<Candidate>> {
     // MP-4d: exclude invalidated memories from retrieval. The row stays in
     // brain.db so `memory list` and replay can still see the history; only
@@ -1501,6 +1559,7 @@ fn latest_memory_candidates(
             row_vec,
         ) {
             candidate.capsule.claim_revision = Some(claim_revision);
+            hydrate_fact_evidence(conn, &mut candidate, include_facts)?;
             candidates.push(candidate);
         }
     }
@@ -1514,6 +1573,7 @@ fn memory_fts_candidates(
     limit: u32,
     query_embedding: Option<&QueryEmbedding>,
     half_life_days: f32,
+    include_facts: bool,
 ) -> KimetsuResult<Vec<Candidate>> {
     let mut stmt = conn.prepare_cached(
         "
@@ -1594,6 +1654,7 @@ fn memory_fts_candidates(
             row_vec,
         ) {
             candidate.capsule.claim_revision = Some(claim_revision);
+            hydrate_fact_evidence(conn, &mut candidate, include_facts)?;
             candidates.push(candidate);
         }
     }
@@ -1755,6 +1816,7 @@ pub(crate) fn memory_row_to_candidate(
             superseded_hint: false,
             rerank_policy_tier,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: Some(multiplier),
             rerank_trust: Some(crate::trust::trust_multiplier(
                 provenance,
@@ -1903,6 +1965,7 @@ fn repo_file_candidates(
                 superseded_hint: false,
                 rerank_policy_tier: 0,
                 claim_revision: None,
+                facts: vec![],
                 rerank_usefulness: None,
                 rerank_trust: None,
             },
@@ -1976,6 +2039,7 @@ fn manifest_candidates(
                 superseded_hint: false,
                 rerank_policy_tier: 0,
                 claim_revision: None,
+                facts: vec![],
                 rerank_usefulness: None,
                 rerank_trust: None,
             },
@@ -2041,6 +2105,7 @@ fn manifest_fts_candidates(
                 superseded_hint: false,
                 rerank_policy_tier: 0,
                 claim_revision: None,
+                facts: vec![],
                 rerank_usefulness: None,
                 rerank_trust: None,
             },
@@ -3342,6 +3407,7 @@ mod tests {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         }
@@ -5274,6 +5340,7 @@ mod tests {
                 superseded_hint: false,
                 rerank_policy_tier: 0,
                 claim_revision: None,
+                facts: vec![],
                 rerank_usefulness: None,
                 rerank_trust: None,
             },
@@ -5350,6 +5417,7 @@ mod tests {
                 superseded_hint: false,
                 rerank_policy_tier: 0,
                 claim_revision: None,
+                facts: vec![],
                 rerank_usefulness: None,
                 rerank_trust: None,
             },
@@ -6068,6 +6136,7 @@ mod tests {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         }
@@ -6330,6 +6399,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: vec![],
             chronological: false,
+            known_fact_conflicts: vec![],
         }
     }
 
@@ -6628,6 +6698,7 @@ mod evidence_tests {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         }
@@ -6646,6 +6717,7 @@ mod evidence_tests {
             evidence_coverage: coverage,
             uncovered_terms: uncovered.iter().map(|s| s.to_string()).collect(),
             chronological: false,
+            known_fact_conflicts: vec![],
         }
     }
 
@@ -7117,8 +7189,17 @@ mod hardening_tests {
         )
         .unwrap();
         for candidates in [
-            memory_fts_candidates(&conn, &["routing".into()], "routing*", 80, None, 30.0).unwrap(),
-            latest_memory_candidates(&conn, &["routing".into()], 200, None, 30.0).unwrap(),
+            memory_fts_candidates(
+                &conn,
+                &["routing".into()],
+                "routing*",
+                80,
+                None,
+                30.0,
+                false,
+            )
+            .unwrap(),
+            latest_memory_candidates(&conn, &["routing".into()], 200, None, 30.0, false).unwrap(),
         ] {
             let ids: Vec<_> = candidates
                 .iter()
@@ -7134,8 +7215,16 @@ mod hardening_tests {
     #[test]
     fn hardening_hydration_binds_text_revision_before_later_correction() {
         let conn = corpus();
-        let candidates =
-            memory_fts_candidates(&conn, &["routing".into()], "routing*", 80, None, 30.0).unwrap();
+        let candidates = memory_fts_candidates(
+            &conn,
+            &["routing".into()],
+            "routing*",
+            80,
+            None,
+            30.0,
+            false,
+        )
+        .unwrap();
         let capsules: Vec<_> = candidates.into_iter().map(|c| c.capsule).collect();
         assert_eq!(memory_revision_bindings(&capsules)["live"], "baseline:live");
         conn.execute("INSERT INTO memory_revisions(memory_id,event_id,text,kind,known_at,effective_at,confidence,use_count,usefulness_score)
@@ -7188,7 +7277,7 @@ mod hardening_tests {
             vector: vec![1.0, 0.0],
             model_id: "test".into(),
         };
-        let out = memory_ann_candidates(&conn, &qe, 80, &["routing".into()], 30.0).unwrap();
+        let out = memory_ann_candidates(&conn, &qe, 80, &["routing".into()], 30.0, false).unwrap();
         assert_eq!(out.len(), 2);
         for c in out {
             assert!(matches!(
@@ -7207,5 +7296,163 @@ mod hardening_tests {
         assert!((coverage["rout"] - (6.0_f32 / 5.0).ln()).abs() < 0.00001);
         assert!((coverage["absent"] - 6.0_f32.ln()).abs() < 0.00001);
         assert_eq!(corpus_token_idf(&conn, &tokens).unwrap()["absent"], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod structured_fact_hydration_tests {
+    use super::*;
+    use kimetsu_core::{event::Event, ids::RunId};
+
+    #[test]
+    fn lexical_and_recency_capsules_keep_their_delivered_fact_revision() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&c).unwrap();
+        crate::projector::apply_events(&c,&[Event::new(RunId::new(),"memory.accepted",serde_json::json!({
+            "memory_id":"m","scope":"project","kind":"fact","text":"Orchid staging gateway port is 7319."
+        }))]).unwrap();
+        let mut delivered = Vec::new();
+        for candidates in [
+            memory_fts_candidates(&c, &["orchid".into()], "orchid*", 80, None, 30.0, true).unwrap(),
+            latest_memory_candidates(&c, &["orchid".into()], 200, None, 30.0, true).unwrap(),
+        ] {
+            let capsule = &candidates[0].capsule;
+            assert_eq!(capsule.facts.len(), 1);
+            assert_eq!(capsule.facts[0].claim.value, "7319");
+            assert_eq!(
+                capsule.claim_revision.as_deref(),
+                Some(capsule.facts[0].claim_revision.as_str())
+            );
+            delivered.push(capsule.clone());
+        }
+        crate::projector::apply_events(
+            &c,
+            &[Event::new(
+                RunId::new(),
+                "memory.corrected",
+                serde_json::json!({
+                    "memory_id":"m","text":"Orchid staging gateway port is 8420."
+                }),
+            )],
+        )
+        .unwrap();
+        for capsule in delivered {
+            assert!(capsule.summary.contains("7319"));
+            assert_eq!(capsule.facts[0].claim.value, "7319");
+        }
+        let latest =
+            latest_memory_candidates(&c, &["orchid".into()], 200, None, 30.0, true).unwrap();
+        assert_eq!(latest[0].capsule.facts[0].claim.value, "8420");
+    }
+    #[test]
+    fn legacy_wire_capsules_default_to_empty_fact_evidence() {
+        let c = ContextCapsule::wire_minimal("hello".into(), "memory".into(), 1.0);
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("facts").is_none());
+        assert!(
+            serde_json::from_value::<ContextCapsule>(json)
+                .unwrap()
+                .facts
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod disabled_fact_hydration_tests {
+    use super::*;
+    #[test]
+    fn ordinary_retrieval_does_not_read_the_fact_projection() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&c).unwrap();
+        crate::projector::apply_events(
+            &c,
+            &[kimetsu_core::event::Event::new(
+                kimetsu_core::ids::RunId::new(),
+                "memory.accepted",
+                serde_json::json!({"memory_id":"m","text":"Orchid gateway port is 7319."}),
+            )],
+        )
+        .unwrap();
+        c.execute_batch("DROP TABLE memory_facts").unwrap();
+        for query in ["Orchid", ""] {
+            let out =
+                memory_candidates_flat(&c, query, None, 30.0, crate::fusion::Fusion::Linear, false)
+                    .unwrap();
+            assert_eq!(out.len(), 1);
+            assert!(out[0].capsule.facts.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_fact_budget_tests {
+    use super::*;
+    #[test]
+    fn initial_retrieval_budget_must_not_hide_an_eligible_conflicting_fact() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::schema::initialize(&c).unwrap();
+        for (id, value) in [("a", "7319"), ("b", "7320")] {
+            let text = format!(
+                "Orchid gateway port is {value}. Stable operation. Recorded settings. {}",
+                "Operational notes remain available. ".repeat(350)
+            );
+            crate::projector::apply_events(
+                &c,
+                &[kimetsu_core::event::Event::new(
+                    kimetsu_core::ids::RunId::new(),
+                    "memory.accepted",
+                    serde_json::json!({"memory_id":id,"scope":"project","kind":"fact","text":text}),
+                )],
+            )
+            .unwrap();
+        }
+        let query = "What is the Orchid gateway port?";
+        let policy = crate::serving::ServingPolicy {
+            budget: 6000,
+            cap: 1,
+            explicit_fact_guard: true,
+            ..Default::default()
+        };
+        let request = ContextRequest {
+            stage: "localization".into(),
+            query: query.into(),
+            budget_tokens: 6000,
+            ..Default::default()
+        };
+        let weights = BrokerWeights::default();
+        let mut ordinary = request.clone();
+        ordinary.max_capsules = 6;
+        let ordinary = retrieve_context_with_embedder(
+            &c,
+            "/fake-repo",
+            &weights,
+            ordinary,
+            &[],
+            &crate::embeddings::NoopEmbedder,
+        )
+        .unwrap();
+        assert_eq!(ordinary.capsules.len(), 1);
+        assert!(ordinary.used_tokens <= 3000);
+        let selected = retrieve_context_with_embedder(
+            &c,
+            "/fake-repo",
+            &weights,
+            policy.prepare(request, false),
+            &[],
+            &crate::embeddings::NoopEmbedder,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.capsules.len(),
+            2,
+            "both eligible claims must reach arbitration before delivery budgeting"
+        );
+        let selected = policy.arbitrate(query, selected, None, 0.0);
+        let delivered =
+            policy.render_for_query(query, selected, true, crate::serving::EVAL_EXPOSURE_ID);
+        assert_eq!(delivered.capsules.len(), 1);
+        assert_eq!(delivered.payload["answerability"]["status"], "conflicting");
+        assert!(delivered.payload["used_tokens"].as_u64().unwrap() <= 6000);
     }
 }

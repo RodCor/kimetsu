@@ -108,6 +108,7 @@ pub(crate) trait RetrievalBackend {
         query: &str,
         query_embedding: Option<&QueryEmbedding>,
         half_life_days: f32,
+        include_facts: bool,
     ) -> KimetsuResult<Vec<Candidate>>;
 }
 
@@ -135,6 +136,7 @@ impl RetrievalBackend for FlatBackend {
         query: &str,
         query_embedding: Option<&QueryEmbedding>,
         half_life_days: f32,
+        include_facts: bool,
     ) -> KimetsuResult<Vec<Candidate>> {
         crate::context::memory_candidates_flat(
             conn,
@@ -142,6 +144,7 @@ impl RetrievalBackend for FlatBackend {
             query_embedding,
             half_life_days,
             self.fusion,
+            include_facts,
         )
     }
 }
@@ -214,6 +217,7 @@ impl RetrievalBackend for GraphLiteBackend {
         query: &str,
         query_embedding: Option<&QueryEmbedding>,
         half_life_days: f32,
+        include_facts: bool,
     ) -> KimetsuResult<Vec<Candidate>> {
         // 1. Start with the flat candidate set (FTS + ANN / FTS + recency).
         let flat = crate::context::memory_candidates_flat(
@@ -222,6 +226,7 @@ impl RetrievalBackend for GraphLiteBackend {
             query_embedding,
             half_life_days,
             self.fusion,
+            include_facts,
         )?;
 
         // 2. Collect the memory_ids already in the flat set.
@@ -264,6 +269,7 @@ impl RetrievalBackend for GraphLiteBackend {
             &mut seen_ids,
             max_flat_relevance,
             half_life_days,
+            include_facts,
         )?;
 
         // 5. Concatenate: flat hits first (they have real relevance signals),
@@ -387,6 +393,7 @@ fn fetch_graph_candidates(
     seen_ids: &mut HashSet<String>,
     seed_relevance: f32,
     half_life_days: f32,
+    include_facts: bool,
 ) -> KimetsuResult<Vec<Candidate>> {
     if new_ids.is_empty() {
         return Ok(Vec::new());
@@ -462,7 +469,8 @@ fn fetch_graph_candidates(
 
         // Keep the graph's hop-derived query signal, but use exactly the same
         // usefulness decay and provenance policy as FTS/ANN hydration.
-        let claim_revision = Some(crate::projector::claim_revision_at(conn, &memory_id, None)?);
+        let revision = crate::projector::claim_revision_at(conn, &memory_id, None)?;
+        let claim_revision = Some(revision);
         if let Some(mut candidate) = crate::context::memory_row_to_candidate(
             &[],
             memory_id,
@@ -481,6 +489,7 @@ fn fetch_graph_candidates(
             None,
         ) {
             candidate.capsule.claim_revision = claim_revision;
+            crate::context::hydrate_fact_evidence(conn, &mut candidate, include_facts)?;
             for source in &mut candidate.capsule.provenance {
                 source.source = "graph".into();
             }
@@ -724,6 +733,7 @@ impl RetrievalBackend for PetgraphBackend {
         query: &str,
         query_embedding: Option<&QueryEmbedding>,
         half_life_days: f32,
+        include_facts: bool,
     ) -> KimetsuResult<Vec<Candidate>> {
         // 1. Flat candidate set (FTS + ANN or FTS + recency).
         let flat = crate::context::memory_candidates_flat(
@@ -732,6 +742,7 @@ impl RetrievalBackend for PetgraphBackend {
             query_embedding,
             half_life_days,
             self.fusion,
+            include_facts,
         )?;
 
         // 2. Collect seen ids from the flat set.
@@ -765,6 +776,7 @@ impl RetrievalBackend for PetgraphBackend {
             &mut seen_ids,
             max_flat_relevance,
             half_life_days,
+            include_facts,
         )?;
 
         // 5. Flat first (real relevance signals), graph-reached appended.
@@ -858,6 +870,7 @@ impl RetrievalBackend for DeferredPetgraphBackend {
         query: &str,
         query_embedding: Option<&QueryEmbedding>,
         half_life_days: f32,
+        include_facts: bool,
     ) -> KimetsuResult<Vec<Candidate>> {
         // Fast path: already initialised — but we must hold the lock to read.
         // We delegate to the inner backend while the lock is held. The lock is
@@ -874,6 +887,7 @@ impl RetrievalBackend for DeferredPetgraphBackend {
             query,
             query_embedding,
             half_life_days,
+            include_facts,
         )
     }
 }
@@ -912,7 +926,8 @@ mod tests {
             ("future".into(), 1),
             ("expired".into(), 1),
         ];
-        let out = fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0, 30.0).unwrap();
+        let out =
+            fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0, 30.0, false).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].capsule.expansion_handle, "memory:live");
         assert_eq!(
@@ -944,7 +959,8 @@ mod tests {
         insert_memory(&conn, "local", "fact", "local claim");
         conn.execute("UPDATE memories SET provenance_snapshot_json='{\"source\":\"pack\"}' WHERE memory_id='pack'",[]).unwrap();
         let ids = vec![("pack".into(), 1), ("local".into(), 1)];
-        let out = fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0, 30.0).unwrap();
+        let out =
+            fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0, 30.0, false).unwrap();
         let ranked = crate::context::rerank_capsules(
             "q",
             out.into_iter().map(|c| c.capsule).collect(),
@@ -960,7 +976,8 @@ mod tests {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         conn.execute("UPDATE memories SET use_count=5,usefulness_score=-5,last_useful_at=?1 WHERE memory_id='local'",[past]).unwrap();
-        let out = fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0, 30.0).unwrap();
+        let out =
+            fetch_graph_candidates(&conn, &ids, &mut HashSet::new(), 1.0, 30.0, false).unwrap();
         let local = out
             .iter()
             .find(|c| c.capsule.expansion_handle == "memory:local")
@@ -1086,12 +1103,12 @@ mod tests {
             let flat = FlatBackend {
                 fusion: crate::fusion::Fusion::Linear,
             }
-            .memory_candidates(&conn, query, None, 90.0)
+            .memory_candidates(&conn, query, None, 90.0, false)
             .expect("flat");
             let graph = GraphLiteBackend {
                 fusion: crate::fusion::Fusion::Linear,
             }
-            .memory_candidates(&conn, query, None, 90.0)
+            .memory_candidates(&conn, query, None, 90.0, false)
             .expect("graph-lite");
 
             for candidate in &flat {
@@ -1156,7 +1173,7 @@ mod tests {
         let graph = GraphLiteBackend {
             fusion: crate::fusion::Fusion::Linear,
         }
-        .memory_candidates(&conn, "checkpoint", None, 90.0)
+        .memory_candidates(&conn, "checkpoint", None, 90.0, false)
         .expect("graph-lite");
         let reached = graph
             .iter()
@@ -1203,10 +1220,10 @@ mod tests {
         };
 
         let flat_candidates = flat_backend
-            .memory_candidates(&conn, "cargo rust", None, 90.0)
+            .memory_candidates(&conn, "cargo rust", None, 90.0, false)
             .expect("flat candidates");
         let graph_candidates = graph_backend
-            .memory_candidates(&conn, "cargo rust", None, 90.0)
+            .memory_candidates(&conn, "cargo rust", None, 90.0, false)
             .expect("graph candidates");
 
         // graph-lite ⊇ flat — so it must have at least as many candidates.
@@ -1360,7 +1377,7 @@ mod tests {
         let flat = FlatBackend {
             fusion: crate::fusion::Fusion::Linear,
         }
-        .memory_candidates(&conn, "cargo fmt", None, 90.0)
+        .memory_candidates(&conn, "cargo fmt", None, 90.0, false)
         .expect("flat");
         let flat_ids: HashSet<String> = flat
             .iter()
@@ -1384,7 +1401,7 @@ mod tests {
         let graph = GraphLiteBackend {
             fusion: crate::fusion::Fusion::Linear,
         }
-        .memory_candidates(&conn, "cargo fmt", None, 90.0)
+        .memory_candidates(&conn, "cargo fmt", None, 90.0, false)
         .expect("graph");
         let graph_ids: HashSet<String> = graph
             .iter()
@@ -1437,7 +1454,7 @@ mod tests {
         let conn = make_conn();
         let backend = backend_for("graph-lite", crate::fusion::Fusion::Linear);
         // Must not panic on an empty brain.
-        let result = backend.memory_candidates(&conn, "some query", None, 90.0);
+        let result = backend.memory_candidates(&conn, "some query", None, 90.0, false);
         assert!(
             result.is_ok(),
             "graph-lite backend must not error on empty brain"
@@ -1555,7 +1572,7 @@ mod tests {
             PetgraphBackend::from_conn(&conn, crate::fusion::Fusion::Linear).expect("from_conn");
 
         let candidates = backend
-            .memory_candidates(&conn, "cargo fmt", None, 90.0)
+            .memory_candidates(&conn, "cargo fmt", None, 90.0, false)
             .expect("memory_candidates");
 
         let ids: std::collections::HashSet<String> = candidates
@@ -1586,7 +1603,7 @@ mod tests {
         let conn = make_conn();
         let backend = backend_for("graph", crate::fusion::Fusion::Linear);
         // Must not panic on an empty brain.
-        let result = backend.memory_candidates(&conn, "some query", None, 90.0);
+        let result = backend.memory_candidates(&conn, "some query", None, 90.0, false);
         assert!(
             result.is_ok(),
             "petgraph backend must not error on empty brain"
@@ -1601,7 +1618,7 @@ mod tests {
         let conn = make_conn();
         let backend = backend_for("graph", crate::fusion::Fusion::Linear);
         // Must still work (graph-lite fallback).
-        let result = backend.memory_candidates(&conn, "some query", None, 90.0);
+        let result = backend.memory_candidates(&conn, "some query", None, 90.0, false);
         assert!(
             result.is_ok(),
             "graph fallback must not error on empty brain"

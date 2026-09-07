@@ -253,6 +253,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let empty_plan = ContextBundle {
             stage: CodingStage::PatchPlan.as_str().to_string(),
@@ -266,6 +267,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         (empty_loc, empty_plan, "Broker disabled (brain_off).")
     } else {
@@ -3166,6 +3168,7 @@ mod tests {
             superseded_hint: false,
             rerank_policy_tier: 0,
             claim_revision: None,
+            facts: vec![],
             rerank_usefulness: None,
             rerank_trust: None,
         }
@@ -3184,6 +3187,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         }
     }
 
@@ -3553,6 +3557,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let mut ledger = RunRecallLedger::new();
         assert!(
@@ -3573,6 +3578,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         assert!(
             render_known_pitfalls(&empty_bundle, &mut ledger).is_none(),

@@ -1915,8 +1915,14 @@ pub(crate) fn try_daemon_retrieve(
             capsules,
             skipped,
             top_score,
+            known_fact_conflicts,
         }) => Some(daemon_capsules_to_bundle(
-            workspace, request, capsules, skipped, top_score,
+            workspace,
+            request,
+            capsules,
+            skipped,
+            top_score,
+            known_fact_conflicts,
         )),
         _ => {
             // Unreachable/errored: we already know it didn't answer, so spawn
@@ -1946,6 +1952,7 @@ pub(crate) fn daemon_capsules_to_bundle(
     capsules: Vec<embed_daemon::proto::Capsule>,
     skipped: bool,
     top_score: f32,
+    known_fact_conflicts: Vec<String>,
 ) -> kimetsu_brain::context::ContextBundle {
     use kimetsu_brain::context::{ContextBundle, ContextCapsule};
     let capsules: Vec<ContextCapsule> = capsules
@@ -1955,6 +1962,7 @@ pub(crate) fn daemon_capsules_to_bundle(
             capsule.id = c.id;
             capsule.expansion_handle = c.expansion_handle;
             capsule.claim_revision = c.claim_revision;
+            capsule.facts = c.facts;
             capsule
         })
         .collect();
@@ -1983,6 +1991,7 @@ pub(crate) fn daemon_capsules_to_bundle(
         // Ordering queries never reach the daemon (`try_daemon_retrieve`
         // declines them), so a bundle from here is never time-ordered.
         chronological: false,
+        known_fact_conflicts,
     }
 }
 
@@ -4135,4 +4144,76 @@ pub(crate) fn brain_skills(args: SkillsArgs) -> KimetsuResult<()> {
     let report = skill_synth::run_skill_synthesis(&workspace)?;
     skill_synth::print_synthesis_report(&report);
     Ok(())
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod conflict_carry_tests {
+    use super::*;
+    #[test]
+    fn daemon_conversion_keeps_conflict_notice_after_one_source_is_trimmed() {
+        let text = "Orchid gateway port is 7319.";
+        let request = kimetsu_brain::context::ContextRequest {
+            query: "What is the Orchid gateway port?".into(),
+            ..Default::default()
+        };
+        let capsule = embed_daemon::proto::Capsule {
+            id: "a".into(),
+            expansion_handle: "memory:a".into(),
+            claim_revision: Some("baseline:a".into()),
+            facts: kimetsu_brain::facts::extract(text)
+                .into_iter()
+                .map(|claim| kimetsu_brain::fact_store::StoredFact {
+                    memory_id: "a".into(),
+                    claim_revision: "baseline:a".into(),
+                    source_event_id: "source".into(),
+                    valid_from: None,
+                    valid_to: None,
+                    claim,
+                })
+                .collect(),
+            summary: text.into(),
+            kind: "memory".into(),
+            score: 0.99,
+        };
+        let response = embed_daemon::proto::Response::Capsules {
+            capsules: vec![capsule],
+            skipped: false,
+            top_score: 0.99,
+            known_fact_conflicts: vec!["port".into()],
+        };
+        let response: embed_daemon::proto::Response =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        let embed_daemon::proto::Response::Capsules {
+            capsules,
+            skipped,
+            top_score,
+            known_fact_conflicts,
+        } = response
+        else {
+            panic!("expected capsules")
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("kimetsu-conflict-wire-{}", ulid::Ulid::new()));
+        let bundle = daemon_capsules_to_bundle(
+            &workspace,
+            &request,
+            capsules,
+            skipped,
+            top_score,
+            known_fact_conflicts,
+        );
+        assert_eq!(
+            kimetsu_brain::fact_query::evaluate(&request.query, &bundle.capsules)
+                .unwrap()
+                .status,
+            "supported"
+        );
+        let notice = kimetsu_brain::fact_query::notice_with_conflicts(
+            &request.query,
+            &bundle.capsules,
+            &bundle.known_fact_conflicts,
+        )
+        .unwrap();
+        assert!(notice.contains("conflicting values for port"));
+    }
 }
