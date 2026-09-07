@@ -19,8 +19,6 @@ use std::time::Instant;
 /// NOTE: summaries must stay FULL — truncating them cratered recall.
 const RERANK_POOL: usize = kimetsu_brain::serving::RERANK_POOL;
 
-/// Sigmoid-score floor — capsules the cross-encoder judges below this are noise.
-
 /// Process-global state shared by all worker threads.
 pub struct DaemonState {
     pub embedder: Box<dyn Embedder + Send + Sync>,
