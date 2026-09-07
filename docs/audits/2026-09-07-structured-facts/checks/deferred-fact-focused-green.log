@@ -1,0 +1,48 @@
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\debug\deps\kimetsu_brain-4447584ffe405f3f.lib y objeto E:\Kimetsu\target\debug\deps\kimetsu_brain-4447584ffe405f3f.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-brain` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.72s
+     Running unittests src\lib.rs (E:/Kimetsu/target\debug\deps\kimetsu_brain-4447584ffe405f3f.exe)
+
+running 36 tests
+test context::tests::weights_for_task_kind_refactor_up_scope_fraction ... ok
+test fact_query::tests::broad_or_ambiguous_questions_keep_normal_retrieval ... ok
+test fact_query::tests::parses_shared_subject_and_environment_for_compound_request ... ok
+test fact_query::tests::parses_subject_after_attributes_and_spanish_aliases ... ok
+test fact_query::tests::conflicting_values_are_reported_instead_of_selecting_one ... ok
+test fact_query::tests::supports_partial_answers_without_borrowing_another_scope ... ok
+test context::structured_fact_hydration_tests::legacy_wire_capsules_default_to_empty_fact_evidence ... ok
+test fact_values::tests::binary_and_decimal_memory_units_are_distinct ... ok
+test fact_values::tests::equivalent_durations_share_keys_without_rounding ... ok
+test fact_values::tests::integer_attributes_normalize_only_valid_counts ... ok
+test fact_values::tests::unsupported_values_and_sensitive_strings_remain_exact ... ok
+test facts::tests::comma_numbers_cannot_be_truncated_into_facts ... ok
+test facts::tests::comma_qualifiers_cannot_be_discarded ... ok
+test fact_query::tests::only_visible_revision_bound_facts_support_an_answer ... ok
+test facts::tests::output_and_input_are_bounded ... ok
+test facts::tests::numeric_attributes_allow_bare_values_and_replica_counts ... ok
+test facts::tests::provisional_headers_cannot_be_discarded_at_clause_boundaries ... ok
+test facts::tests::clauses_do_not_inherit_scope ... ok
+test facts::tests::canonical_scope_keeps_identity_and_rejects_mixed_environments ... ok
+test facts::tests::rejects_relational_and_action_subjects ... ok
+test facts::tests::scope_environment_and_exact_evidence ... ok
+test facts::tests::rejects_negated_hypothetical_and_hidden_values ... ok
+test facts::tests::recognizes_scoped_absence_and_attributes ... ok
+test fact_query::tests::compression_preserves_each_supported_attribute ... ok
+test serving::tests::explicit_fact_guard_excludes_topic_match_before_output_cap ... ok
+test fact_query::tests::serving_metadata_tracks_the_final_budgeted_slice ... ok
+test fact_query::tests::budget_trimming_does_not_hide_a_known_conflict ... ok
+test fact_store::migration_tests::schema_fifteen_backfills_existing_text ... ok
+test fact_store::transaction_tests::failed_event_batch_rolls_back_fact_projection ... ok
+test context::disabled_fact_hydration_tests::ordinary_retrieval_does_not_read_the_fact_projection ... ok
+test fact_store::load_tests::ingestion_and_legacy_backfill_do_not_project_secrets ... ok
+test fact_store::load_tests::revisions_and_text_must_match_and_provenance_tracks_text_changes ... ok
+test fact_store::tests::acceptance_projects_redacted_claim_and_correction_replaces_it_on_replay ... ok
+test fact_store::load_tests::lifecycle_and_temporal_bounds_are_authoritative_at_read_time ... ok
+test context::structured_fact_hydration_tests::lexical_and_recency_capsules_keep_their_delivered_fact_revision ... ok
+test context::deferred_fact_budget_tests::initial_retrieval_budget_must_not_hide_an_eligible_conflicting_fact ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 739 filtered out; finished in 0.20s
+

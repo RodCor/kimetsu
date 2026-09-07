@@ -1,0 +1,19 @@
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+   Compiling kimetsu-agent v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-agent)
+   Compiling kimetsu-chat v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-chat)
+   Compiling kimetsu-cli v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-cli)
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\debug\deps\kimetsu-aabe805e13f18efb.lib y objeto E:\Kimetsu\target\debug\deps\kimetsu-aabe805e13f18efb.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-cli` (bin "kimetsu" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 44.85s
+     Running unittests src\main.rs (E:/Kimetsu/target\debug\deps\kimetsu-aabe805e13f18efb.exe)
+
+running 3 tests
+test embed_daemon::proto::legacy_conflict_wire_tests::legacy_response_without_conflicts_still_roundtrips_without_new_fields ... ok
+test embed_daemon::proto::conflict_wire_tests::response_preserves_conflicts_after_capsules_have_been_trimmed ... ok
+test commands::brain::conflict_carry_tests::daemon_conversion_keeps_conflict_notice_after_one_source_is_trimmed ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 281 filtered out; finished in 0.04s
+

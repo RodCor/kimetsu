@@ -1,0 +1,56 @@
+   Compiling tokio v1.52.3
+   Compiling tokio-util v0.7.18
+   Compiling h2 v0.4.16
+   Compiling hyper v1.9.0
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling tokio-native-tls v0.3.1
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling hyper-tls v0.6.0
+   Compiling tower-http v0.6.10
+   Compiling aws-smithy-async v1.2.14
+   Compiling aws-smithy-runtime-api v1.12.3
+   Compiling reqwest v0.12.28
+   Compiling ureq v3.3.0
+   Compiling hf-hub v0.5.0
+   Compiling anstyle-wincon v3.0.11
+   Compiling kimetsu-core v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-core)
+   Compiling fastembed v5.13.4
+   Compiling ignore v0.4.25
+   Compiling aws-credential-types v1.2.14
+   Compiling aws-smithy-http v0.63.6
+   Compiling anstyle-query v1.1.5
+   Compiling anstream v1.0.0
+   Compiling aws-sigv4 v1.4.5
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+   Compiling kimetsu-agent v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-agent)
+   Compiling clap_builder v4.6.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling axum v0.7.9
+   Compiling tracing-subscriber v0.3.23
+   Compiling kimetsu-chat v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-chat)
+   Compiling clap v4.6.1
+   Compiling kimetsu-remote v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-remote)
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\debug\deps\http_roundtrip-9d3bb9a239dd3067.lib y objeto E:\Kimetsu\target\debug\deps\http_roundtrip-9d3bb9a239dd3067.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-remote` (test "http_roundtrip") generated 1 warning
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\debug\deps\kimetsu_remote.lib y objeto E:\Kimetsu\target\debug\deps\kimetsu_remote.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-remote` (bin "kimetsu-remote") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 13s
+     Running tests\http_roundtrip.rs (E:/Kimetsu/target\debug\deps\http_roundtrip-9d3bb9a239dd3067.exe)
+
+running 5 tests
+test hardening_remote_reranker_empty_reply_obeys_final_budget ... ok
+test hardening_remote_reranker_escaped_capsule_obeys_final_budget ... ok
+test reranker_in_appstate_intercepts_brain_context ... ok
+test record_then_context_round_trips ... ok
+test two_repos_are_isolated ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+

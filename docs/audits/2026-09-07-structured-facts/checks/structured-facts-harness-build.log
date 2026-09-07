@@ -1,0 +1,5 @@
+   Compiling kimetsu-core v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-core)
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+   Compiling kimetsu-agent v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-agent)
+   Compiling kimetsu-bench v0.2.0 (E:\tmp\kimetsu-brain-hardening\bench)
+    Finished `release` profile [optimized] target(s) in 2m 34s

@@ -1,0 +1,17 @@
+
+running 1 test
+
+thread 'record_then_context_round_trips' (20204) panicked at crates\kimetsu-remote\tests\http_roundtrip.rs:122:5:
+assertion `left == right` failed: expected a hit: {"budget_tokens":6000,"capsule_count":0,"capsules":[],"excluded_count":0,"exposure_id":"01M1XYBZEWNRX059DBPD0PM7E2","ok":true,"partial_evidence":true,"skipped":true,"token_accounting":"utf8_byte_upper_bound","used_tokens":469,"warm_start":{"context":"## Repo context\nKey conventions and facts:\n[fact] [tags: alpha beta] The zephyrqux deployment requires flushing the wobblecache before restart"}}
+  left: Bool(true)
+ right: Bool(false)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test record_then_context_round_trips ... FAILED
+
+failures:
+
+failures:
+    record_then_context_round_trips
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.55s
+

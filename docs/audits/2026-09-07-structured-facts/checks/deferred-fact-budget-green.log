@@ -1,0 +1,14 @@
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\debug\deps\kimetsu_brain-4447584ffe405f3f.lib y objeto E:\Kimetsu\target\debug\deps\kimetsu_brain-4447584ffe405f3f.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-brain` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.56s
+     Running unittests src\lib.rs (E:/Kimetsu/target\debug\deps\kimetsu_brain-4447584ffe405f3f.exe)
+
+running 1 test
+test context::deferred_fact_budget_tests::initial_retrieval_budget_must_not_hide_an_eligible_conflicting_fact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 774 filtered out; finished in 0.16s
+
