@@ -99,7 +99,7 @@ fn clause_supports(query: &str, body: &str, start: usize, end: usize) -> bool {
         .char_indices()
         .filter(|(i, c)| boundary(*i, *c))
         .map(|(i, _)| i + 1)
-        .last()
+        .next_back()
         .unwrap_or(0);
     let right = body[end..]
         .char_indices()

@@ -379,7 +379,7 @@ impl BrainSession {
     /// survives a second resolution at the injected/production boundary.
     pub fn resolve_request_floors(&self, request: &mut ContextRequest) {
         request.include_fact_evidence |= self.config.broker.explicit_fact_guard;
-        let semantic = request.min_semantic_score_override.unwrap_or_else(|| {
+        let semantic = request.min_semantic_score_override.unwrap_or({
             if request.min_semantic_score == 0.0 {
                 self.config.broker.min_semantic_score
             } else {
@@ -392,7 +392,7 @@ impl BrainSession {
         } else {
             semantic
         };
-        request.min_lexical_coverage = request.min_lexical_coverage_override.unwrap_or_else(|| {
+        request.min_lexical_coverage = request.min_lexical_coverage_override.unwrap_or({
             if request.min_lexical_coverage == 0.0 {
                 self.config.broker.min_lexical_coverage
             } else {

@@ -239,7 +239,7 @@ mod load_tests {
     use kimetsu_core::{event::Event, ids::RunId};
     fn apply(c: &Connection, kind: &str, payload: serde_json::Value) -> Event {
         let e = Event::new(RunId::new(), kind, payload);
-        crate::projector::apply_events(c, &[e.clone()]).unwrap();
+        crate::projector::apply_events(c, std::slice::from_ref(&e)).unwrap();
         e
     }
     fn seeded() -> Connection {
