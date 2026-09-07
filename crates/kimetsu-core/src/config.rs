@@ -882,6 +882,11 @@ pub struct BrokerSection {
         deserialize_with = "deserialize_rerank_min_score"
     )]
     pub rerank_min_score: f32,
+    /// Require visible value evidence for recognized explicit configuration
+    /// questions. Experimental, opt-in English/Spanish rules; not a general
+    /// entailment check. Unsupported wording retains normal retrieval.
+    #[serde(default)]
+    pub explicit_fact_guard: bool,
     /// F3: floor for the adaptive per-stage brain budget. Small tasks
     /// receive at least this many tokens so the brain is never starved.
     /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
@@ -1063,6 +1068,7 @@ impl Default for BrokerSection {
             normalization: default_normalization(),
             abstain_min_score: default_abstain_min_score(),
             rerank_min_score: default_rerank_min_score(),
+            explicit_fact_guard: false,
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
@@ -1453,6 +1459,20 @@ impl Default for LifecycleSection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_fact_guard_is_opt_in_and_round_trips() {
+        let default = ProjectConfig::default_for_project("guard");
+        assert!(!default.broker.explicit_fact_guard);
+        for enabled in [false, true] {
+            let mut value = serde_json::to_value(&default).unwrap();
+            value["broker"]["explicit_fact_guard"] = serde_json::json!(enabled);
+            let config: ProjectConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["broker"]["explicit_fact_guard"],
+                enabled
+            );
+        }
+    }
     #[test]
     fn rerank_cutoff_survives_configuration_roundtrip_and_rejects_invalid_values() {
         let mut value = serde_json::to_value(ProjectConfig::default_for_project("cutoff")).unwrap();

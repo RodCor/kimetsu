@@ -71,6 +71,7 @@ impl DaemonState {
             cap,
             pool: RERANK_POOL,
             rerank_floor: session.config().broker.rerank_min_score,
+            explicit_fact_guard: session.config().broker.explicit_fact_guard,
         };
         let request = ContextRequest {
             stage: if args.stage.is_empty() {

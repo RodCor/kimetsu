@@ -2,6 +2,7 @@ pub mod ambient;
 pub mod analytics;
 #[cfg(feature = "embeddings")]
 pub mod ann;
+pub mod answerability;
 /// S5.1: retrieval backend trait + FlatBackend implementation.
 pub(crate) mod backend;
 /// S5.4: cross-backend benchmark harness (flat / graph-lite / petgraph).

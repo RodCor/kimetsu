@@ -3119,6 +3119,42 @@ mod tests {
     }
 
     #[test]
+    fn mcp_fact_guard_rejects_high_scoring_topic_and_respects_opt_out() {
+        struct HighScore;
+        impl kimetsu_brain::embeddings::Reranker for HighScore {
+            fn model_id(&self) -> &str {
+                "fixed-high-score"
+            }
+            fn rerank(
+                &self,
+                _: &str,
+                docs: &[&str],
+            ) -> Result<Vec<f32>, kimetsu_brain::embeddings::EmbedderError> {
+                Ok(vec![0.99; docs.len()])
+            }
+        }
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("mcp-fact-guard");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(&root,MemoryScope::Project,MemoryKind::Fact,"The staging listener password is managed in configuration. The staging listener binds port 6319.").unwrap();
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
+            let original = fs::read_to_string(&paths.project_toml).unwrap();
+            for (enabled, count) in [(true, 0), (false, 1)] {
+                let mut config: toml::Value = toml::from_str(&original).unwrap();
+                config["broker"]
+                    .as_table_mut()
+                    .unwrap()
+                    .insert("explicit_fact_guard".into(), toml::Value::Boolean(enabled));
+                fs::write(&paths.project_toml, toml::to_string(&config).unwrap()).unwrap();
+                let result=brain_context_tool(&root,&json!({"query":"What password does the staging listener require?","include_ambient":false,"min_score":0.0,"min_lexical_coverage":0.0,"abstain_evidence":0.0,"budget_tokens":6000}),Some(&HighScore)).unwrap();
+                assert_eq!(result["capsule_count"], count, "guard={enabled}: {result}");
+            }
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
     fn stdio_uses_configured_reranker_off_and_initialization_error_explicitly() {
         kimetsu_brain::user_brain::with_user_brain_disabled(|| {
             let root = temp_root("stdio-configured-reranker");

@@ -100,13 +100,22 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
 
     // Retrieval: try the warm daemon first (semantic); fall back to
     // floored-FTS on any miss (daemon disabled / unreachable / cold).
-    let (bundle, retrieval_path) = match try_daemon_retrieve(&workspace, &request) {
+    let (mut bundle, retrieval_path) = match try_daemon_retrieve(&workspace, &request) {
         Some(b) => (b, "daemon"),
         None => match project::retrieve_context_lexical_readonly(&workspace, request.clone()) {
             Ok(b) => (b, "fts_fallback"),
             Err(_) => return Ok(()), // Brain not initialized — silent fail
         },
     };
+
+    let explicit_fact_guard = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.explicit_fact_guard)
+        .unwrap_or(false);
+    if explicit_fact_guard {
+        kimetsu_brain::answerability::filter_bundle(&request.query, &mut bundle);
+    }
 
     // C7: emit a context.served event BEFORE the early-return so misses are
     // logged. Best-effort (let _ =) — telemetry must never break the hook.
@@ -272,15 +281,23 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
         let rendered: String = if compress_capsules {
-            kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+            if explicit_fact_guard {
+                kimetsu_brain::answerability::compress_preserving_evidence(
+                    &request.query,
+                    &capsule.summary,
+                    3,
+                )
+            } else {
+                kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+            }
         } else {
             capsule.summary.clone()
         };
         // Strip the "scope:kind - " prefix from the summary for readability
         let text = rendered
-            .split(" - ")
-            .nth(1)
-            .map(str::to_string)
+            .split_once(" - ")
+            .filter(|(prefix, _)| prefix.contains(':') && !prefix.contains(' '))
+            .map(|(_, text)| text.to_owned())
             .unwrap_or(rendered);
         additional_context.push('\n');
         // F3 Pass B (3.3): prepend the answer-grade marker to the first capsule

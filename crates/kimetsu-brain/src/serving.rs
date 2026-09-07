@@ -54,6 +54,7 @@ pub struct ServingPolicy {
     pub cap: usize,
     pub pool: usize,
     pub rerank_floor: f32,
+    pub explicit_fact_guard: bool,
 }
 impl Default for ServingPolicy {
     fn default() -> Self {
@@ -62,6 +63,7 @@ impl Default for ServingPolicy {
             cap: DEFAULT_CAP,
             pool: RERANK_POOL,
             rerank_floor: RERANK_FLOOR,
+            explicit_fact_guard: false,
         }
     }
 }
@@ -69,6 +71,7 @@ impl ServingPolicy {
     pub fn from_config(config: &kimetsu_core::config::ProjectConfig) -> Self {
         Self {
             rerank_floor: config.broker.rerank_min_score,
+            explicit_fact_guard: config.broker.explicit_fact_guard,
             ..Self::default()
         }
     }
@@ -98,12 +101,42 @@ impl ServingPolicy {
             reranker,
             abstain,
             self.rerank_floor,
-            self.cap,
+            if self.explicit_fact_guard {
+                0
+            } else {
+                self.cap
+            },
         );
+        if self.explicit_fact_guard {
+            crate::answerability::filter_bundle(query, &mut bundle);
+        }
         if self.cap > 0 {
-            bundle.capsules.truncate(self.cap)
+            bundle.capsules.truncate(self.cap);
+        }
+        bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
+        if bundle.capsules.is_empty() {
+            bundle.skipped = true;
+            bundle.evidence_coverage = 0.0;
         }
         bundle
+    }
+    pub fn render_for_query(
+        &self,
+        query: &str,
+        mut bundle: ContextBundle,
+        compress: bool,
+        exposure_id: &str,
+    ) -> Delivery {
+        if compress {
+            for capsule in &mut bundle.capsules {
+                capsule.summary = if self.explicit_fact_guard {
+                    crate::answerability::compress_preserving_evidence(query, &capsule.summary, 3)
+                } else {
+                    crate::context::compress_for_render(&capsule.summary, 3)
+                };
+            }
+        }
+        self.render(bundle, false, exposure_id)
     }
     pub fn render(&self, mut bundle: ContextBundle, compress: bool, exposure_id: &str) -> Delivery {
         if compress {
@@ -182,7 +215,8 @@ impl ServingPolicy {
             checked_scores.as_ref().map(|r| r as &dyn Reranker),
             abstain,
         );
-        Ok(self.render(
+        Ok(self.render_for_query(
+            &query,
             bundle,
             session.config().broker.compress_capsules,
             exposure_id,
@@ -348,6 +382,67 @@ mod tests {
             assert!(matches!(request.min_semantic_score, 0.35 | 0.0));
         });
     }
+    #[test]
+    fn compression_keeps_the_value_that_justified_admission() {
+        let capsule = ContextCapsule::wire_minimal(
+            "Background one. Background two. Background three. password = `test-value-only`".into(),
+            "memory".into(),
+            0.99,
+        );
+        let bundle = ContextBundle {
+            stage: "localization".into(),
+            budget_tokens: 6000,
+            used_tokens: 0,
+            capsules: vec![capsule],
+            excluded: vec![],
+            skipped: false,
+            top_score: 0.99,
+            top_abs_evidence: 0.99,
+            evidence_coverage: 1.0,
+            uncovered_terms: vec![],
+            chronological: false,
+        };
+        let policy = ServingPolicy {
+            explicit_fact_guard: true,
+            ..Default::default()
+        };
+        let delivered =
+            policy.render_for_query("What is the password?", bundle, true, EVAL_EXPOSURE_ID);
+        assert!(delivered.payload.to_string().contains("test-value-only"));
+    }
+    #[test]
+    fn explicit_fact_guard_excludes_topic_match_before_output_cap() {
+        let capsules = [
+            "The listener binds port 6319.",
+            "password = `test-value-only`",
+        ]
+        .into_iter()
+        .map(|text| ContextCapsule::wire_minimal(text.into(), "memory".into(), 0.99))
+        .collect();
+        let bundle = ContextBundle {
+            stage: "localization".into(),
+            budget_tokens: 6000,
+            used_tokens: 0,
+            capsules,
+            excluded: vec![],
+            skipped: false,
+            top_score: 0.99,
+            top_abs_evidence: 0.99,
+            evidence_coverage: 1.0,
+            uncovered_terms: vec![],
+            chronological: false,
+        };
+        let policy = ServingPolicy {
+            cap: 1,
+            explicit_fact_guard: true,
+            ..Default::default()
+        };
+        let selected = policy.arbitrate("What password is required?", bundle, None, 0.0);
+        assert_eq!(selected.capsules.len(), 1);
+        assert!(selected.capsules[0].summary.contains("test-value-only"));
+        assert_eq!(selected.excluded.len(), 1);
+    }
+
     #[test]
     fn reranker_floor_and_final_serialization_reject_candidates_before_measurement() {
         let capsules = [("hit", "wal checkpoint"), ("noise", "remote network")]
