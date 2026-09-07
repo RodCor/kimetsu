@@ -1,5 +1,11 @@
 # Canonical retrieval evaluation
 
+The [unreleased structured-fact evaluation](audits/2026-09-07-structured-facts.md)
+adds exact status/value/missing/conflict checks for every repeat and validates
+that support handles refer to final delivered capsules. Hit@4 alone is not
+complete answerability: retrieving retries while omitting a requested port is
+still a hit. See [configuration and limitations](answerability.md).
+
 Brain context serving, the tuner, and local evaluation share `ServingPolicy`: pool 6, final cap 3, reranker score floor 0.30, and a default delivery budget of 6000. Explicit benchmark pool/cap experiments are reported as overrides. The final compact MCP renderer determines delivered capsules and cost after reranking, arbitration, compression, and admission. Cost is a conservative **serialized UTF-8 byte upper bound**, including the MCP text envelope and escaping. It is not billed tokens or a tokenizer measurement.
 
 Parity means the same effective query, configuration, models, cap, budget, and rendering inputs. Offline comparisons disable ambient augmentation and session warm-start; they cannot replay an unstored historical workspace snapshot. MCP can augment its query before this boundary and add a warm-start block through the final-budget helper. Evaluation substitutes a deterministic 26-character exposure ID for the real 26-character ULID. Capsule IDs are random but have the same serialized length.

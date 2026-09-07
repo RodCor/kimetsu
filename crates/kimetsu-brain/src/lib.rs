@@ -22,10 +22,10 @@ pub mod embeddings;
 /// Flagship 1 / Story 1.3: episodic work-resume capture, storage, and surface.
 pub mod episode;
 pub mod eval;
-pub mod facts;
-pub mod fact_values;
 pub mod fact_query;
 pub mod fact_store;
+pub mod fact_values;
+pub mod facts;
 pub mod feedback;
 pub mod framing;
 /// #2 knowledge graph: rule-based relation-edge extraction for `memory_edges`.

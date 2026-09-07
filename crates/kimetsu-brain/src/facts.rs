@@ -377,9 +377,11 @@ mod tests {
             canonical_subject("The Orchid’s staging gateway"),
             ("orchid gateway".into(), Some("staging".into()))
         );
-        assert!(canonical_subject("Orchid staging production gateway")
-            .0
-            .is_empty());
+        assert!(
+            canonical_subject("Orchid staging production gateway")
+                .0
+                .is_empty()
+        );
         assert!(canonical_subject("the production").0.is_empty());
         assert_eq!(
             extract("Orchid gateway `cache.max_entries` = 200.")[0].attribute,
