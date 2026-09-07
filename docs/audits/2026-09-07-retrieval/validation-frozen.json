@@ -1,0 +1,813 @@
+{
+  "protocol": "Freeze before production policy changes; do not tune on results. Assistant-authored synthetic facts; language and judgments are audit metadata.",
+  "scenarios": [
+    {
+      "id": "copper-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic project-family validation, not real-agent or independent repository certification.",
+      "memories": [
+        {
+          "key": "port",
+          "text": "Copper staging HTTP listener binds TCP port 6319. This is the current configured port for its staging service."
+        },
+        {
+          "key": "logs",
+          "text": "Copper diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+        },
+        {
+          "key": "rollback",
+          "text": "To roll back Copper to the previous release, run `copperctl rollback --previous` from the deployment workspace."
+        },
+        {
+          "key": "region",
+          "text": "Copper production runs in region eu-north-1. Its deployment configuration selects this region explicitly."
+        },
+        {
+          "key": "backup",
+          "text": "Copper daily database backups start at 02:40 UTC. The backup job runs once per day."
+        },
+        {
+          "key": "storage",
+          "text": "Copper stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+        },
+        {
+          "key": "old-port",
+          "text": "Copper staging listener uses the historical port 4101. This configuration has been replaced.",
+          "valid_to": "2025-01-01T00:00:00Z"
+        },
+        {
+          "key": "future-port",
+          "text": "Copper staging listener will use port 5101 in the future configuration.",
+          "valid_from": "2099-01-01T00:00:00Z"
+        }
+      ],
+      "queries": [
+        {
+          "query": "Which TCP port should I connect to for Copper staging?",
+          "relevant": [
+            "port"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "Where should Copper diagnostic logs be written?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which command rolls back Copper to its previous release?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which region hosts Copper production?",
+          "relevant": [
+            "region"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "At what UTC time do daily Copper database backups start?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which database and journal mode does Copper use for local state?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué puerto TCP debo conectarme para staging de Copper?",
+          "relevant": [
+            "port"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "¿Dónde deben escribirse los mensajes de diagnóstico de Copper?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué comando revierte Copper a la versión anterior?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿En qué región está desplegado Copper en producción?",
+          "relevant": [
+            "region"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué hora UTC empiezan las copias diarias de la base de datos de Copper?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué base de datos y modo de registro usa Copper para guardar el estado local?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "What authentication password is configured for the Copper staging listener?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "What encryption key protects the Copper database backups?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "How many production replicas run in the Copper deployment region?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué contraseña exige el servidor de staging de Copper?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Cuántos días se conservan las copias de seguridad de Copper?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué versión de SQLite requiere Copper?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        }
+      ]
+    },
+    {
+      "id": "willow-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic project-family validation, not real-agent or independent repository certification.",
+      "memories": [
+        {
+          "key": "port",
+          "text": "Willow staging HTTP listener binds TCP port 7421. This is the current configured port for its staging service."
+        },
+        {
+          "key": "logs",
+          "text": "Willow diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+        },
+        {
+          "key": "rollback",
+          "text": "To roll back Willow to the previous release, run `willowctl rollback --previous` from the deployment workspace."
+        },
+        {
+          "key": "region",
+          "text": "Willow production runs in region us-west-2. Its deployment configuration selects this region explicitly."
+        },
+        {
+          "key": "backup",
+          "text": "Willow daily database backups start at 04:15 UTC. The backup job runs once per day."
+        },
+        {
+          "key": "storage",
+          "text": "Willow stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+        },
+        {
+          "key": "old-port",
+          "text": "Willow staging listener uses the historical port 4101. This configuration has been replaced.",
+          "valid_to": "2025-01-01T00:00:00Z"
+        },
+        {
+          "key": "future-port",
+          "text": "Willow staging listener will use port 5101 in the future configuration.",
+          "valid_from": "2099-01-01T00:00:00Z"
+        }
+      ],
+      "queries": [
+        {
+          "query": "Which TCP port should I connect to for Willow staging?",
+          "relevant": [
+            "port"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "Where should Willow diagnostic logs be written?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which command rolls back Willow to its previous release?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which region hosts Willow production?",
+          "relevant": [
+            "region"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "At what UTC time do daily Willow database backups start?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which database and journal mode does Willow use for local state?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué puerto TCP debo conectarme para staging de Willow?",
+          "relevant": [
+            "port"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "¿Dónde deben escribirse los mensajes de diagnóstico de Willow?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué comando revierte Willow a la versión anterior?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿En qué región está desplegado Willow en producción?",
+          "relevant": [
+            "region"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué hora UTC empiezan las copias diarias de la base de datos de Willow?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué base de datos y modo de registro usa Willow para guardar el estado local?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "What authentication password is configured for the Willow staging listener?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "What encryption key protects the Willow database backups?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "How many production replicas run in the Willow deployment region?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué contraseña exige el servidor de staging de Willow?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Cuántos días se conservan las copias de seguridad de Willow?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué versión de SQLite requiere Willow?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        }
+      ]
+    },
+    {
+      "id": "marble-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic project-family validation, not real-agent or independent repository certification.",
+      "memories": [
+        {
+          "key": "port",
+          "text": "Marble staging HTTP listener binds TCP port 8533. This is the current configured port for its staging service."
+        },
+        {
+          "key": "logs",
+          "text": "Marble diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+        },
+        {
+          "key": "rollback",
+          "text": "To roll back Marble to the previous release, run `marblectl rollback --previous` from the deployment workspace."
+        },
+        {
+          "key": "region",
+          "text": "Marble production runs in region ap-south-1. Its deployment configuration selects this region explicitly."
+        },
+        {
+          "key": "backup",
+          "text": "Marble daily database backups start at 01:25 UTC. The backup job runs once per day."
+        },
+        {
+          "key": "storage",
+          "text": "Marble stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+        },
+        {
+          "key": "old-port",
+          "text": "Marble staging listener uses the historical port 4101. This configuration has been replaced.",
+          "valid_to": "2025-01-01T00:00:00Z"
+        },
+        {
+          "key": "future-port",
+          "text": "Marble staging listener will use port 5101 in the future configuration.",
+          "valid_from": "2099-01-01T00:00:00Z"
+        }
+      ],
+      "queries": [
+        {
+          "query": "Which TCP port should I connect to for Marble staging?",
+          "relevant": [
+            "port"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "Where should Marble diagnostic logs be written?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which command rolls back Marble to its previous release?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which region hosts Marble production?",
+          "relevant": [
+            "region"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "At what UTC time do daily Marble database backups start?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which database and journal mode does Marble use for local state?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué puerto TCP debo conectarme para staging de Marble?",
+          "relevant": [
+            "port"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "¿Dónde deben escribirse los mensajes de diagnóstico de Marble?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué comando revierte Marble a la versión anterior?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿En qué región está desplegado Marble en producción?",
+          "relevant": [
+            "region"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué hora UTC empiezan las copias diarias de la base de datos de Marble?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué base de datos y modo de registro usa Marble para guardar el estado local?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "What authentication password is configured for the Marble staging listener?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "What encryption key protects the Marble database backups?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "How many production replicas run in the Marble deployment region?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué contraseña exige el servidor de staging de Marble?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Cuántos días se conservan las copias de seguridad de Marble?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué versión de SQLite requiere Marble?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        }
+      ]
+    },
+    {
+      "id": "kestrel-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic project-family validation, not real-agent or independent repository certification.",
+      "memories": [
+        {
+          "key": "port",
+          "text": "Kestrel staging HTTP listener binds TCP port 9647. This is the current configured port for its staging service."
+        },
+        {
+          "key": "logs",
+          "text": "Kestrel diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+        },
+        {
+          "key": "rollback",
+          "text": "To roll back Kestrel to the previous release, run `kestrelctl rollback --previous` from the deployment workspace."
+        },
+        {
+          "key": "region",
+          "text": "Kestrel production runs in region eu-west-3. Its deployment configuration selects this region explicitly."
+        },
+        {
+          "key": "backup",
+          "text": "Kestrel daily database backups start at 03:50 UTC. The backup job runs once per day."
+        },
+        {
+          "key": "storage",
+          "text": "Kestrel stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+        },
+        {
+          "key": "old-port",
+          "text": "Kestrel staging listener uses the historical port 4101. This configuration has been replaced.",
+          "valid_to": "2025-01-01T00:00:00Z"
+        },
+        {
+          "key": "future-port",
+          "text": "Kestrel staging listener will use port 5101 in the future configuration.",
+          "valid_from": "2099-01-01T00:00:00Z"
+        }
+      ],
+      "queries": [
+        {
+          "query": "Which TCP port should I connect to for Kestrel staging?",
+          "relevant": [
+            "port"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "Where should Kestrel diagnostic logs be written?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which command rolls back Kestrel to its previous release?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which region hosts Kestrel production?",
+          "relevant": [
+            "region"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "At what UTC time do daily Kestrel database backups start?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "Which database and journal mode does Kestrel use for local state?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "en",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué puerto TCP debo conectarme para staging de Kestrel?",
+          "relevant": [
+            "port"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute.",
+          "stale": [
+            "old-port",
+            "future-port"
+          ]
+        },
+        {
+          "query": "¿Dónde deben escribirse los mensajes de diagnóstico de Kestrel?",
+          "relevant": [
+            "logs"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué comando revierte Kestrel a la versión anterior?",
+          "relevant": [
+            "rollback"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿En qué región está desplegado Kestrel en producción?",
+          "relevant": [
+            "region"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿A qué hora UTC empiezan las copias diarias de la base de datos de Kestrel?",
+          "relevant": [
+            "backup"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "¿Qué base de datos y modo de registro usa Kestrel para guardar el estado local?",
+          "relevant": [
+            "storage"
+          ],
+          "language": "es",
+          "judgment": "answerable",
+          "rationale": "The named project memory explicitly states the requested attribute."
+        },
+        {
+          "query": "What authentication password is configured for the Kestrel staging listener?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "What encryption key protects the Kestrel database backups?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "How many production replicas run in the Kestrel deployment region?",
+          "relevant": [],
+          "language": "en",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué contraseña exige el servidor de staging de Kestrel?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Cuántos días se conservan las copias de seguridad de Kestrel?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        },
+        {
+          "query": "¿Qué versión de SQLite requiere Kestrel?",
+          "relevant": [],
+          "language": "es",
+          "judgment": "unanswerable",
+          "rationale": "No supplied memory states this requested attribute; nearby topic facts do not answer it."
+        }
+      ]
+    }
+  ]
+}

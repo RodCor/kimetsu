@@ -1,5 +1,8 @@
 # Kimetsu hardening and BrainBenchmark comparison
 
+> Follow-up correction (2026-09-07): the benchmark text matcher undercounted dated, compressed memory deliveries. The retrieval-regression conclusion and affected hit/recall comparisons below are superseded by the [retrieval-quality follow-up](2026-09-07-retrieval-quality.md). Original artifacts are retained for provenance.
+
+
 Implementation branches: `codex/brain-hardening` (Kimetsu) and `codex/brain-benchmark-hardening` (the separate benchmark repository). The original `E:/Kimetsu` source and live project/user brains were not changed. The preserved pre-change binary is from `3ec56a8`; all comparisons use the same updated harness on both binaries.
 
 This work addresses the concrete defects in the [memory audit](2026-09-04-agent-memory-audit.md) and [model/parameter audit](2026-09-04-models-parameters-memory.md). Local retrieval and rule-based memory processing require no paid generation calls. Returned memory still consumes the receiving agent's context; zero-token information transfer is not an achievable delivery contract.

@@ -1,0 +1,1781 @@
+{
+  "generated_at": "2026-09-07T04:21:17.1085479Z",
+  "dataset": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\retrieval-validation-frozen.json",
+  "session_configuration": {
+    "include_ambient": false,
+    "warm_start": false
+  },
+  "scenarios": [
+    {
+      "observations": [
+        {
+          "query": "Which TCP port should I connect to for Copper staging?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTJHD6DSP6GVC3MHS7VH",
+              "id": "01M1X1HVBQNKP8D9PD5T9224NK",
+              "kind": "memory",
+              "score": 0.9997145533561708,
+              "summary": "project:fact - Copper staging HTTP listener binds TCP port 6319. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 678.8685,
+          "first_query": true,
+          "server_startup_ms": 75.2079,
+          "model_text_bytes": 498,
+          "mcp_result_bytes": 579,
+          "wire_bytes": 614,
+          "reported_used_tokens": 579,
+          "working_set_bytes": 215613440,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "Where should Copper diagnostic logs be written?",
+          "ranked": [
+            "logs"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTK48QWHS9Z3FCEN0ZBE",
+              "id": "01M1X1HVPM4CYZ58ZPNH8958EP",
+              "kind": "memory",
+              "score": 0.9562363028526306,
+              "summary": "project:fact - Copper diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 329.1383,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 488,
+          "mcp_result_bytes": 569,
+          "wire_bytes": 604,
+          "reported_used_tokens": 569,
+          "working_set_bytes": 215662592,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "Which command rolls back Copper to its previous release?",
+          "ranked": [
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTKGWCTQY9AD16Y6GKTT",
+              "id": "01M1X1HW0TGB8HVMSF7AXRN8GZ",
+              "kind": "memory",
+              "score": 0.999831199645996,
+              "summary": "project:fact - To roll back Copper to the previous release, run `copperctl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.4132,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 499,
+          "mcp_result_bytes": 580,
+          "wire_bytes": 615,
+          "reported_used_tokens": 580,
+          "working_set_bytes": 215674880,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "Which region hosts Copper production?",
+          "ranked": [
+            "region"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTKWSFTB5S7ENJYVPNTV",
+              "id": "01M1X1HWBJ01W5Z175J4RKKPZX",
+              "kind": "memory",
+              "score": 0.9995768666267396,
+              "summary": "project:fact - Copper production runs in region eu-north-1. Its deployment configuration selects this region explicitly."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 330.1801,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 493,
+          "mcp_result_bytes": 574,
+          "wire_bytes": 609,
+          "reported_used_tokens": 574,
+          "working_set_bytes": 215691264,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "At what UTC time do daily Copper database backups start?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTM79C49FWBMMP34W9EV",
+              "id": "01M1X1HWNBJMXNV8P4CS3HD0NK",
+              "kind": "memory",
+              "score": 0.999977707862854,
+              "summary": "project:fact - Copper daily database backups start at 02:40 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 317.7899,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 470,
+          "mcp_result_bytes": 551,
+          "wire_bytes": 586,
+          "reported_used_tokens": 551,
+          "working_set_bytes": 216285184,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "Which database and journal mode does Copper use for local state?",
+          "ranked": [
+            "storage"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTMJY1GRX242DG8H51SD",
+              "id": "01M1X1HWZN6M6NF4Y5EHFADKJJ",
+              "kind": "memory",
+              "score": 0.9995567202568054,
+              "summary": "project:fact - Copper stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 330.9628,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 492,
+          "mcp_result_bytes": 573,
+          "wire_bytes": 608,
+          "reported_used_tokens": 573,
+          "working_set_bytes": 216301568,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfA qu\u00e9 puerto TCP debo conectarme para staging de Copper?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 321.8306,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216485888,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfD\u00f3nde deben escribirse los mensajes de diagn\u00f3stico de Copper?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 325.0769,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216764416,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfQu\u00e9 comando revierte Copper a la versi\u00f3n anterior?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 324.6066,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216981504,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfEn qu\u00e9 regi\u00f3n est\u00e1 desplegado Copper en producci\u00f3n?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 325.6349,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 217464832,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfA qu\u00e9 hora UTC empiezan las copias diarias de la base de datos de Copper?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 332.9257,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218689536,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfQu\u00e9 base de datos y modo de registro usa Copper para guardar el estado local?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.32,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218972160,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "What authentication password is configured for the Copper staging listener?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTJHD6DSP6GVC3MHS7VH",
+              "id": "01M1X1HZ7ZRM50TYKR42HVFMK6",
+              "kind": "memory",
+              "score": 0.9995972514152528,
+              "summary": "project:fact - Copper staging HTTP listener binds TCP port 6319. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 340.2247,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 498,
+          "mcp_result_bytes": 579,
+          "wire_bytes": 615,
+          "reported_used_tokens": 579,
+          "working_set_bytes": 219103232,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "What encryption key protects the Copper database backups?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTM79C49FWBMMP34W9EV",
+              "id": "01M1X1HZHWG33W7S4PEJPYED68",
+              "kind": "memory",
+              "score": 0.9638083577156068,
+              "summary": "project:fact - Copper daily database backups start at 02:40 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 320.529,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 471,
+          "mcp_result_bytes": 552,
+          "wire_bytes": 588,
+          "reported_used_tokens": 552,
+          "working_set_bytes": 219156480,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "How many production replicas run in the Copper deployment region?",
+          "ranked": [
+            "region",
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1HTKWSFTB5S7ENJYVPNTV",
+              "id": "01M1X1HZW0BAW5H336PFZNENZV",
+              "kind": "memory",
+              "score": 0.9992319345474244,
+              "summary": "project:fact - Copper production runs in region eu-north-1. Its deployment configuration selects this region explicitly."
+            },
+            {
+              "expansion_handle": "memory:01M1X1HTKGWCTQY9AD16Y6GKTT",
+              "id": "01M1X1HZW1YEQXY7B00YJH988X",
+              "kind": "memory",
+              "score": 0.5319254994392395,
+              "summary": "project:fact - To roll back Copper to the previous release, run `copperctl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 326.0502,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 766,
+          "mcp_result_bytes": 865,
+          "wire_bytes": 901,
+          "reported_used_tokens": 865,
+          "working_set_bytes": 219275264,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfQu\u00e9 contrase\u00f1a exige el servidor de staging de Copper?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 321.74760000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 219410432,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfCu\u00e1ntos d\u00edas se conservan las copias de seguridad de Copper?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 325.4862,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 219500544,
+          "peak_working_set_bytes": 248737792
+        },
+        {
+          "query": "\u00bfQu\u00e9 versi\u00f3n de SQLite requiere Copper?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 327.55620000000005,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 219516928,
+          "peak_working_set_bytes": 248737792
+        }
+      ],
+      "id": "copper-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5,
+      "skipped": false,
+      "detail": "positive-recall@4=0.50 mrr=0.50 stale-hit=0.000 (n=2) resolution=0.500 (n=2) false-injection=0.500 (n=6) positive-n=12 negative-n=6 (18 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "Which TCP port should I connect to for Willow staging?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1VGJ2JT1YKAJSXDKA8R",
+              "id": "01M1X1J2PPVWCEQY9F757M08KP",
+              "kind": "memory",
+              "score": 0.9997742772102356,
+              "summary": "project:fact - Willow staging HTTP listener binds TCP port 7421. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 668.9282,
+          "first_query": true,
+          "server_startup_ms": 74.2534,
+          "model_text_bytes": 498,
+          "mcp_result_bytes": 579,
+          "wire_bytes": 614,
+          "reported_used_tokens": 579,
+          "working_set_bytes": 215531520,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "Where should Willow diagnostic logs be written?",
+          "ranked": [
+            "logs"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1W1ETZ818J2J1BSY7G9",
+              "id": "01M1X1J31GHVXQFPKN6H66AJW3",
+              "kind": "memory",
+              "score": 0.8893650770187378,
+              "summary": "project:fact - Willow diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 335.983,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 488,
+          "mcp_result_bytes": 569,
+          "wire_bytes": 604,
+          "reported_used_tokens": 569,
+          "working_set_bytes": 215572480,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "Which command rolls back Willow to its previous release?",
+          "ranked": [
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1WCG12VM5NQYW05S6J3",
+              "id": "01M1X1J3BE1DA3FZBSDQ4YBRRX",
+              "kind": "memory",
+              "score": 0.9998111128807068,
+              "summary": "project:fact - To roll back Willow to the previous release, run `willowctl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 311.91990000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 499,
+          "mcp_result_bytes": 580,
+          "wire_bytes": 615,
+          "reported_used_tokens": 580,
+          "working_set_bytes": 215584768,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "Which region hosts Willow production?",
+          "ranked": [
+            "region"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1WRS6JP1HNXR67HM79Z",
+              "id": "01M1X1J3N21TVZ49N6XSHWT798",
+              "kind": "memory",
+              "score": 0.9997881054878236,
+              "summary": "project:fact - Willow production runs in region us-west-2. Its deployment configuration selects this region explicitly."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 309.131,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 492,
+          "mcp_result_bytes": 573,
+          "wire_bytes": 608,
+          "reported_used_tokens": 573,
+          "working_set_bytes": 215605248,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "At what UTC time do daily Willow database backups start?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1X31291CNZHMTHHNQ59",
+              "id": "01M1X1J3YVY8CDKW52JCP50M4G",
+              "kind": "memory",
+              "score": 0.9999790191650392,
+              "summary": "project:fact - Willow daily database backups start at 04:15 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 313.29380000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 471,
+          "mcp_result_bytes": 552,
+          "wire_bytes": 587,
+          "reported_used_tokens": 552,
+          "working_set_bytes": 216158208,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "Which database and journal mode does Willow use for local state?",
+          "ranked": [
+            "storage"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1XE7RQ1TGAZHWH4Z91H",
+              "id": "01M1X1J48NW1JMP0QTB00BF7GH",
+              "kind": "memory",
+              "score": 0.9995442032814026,
+              "summary": "project:fact - Willow stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 320.2981,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 492,
+          "mcp_result_bytes": 573,
+          "wire_bytes": 608,
+          "reported_used_tokens": 573,
+          "working_set_bytes": 216166400,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfA qu\u00e9 puerto TCP debo conectarme para staging de Willow?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 352.8876,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216346624,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfD\u00f3nde deben escribirse los mensajes de diagn\u00f3stico de Willow?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 351.3872,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216567808,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfQu\u00e9 comando revierte Willow a la versi\u00f3n anterior?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 342.2691,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216645632,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfEn qu\u00e9 regi\u00f3n est\u00e1 desplegado Willow en producci\u00f3n?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 352.2511,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216928256,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfA qu\u00e9 hora UTC empiezan las copias diarias de la base de datos de Willow?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 341.64860000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 217899008,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfQu\u00e9 base de datos y modo de registro usa Willow para guardar el estado local?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.733,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218042368,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "What authentication password is configured for the Willow staging listener?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1VGJ2JT1YKAJSXDKA8R",
+              "id": "01M1X1J6KYSTY071X9QJPFSJNY",
+              "kind": "memory",
+              "score": 0.99951171875,
+              "summary": "project:fact - Willow staging HTTP listener binds TCP port 7421. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 326.44030000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 493,
+          "mcp_result_bytes": 574,
+          "wire_bytes": 610,
+          "reported_used_tokens": 574,
+          "working_set_bytes": 218124288,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "What encryption key protects the Willow database backups?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1X31291CNZHMTHHNQ59",
+              "id": "01M1X1J6Y3AW1EP3FXC0659ZCG",
+              "kind": "memory",
+              "score": 0.7663611769676208,
+              "summary": "project:fact - Willow daily database backups start at 04:15 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 324.9776,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 471,
+          "mcp_result_bytes": 552,
+          "wire_bytes": 588,
+          "reported_used_tokens": 552,
+          "working_set_bytes": 218185728,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "How many production replicas run in the Willow deployment region?",
+          "ranked": [
+            "region"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J1WRS6JP1HNXR67HM79Z",
+              "id": "01M1X1J789PX0ZTSDQ05NAEWFV",
+              "kind": "memory",
+              "score": 0.9995400905609132,
+              "summary": "project:fact - Willow production runs in region us-west-2. Its deployment configuration selects this region explicitly."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 333.5827,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 492,
+          "mcp_result_bytes": 573,
+          "wire_bytes": 609,
+          "reported_used_tokens": 573,
+          "working_set_bytes": 218238976,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfQu\u00e9 contrase\u00f1a exige el servidor de staging de Willow?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 322.2156,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218312704,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfCu\u00e1ntos d\u00edas se conservan las copias de seguridad de Willow?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 323.75690000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218378240,
+          "peak_working_set_bytes": 248532992
+        },
+        {
+          "query": "\u00bfQu\u00e9 versi\u00f3n de SQLite requiere Willow?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 324.0321,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218456064,
+          "peak_working_set_bytes": 248532992
+        }
+      ],
+      "id": "willow-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5,
+      "skipped": false,
+      "detail": "positive-recall@4=0.50 mrr=0.50 stale-hit=0.000 (n=2) resolution=0.500 (n=2) false-injection=0.500 (n=6) positive-n=12 negative-n=6 (18 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "Which TCP port should I connect to for Marble staging?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J97M267MR7TSBPG7KW97",
+              "id": "01M1X1J9ZKNJ9M2QCS1J4KVFPJ",
+              "kind": "memory",
+              "score": 0.9997395873069764,
+              "summary": "project:fact - Marble staging HTTP listener binds TCP port 8533. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 650.8688999999999,
+          "first_query": true,
+          "server_startup_ms": 79.1767,
+          "model_text_bytes": 498,
+          "mcp_result_bytes": 579,
+          "wire_bytes": 614,
+          "reported_used_tokens": 579,
+          "working_set_bytes": 215343104,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "Where should Marble diagnostic logs be written?",
+          "ranked": [
+            "logs"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J983KD2Z1DZ6ZWDKP62C",
+              "id": "01M1X1JA9JH62DYMMVSTMY62JR",
+              "kind": "memory",
+              "score": 0.944011926651001,
+              "summary": "project:fact - Marble diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 316.2353,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 487,
+          "mcp_result_bytes": 568,
+          "wire_bytes": 603,
+          "reported_used_tokens": 568,
+          "working_set_bytes": 215379968,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "Which command rolls back Marble to its previous release?",
+          "ranked": [
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J98EZ85WPMMKN964S0QH",
+              "id": "01M1X1JAKFE97VKAKA2EQA3FSD",
+              "kind": "memory",
+              "score": 0.9998188614845276,
+              "summary": "project:fact - To roll back Marble to the previous release, run `marblectl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 315.6317,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 499,
+          "mcp_result_bytes": 580,
+          "wire_bytes": 615,
+          "reported_used_tokens": 580,
+          "working_set_bytes": 215400448,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "Which region hosts Marble production?",
+          "ranked": [
+            "region"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J98SCM52GEPFRGERAPY7",
+              "id": "01M1X1JAX94CWJWTFXFRQ18AXT",
+              "kind": "memory",
+              "score": 0.9996392726898192,
+              "summary": "project:fact - Marble production runs in region ap-south-1. Its deployment configuration selects this region explicitly."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 320.03369999999995,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 493,
+          "mcp_result_bytes": 574,
+          "wire_bytes": 609,
+          "reported_used_tokens": 574,
+          "working_set_bytes": 215408640,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "At what UTC time do daily Marble database backups start?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J995ZP42NHDM00898MN7",
+              "id": "01M1X1JB7AD7CJP5RRDX251PTK",
+              "kind": "memory",
+              "score": 0.9999773502349854,
+              "summary": "project:fact - Marble daily database backups start at 01:25 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 317.1426,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 471,
+          "mcp_result_bytes": 552,
+          "wire_bytes": 587,
+          "reported_used_tokens": 552,
+          "working_set_bytes": 216010752,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "Which database and journal mode does Marble use for local state?",
+          "ranked": [
+            "storage"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J99FMP48J1HAKD8SXKPG",
+              "id": "01M1X1JBH7Y17NR5J33M8PS1H7",
+              "kind": "memory",
+              "score": 0.999523401260376,
+              "summary": "project:fact - Marble stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 314.5132,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 491,
+          "mcp_result_bytes": 572,
+          "wire_bytes": 607,
+          "reported_used_tokens": 572,
+          "working_set_bytes": 216018944,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfA qu\u00e9 puerto TCP debo conectarme para staging de Marble?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 343.2577,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216252416,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfD\u00f3nde deben escribirse los mensajes de diagn\u00f3stico de Marble?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 336.5917,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216625152,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfQu\u00e9 comando revierte Marble a la versi\u00f3n anterior?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.451,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216723456,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfEn qu\u00e9 regi\u00f3n est\u00e1 desplegado Marble en producci\u00f3n?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 357.42560000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 217120768,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfA qu\u00e9 hora UTC empiezan las copias diarias de la base de datos de Marble?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 317.49309999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218320896,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfQu\u00e9 base de datos y modo de registro usa Marble para guardar el estado local?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 319.5387,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218697728,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "What authentication password is configured for the Marble staging listener?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J97M267MR7TSBPG7KW97",
+              "id": "01M1X1JDT1FXCKC4NCEY5C6TJV",
+              "kind": "memory",
+              "score": 0.9994357228279114,
+              "summary": "project:fact - Marble staging HTTP listener binds TCP port 8533. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 322.16179999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 498,
+          "mcp_result_bytes": 579,
+          "wire_bytes": 615,
+          "reported_used_tokens": 579,
+          "working_set_bytes": 218779648,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "What encryption key protects the Marble database backups?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J995ZP42NHDM00898MN7",
+              "id": "01M1X1JE40598K969XSCKKB379",
+              "kind": "memory",
+              "score": 0.8242418766021729,
+              "summary": "project:fact - Marble daily database backups start at 01:25 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 312.8632,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 471,
+          "mcp_result_bytes": 552,
+          "wire_bytes": 588,
+          "reported_used_tokens": 552,
+          "working_set_bytes": 218783744,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "How many production replicas run in the Marble deployment region?",
+          "ranked": [
+            "region",
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1J98SCM52GEPFRGERAPY7",
+              "id": "01M1X1JEDTWN4HMXAFZBBQCVF8",
+              "kind": "memory",
+              "score": 0.999541997909546,
+              "summary": "project:fact - Marble production runs in region ap-south-1. Its deployment configuration selects this region explicitly."
+            },
+            {
+              "expansion_handle": "memory:01M1X1J98EZ85WPMMKN964S0QH",
+              "id": "01M1X1JEDT653FDGT19ZCVFGF6",
+              "kind": "memory",
+              "score": 0.8961524367332458,
+              "summary": "project:fact - To roll back Marble to the previous release, run `marblectl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 313.9988,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 766,
+          "mcp_result_bytes": 865,
+          "wire_bytes": 901,
+          "reported_used_tokens": 865,
+          "working_set_bytes": 218796032,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfQu\u00e9 contrase\u00f1a exige el servidor de staging de Marble?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 322.3686,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218800128,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfCu\u00e1ntos d\u00edas se conservan las copias de seguridad de Marble?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 326.5273,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218804224,
+          "peak_working_set_bytes": 248459264
+        },
+        {
+          "query": "\u00bfQu\u00e9 versi\u00f3n de SQLite requiere Marble?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 335.8336,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218976256,
+          "peak_working_set_bytes": 248459264
+        }
+      ],
+      "id": "marble-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5,
+      "skipped": false,
+      "detail": "positive-recall@4=0.50 mrr=0.50 stale-hit=0.000 (n=2) resolution=0.500 (n=2) false-injection=0.500 (n=6) positive-n=12 negative-n=6 (18 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "Which TCP port should I connect to for Kestrel staging?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGCA8Q8CGTM1RAV1ZCQJ",
+              "id": "01M1X1JH46WW3FA11XPT9XYXBT",
+              "kind": "memory",
+              "score": 0.9996844530105592,
+              "summary": "project:fact - Kestrel staging HTTP listener binds TCP port 9647. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 648.7965999999999,
+          "first_query": true,
+          "server_startup_ms": 73.0072,
+          "model_text_bytes": 499,
+          "mcp_result_bytes": 580,
+          "wire_bytes": 615,
+          "reported_used_tokens": 580,
+          "working_set_bytes": 215756800,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "Where should Kestrel diagnostic logs be written?",
+          "ranked": [
+            "logs"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGCS4N3NJRCDTE6217YT",
+              "id": "01M1X1JHEKQ1E4R8CJP40DS5Y4",
+              "kind": "memory",
+              "score": 0.9909712076187134,
+              "summary": "project:fact - Kestrel diagnostic messages are written to stderr. Stdout is reserved for JSON-RPC protocol messages."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.88390000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 489,
+          "mcp_result_bytes": 570,
+          "wire_bytes": 605,
+          "reported_used_tokens": 570,
+          "working_set_bytes": 215805952,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "Which command rolls back Kestrel to its previous release?",
+          "ranked": [
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGD6N2W3AQR5WXJ8RHWC",
+              "id": "01M1X1JHSMCNW0XA7P4TPHJ75T",
+              "kind": "memory",
+              "score": 0.9997952580451964,
+              "summary": "project:fact - To roll back Kestrel to the previous release, run `kestrelctl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.8752,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 501,
+          "mcp_result_bytes": 582,
+          "wire_bytes": 617,
+          "reported_used_tokens": 582,
+          "working_set_bytes": 215842816,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "Which region hosts Kestrel production?",
+          "ranked": [
+            "region"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGDKMCE8DS2720HH5NXD",
+              "id": "01M1X1JJ3GS1NDQT3HTTPQRBY0",
+              "kind": "memory",
+              "score": 0.9996514320373536,
+              "summary": "project:fact - Kestrel production runs in region eu-west-3. Its deployment configuration selects this region explicitly."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 315.5568,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 493,
+          "mcp_result_bytes": 574,
+          "wire_bytes": 609,
+          "reported_used_tokens": 574,
+          "working_set_bytes": 215855104,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "At what UTC time do daily Kestrel database backups start?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGDZB16RJ8XHTDJP46JT",
+              "id": "01M1X1JJDE4F2EZY0T76S95H2D",
+              "kind": "memory",
+              "score": 0.9999736547470092,
+              "summary": "project:fact - Kestrel daily database backups start at 03:50 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 322.9441,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 472,
+          "mcp_result_bytes": 553,
+          "wire_bytes": 588,
+          "reported_used_tokens": 553,
+          "working_set_bytes": 216444928,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "Which database and journal mode does Kestrel use for local state?",
+          "ranked": [
+            "storage"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGEAGZFTQBPDH66BPEDB",
+              "id": "01M1X1JJQMCZ916SC7VEW3PC3H",
+              "kind": "memory",
+              "score": 0.9996076226234436,
+              "summary": "project:fact - Kestrel stores its local state in SQLite with write-ahead logging enabled. Use WAL mode for its database."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 327.4099,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 493,
+          "mcp_result_bytes": 574,
+          "wire_bytes": 609,
+          "reported_used_tokens": 574,
+          "working_set_bytes": 216489984,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfA qu\u00e9 puerto TCP debo conectarme para staging de Kestrel?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 332.43739999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 216883200,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfD\u00f3nde deben escribirse los mensajes de diagn\u00f3stico de Kestrel?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 317.405,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 217964544,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfQu\u00e9 comando revierte Kestrel a la versi\u00f3n anterior?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 321.3954,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218091520,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfEn qu\u00e9 regi\u00f3n est\u00e1 desplegado Kestrel en producci\u00f3n?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 321.3799,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218374144,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfA qu\u00e9 hora UTC empiezan las copias diarias de la base de datos de Kestrel?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 323.3596,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218787840,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfQu\u00e9 base de datos y modo de registro usa Kestrel para guardar el estado local?",
+          "ranked": [],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 320.0651,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 218931200,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "What authentication password is configured for the Kestrel staging listener?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGCA8Q8CGTM1RAV1ZCQJ",
+              "id": "01M1X1JMY62FH8B9RSF3GSB3BB",
+              "kind": "memory",
+              "score": 0.9995429515838624,
+              "summary": "project:fact - Kestrel staging HTTP listener binds TCP port 9647. This is the current configured port for its staging service."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 315.3713,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 499,
+          "mcp_result_bytes": 580,
+          "wire_bytes": 616,
+          "reported_used_tokens": 580,
+          "working_set_bytes": 219078656,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "What encryption key protects the Kestrel database backups?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGDZB16RJ8XHTDJP46JT",
+              "id": "01M1X1JN881TAE51MZV5KR7AHB",
+              "kind": "memory",
+              "score": 0.9792222380638124,
+              "summary": "project:fact - Kestrel daily database backups start at 03:50 UTC. The backup job runs once per day."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 323.9365,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 472,
+          "mcp_result_bytes": 553,
+          "wire_bytes": 589,
+          "reported_used_tokens": 553,
+          "working_set_bytes": 219144192,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "How many production replicas run in the Kestrel deployment region?",
+          "ranked": [
+            "region",
+            "rollback"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X1JGDKMCE8DS2720HH5NXD",
+              "id": "01M1X1JNJHGD6D8AZ2W4QR9CA9",
+              "kind": "memory",
+              "score": 0.9996774196624756,
+              "summary": "project:fact - Kestrel production runs in region eu-west-3. Its deployment configuration selects this region explicitly."
+            },
+            {
+              "expansion_handle": "memory:01M1X1JGD6N2W3AQR5WXJ8RHWC",
+              "id": "01M1X1JNJH8QNP9ZNRCD8VHP0V",
+              "kind": "memory",
+              "score": 0.5633138418197632,
+              "summary": "project:fact - To roll back Kestrel to the previous release, run `kestrelctl rollback --previous` from the deployment workspace."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 339.94210000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 768,
+          "mcp_result_bytes": 867,
+          "wire_bytes": 903,
+          "reported_used_tokens": 867,
+          "working_set_bytes": 219242496,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfQu\u00e9 contrase\u00f1a exige el servidor de staging de Kestrel?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 345.5095,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 219303936,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfCu\u00e1ntos d\u00edas se conservan las copias de seguridad de Kestrel?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 320.29970000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 219463680,
+          "peak_working_set_bytes": 248725504
+        },
+        {
+          "query": "\u00bfQu\u00e9 versi\u00f3n de SQLite requiere Kestrel?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 320.259,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 219488256,
+          "peak_working_set_bytes": 248725504
+        }
+      ],
+      "id": "kestrel-unseen-project",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5,
+      "skipped": false,
+      "detail": "positive-recall@4=0.50 mrr=0.50 stale-hit=0.000 (n=2) resolution=0.500 (n=2) false-injection=0.500 (n=6) positive-n=12 negative-n=6 (18 queries)"
+    }
+  ],
+  "by_dimension_tier": {
+    "retrieval/hard": [
+      2.0,
+      4
+    ]
+  },
+  "by_dimension": {
+    "retrieval": {
+      "mean": 0.5,
+      "n": 4,
+      "ci95": 0.0
+    }
+  },
+  "overall_index": 0.5,
+  "scenario_weighted_index": 0.5
+}
