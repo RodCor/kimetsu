@@ -1,0 +1,4 @@
+brainbench: 1 scenario(s) to run
+  [1/1] existing-development-100 | dim=retrieval tier=hard ...
+    -> score=0.82 | positive-recall@4=0.84 mrr=0.85 stale-hit=n/a resolution=n/a false-injection=0.538 (n=13) positive-n=197 negative-n=13 (210 queries)
+kbench brainbench: report saved -> E:\tmp\kimetsu-brain-hardening\bench\local\runs\brainbench\2026-09-07T05-53-41.7227119Z.json

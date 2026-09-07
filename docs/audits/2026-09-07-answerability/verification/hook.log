@@ -1,0 +1,3 @@
+PASS: guard=True, expected=None
+PASS: guard=False, expected='managed'
+PASS: guard=True, expected='6319'

@@ -1,0 +1,18 @@
+   Compiling kimetsu-core v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-core)
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.11s
+     Running unittests src\lib.rs (E:/Kimetsu/target\debug\deps\kimetsu_brain-aca789751d649d80.exe)
+
+running 9 tests
+test answerability::tests::broad_tasks_remain_outside_this_bounded_guard ... ok
+test answerability::tests::review_scope_regressions ... ok
+test answerability::tests::mentions_and_unknown_values_are_not_answers ... ok
+test answerability::tests::review_negated_values ... ok
+test answerability::tests::review_competing_clause ... ok
+test answerability::tests::related_topics_do_not_supply_missing_configuration_values ... ok
+test answerability::tests::explicit_absence_and_short_retention_are_useful_answers ... ok
+test answerability::tests::a_value_for_another_component_is_not_an_answer ... ok
+test answerability::tests::explicit_values_survive_in_both_languages ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 694 filtered out; finished in 0.07s
+
