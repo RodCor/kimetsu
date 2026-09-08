@@ -27,7 +27,10 @@ that all possible vulnerabilities have been eliminated.
   Updates to 0.4.16, 0.11.15, 1.0.103, 1.0.195, and 0.8.2 respectively leave
   zero known vulnerabilities and only the informational `paste` maintenance
   notice. These changes belong to
-  [benchmark PR #4](https://github.com/RodCor/kimetsu-bench/pull/4).
+  [benchmark PR #5](https://github.com/RodCor/kimetsu-bench/pull/5), following the
+  merge of the benchmark implementation in PR #4. The patched lockfile passed
+  all 132 benchmark Rust tests against this Kimetsu 2.8.0 checkout. The benchmark
+  default branch's Dependabot alert #1 remains open until this follow-up is merged.
 
 ## CodeQL triage
 
