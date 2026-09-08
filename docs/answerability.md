@@ -1,4 +1,4 @@
-# Structured fact answerability (unreleased, opt-in)
+# Structured fact answerability (v2.8.0, opt-in)
 
 The broker can attach evidence accounting to direct configuration questions: which attributes are supported, missing, or conflicting. This is a bounded syntactic check on retrieved evidence, not a general truth or entailment model.
 
@@ -8,7 +8,7 @@ The broker can attach evidence accounting to direct configuration questions: whi
 kimetsu config set broker.explicit_fact_guard true
 ```
 
-The default is `false`. Use the same command with `false` to disable it. If a warm embed daemon is running an older executable, restart it with the updated build before comparing daemon behavior. This documentation describes unreleased code; installing the current published version does not guarantee this feature is available.
+The default is `false`. Use the same command with `false` to disable it. This feature requires v2.8.0 or a build containing these changes. If a warm embed daemon is running an older executable, restart it with the updated build before comparing daemon behavior.
 
 An explicit statement such as `Orchid staging gateway port is 7319.` can support the port part of `What are the Orchid staging gateway port and timeout?`. The response reports timeout missing unless matching evidence is retrieved. Production evidence cannot fill a staging request. Distinct eligible values produce a conflict; equivalent durations such as `30 seconds` and `30000 ms` compare using exact rational arithmetic.
 

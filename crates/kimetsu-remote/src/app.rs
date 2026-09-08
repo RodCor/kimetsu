@@ -193,6 +193,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_excluded_catalog_tool_is_blocked_at_http_boundary() {
+        for host_only in [
+            "kimetsu_bridge_status",
+            "kimetsu_skills_search",
+            "kimetsu_bridge_import",
+            "kimetsu_bridge_export",
+            "kimetsu_bridge_sync",
+            "kimetsu_plugin_install",
+        ] {
+            assert!(
+                !crate::catalog::REMOTE_TOOLS.contains(host_only),
+                "host filesystem tool {host_only} must never be remotely callable"
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state_with(tmp.path()));
+        let catalog = kimetsu_chat::dispatch(
+            "tools/list",
+            json!({}),
+            tmp.path(),
+            &kimetsu_chat::SkillConfig::default(),
+            None,
+        )
+        .unwrap();
+        let mut blocked = 0;
+        for tool in catalog["tools"].as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            if crate::catalog::REMOTE_TOOLS.contains(name) {
+                continue;
+            }
+            let response = app.clone().oneshot(post("web", Some("tok_admin"), json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":name, "arguments":{"selection":"../outside", "target":"codex", "force":true}}
+            }))).await.unwrap();
+            let result = body_json(response).await;
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not available in remote mode"),
+                "{name}: {result}"
+            );
+            blocked += 1;
+        }
+        assert!(blocked >= 8, "must exercise the host-only catalog");
+        for directory in [".codex", ".claude", ".cursor"] {
+            assert!(!tmp.path().join("web").join(directory).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn per_repo_token_cannot_write_shared_user_memory() {
         let tmp = tempfile::tempdir().unwrap();
         let app = build_router(state_with(tmp.path()));
