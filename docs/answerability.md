@@ -20,6 +20,33 @@ Schema 15 adds a rebuildable SQLite fact projection. Facts bind to the memory's 
 
 Projection maintenance adds write/storage work even when the guard is disabled; ordinary retrieval skips fact hydration while it is disabled. No extra model calls are required. Delivered evidence and metadata still consume agent context tokens. MCP output admission includes serialized metadata in its byte upper bound; that bound is not a measured tokenizer count.
 
+## v2.8.0 metrics
+
+These measurements cover the implementation included in v2.8.0. They were
+recorded on September 7 using implementation `3ae8329` and harness `2c74dad`,
+against the preceding answerability build with the guard enabled on both sides.
+They are not a fresh tagged-release run or a v2.7.0-versus-v2.8.0 comparison.
+
+| Metric (45 synthetic cases, two repeats) | Baseline | Candidate |
+|---|---:|---:|
+| Unwanted injections | 15/18 (83.3%) | 3/18 (16.7%) |
+| Positive retrieval hits | 24/27 (88.9%) | 24/27 (88.9%) |
+| Exact evidence metadata | Not emitted | 36/45 (80%) per repeat |
+| Subsequent-query p95 | 376.6 ms | 386.6 ms |
+| Mean MCP response bytes | 613.5 | 651.2 |
+
+Unwanted injections decreased by 80% relatively, or 66.7 percentage points.
+P95 increased by 10.0 ms (2.7%), and response size by 37.8 bytes (6.2%). Deltas use unrounded measurements;
+the table displays rounded values.
+Across the three fixtures, 688 observations covered 299 distinct scenario/query
+cases without positive-hit losses. The short synthetic runs do not establish
+a statistically significant performance change or general answer accuracy.
+
+Separate release-preparation validation passed 1,500 workspace tests (six
+ignored) and 132 benchmark Rust tests after dependency updates. See the
+[release review](audits/2026-09-08-release-security.md) for that validation;
+it does not change the original benchmark provenance.
+
 ## Measured results and limits
 
 On the frozen 45-query synthetic fixture, unwanted injections fell from **15/18 to 3/18**, with **24/27 positive hits retained**. Exact metadata matched **36/45** cases in each of two repeats: 33/42 direct fact questions and three broad controls. P95 was **376.6 → 386.6 ms**; mean MCP result bytes were **613.5 → 651.2**. The development and prior answerability fixtures had no positive-hit losses.
