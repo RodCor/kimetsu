@@ -56,11 +56,9 @@ cannot enter the remote catalog, and verifies the excluded calls return the
 remote-mode denial without creating host configuration directories. No scanner
 rule or language is disabled.
 
-This is a source review and regression-test disposition, not a report that
-GitHub has closed the alerts. No alerts were dismissed through the API during
-this review. The updated branch needs a fresh CodeQL scan, and the reviewed
-false positives still need a maintainer disposition in GitHub before the alert
-list can be described as cleared.
+At the original September 8 review, no alerts had been dismissed through the
+API. The branch still needed a fresh CodeQL scan and maintainer disposition.
+The September 9 follow-up below records the completed alert review.
 
 Path checks protect against existing symlinks/junctions and filesystem aliases.
 Configured repository IDs that use reserved device names or trailing dots now
@@ -108,3 +106,38 @@ Formatting and workspace/all-target Clippy with `-D warnings` pass for both
 the release feature set above and `--no-default-features`. Validation used Rust/Cargo 1.97.0 and cargo-audit
 0.22.2. The manifest/lockfile consistency check covered all seven workspace
 packages and every existing inter-crate version pin.
+
+
+## September 9 follow-up: code-scanning disposition
+
+After PR #45 merged, main commit `6a54f2e` passed all CI jobs and CodeQL analyses.
+The remaining 46 open alerts were inspected against Rust SARIF analysis
+`1745269927` and dismissed as **false positives**, each with a rationale in
+GitHub. A subsequent API query returned **zero open code-scanning alerts**;
+Dependabot also returned zero open alerts. No scanning rules were disabled.
+
+- **44 path findings** (#5–#48): every reported path starts with the HTTP
+  handler and taints `State<AppState>.data_dir`. That path comes from the
+  operator's `--data` option, is canonicalized during startup, and is held in
+  `Arc<PathBuf>`; requests cannot supply or mutate it. Repository IDs remain
+  validated before joining, and redirected repository/state paths are checked.
+- Of these, **41 host-tool paths** additionally cannot execute through the
+  remote router because the allowlist rejects them before `call_tool`.
+  The other three are #21, #34 and #44 in repository/state initialization.
+- **Two logging findings** (#2 and #3) concern a stored conversation correlation
+  identifier and an environment variable name, respectively. Neither field
+  contains the authentication secret inferred by the scanner.
+
+The Axum modeling issue is corroborated by GitHub's
+[September 3 upstream fix](https://github.com/github/codeql/commit/d8e57bd223566df5bc236c0fdc54f12e222ab781),
+which excludes state-field taint reads while retaining request-body taint.
+Alert #49 for the same pattern had already been dismissed before this follow-up.
+The HTTPS finding #4 no longer appears among main's open findings after the
+transport hardening. These dispositions concern the reported flows, not a
+claim that all possible vulnerabilities have been eliminated.
+
+The remote suite was rerun with embeddings, TLS and host integration features:
+**36 passed, zero failed**. Main's Rust implementation and dependency lockfile
+match the previously validated release candidate. A fresh dependency audit
+again returned zero known vulnerabilities; the two informational maintenance
+notices described above remain.
