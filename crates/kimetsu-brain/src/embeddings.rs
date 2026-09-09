@@ -317,6 +317,7 @@ pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
             "jina-reranker-v1-tiny-en",
             "ms-marco-tinybert-l-2-v2",
             "ms-marco-minilm-l-4-v2",
+            "mmarco-minilm-l12-v2-int8",
         ];
 
         if CURATED.contains(&v.as_str()) {
@@ -343,22 +344,97 @@ pub fn open_reranker_for_model(model_id: &str) -> Option<Box<dyn Reranker>> {
                 }
             };
         }
-        // Unknown → fallback to default curated turbo.
-        match fastembed_backend::FastembedReranker::try_open("jina-reranker-v1-turbo-en") {
-            Ok(r) => Some(Box::new(r) as Box<dyn Reranker>),
-            Err(err) => {
-                eprintln!(
-                    "kimetsu-brain: fallback reranker unavailable ({err}); \
-                     continuing without cross-encoder reranking"
-                );
-                None
-            }
-        }
+        eprintln!("kimetsu-brain: unknown reranker {model_id:?}");
+        None
     }
     #[cfg(not(feature = "embeddings"))]
     {
         let _ = v;
         None
+    }
+}
+
+pub fn reranker_is_off(model_id: &str) -> bool {
+    matches!(
+        model_id.trim().to_ascii_lowercase().as_str(),
+        "" | "off" | "none" | "noop"
+    )
+}
+
+/// Evaluation must never label a failed initialization as a measured CE run.
+pub fn open_reranker_checked(model_id: &str) -> Result<Option<Box<dyn Reranker>>, String> {
+    if reranker_is_off(model_id) {
+        return Ok(None);
+    }
+    open_reranker_for_model(model_id).map(Some).ok_or_else(|| {
+        format!("requested reranker {model_id:?} unavailable; no cross-encoder measurement")
+    })
+}
+
+type CachedReranker = Result<Option<std::sync::Arc<dyn Reranker>>, String>;
+#[derive(Default)]
+struct RerankerCache(std::sync::Mutex<std::collections::HashMap<String, CachedReranker>>);
+impl RerankerCache {
+    fn get(&self, id: &str, load: impl FnOnce(&str) -> CachedReranker) -> CachedReranker {
+        if reranker_is_off(id) {
+            return Ok(None);
+        }
+        let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .entry(id.trim().to_string())
+            .or_insert_with(|| load(id))
+            .clone()
+    }
+}
+/// Process cache keyed by configured model, including failed loads. Explicit off
+/// bypasses the cache. Lean serving is explicitly FTS-only; checked evaluation
+/// above still rejects any requested CE measurement on lean builds.
+pub fn open_cached_reranker(model_id: &str) -> CachedReranker {
+    static CACHE: std::sync::OnceLock<RerankerCache> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(RerankerCache::default)
+        .get(model_id, |id| {
+            #[cfg(feature = "embeddings")]
+            {
+                open_reranker_checked(id).map(|r| r.map(std::sync::Arc::from))
+            }
+            #[cfg(not(feature = "embeddings"))]
+            {
+                let _ = id;
+                Ok(None)
+            }
+        })
+}
+
+#[cfg(test)]
+mod configured_reranker_tests {
+    use super::*;
+    #[test]
+    fn configured_cache_reuses_model_and_off_never_loads() {
+        let cache = RerankerCache::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let load = |_: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(
+                std::sync::Arc::new(StubReranker) as std::sync::Arc<dyn Reranker>
+            ))
+        };
+        let first = cache.get("configured", load).unwrap().unwrap();
+        let second = cache.get("configured", load).unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            cache
+                .get("off", |_| panic!("off must not load"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get("failed", |_| Err("unavailable".into())).is_err());
+        assert!(
+            cache
+                .get("failed", |_| panic!("failure must remain explicit"))
+                .is_err()
+        );
     }
 }
 
@@ -432,6 +508,41 @@ pub fn open_embedder_for(config_enabled: bool) -> &'static dyn Embedder {
     }
 }
 
+/// Serving/evaluation must distinguish an explicitly lexical configuration from
+/// a requested model whose cached initialization fell back to Noop.
+pub fn open_embedder_for_checked(config_enabled: bool) -> Result<&'static dyn Embedder, String> {
+    let embedder = open_embedder_for(config_enabled);
+    validate_requested_embedder(
+        embedder,
+        embedder_enabled_for_config(config_enabled),
+        cfg!(feature = "embeddings"),
+    )?;
+    Ok(embedder)
+}
+
+fn validate_requested_embedder(
+    embedder: &dyn Embedder,
+    enabled: bool,
+    available: bool,
+) -> Result<(), String> {
+    if available && enabled && embedder.is_noop() {
+        return Err("requested embedder unavailable after initialization; no semantic measurement (explicitly disable embeddings for lexical-only serving)".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod checked_serving_loader_tests {
+    use super::*;
+    #[test]
+    fn failed_requested_model_is_not_an_intentional_lexical_measurement() {
+        assert!(validate_requested_embedder(&NoopEmbedder, true, true).is_err());
+        assert!(validate_requested_embedder(&NoopEmbedder, false, true).is_ok());
+        assert!(validate_requested_embedder(&NoopEmbedder, true, false).is_ok());
+        assert!(validate_requested_embedder(&StubEmbedder::default(), true, true).is_ok());
+    }
+}
+
 /// v0.8: open a FRESH (uncached) embedder for an explicit built-in
 /// model id. Unlike [`open_default_embedder`], this bypasses the
 /// process-static cache AND the env/override resolution — the caller
@@ -441,6 +552,14 @@ pub fn open_embedder_for(config_enabled: bool) -> &'static dyn Embedder {
 /// embedder cached). Returns [`NoopEmbedder`] on the lean build or if
 /// the model fails to load.
 pub fn open_embedder_for_model(model_id: &str) -> Box<dyn Embedder + Send + Sync> {
+    let model_id = match canonical_embedder_id(model_id) {
+        Ok("noop") => return Box::new(NoopEmbedder),
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("{error}");
+            return Box::new(NoopEmbedder);
+        }
+    };
     #[cfg(feature = "embeddings")]
     {
         match fastembed_backend::FastembedEmbedder::try_open(model_id) {
@@ -458,6 +577,44 @@ pub fn open_embedder_for_model(model_id: &str) -> Box<dyn Embedder + Send + Sync
         let _ = model_id;
     }
     Box::new(NoopEmbedder)
+}
+
+/// Explicit model selection for evaluators. Unknown values are errors, never a
+/// differently named BGE measurement. Aliases match the environment resolver.
+pub fn canonical_embedder_id(id: &str) -> Result<&'static str, EmbedderError> {
+    match id.trim().to_ascii_lowercase().as_str() {
+        "noop" | "off" | "none" | "0" | "false" | "no" => Ok("noop"),
+        "" | "default" | "bge-small" | "bge-small-en-v1.5" => Ok("bge-small-en-v1.5"),
+        "bge-m3" | "m3" => Ok("bge-m3"),
+        "jina-code" | "jina-v2-base-code" | "jina-embeddings-v2-base-code" => {
+            Ok("jina-v2-base-code")
+        }
+        _ => Err(EmbedderError::LoadFailed(format!(
+            "unknown requested embedder {id:?}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod explicit_embedder_tests {
+    use super::*;
+    #[test]
+    fn aliases_and_disable_have_one_effective_model_identity() {
+        assert_eq!(
+            canonical_embedder_id("jina-code").unwrap(),
+            "jina-v2-base-code"
+        );
+        assert_eq!(canonical_embedder_id("m3").unwrap(), "bge-m3");
+        assert_eq!(
+            canonical_embedder_id("bge-small").unwrap(),
+            "bge-small-en-v1.5"
+        );
+        for off in ["off", "noop", "false", "none", "0"] {
+            assert_eq!(canonical_embedder_id(off).unwrap(), "noop");
+            assert!(open_embedder_for_model(off).is_noop());
+        }
+        assert!(canonical_embedder_id("typo-not-a-model").is_err());
+    }
 }
 
 /// v0.4.3: env-driven kill switch. Truthy values (1/true/yes/on)
@@ -620,6 +777,27 @@ mod fastembed_backend {
     };
     use std::sync::{Arc, Mutex, OnceLock};
 
+    /// Opt-in process-wide pool configured before any local model session.
+    /// With no setting, leave the embedding application's ORT environment alone.
+    /// ORT disables per-session pools when a global pool is installed, so this
+    /// overrides FastEmbed's per-session available_parallelism setting as well.
+    fn configure_runtime_threads() -> Result<(), EmbedderError> {
+        static CONFIGURED: OnceLock<Result<(), String>> = OnceLock::new();
+        CONFIGURED.get_or_init(|| {
+            let raw = std::env::var("KIMETSU_INTRA_THREADS").ok();
+            let Some(threads) = super::parse_runtime_threads(raw.as_deref())? else { return Ok(()) };
+            let pool = ort::environment::GlobalThreadPoolOptions::default()
+                .with_intra_threads(threads).map_err(|e| e.to_string())?
+                .with_inter_threads(1).map_err(|e| e.to_string())?
+                .with_spin_control(false).map_err(|e| e.to_string())?;
+            if !ort::init().with_global_thread_pool(pool).commit() {
+                return Err("KIMETSU_INTRA_THREADS cannot take effect: ONNX environment already configured; set it before the first model load".into());
+            }
+            eprintln!("kimetsu-brain: ONNX shared intra-op threads={threads}, inter-op=1, spinning=off");
+            Ok(())
+        }).clone().map_err(EmbedderError::LoadFailed)
+    }
+
     // ── HF Hub download helper (user-defined ONNX rerankers) ─────────────────
 
     /// Alias table: lowercased stable id → HuggingFace repo id.
@@ -628,6 +806,7 @@ mod fastembed_backend {
             "jina-reranker-v1-tiny-en" => Some("jinaai/jina-reranker-v1-tiny-en"),
             "ms-marco-tinybert-l-2-v2" => Some("Xenova/ms-marco-TinyBERT-L-2-v2"),
             "ms-marco-minilm-l-4-v2" => Some("Xenova/ms-marco-MiniLM-L-4-v2"),
+            "mmarco-minilm-l12-v2-int8" => Some("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"),
             _ => None,
         }
     }
@@ -658,7 +837,16 @@ mod fastembed_backend {
         let api = ApiBuilder::from_env().build().map_err(|e| {
             EmbedderError::LoadFailed(format!("hf-hub ApiBuilder::from_env failed: {e}"))
         })?;
-        let repo = api.model(repo_id.clone());
+        let multilingual_int8 = lowercased == "mmarco-minilm-l12-v2-int8";
+        let repo = if multilingual_int8 {
+            api.repo(hf_hub::Repo::with_revision(
+                repo_id.clone(),
+                hf_hub::RepoType::Model,
+                "1427fd652930e4ba29e8149678df786c240d8825".into(),
+            ))
+        } else {
+            api.model(repo_id.clone())
+        };
 
         // Helper: download a required file or return LoadFailed.
         let get_required = |filename: &str| -> Result<Vec<u8>, EmbedderError> {
@@ -676,14 +864,19 @@ mod fastembed_backend {
         let special_tokens_map_file = get_required("special_tokens_map.json")?;
 
         // Try `onnx/model.onnx` first, then `model.onnx` at root.
-        let onnx_path = repo
-            .get("onnx/model.onnx")
-            .or_else(|_| repo.get("model.onnx"))
-            .map_err(|e| {
-                EmbedderError::LoadFailed(format!(
-                    "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
-                ))
-            })?;
+        let onnx_path = if multilingual_int8 {
+            // Pin the tested compact CPU export; never silently fetch the
+            // much larger float32 checkpoint for this explicit model ID.
+            repo.get("onnx/model_quint8_avx2.onnx")
+        } else {
+            repo.get("onnx/model.onnx")
+                .or_else(|_| repo.get("model.onnx"))
+        }
+        .map_err(|e| {
+            EmbedderError::LoadFailed(format!(
+                "{repo_id}: could not find onnx/model.onnx or model.onnx: {e}"
+            ))
+        })?;
 
         let tokenizer_files = fastembed::TokenizerFiles {
             tokenizer_file,
@@ -707,6 +900,7 @@ mod fastembed_backend {
 
     impl FastembedEmbedder {
         pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            configure_runtime_threads()?;
             let (kind, model_id, dim) = match builtin_id {
                 "bge-m3" => (EmbeddingModel::BGEM3, "bge-m3", 1024),
                 "jina-v2-base-code" => (
@@ -827,6 +1021,7 @@ mod fastembed_backend {
         /// initialize a `TextRerank` engine. Unknown ids fall back to the
         /// jina-reranker-v1-turbo-en default.
         pub fn try_open(builtin_id: &str) -> Result<Self, EmbedderError> {
+            configure_runtime_threads()?;
             let (kind, stable_id) = match builtin_id {
                 "bge-reranker-base" => (RerankerModel::BGERerankerBase, "bge-reranker-base"),
                 "bge-reranker-v2-m3" => (RerankerModel::BGERerankerV2M3, "bge-reranker-v2-m3"),
@@ -857,6 +1052,7 @@ mod fastembed_backend {
         /// the normalized alias (e.g. `"jina-reranker-v1-tiny-en"`) or the raw
         /// repo id, lower-cased, so it is stable across calls.
         pub fn try_open_user_defined(alias_or_repo: &str) -> Result<Self, EmbedderError> {
+            configure_runtime_threads()?;
             use fastembed::{RerankInitOptionsUserDefined, UserDefinedRerankingModel};
 
             let (onnx_source, tokenizer_files) = download_user_defined_reranker(alias_or_repo)?;
@@ -974,6 +1170,16 @@ pub fn embed_and_persist(
     if embedder.is_noop() {
         return Ok(None);
     }
+    use rusqlite::OptionalExtension;
+    // Capture the claim generation before expensive inference. Text alone is
+    // insufficient for A -> B -> A corrections.
+    let expected_revision: Option<String> = conn.query_row(
+        "SELECT COALESCE((SELECT event_id FROM memory_revisions WHERE memory_id=?1 ORDER BY revision_id DESC LIMIT 1),'baseline:' || memory_id)
+         FROM memories WHERE memory_id=?1 AND text=?2 AND invalidated_at IS NULL AND superseded_by IS NULL",
+        rusqlite::params![memory_id,text], |r|r.get(0)).optional()?;
+    let Some(expected_revision) = expected_revision else {
+        return Ok(None);
+    };
     let vec = match embedder.embed(text) {
         Ok(v) => v,
         // NotImplemented is the contract for "skip silently". Treat
@@ -991,33 +1197,18 @@ pub fn embed_and_persist(
         .into());
     }
     let blob = encode_embedding(&vec);
-    conn.execute(
-        "UPDATE memories SET embedding = ?1, embedding_model = ?2 WHERE memory_id = ?3",
-        rusqlite::params![blob, embedder.model_id(), memory_id],
+    let changed = conn.execute(
+        "UPDATE memories SET embedding=?1,embedding_model=?2 WHERE memory_id=?3 AND text=?4
+         AND invalidated_at IS NULL AND superseded_by IS NULL
+         AND COALESCE((SELECT event_id FROM memory_revisions WHERE memory_id=?3 ORDER BY revision_id DESC LIMIT 1),'baseline:' || memory_id)=?5",
+        rusqlite::params![blob,embedder.model_id(),memory_id,text,expected_revision],
     )?;
-
-    // Tier-3: keep the warm usearch index current at add time. For in-memory
-    // DBs there is no cached handle — the rebuild-on-query path picks the row
-    // up, so we safely skip. Best-effort: an index failure must not abort a
-    // successful memory write.
-    #[cfg(feature = "embeddings")]
-    if let Some(handle) = crate::ann::cached_handle(conn) {
-        let rowid: Option<i64> = conn
-            .query_row(
-                "SELECT rowid FROM memories WHERE memory_id = ?1",
-                rusqlite::params![memory_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(rowid) = rowid {
-            let mut guard = handle.write().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = guard.add(rowid, &vec) {
-                eprintln!(
-                    "kimetsu-brain: ann add failed for memory {memory_id}: {e} (index will reconcile on next open)"
-                );
-            }
-        }
+    if changed == 0 {
+        return Ok(None);
     }
+    // The corpus trigger makes cached ANN handles stale. Reconcile from the
+    // committed database on the next query; directly adding this vector could
+    // race a newer correction after the conditional write succeeded.
 
     Ok(Some(vec))
 }
@@ -1059,9 +1250,35 @@ pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuRes
     Ok(out)
 }
 
+#[cfg(any(test, feature = "embeddings"))]
+fn parse_runtime_threads(raw: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let threads = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "KIMETSU_INTRA_THREADS must be an integer from 1 to 1024".to_string())?;
+    if !(1..=1024).contains(&threads) {
+        return Err("KIMETSU_INTRA_THREADS must be an integer from 1 to 1024".into());
+    }
+    Ok(Some(threads))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_threads_are_explicit_bounded_and_invalid_values_are_errors() {
+        assert_eq!(parse_runtime_threads(None).unwrap(), None);
+        assert_eq!(parse_runtime_threads(Some(" 4 ")).unwrap(), Some(4));
+        assert_eq!(parse_runtime_threads(Some("1")).unwrap(), Some(1));
+        for value in ["0", "-1", "abc", "1025", "999999999999999999999999"] {
+            assert!(
+                parse_runtime_threads(Some(value)).is_err(),
+                "invalid setting: {value}"
+            );
+        }
+    }
 
     #[test]
     fn map_builtin_id_maps_aliases_and_defaults_unknown() {
@@ -1503,5 +1720,81 @@ mod tests {
             }
         }
         drop(lock);
+    }
+}
+
+#[cfg(test)]
+mod correction_race_tests {
+    use super::*;
+    #[test]
+    fn slow_embedding_cannot_overwrite_a_newer_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        crate::schema::initialize(&writer).unwrap();
+        let accepted = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "memory.accepted",
+            serde_json::json!({"memory_id":"m","scope":"project","kind":"fact","text":"claim A"}),
+        );
+        crate::projector::apply_events(&writer, &[accepted]).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        struct Blocking {
+            started: std::sync::mpsc::Sender<()>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Embedder for Blocking {
+            fn embed(&self, _: &str) -> Result<Vec<f32>, EmbedderError> {
+                self.started.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+                Ok(vec![1.0, 0.0])
+            }
+            fn model_id(&self) -> &str {
+                "stub"
+            }
+            fn dim(&self) -> usize {
+                2
+            }
+        }
+        let pending = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(db).unwrap();
+            embed_and_persist(
+                &conn,
+                "m",
+                "claim A",
+                &Blocking {
+                    started: started_tx,
+                    resume: std::sync::Mutex::new(resume_rx),
+                },
+            )
+            .unwrap()
+        });
+        started_rx.recv().unwrap();
+        let correction = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "memory.corrected",
+            serde_json::json!({"memory_id":"m","text":"claim B"}),
+        );
+        crate::projector::apply_events(&writer, &[correction]).unwrap();
+        writer
+            .execute(
+                "UPDATE memories SET embedding=?1,embedding_model='stub' WHERE memory_id='m'",
+                rusqlite::params![encode_embedding(&[0.0, 1.0])],
+            )
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(
+            pending.join().unwrap().is_none(),
+            "stale computation must not be published"
+        );
+        let blob: Vec<u8> = writer
+            .query_row(
+                "SELECT embedding FROM memories WHERE memory_id='m'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decode_embedding(&blob, Some(2)).unwrap(), vec![0.0, 1.0]);
     }
 }

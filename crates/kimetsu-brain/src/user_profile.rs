@@ -71,7 +71,8 @@ pub fn preferences(
          WHERE kind = 'preference'
            AND invalidated_at IS NULL
            AND superseded_by IS NULL
-           AND (valid_to IS NULL OR valid_to > datetime('now'))
+           AND (valid_from IS NULL OR julianday(valid_from) <= julianday('now'))
+           AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))
          ORDER BY usefulness_score DESC, created_at DESC
          LIMIT ?1",
     )?;
@@ -216,6 +217,33 @@ mod tests {
         let profile = preferences(&c, false, 10).expect("preferences");
         assert_eq!(profile.len(), 1);
         assert_eq!(profile[0].memory_id, "live");
+    }
+
+    #[test]
+    fn hardening_profile_checks_numeric_start_and_expiry() {
+        let c = conn();
+        for id in ["current", "future", "expired", "invalid"] {
+            insert(&c, id, "preference", id, 0.0);
+        }
+        c.execute(
+            "UPDATE memories SET valid_from='2099-01-01T00:00:00Z' WHERE memory_id='future'",
+            [],
+        )
+        .unwrap();
+        c.execute("UPDATE memories SET valid_to=strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 minute') WHERE memory_id='expired'", []).unwrap();
+        c.execute(
+            "UPDATE memories SET valid_from='not-a-date' WHERE memory_id='invalid'",
+            [],
+        )
+        .unwrap();
+        let profile = preferences(&c, false, 10).unwrap();
+        assert_eq!(
+            profile
+                .iter()
+                .map(|p| p.memory_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current"]
+        );
     }
 
     /// Specificity wins when the budget runs out: a preference stated for this

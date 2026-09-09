@@ -54,17 +54,26 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     let fixture: EvalFixture = serde_json::from_str(&fixture_text)
         .map_err(|e| format!("invalid fixture JSON in {}: {e}", fixture_path.display()))?;
 
-    // Validate: every relevant key must exist in memories.
+    // Validate every referenced key before seeding the temporary brain.
     let all_keys: std::collections::HashSet<&str> =
         fixture.memories.iter().map(|m| m.key.as_str()).collect();
     for case in &fixture.cases {
-        for rel in &case.relevant {
+        for rel in case.relevant.iter().chain(&case.stale) {
             if !all_keys.contains(rel.as_str()) {
                 return Err(format!(
                     "fixture validation error: relevant key {:?} in query {:?} does not exist in memories",
                     rel, case.query
                 )
                 .into());
+            }
+        }
+    }
+    for memory in &fixture.memories {
+        if let Some(survivor) = &memory.superseded_by_key {
+            if !all_keys.contains(survivor.as_str()) {
+                return Err(
+                    format!("fixture references missing superseding key {survivor:?}").into(),
+                );
             }
         }
     }
@@ -94,9 +103,31 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     );
     let mut key_to_id: HashMap<String, String> = HashMap::new();
     for mem in &fixture.memories {
-        let memory_id = add_memory(&tmp_root, MemoryScope::Project, MemoryKind::Fact, &mem.text)
-            .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
+        let memory_id = project::add_memory_with_validity(
+            &tmp_root,
+            MemoryScope::Project,
+            MemoryKind::Fact,
+            &mem.text,
+            None,
+            mem.valid_to.as_deref(),
+        )
+        .map_err(|e| format!("add_memory {:?}: {e}", mem.key))?;
         key_to_id.insert(mem.key.clone(), memory_id);
+    }
+    // Match the worker/tuner fixture contract: expiry is recorded at capture;
+    // supersession is applied after all survivor keys have their generated IDs.
+    {
+        let (_, _, conn) = project::load_project(&tmp_root)?;
+        for mem in &fixture.memories {
+            if let Some(survivor) = &mem.superseded_by_key {
+                let id = &key_to_id[&mem.key];
+                conn.execute(
+                    "UPDATE memories SET superseded_by=?2 WHERE memory_id=?1",
+                    rusqlite::params![id, key_to_id[survivor]],
+                )?;
+                conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [id])?;
+            }
+        }
     }
 
     // Build key → id lookup from the map (for ranking back to keys).
@@ -136,7 +167,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
                     embedder: &dyn kimetsu_brain::embeddings::Embedder,
                     reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
                     pool: usize,
-                    rerank_floor: f32,
+                    _rerank_floor: f32,
                     rerank_cap: usize|
      -> KimetsuResult<(Vec<Vec<String>>, u128)> {
         let session = BrainSession::open_readonly(&tmp_root)
@@ -145,27 +176,29 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         let t0 = Instant::now();
         let mut per_case_ranked: Vec<Vec<String>> = Vec::new();
 
-        for (ci, case) in fixture.cases.iter().enumerate() {
-            let fetch_cap = pool;
+        for (ci, _case) in fixture.cases.iter().enumerate() {
+            let policy = kimetsu_brain::serving::ServingPolicy {
+                pool,
+                cap: if rerank_cap == 0 {
+                    kimetsu_brain::serving::DEFAULT_CAP
+                } else {
+                    rerank_cap
+                },
+                ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
+            };
             let request = ContextRequest {
-                stage: "localization".to_string(),
+                stage: "localization".into(),
                 query: retrieval_queries[ci].clone(),
-                budget_tokens: 6000,
-                max_capsules: fetch_cap,
-                min_semantic_score: 0.0,   // disable floor for eval recall
-                min_lexical_coverage: 0.0, // disable floor for eval recall
+                min_score: 0.15,
                 ..Default::default()
             };
-            let mut bundle = session
-                .retrieve_context_with_injected_embedder(request, embedder)
-                .map_err(|e| format!("{mode_label} retrieve: {e}"))?;
-
-            // Apply reranker when present.
-            if let Some(rr) = reranker {
-                bundle.capsules =
-                    rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
-            }
-
+            let bundle = policy.retrieve(
+                &session,
+                request,
+                embedder,
+                reranker,
+                kimetsu_brain::serving::EVAL_EXPOSURE_ID,
+            )?;
             // Map capsule expansion_handle "memory:<id>" → fixture key.
             let ranked_keys: Vec<String> = bundle
                 .capsules
@@ -190,24 +223,27 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
     // for pool-size experiments.
     let pool = args.pool.max(1);
     let rerank_floor = 0.30f32;
-    let rerank_cap = 4usize;
+    let rerank_cap = kimetsu_brain::serving::DEFAULT_CAP;
 
     print!("running fts mode...");
     let (fts_ranked, fts_ms) = run_mode("fts", &NoopEmbedder, None, pool, 0.0, 0)?;
     println!(" done ({fts_ms} ms)");
 
     print!("running semantic mode (loading embedder)...");
-    let semantic_embedder = open_embedder_for_model("bge-small-en-v1.5");
-    let (sem_ranked, sem_ms) =
-        run_mode("semantic", semantic_embedder.as_ref(), None, pool, 0.0, 0)?;
+    let semantic_embedder = kimetsu_brain::embeddings::open_default_embedder();
+    if semantic_embedder.is_noop() {
+        return Err("semantic embedder unavailable; no semantic measurement".into());
+    }
+    let (sem_ranked, sem_ms) = run_mode("semantic", semantic_embedder, None, pool, 0.0, 0)?;
     println!(" done ({sem_ms} ms)");
 
     print!("running semantic+rerank mode (loading reranker)...");
-    let reranker_opt = open_reranker_for_model("jina-reranker-v1-turbo-en");
+    let reranker_opt =
+        kimetsu_brain::embeddings::open_reranker_checked("ms-marco-tinybert-l-2-v2")?;
     let reranker_ref: Option<&dyn kimetsu_brain::embeddings::Reranker> = reranker_opt.as_deref();
     let (rr_ranked, rr_ms) = run_mode(
         "semantic+rerank",
-        semantic_embedder.as_ref(),
+        semantic_embedder,
         reranker_ref,
         pool,
         rerank_floor,
@@ -297,8 +333,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         struct RankerBenchRow {
             label: String,
             load_ms: u128,
-            rerank_mean_ms: f64,
-            rerank_max_ms: u128,
+            delivery_mean_ms: f64,
+            delivery_max_ms: u128,
             r2: f64,
             r4: f64,
             mrr: f64,
@@ -330,33 +366,29 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
             let rr = reranker_ref.unwrap();
 
             let mut per_case_ranked: Vec<Vec<String>> = Vec::new();
-            let mut rerank_times_ms: Vec<u128> = Vec::new();
+            let mut delivery_times_ms: Vec<u128> = Vec::new();
 
             for case in fixture.cases.iter() {
-                let request = kimetsu_brain::context::ContextRequest {
-                    stage: "localization".to_string(),
+                let policy = kimetsu_brain::serving::ServingPolicy {
+                    pool,
+                    cap: rerank_cap,
+                    ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
+                };
+                let request = ContextRequest {
+                    stage: "localization".into(),
                     query: case.query.clone(),
-                    budget_tokens: 6000,
-                    max_capsules: pool,
-                    min_semantic_score: 0.0,
-                    min_lexical_coverage: 0.0,
+                    min_score: 0.15,
                     ..Default::default()
                 };
-                let mut bundle = session
-                    .retrieve_context_with_injected_embedder(request, semantic_embedder.as_ref())
-                    .map_err(|e| format!("{rr_id} retrieve: {e}"))?;
-
-                // Time only the rerank step.
                 let rr_start = Instant::now();
-                if !eval_cases[per_case_ranked.len()].relevant.is_empty() {
-                    bundle.capsules =
-                        rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
-                    rerank_times_ms.push(rr_start.elapsed().as_millis());
-                } else {
-                    // Noise case: still rerank so we get noise metric.
-                    bundle.capsules =
-                        rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
-                }
+                let bundle = policy.retrieve(
+                    &session,
+                    request,
+                    semantic_embedder,
+                    Some(rr),
+                    kimetsu_brain::serving::EVAL_EXPOSURE_ID,
+                )?;
+                delivery_times_ms.push(rr_start.elapsed().as_millis());
 
                 let ranked_keys: Vec<String> = bundle
                     .capsules
@@ -373,12 +405,12 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
 
             let (r2, r4, mrr_val, noise) = compute_metrics(&per_case_ranked);
 
-            let rerank_mean_ms = if rerank_times_ms.is_empty() {
+            let delivery_mean_ms = if delivery_times_ms.is_empty() {
                 0.0
             } else {
-                rerank_times_ms.iter().sum::<u128>() as f64 / rerank_times_ms.len() as f64
+                delivery_times_ms.iter().sum::<u128>() as f64 / delivery_times_ms.len() as f64
             };
-            let rerank_max_ms = rerank_times_ms.into_iter().max().unwrap_or(0);
+            let delivery_max_ms = delivery_times_ms.into_iter().max().unwrap_or(0);
 
             // Try to find the ONNX file size on disk (best-effort, no panic on miss).
             let onnx_kb: Option<u64> = {
@@ -430,8 +462,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
             Ok(RankerBenchRow {
                 label: rr_id.to_string(),
                 load_ms,
-                rerank_mean_ms,
-                rerank_max_ms,
+                delivery_mean_ms,
+                delivery_max_ms,
                 r2,
                 r4,
                 mrr: mrr_val,
@@ -441,7 +473,7 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         };
 
         println!();
-        println!("=== Reranker benchmark (semantic base + per-reranker) ===");
+        println!("=== Reranker comparison (full query-to-delivery latency) ===");
         println!();
 
         // Print the semantic-only baseline row for comparison.
@@ -450,8 +482,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
             "{:<col_w$} {:>9} {:>14} {:>13} {:>10} {:>10} {:>10} {:>8} {:>10}",
             "reranker",
             "load_ms",
-            "rerank_mean_ms",
-            "rerank_max_ms",
+            "delivery_mean_ms",
+            "delivery_max_ms",
             "recall@2",
             "recall@4",
             "MRR",
@@ -481,8 +513,8 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
                 "{:<col_w$} {:>9} {:>14.1} {:>13} {:>10.3} {:>10.3} {:>10.3} {:>8.1} {:>10}",
                 row.label,
                 row.load_ms,
-                row.rerank_mean_ms,
-                row.rerank_max_ms,
+                row.delivery_mean_ms,
+                row.delivery_max_ms,
                 row.r2,
                 row.r4,
                 row.mrr,
@@ -616,6 +648,7 @@ pub(crate) fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()>
     println!("output:  {}", out_dir.display());
     println!();
 
+    let mut successful = std::collections::HashSet::new();
     let mut combo_idx = 0usize;
     for &embedder in &embedders {
         for &reranker in &rerankers {
@@ -645,6 +678,7 @@ pub(crate) fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()>
 
             let elapsed = t0.elapsed().as_secs_f64();
             if status.success() {
+                successful.insert((embedder.to_string(), reranker.to_string()));
                 println!("done ({elapsed:.1}s)");
             } else {
                 println!("FAILED (exit={status})");
@@ -693,6 +727,9 @@ pub(crate) fn brain_bench_orchestrate(args: BrainBenchArgs) -> KimetsuResult<()>
     let mut rows: Vec<ComboResult> = Vec::new();
     for &embedder in &embedders {
         for &reranker in &rerankers {
+            if !successful.contains(&(embedder.to_string(), reranker.to_string())) {
+                continue;
+            }
             let safe_emb = embedder.replace(['/', '.', ' '], "-");
             let safe_rr = reranker.replace(['/', '.', ' '], "-");
             let fname = format!("combo-{safe_emb}-{safe_rr}.json");
@@ -818,6 +855,27 @@ pub(crate) fn process_rss_mb(_pid: u32) -> Option<f64> {
 /// Remote bench: spawn kimetsu-remote, seed a temp brain, measure HTTP MCP retrieval.
 #[cfg(feature = "embeddings")]
 pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
+    for id in args
+        .embedders
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        kimetsu_brain::embeddings::canonical_embedder_id(id)?;
+    }
+    let remote_rerankers: Vec<_> = args
+        .rerankers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if remote_rerankers.len() != 1 {
+        return Err("remote bench requires one explicit --rerankers value per run".into());
+    }
+    let remote_reranker = remote_rerankers[0];
+    if args.pool != kimetsu_brain::serving::RERANK_POOL {
+        return Err("remote serving uses the canonical pool; --pool must be 6".into());
+    }
     use kimetsu_brain::eval::EvalFixture;
     use kimetsu_brain::project::{add_memory, init_project};
     use kimetsu_core::memory::{MemoryKind, MemoryScope};
@@ -894,7 +952,7 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         .collect();
 
     println!(
-        "brain bench --remote: {} embedder(s) (server reranks with --reranker default jina-tiny)",
+        "brain bench --remote: {} embedder(s) (server uses the explicit --rerankers selection)",
         embedders.len()
     );
     println!(
@@ -915,14 +973,18 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         obtained: Vec<String>,
         hit_at_2: bool,
         hit_at_4: bool,
+        recall_at_2: f64,
+        recall_at_4: f64,
         mrr: f64,
         latency_ms: u128,
+        final_bound: Option<u32>,
         error: Option<String>,
     }
 
     #[derive(serde::Serialize)]
     struct RemoteComboResult {
         embedder: String,
+        reranker: String,
         seed_ms: u128,
         rss_after_warm_mb: Option<f64>,
         peak_rss_mb: Option<f64>,
@@ -931,7 +993,7 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         concurrent: RemoteConcurrentStats,
     }
 
-    #[derive(serde::Serialize)]
+    #[derive(Clone, serde::Serialize)]
     struct RemoteComboSummary {
         recall_at_2: f64,
         recall_at_4: f64,
@@ -940,6 +1002,15 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         p95_latency_ms: f64,
         noise_capsules: f64,
         error_cases: usize,
+        positive_count: usize,
+        negative_count: usize,
+        negative_accuracy: Option<f64>,
+        false_injection_rate: Option<f64>,
+        mean_final_bound: Option<f64>,
+        cost_measurement_count: usize,
+        cost_unit: &'static str,
+        hit_at_2: Option<f64>,
+        hit_at_4: Option<f64>,
     }
 
     #[derive(serde::Serialize)]
@@ -1024,6 +1095,8 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
             .arg(&data_dir)
             .arg("--token")
             .arg(token)
+            .arg("--reranker")
+            .arg(remote_reranker)
             .arg("--rate-limit")
             .arg("0")
             .env("KIMETSU_BRAIN_EMBEDDER", embedder_id)
@@ -1082,100 +1155,138 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         let auth_header = format!("Bearer {token}");
 
         // Helper: call kimetsu_brain_context over HTTP, return (obtained_keys, latency_ms, error).
-        let call_context = |query: &str, id: u64| -> (Vec<String>, u128, Option<String>) {
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": {
-                    "name": "kimetsu_brain_context",
-                    "arguments": {
-                        "query": query,
-                        "budget_tokens": 6000,
-                        "max_capsules": 4
+        let call_context =
+            |query: &str, id: u64| -> (Vec<String>, u128, Option<String>, Option<u32>) {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "kimetsu_brain_context",
+                        "arguments": {
+                            "query": query,
+                            "budget_tokens": 6000,
+                            "max_capsules": args.cap,
+                            "include_ambient":false
+                        }
                     }
+                });
+                let t0 = Instant::now();
+                let resp = client
+                    .post(&mcp_url)
+                    .header("Authorization", &auth_header)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send();
+                let latency_ms = t0.elapsed().as_millis();
+
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(e) => return (vec![], latency_ms, Some(format!("HTTP error: {e}")), None),
+                };
+
+                let json: serde_json::Value = match resp.json() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            vec![],
+                            latency_ms,
+                            Some(format!("JSON parse error: {e}")),
+                            None,
+                        );
+                    }
+                };
+
+                // Check for JSON-RPC error
+                if let Some(err_obj) = json.get("error") {
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error");
+                    return (vec![], latency_ms, Some(format!("RPC error: {msg}")), None);
                 }
-            });
-            let t0 = Instant::now();
-            let resp = client
-                .post(&mcp_url)
-                .header("Authorization", &auth_header)
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send();
-            let latency_ms = t0.elapsed().as_millis();
 
-            let resp = match resp {
-                Ok(r) => r,
-                Err(e) => return (vec![], latency_ms, Some(format!("HTTP error: {e}"))),
+                // Parse the result: result.content[0].text → JSON string → capsules
+                let text = json
+                    .get("result")
+                    .and_then(|r| r.get("content"))
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+
+                if text.is_empty() {
+                    return (
+                        vec![],
+                        latency_ms,
+                        Some("empty text in result".to_string()),
+                        None,
+                    );
+                }
+
+                let inner: serde_json::Value = match serde_json::from_str(text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            vec![],
+                            latency_ms,
+                            Some(format!("inner JSON parse: {e}")),
+                            None,
+                        );
+                    }
+                };
+
+                let final_bound = Some(kimetsu_brain::context::delivery::serialized_output_tokens(
+                    &inner,
+                ));
+                if inner.get("ok").and_then(|v| v.as_bool()) == Some(false)
+                    || inner.get("error").is_some()
+                {
+                    return (
+                        vec![],
+                        latency_ms,
+                        Some("tool delivery error".into()),
+                        final_bound,
+                    );
+                }
+                // skipped case → no capsules (intentional, not an error)
+                if inner
+                    .get("skipped")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return (vec![], latency_ms, None, final_bound);
+                }
+
+                let capsules = inner
+                    .get("capsules")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let keys: Vec<String> = capsules
+                    .iter()
+                    .filter_map(|cap| {
+                        cap.get("expansion_handle")
+                            .and_then(|h| h.as_str())
+                            .map(|handle| {
+                                handle
+                                    .strip_prefix("memory:")
+                                    .and_then(|id| id_to_key.get(id))
+                                    .cloned()
+                                    .unwrap_or_else(|| handle.to_string())
+                            })
+                    })
+                    .collect();
+
+                (keys, latency_ms, None, final_bound)
             };
-
-            let json: serde_json::Value = match resp.json() {
-                Ok(v) => v,
-                Err(e) => return (vec![], latency_ms, Some(format!("JSON parse error: {e}"))),
-            };
-
-            // Check for JSON-RPC error
-            if let Some(err_obj) = json.get("error") {
-                let msg = err_obj
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                return (vec![], latency_ms, Some(format!("RPC error: {msg}")));
-            }
-
-            // Parse the result: result.content[0].text → JSON string → capsules
-            let text = json
-                .get("result")
-                .and_then(|r| r.get("content"))
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
-
-            if text.is_empty() {
-                return (vec![], latency_ms, Some("empty text in result".to_string()));
-            }
-
-            let inner: serde_json::Value = match serde_json::from_str(text) {
-                Ok(v) => v,
-                Err(e) => return (vec![], latency_ms, Some(format!("inner JSON parse: {e}"))),
-            };
-
-            // skipped case → no capsules (intentional, not an error)
-            if inner
-                .get("skipped")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                return (vec![], latency_ms, None);
-            }
-
-            let capsules = inner
-                .get("capsules")
-                .and_then(|c| c.as_array())
-                .cloned()
-                .unwrap_or_default();
-
-            let keys: Vec<String> = capsules
-                .iter()
-                .filter_map(|cap| {
-                    cap.get("expansion_handle")
-                        .and_then(|h| h.as_str())
-                        .and_then(|h| h.strip_prefix("memory:"))
-                        .and_then(|id| id_to_key.get(id))
-                        .cloned()
-                })
-                .collect();
-
-            (keys, latency_ms, None)
-        };
 
         let mut case_results: Vec<RemoteCaseResult> = Vec::new();
         let mut seq_latencies: Vec<u128> = Vec::new();
 
         for (idx, case) in fixture.cases.iter().enumerate() {
-            let (obtained, latency_ms, error) = call_context(&case.query, idx as u64);
+            let (obtained, latency_ms, error, final_bound) = call_context(&case.query, idx as u64);
             seq_latencies.push(latency_ms);
 
             let hit_at_2 = if case.relevant.is_empty() {
@@ -1193,11 +1304,14 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
             case_results.push(RemoteCaseResult {
                 query: case.query.clone(),
                 expected: case.relevant.clone(),
+                recall_at_2: kimetsu_brain::eval::recall_at_k(&obtained, &case.relevant, 2),
+                recall_at_4: kimetsu_brain::eval::recall_at_k(&obtained, &case.relevant, 4),
                 obtained,
                 hit_at_2,
                 hit_at_4,
                 mrr: mrr_val,
                 latency_ms,
+                final_bound,
                 error,
             });
         }
@@ -1242,6 +1356,7 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
                 continue;
             }
 
+            let cap = args.cap;
             let handle = std::thread::spawn(move || {
                 for case_idx in start..end {
                     let (i, ref query) = cases[case_idx];
@@ -1254,7 +1369,8 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
                             "arguments": {
                                 "query": query,
                                 "budget_tokens": 6000,
-                                "max_capsules": 4
+                                "max_capsules": cap,
+                                "include_ambient":false
                             }
                         }
                     });
@@ -1324,20 +1440,12 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         let recall_at_2 = if signal_cases.is_empty() {
             0.0
         } else {
-            signal_cases
-                .iter()
-                .map(|(_, r)| if r.hit_at_2 { 1.0f64 } else { 0.0 })
-                .sum::<f64>()
-                / signal_cases.len() as f64
+            signal_cases.iter().map(|(_, r)| r.recall_at_2).sum::<f64>() / signal_cases.len() as f64
         };
         let recall_at_4 = if signal_cases.is_empty() {
             0.0
         } else {
-            signal_cases
-                .iter()
-                .map(|(_, r)| if r.hit_at_4 { 1.0f64 } else { 0.0 })
-                .sum::<f64>()
-                / signal_cases.len() as f64
+            signal_cases.iter().map(|(_, r)| r.recall_at_4).sum::<f64>() / signal_cases.len() as f64
         };
         let mrr_avg = if signal_cases.is_empty() {
             0.0
@@ -1369,6 +1477,62 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         let error_cases = case_results.iter().filter(|r| r.error.is_some()).count();
 
         let summary = RemoteComboSummary {
+            positive_count: signal_cases.len(),
+            negative_count: noise_cases.len(),
+            negative_accuracy: if noise_cases.is_empty() {
+                None
+            } else {
+                Some(
+                    noise_cases
+                        .iter()
+                        .filter(|(_, r)| r.error.is_none() && r.obtained.is_empty())
+                        .count() as f64
+                        / noise_cases.len() as f64,
+                )
+            },
+            false_injection_rate: if noise_cases.is_empty() {
+                None
+            } else {
+                Some(
+                    noise_cases
+                        .iter()
+                        .filter(|(_, r)| !r.obtained.is_empty())
+                        .count() as f64
+                        / noise_cases.len() as f64,
+                )
+            },
+            cost_measurement_count: case_results
+                .iter()
+                .filter(|r| r.final_bound.is_some())
+                .count(),
+            mean_final_bound: {
+                let costs: Vec<_> = case_results
+                    .iter()
+                    .filter_map(|r| r.final_bound.map(f64::from))
+                    .collect();
+                if costs.is_empty() {
+                    None
+                } else {
+                    Some(kimetsu_brain::eval::mean(&costs))
+                }
+            },
+            cost_unit: "serialized_utf8_byte_bound",
+            hit_at_2: if signal_cases.is_empty() {
+                None
+            } else {
+                Some(
+                    signal_cases.iter().filter(|(_, r)| r.hit_at_2).count() as f64
+                        / signal_cases.len() as f64,
+                )
+            },
+            hit_at_4: if signal_cases.is_empty() {
+                None
+            } else {
+                Some(
+                    signal_cases.iter().filter(|(_, r)| r.hit_at_4).count() as f64
+                        / signal_cases.len() as f64,
+                )
+            },
             recall_at_2,
             recall_at_4,
             mrr: mrr_avg,
@@ -1397,19 +1561,12 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
         // ── 11. Write per-embedder JSON ───────────────────────────────────────
         let combo = RemoteComboResult {
             embedder: embedder_id.to_string(),
+            reranker: remote_reranker.to_string(),
             seed_ms,
             rss_after_warm_mb: rss_after_warm,
             peak_rss_mb: peak_rss,
             cases: case_results,
-            summary: RemoteComboSummary {
-                recall_at_2,
-                recall_at_4,
-                mrr: mrr_avg,
-                mean_latency_ms,
-                p95_latency_ms,
-                noise_capsules,
-                error_cases,
-            },
+            summary: summary.clone(),
             concurrent: RemoteConcurrentStats {
                 mean_ms: conc_mean_ms,
                 p95_ms: conc_p95_ms,
@@ -1433,12 +1590,7 @@ pub(crate) fn brain_bench_remote(args: BrainBenchArgs) -> KimetsuResult<()> {
     }
 
     // ── 12. Write summary table ───────────────────────────────────────────────
-    let caveat = "\
-> **NOTE — remote production floors**: the remote path applies `min_lexical_coverage = 0.5` and \
-the AUTO semantic floor (0.35 on bge-family, 0.0 elsewhere — cosine scales are model-dependent). \
-Quality numbers are **NOT** directly comparable to the local bench's floors-off results — noise \
-cases dropped by the floors are intentional precision wins, not recall failures. The remote server \
-reranks with `--reranker` (default `jina-reranker-v1-tiny-en`, operator-level, `off` disables).\n";
+    let caveat = "> Canonical brain-context delivery: production floors, rerank score floor, capsule admission and serialized UTF-8 bound. Compare only matching model, budget, pool, cap and configuration. Missing positive/negative denominators are reported in JSON.\n";
 
     let header = format!(
         "| {:<25} | {:>8} | {:>8} | {:>7} | {:>9} | {:>8} | {:>12} | {:>10} | {:>14} | {:>11} | {:>11} |",
@@ -1529,6 +1681,7 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         .unwrap_or("off")
         .to_string();
 
+    let effective_embedder = kimetsu_brain::embeddings::canonical_embedder_id(&embedder_id)?;
     // ── 1. Load fixture ───────────────────────────────────────────────────────
     let fixture_text = std::fs::read_to_string(&args.dataset)
         .map_err(|e| format!("cannot read dataset {}: {e}", args.dataset.display()))?;
@@ -1565,19 +1718,17 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
     unsafe {
         std::env::set_var("KIMETSU_BRAIN_EMBEDDER", &embedder_id);
     }
-    let embedder = open_embedder_for_model(&embedder_id);
+    let embedder = open_embedder_for_model(effective_embedder);
     let embedder_load_ms = t_emb.elapsed().as_millis();
     let rss_after_emb = rss_mb();
 
     // ── 3. Load reranker ──────────────────────────────────────────────────────
     let rss_before_rr = rss_mb();
     let t_rr = Instant::now();
-    let reranker_box: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = if reranker_id == "off"
-    {
-        None
-    } else {
-        open_reranker_for_model(&reranker_id)
-    };
+    let reranker_box = kimetsu_brain::embeddings::open_reranker_checked(&reranker_id)?;
+    if embedder.is_noop() && effective_embedder != "noop" {
+        return Err("requested embedder unavailable; no semantic measurement".into());
+    }
     let reranker_load_ms = t_rr.elapsed().as_millis();
     let rss_after_rr = rss_mb();
 
@@ -1692,8 +1843,11 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         obtained: Vec<ObtainedItem>,
         hit_at_2: bool,
         hit_at_4: bool,
+        recall_at_2: f64,
+        recall_at_4: f64,
         mrr: f64,
         latency_ms: u128,
+        final_bound: u32,
         /// v1.5 (Story 2.1): mean rendered tokens across the returned capsules
         /// after compress_for_render(3) vs raw token estimates.
         raw_tokens_mean: f64,
@@ -1709,26 +1863,24 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
 
     for case in &fixture.cases {
         let t0 = Instant::now();
+        let policy = kimetsu_brain::serving::ServingPolicy {
+            pool: args.pool,
+            cap: args.cap,
+            ..kimetsu_brain::serving::ServingPolicy::from_config(session.config())
+        };
         let request = ContextRequest {
-            stage: "localization".to_string(),
+            stage: "localization".into(),
             query: case.query.clone(),
-            budget_tokens: 6000,
-            max_capsules: args.pool,
-            min_semantic_score: 0.0,
-            min_lexical_coverage: 0.0,
+            min_score: 0.15,
             ..Default::default()
         };
-        let mut bundle = session
-            .retrieve_context_with_injected_embedder(request, embedder.as_ref())
-            .map_err(|e| format!("retrieve: {e}"))?;
-
-        // Apply reranker or truncate.
-        if let Some(ref rr) = reranker_box {
-            bundle.capsules =
-                rerank_capsules(&case.query, bundle.capsules, rr.as_ref(), 0.0, args.cap);
-        } else {
-            bundle.capsules.truncate(args.cap);
-        }
+        let bundle = policy.retrieve(
+            &session,
+            request,
+            embedder.as_ref(),
+            reranker_box.as_deref(),
+            kimetsu_brain::serving::EVAL_EXPOSURE_ID,
+        )?;
 
         let latency_ms = t0.elapsed().as_millis();
         latencies_ms.push(latency_ms);
@@ -1806,8 +1958,11 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
             obtained,
             hit_at_2,
             hit_at_4,
+            recall_at_2: kimetsu_brain::eval::recall_at_k(&obtained_keys, &case.relevant, 2),
+            recall_at_4: kimetsu_brain::eval::recall_at_k(&obtained_keys, &case.relevant, 4),
             mrr: mrr_val,
             latency_ms,
+            final_bound: bundle.payload["used_tokens"].as_u64().unwrap_or(0) as u32,
             raw_tokens_mean,
             rendered_tokens_mean,
             stale_hit,
@@ -1832,20 +1987,12 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
     let recall_at_2 = if signal_cases.is_empty() {
         0.0
     } else {
-        signal_cases
-            .iter()
-            .map(|(_, r)| if r.hit_at_2 { 1.0f64 } else { 0.0 })
-            .sum::<f64>()
-            / signal_cases.len() as f64
+        signal_cases.iter().map(|(_, r)| r.recall_at_2).sum::<f64>() / signal_cases.len() as f64
     };
     let recall_at_4 = if signal_cases.is_empty() {
         0.0
     } else {
-        signal_cases
-            .iter()
-            .map(|(_, r)| if r.hit_at_4 { 1.0f64 } else { 0.0 })
-            .sum::<f64>()
-            / signal_cases.len() as f64
+        signal_cases.iter().map(|(_, r)| r.recall_at_4).sum::<f64>() / signal_cases.len() as f64
     };
     let mrr_avg = if signal_cases.is_empty() {
         0.0
@@ -1921,6 +2068,8 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
     // ── 7. Write combo JSON ───────────────────────────────────────────────────
     let combo_json = serde_json::json!({
         "embedder": embedder_id,
+        "embedder_actual":embedder.model_id(),"embedding_dimension":embedder.dim(),
+        "reranker_actual":reranker_box.as_ref().map(|r|r.model_id()).unwrap_or("off"),
         "reranker": reranker_id,
         "embedder_load_ms": embedder_load_ms,
         "reranker_load_ms": reranker_load_ms,
@@ -1931,7 +2080,18 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
         "peak_rss_mb": peak,
         "seed_ms": seed_ms,
         "cases": case_results,
+        "measurement_policy":"canonical_brain_context_v1",
+        "ambient":false,"warm_start":false,
+        "cost_unit":"serialized_utf8_byte_bound",
+        "budget":6000,"pool":args.pool,"cap":args.cap,"rerank_floor":session.config().broker.rerank_min_score,
         "summary": {
+            "positive_count":signal_cases.len(),"negative_count":noise_cases.len(),
+            "negative_accuracy":if noise_cases.is_empty() {None}else{Some(noise_cases.iter().filter(|(_,r)|r.obtained.is_empty()).count() as f64/noise_cases.len() as f64)},
+            "false_injection_rate":if noise_cases.is_empty() {None}else{Some(noise_cases.iter().filter(|(_,r)|!r.obtained.is_empty()).count() as f64/noise_cases.len() as f64)},
+            "mean_final_bound":kimetsu_brain::eval::mean(&case_results.iter().map(|r|f64::from(r.final_bound)).collect::<Vec<_>>()),
+            "hit_at_2":if signal_cases.is_empty() {None}else{Some(signal_cases.iter().filter(|(_,r)|r.hit_at_2).count() as f64/signal_cases.len() as f64)},
+            "hit_at_4":if signal_cases.is_empty() {None}else{Some(signal_cases.iter().filter(|(_,r)|r.hit_at_4).count() as f64/signal_cases.len() as f64)},
+            "legacy_capsule_token_estimates":"whitespace heuristics, not delivery cost",
             "recall_at_2": recall_at_2,
             "recall_at_4": recall_at_4,
             "mrr": mrr_avg,

@@ -1,0 +1,3 @@
+# Preserve the exact bytes of reproducible audit artifacts.
+docs/audits/2026-09-07-retrieval/** -text whitespace=cr-at-eol
+docs/audits/2026-09-07-answerability/** -text whitespace=cr-at-eol,-blank-at-eof

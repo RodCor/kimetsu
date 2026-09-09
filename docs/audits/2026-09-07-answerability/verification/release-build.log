@@ -1,0 +1,11 @@
+   Compiling kimetsu-core v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-core)
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+   Compiling kimetsu-agent v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-agent)
+   Compiling kimetsu-chat v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-chat)
+   Compiling kimetsu-cli v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-cli)
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\release\deps\kimetsu.lib y objeto E:\Kimetsu\target\release\deps\kimetsu.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-cli` (bin "kimetsu") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 54s

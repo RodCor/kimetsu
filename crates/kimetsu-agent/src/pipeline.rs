@@ -253,6 +253,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let empty_plan = ContextBundle {
             stage: CodingStage::PatchPlan.as_str().to_string(),
@@ -266,6 +267,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         (empty_loc, empty_plan, "Broker disabled (brain_off).")
     } else {
@@ -332,30 +334,13 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
             "Context capsules retrieved.",
         )
     };
-    // MP-4a: emit a `context.injected` event per stage so the projector can
-    // correlate accepted memories with terminal outcomes. The projector reads
-    // every context.injected for a run when applying run.finished/failed and
-    // updates memories.usefulness_score / use_count accordingly.
-    emit_context_injected(
-        &mut writer,
-        &mut events,
-        run_id,
-        CodingStage::Localization,
-        &localization_context,
-    )?;
+    // Retrieval telemetry is not exposure. Emit injections at model delivery.
     emit_context_served(
         &mut writer,
         &mut events,
         run_id,
         CodingStage::Localization,
         &localization_context,
-    )?;
-    emit_context_injected(
-        &mut writer,
-        &mut events,
-        run_id,
-        CodingStage::PatchPlan,
-        &patch_context,
     )?;
     emit_context_served(
         &mut writer,
@@ -713,6 +698,34 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 }
             };
 
+            let mut delivered = patch_context.clone();
+            delivered
+                .capsules
+                .retain(|c| !recall_ledger.is_injected(&c.id));
+            if let Some(pitfalls) = proactive_pitfall_bundle.as_ref() {
+                delivered.capsules.extend(
+                    pitfalls
+                        .capsules
+                        .iter()
+                        .filter(|c| !recall_ledger.is_surfaced(&c.id))
+                        .cloned(),
+                );
+            }
+            let initial_messages = build_implementation_messages(
+                &options.task,
+                &patch_plan,
+                &patch_context,
+                proactive_pitfall_bundle.as_ref(),
+                last_failure_context.as_deref(),
+                &mut recall_ledger,
+            )?;
+            emit_context_injected(
+                &mut writer,
+                &mut events,
+                run_id,
+                CodingStage::Implementation,
+                &delivered,
+            )?;
             let mut runtime = ToolRuntime::new(&paths.repo_root, run_id)?
                 .with_stage(CodingStage::Implementation.as_str())
                 .with_config(tool_runtime_config(&config))
@@ -728,14 +741,7 @@ pub fn run_coding(options: CodingRunOptions) -> KimetsuResult<CodingRunResult> {
                 temperature: config.model.temperature,
             };
             let mut loop_runner = AgentLoop::new(provider, runtime, loop_config);
-            let loop_result = loop_runner.run(build_implementation_messages(
-                &options.task,
-                &patch_plan,
-                &patch_context,
-                proactive_pitfall_bundle.as_ref(),
-                last_failure_context.as_deref(),
-                &mut recall_ledger,
-            )?);
+            let loop_result = loop_runner.run(initial_messages);
             let runtime = loop_runner.into_runtime();
             let Some((restored_writer, _)) = runtime.into_trace() else {
                 return Err("implementation runtime lost trace writer".into());
@@ -1201,6 +1207,8 @@ fn try_model_patch_plan(
         return Ok(None);
     };
 
+    let mut delivered = patch_context.clone();
+    delivered.capsules.retain(|c| !ledger.is_injected(&c.id));
     let request = build_patch_plan_request(config, task, files_to_read, patch_context, ledger);
     record_model_requested(
         writer,
@@ -1211,6 +1219,7 @@ fn try_model_patch_plan(
         &provider.model_name,
         &request,
     )?;
+    emit_context_injected(writer, events, run_id, CodingStage::PatchPlan, &delivered)?;
     let response = provider.complete(request)?;
     record_model_responded(
         writer,
@@ -1912,9 +1921,11 @@ fn emit_context_injected(
                 "stage": stage.as_str(),
                 "capsule_handles": capsule_handles,
                 "memory_ids": memory_ids,
+                "memory_revisions": context::memory_revision_bindings(&bundle.capsules),
                 "prior_run_ids": prior_run_ids,
                 "file_paths": file_paths,
-                "used_tokens": bundle.used_tokens,
+                "used_tokens": bundle.capsules.iter().map(|c|c.token_estimate).sum::<u32>(),
+                "cost_unit": "legacy_token_estimate",
                 "capsule_count": bundle.capsules.len(),
             }),
         ),
@@ -2781,6 +2792,10 @@ mod tests {
                 .any(|event| event.kind == "patch.plan.created")
         );
         assert!(events.iter().any(|event| event.kind == "run.finished"));
+        assert!(
+            !events.iter().any(|event| event.kind == "context.injected"),
+            "retrieval without model delivery cannot earn exposure credit"
+        );
         // Dry-run skips Verification.
         assert!(!events.iter().any(|event| event.kind == "stage.entered"
             && event.payload.get("stage").and_then(|s| s.as_str()) == Some("verification")));
@@ -3152,6 +3167,10 @@ mod tests {
             score: 0.75,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            facts: vec![],
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 
@@ -3168,6 +3187,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         }
     }
 
@@ -3537,6 +3557,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         let mut ledger = RunRecallLedger::new();
         assert!(
@@ -3557,6 +3578,7 @@ mod tests {
             evidence_coverage: 1.0,
             uncovered_terms: Vec::new(),
             chronological: false,
+            known_fact_conflicts: vec![],
         };
         assert!(
             render_known_pitfalls(&empty_bundle, &mut ledger).is_none(),

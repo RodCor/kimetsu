@@ -220,7 +220,7 @@ fn run_backend(
 
     for (query, relevant) in cases {
         let t0 = Instant::now();
-        let candidates = match backend.memory_candidates(conn, query, None, 90.0) {
+        let candidates = match backend.memory_candidates(conn, query, None, 90.0, false) {
             Ok(c) => c,
             Err(_) => {
                 continue;

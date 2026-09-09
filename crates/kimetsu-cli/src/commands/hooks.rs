@@ -43,6 +43,9 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
+    let episode_identity = hook_payload
+        .as_ref()
+        .and_then(kimetsu_brain::episode::requested_identity);
 
     // Extract the prompt text from the hook payload
     let prompt = match &hook_payload {
@@ -62,7 +65,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .ok()
         .map(|p| {
             let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
-            proactive_state::session_path(&cache_dir, session_id.as_deref())
+            proactive_state::session_path(&cache_dir, episode_identity)
         });
     let mut state = state_path
         .as_deref()
@@ -75,7 +78,7 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
     // gets the identical block from `brain session-start-hook`.
     let warm_start_block = if args.warm_on_first_prompt && state.warm_started_unix == 0 {
-        warm_start_context(&workspace)
+        kimetsu_brain::digest::warm_start_block_scoped(&workspace, episode_identity.unwrap_or(""))
     } else {
         None
     };
@@ -86,7 +89,14 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
     }
 
+    let explicit_fact_guard = kimetsu_core::paths::ProjectPaths::discover(&workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.broker.explicit_fact_guard)
+        .unwrap_or(false);
+
     let request = ContextRequest {
+        include_fact_evidence: explicit_fact_guard,
         stage: "localization".to_string(),
         query: prompt,
         budget_tokens: 2000,
@@ -95,15 +105,63 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         ..Default::default()
     };
 
+    let defer_fact_budget =
+        explicit_fact_guard && kimetsu_brain::fact_query::parse(&request.query).is_some();
+
     // Retrieval: try the warm daemon first (semantic); fall back to
     // floored-FTS on any miss (daemon disabled / unreachable / cold).
-    let (bundle, retrieval_path) = match try_daemon_retrieve(&workspace, &request) {
+    let (mut bundle, retrieval_path) = match try_daemon_retrieve(&workspace, &request) {
         Some(b) => (b, "daemon"),
-        None => match project::retrieve_context_lexical_readonly(&workspace, request.clone()) {
+        None => match project::retrieve_context_lexical_readonly(&workspace, {
+            let mut fallback_request = request.clone();
+            fallback_request.defer_fact_budget = defer_fact_budget;
+            if explicit_fact_guard {
+                fallback_request.max_capsules = fallback_request
+                    .max_capsules
+                    .max(kimetsu_brain::serving::RERANK_POOL);
+            }
+            fallback_request
+        }) {
             Ok(b) => (b, "fts_fallback"),
             Err(_) => return Ok(()), // Brain not initialized — silent fail
         },
     };
+
+    if explicit_fact_guard {
+        kimetsu_brain::answerability::filter_bundle(&request.query, &mut bundle);
+        if let Some(assessment) =
+            kimetsu_brain::fact_query::evaluate(&request.query, &bundle.capsules)
+        {
+            bundle.known_fact_conflicts.extend(assessment.conflicting);
+            bundle.known_fact_conflicts.sort();
+            bundle.known_fact_conflicts.dedup();
+        }
+        if retrieval_path == "fts_fallback" && defer_fact_budget {
+            // Observe eligible contradictions first, then restore the hook's
+            // original half-budget and cap before any text is rendered.
+            let capsule_budget = request.budget_tokens / 2;
+            let mut used = 0u32;
+            for capsule in std::mem::take(&mut bundle.capsules) {
+                if (args.max_capsules == 0 || bundle.capsules.len() < args.max_capsules)
+                    && used.saturating_add(capsule.token_estimate) <= capsule_budget
+                {
+                    used += capsule.token_estimate;
+                    bundle.capsules.push(capsule);
+                } else {
+                    bundle.excluded.push(capsule);
+                }
+            }
+        } else if args.max_capsules > 0 {
+            bundle.capsules.truncate(args.max_capsules);
+        }
+        bundle.skipped |= bundle.capsules.is_empty();
+        bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
+        bundle.top_score = bundle
+            .capsules
+            .iter()
+            .map(|c| c.score)
+            .fold(0.0_f32, f32::max);
+    }
 
     // C7: emit a context.served event BEFORE the early-return so misses are
     // logged. Best-effort (let _ =) — telemetry must never break the hook.
@@ -265,19 +323,37 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         additional_context.push('\n');
         additional_context.push_str(kimetsu_brain::ordering::CHRONOLOGICAL_NOTE);
     }
+    let known_fact_conflicts = if explicit_fact_guard {
+        let mut known = bundle.known_fact_conflicts.clone();
+        known.extend(
+            kimetsu_brain::fact_query::evaluate(&request.query, &bundle.capsules)
+                .map(|a| a.conflicting)
+                .unwrap_or_default(),
+        );
+        known.sort();
+        known.dedup();
+        known
+    } else {
+        Vec::new()
+    };
+    let mut rendered_fact_capsules = Vec::new();
     for (idx, capsule) in capsules_to_render.iter().enumerate() {
         // v1.5 (Story 2.1): render-time compression — runs AFTER retrieval and
         // reranking, purely on the injected text. Full summary untouched in DB.
         let rendered: String = if compress_capsules {
-            kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+            if explicit_fact_guard {
+                kimetsu_brain::fact_query::compress_capsule(&request.query, capsule, 3)
+            } else {
+                kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+            }
         } else {
             capsule.summary.clone()
         };
         // Strip the "scope:kind - " prefix from the summary for readability
         let text = rendered
-            .split(" - ")
-            .nth(1)
-            .map(str::to_string)
+            .split_once(" - ")
+            .filter(|(prefix, _)| prefix.contains(':') && !prefix.contains(' '))
+            .map(|(_, text)| text.to_owned())
             .unwrap_or(rendered);
         additional_context.push('\n');
         // F3 Pass B (3.3): prepend the answer-grade marker to the first capsule
@@ -285,9 +361,24 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         // guard. Only the first rendered capsule (idx == 0) can be answer-grade
         // (it's the top-ranked capsule); subsequent capsules are never marked.
         if idx == 0 && answer_grade_handle.is_some() {
-            additional_context.push_str("Verified answer from project memory: ");
+            additional_context.push_str("Relevant project memory (not independently verified): ");
         }
         additional_context.push_str(&text);
+        if explicit_fact_guard {
+            let mut visible = (**capsule).clone();
+            visible.summary = text;
+            rendered_fact_capsules.push(visible);
+        }
+    }
+    if explicit_fact_guard {
+        if let Some(notice) = kimetsu_brain::fact_query::notice_with_conflicts(
+            &request.query,
+            &rendered_fact_capsules,
+            &known_fact_conflicts,
+        ) {
+            additional_context.push('\n');
+            additional_context.push_str(&notice);
+        }
     }
 
     // v2.6: when the bundle collectively covers only part of the question, say
@@ -301,6 +392,15 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     }
 
     print_user_prompt_submit_context(&additional_context)?;
+
+    let delivered: Vec<_> = capsules_to_render.iter().map(|c| (*c).clone()).collect();
+    record_hook_delivery(
+        &workspace,
+        &delivered,
+        &additional_context,
+        session_id.as_deref(),
+        "user_prompt",
+    );
 
     // v1.5 (Story 2.3): persist newly surfaced handles so subsequent prompts
     // in the same session skip them. Best-effort — state write must never
@@ -500,11 +600,7 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let paths = kimetsu_core::paths::ProjectPaths::discover(&workspace).ok();
-    let auto_harvest = paths
-        .as_ref()
-        .and_then(|p| project::load_config(p).ok())
-        .map(|c| c.learning.auto_harvest)
-        .unwrap_or(true);
+    let config = paths.as_ref().and_then(|p| project::load_config(p).ok());
     let distiller_enabled = distiller::resolve_pipeline_distiller(&workspace).is_some();
     let state_path = paths.as_ref().map(|p| {
         let cache_dir = kimetsu_core::paths::user_cache_dir_for(&p.repo_root);
@@ -530,7 +626,9 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    if should_emit_stop_harvest_cue(auto_harvest, distiller_enabled)
+    if config
+        .as_ref()
+        .is_some_and(|c| should_emit_stop_harvest_cue(c, distiller_enabled))
         && !stop_active
         && let Some(paths) = paths.as_ref()
     {
@@ -545,6 +643,14 @@ pub(crate) fn brain_stop_hook(args: StopHookArgs) -> KimetsuResult<()> {
             proactive_state::save(&state_path, &state);
             return Ok(());
         }
+    }
+
+    // Strict Free (including config-load failure) does not cue host learning.
+    if !config
+        .as_ref()
+        .is_some_and(|c| c.allows_automatic_harvest())
+    {
+        return Ok(());
     }
 
     emit_stop_hook_json(stop_no_lessons_json_with_savings_and_tune(
@@ -706,8 +812,11 @@ pub(crate) fn stop_lessons_recorded_json_with_savings_and_tune(
 
 /// The end-of-session harvest cue fires only when auto-harvest is on AND
 /// the credentialed distiller is not handling end-of-session itself.
-pub(crate) fn should_emit_stop_harvest_cue(auto_harvest: bool, distiller_enabled: bool) -> bool {
-    auto_harvest && !distiller_enabled
+pub(crate) fn should_emit_stop_harvest_cue(
+    config: &kimetsu_core::config::ProjectConfig,
+    distiller_enabled: bool,
+) -> bool {
+    config.allows_automatic_harvest() && !distiller_enabled
 }
 
 /// Count `kimetsu_brain_record` tool-use blocks across transcript
@@ -878,13 +987,13 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         Ok(config) => {
             kimetsu_brain::embeddings::apply_embedder_selection(Some(&config.embedder.model));
             (
-                config.learning.auto_harvest,
+                config.allows_automatic_harvest(),
                 config.broker.compress_capsules,
                 config.broker.proactive_prefetch,
             )
         }
         // Fallback: safe defaults — proactive_prefetch OFF (zero behaviour change)
-        Err(_) => (true, true, false),
+        Err(_) => (false, true, false),
     };
 
     let mut input = String::new();
@@ -1147,10 +1256,44 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
 
     print_tool_use_context(event, &additional_context)?;
 
+    record_hook_delivery(
+        &workspace,
+        std::slice::from_ref(capsule),
+        &additional_context,
+        hook.session_id.as_deref(),
+        "proactive",
+    );
+
     state.mark_surfaced(&capsule.expansion_handle);
     state.record_injection(now);
     proactive_state::save(&state_path, &state);
     Ok(())
+}
+
+fn record_hook_delivery(
+    workspace: &std::path::Path,
+    capsules: &[kimetsu_brain::context::ContextCapsule],
+    text: &str,
+    session_id: Option<&str>,
+    surface: &str,
+) {
+    if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() == Ok("0") {
+        return;
+    }
+    let mut payload = kimetsu_brain::context::delivery::injected_payload(
+        capsules,
+        u32::try_from(text.len()).unwrap_or(u32::MAX),
+    );
+    payload["session_id"] = serde_json::json!(session_id);
+    payload["surface"] = serde_json::json!(surface);
+    payload["cost_unit"] = serde_json::json!("rendered_utf8_bytes");
+    let mut exposure = kimetsu_core::event::Event::new(
+        kimetsu_core::ids::RunId::new(),
+        "context.injected",
+        payload,
+    );
+    exposure.payload["exposure_id"] = serde_json::json!(exposure.event_id.to_string());
+    let _ = project::record_context_exposure(workspace, &exposure);
 }
 
 pub(crate) fn proactive_header(event: ProactiveEvent, loop_mode: bool) -> &'static str {

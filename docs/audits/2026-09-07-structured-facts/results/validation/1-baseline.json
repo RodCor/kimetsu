@@ -1,0 +1,1495 @@
+{
+  "generated_at": "2026-09-07T13:24:25.5097752Z",
+  "dataset": "E:\\tmp\\kimetsu-brain-hardening\\docs\\audits\\2026-09-07-structured-facts\\validation-frozen.json",
+  "session_configuration": {
+    "include_ambient": false,
+    "warm_start": false
+  },
+  "scenarios": [
+    {
+      "observations": [
+        {
+          "query": "What is the Lumen staging gateway port?",
+          "ranked": [
+            "stage-port",
+            "prod-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEGJK4S1X6SB7DJ2QVA8",
+              "id": "01M1Y0MGPVR4X1JVGA6FB009SN",
+              "kind": "memory",
+              "score": 0.999786913394928,
+              "summary": "project:fact - Lumen staging gateway port is 7101."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEGYV2GFB7884HENJBSW",
+              "id": "01M1Y0MGPVCSZRG5YVWRB204WM",
+              "kind": "memory",
+              "score": 0.9992988109588624,
+              "summary": "project:fact - Lumen production gateway port is 8101."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2161.8268,
+          "first_query": true,
+          "server_startup_ms": 71.7619,
+          "model_text_bytes": 623,
+          "mcp_result_bytes": 722,
+          "wire_bytes": 757,
+          "reported_used_tokens": 722,
+          "working_set_bytes": 634105856,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Lumen production gateway port?",
+          "ranked": [
+            "prod-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEGYV2GFB7884HENJBSW",
+              "id": "01M1Y0MH1T69GBTR3AG98950NW",
+              "kind": "memory",
+              "score": 0.9999414682388306,
+              "summary": "project:fact - Lumen production gateway port is 8101."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 337.3809,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 543,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 634716160,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What are the Lumen staging gateway retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEHXNXNPD1S5946679C4",
+              "id": "01M1Y0MHC966FVCR51XAG676YR",
+              "kind": "memory",
+              "score": 0.9987403750419616,
+              "summary": "project:fact - Lumen staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 337.5271,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 425,
+          "mcp_result_bytes": 506,
+          "wire_bytes": 541,
+          "reported_used_tokens": 506,
+          "working_set_bytes": 635052032,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is `cache.max_entries` for Lumen?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEKQPR684WMSD9WVSQY5",
+              "id": "01M1Y0MHQ0B6KT8CZFBRFSVSQM",
+              "kind": "memory",
+              "score": 0.9999709129333496,
+              "summary": "project:fact - Lumen cache.max_entries = 200."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 354.614,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 419,
+          "mcp_result_bytes": 500,
+          "wire_bytes": 535,
+          "reported_used_tokens": 500,
+          "working_set_bytes": 637194240,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "Which database stores local state for Lumen?",
+          "ranked": [
+            "runtime",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEKD5WDR6ZE7AMP5XVTC",
+              "id": "01M1Y0MJ26THJ5ANP1EDZ7443Y",
+              "kind": "memory",
+              "score": 0.9999797344207764,
+              "summary": "project:fact - Lumen stores its local state in SQLite using WAL mode."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEJ6M1BYAK8ZKDPT7CKY",
+              "id": "01M1Y0MJ26THRF8AC3H387NEKW",
+              "kind": "memory",
+              "score": 0.9386039972305298,
+              "summary": "project:fact - Lumen production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 342.1549,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 644,
+          "mcp_result_bytes": 743,
+          "wire_bytes": 778,
+          "reported_used_tokens": 743,
+          "working_set_bytes": 637284352,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What are the Lumen staging gateway port and password?",
+          "ranked": [
+            "no-password",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEJGWQH0AB6WS5RZJQWW",
+              "id": "01M1Y0MJCXWD9N16ADRGQ3Y513",
+              "kind": "memory",
+              "score": 0.9715816974639891,
+              "summary": "project:fact - No password is required for the Lumen production gateway."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEJ6M1BYAK8ZKDPT7CKY",
+              "id": "01M1Y0MJCYDP8NY0QCYJ2RAND4",
+              "kind": "memory",
+              "score": 0.5804274678230286,
+              "summary": "project:fact - Lumen production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 348.96139999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 647,
+          "mcp_result_bytes": 746,
+          "wire_bytes": 781,
+          "reported_used_tokens": 746,
+          "working_set_bytes": 637353984,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What are the Lumen staging gateway port and retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEHXNXNPD1S5946679C4",
+              "id": "01M1Y0MJR6HQVBVEGR679SJ3TJ",
+              "kind": "memory",
+              "score": 0.9976552724838256,
+              "summary": "project:fact - Lumen staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": 0.5,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 364.68899999999996,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 425,
+          "mcp_result_bytes": 506,
+          "wire_bytes": 541,
+          "reported_used_tokens": 506,
+          "working_set_bytes": 637411328,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Lumen staging gateway timeout?",
+          "ranked": [
+            "timeout-b",
+            "timeout-a"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEHJAX6CJJQ9VZK51JTG",
+              "id": "01M1Y0MK3EPE6M3YAA7MJJ8BNC",
+              "kind": "memory",
+              "score": 0.9999746084213256,
+              "summary": "project:fact - Lumen staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEH7N0AX26SH1A524DK0",
+              "id": "01M1Y0MK3ERD3S8200QEH4K9PP",
+              "kind": "memory",
+              "score": 0.9999712705612184,
+              "summary": "project:fact - Lumen staging gateway timeout is 30 seconds. Operators record this in the request settings."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 365.25010000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 746,
+          "mcp_result_bytes": 845,
+          "wire_bytes": 880,
+          "reported_used_tokens": 845,
+          "working_set_bytes": 637419520,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What password does the Lumen production gateway require?",
+          "ranked": [
+            "no-password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEJGWQH0AB6WS5RZJQWW",
+              "id": "01M1Y0MKF9FEXG3ZQ7Y3CQ0C0V",
+              "kind": "memory",
+              "score": 0.9999558925628662,
+              "summary": "project:fact - No password is required for the Lumen production gateway."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 372.4498,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 446,
+          "mcp_result_bytes": 527,
+          "wire_bytes": 563,
+          "reported_used_tokens": 527,
+          "working_set_bytes": 642215936,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Lumen staging database port?",
+          "ranked": [
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEJ6M1BYAK8ZKDPT7CKY",
+              "id": "01M1Y0MKT7FMJFTQEJQPXFEY9S",
+              "kind": "memory",
+              "score": 0.9998140931129456,
+              "summary": "project:fact - Lumen production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 343.56579999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 428,
+          "mcp_result_bytes": 509,
+          "wire_bytes": 545,
+          "reported_used_tokens": 509,
+          "working_set_bytes": 642269184,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Lumen production gateway timeout?",
+          "ranked": [
+            "timeout-a",
+            "timeout-b"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEH7N0AX26SH1A524DK0",
+              "id": "01M1Y0MM516QC1EWRPR39JH8W8",
+              "kind": "memory",
+              "score": 0.999944806098938,
+              "summary": "project:fact - Lumen staging gateway timeout is 30 seconds. Operators record this in the request settings."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEHJAX6CJJQ9VZK51JTG",
+              "id": "01M1Y0MM51PX9KAX76GMF1AJEN",
+              "kind": "memory",
+              "score": 0.9999274015426636,
+              "summary": "project:fact - Lumen staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 357.7755,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 745,
+          "mcp_result_bytes": 844,
+          "wire_bytes": 880,
+          "reported_used_tokens": 844,
+          "working_set_bytes": 642318336,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Unknown staging gateway port?",
+          "ranked": [
+            "foreign-port",
+            "stage-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEK45XJ7TCN3T7R9Q9KY",
+              "id": "01M1Y0MMG6A0PFM0PACHC980FD",
+              "kind": "memory",
+              "score": 0.7973032593727112,
+              "summary": "project:fact - Foreign staging gateway port is 9944."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEGJK4S1X6SB7DJ2QVA8",
+              "id": "01M1Y0MMG6V2F0T27GF8K30786",
+              "kind": "memory",
+              "score": 0.7143108248710632,
+              "summary": "project:fact - Lumen staging gateway port is 7101."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 349.24129999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 622,
+          "mcp_result_bytes": 721,
+          "wire_bytes": 757,
+          "reported_used_tokens": 721,
+          "working_set_bytes": 642322432,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Lumen test gateway port?",
+          "ranked": [
+            "stage-port",
+            "prod-port",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEGJK4S1X6SB7DJ2QVA8",
+              "id": "01M1Y0MMV3S7K3RTACF3Q6W93P",
+              "kind": "memory",
+              "score": 0.9995205402374268,
+              "summary": "project:fact - Lumen staging gateway port is 7101."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEGYV2GFB7884HENJBSW",
+              "id": "01M1Y0MMV36P79FN0C5PB5YTR8",
+              "kind": "memory",
+              "score": 0.9990516304969788,
+              "summary": "project:fact - Lumen production gateway port is 8101."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MEJ6M1BYAK8ZKDPT7CKY",
+              "id": "01M1Y0MMV390V4A7RYGPVVD00G",
+              "kind": "memory",
+              "score": 0.9248796105384828,
+              "summary": "project:fact - Lumen production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 353.62510000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 824,
+          "mcp_result_bytes": 941,
+          "wire_bytes": 977,
+          "reported_used_tokens": 941,
+          "working_set_bytes": 642404352,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What are the Lumen production gateway retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MEHXNXNPD1S5946679C4",
+              "id": "01M1Y0MN64G8N83N3HG1RTGG5M",
+              "kind": "memory",
+              "score": 0.9977250695228576,
+              "summary": "project:fact - Lumen staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 348.50989999999996,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 425,
+          "mcp_result_bytes": 506,
+          "wire_bytes": 542,
+          "reported_used_tokens": 506,
+          "working_set_bytes": 642494464,
+          "peak_working_set_bytes": 685051904
+        },
+        {
+          "query": "What is the Lumen staging worker timeout?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 386.7882,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 642502656,
+          "peak_working_set_bytes": 685051904
+        }
+      ],
+      "id": "lumen-structured-scope",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5666666666666667,
+      "skipped": false,
+      "detail": "positive-recall@4=0.83 mrr=0.89 stale-hit=n/a resolution=n/a false-injection=0.833 (n=6) positive-n=9 negative-n=6 (15 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "What is the Harbor staging gateway port?",
+          "ranked": [
+            "stage-port",
+            "prod-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ2ZA5KDDPFZ23RHB8XH",
+              "id": "01M1Y0MSFZEV4KKR75J9TC7M9B",
+              "kind": "memory",
+              "score": 0.9975167512893676,
+              "summary": "project:fact - Harbor staging gateway port is 7102."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MQ3BH95XDSR9MGVK404P",
+              "id": "01M1Y0MSFZPF9TXAND4ESWZX5M",
+              "kind": "memory",
+              "score": 0.9971925616264344,
+              "summary": "project:fact - Harbor production gateway port is 8102."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2386.2785,
+          "first_query": true,
+          "server_startup_ms": 74.53899999999999,
+          "model_text_bytes": 626,
+          "mcp_result_bytes": 725,
+          "wire_bytes": 760,
+          "reported_used_tokens": 725,
+          "working_set_bytes": 635764736,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Harbor production gateway port?",
+          "ranked": [
+            "prod-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ3BH95XDSR9MGVK404P",
+              "id": "01M1Y0MSVTPDQAD2S4G5VCEW01",
+              "kind": "memory",
+              "score": 0.9997510313987732,
+              "summary": "project:fact - Harbor production gateway port is 8102."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 349.6612,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 428,
+          "mcp_result_bytes": 509,
+          "wire_bytes": 544,
+          "reported_used_tokens": 509,
+          "working_set_bytes": 636194816,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What are the Harbor staging gateway retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ4B8Q9ZWPZDYB23MC98",
+              "id": "01M1Y0MT6CT82P2X1DPNQYP60Q",
+              "kind": "memory",
+              "score": 0.9980675578117372,
+              "summary": "project:fact - Harbor staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 344.2382,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 542,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 636461056,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is `cache.max_entries` for Harbor?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ620SFCWY0FESRF8WB8",
+              "id": "01M1Y0MTHHKEJYTGCBRGP6Z61G",
+              "kind": "memory",
+              "score": 0.9999717473983764,
+              "summary": "project:fact - Harbor cache.max_entries = 200."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 357.80109999999996,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 420,
+          "mcp_result_bytes": 501,
+          "wire_bytes": 536,
+          "reported_used_tokens": 501,
+          "working_set_bytes": 638603264,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "Which database stores local state for Harbor?",
+          "ranked": [
+            "runtime",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ5RHQW2THGRF9S0K19M",
+              "id": "01M1Y0MTWCVRC1TRRVF6BWJ8EP",
+              "kind": "memory",
+              "score": 0.9999715089797974,
+              "summary": "project:fact - Harbor stores its local state in SQLite using WAL mode."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MQ4MQC2ZF45HFNG58TGK",
+              "id": "01M1Y0MTWCQS6Q1J7TQCJ9WT3H",
+              "kind": "memory",
+              "score": 0.8901878595352173,
+              "summary": "project:fact - Harbor production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.3875,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 646,
+          "mcp_result_bytes": 745,
+          "wire_bytes": 780,
+          "reported_used_tokens": 745,
+          "working_set_bytes": 638771200,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What are the Harbor staging gateway port and password?",
+          "ranked": [
+            "no-password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ4XRVE2RFW6DY859NF6",
+              "id": "01M1Y0MV73DQETVFJ9Z6N5E34M",
+              "kind": "memory",
+              "score": 0.9481525421142578,
+              "summary": "project:fact - No password is required for the Harbor production gateway."
+            }
+          ],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 357.32779999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 447,
+          "mcp_result_bytes": 528,
+          "wire_bytes": 563,
+          "reported_used_tokens": 528,
+          "working_set_bytes": 638849024,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What are the Harbor staging gateway port and retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ4B8Q9ZWPZDYB23MC98",
+              "id": "01M1Y0MVJ5XZWF4NXXEBPSR00N",
+              "kind": "memory",
+              "score": 0.9916656613349916,
+              "summary": "project:fact - Harbor staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": 0.5,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 356.4323,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 542,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 639021056,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Harbor staging gateway timeout?",
+          "ranked": [
+            "timeout-b",
+            "timeout-a"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ3Z9TDZVZ7WQ6YXA2BX",
+              "id": "01M1Y0MVXN94HN1NWNSH1DCRBE",
+              "kind": "memory",
+              "score": 0.9999679327011108,
+              "summary": "project:fact - Harbor staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MQ3MV3S4P9XRQD4EMT0V",
+              "id": "01M1Y0MVXN14YVFSR810JW2E5P",
+              "kind": "memory",
+              "score": 0.9999622106552124,
+              "summary": "project:fact - Harbor staging gateway timeout is 30 seconds. Operators record this in the request settings."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 384.5116,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 748,
+          "mcp_result_bytes": 847,
+          "wire_bytes": 882,
+          "reported_used_tokens": 847,
+          "working_set_bytes": 639053824,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What password does the Harbor production gateway require?",
+          "ranked": [
+            "no-password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ4XRVE2RFW6DY859NF6",
+              "id": "01M1Y0MW9CMC5WQCBBAZ4MDGZ3",
+              "kind": "memory",
+              "score": 0.999948024749756,
+              "summary": "project:fact - No password is required for the Harbor production gateway."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 348.7006,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 447,
+          "mcp_result_bytes": 528,
+          "wire_bytes": 564,
+          "reported_used_tokens": 528,
+          "working_set_bytes": 643731456,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Harbor staging database port?",
+          "ranked": [
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ4MQC2ZF45HFNG58TGK",
+              "id": "01M1Y0MWM6G4Z1YG6GWGZRETGK",
+              "kind": "memory",
+              "score": 0.9995362758636476,
+              "summary": "project:fact - Harbor production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 343.74490000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 546,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 643792896,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Harbor production gateway timeout?",
+          "ranked": [
+            "timeout-a",
+            "timeout-b"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ3MV3S4P9XRQD4EMT0V",
+              "id": "01M1Y0MWYZJZ5061WCB7WVHQAZ",
+              "kind": "memory",
+              "score": 0.9995842576026917,
+              "summary": "project:fact - Harbor staging gateway timeout is 30 seconds. Operators record this in the request settings."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MQ3Z9TDZVZ7WQ6YXA2BX",
+              "id": "01M1Y0MWYZZB7C8SN5VWY7E6M8",
+              "kind": "memory",
+              "score": 0.9994773268699646,
+              "summary": "project:fact - Harbor staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 344.4561,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 748,
+          "mcp_result_bytes": 847,
+          "wire_bytes": 883,
+          "reported_used_tokens": 847,
+          "working_set_bytes": 643792896,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Unknown staging gateway port?",
+          "ranked": [
+            "foreign-port",
+            "stage-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ5GBXMTM8YQZN2RGJSC",
+              "id": "01M1Y0MX9QAN518VAJ4SAC5PEX",
+              "kind": "memory",
+              "score": 0.873483419418335,
+              "summary": "project:fact - Foreign staging gateway port is 9944."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MQ2ZA5KDDPFZ23RHB8XH",
+              "id": "01M1Y0MX9QT3QEFDP1XPVF5106",
+              "kind": "memory",
+              "score": 0.7721561789512634,
+              "summary": "project:fact - Harbor staging gateway port is 7102."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 348.8424,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 622,
+          "mcp_result_bytes": 721,
+          "wire_bytes": 757,
+          "reported_used_tokens": 721,
+          "working_set_bytes": 643825664,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Harbor test gateway port?",
+          "ranked": [
+            "prod-port",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ3BH95XDSR9MGVK404P",
+              "id": "01M1Y0MXMVCZDQP71FZNZ2FKTS",
+              "kind": "memory",
+              "score": 0.9944294691085817,
+              "summary": "project:fact - Harbor production gateway port is 8102."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MQ4MQC2ZF45HFNG58TGK",
+              "id": "01M1Y0MXMVGG6M5BKKRSW4TP0X",
+              "kind": "memory",
+              "score": 0.5744403600692749,
+              "summary": "project:fact - Harbor production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 350.05920000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 629,
+          "mcp_result_bytes": 728,
+          "wire_bytes": 764,
+          "reported_used_tokens": 728,
+          "working_set_bytes": 643825664,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What are the Harbor production gateway retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MQ4B8Q9ZWPZDYB23MC98",
+              "id": "01M1Y0MXZMDDBH4WBVZANPBRGN",
+              "kind": "memory",
+              "score": 0.9974480867385864,
+              "summary": "project:fact - Harbor staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 347.078,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 543,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 643907584,
+          "peak_working_set_bytes": 685244416
+        },
+        {
+          "query": "What is the Harbor staging worker timeout?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 357.9303,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 643928064,
+          "peak_working_set_bytes": 685244416
+        }
+      ],
+      "id": "harbor-structured-scope",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5666666666666667,
+      "skipped": false,
+      "detail": "positive-recall@4=0.83 mrr=0.89 stale-hit=n/a resolution=n/a false-injection=0.833 (n=6) positive-n=9 negative-n=6 (15 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "What is the Sable staging gateway port?",
+          "ranked": [
+            "stage-port",
+            "prod-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZYEKSR2C8636N31FRH1",
+              "id": "01M1Y0N290YR56CSYRD0PVM0AT",
+              "kind": "memory",
+              "score": 0.9981032609939576,
+              "summary": "project:fact - Sable staging gateway port is 7103."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MZYTT5EG3BN8Z2VDZYF1",
+              "id": "01M1Y0N290C2VVP864WDV7X43X",
+              "kind": "memory",
+              "score": 0.9930086135864258,
+              "summary": "project:fact - Sable production gateway port is 8103."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2303.7169999999996,
+          "first_query": true,
+          "server_startup_ms": 71.23870000000001,
+          "model_text_bytes": 624,
+          "mcp_result_bytes": 723,
+          "wire_bytes": 758,
+          "reported_used_tokens": 723,
+          "working_set_bytes": 637116416,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Sable production gateway port?",
+          "ranked": [
+            "prod-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZYTT5EG3BN8Z2VDZYF1",
+              "id": "01M1Y0N2M0Q2BD5KCZXBN61XH4",
+              "kind": "memory",
+              "score": 0.9996471405029296,
+              "summary": "project:fact - Sable production gateway port is 8103."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 338.7989,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 543,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 637607936,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What are the Sable staging gateway retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZZSGHP9RQJ7SJBET0V1",
+              "id": "01M1Y0N2YK6ZYT1AX62CHKKH1A",
+              "kind": "memory",
+              "score": 0.9971465468406676,
+              "summary": "project:fact - Sable staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 341.02500000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 425,
+          "mcp_result_bytes": 506,
+          "wire_bytes": 541,
+          "reported_used_tokens": 506,
+          "working_set_bytes": 637861888,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is `cache.max_entries` for Sable?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0N01ET7DABQCDCY7VFGZJ",
+              "id": "01M1Y0N39N8APG91JC4GFGRV5F",
+              "kind": "memory",
+              "score": 0.9999657869338988,
+              "summary": "project:fact - Sable cache.max_entries = 200."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 357.88779999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 419,
+          "mcp_result_bytes": 500,
+          "wire_bytes": 535,
+          "reported_used_tokens": 500,
+          "working_set_bytes": 639881216,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "Which database stores local state for Sable?",
+          "ranked": [
+            "runtime",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0N014EG1WJAVZ27PEM84S",
+              "id": "01M1Y0N3MKH0N10XVFF43T1FH6",
+              "kind": "memory",
+              "score": 0.9999470710754396,
+              "summary": "project:fact - Sable stores its local state in SQLite using WAL mode."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0N0013E35ENMXVAVQ9QRT",
+              "id": "01M1Y0N3MK1SGAKP0JP0XTQ0RZ",
+              "kind": "memory",
+              "score": 0.7779185175895691,
+              "summary": "project:fact - Sable production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 340.3432,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 644,
+          "mcp_result_bytes": 743,
+          "wire_bytes": 778,
+          "reported_used_tokens": 743,
+          "working_set_bytes": 639963136,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What are the Sable staging gateway port and password?",
+          "ranked": [
+            "no-password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0N00AA6WFV64M4HZS0AHQ",
+              "id": "01M1Y0N3ZFZPF2P8MBXW2GQ1BN",
+              "kind": "memory",
+              "score": 0.9167110919952391,
+              "summary": "project:fact - No password is required for the Sable production gateway."
+            }
+          ],
+          "positive_recall_at_4": 0.0,
+          "positive_hit_at_4": false,
+          "positive_mrr": 0.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 356.231,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 446,
+          "mcp_result_bytes": 527,
+          "wire_bytes": 562,
+          "reported_used_tokens": 527,
+          "working_set_bytes": 640012288,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What are the Sable staging gateway port and retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZZSGHP9RQJ7SJBET0V1",
+              "id": "01M1Y0N4AC456FTWYRTQQCB4M5",
+              "kind": "memory",
+              "score": 0.9917003512382508,
+              "summary": "project:fact - Sable staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": 0.5,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 355.7128,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 425,
+          "mcp_result_bytes": 506,
+          "wire_bytes": 541,
+          "reported_used_tokens": 506,
+          "working_set_bytes": 640225280,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Sable staging gateway timeout?",
+          "ranked": [
+            "timeout-b",
+            "timeout-a"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZZE36BDMZG2RZKCCQYG",
+              "id": "01M1Y0N4NXSRE844ZBZNQ7032N",
+              "kind": "memory",
+              "score": 0.9999639987945556,
+              "summary": "project:fact - Sable staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MZZ3G0FF4JCM4923V26S",
+              "id": "01M1Y0N4NXQG4R3AQX9JQNYJSR",
+              "kind": "memory",
+              "score": 0.9999442100524902,
+              "summary": "project:fact - Sable staging gateway timeout is 30 seconds. Operators record this in the request settings."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 378.49899999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 746,
+          "mcp_result_bytes": 845,
+          "wire_bytes": 880,
+          "reported_used_tokens": 845,
+          "working_set_bytes": 640249856,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What password does the Sable production gateway require?",
+          "ranked": [
+            "no-password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0N00AA6WFV64M4HZS0AHQ",
+              "id": "01M1Y0N51ARDG72QKQ6ES9ANXQ",
+              "kind": "memory",
+              "score": 0.9999281167984008,
+              "summary": "project:fact - No password is required for the Sable production gateway."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 349.7147,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 446,
+          "mcp_result_bytes": 527,
+          "wire_bytes": 563,
+          "reported_used_tokens": 527,
+          "working_set_bytes": 645111808,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Sable staging database port?",
+          "ranked": [
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0N0013E35ENMXVAVQ9QRT",
+              "id": "01M1Y0N5C76Z71N14QBAT4D4E6",
+              "kind": "memory",
+              "score": 0.9992688298225404,
+              "summary": "project:fact - Sable production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 347.5526,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 428,
+          "mcp_result_bytes": 509,
+          "wire_bytes": 545,
+          "reported_used_tokens": 509,
+          "working_set_bytes": 645169152,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Sable production gateway timeout?",
+          "ranked": [
+            "timeout-b",
+            "timeout-a"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZZE36BDMZG2RZKCCQYG",
+              "id": "01M1Y0N5Q55H95XWKGSPYHPJJA",
+              "kind": "memory",
+              "score": 0.9997990727424622,
+              "summary": "project:fact - Sable staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MZZ3G0FF4JCM4923V26S",
+              "id": "01M1Y0N5Q5EZVQRYJC05ZPZM7J",
+              "kind": "memory",
+              "score": 0.9994401335716248,
+              "summary": "project:fact - Sable staging gateway timeout is 30 seconds. Operators record this in the request settings."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 349.3759,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 746,
+          "mcp_result_bytes": 845,
+          "wire_bytes": 881,
+          "reported_used_tokens": 845,
+          "working_set_bytes": 645210112,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Unknown staging gateway port?",
+          "ranked": [
+            "stage-port",
+            "foreign-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZYEKSR2C8636N31FRH1",
+              "id": "01M1Y0N61ZA4Z3FD765ZJY62ZN",
+              "kind": "memory",
+              "score": 0.8858267068862915,
+              "summary": "project:fact - Sable staging gateway port is 7103."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0N00W5ZMG5YZY06YGZ0Q9",
+              "id": "01M1Y0N61Z1NWX36X5CB29JJ2Z",
+              "kind": "memory",
+              "score": 0.8669298887252808,
+              "summary": "project:fact - Foreign staging gateway port is 9944."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 345.1217,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 622,
+          "mcp_result_bytes": 721,
+          "wire_bytes": 757,
+          "reported_used_tokens": 721,
+          "working_set_bytes": 645222400,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Sable test gateway port?",
+          "ranked": [
+            "prod-port",
+            "stage-port",
+            "database"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZYTT5EG3BN8Z2VDZYF1",
+              "id": "01M1Y0N6D1XYQQWMARK6D2T9VT",
+              "kind": "memory",
+              "score": 0.9929980039596558,
+              "summary": "project:fact - Sable production gateway port is 8103."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0MZYEKSR2C8636N31FRH1",
+              "id": "01M1Y0N6D1TVDJAZT1C35A34ZN",
+              "kind": "memory",
+              "score": 0.9868773221969604,
+              "summary": "project:fact - Sable staging gateway port is 7103."
+            },
+            {
+              "expansion_handle": "memory:01M1Y0N0013E35ENMXVAVQ9QRT",
+              "id": "01M1Y0N6D1YE9XRE71AQ3KDEY5",
+              "kind": "memory",
+              "score": 0.6837578415870667,
+              "summary": "project:fact - Sable production database port is 5432."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 364.24440000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 824,
+          "mcp_result_bytes": 941,
+          "wire_bytes": 977,
+          "reported_used_tokens": 941,
+          "working_set_bytes": 645234688,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What are the Sable production gateway retries?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1Y0MZZSGHP9RQJ7SJBET0V1",
+              "id": "01M1Y0N6R5YFHDZZF3HJRCPMSW",
+              "kind": "memory",
+              "score": 0.992603600025177,
+              "summary": "project:fact - Sable staging gateway retries are 3."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 347.4506,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 424,
+          "mcp_result_bytes": 505,
+          "wire_bytes": 541,
+          "reported_used_tokens": 505,
+          "working_set_bytes": 645234688,
+          "peak_working_set_bytes": 685043712
+        },
+        {
+          "query": "What is the Sable staging worker timeout?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 355.12919999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 645271552,
+          "peak_working_set_bytes": 685043712
+        }
+      ],
+      "id": "sable-structured-scope",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.5666666666666667,
+      "skipped": false,
+      "detail": "positive-recall@4=0.83 mrr=0.89 stale-hit=n/a resolution=n/a false-injection=0.833 (n=6) positive-n=9 negative-n=6 (15 queries)"
+    }
+  ],
+  "by_dimension_tier": {
+    "retrieval/hard": [
+      1.7,
+      3
+    ]
+  },
+  "by_dimension": {
+    "retrieval": {
+      "mean": 0.5666666666666667,
+      "n": 3,
+      "ci95": 0.0
+    }
+  },
+  "overall_index": 0.5666666666666667,
+  "scenario_weighted_index": 0.5666666666666667
+}

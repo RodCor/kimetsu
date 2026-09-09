@@ -44,7 +44,12 @@ pub(crate) fn checkpoint_cmd(args: CheckpointArgs) -> KimetsuResult<()> {
 
     // Use capture_episode_now with an empty transcript (manual save does not
     // require a transcript — the note itself is sufficient context).
-    let ok = distiller::capture_episode_now(&workspace, "", note);
+    let ok = distiller::capture_episode_now_scoped(
+        &workspace,
+        "",
+        note,
+        args.task_id.as_deref().unwrap_or(""),
+    );
 
     if ok {
         println!("[Kimetsu] Work checkpoint saved.");
@@ -70,7 +75,10 @@ pub(crate) fn resume_cmd(args: ResumeArgs) -> KimetsuResult<()> {
         .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
 
-    match kimetsu_brain::episode::load_live_episode_for_workspace(&workspace) {
+    match kimetsu_brain::episode::load_live_episode_for_workspace_scoped(
+        &workspace,
+        args.task_id.as_deref().unwrap_or(""),
+    ) {
         Ok(Some(ep)) => {
             println!("── Resume: last session ──────────────────────────────");
             if !ep.task.is_empty() {

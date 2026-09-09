@@ -1,0 +1,31 @@
+{
+  "main_commit": "3ae8329c43660ada6e9cce4502c4ca89002bbcc4",
+  "benchmark_commit": "2c74dad135d3fe611ada259e9f94cf229bacb5b7",
+  "schema_version": 15,
+  "guard_default": false,
+  "installed": false,
+  "verification": {
+    "workspace_passed": 1470,
+    "workspace_ignored": 6,
+    "benchmark_rust_passed": 132,
+    "benchmark_python_passed": 18,
+    "delivery_probes_passed": 6
+  },
+  "binaries": {
+    "baseline_binary": {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\kimetsu-answerability-candidate.exe",
+      "sha256": "405d3483fe320e76b0ec776bf9ada3b7771852b04a73f70f3b5da377a43d31c3",
+      "bytes": 47151104
+    },
+    "candidate_binary": {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\kimetsu-structured-facts-candidate.exe",
+      "sha256": "b5672cfed1da5bbd03fdbc20b954582ad5216f4fb579c8e463914c0839126ee7",
+      "bytes": 47382016
+    },
+    "harness_binary": {
+      "path": "E:\\Kimetsu\\bench\\target\\release\\kbench.exe",
+      "sha256": "5ba5065f9aaa28ced75a091bb43e01c8b995751e0e5cd3f9842ac6c822e844ff",
+      "bytes": 9405952
+    }
+  }
+}

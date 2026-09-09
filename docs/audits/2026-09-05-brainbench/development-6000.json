@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "harness": {
+    "path": "E:\\Kimetsu\\bench\\target\\release\\kbench.exe",
+    "sha256": "62d20550bac2c915613b39f9381fdd6eb5c4d1a10a1782a91796a6d87ff5ea75",
+    "bytes": 9355776
+  },
+  "runner": {
+    "path": "E:\\tmp\\kimetsu-brain-hardening\\bench\\scripts\\compare_brainbench.py",
+    "sha256": "c9722466009db103d37e7701b3a42a7a7c0785be6ef3db018be80da4f6fc9b11",
+    "bytes": 22969
+  },
+  "binaries": {
+    "baseline": {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\kimetsu-baseline.exe",
+      "sha256": "aba19d66742fe4c6b7d8902a52f0b6d5a0ad5c9d72ecf705a2e5d69d546a75c0",
+      "bytes": 46408704
+    },
+    "candidate": {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\kimetsu-candidate.exe",
+      "sha256": "5c87e542907a47917f23fad50ddff1e46789eaae14328ccc662ca748b66b5477",
+      "bytes": 47080448
+    }
+  },
+  "datasets": [
+    {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\brainbench-development-100.json",
+      "sha256": "ff3c78f8b5dab7e9b2f10894af93f07965705502a4f9d3e8c45c529b9b6ca33f",
+      "bytes": 122806
+    }
+  ],
+  "settings": {
+    "budget_tokens": 6000,
+    "dimensions": [
+      "poisoning",
+      "render-contract",
+      "retrieval",
+      "workflow"
+    ],
+    "jobs": 1,
+    "warm_start": false,
+    "include_ambient": false,
+    "overrides": {
+      "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+      "KIMETSU_DETECT_CONFLICTS": "0",
+      "KIMETSU_RESOLVE_CONFLICTS": "0",
+      "FASTEMBED_CACHE_DIR": "E:/Kimetsu/.fastembed_cache"
+    },
+    "baseline_threads": 0,
+    "candidate_threads": 0,
+    "baseline_reranker": null,
+    "candidate_reranker": null
+  },
+  "runs": [
+    {
+      "label": "baseline",
+      "repeat": 1,
+      "intra_threads_override": null,
+      "reranker_override": null,
+      "wall_seconds": 205.66018299999996,
+      "report_file": "1-baseline.json"
+    },
+    {
+      "label": "candidate",
+      "repeat": 1,
+      "intra_threads_override": null,
+      "reranker_override": null,
+      "wall_seconds": 230.2012442999985,
+      "report_file": "1-candidate.json"
+    },
+    {
+      "label": "candidate",
+      "repeat": 2,
+      "intra_threads_override": null,
+      "reranker_override": null,
+      "wall_seconds": 233.46974230000342,
+      "report_file": "2-candidate.json"
+    },
+    {
+      "label": "baseline",
+      "repeat": 2,
+      "intra_threads_override": null,
+      "reranker_override": null,
+      "wall_seconds": 180.9405689999985,
+      "report_file": "2-baseline.json"
+    },
+    {
+      "label": "baseline",
+      "repeat": 3,
+      "intra_threads_override": null,
+      "reranker_override": null,
+      "wall_seconds": 179.88030720000097,
+      "report_file": "3-baseline.json"
+    },
+    {
+      "label": "candidate",
+      "repeat": 3,
+      "intra_threads_override": null,
+      "reranker_override": null,
+      "wall_seconds": 198.51590569999826,
+      "report_file": "3-candidate.json"
+    }
+  ],
+  "comparison": {
+    "measurement_summary": {
+      "baseline": {
+        "unique_queries": 210,
+        "query_observations": 630,
+        "positive_queries": 197,
+        "negative_queries": 13,
+        "stale_queries": 0,
+        "positive_recall_at_4": 0.7368866328257191,
+        "positive_hit_at_4": 0.7563451776649747,
+        "positive_mrr": 0.7385786802030457,
+        "negative_injection_rate": 0.8461538461538461,
+        "stale_injection_rate": null,
+        "first_query_mean_ms": 942.4398333333332,
+        "subsequent_query_p50_ms": 866.2045,
+        "subsequent_query_p95_ms": 982.2975,
+        "subsequent_observations": 627,
+        "mean_model_text_bytes": 146856.6,
+        "mean_mcp_result_bytes": 153628.91904761904,
+        "memory_observations": 630,
+        "mean_mcp_working_set_bytes": 188760369.57460317,
+        "max_mcp_peak_working_set_bytes": 220270592,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      },
+      "candidate": {
+        "unique_queries": 210,
+        "query_observations": 630,
+        "positive_queries": 197,
+        "negative_queries": 13,
+        "stale_queries": 0,
+        "positive_recall_at_4": 0.6962774957698815,
+        "positive_hit_at_4": 0.7055837563451777,
+        "positive_mrr": 0.6979695431472082,
+        "negative_injection_rate": 0.5384615384615384,
+        "stale_injection_rate": null,
+        "first_query_mean_ms": 1206.6408,
+        "subsequent_query_p50_ms": 1015.6333,
+        "subsequent_query_p95_ms": 1154.0131000000001,
+        "subsequent_observations": 627,
+        "mean_model_text_bytes": 1167.6,
+        "mean_mcp_result_bytes": 1262.4285714285713,
+        "memory_observations": 630,
+        "mean_mcp_working_set_bytes": 287032602.81904763,
+        "max_mcp_peak_working_set_bytes": 294555648,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      }
+    },
+    "by_dimension": {
+      "retrieval": {
+        "n_scenarios": 1,
+        "baseline": 0.7007936507936509,
+        "candidate": 0.6817460317460317,
+        "mean_delta": -0.019047619047619202,
+        "ci95": null,
+        "wins": 0,
+        "ties": 0,
+        "losses": 1
+      }
+    },
+    "scenarios": [
+      {
+        "identity": "retrieval/existing-development-100",
+        "dimension": "retrieval",
+        "baseline": 0.7007936507936509,
+        "candidate": 0.6817460317460317,
+        "delta": -0.019047619047619202
+      }
+    ],
+    "unpaired_scenarios": [],
+    "unpaired_details": [],
+    "baseline_errors": 0,
+    "candidate_errors": 0,
+    "repeats": 3,
+    "uncertainty_note": "Exploratory paired bootstrap over scenario IDs after averaging repeats; correlated task families require a separate grouped holdout."
+  }
+}

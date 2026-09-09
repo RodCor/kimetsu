@@ -1,0 +1,194 @@
+{
+  "contract": {
+    "measurements": {
+      "baseline": {
+        "unique_queries": 22,
+        "query_observations": 66,
+        "positive_queries": 11,
+        "negative_queries": 11,
+        "stale_queries": 2,
+        "positive_recall_at_4": 0.7272727272727273,
+        "positive_hit_at_4": 0.7272727272727273,
+        "positive_mrr": 0.7272727272727273,
+        "negative_injection_rate": 0.18181818181818182,
+        "stale_injection_rate": 0,
+        "first_query_mean_ms": 1018.891488888889,
+        "subsequent_query_p50_ms": 428.7726,
+        "subsequent_query_p95_ms": 801.7253,
+        "subsequent_observations": 48,
+        "mean_model_text_bytes": 344.90909090909093,
+        "mean_mcp_result_bytes": 416.90909090909093,
+        "memory_observations": 66,
+        "mean_mcp_working_set_bytes": 214227812.84848484,
+        "max_mcp_peak_working_set_bytes": 248709120,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      },
+      "candidate": {
+        "unique_queries": 22,
+        "query_observations": 66,
+        "positive_queries": 11,
+        "negative_queries": 11,
+        "stale_queries": 2,
+        "positive_recall_at_4": 0.9545454545454546,
+        "positive_hit_at_4": 1,
+        "positive_mrr": 1.0,
+        "negative_injection_rate": 0.09090909090909091,
+        "stale_injection_rate": 0,
+        "first_query_mean_ms": 2163.8191444444446,
+        "subsequent_query_p50_ms": 444.8203,
+        "subsequent_query_p95_ms": 470.4541,
+        "subsequent_observations": 48,
+        "mean_model_text_bytes": 359.1363636363636,
+        "mean_mcp_result_bytes": 431.95454545454544,
+        "memory_observations": 66,
+        "mean_mcp_working_set_bytes": 629898457.2121212,
+        "max_mcp_peak_working_set_bytes": 685191168,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      }
+    },
+    "positive_gains": 3,
+    "positive_losses": 0,
+    "queries_with_ranking_variation": {
+      "baseline": 0,
+      "candidate": 0
+    }
+  },
+  "development": {
+    "measurements": {
+      "baseline": {
+        "unique_queries": 210,
+        "query_observations": 630,
+        "positive_queries": 197,
+        "negative_queries": 13,
+        "stale_queries": 0,
+        "positive_recall_at_4": 0.8417935702199661,
+        "positive_hit_at_4": 0.8578680203045685,
+        "positive_mrr": 0.850253807106599,
+        "negative_injection_rate": 0.5384615384615384,
+        "stale_injection_rate": null,
+        "first_query_mean_ms": 1200.0951333333333,
+        "subsequent_query_p50_ms": 969.7701,
+        "subsequent_query_p95_ms": 1106.8446000000001,
+        "subsequent_observations": 627,
+        "mean_model_text_bytes": 1167.5904761904762,
+        "mean_mcp_result_bytes": 1262.4190476190477,
+        "memory_observations": 630,
+        "mean_mcp_working_set_bytes": 287675330.2349206,
+        "max_mcp_peak_working_set_bytes": 295104512,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      },
+      "candidate": {
+        "unique_queries": 210,
+        "query_observations": 630,
+        "positive_queries": 197,
+        "negative_queries": 13,
+        "stale_queries": 0,
+        "positive_recall_at_4": 0.8434856175972927,
+        "positive_hit_at_4": 0.8629441624365483,
+        "positive_mrr": 0.8604060913705583,
+        "negative_injection_rate": 0.38461538461538464,
+        "stale_injection_rate": null,
+        "first_query_mean_ms": 2614.5614666666665,
+        "subsequent_query_p50_ms": 1336.2471,
+        "subsequent_query_p95_ms": 1767.8703,
+        "subsequent_observations": 627,
+        "mean_model_text_bytes": 1022.504761904762,
+        "mean_mcp_result_bytes": 1112.1714285714286,
+        "memory_observations": 630,
+        "mean_mcp_working_set_bytes": 938291479.568254,
+        "max_mcp_peak_working_set_bytes": 1001422848,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      }
+    },
+    "positive_gains": 6,
+    "positive_losses": 5,
+    "queries_with_ranking_variation": {
+      "baseline": 0,
+      "candidate": 0
+    }
+  },
+  "validation": {
+    "measurements": {
+      "baseline": {
+        "unique_queries": 72,
+        "query_observations": 216,
+        "positive_queries": 48,
+        "negative_queries": 24,
+        "stale_queries": 8,
+        "positive_recall_at_4": 0.5,
+        "positive_hit_at_4": 0.5,
+        "positive_mrr": 0.5,
+        "negative_injection_rate": 0.5,
+        "stale_injection_rate": 0,
+        "first_query_mean_ms": 663.7127916666666,
+        "subsequent_query_p50_ms": 324.1918,
+        "subsequent_query_p95_ms": 354.77180000000004,
+        "subsequent_observations": 204,
+        "mean_model_text_bytes": 368.9861111111111,
+        "mean_mcp_result_bytes": 441.7361111111111,
+        "memory_observations": 216,
+        "mean_mcp_working_set_bytes": 217263729.7777778,
+        "max_mcp_peak_working_set_bytes": 248737792,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      },
+      "candidate": {
+        "unique_queries": 72,
+        "query_observations": 216,
+        "positive_queries": 48,
+        "negative_queries": 24,
+        "stale_queries": 8,
+        "positive_recall_at_4": 1.0,
+        "positive_hit_at_4": 1,
+        "positive_mrr": 1.0,
+        "negative_injection_rate": 0.7916666666666666,
+        "stale_injection_rate": 0,
+        "first_query_mean_ms": 1821.885925,
+        "subsequent_query_p50_ms": 368.83050000000003,
+        "subsequent_query_p95_ms": 401.2908,
+        "subsequent_observations": 204,
+        "mean_model_text_bytes": 486.7083333333333,
+        "mean_mcp_result_bytes": 567.4583333333334,
+        "memory_observations": 216,
+        "mean_mcp_working_set_bytes": 639348717.037037,
+        "max_mcp_peak_working_set_bytes": 685043712,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      }
+    },
+    "positive_gains": 24,
+    "positive_losses": 0,
+    "queries_with_ranking_variation": {
+      "baseline": 0,
+      "candidate": 0
+    },
+    "language_cohorts": {
+      "baseline": {
+        "en": {
+          "positive_hits": 24,
+          "positive_queries": 24,
+          "negative_injections": 12,
+          "negative_queries": 12
+        },
+        "es": {
+          "positive_hits": 0,
+          "positive_queries": 24,
+          "negative_injections": 0,
+          "negative_queries": 12
+        }
+      },
+      "candidate": {
+        "en": {
+          "positive_hits": 24,
+          "positive_queries": 24,
+          "negative_injections": 8,
+          "negative_queries": 12
+        },
+        "es": {
+          "positive_hits": 24,
+          "positive_queries": 24,
+          "negative_injections": 11,
+          "negative_queries": 12
+        }
+      }
+    }
+  }
+}

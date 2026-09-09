@@ -21,27 +21,10 @@
 //! contradicting fact there invalidates rather than overwrites: history stays
 //! answerable.
 //!
-//! ## The shape here
-//!
-//! Kimetsu is already most of the way there without a schema change, because
-//! **nothing is ever destroyed**. Supersession stamps `superseded_by`,
-//! invalidation stamps `invalidated_at`, and automatic contradiction resolution
-//! stamps the loser's `valid_to` — every one of them a tombstone with a
-//! timestamp, not a delete. The rows to answer an as-of query are all present;
-//! there was simply no query that read them that way.
-//!
-//! So [`as_of_predicate`] is a WHERE clause rather than a migration:
-//!
-//! ```text
-//! created_at      <= T                    -- the brain knew it by then
-//! (invalidated_at IS NULL OR > T)         -- and had not retracted it
-//! (valid_from     IS NULL OR <= T)        -- and it had taken effect
-//! (valid_to       IS NULL OR  > T)        -- and had not expired
-//! ```
-//!
-//! Superseded memories are deliberately *included*: a memory merged into a
-//! survivor last week was a live belief the week before, and excluding it would
-//! misreport what the brain knew.
+//! Corrections retain their text and kind in `memory_revisions`. The original
+//! single-time API delegates to [`memories_at`], which separates effective and
+//! known time. Retirement and validity still use the memory's tombstones;
+//! temporal metadata edits are not yet independently revisioned.
 
 use kimetsu_core::KimetsuResult;
 use rusqlite::Connection;
@@ -55,10 +38,10 @@ use crate::context::ContextCapsule;
 /// query so the several candidate paths can share exactly one definition of
 /// "believed at T"; two subtly different versions of this clause would be a
 /// bug nobody would ever notice.
-pub const AS_OF_PREDICATE: &str = "created_at <= ?1 \
-     AND (invalidated_at IS NULL OR invalidated_at > ?1) \
-     AND (valid_from IS NULL OR valid_from <= ?1) \
-     AND (valid_to IS NULL OR valid_to > ?1)";
+pub const AS_OF_PREDICATE: &str = "julianday(created_at) <= julianday(?1) \
+     AND (invalidated_at IS NULL OR julianday(invalidated_at) > julianday(?1)) \
+     AND (valid_from IS NULL OR julianday(valid_from) <= julianday(?1)) \
+     AND (valid_to IS NULL OR julianday(valid_to) > julianday(?1))";
 
 /// Human-readable form of [`AS_OF_PREDICATE`], for `--explain` output and docs.
 pub fn as_of_predicate() -> &'static str {
@@ -88,11 +71,28 @@ pub fn memories_as_of(
     as_of: &str,
     limit: u32,
 ) -> KimetsuResult<Vec<AsOfMemory>> {
+    memories_at(conn, as_of, as_of, limit)
+}
+
+/// Query independently when a claim was effective and when it was known.
+/// Corrections default effective time to their recording time; imported events
+/// may supply an explicit RFC3339 `effective_at` for late-arriving corrections.
+pub fn memories_at(
+    conn: &Connection,
+    valid_at: &str,
+    known_at: &str,
+    limit: u32,
+) -> KimetsuResult<Vec<AsOfMemory>> {
     let sql = format!(
-        "SELECT memory_id, scope, kind, text, created_at,
+        "SELECT memory_id, scope,
+                COALESCE((SELECT kind FROM memory_revisions r WHERE r.memory_id=m.memory_id AND julianday(r.known_at)<=julianday(?2) AND julianday(r.effective_at)<=julianday(?1) ORDER BY julianday(r.known_at) DESC,revision_id DESC LIMIT 1),kind),
+                COALESCE((SELECT text FROM memory_revisions r WHERE r.memory_id=m.memory_id AND julianday(r.known_at)<=julianday(?2) AND julianday(r.effective_at)<=julianday(?1) ORDER BY julianday(r.known_at) DESC,revision_id DESC LIMIT 1),text), created_at,
                 invalidated_at, invalidated_reason, valid_to, superseded_by
-         FROM memories
-         WHERE {AS_OF_PREDICATE}
+         FROM memories m
+         WHERE julianday(created_at)<=julianday(?2)
+           AND (invalidated_at IS NULL OR julianday(invalidated_at)>julianday(?2))
+           AND (valid_from IS NULL OR julianday(valid_from)<=julianday(?1))
+           AND (valid_to IS NULL OR julianday(valid_to)>julianday(?1))
          ORDER BY created_at DESC
          {}",
         if limit == 0 {
@@ -103,7 +103,7 @@ pub fn memories_as_of(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(rusqlite::params![as_of], |row| {
+        .query_map(rusqlite::params![valid_at, known_at], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -176,6 +176,10 @@ pub fn as_of_capsules(memories: &[AsOfMemory]) -> Vec<ContextCapsule> {
             score: 0.0,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            facts: vec![],
+            rerank_usefulness: None,
+            rerank_trust: None,
         })
         .collect()
 }
@@ -198,18 +202,24 @@ pub fn belief_delta(conn: &Connection, from: &str, to: &str) -> KimetsuResult<Be
 
     let before = memories_as_of(conn, from, 0)?;
     let after = memories_as_of(conn, to, 0)?;
-    let before_ids: HashSet<&str> = before.iter().map(|m| m.memory_id.as_str()).collect();
-    let after_ids: HashSet<&str> = after.iter().map(|m| m.memory_id.as_str()).collect();
+    let before_ids: HashSet<_> = before
+        .iter()
+        .map(|m| (&m.memory_id, &m.text, &m.kind))
+        .collect();
+    let after_ids: HashSet<_> = after
+        .iter()
+        .map(|m| (&m.memory_id, &m.text, &m.kind))
+        .collect();
 
     Ok(BeliefDelta {
         learned: after
             .iter()
-            .filter(|m| !before_ids.contains(m.memory_id.as_str()))
+            .filter(|m| !before_ids.contains(&(&m.memory_id, &m.text, &m.kind)))
             .cloned()
             .collect(),
         retired: before
             .iter()
-            .filter(|m| !after_ids.contains(m.memory_id.as_str()))
+            .filter(|m| !after_ids.contains(&(&m.memory_id, &m.text, &m.kind)))
             .cloned()
             .collect(),
     })

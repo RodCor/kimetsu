@@ -122,6 +122,12 @@ impl ProjectConfig {
         if !self.embedder.enabled {
             return;
         }
+        // An explicit reranker opt-out outranks presets just like the embedder
+        // opt-out above. Nondefault models still require level="custom".
+        let reranker_off = matches!(
+            self.embedder.reranker.trim().to_ascii_lowercase().as_str(),
+            "" | "off" | "none" | "noop"
+        );
         match self.retrieval.level.as_str() {
             "basic" => {
                 self.embedder.enabled = false;
@@ -140,6 +146,9 @@ impl ProjectConfig {
                 self.embedder.reranker = "ms-marco-tinybert-l-2-v2".to_string();
             }
             _ => {} // "custom" or unknown: leave as configured
+        }
+        if reranker_off {
+            self.embedder.reranker = "off".into();
         }
     }
 
@@ -225,6 +234,13 @@ impl ProjectConfig {
     /// exactly the statement that no memory-pipeline call site proceeds past it.
     pub fn allows_model_in_pipeline(&self) -> bool {
         self.tier().allows_model()
+    }
+
+    /// Automatic harvesting may ask either a configured model or the host to
+    /// generate lessons. Both obey the same Free/Deep policy; a missing model
+    /// is Free, never an implicit host-generation fallback.
+    pub fn allows_automatic_harvest(&self) -> bool {
+        self.learning.auto_harvest && self.allows_model_in_pipeline()
     }
 
     pub fn from_toml(value: &str) -> KimetsuResult<Self> {
@@ -859,6 +875,18 @@ pub struct BrokerSection {
     /// unchanged (off).
     #[serde(default = "default_abstain_min_score")]
     pub abstain_min_score: f32,
+    /// Final cross-encoder admission floor. Scores are model-specific, not
+    /// calibrated probabilities. Zero disables this floor (not cosine gating).
+    #[serde(
+        default = "default_rerank_min_score",
+        deserialize_with = "deserialize_rerank_min_score"
+    )]
+    pub rerank_min_score: f32,
+    /// Require visible value evidence for recognized explicit configuration
+    /// questions. Experimental, opt-in English/Spanish rules; not a general
+    /// entailment check. Unsupported wording retains normal retrieval.
+    #[serde(default)]
+    pub explicit_fact_guard: bool,
     /// F3: floor for the adaptive per-stage brain budget. Small tasks
     /// receive at least this many tokens so the brain is never starved.
     /// `#[serde(default)]` keeps pre-F3 project.toml files loading cleanly.
@@ -1011,6 +1039,23 @@ fn default_answer_grade_min_score() -> f32 {
     0.92
 }
 
+fn default_rerank_min_score() -> f32 {
+    0.30
+}
+
+fn deserialize_rerank_min_score<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f32, D::Error> {
+    let value = f32::deserialize(deserializer)?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "rerank_min_score must be finite and between 0 and 1",
+        ))
+    }
+}
+
 impl Default for BrokerSection {
     fn default() -> Self {
         Self {
@@ -1022,6 +1067,8 @@ impl Default for BrokerSection {
             fusion: default_fusion(),
             normalization: default_normalization(),
             abstain_min_score: default_abstain_min_score(),
+            rerank_min_score: default_rerank_min_score(),
+            explicit_fact_guard: false,
             budget_floor_tokens: default_budget_floor_tokens(),
             budget_run_cap_tokens: default_budget_run_cap_tokens(),
             ambient: default_true(),
@@ -1179,20 +1226,10 @@ pub struct IngestionSection {
     /// Precedence: `KIMETSU_DETECT_CONFLICTS` env > this field > default.
     #[serde(default = "default_true")]
     pub detect_conflicts: bool,
-    /// v2.5 Pass B (Story 1.3): enable automatic contradiction resolution.
-    ///
-    /// When true (default), conflicting memory pairs are scored by
-    /// `confidence × recency`.  Clear winners (score gap ≥ 0.15) have the
-    /// loser's `valid_to` stamped to now via `mark_memory_temporal`
-    /// (event-sourced, rebuild-safe).  Near-ties are queued in
-    /// `memory_conflicts` for operator review, same as the v0.5.2 behavior.
-    ///
-    /// Set to false (or set env `KIMETSU_RESOLVE_CONFLICTS=0`) to revert to
-    /// detect-only mode: all conflicts are queued for the operator.
-    ///
-    /// Precedence: `KIMETSU_RESOLVE_CONFLICTS` env > this field > default.
-    /// Resolution only runs when `detect_conflicts` is also enabled.
-    #[serde(default = "default_true")]
+    /// Legacy resolution switch, default false. Both settings now queue
+    /// similarity candidates for explicit review when detection is enabled.
+    /// Neither similarity nor confidence/recency automatically retires a claim.
+    #[serde(default)]
     pub resolve_conflicts: bool,
 
     /// Flagship 2 / Story 2.1: seed a non-zero initial usefulness_score for
@@ -1208,15 +1245,14 @@ pub struct IngestionSection {
     pub initial_importance_scoring: bool,
 
     /// Flagship 2 / Story 2.2: quality-control filter in the distiller.
-    /// Drop lessons that are near-duplicates (cosine ≥ threshold), too long,
-    /// too short, or contain transience markers.  Default true.
+    /// Drop exact duplicates, overlong/short lessons and unbounded temporary
+    /// lessons. Similar corrections and temporally bounded workarounds pass.
     /// `#[serde(default = "default_true")]` keeps older configs loading cleanly.
     #[serde(default = "default_true")]
     pub quality_filter_enabled: bool,
 
-    /// Flagship 2 / Story 2.2: novelty threshold — cosine ≥ this value → DROP.
-    /// Default 0.9.  `#[serde(default)]` keeps older configs loading cleanly
-    /// (they get the default via the `Default` impl).
+    /// Legacy field retained for config compatibility; ignored. Cosine
+    /// similarity cannot safely prove a lesson duplicates an existing claim.
     #[serde(default = "default_quality_filter_novelty_threshold")]
     pub quality_filter_novelty_threshold: f32,
 
@@ -1229,6 +1265,14 @@ pub struct IngestionSection {
     /// Lessons longer than this are dropped.  Default 500.
     #[serde(default = "default_quality_filter_max_len")]
     pub quality_filter_max_len: usize,
+    /// Lifetime assigned to temporary lessons without an explicit expiry.
+    /// Default seven days; zero disables assignment, maximum applied is 365 days.
+    #[serde(default = "default_transient_ttl_days")]
+    pub transient_ttl_days: u32,
+}
+
+fn default_transient_ttl_days() -> u32 {
+    7
 }
 
 fn default_quality_filter_novelty_threshold() -> f32 {
@@ -1248,12 +1292,13 @@ impl Default for IngestionSection {
             extra_skip_dirs: Vec::new(),
             max_total_files: 50_000,
             detect_conflicts: true,
-            resolve_conflicts: true,
+            resolve_conflicts: false,
             initial_importance_scoring: true,
             quality_filter_enabled: true,
             quality_filter_novelty_threshold: default_quality_filter_novelty_threshold(),
             quality_filter_min_len: default_quality_filter_min_len(),
             quality_filter_max_len: default_quality_filter_max_len(),
+            transient_ttl_days: default_transient_ttl_days(),
         }
     }
 }
@@ -1355,7 +1400,7 @@ pub struct LifecycleSection {
     pub forget_usefulness_floor: f32,
 
     /// Evergreen protection threshold. Memories with
-    /// `use_count >= forget_protect_use_count` are NEVER archived regardless
+    /// Non-negative memories with `use_count >= forget_protect_use_count` are protected regardless
     /// of their usefulness ratio. Default 10.
     #[serde(default = "default_forget_protect_use_count")]
     pub forget_protect_use_count: u32,
@@ -1414,6 +1459,34 @@ impl Default for LifecycleSection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_fact_guard_is_opt_in_and_round_trips() {
+        let default = ProjectConfig::default_for_project("guard");
+        assert!(!default.broker.explicit_fact_guard);
+        for enabled in [false, true] {
+            let mut value = serde_json::to_value(&default).unwrap();
+            value["broker"]["explicit_fact_guard"] = serde_json::json!(enabled);
+            let config: ProjectConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["broker"]["explicit_fact_guard"],
+                enabled
+            );
+        }
+    }
+    #[test]
+    fn rerank_cutoff_survives_configuration_roundtrip_and_rejects_invalid_values() {
+        let mut value = serde_json::to_value(ProjectConfig::default_for_project("cutoff")).unwrap();
+        value["broker"]["rerank_min_score"] = serde_json::json!(0.75);
+        let config: ProjectConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["broker"]["rerank_min_score"],
+            0.75
+        );
+        for invalid in [-0.1, 1.1] {
+            value["broker"]["rerank_min_score"] = serde_json::json!(invalid);
+            assert!(serde_json::from_value::<ProjectConfig>(value.clone()).is_err());
+        }
+    }
     use super::*;
 
     // ── v2.6: Free/Deep tier resolution ──────────────────────────────────
@@ -1427,6 +1500,25 @@ mod tests {
         CheapModelSection {
             enabled: true,
             ..CheapModelSection::default()
+        }
+    }
+
+    #[test]
+    fn hardening_automatic_harvest_policy_matrix() {
+        for tier in [None, Some(Tier::Free), Some(Tier::Deep)] {
+            for model in [false, true] {
+                for automatic in [false, true] {
+                    let mut config = ProjectConfig::default_for_project("harvest-matrix");
+                    config.kimetsu.tier = tier;
+                    config.cheap_model = model.then(enabled_cheap_model);
+                    config.learning.auto_harvest = automatic;
+                    assert_eq!(
+                        config.allows_automatic_harvest(),
+                        automatic && model && tier != Some(Tier::Free),
+                        "tier={tier:?} model={model} automatic={automatic}"
+                    );
+                }
+            }
         }
     }
 
@@ -1760,6 +1852,18 @@ max_total_cost_usd = 250.0
         unknown.embedder.enabled = false;
         unknown.apply_retrieval_level();
         assert!(!unknown.embedder.enabled, "unknown level must be a no-op");
+    }
+
+    #[test]
+    fn retrieval_level_never_reenables_explicit_reranker_off() {
+        for level in ["deep", "advanced"] {
+            let mut config = ProjectConfig::default_for_project("off");
+            config.retrieval.level = level.into();
+            config.embedder.reranker = "off".into();
+            config.apply_retrieval_level();
+            assert_eq!(config.embedder.reranker, "off");
+            assert!(config.embedder.enabled);
+        }
     }
 
     /// The `[embedder] enabled = false` off-switch outranks every level

@@ -82,18 +82,9 @@ pub fn abort_run(start: &Path, run_id_str: &str) -> KimetsuResult<()> {
     Ok(())
 }
 
-/// C7: best-effort telemetry write from a hook context (no active run).
-///
-/// Appends a single event (e.g. `context.served`) directly to the project
-/// brain's `events` table with a sentinel run_id (`"hook"` encoded as a
-/// ULID-zero string). Swallows all errors — telemetry must never break
-/// a hook. Opens the DB read-write so the hook can record misses without
-/// holding a write lock (the DB is opened and closed immediately).
-///
-/// The sentinel run_id is a valid ULID-shaped string (`00000000000000000000000000`
-/// padded to 26 chars). Crucially there is **no** corresponding row in the
-/// `runs` table; analytics windows over `context.served` filter by `ts`, not
-/// `run_id`, so this is correct.
+/// Best-effort telemetry from hooks/MCP without an active pipeline run.
+/// Each event receives a fresh run identity, never a shared nil-run bucket.
+/// Producers include session/task identity in their payload when available.
 pub fn log_telemetry_event(
     start: &Path,
     kind: &str,
@@ -106,11 +97,114 @@ pub fn log_telemetry_event(
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
 
-    // Sentinel run_id: all-zero ULID (26 '0' chars), never in `runs`.
-    let sentinel_run_id = RunId(ulid::Ulid::nil());
-    let event = Event::new(sentinel_run_id, kind, payload);
+    // Standalone telemetry cannot alias unrelated sessions.
+    let event = Event::new(RunId::new(), kind, payload);
     projector::insert_event(&conn, &event)?;
     Ok(())
+}
+
+/// Persist a caller-created final delivery event. Event ID is the exposure handle.
+pub fn record_context_exposure(start: &Path, event: &Event) -> KimetsuResult<()> {
+    if event.kind != "context.injected"
+        || event.payload.get("memory_revisions").is_none()
+        || event.run_id.0 == ulid::Ulid::nil()
+    {
+        return Err("exposure requires final delivered revision map".into());
+    }
+    let (paths, _, conn) = load_project(start)?;
+    let _lock = ProjectLock::acquire(&paths, "context exposure", Some(event.run_id))?;
+    projector::apply_events(&conn, std::slice::from_ref(event))
+}
+
+fn load_exposure(
+    conn: &Connection,
+    exposure_id: &str,
+) -> KimetsuResult<(RunId, serde_json::Value)> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT run_id,payload_json FROM events WHERE event_id=?1 AND kind='context.injected'",
+            [exposure_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (run, payload) = row.ok_or("unknown context exposure")?;
+    Ok((
+        RunId(run.parse::<ulid::Ulid>()?),
+        serde_json::from_str(&payload)?,
+    ))
+}
+
+/// Record reliance on exactly one delivered claim. This does not verify truth
+/// or credit success. Repeated citations for an exposure/memory are idempotent.
+pub fn record_exposure_citation(
+    start: &Path,
+    exposure_id: &str,
+    memory_id: &str,
+    note: Option<&str>,
+) -> KimetsuResult<()> {
+    let (paths, _, conn) = load_project(start)?;
+    let _lock = ProjectLock::acquire(&paths, "exposure citation", None)?;
+    projector::with_write_txn(&conn, |conn| {
+        let (run, payload) = load_exposure(conn, exposure_id)?;
+        if !payload["memory_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(memory_id)))
+        {
+            return Err("memory was not delivered in this exposure".into());
+        }
+        let revision = payload["memory_revisions"][memory_id]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("delivered claim is unbound")?;
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='memory.cited' AND json_extract(payload_json,'$.exposure_id')=?1 AND json_extract(payload_json,'$.memory_id')=?2)",rusqlite::params![exposure_id,memory_id],|r|r.get(0))?;
+        if exists {
+            return Ok(());
+        }
+        let event = Event::new(
+            run,
+            "memory.cited",
+            serde_json::json!({"memory_id":memory_id,"revision_event_id":revision,"exposure_id":exposure_id,"rationale":note,"evidence_kind":"reliance"}),
+        );
+        projector::apply_event(conn, &event)
+    })
+}
+
+/// Observed run outcome for an actual exposure. Unknown outcomes do nothing.
+/// No retrieval or invented citations occur here. One outcome per exposure run.
+pub fn record_exposure_outcome(
+    start: &Path,
+    exposure_id: &str,
+    passed: Option<bool>,
+) -> KimetsuResult<usize> {
+    let Some(passed) = passed else { return Ok(0) };
+    let (paths, _, conn) = load_project(start)?;
+    let _lock = ProjectLock::acquire(&paths, "exposure outcome", None)?;
+    let mut count = 0;
+    projector::with_write_txn(&conn, |conn| {
+        let (run, payload) = load_exposure(conn, exposure_id)?;
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind IN ('run.finished','run.failed','run.aborted'))",[run.to_string()],|r|r.get(0))?;
+        if exists {
+            return Ok(());
+        }
+        count = payload["memory_ids"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| {
+                        id.as_str()
+                            .is_some_and(|id| payload["memory_revisions"][id].as_str().is_some())
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let event = Event::new(
+            run,
+            if passed { "run.finished" } else { "run.failed" },
+            serde_json::json!({"exposure_id":exposure_id,"evidence_kind":"outcome_association"}),
+        );
+        projector::apply_event(conn, &event)
+    })?;
+    Ok(count)
 }
 
 /// v1.5: scan `events` for `memory.cited` entries and, for each cited
@@ -168,7 +262,7 @@ pub fn emit_regret_for_cited_memories(start: &Path, events: &[kimetsu_core::even
 
 /// v1.5: write a `memory.cited` event from the MCP `kimetsu_brain_cite` tool.
 ///
-/// Uses the same sentinel run_id as [`log_telemetry_event`] (all-zero ULID)
+/// Legacy explicit manual reliance without a delivered exposure.
 /// so no corresponding `runs` row is required. The event is inserted then
 /// projected (populating `memory_citations`) in one connection, and the
 /// regret sidecar is checked best-effort.
@@ -176,14 +270,10 @@ pub fn record_mcp_citation(start: &Path, memory_id: &str, note: Option<&str>) ->
     record_citations(start, &[memory_id.to_string()], note, None)
 }
 
-/// v2.5.2 consolidation v1: record one or more standalone citations as a
-/// GROUP. All memories share a fresh run_id, which is what makes them
-/// co-cited (`brain reinforce --staple` staples pairs that answer together
-/// repeatedly). `query` links the citations to the question they answered,
-/// feeding the `query_routes` derived index. The `standalone: true` payload
-/// flag tells the projector to apply the cited-outcome delta immediately
-/// (there is no terminal run event coming), replacing the old nil-run gate
-/// so grouped citations still bump usefulness.
+/// Record explicit manual reliance as a group for co-citation analysis. These
+/// legacy unscoped citations do not update outcome statistics or verify claims.
+/// Query text is retained only when learning.store_queries is enabled. Callers
+/// with delivered context should use record_exposure_citation instead.
 pub fn record_citations(
     start: &Path,
     memory_ids: &[String],
@@ -197,6 +287,9 @@ pub fn record_citations(
     let conn = Connection::open(&paths.brain_db)?;
     schema::initialize(&conn)?;
 
+    let store_queries = crate::project::load_config(&paths)
+        .map(|cfg| cfg.learning.store_queries)
+        .unwrap_or(false);
     let group_run_id = RunId::new();
     let mut events = Vec::with_capacity(memory_ids.len());
     for (turn, memory_id) in memory_ids.iter().enumerate() {
@@ -208,7 +301,7 @@ pub fn record_citations(
         if let Some(n) = note {
             payload["rationale"] = serde_json::json!(n);
         }
-        if let Some(q) = query {
+        if let Some(q) = query.filter(|_| store_queries) {
             payload["query"] = serde_json::json!(q);
         }
         events.push(kimetsu_core::event::Event::new(

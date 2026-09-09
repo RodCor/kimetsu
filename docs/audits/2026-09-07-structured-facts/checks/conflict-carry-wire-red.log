@@ -1,0 +1,29 @@
+   Compiling kimetsu-cli v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-cli)
+warning: linker stdout: Creando biblioteca E:\Kimetsu\target\debug\deps\kimetsu-aabe805e13f18efb.lib y objeto E:\Kimetsu\target\debug\deps\kimetsu-aabe805e13f18efb.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kimetsu-cli` (bin "kimetsu" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.04s
+     Running unittests src\main.rs (E:/Kimetsu/target\debug\deps\kimetsu-aabe805e13f18efb.exe)
+
+running 1 test
+test embed_daemon::proto::conflict_wire_tests::response_preserves_conflicts_after_capsules_have_been_trimmed ... FAILED
+
+failures:
+
+---- embed_daemon::proto::conflict_wire_tests::response_preserves_conflicts_after_capsules_have_been_trimmed stdout ----
+
+thread 'embed_daemon::proto::conflict_wire_tests::response_preserves_conflicts_after_capsules_have_been_trimmed' (5232) panicked at crates\kimetsu-cli\src\embed_daemon\proto.rs:186:9:
+assertion `left == right` failed
+  left: Null
+ right: Array [String("port")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    embed_daemon::proto::conflict_wire_tests::response_preserves_conflicts_after_capsules_have_been_trimmed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 281 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kimetsu-cli --bin kimetsu`

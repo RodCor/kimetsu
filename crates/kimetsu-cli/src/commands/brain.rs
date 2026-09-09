@@ -244,6 +244,24 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
         BrainCommand::Reflect(args) => brain_reflect(args),
         BrainCommand::Triage(args) => brain_triage(args),
         BrainCommand::Forget(args) => brain_forget(args),
+        BrainCommand::Archives => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&kimetsu_brain::lifecycle::list_archived(
+                    &env::current_dir()?
+                )?)?
+            );
+            Ok(())
+        }
+        BrainCommand::Restore { memory_id } => {
+            let restored =
+                kimetsu_brain::lifecycle::restore_memory(&env::current_dir()?, &memory_id)?;
+            println!(
+                "{}",
+                serde_json::json!({"memory_id":memory_id,"restored":restored})
+            );
+            Ok(())
+        }
         BrainCommand::Cite(args) => brain_cite(args),
         BrainCommand::Reinforce(args) => brain_reinforce(args),
         BrainCommand::BenchmarkCredit(args) => brain_benchmark_credit(args),
@@ -542,7 +560,14 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
     // below: a brain with nothing to say still needs its upkeep.
     spawn_maintenance_if_due(workspace);
 
-    let Some(additional_context) = warm_start_context(workspace) else {
+    let mut input = String::new();
+    use std::io::Read;
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let payload: serde_json::Value = serde_json::from_str(input.trim()).unwrap_or_default();
+    let identity = kimetsu_brain::episode::requested_identity(&payload).unwrap_or("");
+    let Some(additional_context) =
+        kimetsu_brain::digest::warm_start_block_scoped(workspace, identity)
+    else {
         return Ok(());
     };
 
@@ -556,15 +581,6 @@ pub(crate) fn brain_session_start_hook(workspace: &Path) -> KimetsuResult<()> {
     });
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
-}
-
-/// Assemble the warm-start block: repo digest + episodic resume.
-///
-/// Thin wrapper over [`kimetsu_brain::digest::warm_start_block`], which the
-/// MCP server shares so Cursor — no hooks, no session-start surface — gets the
-/// same block on its first `kimetsu_brain_context` call.
-pub(crate) fn warm_start_context(workspace: &Path) -> Option<String> {
-    kimetsu_brain::digest::warm_start_block(workspace)
 }
 
 /// Normalize a user-supplied time into RFC 3339.
@@ -697,12 +713,12 @@ pub(crate) fn brain_audit(args: AuditArgs) -> KimetsuResult<()> {
     println!();
     println!(
         "{:<12} {:>8} {:>14} {:>9}",
-        "origin", "total", "corroborated", "unvetted"
+        "origin", "total", "associated", "unvetted"
     );
     for group in &report.groups {
         println!(
             "{:<12} {:>8} {:>14} {:>9}",
-            group.provenance, group.total, group.corroborated, group.unvetted
+            group.provenance, group.total, group.associated, group.unvetted
         );
     }
 
@@ -1186,9 +1202,8 @@ pub(crate) fn brain_compact(args: CompactArgs) -> KimetsuResult<()> {
     // Print warnings before performing any destructive operations.
     if let Some(ref dur_str) = args.trim_events_older_than {
         eprintln!(
-            "WARNING: --trim-events-older-than {dur_str} will delete events older than \
-             {dur_str} from the durable event log. Materialized memories are unaffected, \
-             but the rebuild history window will be reduced."
+            "Trimming expendable telemetry older than {dur_str}; retaining durable \
+             claim, exposure and outcome history for rebuilds."
         );
     }
     if args.purge_invalidated {
@@ -1900,8 +1915,14 @@ pub(crate) fn try_daemon_retrieve(
             capsules,
             skipped,
             top_score,
+            known_fact_conflicts,
         }) => Some(daemon_capsules_to_bundle(
-            workspace, request, capsules, skipped, top_score,
+            workspace,
+            request,
+            capsules,
+            skipped,
+            top_score,
+            known_fact_conflicts,
         )),
         _ => {
             // Unreachable/errored: we already know it didn't answer, so spawn
@@ -1931,11 +1952,19 @@ pub(crate) fn daemon_capsules_to_bundle(
     capsules: Vec<embed_daemon::proto::Capsule>,
     skipped: bool,
     top_score: f32,
+    known_fact_conflicts: Vec<String>,
 ) -> kimetsu_brain::context::ContextBundle {
     use kimetsu_brain::context::{ContextBundle, ContextCapsule};
     let capsules: Vec<ContextCapsule> = capsules
         .into_iter()
-        .map(|c| ContextCapsule::wire_minimal(c.summary, c.kind, c.score))
+        .map(|c| {
+            let mut capsule = ContextCapsule::wire_minimal(c.summary, c.kind, c.score);
+            capsule.id = c.id;
+            capsule.expansion_handle = c.expansion_handle;
+            capsule.claim_revision = c.claim_revision;
+            capsule.facts = c.facts;
+            capsule
+        })
         .collect();
     // v2.6: measure coverage here too. The in-process path does it during
     // finalization, which this path skips — so without this the "memory does
@@ -1962,6 +1991,7 @@ pub(crate) fn daemon_capsules_to_bundle(
         // Ordering queries never reach the daemon (`try_daemon_retrieve`
         // declines them), so a bundle from here is never time-ordered.
         chronological: false,
+        known_fact_conflicts,
     }
 }
 
@@ -2331,7 +2361,12 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         let entries = per_memory_roi(&conn, window, limit)?;
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&entries)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"estimate_label":report.estimate_label,"model":report.model,"assumptions":report.assumptions,"memories":entries})
+                )?
+            );
             return Ok(());
         }
 
@@ -2339,13 +2374,13 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
             Some(d) => format!("last {d} days"),
             None => "all time".to_string(),
         };
-        println!("── ROI Top Memories ({window_label}, top {limit}) ─────");
+        println!("── Estimated ROI Top Memories ({window_label}, top {limit}) ─────");
         if entries.is_empty() {
             println!("  No citations recorded yet.");
         } else {
             for (i, e) in entries.iter().enumerate() {
                 println!(
-                    "  #{:>2}  [{:>15}]  cites={:>3}  saved={:>6} tok  {}",
+                    "  #{:>2}  [{:>15}]  cites={:>3}  estimated_saved={:>6} tok  {}",
                     i + 1,
                     e.kind,
                     e.citation_count,
@@ -2373,7 +2408,14 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         Some(d) => format!("last {d} days"),
         None => "all time".to_string(),
     };
-    println!("── ROI Ledger ({window_label}) ────────────────────────");
+    println!("── Estimated ROI Ledger ({window_label}) ────────────────────────");
+    println!("  {}", report.estimate_label);
+    println!("  model: {}", report.model);
+    println!("  assumptions: {}", report.assumptions);
+    println!(
+        "  delivered cost by unit: {:?}",
+        report.delivered_cost_by_unit
+    );
     println!("  served events:        {}", report.served_events);
     // S2.4(c): show warm-start events.
     if report.digest_served_events > 0 || report.resume_served_events > 0 {
@@ -2386,7 +2428,7 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     }
     println!("  citations:            {}", report.citations);
     println!(
-        "  injected tokens:      {}",
+        "  overhead estimate:      {}",
         format_token_count(report.injected_tokens)
     );
     // S2.4(b): output token estimate.
@@ -2399,7 +2441,10 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         format_token_count(report.estimated_saved_tokens)
     );
     let net_sign = if report.net_tokens >= 0 { "+" } else { "" };
-    println!("  net tokens:           {net_sign}{}", report.net_tokens);
+    println!(
+        "  estimated net tokens:           {net_sign}{}",
+        report.net_tokens
+    );
 
     if let Some(ref usd) = report.usd {
         println!(
@@ -2430,12 +2475,12 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
     } else if report.net_tokens >= 0 {
         match &report.usd {
             Some(u) if u.net >= 0.0 => println!(
-                "  Net positive: kimetsu saved you ~{} tokens (~${:.4}) this window.",
+                "  Model estimate: potential savings ~{} tokens (~${:.4}) this window.",
                 format_token_count(report.estimated_saved_tokens),
                 u.net,
             ),
             _ => println!(
-                "  Net positive: kimetsu saved you ~{} tokens this window.",
+                "  Model estimate: potential savings ~{} tokens this window.",
                 format_token_count(report.estimated_saved_tokens),
             ),
         }
@@ -2443,7 +2488,7 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
         // Honest negative.
         match &report.usd {
             Some(u) => println!(
-                "  Net negative: brain overhead exceeded savings by ~{} tokens (~${:.4}) this window.",
+                "  Model estimate: overhead exceeds assumed savings by ~{} tokens (~${:.4}) this window.",
                 format_token_count(
                     report
                         .injected_tokens
@@ -2452,7 +2497,7 @@ pub(crate) fn brain_roi(args: RoiArgs) -> KimetsuResult<()> {
                 (u.spent - u.saved).abs(),
             ),
             None => println!(
-                "  Net negative: brain overhead exceeded savings by ~{} tokens this window.",
+                "  Model estimate: overhead exceeds assumed savings by ~{} tokens this window.",
                 format_token_count(
                     report
                         .injected_tokens
@@ -2496,7 +2541,7 @@ pub(crate) fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
     let noise_count = eval.noise_count;
 
     let readiness = if positive_count >= 30 {
-        "READY — enough cases for a meaningful sweep."
+        "READY for weak-positive diagnostics; independent families and negative gold are required for apply."
     } else {
         "accumulating — synthetic fixture will be used for the sweep (< 30 positive cases)."
     };
@@ -2505,8 +2550,8 @@ pub(crate) fn brain_tune(args: TuneArgs) -> KimetsuResult<()> {
     let kind_coverage = kind_coverage_from_eval(&conn, &eval.cases);
 
     println!("=== kimetsu brain tune --status ===");
-    println!("Positive cases (query + ≥1 cited memory): {positive_count}");
-    println!("Noise entries  (served, no citation):     {noise_count}");
+    println!("Weak reliance cases (query + exact cited claim): {positive_count}");
+    println!("Unknown exposures (no usable exact citation):     {noise_count}");
     if let Some(o) = &eval.oldest {
         println!("Oldest positive case: {o}");
     }
@@ -2655,328 +2700,248 @@ pub(crate) fn brain_tune_sweep(
     args: TuneArgs,
     eval: kimetsu_brain::tuneset::PersonalEval,
 ) -> KimetsuResult<()> {
-    use kimetsu_brain::context::{ContextRequest, rerank_capsules};
-    use kimetsu_brain::embeddings::{open_embedder_for, open_reranker_for_model};
-    use kimetsu_brain::eval::{mean, mrr};
-    use kimetsu_brain::project::BrainSession;
-    use kimetsu_brain::tune::{
-        ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history,
-        compute_objective_with_regret, count_regret_events, select_winner, train_holdout_split,
+    use kimetsu_brain::{
+        context::ContextRequest,
+        embeddings::{open_embedder_for_checked, open_reranker_checked},
+        eval::{EvaluationMetrics, summarize_deliveries},
+        project::BrainSession,
+        serving::{EVAL_EXPOSURE_ID, ServingPolicy},
+        tune::{
+            ComboResult, TuneCombo, TuneHistoryEntry, append_tune_history, compute_objective,
+            grouped_train_holdout_split, select_winner,
+        },
     };
     use std::collections::HashMap;
     use time::format_description::well_known::Rfc3339;
-
-    let config = project::load_config(paths)?;
-    // Tune against the PRODUCTION retrieval pipeline: the same embedder
-    // resolution as retrieve_context_with_request. On embeddings builds this
-    // loads the real model (semantic floors only discriminate with real
-    // cosines); lean builds degrade to Noop and sweep FTS-only — the status
-    // output should make that visible to the user.
-    let embedder = open_embedder_for(config.embedder.enabled);
-    if embedder.is_noop() {
-        println!(
-            "note: lean build/embedder disabled — sweeping FTS-only retrieval \
-             (semantic floor values will not differentiate)"
-        );
+    if !args.cost_weight.is_finite() || args.cost_weight < 0.0 {
+        return Err("cost_weight must be finite and nonnegative".into());
     }
+    let config = project::load_config(paths)?;
+    let embedder = open_embedder_for_checked(config.embedder.enabled)?;
+    let policy = ServingPolicy::from_config(&config);
     let current_combo = TuneCombo {
         min_lexical_coverage: config.broker.min_lexical_coverage,
         min_semantic_score: config.broker.min_semantic_score,
         reranker_id: config.embedder.reranker.clone(),
         fusion: config.broker.fusion.clone(),
     };
-
-    // Choose eval cases: personal if READY, else fall back to fixture.
-    let fallback_fixture_path = std::path::Path::new("fixtures/eval-retrieval.json");
-    let (cases, using_personal) = if eval.cases.len() >= 30 {
-        (eval.cases.clone(), true)
-    } else {
-        // Load the committed fixture.
-        if !fallback_fixture_path.exists() {
-            println!(
-                "note: fewer than 30 personal eval cases ({}) and no fixture at {}. \
-                 Sweep skipped. Accumulate more sessions with store_queries=true.",
-                eval.cases.len(),
-                fallback_fixture_path.display()
-            );
-            return Ok(());
-        }
-        let text = std::fs::read_to_string(fallback_fixture_path)
-            .map_err(|e| format!("read fixture: {e}"))?;
-        let fixture: kimetsu_brain::eval::EvalFixture =
-            serde_json::from_str(&text).map_err(|e| format!("parse fixture: {e}"))?;
-        // Fixture uses key-based relevance, not memory_ids. For the sweep
-        // we need memory_ids. We cannot map them here (fixture is hermetic).
-        // Instead: use fixture cases as-is for MRR calculation but note that
-        // relevant ids won't match real DB memories → MRR will be 0.
-        // The sweep is still meaningful for comparing COMBOS relatively.
-        let eval_cases: Vec<kimetsu_brain::eval::EvalCase> = fixture
-            .cases
-            .into_iter()
-            .map(|c| kimetsu_brain::eval::EvalCase {
-                query: c.query,
-                relevant: c.relevant,
-                kind: Default::default(),
-                stale: Vec::new(),
-            })
-            .collect();
-        (eval_cases, false)
-    };
-
-    if !using_personal {
-        println!(
-            "note: fewer than 30 personal eval cases ({}). Using fixture file for relative sweep.",
-            eval.cases.len()
-        );
-        // Fix 3: guard --apply behind personal data.
-        // In fixture mode MRR≡0 for every combo (fixture IDs don't match real
-        // memories), so the objective degenerates to pure token-minimisation.
-        // Applying the resulting floors would optimise for fewer tokens at the
-        // cost of recall.  Refuse --apply until the user has ≥30 cited cases.
-        if args.apply {
-            println!(
-                "note: fixture mode is relative-only — --apply refused. \
-                 Accumulate ≥30 cited cases first (see `kimetsu brain tune --status`)."
-            );
-            return Ok(());
+    struct FixtureRoot(std::path::PathBuf);
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-
-    let n = cases.len();
-    if n == 0 {
-        println!("No eval cases available. Run more sessions with store_queries=true.");
+    let mut fixture_root = None;
+    let using_personal = eval.cases.len() >= 30;
+    let cases = if using_personal {
+        eval.cases.clone()
+    } else {
+        let fixture_path = std::path::Path::new("fixtures/eval-retrieval.json");
+        if !fixture_path.exists() {
+            println!(
+                "Fewer than 30 personal weak-label cases and no fixture; no measurable sweep."
+            );
+            return Ok(());
+        }
+        let fixture: kimetsu_brain::eval::EvalFixture =
+            serde_json::from_str(&std::fs::read_to_string(fixture_path)?)?;
+        let root = std::env::temp_dir().join(format!("kimetsu-tune-fixture-{}", ulid::Ulid::new()));
+        kimetsu_core::paths::git_init_boundary(&root);
+        let guard = FixtureRoot(root.clone());
+        project::init_project(&root, false)?;
+        let fixture_paths = kimetsu_core::paths::ProjectPaths::discover(&root)?;
+        let mut fixture_config = config.clone();
+        fixture_config.kimetsu.use_user_brain = false;
+        std::fs::write(
+            &fixture_paths.project_toml,
+            toml::to_string_pretty(&fixture_config)?,
+        )?;
+        let mut ids = HashMap::new();
+        for mem in &fixture.memories {
+            let id = project::add_memory_with_validity(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                &mem.text,
+                None,
+                mem.valid_to.as_deref(),
+            )?;
+            ids.insert(mem.key.clone(), id);
+        }
+        let (_, _, conn) = project::load_project(&root)?;
+        for mem in &fixture.memories {
+            if let Some(next) = &mem.superseded_by_key {
+                let survivor = ids
+                    .get(next)
+                    .ok_or("fixture references missing superseding key")?;
+                conn.execute(
+                    "UPDATE memories SET superseded_by=?2 WHERE memory_id=?1",
+                    rusqlite::params![ids[&mem.key], survivor],
+                )?;
+            }
+        }
+        let mut cases = fixture.cases;
+        for case in &mut cases {
+            for id in case.relevant.iter_mut().chain(&mut case.stale) {
+                *id = ids
+                    .get(id)
+                    .ok_or("fixture references missing memory key")?
+                    .clone();
+            }
+        }
+        println!(
+            "Using a hermetic seeded fixture: {} positive/negative cases; personal weak labels {}, unknown {}. Fixture results cannot authorize changes to this brain.",
+            cases.len(),
+            eval.cases.len(),
+            eval.noise_count
+        );
+        fixture_root = Some(guard);
+        cases
+    };
+    let evaluation_workspace = fixture_root
+        .as_ref()
+        .map(|g| g.0.as_path())
+        .unwrap_or(workspace);
+    let split = grouped_train_holdout_split(&cases);
+    if split.train.is_empty() || split.holdout.is_empty() {
+        println!(
+            "Only {} independent families; no independent train/holdout comparison is available. No validated tuning recommendation.",
+            split.family_count
+        );
         return Ok(());
     }
-
-    let (train_idx, holdout_idx) = train_holdout_split(n);
-    let train_cases: Vec<&kimetsu_brain::eval::EvalCase> =
-        train_idx.iter().map(|&i| &cases[i]).collect();
-    let holdout_cases: Vec<&kimetsu_brain::eval::EvalCase> =
-        holdout_idx.iter().map(|&i| &cases[i]).collect();
-
-    println!(
-        "Sweep: {} combos × {} train / {} holdout cases",
-        kimetsu_brain::tune::TuneCombo::all_combos().len(),
-        train_cases.len(),
-        holdout_cases.len()
-    );
-
-    // Cache reranker handles (load once, reuse).
-    let mut reranker_cache: HashMap<String, Option<Box<dyn kimetsu_brain::embeddings::Reranker>>> =
-        HashMap::new();
-    for rr_id in kimetsu_brain::tune::RERANKER_IDS {
-        let rr: Option<Box<dyn kimetsu_brain::embeddings::Reranker>> = if *rr_id == "off" {
-            None
-        } else {
-            open_reranker_for_model(rr_id)
-        };
-        reranker_cache.insert(rr_id.to_string(), rr);
+    let train_cases: Vec<_> = split.train.iter().map(|&i| &cases[i]).collect();
+    let holdout_cases: Vec<_> = split.holdout.iter().map(|&i| &cases[i]).collect();
+    let mut reranker_cache = HashMap::new();
+    for id in kimetsu_brain::tune::RERANKER_IDS
+        .iter()
+        .copied()
+        .chain(std::iter::once(current_combo.reranker_id.as_str()))
+    {
+        if !reranker_cache.contains_key(id) {
+            reranker_cache.insert(id.to_string(), open_reranker_checked(id));
+        }
     }
-
-    // Helper: evaluate one combo over a slice of cases.
-    let evaluate_cases =
-        |combo: &TuneCombo, case_slice: &[&kimetsu_brain::eval::EvalCase]| -> (f64, f64) {
-            let session = match BrainSession::open_readonly(workspace) {
-                Ok(s) => s,
-                Err(_) => return (0.0, 0.0),
+    if let Some(Err(error)) = reranker_cache.get(&current_combo.reranker_id) {
+        println!("Baseline unavailable: {error}. No measured comparison or recommendation.");
+        return Ok(());
+    }
+    let session = BrainSession::open_readonly(evaluation_workspace)?;
+    let evaluate_cases = |combo: &TuneCombo,
+                          cases: &[&kimetsu_brain::eval::EvalCase]|
+     -> KimetsuResult<EvaluationMetrics> {
+        let rr = reranker_cache
+            .get(&combo.reranker_id)
+            .ok_or("missing reranker")?
+            .as_ref()
+            .map_err(|e| e.clone())?
+            .as_deref();
+        let mut ranked = Vec::new();
+        let mut costs = Vec::new();
+        for case in cases {
+            let request = ContextRequest {
+                query: case.query.clone(),
+                stage: "localization".into(),
+                min_score: 0.15,
+                min_semantic_score_override: Some(combo.min_semantic_score),
+                min_lexical_coverage_override: Some(combo.min_lexical_coverage),
+                fusion: combo.fusion.clone(),
+                ..Default::default()
             };
-            let rr_ref = reranker_cache
-                .get(&combo.reranker_id)
-                .and_then(|r| r.as_deref());
-            let rerank_floor = 0.30f32;
-            let rerank_cap = 4usize;
-            let pool = 8usize;
-
-            let mut mrr_vals: Vec<f64> = Vec::new();
-            let mut token_vals: Vec<f64> = Vec::new();
-
-            for case in case_slice {
-                let request = ContextRequest {
-                    stage: "localization".to_string(),
-                    query: case.query.clone(),
-                    budget_tokens: 6000,
-                    max_capsules: pool,
-                    min_semantic_score: combo.min_semantic_score,
-                    min_lexical_coverage: combo.min_lexical_coverage,
-                    fusion: combo.fusion.clone(),
-                    ..Default::default()
-                };
-                let mut bundle =
-                    match session.retrieve_context_with_injected_embedder(request, embedder) {
-                        Ok(b) => b,
-                        Err(_) => continue,
-                    };
-                if let Some(rr) = rr_ref {
-                    bundle.capsules =
-                        rerank_capsules(&case.query, bundle.capsules, rr, rerank_floor, rerank_cap);
-                }
-
-                let ranked_ids: Vec<String> = bundle
+            let delivery = policy.retrieve(&session, request, embedder, rr, EVAL_EXPOSURE_ID)?;
+            ranked.push(
+                delivery
                     .capsules
                     .iter()
-                    .filter_map(|c| {
+                    .map(|c| {
                         c.expansion_handle
                             .strip_prefix("memory:")
-                            .map(str::to_string)
+                            .unwrap_or(&c.expansion_handle)
+                            .to_string()
                     })
-                    .collect();
-
-                let mrr_val = mrr(&ranked_ids, &case.relevant);
-                mrr_vals.push(mrr_val);
-
-                let tokens: f64 = bundle
-                    .capsules
-                    .iter()
-                    .map(|c| c.token_estimate as f64)
-                    .sum();
-                token_vals.push(tokens);
-            }
-
-            (mean(&mrr_vals), mean(&token_vals))
-        };
-
-    // S2.3: Compute global regret rate from the DB for the objective penalty.
-    // We use the ALL-TIME regret / served ratio here (the sweep window is the
-    // full personal eval set, which spans all time).
-    // Best-effort: if the DB cannot be opened, regret_rate and memory_count
-    // degrade gracefully to 0 (objective falls back to v1.5 formula).
-    let (global_regret_rate, current_memory_count) = {
-        match kimetsu_brain::project::load_project_readonly(workspace) {
-            Ok((_paths_ro, _cfg_ro, conn_ro)) => {
-                let total_regrets = count_regret_events(&conn_ro, None, None).unwrap_or(0);
-                let total_served: u64 = conn_ro
-                    .query_row(
-                        "SELECT COUNT(*) FROM events WHERE kind = 'context.served'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                let regret_rate = if total_served > 0 {
-                    total_regrets as f64 / total_served as f64
-                } else {
-                    0.0
-                };
-                let mem_count: u64 = conn_ro
-                    .query_row(
-                        "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                (regret_rate, mem_count)
-            }
-            Err(_) => (0.0_f64, 0_u64),
+                    .collect(),
+            );
+            costs.push(
+                delivery.payload["used_tokens"]
+                    .as_u64()
+                    .ok_or("missing delivery cost")? as u32,
+            );
         }
+        Ok(summarize_deliveries(cases, &ranked, &costs)?)
     };
-
-    // Evaluate current config on holdout for baseline.
-    let (baseline_holdout_mrr, baseline_holdout_tokens) =
-        evaluate_cases(&current_combo, &holdout_cases);
-    let baseline_holdout_obj = compute_objective_with_regret(
-        baseline_holdout_mrr,
-        baseline_holdout_tokens,
-        args.cost_weight,
-        global_regret_rate,
-    );
-
-    // Sweep all combos on TRAIN set.
-    let all_combos = TuneCombo::all_combos();
-    let mut combo_results: Vec<ComboResult> = Vec::new();
-
-    for (i, combo) in all_combos.iter().enumerate() {
-        if i % 10 == 0 {
-            print!("\r  sweeping combo {}/{} ...", i + 1, all_combos.len());
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+    let objective = |m: &EvaluationMetrics| {
+        compute_objective(
+            m.quality.unwrap_or(0.0),
+            m.mean_final_bound,
+            args.cost_weight,
+        )
+    };
+    let baseline = evaluate_cases(&current_combo, &holdout_cases)?;
+    let baseline_holdout_obj = objective(&baseline);
+    let mut combo_results = Vec::new();
+    let mut measurements = HashMap::new();
+    for combo in TuneCombo::all_combos() {
+        if reranker_cache
+            .get(&combo.reranker_id)
+            .is_none_or(|r| r.is_err())
+        {
+            continue;
         }
-        let (mmrr, mtok) = evaluate_cases(combo, &train_cases);
-        // S2.3: include regret penalty in the objective.
-        let obj = compute_objective_with_regret(mmrr, mtok, args.cost_weight, global_regret_rate);
+        let metrics = evaluate_cases(&combo, &train_cases)?;
         combo_results.push(ComboResult {
             combo: combo.clone(),
-            mean_mrr: mmrr,
-            mean_tokens: mtok,
-            objective: obj,
+            mean_mrr: metrics.mrr.unwrap_or(0.0),
+            mean_tokens: metrics.mean_final_bound,
+            objective: objective(&metrics),
         });
+        measurements.insert(serde_json::to_string(&combo)?, metrics);
     }
-    println!();
-
-    let winner = match select_winner(&combo_results) {
-        Some(w) => w,
-        None => {
-            println!("No combos evaluated. Nothing to tune.");
-            return Ok(());
-        }
+    let Some(winner) = select_winner(&combo_results) else {
+        println!("No available models produced measurements.");
+        return Ok(());
     };
-
-    // Evaluate winner on HOLDOUT (with regret penalty for consistency).
-    let (holdout_mrr, holdout_tokens) = evaluate_cases(&winner.combo, &holdout_cases);
-    let holdout_obj = compute_objective_with_regret(
-        holdout_mrr,
-        holdout_tokens,
-        args.cost_weight,
-        global_regret_rate,
-    );
+    let train_metrics = &measurements[&serde_json::to_string(&winner.combo)?];
+    let holdout = evaluate_cases(&winner.combo, &holdout_cases)?;
+    let holdout_mrr = holdout.mrr.unwrap_or(0.0);
+    let holdout_obj = objective(&holdout);
     let improvement = holdout_obj - baseline_holdout_obj;
-
-    println!();
-    println!("=== Tune Sweep Results ===");
+    let current_memory_count = project::load_project_readonly(workspace)?.2.query_row(
+        "SELECT COUNT(*) FROM memories WHERE invalidated_at IS NULL",
+        [],
+        |r| r.get::<_, u64>(0),
+    )?;
+    let measurement = serde_json::json!({"policy":"canonical_brain_context_v1","cost_unit":"serialized_utf8_byte_bound","budget":policy.budget,"cap":policy.cap,"pool":policy.pool,"rerank_floor":policy.rerank_floor,"cost_weight_per_unit":args.cost_weight,"lambda":args.cost_weight*f64::from(policy.budget),"quality_formula":"mean of available positive MRR and known-negative abstention accuracy","embedder_actual":embedder.model_id(),"family_count":split.family_count,"train":train_metrics,"holdout":holdout,"baseline_holdout":baseline,"historical_regret":"diagnostic_only","ambient":"disabled; effective query is the fixture/stored query","warm_start":"not replayed","labels":if using_personal {"weak_reliance"}else{"explicit_fixture"}});
     println!(
-        "Current config:  lex={:.2} sem={:.3} rr={}",
-        current_combo.min_lexical_coverage,
-        current_combo.min_semantic_score,
-        current_combo.reranker_id
+        "Sweep: {} available combos, {} train / {} holdout cases in {} independent families",
+        combo_results.len(),
+        train_cases.len(),
+        holdout_cases.len(),
+        split.family_count
     );
+    println!("Best combo: {}", serde_json::to_string(&winner.combo)?);
     println!(
-        "Best combo:      lex={:.2} sem={:.3} rr={}",
-        winner.combo.min_lexical_coverage,
-        winner.combo.min_semantic_score,
-        winner.combo.reranker_id
+        "Train objective {:.6}; holdout {:.6} vs baseline {:.6} (difference {:+.6})",
+        winner.objective, holdout_obj, baseline_holdout_obj, improvement
     );
-    println!(
-        "Train objective: {:.4}  (MRR {:.4}, avg_tokens {:.1})",
-        winner.objective, winner.mean_mrr, winner.mean_tokens
-    );
-    println!(
-        "Holdout objective: {:.4} vs baseline {:.4} (improvement: {:+.4})",
-        holdout_obj, baseline_holdout_obj, improvement
-    );
-
+    println!("{}", serde_json::to_string_pretty(&measurement)?);
     if improvement < 0.01 {
-        println!();
+        println!("No change recommended: held-out objective difference is below 0.01.");
+        return Ok(());
+    }
+    if !using_personal || train_metrics.negative_count == 0 || holdout.negative_count == 0 {
         println!(
-            "verdict: no change recommended (holdout improvement {improvement:+.4} < 0.01 threshold)"
+            "Diagnostic comparison only: application requires personal data and explicit negative coverage in both partitions. No validated all-query improvement is claimed."
         );
         return Ok(());
     }
-
-    println!();
-    // Reranker change recommendation (never auto-applied).
     if winner.combo.reranker_id != current_combo.reranker_id {
         println!(
-            "note: reranker change recommended ({} → {}) — apply manually after \
-             downloading the model and restarting the MCP daemon.",
-            current_combo.reranker_id, winner.combo.reranker_id
+            "Winning reranker differs; no partial configuration application is measured. Apply a complete reviewed configuration manually."
         );
+        return Ok(());
     }
-
     if !args.apply {
-        if !using_personal {
-            println!(
-                "note: fixture mode — results are relative only; \
-                 --apply is disabled until you have ≥30 cited cases."
-            );
-        }
-        println!(
-            "DRY RUN — to apply: kimetsu brain tune --apply\n\
-             (lex {:.2}→{:.2}, sem {:.3}→{:.3}, fusion {}→{})",
-            current_combo.min_lexical_coverage,
-            winner.combo.min_lexical_coverage,
-            current_combo.min_semantic_score,
-            winner.combo.min_semantic_score,
-            current_combo.fusion,
-            winner.combo.fusion,
-        );
+        println!("Dry run; use --apply to save the complete evaluated configuration.");
         return Ok(());
     }
 
@@ -3024,6 +2989,7 @@ pub(crate) fn brain_tune_sweep(
         baseline_holdout_objective: baseline_holdout_obj,
         // S2.1: record corpus size so re-tune trigger can detect growth.
         memory_count_at_tune: Some(current_memory_count),
+        measurement: Some(measurement),
     };
     append_tune_history(&paths.kimetsu_dir, history_entry)?;
 
@@ -3620,22 +3586,28 @@ pub(crate) fn brain_benchmark_credit(args: BenchmarkCreditArgs) -> KimetsuResult
     let workspace = args
         .workspace
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
-    let credited = kimetsu_brain::reinforce::credit_benchmark_outcome(
-        &workspace,
-        &args.task,
-        args.passed,
-        args.top_k,
-    )?;
+    let credited = if let Some(exposure) = args.exposure_id.as_deref() {
+        project::record_exposure_outcome(
+            &workspace,
+            exposure,
+            if args.passed {
+                Some(true)
+            } else if args.failed {
+                Some(false)
+            } else {
+                None
+            },
+        )?
+    } else {
+        kimetsu_brain::reinforce::credit_benchmark_outcome(
+            &workspace,
+            &args.task,
+            args.passed,
+            args.top_k,
+        )?
+    };
     println!(
-        "benchmark-credit: {} memor{} cited for task \"{}\" ({})",
-        credited,
-        if credited == 1 { "y" } else { "ies" },
-        args.task,
-        if args.passed {
-            "passed"
-        } else {
-            "not passed — no citation"
-        }
+        "benchmark-credit: {credited} delivered memories associated with explicit outcome; no citations or verification inferred"
     );
     Ok(())
 }
@@ -4088,6 +4060,7 @@ pub(crate) fn brain_ask(args: AskArgs) -> KimetsuResult<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
                 "question": question,
+                "exposure_id": result.exposure_id,
                 "answer": result.answer,
                 "citations": result.citations,
                 "grounded": result.grounded,
@@ -4171,4 +4144,76 @@ pub(crate) fn brain_skills(args: SkillsArgs) -> KimetsuResult<()> {
     let report = skill_synth::run_skill_synthesis(&workspace)?;
     skill_synth::print_synthesis_report(&report);
     Ok(())
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod conflict_carry_tests {
+    use super::*;
+    #[test]
+    fn daemon_conversion_keeps_conflict_notice_after_one_source_is_trimmed() {
+        let text = "Orchid gateway port is 7319.";
+        let request = kimetsu_brain::context::ContextRequest {
+            query: "What is the Orchid gateway port?".into(),
+            ..Default::default()
+        };
+        let capsule = embed_daemon::proto::Capsule {
+            id: "a".into(),
+            expansion_handle: "memory:a".into(),
+            claim_revision: Some("baseline:a".into()),
+            facts: kimetsu_brain::facts::extract(text)
+                .into_iter()
+                .map(|claim| kimetsu_brain::fact_store::StoredFact {
+                    memory_id: "a".into(),
+                    claim_revision: "baseline:a".into(),
+                    source_event_id: "source".into(),
+                    valid_from: None,
+                    valid_to: None,
+                    claim,
+                })
+                .collect(),
+            summary: text.into(),
+            kind: "memory".into(),
+            score: 0.99,
+        };
+        let response = embed_daemon::proto::Response::Capsules {
+            capsules: vec![capsule],
+            skipped: false,
+            top_score: 0.99,
+            known_fact_conflicts: vec!["port".into()],
+        };
+        let response: embed_daemon::proto::Response =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        let embed_daemon::proto::Response::Capsules {
+            capsules,
+            skipped,
+            top_score,
+            known_fact_conflicts,
+        } = response
+        else {
+            panic!("expected capsules")
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("kimetsu-conflict-wire-{}", ulid::Ulid::new()));
+        let bundle = daemon_capsules_to_bundle(
+            &workspace,
+            &request,
+            capsules,
+            skipped,
+            top_score,
+            known_fact_conflicts,
+        );
+        assert_eq!(
+            kimetsu_brain::fact_query::evaluate(&request.query, &bundle.capsules)
+                .unwrap()
+                .status,
+            "supported"
+        );
+        let notice = kimetsu_brain::fact_query::notice_with_conflicts(
+            &request.query,
+            &bundle.capsules,
+            &bundle.known_fact_conflicts,
+        )
+        .unwrap();
+        assert!(notice.contains("conflicting values for port"));
+    }
 }

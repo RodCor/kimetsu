@@ -3,12 +3,11 @@
 //! Builds a compact ~400-token digest of the current repo state:
 //!   - top-usefulness memories (conventions/facts that matter most)
 //!   - repo manifest summary (Cargo.toml, package.json, …)
-//!   - recent run focus ("current focus" from run history)
+//! Task focus is delivered separately through identity-scoped resume.
 //!
-//! The digest is cached in `.kimetsu/digest.md`, keyed by a SHA-256
-//! CONTENT HASH of the inputs.  Staleness is detected cheaply (git HEAD
-//! change, manifest hash change, memory corpus change) and the rebuild
-//! runs detached so it never blocks SessionStart.
+//! The digest is cached in `.kimetsu/digest.md`, keyed by a non-cryptographic
+//! CONTENT HASH of current inputs. Warm delivery validates the inputs
+//! synchronously so corrected or expired claims cannot survive in cached text.
 //!
 //! ## Cheap-model vs rule-based
 //!
@@ -41,8 +40,6 @@ use crate::project::{load_project, load_project_readonly};
 const DIGEST_CHAR_BUDGET: usize = 1_600;
 /// Number of top-useful memories to include in the digest.
 const TOP_MEMORY_COUNT: usize = 5;
-/// Number of recent run titles to include in "current focus".
-const RECENT_RUNS_COUNT: usize = 3;
 /// Max chars per memory text included in digest.
 const MEMORY_SNIPPET_CHARS: usize = 180;
 
@@ -50,7 +47,7 @@ const MEMORY_SNIPPET_CHARS: usize = 180;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DigestMeta {
-    /// SHA-256-like content hash of the inputs (via DefaultHasher for speed).
+    /// Non-cryptographic content hash of the inputs (DefaultHasher).
     pub input_hash: u64,
     /// ISO-8601 timestamp when this digest was built.
     pub built_at: String,
@@ -91,17 +88,21 @@ fn build_or_load_digest_inner(
     let cache_path = paths.kimetsu_dir.join("digest.md");
     let meta_path = paths.kimetsu_dir.join("digest-meta.json");
 
-    // 4. Check cache validity.
-    if !force_rebuild {
-        if let Some(cached) = try_load_cache(&cache_path, &meta_path, hash) {
-            return Ok(Some(cached));
-        }
-    }
-
-    // 5. Build the digest (cheap-model optional; rule-based otherwise).
+    // The rule-based assembly is cheap and binds delivery to this exact input
+    // snapshot. Separate diagnostic cache publishers can mix text/metadata
+    // generations, so an input-hash match alone cannot authorize cached text.
     let digest_text = assemble_rule_based(&inputs, &config)?;
     if digest_text.trim().is_empty() {
         return Ok(None);
+    }
+
+    // 4. Reuse the disk cache only as a reason to skip an unchanged write.
+    if !force_rebuild {
+        if let Some(cached) = try_load_cache(&cache_path, &meta_path, hash) {
+            if cached == digest_text {
+                return Ok(Some(digest_text));
+            }
+        }
     }
 
     // 6. Write cache atomically.
@@ -118,12 +119,9 @@ fn build_or_load_digest_inner(
 /// Read `.kimetsu/digest.md` verbatim, without checking whether it is
 /// still current.
 ///
-/// This is the warm-path counterpart to [`build_or_load_digest`]: the
-/// caller serves the cached text immediately and rebuilds off the hot
-/// path (see [`is_stale`]), instead of paying a synchronous rebuild the
-/// moment the corpus moves. Returns `None` when the brain is not
-/// initialized here or nothing has been cached yet — a cold start still
-/// has to build.
+/// This diagnostic raw read may return stale text. Model-facing warm delivery
+/// uses [`build_or_load_digest`] to validate current inputs before cache reuse.
+/// Returns `None` when the brain is not initialized or no cache exists.
 pub fn load_cached_digest(workspace: &Path) -> Option<String> {
     let (paths, _config, _conn) = load_project_readonly(workspace).ok()?;
     let text = std::fs::read_to_string(paths.kimetsu_dir.join("digest.md")).ok()?;
@@ -138,11 +136,9 @@ pub fn load_cached_digest(workspace: &Path) -> Option<String> {
 
 /// Returns `true` when the cached digest is stale and should be rebuilt.
 ///
-/// Cheap: only checks the content hash (no I/O heavier than reading the
-/// meta sidecar and querying two SQLite count rows).
+/// Reads the metadata and current bounded digest inputs to compare their hash.
 ///
-/// Used by the SessionStart hook to decide whether to spawn a detached
-/// rebuild before injecting the (potentially stale) cached digest.
+/// Diagnostic helper; warm delivery validates through build_or_load_digest.
 pub fn is_stale(workspace: &Path) -> bool {
     is_stale_inner(workspace).unwrap_or(false)
 }
@@ -178,13 +174,31 @@ fn is_stale_inner(workspace: &Path) -> KimetsuResult<bool> {
 /// Returns `None` when `[broker] warm_start` is off, or when there is no
 /// digest, no preferences and no live episode to report.
 ///
-/// The cached digest is served even when the corpus has moved under it, and the
-/// rebuild is spawned detached — a synchronous rebuild would sit in front of the
-/// agent's first turn. Only a cold brain (nothing cached yet) builds inline.
+/// Current inputs are checked before cached text is used. Rule-based rebuilds
+/// run synchronously when claims change or temporal validity crosses a boundary.
 ///
 /// Records ROI attribution as a side effect, so call it only when the block is
 /// actually going to be emitted.
 pub fn warm_start_block(workspace: &Path) -> Option<String> {
+    warm_start_block_scoped(workspace, "")
+}
+pub fn warm_start_block_scoped(workspace: &Path, identity: &str) -> Option<String> {
+    let block = prepare_warm_start_block_scoped(workspace, identity)?;
+    record_warmstart_served(workspace, block.digest_chars, block.resume_chars);
+    Some(block.context)
+}
+
+/// Prepared text carries no delivery attribution until the caller emits it.
+pub struct PreparedWarmStart {
+    pub context: String,
+    pub digest_chars: usize,
+    pub resume_chars: usize,
+}
+
+pub fn prepare_warm_start_block_scoped(
+    workspace: &Path,
+    identity: &str,
+) -> Option<PreparedWarmStart> {
     // Gate: load warm_start from config (best-effort; default ON).
     let warm_start_enabled = kimetsu_core::paths::ProjectPaths::discover(workspace)
         .ok()
@@ -195,16 +209,11 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
         return None;
     }
 
-    let digest = match load_cached_digest(workspace) {
-        Some(cached) => {
-            if is_stale(workspace) {
-                spawn_detached_refresh(workspace);
-            }
-            Some(cached)
-        }
-        None => build_or_load_digest(workspace, false),
-    };
-    let resume = crate::episode::render_resume_context(workspace);
+    // Validate current claim text, retirement and temporal applicability before
+    // using a cached overview. A stale-while-revalidate policy reintroduces
+    // facts the retrieval path deliberately rejected.
+    let digest = build_or_load_digest(workspace, false);
+    let resume = crate::episode::render_resume_context_scoped(workspace, identity);
 
     // v2.6: the user's standing preferences, delivered rather than retrieved.
     //
@@ -241,13 +250,11 @@ pub fn warm_start_block(workspace: &Path) -> Option<String> {
         parts.push(format!("## Skills ready to graduate\n{s}"));
     }
 
-    record_warmstart_served(
-        workspace,
-        digest.as_ref().map(|d| d.len()).unwrap_or(0),
-        resume.as_ref().map(|r| r.len()).unwrap_or(0),
-    );
-
-    Some(parts.join("\n\n"))
+    Some(PreparedWarmStart {
+        context: parts.join("\n\n"),
+        digest_chars: digest.as_ref().map(|d| d.len()).unwrap_or(0),
+        resume_chars: resume.as_ref().map(|r| r.len()).unwrap_or(0),
+    })
 }
 
 /// Assemble the skills-loop nudge for the warm start.
@@ -264,42 +271,15 @@ fn skills_block(workspace: &Path) -> Option<String> {
 /// Best-effort: an unreadable brain means no preferences block, never a failed
 /// warm start.
 fn user_profile_block(workspace: &Path) -> Option<String> {
-    let (_paths, _config, conn) = load_project_readonly(workspace).ok()?;
+    let (_paths, config, conn) = load_project_readonly(workspace).ok()?;
     // The cross-project user brain is opened separately; when it is disabled or
     // unreachable the project's own preferences stand on their own.
-    let user_conn = kimetsu_core::paths::user_brain_db_path()
-        .filter(|path| path.exists())
-        .and_then(|path| Connection::open(&path).ok());
+    let user_conn =
+        crate::user_brain::open_user_brain_readonly_for_config(config.kimetsu.use_user_brain)
+            .ok()
+            .flatten();
     let profile = crate::user_profile::build_profile(&conn, user_conn.as_ref()).ok()?;
     crate::user_profile::render_profile(&profile)
-}
-
-/// Fire-and-forget `<current_exe> brain digest --refresh --workspace <ws>`.
-///
-/// Assumes the running executable is the kimetsu CLI, which holds for every
-/// caller of [`warm_start_block`] (the hooks and the MCP server are both the
-/// `kimetsu` binary). Embedders of this crate that are not the CLI simply get a
-/// spawn that fails and is swallowed — a stale digest, never a broken host.
-///
-/// Fully detached with null stdio, mirroring the embed daemon's spawn: an
-/// inherited stdout pipe would hold the host's hook open until its timeout.
-fn spawn_detached_refresh(workspace: &Path) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["brain", "digest", "--refresh", "--workspace"])
-        .arg(workspace)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
-    }
-    let _ = cmd.spawn();
 }
 
 // ── ROI attribution ───────────────────────────────────────────────────────────
@@ -365,13 +345,11 @@ struct DigestInputs {
     top_memories: Vec<(String, String)>,
     /// Manifest summaries: `(manifest_kind, path)` e.g. ("cargo", "Cargo.toml").
     manifests: Vec<(String, String)>,
-    /// Recent run task titles.
-    recent_runs: Vec<String>,
 }
 
 impl DigestInputs {
     fn is_empty(&self) -> bool {
-        self.top_memories.is_empty() && self.manifests.is_empty() && self.recent_runs.is_empty()
+        self.top_memories.is_empty() && self.manifests.is_empty()
     }
 }
 
@@ -395,6 +373,8 @@ fn gather_inputs(conn: &Connection, repo_root: &str) -> KimetsuResult<DigestInpu
              FROM memories
              WHERE invalidated_at IS NULL
                AND superseded_by IS NULL
+               AND (valid_from IS NULL OR julianday(valid_from) <= julianday('now'))
+               AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))
                AND kind != 'preference'
              ORDER BY
                CASE WHEN use_count > 0
@@ -430,25 +410,7 @@ fn gather_inputs(conn: &Connection, repo_root: &str) -> KimetsuResult<DigestInpu
         }
     }
 
-    // Recent run summaries from work_episodes (current focus).
-    {
-        let mut stmt = conn.prepare(
-            "SELECT task
-             FROM work_episodes
-             WHERE repo_root = ?1
-               AND superseded_by IS NULL
-             ORDER BY created_at DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map([repo_root, &RECENT_RUNS_COUNT.to_string()], |row| {
-            row.get::<_, String>(0)
-        })?;
-        for task in rows.flatten() {
-            if !task.trim().is_empty() {
-                inputs.recent_runs.push(task);
-            }
-        }
-    }
+    // Task focus belongs exclusively to the identity-scoped resume block.
 
     Ok(inputs)
 }
@@ -464,9 +426,6 @@ fn content_hash(inputs: &DigestInputs) -> u64 {
     for (mk, mp) in &inputs.manifests {
         mk.hash(&mut h);
         mp.hash(&mut h);
-    }
-    for task in &inputs.recent_runs {
-        task.hash(&mut h);
     }
     h.finish()
 }
@@ -487,19 +446,6 @@ fn assemble_rule_based(
             .map(|(kind, path)| format!("{kind}: {path}"))
             .collect();
         parts.push(format!("Project manifests: {}", manifest_list.join(", ")));
-    }
-
-    // Current focus.
-    if !inputs.recent_runs.is_empty() {
-        let focus = inputs
-            .recent_runs
-            .iter()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>();
-        if !focus.is_empty() {
-            parts.push(format!("Current focus: {}", focus.join(" / ")));
-        }
     }
 
     // Top memories.
@@ -581,6 +527,136 @@ mod tests {
 
     use super::*;
     use crate::{project, user_brain};
+
+    #[test]
+    fn hardening_warm_profile_honors_user_brain_opt_out() {
+        user_brain::with_user_brain_disabled(|| {
+            let dir = tmp_workspace("hardening-warm-profile-off");
+            git_init_boundary(&dir);
+            project::init_project(&dir, false).unwrap();
+            let global_dir = dir.join("isolated-global");
+            std::fs::create_dir_all(&global_dir).unwrap();
+            // The shared test-env lock is held by with_user_brain_disabled.
+            unsafe {
+                std::env::set_var("KIMETSU_USER_BRAIN_DIR", &global_dir);
+            }
+            let global =
+                Connection::open(kimetsu_core::paths::user_brain_db_path().unwrap()).unwrap();
+            crate::schema::initialize(&global).unwrap();
+            global.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at) VALUES('global','global_user','preference','PRIVATE_GLOBAL','private_global',1.0,'{}','2026-01-01T00:00:00Z')", []).unwrap();
+            let env_disabled = user_profile_block(&dir);
+            let (paths, mut config, conn) = load_project_readonly(&dir).unwrap();
+            config.kimetsu.use_user_brain = false;
+            std::fs::write(paths.project_toml, config.to_toml().unwrap()).unwrap();
+            unsafe {
+                std::env::remove_var("KIMETSU_USER_BRAIN");
+            }
+            let config_disabled = user_profile_block(&dir);
+            unsafe {
+                std::env::set_var("KIMETSU_USER_BRAIN", "0");
+                std::env::remove_var("KIMETSU_USER_BRAIN_DIR");
+            }
+            drop(conn);
+            drop(global);
+            std::fs::remove_dir_all(dir).unwrap();
+            assert!(
+                env_disabled.is_none(),
+                "environment opt-out leaked global profile"
+            );
+            assert!(
+                config_disabled.is_none(),
+                "project opt-out leaked global profile"
+            );
+        });
+    }
+
+    #[test]
+    fn hardening_warm_digest_revalidates_corrected_and_retired_claims() {
+        user_brain::with_user_brain_disabled(|| {
+            let dir = tmp_workspace("hardening-warm-current");
+            git_init_boundary(&dir);
+            project::init_project(&dir, false).unwrap();
+            let id = project::add_memory(
+                &dir,
+                kimetsu_core::memory::MemoryScope::Project,
+                kimetsu_core::memory::MemoryKind::Fact,
+                "ORIGINAL port is 4001",
+            )
+            .unwrap();
+            assert!(
+                build_or_load_digest(&dir, true)
+                    .unwrap()
+                    .contains("ORIGINAL")
+            );
+            project::edit_memory(&dir, &id, Some("CORRECTED port is 4002"), None).unwrap();
+            let block = warm_start_block_scoped(&dir, "lane-a").unwrap();
+            assert!(
+                !block.contains("ORIGINAL"),
+                "stale cache must never reintroduce corrected text"
+            );
+            assert!(block.contains("CORRECTED"));
+            // Separate cache-file publishers can leave old text with current
+            // input metadata. Delivery must bind to the gathered inputs anyway.
+            let (paths, _, conn) = load_project_readonly(&dir).unwrap();
+            std::fs::write(paths.kimetsu_dir.join("digest.md"), "ORIGINAL port is 4001").unwrap();
+            let mixed = warm_start_block_scoped(&dir, "lane-a").unwrap();
+            assert!(
+                mixed.contains("CORRECTED") && !mixed.contains("ORIGINAL"),
+                "mixed cache generations leaked: {mixed}"
+            );
+            drop(conn);
+            project::invalidate_memory(&dir, &id, Some("wrong claim")).unwrap();
+            assert!(
+                !warm_start_block_scoped(&dir, "lane-a")
+                    .unwrap_or_default()
+                    .contains("CORRECTED")
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn hardening_warm_digest_excludes_invalid_time_and_other_task_focus() {
+        user_brain::with_user_brain_disabled(|| {
+            let dir = tmp_workspace("hardening-warm-validity");
+            git_init_boundary(&dir);
+            project::init_project(&dir, false).unwrap();
+            for (text, from, to) in [
+                ("CURRENT endpoint", None, None),
+                ("FUTURE endpoint", Some("2099-01-01T00:00:00Z"), None),
+                ("EXPIRED endpoint", None, Some("2020-01-01T00:00:00Z")),
+            ] {
+                project::add_memory_with_validity(
+                    &dir,
+                    kimetsu_core::memory::MemoryScope::Project,
+                    kimetsu_core::memory::MemoryKind::Fact,
+                    text,
+                    from,
+                    to,
+                )
+                .unwrap();
+            }
+            for lane in ["ALPHA", "BETA"] {
+                crate::episode::capture_episode(
+                    &dir,
+                    crate::episode::EpisodePayload {
+                        identity: lane.into(),
+                        task: format!("{lane} task title"),
+                        summary: format!("{lane} task state"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            let block = warm_start_block_scoped(&dir, "ALPHA").unwrap();
+            assert!(block.contains("CURRENT") && block.contains("ALPHA"));
+            assert!(
+                !block.contains("FUTURE") && !block.contains("EXPIRED") && !block.contains("BETA"),
+                "{block}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
 
     fn tmp_workspace(name: &str) -> std::path::PathBuf {
         let ts = std::time::SystemTime::now()
@@ -811,7 +887,6 @@ mod tests {
             manifests: (0..5)
                 .map(|i| ("cargo".to_string(), format!("Cargo{i}.toml")))
                 .collect(),
-            recent_runs: (0..5).map(|i| format!("task {i}")).collect(),
         };
         let config = kimetsu_core::config::ProjectConfig::default_for_project("test");
         let digest = assemble_rule_based(&inputs, &config).expect("assemble");

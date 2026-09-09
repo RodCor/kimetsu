@@ -1,0 +1,6 @@
+brainbench: 2 scenario(s) to run
+  [1/2] orchid-answerability-frozen | dim=retrieval tier=hard ...
+    -> score=1.00 | positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.000 (n=10) positive-n=12 negative-n=10 (22 queries)
+  [2/2] quartz-answerability-frozen | dim=retrieval tier=hard ...
+    -> score=1.00 | positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.000 (n=10) positive-n=12 negative-n=10 (22 queries)
+kbench brainbench: report saved -> E:\tmp\kimetsu-brain-hardening\bench\local\runs\brainbench\2026-09-07T13-23-34.8176877Z.json

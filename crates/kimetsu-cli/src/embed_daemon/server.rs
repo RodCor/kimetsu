@@ -17,10 +17,7 @@ use std::time::Instant;
 /// noise 0) at half the rerank latency (~44ms vs ~95ms per query) — the
 /// earlier pool-shrink regression was the snippet truncation, not the pool.
 /// NOTE: summaries must stay FULL — truncating them cratered recall.
-const RERANK_POOL: usize = 6;
-
-/// Sigmoid-score floor — capsules the cross-encoder judges below this are noise.
-const RERANK_FLOOR: f32 = 0.30;
+const RERANK_POOL: usize = kimetsu_brain::serving::RERANK_POOL;
 
 /// Process-global state shared by all worker threads.
 pub struct DaemonState {
@@ -61,30 +58,18 @@ impl DaemonState {
         };
         // Clone query before it's moved into the request so we can pass it to
         // the reranker after retrieval.
-        let query = args.query.clone();
+
         let cap = args.max_capsules;
-        // When reranking, over-fetch a larger candidate pool so the
-        // cross-encoder sees enough diversity before truncating to `cap`.
-        let fetch_cap = if self.reranker.is_some() {
-            cap.max(RERANK_POOL)
-        } else {
-            cap
-        };
-        // Bump the token budget so the pool isn't budget-starved before the
-        // reranker sees it.
-        let budget = if self.reranker.is_some() {
-            (if args.budget_tokens == 0 {
+        let policy = kimetsu_brain::serving::ServingPolicy {
+            budget: if args.budget_tokens == 0 {
                 2000
             } else {
                 args.budget_tokens
-            })
-            .max(6000)
-        } else {
-            if args.budget_tokens == 0 {
-                2000
-            } else {
-                args.budget_tokens
-            }
+            },
+            cap,
+            pool: RERANK_POOL,
+            rerank_floor: session.config().broker.rerank_min_score,
+            explicit_fact_guard: session.config().broker.explicit_fact_guard,
         };
         let request = ContextRequest {
             stage: if args.stage.is_empty() {
@@ -93,38 +78,54 @@ impl DaemonState {
                 args.stage
             },
             query: args.query,
-            budget_tokens: budget,
+
             min_score: args.min_score,
-            max_capsules: fetch_cap,
+
             tags: args.tags,
             ..Default::default()
         };
-        match session.retrieve_context_with_injected_embedder(request, self.embedder.as_ref()) {
+        match policy.retrieve(
+            &session,
+            request,
+            self.embedder.as_ref(),
+            self.reranker.as_deref(),
+            kimetsu_brain::serving::EVAL_EXPOSURE_ID,
+        ) {
             Ok(bundle) => {
-                // v2.7: rerank + evidence-band arbitration (see
-                // `rerank_and_arbitrate`). A band bundle the cross-encoder
-                // rejects goes back over the wire as skipped, exactly like a
-                // hard-gated one.
-                let bundle = kimetsu_brain::context::rerank_and_arbitrate(
-                    &query,
-                    bundle,
-                    self.reranker.as_deref(),
-                    session.resolved_abstain_evidence(),
-                    RERANK_FLOOR,
-                    cap,
-                );
+                if let Some(error) = bundle.payload.get("error") {
+                    return proto::Response::Error {
+                        message: error.to_string(),
+                    };
+                }
                 proto::Response::Capsules {
+                    known_fact_conflicts: bundle.payload["answerability"]["conflicting"]
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     capsules: bundle
                         .capsules
                         .iter()
                         .map(|c| proto::Capsule {
+                            id: c.id.clone(),
+                            expansion_handle: c.expansion_handle.clone(),
+                            claim_revision: c.claim_revision.clone(),
+                            facts: c.facts.clone(),
                             summary: c.summary.clone(),
                             kind: c.kind.clone(),
                             score: c.score,
                         })
                         .collect(),
-                    skipped: bundle.skipped,
-                    top_score: bundle.top_score,
+                    skipped: bundle.capsules.is_empty(),
+                    top_score: bundle
+                        .capsules
+                        .iter()
+                        .map(|c| c.score)
+                        .fold(0.0_f32, f32::max),
                 }
             }
             Err(e) => proto::Response::Error {

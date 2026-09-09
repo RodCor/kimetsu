@@ -1,0 +1,15 @@
+repeat 1/1: baseline
+repeat 1/1: candidate
+repeat 1/1: baseline
+repeat 1/1: candidate
+repeat 1/1: baseline
+repeat 1/1: baseline
+repeat 1/1: baseline
+repeat 1/1: baseline
+repeat 1/1: baseline
+repeat 1/1: baseline
+..................
+----------------------------------------------------------------------
+Ran 18 tests in 2.541s
+
+OK

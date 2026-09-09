@@ -701,10 +701,9 @@ enum BrainCommand {
     /// makes VACUUM actually shrink the file. Note: they will no longer appear
     /// in audit/blame output.
     ///
-    /// --trim-events-older-than <dur>: deletes events older than the given
-    /// duration (e.g. 30d, 7d, 24h). WARNING: this shrinks the rebuild
-    /// history window. Materialized memories (projection rows) are NOT
-    /// affected — only the raw event log is trimmed.
+    /// --trim-events-older-than <dur>: deletes expendable telemetry older
+    /// than the given duration (e.g. 30d, 7d, 24h). Durable claim, exposure,
+    /// outcome and correction history is retained for safe rebuilds.
     ///
     /// Examples:
     ///   kimetsu brain compact
@@ -875,7 +874,11 @@ enum BrainCommand {
     ///   kimetsu brain forget --yes
     ///   kimetsu brain forget --yes --force-enabled
     Forget(ForgetArgs),
-    /// Record a ground-truth citation: mark that a memory materially helped.
+    /// List reversibly archived memories.
+    Archives,
+    /// Restore an archived memory without reopening temporal expiry.
+    Restore { memory_id: String },
+    /// Record explicit reliance on a memory; this does not verify its truth.
     ///
     /// Writes a `memory.cited` event (raising use_count / usefulness), the same
     /// signal the MCP `kimetsu_brain_cite` tool records — exposed on the CLI so
@@ -1122,8 +1125,8 @@ struct EvalArgs {
     #[arg(long, default_value = "")]
     rerankers: String,
     /// Candidate-pool size handed to the reranker before truncating to the
-    /// cap (mirrors the daemon's RERANK_POOL; 12 is the production value).
-    #[arg(long, default_value_t = 12)]
+    /// cap (the canonical default is 6).
+    #[arg(long, default_value_t = 6)]
     pool: usize,
     /// HyDE: expand each case query with a hypothetical answer from the cheap
     /// model before retrieval, to measure the recall lift on oblique queries.
@@ -1138,19 +1141,16 @@ struct BrainBenchArgs {
     #[arg(long, default_value = "bench/dataset.json")]
     dataset: PathBuf,
     /// Comma-separated embedder ids to sweep.
-    #[arg(long, default_value = "bge-small-en-v1.5,jina-v2-base-code")]
+    #[arg(long, default_value = "bge-small-en-v1.5")]
     embedders: String,
     /// Comma-separated reranker ids to sweep.
-    #[arg(
-        long,
-        default_value = "off,jina-reranker-v1-turbo-en,jina-reranker-v1-tiny-en,ms-marco-tinybert-l-2-v2,ms-marco-minilm-l-4-v2"
-    )]
+    #[arg(long, default_value = "ms-marco-tinybert-l-2-v2")]
     rerankers: String,
     /// Candidate-pool size passed to retrieval before reranking.
-    #[arg(long, default_value_t = 12usize)]
+    #[arg(long, default_value_t = 6usize)]
     pool: usize,
     /// Final capsule cap after reranking.
-    #[arg(long, default_value_t = 4usize)]
+    #[arg(long, default_value_t = 3usize)]
     cap: usize,
     /// Directory to write per-combo JSON files and summary.md.
     #[arg(long, default_value = "bench/results")]
@@ -1257,6 +1257,9 @@ struct DigestArgs {
 /// Args for `kimetsu checkpoint`.
 #[derive(Debug, Args)]
 struct CheckpointArgs {
+    /// Stable task, session or worktree identity for this checkpoint lane.
+    #[arg(long, alias = "session-id", alias = "worktree-id")]
+    task_id: Option<String>,
     /// Optional note to attach to this checkpoint.
     #[arg(value_name = "NOTE")]
     note: Option<String>,
@@ -1268,6 +1271,9 @@ struct CheckpointArgs {
 /// Args for `kimetsu resume`.
 #[derive(Debug, Args)]
 struct ResumeArgs {
+    /// Resume this exact task lane; never fall back to another task.
+    #[arg(long, alias = "session-id", alias = "worktree-id")]
+    task_id: Option<String>,
     /// Override the brain workspace path (defaults to current directory).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -1362,9 +1368,9 @@ struct TuneArgs {
     /// Show personal eval-set statistics without running the sweep.
     #[arg(long)]
     status: bool,
-    /// Cost penalty weight per estimated token injected per query.
-    /// Default 0.005 ≈ one MRR rank position ≈ 200 tokens.
-    #[arg(long, default_value_t = 0.005f64)]
+    /// Cost penalty per serialized UTF-8 byte upper bound, not billed tokens.
+    /// Default is explicit policy lambda 0.05 / delivery budget 6000.
+    #[arg(long, default_value_t = kimetsu_brain::tune::DEFAULT_COST_WEIGHT)]
     cost_weight: f64,
     /// Apply the winning config to project.toml (without this flag, dry-run only).
     #[arg(long)]
@@ -1498,13 +1504,19 @@ struct ReinforceArgs {
 /// Args for `kimetsu brain benchmark-credit`.
 #[derive(Debug, Args)]
 struct BenchmarkCreditArgs {
+    /// Exact exposure_id from the context actually delivered before grading.
+    #[arg(long)]
+    exposure_id: Option<String>,
+    /// Explicit failure outcome; omission of both outcome flags is unknown.
+    #[arg(long, conflicts_with = "passed")]
+    failed: bool,
     /// The task description / query the graded task represents.
     #[arg(long)]
     task: String,
-    /// Mark the task as PASSED — only passes produce a citation.
+    /// Record an observed pass association; never invent citations.
     #[arg(long)]
     passed: bool,
-    /// How many top-ranked memories to credit on a pass.
+    /// Legacy compatibility option; no post-outcome retrieval is performed.
     #[arg(long, default_value_t = 3)]
     top_k: usize,
     /// Override the brain workspace path (defaults to current directory).
@@ -1623,9 +1635,8 @@ struct CompactArgs {
     /// audit/blame output after this operation.
     #[arg(long)]
     purge_invalidated: bool,
-    /// Trim events older than this duration before VACUUM (e.g. 30d, 7d, 24h).
-    /// WARNING: reduces the rebuild history window. Materialized memories
-    /// (projection rows) are NOT affected — only the raw event log is trimmed.
+    /// Trim expendable telemetry older than this duration (e.g. 30d, 7d, 24h).
+    /// Retains claim, exposure and outcome history required by rebuilds.
     #[arg(long, value_name = "DUR")]
     trim_events_older_than: Option<String>,
     /// Emit machine-readable JSON instead of the human summary.
@@ -2614,10 +2625,22 @@ mod tests {
     }
 
     #[test]
+    fn hardening_free_never_requests_host_harvesting() {
+        let config = kimetsu_core::config::ProjectConfig::default_for_project("free-hooks");
+        assert!(!should_emit_stop_harvest_cue(&config, false));
+    }
+
+    #[test]
     fn stop_cue_suppressed_when_distiller_enabled() {
-        assert!(should_emit_stop_harvest_cue(true, false));
-        assert!(!should_emit_stop_harvest_cue(true, true));
-        assert!(!should_emit_stop_harvest_cue(false, false));
+        let mut config = kimetsu_core::config::ProjectConfig::default_for_project("deep-hooks");
+        config.cheap_model = Some(kimetsu_core::config::CheapModelSection {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(should_emit_stop_harvest_cue(&config, false));
+        assert!(!should_emit_stop_harvest_cue(&config, true));
+        config.learning.auto_harvest = false;
+        assert!(!should_emit_stop_harvest_cue(&config, false));
     }
 
     // ── Stop-hook output must be valid JSON (CC validates stdout as the
@@ -4148,6 +4171,10 @@ scope = 0.1
             ..Default::default()
         };
         let wire = vec![crate::embed_daemon::proto::Capsule {
+            id: "m1".into(),
+            expansion_handle: "memory:m1".into(),
+            claim_revision: Some("rev1".into()),
+            facts: vec![],
             summary: "repo:fact - x".to_string(),
             kind: "memory".to_string(),
             score: 0.9,
@@ -4156,9 +4183,12 @@ scope = 0.1
         // the neutral (1.0, []) — which is the point: an unmeasurable bundle
         // must render as no claim, never as a false "memory does not cover".
         let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-no-brain");
-        let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9);
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, wire, false, 0.9, vec![]);
         assert_eq!(bundle.capsules.len(), 1);
         assert_eq!(bundle.capsules[0].summary, "repo:fact - x");
+        assert_eq!(bundle.capsules[0].id, "m1");
+        assert_eq!(bundle.capsules[0].expansion_handle, "memory:m1");
+        assert_eq!(bundle.capsules[0].claim_revision.as_deref(), Some("rev1"));
         assert_eq!(bundle.capsules[0].kind, "memory");
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);
@@ -4186,7 +4216,7 @@ scope = 0.1
             ..Default::default()
         };
         let tmp = std::env::temp_dir().join("kimetsu-daemon-bundle-test-skipped");
-        let bundle = daemon_capsules_to_bundle(&tmp, &request, Vec::new(), true, 0.1);
+        let bundle = daemon_capsules_to_bundle(&tmp, &request, Vec::new(), true, 0.1, vec![]);
         assert!(bundle.skipped);
         assert_eq!(bundle.evidence_coverage, 0.0);
         assert!(bundle.uncovered_terms.is_empty());

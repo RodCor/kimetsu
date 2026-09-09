@@ -689,6 +689,61 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> KimetsuResu
     Ok(false)
 }
 
+/// Retain correction lineage and invalidate indexes across connections.
+pub fn migrate_v11_to_v12(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_revisions (
+        revision_id INTEGER PRIMARY KEY, memory_id TEXT NOT NULL,
+        event_id TEXT NOT NULL UNIQUE, text TEXT NOT NULL, kind TEXT NOT NULL,
+        known_at TEXT NOT NULL, effective_at TEXT NOT NULL,
+        confidence REAL NOT NULL, use_count INTEGER NOT NULL, usefulness_score REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_memory_revisions_time ON memory_revisions(memory_id, known_at, effective_at);
+        CREATE TABLE IF NOT EXISTS corpus_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+        INSERT OR IGNORE INTO corpus_revision VALUES (1,0);
+        CREATE TRIGGER IF NOT EXISTS corpus_insert AFTER INSERT ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;
+        CREATE TRIGGER IF NOT EXISTS corpus_delete AFTER DELETE ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;
+        CREATE TRIGGER IF NOT EXISTS corpus_update AFTER UPDATE OF embedding, embedding_model, text, invalidated_at, superseded_by ON memories BEGIN UPDATE corpus_revision SET revision=revision+1 WHERE id=1; END;")?;
+    Ok(())
+}
+
+/// Keep proposed applicability through review and replay.
+pub fn migrate_v12_to_v13(conn: &Connection) -> KimetsuResult<()> {
+    // Synthetic partial schemas used by migration tooling may omit proposals.
+    if !table_has_column(conn, "memory_proposals", "proposal_id")? {
+        return Ok(());
+    }
+    add_column_if_missing(conn, "memory_proposals", "valid_from TEXT")?;
+    add_column_if_missing(conn, "memory_proposals", "valid_to TEXT")?;
+    Ok(())
+}
+
+/// Optional stable task identity. Empty string retains the original legacy lane.
+pub(crate) fn migrate_v13_to_v14(conn: &Connection) -> KimetsuResult<()> {
+    crate::episode::create_work_episodes_table(conn)?;
+    add_column_if_missing(conn, "work_episodes", "identity TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_episodes_identity ON work_episodes(repo_root, identity, superseded_by)")?;
+    Ok(())
+}
+
+/// Derived structured evidence is replayable and never replaces memory text.
+pub(crate) fn migrate_v14_to_v15(conn: &Connection) -> KimetsuResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_facts (
+        memory_id TEXT NOT NULL, claim_revision TEXT NOT NULL, ordinal INTEGER NOT NULL,
+        source_event_id TEXT NOT NULL, source_digest TEXT NOT NULL, claim_json TEXT NOT NULL,
+        PRIMARY KEY(memory_id,claim_revision,ordinal));",
+    )?;
+    // Migration tools/tests can intentionally provide incomplete old schemas.
+    for column in ["memory_id", "text", "source_event_id"] {
+        if !table_has_column(conn, "memories", column)? {
+            return Ok(());
+        }
+    }
+    if !table_has_column(conn, "memory_revisions", "revision_id")? {
+        return Ok(());
+    }
+    crate::fact_store::backfill(conn)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

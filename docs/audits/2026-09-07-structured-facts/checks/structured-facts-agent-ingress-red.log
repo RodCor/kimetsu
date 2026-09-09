@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "E:\tmp\kimetsu-brain-hardening\docs\audits\2026-09-07-structured-facts\check-delivery.py", line 58, in <module>
+    assert payload["answerability"]["status"] == status, payload
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'answerability': {'conflicting': [], 'environment': 'staging', 'missing': ['port', 'timeout'], 'status': 'missing', 'subject': 'orchid gateway', 'supported': []}, 'budget_tokens': 6000, 'capsule_count': 1, 'capsules': [{'expansion_handle': 'memory:01M1XZ10N6N08Q2VJP47SGSQPC', 'id': '01M1XZ10XJ418ZJ0X4TMDAGV1C', 'kind': 'memory', 'score': 0.9549999833106995, 'summary': 'project:fact - [tags: network gateway] Orchid staging gateway port is 7319.'}], 'excluded_count': 0, 'exposure_id': '01M1XZ10XH9N57GSTP6VKWRM17', 'ok': True, 'partial_evidence': True, 'skipped': False, 'token_accounting': 'utf8_byte_upper_bound', 'used_tokens': 702}

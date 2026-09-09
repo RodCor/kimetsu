@@ -23,7 +23,7 @@ use kimetsu_core::KimetsuResult;
 /// makes an old sidecar unsafe to load — forces a rebuild. v2: the manifest
 /// gained a `quant` field AND the default index scalar changed f32→f16, so all
 /// pre-v2 (f32) sidecars must be rebuilt.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 
 /// HNSW graph degree (M). Higher = better recall, more memory.
 const CONNECTIVITY: usize = 16;
@@ -42,12 +42,14 @@ struct Manifest {
     model_id: String,
     /// Highest `memories.rowid` already represented in the index.
     max_rowid_indexed: i64,
+    corpus_revision: i64,
     /// Number of active vectors in the index (sanity check vs SQLite).
     count: usize,
     /// Scalar quantization the sidecar was built with (`f16`/`i8`/`f32`). A
     /// sidecar must NOT be loaded under a different quantization (silent
     /// corruption), so `try_load` rejects a mismatch and forces a rebuild.
     quant: String,
+    index_digest: String,
 }
 
 /// Index scalar quantization. f16 is the default — it ~halves the index's
@@ -175,6 +177,16 @@ pub fn handle_for_query(conn: &Connection, dim: usize, model_id: &str) -> Kimets
         )?)));
     };
     let handle = get_or_build_handle(&key, conn, dim, model_id)?;
+    let model_changed = {
+        let index = handle.read().unwrap_or_else(|p| p.into_inner());
+        index.dim != dim || index.model_id != model_id
+    };
+    if model_changed {
+        let mut index = handle.write().unwrap_or_else(|p| p.into_inner());
+        let mut fresh = AnnIndex::build_from_conn(conn, dim, model_id)?;
+        fresh.sidecar = Some(key);
+        *index = fresh;
+    }
     reconcile_if_stale(&handle, conn)?;
     Ok(handle)
 }
@@ -224,7 +236,7 @@ fn get_or_build_handle(
 
 /// Step 2: reconcile a cached index that has fallen behind SQLite (rows added
 /// out-of-band of the warm add path). Cheap guard: only pay the write lock +
-/// reconcile when MAX(rowid) shows new rows. Double-checked under the lock.
+/// reconcile when the corpus revision changes. Double-checked under the lock.
 fn reconcile_if_stale(handle: &Handle, conn: &Connection) -> KimetsuResult<()> {
     let stale = {
         let idx = handle.read().unwrap_or_else(|p| p.into_inner());
@@ -312,6 +324,7 @@ pub struct AnnIndex {
     /// `None` for in-memory / pathless DBs (no sidecar).
     sidecar: Option<PathBuf>,
     max_rowid_indexed: i64,
+    corpus_revision: i64,
 }
 
 impl AnnIndex {
@@ -329,11 +342,11 @@ impl AnnIndex {
     /// detected here, but that's harmless — retrieval hydration already filters
     /// `invalidated_at IS NULL`, so a stale-invalidated candidate is dropped.
     pub fn is_stale(&self, conn: &Connection) -> KimetsuResult<bool> {
-        let max_rowid: i64 =
-            conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM memories", [], |r| {
-                r.get(0)
-            })?;
-        Ok(max_rowid > self.max_rowid_indexed)
+        Ok(
+            conn.query_row("SELECT revision FROM corpus_revision WHERE id=1", [], |r| {
+                r.get::<_, i64>(0)
+            })? != self.corpus_revision,
+        )
     }
 
     /// Build a fresh index from every active, current-model embedding in SQLite.
@@ -345,6 +358,11 @@ impl AnnIndex {
             model_id: model_id.to_string(),
             sidecar: None,
             max_rowid_indexed: 0,
+            corpus_revision: conn.query_row(
+                "SELECT revision FROM corpus_revision WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?,
         };
         me.reserve_and_load_active(conn)?;
         Ok(me)
@@ -509,20 +527,18 @@ impl AnnIndex {
             dim: self.dim,
             model_id: self.model_id.clone(),
             max_rowid_indexed: self.max_rowid_indexed,
+            corpus_revision: self.corpus_revision,
             count: self.len(),
             quant: scalar_kind_id(ann_scalar_kind()).to_string(),
+            index_digest: String::new(),
         }
     }
 
     /// Serialize the index + manifest to the sidecar (no-op for in-memory DBs).
     ///
-    /// Concurrency-safe for fleet writers: each file is written to a
-    /// process-unique temp path and atomically `rename`d into place, so a
-    /// concurrent reader (another process opening the same brain) never observes
-    /// a torn `.usearch`. The manifest is renamed LAST — a reader that sees the
-    /// new manifest is guaranteed to also see the new index, and the reverse
-    /// (new index + old manifest) is caught by the `size != count` check on load
-    /// and degrades to a rebuild rather than serving stale hits.
+    /// A digest binds the manifest revision to the exact serialized index.
+    /// Concurrent two-file publications may mix generations; readers reject
+    /// those pairs and rebuild, including equal-count vector updates.
     pub fn save(&self) -> KimetsuResult<()> {
         let Some(sidecar) = &self.sidecar else {
             return Ok(());
@@ -533,6 +549,10 @@ impl AnnIndex {
         self.index
             .save(index_tmp.to_string_lossy().as_ref())
             .map_err(|e| format!("usearch save: {e}"))?;
+        // Digest the exact generation before publishing either file.
+        let index_digest = blake3::hash(&std::fs::read(&index_tmp)?)
+            .to_hex()
+            .to_string();
         std::fs::rename(&index_tmp, sidecar).map_err(|e| {
             let _ = std::fs::remove_file(&index_tmp);
             format!("usearch rename: {e}")
@@ -541,8 +561,10 @@ impl AnnIndex {
         // 2. Manifest LAST → temp → atomic rename.
         let manifest_path = Self::manifest_path(sidecar);
         let manifest_tmp = Self::tmp_sibling(&manifest_path);
+        let mut generation = self.manifest();
+        generation.index_digest = index_digest;
         let manifest =
-            serde_json::to_vec(&self.manifest()).map_err(|e| format!("manifest serialize: {e}"))?;
+            serde_json::to_vec(&generation).map_err(|e| format!("manifest serialize: {e}"))?;
         std::fs::write(&manifest_tmp, manifest).map_err(|e| format!("manifest write: {e}"))?;
         std::fs::rename(&manifest_tmp, &manifest_path).map_err(|e| {
             let _ = std::fs::remove_file(&manifest_tmp);
@@ -591,8 +613,16 @@ impl AnnIndex {
             return Ok(None);
         }
         let index = Index::new(&index_options(dim)).map_err(|e| format!("usearch new: {e}"))?;
-        if index.load(sidecar.to_string_lossy().as_ref()).is_err() {
-            return Ok(None); // corrupt sidecar → rebuild
+        // Read once: validating a path and then reopening it for load would
+        // permit a concurrent rename between validation and use.
+        let bytes = match std::fs::read(sidecar) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        if blake3::hash(&bytes).to_hex().as_str() != manifest.index_digest
+            || index.load_from_buffer(&bytes).is_err()
+        {
+            return Ok(None); // Mixed generation or corrupt sidecar.
         }
         if index.size() != manifest.count {
             return Ok(None);
@@ -603,6 +633,7 @@ impl AnnIndex {
             model_id: model_id.to_string(),
             sidecar: Some(sidecar.to_path_buf()),
             max_rowid_indexed: manifest.max_rowid_indexed,
+            corpus_revision: manifest.corpus_revision,
         }))
     }
 
@@ -612,6 +643,15 @@ impl AnnIndex {
     ///
     /// Cheap: rides the `idx_memories_scope_model_active` covering index.
     pub fn reconcile(&mut self, conn: &Connection) -> KimetsuResult<()> {
+        if self.is_stale(conn)? {
+            // Existing keys may have new vectors, a new model, or tombstones.
+            // Rebuild until a bounded change-log consumer is available.
+            let mut fresh = Self::build_from_conn(conn, self.dim, &self.model_id)?;
+            fresh.sidecar = self.sidecar.clone();
+            *self = fresh;
+            return Ok(());
+        }
+
         // 3a. New active rows since last index. Stream the delta in chunks so a
         // bulk load (e.g. 500k rows) never materializes its BLOBs + decoded f32
         // all at once (~1.5GB transient). COUNT once + reserve the full delta up
@@ -791,6 +831,64 @@ mod tests {
             total += k;
         }
         hit as f32 / total as f32
+    }
+
+    #[test]
+    fn mixed_equal_count_sidecar_generations_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let c = Connection::open(&db).unwrap();
+        crate::schema::initialize(&c).unwrap();
+        c.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at,embedding,embedding_model) VALUES ('m','project','fact','t','t',1,'{}','2026-01-01T00:00:00Z',?1,'stub')",rusqlite::params![encode_embedding(&[1.0,0.0])]).unwrap();
+        let old = AnnIndex::open_or_build(&c, 2, "stub").unwrap();
+        old.save().unwrap();
+        let path = db.with_extension("usearch");
+        let old_bytes = std::fs::read(&path).unwrap();
+        c.execute(
+            "UPDATE memories SET embedding=?1",
+            rusqlite::params![encode_embedding(&[0.0, 1.0])],
+        )
+        .unwrap();
+        let new = AnnIndex::open_or_build(&c, 2, "stub").unwrap();
+        new.save().unwrap();
+        // Deterministically materialize older index + newer manifest, equal size.
+        std::fs::write(&path, old_bytes).unwrap();
+        assert!(AnnIndex::try_load(&path, 2, "stub").unwrap().is_none());
+        let repaired = AnnIndex::open_or_build(&c, 2, "stub").unwrap();
+        assert!(!repaired.is_stale(&c).unwrap());
+        assert!(repaired.search(&[0.0, 1.0], 1).unwrap()[0].1 < 0.01);
+    }
+
+    #[test]
+    fn warm_reader_refreshes_existing_vectors_from_another_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let reader = Connection::open(&db).unwrap();
+        crate::schema::initialize(&reader).unwrap();
+        for (id, vector) in [("a", vec![1.0f32, 0.0]), ("b", vec![0.0f32, 1.0])] {
+            reader.execute("INSERT INTO memories(memory_id,scope,kind,text,normalized_text,confidence,provenance_snapshot_json,created_at,embedding,embedding_model) VALUES (?1,'project','fact',?1,?1,1.0,'{}','2026-01-01T00:00:00Z',?2,'stub')",rusqlite::params![id,encode_embedding(&vector)]).unwrap();
+        }
+        let mut index = AnnIndex::build_from_conn(&reader, 2, "stub").unwrap();
+        assert_eq!(index.search(&[1.0, 0.0], 1).unwrap()[0].0, 1);
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute(
+                "UPDATE memories SET embedding=?1 WHERE memory_id='a'",
+                rusqlite::params![encode_embedding(&[-1.0, 0.0])],
+            )
+            .unwrap();
+        assert!(index.is_stale(&reader).unwrap());
+        index.reconcile(&reader).unwrap();
+        assert_eq!(index.search(&[1.0, 0.0], 1).unwrap()[0].0, 2);
+        assert!(!index.is_stale(&reader).unwrap());
+        writer
+            .execute(
+                "UPDATE memories SET invalidated_at='2026-03-01T00:00:00Z' WHERE memory_id='b'",
+                [],
+            )
+            .unwrap();
+        index.reconcile(&reader).unwrap();
+        assert_eq!(index.len(), 1);
     }
 
     #[test]

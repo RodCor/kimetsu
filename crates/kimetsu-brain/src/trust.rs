@@ -22,7 +22,7 @@
 //!
 //! It scores *origin*, and nothing else. A [`Provenance`] read off the memory's
 //! stored snapshot maps to a [`trust_multiplier`] the broker folds into the
-//! composite score, so a corroborated local lesson outranks an anonymous
+//! composite score, so a local lesson outranks an anonymous
 //! imported one at equal relevance.
 //!
 //! Two deliberate limits:
@@ -30,11 +30,8 @@
 //! * **It never blocks retrieval.** Trust is a weight, not a gate. A hard gate
 //!   on provenance would make a bad pack import silently delete a user's
 //!   working knowledge, which is a worse failure than the one it prevents.
-//! * **Corroboration outranks origin.** A memory that has been cited in a
-//!   successful local run has been *tested here*, whatever its origin, and
-//!   carries no penalty at all from then on. Otherwise an imported pack — the
-//!   whole point of which is to share knowledge — would stay second-class
-//!   forever.
+//! * **Reliance is not verification.** Citations and successful-run association
+//!   never remove an origin penalty. No explicit verification channel exists.
 //!
 //! ## Not done here
 //!
@@ -116,24 +113,9 @@ impl Provenance {
 
 /// Multiplier applied to a candidate's composite score.
 ///
-/// `corroborated` means the memory has been cited in a *successful* run on this
-/// machine — precisely what `memories.last_useful_at` records, and the reason
-/// the signal is a boolean rather than a count: `last_useful_at` is already
-/// selected by every candidate query, so reading it costs nothing, whereas
-/// counting citations would put a per-row aggregate on the hot path.
-///
-/// A corroborated memory carries no origin penalty at all, whatever its
-/// provenance. It has been tested here; where it was written stops being the
-/// most informative thing about it. Without that, an imported pack — the entire
-/// point of which is to share knowledge — would stay second-class forever.
-///
-/// Bounded in `(0, 1]` — trust can only ever hold a memory back, never promote
-/// one above its relevance. Promotion is what `usefulness_score` is for, and
-/// two mechanisms that both boost would make the composite unreadable.
-pub fn trust_multiplier(provenance: Provenance, corroborated: bool) -> f32 {
-    if corroborated {
-        return 1.0;
-    }
+/// The second argument is retained for API compatibility and represents observed
+/// successful-run association. It does not verify the proposition.
+pub fn trust_multiplier(provenance: Provenance, _associated: bool) -> f32 {
     match provenance {
         Provenance::Local | Provenance::Derived => 1.0,
         Provenance::Distilled => 0.95,
@@ -149,9 +131,9 @@ pub fn trust_multiplier(provenance: Provenance, corroborated: bool) -> f32 {
 pub struct ProvenanceGroup {
     pub provenance: String,
     pub total: usize,
-    /// Cited in a successful run here at least once.
-    pub corroborated: usize,
-    /// Never corroborated *and* from an external origin: the population a
+    /// Observed successful-run association; not verification.
+    pub associated: usize,
+    /// From an external origin without explicit verification: the population a
     /// poisoned memory would be hiding in.
     pub unvetted: usize,
 }
@@ -225,11 +207,11 @@ pub fn audit(conn: &rusqlite::Connection) -> kimetsu_core::KimetsuResult<AuditRe
         .map(|(provenance, (total, corroborated))| ProvenanceGroup {
             provenance: provenance.as_str().to_string(),
             total,
-            corroborated,
+            associated: corroborated,
             unvetted: if provenance >= Provenance::Derived {
                 0 // local and derived memories have no external origin to vet
             } else {
-                total - corroborated
+                total
             },
         })
         .collect();
@@ -296,25 +278,14 @@ mod tests {
         }
     }
 
-    /// A shared pack is the whole point of packs. A memory that has proven
-    /// itself locally must stop being treated as an outsider.
     #[test]
-    fn corroboration_erases_the_origin_penalty() {
-        let cold = trust_multiplier(Provenance::Pack, false);
-        let proven = trust_multiplier(Provenance::Pack, true);
-        assert!(cold < 1.0, "an uncorroborated pack memory is discounted");
-        assert!(
-            (proven - 1.0).abs() < 1e-6,
-            "once cited in a successful run here, origin stops mattering: {proven}"
-        );
-        for provenance in [
-            Provenance::Pack,
-            Provenance::Remote,
-            Provenance::Distilled,
-            Provenance::Derived,
-            Provenance::Local,
-        ] {
-            assert_eq!(trust_multiplier(provenance, true), 1.0, "{provenance:?}");
+    fn hardening_citation_retains_origin_penalty() {
+        for provenance in [Provenance::Pack, Provenance::Remote, Provenance::Distilled] {
+            assert_eq!(
+                trust_multiplier(provenance, true),
+                trust_multiplier(provenance, false)
+            );
+            assert!(trust_multiplier(provenance, true) < 1.0);
         }
     }
 
@@ -363,8 +334,7 @@ mod tests {
         .expect("insert");
     }
 
-    /// The population a poisoned memory hides in: external origin, never
-    /// corroborated. Local memories are not "unvetted" — there is no external
+    /// External memories remain unvetted even after observed association. Local memories are not "unvetted" — there is no external
     /// origin to vet.
     #[test]
     fn audit_counts_the_unvetted_external_population() {
@@ -399,12 +369,8 @@ mod tests {
         };
         assert_eq!(group("local").unvetted, 0, "nothing external to vet");
         assert_eq!(group("pack").total, 2);
-        assert_eq!(group("pack").corroborated, 1);
-        assert_eq!(
-            group("pack").unvetted,
-            1,
-            "the corroborated one has been tested here"
-        );
+        assert_eq!(group("pack").associated, 1);
+        assert_eq!(group("pack").unvetted, 2, "association is not verification");
         assert_eq!(group("distilled").unvetted, 1);
     }
 

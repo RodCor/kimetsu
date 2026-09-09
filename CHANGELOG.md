@@ -9,10 +9,52 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+## v2.8.0: Durable memory and scoped answerability
+
+Structured answerability remains opt-in. Existing brains
+upgrade to schema 15 when opened by this version. Memory projection maintenance
+adds local storage/write work even with the guard disabled; no extra model calls
+are required for fact extraction or evidence accounting.
+
+### Added
+
+- Opt-in `broker.explicit_fact_guard` for scoped configuration evidence, partial
+  answers and conflicting values. Schema 15 stores a rebuildable fact projection
+  bound to source events, revisions and visible evidence. No additional model
+  calls; delivered evidence still consumes context tokens.
+- Reproducible paired evaluation and per-query delivered evidence. The new
+  45-query synthetic fixture retained 24/27 positive hits and reduced unwanted
+  injections from 15/18 to 3/18. Exact metadata matched 36/45 in both repeats;
+  p95 was 376.6 → 386.6 ms. Compound retrieval and unsupported subjects remain
+  gaps. See [answerability](docs/answerability.md) and the [report](docs/audits/2026-09-07-structured-facts.md).
+- Configurable reranker cutoff, an optional pinned multilingual reranker and
+  opt-in shared ONNX inference thread control. Existing model defaults remain.
+
+### Fixed
+
+- Durable corrections and cross-writer ANN refresh; delayed feedback is bound to
+  delivered claim revisions. Lifecycle decisions preserve distinct claims and
+  archive/restore state; replay and merged sync imports are atomic.
+- Final serialized delivery budgets, post-rerank policy, current warm-start
+  evidence and explicit episode lanes. Free-tier hooks avoid host harvesting.
+- Conflict warnings survive intermediate budgets, capsule caps and daemon
+  transport. Tagged agent-recorded lessons can produce structured evidence.
+- Remote context honors an absent server reranker instead of loading the local
+  stdio configuration and consulting its warm-start cache.
+- Release notes correctly extract changelog headings with a version followed by
+  a colon; empty extracted notes now fail the release job.
+
 ### Security
 
 - Updated transitive `h2` from 0.4.14 to 0.4.16, fixing
   `RUSTSEC-2026-0258` (unbounded empty HTTP/2 DATA frames).
+- Reject repository identifiers that alias Windows paths and reject redirected
+  repository roots. Validate existing brain state paths before first-use shortcuts.
+- Restrict Bedrock region values to a hostname label, encode model IDs as path
+  segments, require HTTPS, and disable redirects for signed requests.
+- Replace the yanked `der` 0.8.0 dependency with 0.8.2. See the
+  [release security review](docs/audits/2026-09-08-release-security.md) for the
+  dependency audit and the disposition of existing code-scanning alerts.
 
 ## v2.7.0: Retrieval that knows when to stay silent
 

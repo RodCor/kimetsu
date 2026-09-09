@@ -1,0 +1,1241 @@
+{
+  "generated_at": "2026-09-07T05:55:24.9738733Z",
+  "dataset": "E:\\tmp\\kimetsu-brain-hardening\\docs\\audits\\2026-09-07-answerability\\validation-frozen.json",
+  "session_configuration": {
+    "include_ambient": false,
+    "warm_start": false
+  },
+  "scenarios": [
+    {
+      "observations": [
+        {
+          "query": "What is the Orchid gateway timeout?",
+          "ranked": [
+            "timeout"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDS6AM46ADZA20HCA3N7",
+              "id": "01M1X6YFKQJ4X437CDB542ZS2S",
+              "kind": "memory",
+              "score": 0.999908208847046,
+              "summary": "project:fact - Orchid gateway timeout is 45 seconds."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 1784.9897,
+          "first_query": true,
+          "server_startup_ms": 73.9532,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 542,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 634707968,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "How many retries does the Orchid client use?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDSPXE2KBVGTTFZPDRYZ",
+              "id": "01M1X6YFZD5FJ4WJAT50D6E5RR",
+              "kind": "memory",
+              "score": 0.9976400136947632,
+              "summary": "project:fact - Orchid client retry count is 5."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 365.2181,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 420,
+          "mcp_result_bytes": 501,
+          "wire_bytes": 536,
+          "reported_used_tokens": 501,
+          "working_set_bytes": 636993536,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is the Orchid worker memory limit?",
+          "ranked": [
+            "memory"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDSYVMWAYEKR8WC3A4CV",
+              "id": "01M1X6YGAT8X08SYBMZV5Z1S7K",
+              "kind": "memory",
+              "score": 0.9999785423278807,
+              "summary": "project:fact - Orchid worker memory limit is 768 MiB."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 359.4508,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 543,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 642109440,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What version does the Orchid worker run?",
+          "ranked": [
+            "version"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDT8N1XW0HMY7EPRHDAM",
+              "id": "01M1X6YGNNEPAMWHGE6Y0W7MX0",
+              "kind": "memory",
+              "score": 0.9998592138290404,
+              "summary": "project:fact - Orchid worker version 8.2 is installed."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 348.2773,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 543,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 642129920,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is `storage.page_bytes` in Orchid?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDTKXBSR6WHV1VEVKQ92",
+              "id": "01M1X6YH0JB7ZV8J0AKZ5BX7TE",
+              "kind": "memory",
+              "score": 0.9999752044677734,
+              "summary": "project:fact - Orchid storage.page_bytes = 8192."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 358.5264,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 422,
+          "mcp_result_bytes": 503,
+          "wire_bytes": 538,
+          "reported_used_tokens": 503,
+          "working_set_bytes": 642551808,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What password does the Orchid gateway require?",
+          "ranked": [
+            "password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDTWGPBD1DYZ2CN4XGWB",
+              "id": "01M1X6YHBY3NFCERWP7P1D81EQ",
+              "kind": "memory",
+              "score": 0.999871015548706,
+              "summary": "project:fact - No password is required for the Orchid gateway."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 358.1663,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 435,
+          "mcp_result_bytes": 516,
+          "wire_bytes": 551,
+          "reported_used_tokens": 516,
+          "working_set_bytes": 642576384,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "How long are Orchid backups retained?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDV5N0NSTYAN792AB1CP",
+              "id": "01M1X6YHQ4488DJS38CTP3PPDH",
+              "kind": "memory",
+              "score": 0.9999786615371704,
+              "summary": "project:fact - Orchid backups are retained for 36 hours."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 353.8764,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 545,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 642613248,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "Which files configure the port for Orchid?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDVEMNRTMRDVCEYDRC1B",
+              "id": "01M1X6YJ21Q2Q5M11QJBAZJF8Y",
+              "kind": "memory",
+              "score": 0.9955846667289734,
+              "summary": "project:fact - Orchid listener binds TCP port 7321. Configure its port in listener.toml."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 355.8541,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 462,
+          "mcp_result_bytes": 543,
+          "wire_bytes": 578,
+          "reported_used_tokens": 543,
+          "working_set_bytes": 642633728,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What causes a version conflict in Orchid?",
+          "ranked": [
+            "advice"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDVT5V9PY7APWPRTZM1Z",
+              "id": "01M1X6YJD20YXX0Y87VBNXVXMK",
+              "kind": "memory",
+              "score": 0.9998210072517396,
+              "summary": "project:fact - Orchid version conflicts occur when lockfiles disagree. Regenerate the lockfile and check dependency constraints."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 369.6207,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 501,
+          "mcp_result_bytes": 582,
+          "wire_bytes": 618,
+          "reported_used_tokens": 582,
+          "working_set_bytes": 642654208,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "¿Qué versión usa el worker de Orchid?",
+          "ranked": [
+            "version"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDT8N1XW0HMY7EPRHDAM",
+              "id": "01M1X6YJRN1Y2PW82GX89YMMMT",
+              "kind": "memory",
+              "score": 0.999970316886902,
+              "summary": "project:fact - Orchid worker version 8.2 is installed."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 350.5338,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 544,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 642723840,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "¿Cuánto tiempo se conservan las copias de seguridad de Orchid?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDV5N0NSTYAN792AB1CP",
+              "id": "01M1X6YK43NWETW90N0DG5YJ3J",
+              "kind": "memory",
+              "score": 0.9995601773262024,
+              "summary": "project:fact - Orchid backups are retained for 36 hours."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 377.40439999999995,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 546,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 643182592,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is the timeout in seconds for the gateway in Orchid?",
+          "ranked": [
+            "timeout"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDS6AM46ADZA20HCA3N7",
+              "id": "01M1X6YKG2EBKMJ6G9DHEAE7D0",
+              "kind": "memory",
+              "score": 0.9999822378158568,
+              "summary": "project:fact - Orchid gateway timeout is 45 seconds."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 374.3332,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 543,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 643219456,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is the database timeout for Orchid?",
+          "ranked": [
+            "timeout"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDS6AM46ADZA20HCA3N7",
+              "id": "01M1X6YKV41NABVJSVM3B2D85M",
+              "kind": "memory",
+              "score": 0.969832181930542,
+              "summary": "project:fact - Orchid gateway timeout is 45 seconds."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 348.1424,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 424,
+          "mcp_result_bytes": 505,
+          "wire_bytes": 541,
+          "reported_used_tokens": 505,
+          "working_set_bytes": 643235840,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What encryption key does Orchid use?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 349.8092,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 643244032,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is `storage.cache_bytes` in Orchid?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDTKXBSR6WHV1VEVKQ92",
+              "id": "01M1X6YMH4ER27R12PV5VF5PA6",
+              "kind": "memory",
+              "score": 0.9991620779037476,
+              "summary": "project:fact - Orchid storage.page_bytes = 8192."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 364.9801,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 421,
+          "mcp_result_bytes": 502,
+          "wire_bytes": 538,
+          "reported_used_tokens": 502,
+          "working_set_bytes": 643248128,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "How many production replicas does Orchid run?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 374.0399,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 643260416,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is the OpenSSL version for Orchid?",
+          "ranked": [
+            "version"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDT8N1XW0HMY7EPRHDAM",
+              "id": "01M1X6YN874S0AGNTPM3ZJR071",
+              "kind": "memory",
+              "score": 0.7756274342536926,
+              "summary": "project:fact - Orchid worker version 8.2 is installed."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 369.2296,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 544,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 643264512,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "What is the database password for Orchid?",
+          "ranked": [
+            "password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDTWGPBD1DYZ2CN4XGWB",
+              "id": "01M1X6YNKM0JC8QNZKE6HSAB16",
+              "kind": "memory",
+              "score": 0.6111225485801697,
+              "summary": "project:fact - No password is required for the Orchid gateway."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 351.32039999999995,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 435,
+          "mcp_result_bytes": 516,
+          "wire_bytes": 552,
+          "reported_used_tokens": 516,
+          "working_set_bytes": 643330048,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "How long are logs retained for Orchid?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDV5N0NSTYAN792AB1CP",
+              "id": "01M1X6YNYQCK6JR2HZHABC6SSH",
+              "kind": "memory",
+              "score": 0.9884384274482728,
+              "summary": "project:fact - Orchid backups are retained for 36 hours."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 363.88890000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 546,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 643416064,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "¿Qué contraseña usa la base de datos de Orchid?",
+          "ranked": [
+            "password",
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YDTWGPBD1DYZ2CN4XGWB",
+              "id": "01M1X6YPA6438KH3FXYK0GQTTY",
+              "kind": "memory",
+              "score": 0.8813819885253906,
+              "summary": "project:fact - No password is required for the Orchid gateway."
+            },
+            {
+              "expansion_handle": "memory:01M1X6YDVEMNRTMRDVCEYDRC1B",
+              "id": "01M1X6YPA64W26MGG7PDFKGDE3",
+              "kind": "memory",
+              "score": 0.8048929572105408,
+              "summary": "project:fact - Orchid listener binds TCP port 7321. Configure its port in listener.toml."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 379.0547,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 670,
+          "mcp_result_bytes": 769,
+          "wire_bytes": 805,
+          "reported_used_tokens": 769,
+          "working_set_bytes": 643489792,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "¿Cuántas replicas de producción tiene Orchid?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 396.481,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 643555328,
+          "peak_working_set_bytes": 684695552
+        },
+        {
+          "query": "Which region hosts Orchid production?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 682.9003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 643670016,
+          "peak_working_set_bytes": 684695552
+        }
+      ],
+      "id": "orchid-answerability-frozen",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.7272727272727273,
+      "skipped": false,
+      "detail": "positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.600 (n=10) positive-n=12 negative-n=10 (22 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "What is the Quartz gateway timeout?",
+          "ranked": [
+            "timeout"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRW0EC8XYXJDJBVJCNX6",
+              "id": "01M1X6YTP6GFT865MD8XX1YBN7",
+              "kind": "memory",
+              "score": 0.9999661445617676,
+              "summary": "project:fact - Quartz gateway timeout is 45 seconds."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 1776.3401999999999,
+          "first_query": true,
+          "server_startup_ms": 72.87599999999999,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 542,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 630677504,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "How many retries does the Quartz client use?",
+          "ranked": [
+            "retries"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRWEP5V7T2DRR5W191RY",
+              "id": "01M1X6YV16TQTXB1KFMFAPHGBA",
+              "kind": "memory",
+              "score": 0.9913354516029358,
+              "summary": "project:fact - Quartz client retry count is 5."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 350.932,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 420,
+          "mcp_result_bytes": 501,
+          "wire_bytes": 536,
+          "reported_used_tokens": 501,
+          "working_set_bytes": 630988800,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is the Quartz worker memory limit?",
+          "ranked": [
+            "memory"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRWQYM61QB54QCXY5M8S",
+              "id": "01M1X6YVCDBJHFR3V4CF38Q9DP",
+              "kind": "memory",
+              "score": 0.9999793767929076,
+              "summary": "project:fact - Quartz worker memory limit is 768 MiB."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 352.15049999999997,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 543,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 635928576,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What version does the Quartz worker run?",
+          "ranked": [
+            "version"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRX0N2VZWG624EM98933",
+              "id": "01M1X6YVQBH48NYRBWS2GCWHCE",
+              "kind": "memory",
+              "score": 0.9998953342437744,
+              "summary": "project:fact - Quartz worker version 8.2 is installed."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 355.2699,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 543,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 636006400,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is `storage.page_bytes` in Quartz?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRX9144J4G8J165CF3WK",
+              "id": "01M1X6YW30JX5Q1TAZZHQA4RQA",
+              "kind": "memory",
+              "score": 0.9999722242355348,
+              "summary": "project:fact - Quartz storage.page_bytes = 8192."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 374.8146,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 422,
+          "mcp_result_bytes": 503,
+          "wire_bytes": 538,
+          "reported_used_tokens": 503,
+          "working_set_bytes": 638234624,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What password does the Quartz gateway require?",
+          "ranked": [
+            "password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRXJ8E92QTCNBSVRM7RQ",
+              "id": "01M1X6YWDZNFG1H7C4T71J6HD1",
+              "kind": "memory",
+              "score": 0.9998206496238708,
+              "summary": "project:fact - No password is required for the Quartz gateway."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 351.1381,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 436,
+          "mcp_result_bytes": 517,
+          "wire_bytes": 552,
+          "reported_used_tokens": 517,
+          "working_set_bytes": 638275584,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "How long are Quartz backups retained?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRXWS06KM9HEA391XTW1",
+              "id": "01M1X6YWS1YRP5SRBBQVBXHFMM",
+              "kind": "memory",
+              "score": 0.999981164932251,
+              "summary": "project:fact - Quartz backups are retained for 36 hours."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 346.8805,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 428,
+          "mcp_result_bytes": 509,
+          "wire_bytes": 544,
+          "reported_used_tokens": 509,
+          "working_set_bytes": 638300160,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "Which files configure the port for Quartz?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRY6PW9FEZA7EK8NW7B2",
+              "id": "01M1X6YX3XJ56PPBFMPSXGC6H7",
+              "kind": "memory",
+              "score": 0.9969274401664734,
+              "summary": "project:fact - Quartz listener binds TCP port 8452. Configure its port in listener.toml."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 349.4505,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 462,
+          "mcp_result_bytes": 543,
+          "wire_bytes": 578,
+          "reported_used_tokens": 543,
+          "working_set_bytes": 638337024,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What causes a version conflict in Quartz?",
+          "ranked": [
+            "advice"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRYJJ4SGYR06FREHSYQP",
+              "id": "01M1X6YXESJ7CG1XRMA1Z2AM7Q",
+              "kind": "memory",
+              "score": 0.9998512268066406,
+              "summary": "project:fact - Quartz version conflicts occur when lockfiles disagree. Regenerate the lockfile and check dependency constraints."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 357.88160000000005,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 501,
+          "mcp_result_bytes": 582,
+          "wire_bytes": 618,
+          "reported_used_tokens": 582,
+          "working_set_bytes": 638468096,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "¿Qué versión usa el worker de Quartz?",
+          "ranked": [
+            "version"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRX0N2VZWG624EM98933",
+              "id": "01M1X6YXSX9NJ1A4F1Y2Q30CVQ",
+              "kind": "memory",
+              "score": 0.9999598264694214,
+              "summary": "project:fact - Quartz worker version 8.2 is installed."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 349.2778,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 544,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 638562304,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "¿Cuánto tiempo se conservan las copias de seguridad de Quartz?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRXWS06KM9HEA391XTW1",
+              "id": "01M1X6YY4XTGDFXBEJJ29M6QDW",
+              "kind": "memory",
+              "score": 0.9996949434280396,
+              "summary": "project:fact - Quartz backups are retained for 36 hours."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 353.0143,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 546,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 638988288,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is the timeout in seconds for the gateway in Quartz?",
+          "ranked": [
+            "timeout"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRW0EC8XYXJDJBVJCNX6",
+              "id": "01M1X6YYG92D4YHB9NM73ADAFD",
+              "kind": "memory",
+              "score": 0.9999818801879884,
+              "summary": "project:fact - Quartz gateway timeout is 45 seconds."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 363.98190000000005,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 426,
+          "mcp_result_bytes": 507,
+          "wire_bytes": 543,
+          "reported_used_tokens": 507,
+          "working_set_bytes": 639008768,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is the database timeout for Quartz?",
+          "ranked": [
+            "timeout"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRW0EC8XYXJDJBVJCNX6",
+              "id": "01M1X6YYVF4SHBSEKPK7NNBCEH",
+              "kind": "memory",
+              "score": 0.9865899085998536,
+              "summary": "project:fact - Quartz gateway timeout is 45 seconds."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 365.71340000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 425,
+          "mcp_result_bytes": 506,
+          "wire_bytes": 542,
+          "reported_used_tokens": 506,
+          "working_set_bytes": 639062016,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What encryption key does Quartz use?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 373.8856,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 639082496,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is `storage.cache_bytes` in Quartz?",
+          "ranked": [
+            "literal"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRX9144J4G8J165CF3WK",
+              "id": "01M1X6YZJFNMY4TQRY724AHQR8",
+              "kind": "memory",
+              "score": 0.998980700969696,
+              "summary": "project:fact - Quartz storage.page_bytes = 8192."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 353.7404,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 420,
+          "mcp_result_bytes": 501,
+          "wire_bytes": 537,
+          "reported_used_tokens": 501,
+          "working_set_bytes": 639082496,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "How many production replicas does Quartz run?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 349.1059,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 639143936,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is the OpenSSL version for Quartz?",
+          "ranked": [
+            "version"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRX0N2VZWG624EM98933",
+              "id": "01M1X6Z08FFM5T6EDF1RT3SE3X",
+              "kind": "memory",
+              "score": 0.7910260558128357,
+              "summary": "project:fact - Quartz worker version 8.2 is installed."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 356.2742,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 427,
+          "mcp_result_bytes": 508,
+          "wire_bytes": 544,
+          "reported_used_tokens": 508,
+          "working_set_bytes": 639148032,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "What is the database password for Quartz?",
+          "ranked": [
+            "password"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRXJ8E92QTCNBSVRM7RQ",
+              "id": "01M1X6Z0KDY5CADXF1A7GKK0Z1",
+              "kind": "memory",
+              "score": 0.5618340969085693,
+              "summary": "project:fact - No password is required for the Quartz gateway."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 346.1132,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 435,
+          "mcp_result_bytes": 516,
+          "wire_bytes": 552,
+          "reported_used_tokens": 516,
+          "working_set_bytes": 639148032,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "How long are logs retained for Quartz?",
+          "ranked": [
+            "backup"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRXWS06KM9HEA391XTW1",
+              "id": "01M1X6Z0YFD0R9SQGMGTM4YYVM",
+              "kind": "memory",
+              "score": 0.9967792630195618,
+              "summary": "project:fact - Quartz backups are retained for 36 hours."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 352.7833,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 546,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 639160320,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "¿Qué contraseña usa la base de datos de Quartz?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1X6YRY6PW9FEZA7EK8NW7B2",
+              "id": "01M1X6Z19EXZRA3MPY84DWRXAK",
+              "kind": "memory",
+              "score": 0.8378869891166687,
+              "summary": "project:fact - Quartz listener binds TCP port 8452. Configure its port in listener.toml."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 353.2962,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 461,
+          "mcp_result_bytes": 542,
+          "wire_bytes": 578,
+          "reported_used_tokens": 542,
+          "working_set_bytes": 639213568,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "¿Cuántas replicas de producción tiene Quartz?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 363.99350000000004,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 639266816,
+          "peak_working_set_bytes": 684937216
+        },
+        {
+          "query": "Which region hosts Quartz production?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 348.8584,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 325,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 639365120,
+          "peak_working_set_bytes": 684937216
+        }
+      ],
+      "id": "quartz-answerability-frozen",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.7272727272727273,
+      "skipped": false,
+      "detail": "positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.600 (n=10) positive-n=12 negative-n=10 (22 queries)"
+    }
+  ],
+  "by_dimension_tier": {
+    "retrieval/hard": [
+      1.4545454545454546,
+      2
+    ]
+  },
+  "by_dimension": {
+    "retrieval": {
+      "mean": 0.7272727272727273,
+      "n": 2,
+      "ci95": 0.0
+    }
+  },
+  "overall_index": 0.7272727272727273,
+  "scenario_weighted_index": 0.7272727272727273
+}

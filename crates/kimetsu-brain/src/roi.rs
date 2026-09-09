@@ -4,14 +4,11 @@
 //! by surfacing relevant knowledge before a coding session, so the model
 //! didn't have to (re-)discover it through expensive exploration.
 //!
-//! # Design philosophy: deliberate under-claiming
+//! # Assumption-based estimates
 //!
-//! Every constant in [`SAVED_TOKENS_PER_CITATION`] is a *conservative*
-//! lower-bound estimate of the avoided exploration cost for that memory
-//! kind.  We never inflate the numbers: the goal is that a user who sees
-//! a "net positive" result can trust it.  The methodology document at
-//! <https://kimetsu.dev/docs/roi-methodology/> explains the calibration approach and the
-//! Terminal-Bench sanity anchor.
+//! Savings constants are nominal assumptions, not measured counterfactuals,
+//! calibrated guarantees, or lower bounds. Delivered cost observations retain
+//! their producer units separately; byte bounds are not model token counts.
 
 use kimetsu_core::{KimetsuResult, memory::MemoryKind};
 use rusqlite::{OptionalExtension, params};
@@ -21,10 +18,10 @@ use serde::Serialize;
 // S2.4(b): Output-token accounting
 // ---------------------------------------------------------------------------
 
-/// Conservative ratio of output tokens to input tokens for a typical coding
-/// assistant response.  Calibration: real Claude Code sessions show ~30–40 %
-/// of the context going to output.  We use 0.25 as a deliberate under-claim
-/// to match the project's "never inflate" policy.
+/// Assumed ratio of output tokens to input tokens for a typical coding
+/// assistant response. This ratio has not been calibrated against sessions.
+/// We use 0.25 as a nominal assumption
+/// and expose it in the public report.
 ///
 /// **Audited limitation**: this is a ratio-based *estimate* because Claude Code
 /// does not expose per-session output token counts to the Stop hook.  The
@@ -48,35 +45,35 @@ pub fn estimate_output_tokens(input_tokens: u64) -> u64 {
 
 /// Conservative token savings per `digest_served` event.
 ///
-/// Calibration: a digest saves the model from re-reading the CLAUDE.md +
+/// Assumption: a digest saves the model from re-reading the CLAUDE.md +
 /// searching for the top conventions at session start.  Estimated equivalent:
 /// ~2 search calls × 600 tokens/call = ~1 200 tokens.  We claim 800 as a
-/// conservative lower bound.
+/// nominal assumption.
 pub const SAVED_TOKENS_PER_DIGEST_SERVED: u64 = 800;
 
 /// Conservative token savings per `resume_served` event.
 ///
-/// Calibration: an episodic resume avoids the model asking "what were you
+/// Assumption: an episodic resume avoids the model asking "what were you
 /// working on?" + 1–2 file reads to reconstruct context.  Estimated
 /// equivalent: ~2 tool calls × 400 tokens/call = ~800 tokens.  We claim 500.
 pub const SAVED_TOKENS_PER_RESUME_SERVED: u64 = 500;
 
 /// Conservative token savings per `skill.served` event (future-proof).
 ///
-/// Calibration: a synthesized skill file avoids the model re-deriving the
+/// Assumption: a synthesized skill file avoids the model re-deriving the
 /// composite procedure from individual memories.  We claim 300 as a
-/// conservative lower bound.
+/// nominal assumption.
 pub const SAVED_TOKENS_PER_SKILL_SERVED: u64 = 300;
 
 // ---------------------------------------------------------------------------
-// Per-kind calibrated constants
+// Per-kind nominal assumptions
 // ---------------------------------------------------------------------------
 
-/// Conservative lower-bound estimate of tokens saved per citation, by memory
+/// Assumed estimate of tokens saved per citation, by memory
 /// kind.  These are deliberate *under*-estimates of the exploration cost the
 /// model would have incurred without the brain context.
 ///
-/// Calibration methodology (see <https://kimetsu.dev/docs/roi-methodology/> for details):
+/// Assumed methodology (see <https://kimetsu.dev/docs/roi-methodology/> for details):
 /// - `failure_pattern`: avoids the "try → fail → diagnose → fix" loop.
 ///   Typical loop: ~3 tool calls × ~500 tokens/call = ~1 500 tokens.
 /// - `command`: avoids a web/docs lookup or `--help` trial.  ~1–2 tool
@@ -160,7 +157,7 @@ pub fn resolve_price_per_mtok(model: &str, price_override: Option<f64>) -> Optio
 /// memory kind was cited in the window.  The function is intentionally pure
 /// (no I/O) so it can be unit-tested without a DB.
 ///
-/// The result is a conservative lower-bound: if a kind has no entry in
+/// The result is a assumption-based estimate: if a kind has no entry in
 /// [`SAVED_TOKENS_PER_CITATION`] it contributes 0 (fail-safe).
 pub fn estimate_savings(citations: &[(MemoryKind, u32)]) -> u64 {
     citations
@@ -196,6 +193,11 @@ pub struct RoiUsd {
 /// Full ROI report for a time window.
 #[derive(Debug, Clone, Serialize)]
 pub struct RoiReport {
+    pub estimate_label: &'static str,
+    pub model: String,
+    pub assumptions: serde_json::Value,
+    /// Observed producer costs grouped by units. Not summed as measured tokens.
+    pub delivered_cost_by_unit: std::collections::BTreeMap<String, u64>,
     /// Window length in days, or `None` for "all time".
     pub window_days: Option<u32>,
     /// Total tokens injected by the brain (sum of `used_tokens` from
@@ -218,7 +220,7 @@ pub struct RoiReport {
     /// Total citation count (rows in `memory_citations` for runs in the
     /// window).
     pub citations: u64,
-    /// Estimated tokens saved (conservative lower-bound).
+    /// Estimated tokens saved (assumption-based estimate).
     pub estimated_saved_tokens: u64,
     /// `estimated_saved_tokens − injected_tokens`.  Can be negative.
     pub net_tokens: i64,
@@ -447,6 +449,7 @@ pub fn roi_report(
         + resume_served_events * SAVED_TOKENS_PER_RESUME_SERVED;
 
     // --- injected_tokens (sum of used_tokens across context.injected events) ---
+    let mut delivered_cost_by_unit = std::collections::BTreeMap::<String, u64>::new();
     let injected_tokens: u64 = {
         let payloads: Vec<String> = match &window_since {
             Some(ts) => {
@@ -467,6 +470,14 @@ pub fn roi_report(
         for p in &payloads {
             let v: serde_json::Value = serde_json::from_str(p)?;
             if let Some(t) = v.get("used_tokens").and_then(|x| x.as_u64()) {
+                *delivered_cost_by_unit
+                    .entry(
+                        v.get("cost_unit")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("legacy_token_estimate")
+                            .to_string(),
+                    )
+                    .or_default() += t;
                 sum += t;
             }
         }
@@ -562,6 +573,10 @@ pub fn roi_report(
     });
 
     Ok(RoiReport {
+        estimate_label: "Assumption-based estimate; savings are not measured or guaranteed",
+        model: model_name.to_string(),
+        assumptions: serde_json::json!({"tokens_per_citation":SAVED_TOKENS_PER_CITATION.iter().map(|(kind,n)|(kind.to_string(),*n)).collect::<std::collections::BTreeMap<_,_>>(),"digest":SAVED_TOKENS_PER_DIGEST_SERVED,"resume":SAVED_TOKENS_PER_RESUME_SERVED,"output_input_ratio":OUTPUT_TOKEN_INPUT_RATIO,"price_per_mtok":price,"overhead":"legacy estimate combines producer costs; see delivered_cost_by_unit for observed units"}),
+        delivered_cost_by_unit,
         window_days: window.days(),
         injected_tokens,
         estimated_output_tokens,
@@ -675,21 +690,21 @@ pub struct SessionRoi {
 impl SessionRoi {
     /// Build a one-line savings sentence for the Stop hook `systemMessage`.
     /// Returns a human-readable string like:
-    ///   "[Kimetsu] Brain saved ~1 200 tokens (~$0.004) this session."
+    ///   "[Kimetsu] Estimated savings (nominal assumptions): ~1 200 tokens (~$0.004) this session."
     pub fn savings_sentence(&self) -> String {
         match &self.usd {
             Some(u) if u.net >= 0.0 => format!(
-                "[Kimetsu] Brain saved ~{} tokens (~${:.4}) this session.",
+                "[Kimetsu] Estimated savings (nominal assumptions): ~{} tokens (~${:.4}) this session.",
                 format_tokens(self.estimated_saved_tokens),
                 u.saved,
             ),
             Some(u) => format!(
-                "[Kimetsu] Brain used ~{} tokens (net −${:.4}) this session.",
+                "[Kimetsu] Estimated overhead (nominal assumptions): ~{} tokens (net −${:.4}) this session.",
                 format_tokens(self.injected_tokens),
                 u.spent - u.saved,
             ),
             None => format!(
-                "[Kimetsu] Brain saved ~{} tokens this session.",
+                "[Kimetsu] Estimated savings (nominal assumptions): ~{} tokens this session.",
                 format_tokens(self.estimated_saved_tokens),
             ),
         }

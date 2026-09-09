@@ -46,7 +46,18 @@ pub fn ingest_repo(
     paths: &ProjectPaths,
     config: &ProjectConfig,
 ) -> KimetsuResult<RepoIngestSummary> {
-    let repo_root = paths.repo_root.canonicalize()?;
+    ingest_repo_from_root(conn, paths, config, &paths.repo_root)
+}
+
+/// File traversal can live in a managed checkout, while indexed rows remain
+/// scoped to the owning brain root used by every retrieval consumer.
+pub(crate) fn ingest_repo_from_root(
+    conn: &Connection,
+    paths: &ProjectPaths,
+    config: &ProjectConfig,
+    files_root: &Path,
+) -> KimetsuResult<RepoIngestSummary> {
+    let repo_root = files_root.canonicalize()?;
     let skip_dirs = skip_dirs(config);
     let (max_file_bytes, max_total_files) = effective_ingest_limits(config);
     let mut builder = WalkBuilder::new(&repo_root);
@@ -94,22 +105,27 @@ pub fn ingest_repo(
     }
 
     let tx = conn.unchecked_transaction()?;
-    let repo_root_text = repo_root.to_string_lossy().to_string();
+    let repo_root_text = paths
+        .repo_root
+        .canonicalize()?
+        .to_string_lossy()
+        .to_string();
+    let old_checkout_key = repo_root.to_string_lossy().to_string();
     tx.execute(
-        "DELETE FROM repo_files WHERE repo_root = ?1",
-        params![repo_root_text],
+        "DELETE FROM repo_files WHERE repo_root = ?1 OR repo_root = ?2",
+        params![repo_root_text, old_checkout_key],
     )?;
     tx.execute(
-        "DELETE FROM repo_files_fts WHERE repo_root = ?1",
-        params![repo_root_text],
+        "DELETE FROM repo_files_fts WHERE repo_root = ?1 OR repo_root = ?2",
+        params![repo_root_text, old_checkout_key],
     )?;
     tx.execute(
-        "DELETE FROM repo_manifests WHERE repo_root = ?1",
-        params![repo_root_text],
+        "DELETE FROM repo_manifests WHERE repo_root = ?1 OR repo_root = ?2",
+        params![repo_root_text, old_checkout_key],
     )?;
     tx.execute(
-        "DELETE FROM repo_manifests_fts WHERE repo_root = ?1",
-        params![repo_root_text],
+        "DELETE FROM repo_manifests_fts WHERE repo_root = ?1 OR repo_root = ?2",
+        params![repo_root_text, old_checkout_key],
     )?;
 
     let mut manifests = 0usize;

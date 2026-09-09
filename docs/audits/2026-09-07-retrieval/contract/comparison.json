@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "harness": {
+    "path": "E:\\Kimetsu\\bench\\target\\release\\kbench.exe",
+    "sha256": "fcb3d2ee52aaa040a1f54eb26a8245fa833a4cd35bed51505ddce76d31e8df9c",
+    "bytes": 9348096
+  },
+  "runner": {
+    "path": "E:\\tmp\\kimetsu-brain-hardening\\bench\\scripts\\compare_brainbench.py",
+    "sha256": "9b2f79c38a34a13d4f95ef9e19972eb0ccdba9e0e585a8df7a637ad7d06332a8",
+    "bytes": 23909
+  },
+  "binaries": {
+    "baseline": {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\kimetsu-candidate.exe",
+      "sha256": "5c87e542907a47917f23fad50ddff1e46789eaae14328ccc662ca748b66b5477",
+      "bytes": 47080448
+    },
+    "candidate": {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\tmp-tests\\kimetsu-retrieval-candidate.exe",
+      "sha256": "2445e8adc06c4a6b59d5ee51be46a6f5aa6e777514dfbb60ac4b136b69ba0ba6",
+      "bytes": 47064064
+    }
+  },
+  "datasets": [
+    {
+      "path": "E:\\tmp\\kimetsu-brain-hardening\\bench\\datasets\\brainbench\\agent-memory-contract.json",
+      "sha256": "ef30967945d2230f84539f2c81d275f00c48765b5f8850a44068948f6825ace4",
+      "bytes": 8300
+    }
+  ],
+  "settings": {
+    "budget_tokens": 2048,
+    "dimensions": [
+      "poisoning",
+      "render-contract",
+      "retrieval",
+      "workflow"
+    ],
+    "jobs": 1,
+    "warm_start": false,
+    "include_ambient": false,
+    "overrides": {
+      "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+      "KIMETSU_DETECT_CONFLICTS": "0",
+      "KIMETSU_RESOLVE_CONFLICTS": "0",
+      "FASTEMBED_CACHE_DIR": "E:/Kimetsu/.fastembed_cache",
+      "HF_HOME": "E:/tmp/kimetsu-brain-hardening/tmp-tests/hf-home"
+    },
+    "baseline_threads": 0,
+    "candidate_threads": 0,
+    "baseline_reranker": "ms-marco-tinybert-l-2-v2",
+    "candidate_reranker": "mmarco-minilm-l12-v2-int8",
+    "baseline_rerank_floor": null,
+    "candidate_rerank_floor": 0.55
+  },
+  "runs": [
+    {
+      "label": "baseline",
+      "repeat": 1,
+      "intra_threads_override": null,
+      "rerank_floor_override": null,
+      "reranker_override": "ms-marco-tinybert-l-2-v2",
+      "wall_seconds": 167.34423210000386,
+      "report_file": "1-baseline.json"
+    },
+    {
+      "label": "candidate",
+      "repeat": 1,
+      "intra_threads_override": null,
+      "rerank_floor_override": "0.55",
+      "reranker_override": "mmarco-minilm-l12-v2-int8",
+      "wall_seconds": 30.990422799950466,
+      "report_file": "1-candidate.json"
+    },
+    {
+      "label": "candidate",
+      "repeat": 2,
+      "intra_threads_override": null,
+      "rerank_floor_override": "0.55",
+      "reranker_override": "mmarco-minilm-l12-v2-int8",
+      "wall_seconds": 30.323271200002637,
+      "report_file": "2-candidate.json"
+    },
+    {
+      "label": "baseline",
+      "repeat": 2,
+      "intra_threads_override": null,
+      "rerank_floor_override": null,
+      "reranker_override": "ms-marco-tinybert-l-2-v2",
+      "wall_seconds": 25.16442939999979,
+      "report_file": "2-baseline.json"
+    },
+    {
+      "label": "baseline",
+      "repeat": 3,
+      "intra_threads_override": null,
+      "rerank_floor_override": null,
+      "reranker_override": "ms-marco-tinybert-l-2-v2",
+      "wall_seconds": 20.796417599951383,
+      "report_file": "3-baseline.json"
+    },
+    {
+      "label": "candidate",
+      "repeat": 3,
+      "intra_threads_override": null,
+      "rerank_floor_override": "0.55",
+      "reranker_override": "mmarco-minilm-l12-v2-int8",
+      "wall_seconds": 30.27207519998774,
+      "report_file": "3-candidate.json"
+    }
+  ],
+  "comparison": {
+    "measurement_summary": {
+      "baseline": {
+        "unique_queries": 22,
+        "query_observations": 66,
+        "positive_queries": 11,
+        "negative_queries": 11,
+        "stale_queries": 2,
+        "positive_recall_at_4": 0.7272727272727273,
+        "positive_hit_at_4": 0.7272727272727273,
+        "positive_mrr": 0.7272727272727273,
+        "negative_injection_rate": 0.18181818181818182,
+        "stale_injection_rate": 0,
+        "first_query_mean_ms": 1018.891488888889,
+        "subsequent_query_p50_ms": 428.7726,
+        "subsequent_query_p95_ms": 801.7253,
+        "subsequent_observations": 48,
+        "mean_model_text_bytes": 344.90909090909093,
+        "mean_mcp_result_bytes": 416.90909090909093,
+        "memory_observations": 66,
+        "mean_mcp_working_set_bytes": 214227812.84848484,
+        "max_mcp_peak_working_set_bytes": 248709120,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      },
+      "candidate": {
+        "unique_queries": 22,
+        "query_observations": 66,
+        "positive_queries": 11,
+        "negative_queries": 11,
+        "stale_queries": 2,
+        "positive_recall_at_4": 0.9545454545454546,
+        "positive_hit_at_4": 1,
+        "positive_mrr": 1.0,
+        "negative_injection_rate": 0.09090909090909091,
+        "stale_injection_rate": 0,
+        "first_query_mean_ms": 2163.8191444444446,
+        "subsequent_query_p50_ms": 444.8203,
+        "subsequent_query_p95_ms": 470.4541,
+        "subsequent_observations": 48,
+        "mean_model_text_bytes": 359.1363636363636,
+        "mean_mcp_result_bytes": 431.95454545454544,
+        "memory_observations": 66,
+        "mean_mcp_working_set_bytes": 629898457.2121212,
+        "max_mcp_peak_working_set_bytes": 685191168,
+        "note": "Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately."
+      }
+    },
+    "by_dimension": {
+      "retrieval": {
+        "n_scenarios": 5,
+        "baseline": 0.7,
+        "candidate": 0.9,
+        "mean_delta": 0.2,
+        "ci95": [
+          -0.1,
+          0.55
+        ],
+        "wins": 2,
+        "ties": 2,
+        "losses": 1
+      },
+      "workflow": {
+        "n_scenarios": 1,
+        "baseline": 1.0,
+        "candidate": 1.0,
+        "mean_delta": 0.0,
+        "ci95": null,
+        "wins": 0,
+        "ties": 1,
+        "losses": 0
+      }
+    },
+    "scenarios": [
+      {
+        "identity": "retrieval/cross-language-code",
+        "dimension": "retrieval",
+        "baseline": 0.25,
+        "candidate": 1.0,
+        "delta": 0.75
+      },
+      {
+        "identity": "retrieval/exact-code-evidence",
+        "dimension": "retrieval",
+        "baseline": 1.0,
+        "candidate": 1.0,
+        "delta": 0.0
+      },
+      {
+        "identity": "retrieval/live-temporal-applicability",
+        "dimension": "retrieval",
+        "baseline": 0.5,
+        "candidate": 1.0,
+        "delta": 0.5
+      },
+      {
+        "identity": "retrieval/multi-fact-retrieval",
+        "dimension": "retrieval",
+        "baseline": 1.0,
+        "candidate": 0.75,
+        "delta": -0.25
+      },
+      {
+        "identity": "retrieval/related-but-unanswerable",
+        "dimension": "retrieval",
+        "baseline": 0.75,
+        "candidate": 0.75,
+        "delta": 0.0
+      },
+      {
+        "identity": "workflow/persistent-mcp-observes-new-writes",
+        "dimension": "workflow",
+        "baseline": 1.0,
+        "candidate": 1.0,
+        "delta": 0.0
+      }
+    ],
+    "unpaired_scenarios": [],
+    "unpaired_details": [],
+    "baseline_errors": 0,
+    "candidate_errors": 0,
+    "repeats": 3,
+    "uncertainty_note": "Exploratory paired bootstrap over scenario IDs after averaging repeats; correlated task families require a separate grouped holdout."
+  }
+}

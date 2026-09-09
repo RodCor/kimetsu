@@ -1,0 +1,26 @@
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+   Compiling kimetsu-agent v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-agent)
+   Compiling kimetsu-bench v0.2.0 (E:\tmp\kimetsu-brain-hardening\bench)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.08s
+     Running unittests src\main.rs (E:/Kimetsu/bench/target\debug\deps\kbench-a3892fa7ea342860.exe)
+
+running 1 test
+test drivers::brainbench::tests::query_observation_retains_delivered_answerability ... FAILED
+
+failures:
+
+---- drivers::brainbench::tests::query_observation_retains_delivered_answerability stdout ----
+
+thread 'drivers::brainbench::tests::query_observation_retains_delivered_answerability' (13516) panicked at src\drivers\brainbench.rs:4829:9:
+assertion `left == right` failed
+  left: Null
+ right: Array [String("timeout")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    drivers::brainbench::tests::query_observation_retains_delivered_answerability
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 131 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin kbench`

@@ -1,0 +1,365 @@
+{
+  "protocol": "Frozen before answerability candidate inference. Assistant-authored synthetic fixture; not independent certification. Do not tune on results. Preflight revision before any fixture inference: replace literal passwords (redacted by ingestion) with explicit absence. Original retained as validation-preflight-invalid.json.",
+  "scenarios": [
+    {
+      "id": "orchid-answerability-frozen",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Synthetic single-project fact requests plus broad-task and unsupported-attribute controls.",
+      "memories": [
+        {
+          "key": "timeout",
+          "text": "Orchid gateway timeout is 45 seconds."
+        },
+        {
+          "key": "retries",
+          "text": "Orchid client retry count is 5."
+        },
+        {
+          "key": "memory",
+          "text": "Orchid worker memory limit is 768 MiB."
+        },
+        {
+          "key": "version",
+          "text": "Orchid worker version 8.2 is installed."
+        },
+        {
+          "key": "literal",
+          "text": "Orchid storage.page_bytes = 8192."
+        },
+        {
+          "key": "password",
+          "text": "No password is required for the Orchid gateway."
+        },
+        {
+          "key": "backup",
+          "text": "Orchid backups are retained for 36 hours."
+        },
+        {
+          "key": "port",
+          "text": "Orchid listener binds TCP port 7321. Configure its port in listener.toml."
+        },
+        {
+          "key": "advice",
+          "text": "Orchid version conflicts occur when lockfiles disagree. Regenerate the lockfile and check dependency constraints."
+        }
+      ],
+      "queries": [
+        {
+          "query": "What is the Orchid gateway timeout?",
+          "relevant": [
+            "timeout"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "How many retries does the Orchid client use?",
+          "relevant": [
+            "retries"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is the Orchid worker memory limit?",
+          "relevant": [
+            "memory"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What version does the Orchid worker run?",
+          "relevant": [
+            "version"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is `storage.page_bytes` in Orchid?",
+          "relevant": [
+            "literal"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What password does the Orchid gateway require?",
+          "relevant": [
+            "password"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "How long are Orchid backups retained?",
+          "relevant": [
+            "backup"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "Which files configure the port for Orchid?",
+          "relevant": [
+            "port"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What causes a version conflict in Orchid?",
+          "relevant": [
+            "advice"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "¿Qué versión usa el worker de Orchid?",
+          "relevant": [
+            "version"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "¿Cuánto tiempo se conservan las copias de seguridad de Orchid?",
+          "relevant": [
+            "backup"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is the timeout in seconds for the gateway in Orchid?",
+          "relevant": [
+            "timeout"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is the database timeout for Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What encryption key does Orchid use?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What is `storage.cache_bytes` in Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "How many production replicas does Orchid run?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What is the OpenSSL version for Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What is the database password for Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "How long are logs retained for Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "¿Qué contraseña usa la base de datos de Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "¿Cuántas replicas de producción tiene Orchid?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "Which region hosts Orchid production?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        }
+      ]
+    },
+    {
+      "id": "quartz-answerability-frozen",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Synthetic single-project fact requests plus broad-task and unsupported-attribute controls.",
+      "memories": [
+        {
+          "key": "timeout",
+          "text": "Quartz gateway timeout is 45 seconds."
+        },
+        {
+          "key": "retries",
+          "text": "Quartz client retry count is 5."
+        },
+        {
+          "key": "memory",
+          "text": "Quartz worker memory limit is 768 MiB."
+        },
+        {
+          "key": "version",
+          "text": "Quartz worker version 8.2 is installed."
+        },
+        {
+          "key": "literal",
+          "text": "Quartz storage.page_bytes = 8192."
+        },
+        {
+          "key": "password",
+          "text": "No password is required for the Quartz gateway."
+        },
+        {
+          "key": "backup",
+          "text": "Quartz backups are retained for 36 hours."
+        },
+        {
+          "key": "port",
+          "text": "Quartz listener binds TCP port 8452. Configure its port in listener.toml."
+        },
+        {
+          "key": "advice",
+          "text": "Quartz version conflicts occur when lockfiles disagree. Regenerate the lockfile and check dependency constraints."
+        }
+      ],
+      "queries": [
+        {
+          "query": "What is the Quartz gateway timeout?",
+          "relevant": [
+            "timeout"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "How many retries does the Quartz client use?",
+          "relevant": [
+            "retries"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is the Quartz worker memory limit?",
+          "relevant": [
+            "memory"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What version does the Quartz worker run?",
+          "relevant": [
+            "version"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is `storage.page_bytes` in Quartz?",
+          "relevant": [
+            "literal"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What password does the Quartz gateway require?",
+          "relevant": [
+            "password"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "How long are Quartz backups retained?",
+          "relevant": [
+            "backup"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "Which files configure the port for Quartz?",
+          "relevant": [
+            "port"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What causes a version conflict in Quartz?",
+          "relevant": [
+            "advice"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "¿Qué versión usa el worker de Quartz?",
+          "relevant": [
+            "version"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "¿Cuánto tiempo se conservan las copias de seguridad de Quartz?",
+          "relevant": [
+            "backup"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is the timeout in seconds for the gateway in Quartz?",
+          "relevant": [
+            "timeout"
+          ],
+          "judgment": "answerable"
+        },
+        {
+          "query": "What is the database timeout for Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What encryption key does Quartz use?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What is `storage.cache_bytes` in Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "How many production replicas does Quartz run?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What is the OpenSSL version for Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "What is the database password for Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "How long are logs retained for Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "¿Qué contraseña usa la base de datos de Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "¿Cuántas replicas de producción tiene Quartz?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        },
+        {
+          "query": "Which region hosts Quartz production?",
+          "relevant": [],
+          "judgment": "unanswerable"
+        }
+      ]
+    }
+  ]
+}

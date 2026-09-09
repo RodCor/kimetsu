@@ -202,6 +202,11 @@ ingest, TLS, Prometheus metrics, and a server-side reranker. Full setup in
 
 ## Docs
 
+- **[v2.8.0 answerability](docs/answerability.md)**: opt-in scoped facts,
+  partial/conflicting evidence, configuration and limits. On the new 45-query
+  synthetic fixture, unwanted injections fell **15/18 → 3/18**, with **24/27 hits
+  retained**; this is not a new overall benchmark score. [Measured report](docs/audits/2026-09-07-structured-facts.md).
+
 - **[Install & host wiring](https://kimetsu.dev/docs/install)**: every install path, host
   wiring, auto-harvest and distiller setup, maintenance commands.
 - **[How Kimetsu Works](https://kimetsu.dev/docs/how-kimetsu-works)**: the brain, the broker,

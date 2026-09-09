@@ -1,0 +1,539 @@
+{
+  "protocol": "Frozen before structured-fact candidate inference. Assistant-authored synthetic fixture, not independent or real-agent certification. Do not tune on results.",
+  "scenarios": [
+    {
+      "id": "lumen-structured-scope",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic scope, environment, partial and conflict controls; expected metadata is corpus-based and may expose retrieval omissions.",
+      "memories": [
+        {
+          "key": "stage-port",
+          "text": "Lumen staging gateway port is 7101."
+        },
+        {
+          "key": "prod-port",
+          "text": "Lumen production gateway port is 8101."
+        },
+        {
+          "key": "timeout-a",
+          "text": "Lumen staging gateway timeout is 30 seconds. Operators record this in the request settings."
+        },
+        {
+          "key": "timeout-b",
+          "text": "Lumen staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+        },
+        {
+          "key": "retries",
+          "text": "Lumen staging gateway retries are 3."
+        },
+        {
+          "key": "database",
+          "text": "Lumen production database port is 5432."
+        },
+        {
+          "key": "no-password",
+          "text": "No password is required for the Lumen production gateway."
+        },
+        {
+          "key": "other-timeout",
+          "text": "Lumen staging database timeout is 5 seconds."
+        },
+        {
+          "key": "foreign-port",
+          "text": "Foreign staging gateway port is 9944."
+        },
+        {
+          "key": "runtime",
+          "text": "Lumen stores its local state in SQLite using WAL mode."
+        },
+        {
+          "key": "literal",
+          "text": "Lumen cache.max_entries = 200."
+        }
+      ],
+      "queries": [
+        {
+          "query": "What is the Lumen staging gateway port?",
+          "relevant": [
+            "stage-port"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Lumen production gateway port?",
+          "relevant": [
+            "prod-port"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What are the Lumen staging gateway retries?",
+          "relevant": [
+            "retries"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is `cache.max_entries` for Lumen?",
+          "relevant": [
+            "literal"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "Which database stores local state for Lumen?",
+          "relevant": [
+            "runtime"
+          ],
+          "expected_answerability": null,
+          "expected_missing": []
+        },
+        {
+          "query": "What are the Lumen staging gateway port and password?",
+          "relevant": [
+            "stage-port"
+          ],
+          "expected_answerability": "partial",
+          "expected_missing": [
+            "password"
+          ]
+        },
+        {
+          "query": "What are the Lumen staging gateway port and retries?",
+          "relevant": [
+            "stage-port",
+            "retries"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Lumen staging gateway timeout?",
+          "relevant": [
+            "timeout-a",
+            "timeout-b"
+          ],
+          "expected_answerability": "conflicting",
+          "expected_missing": []
+        },
+        {
+          "query": "What password does the Lumen production gateway require?",
+          "relevant": [
+            "no-password"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Lumen staging database port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What is the Lumen production gateway timeout?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "timeout"
+          ]
+        },
+        {
+          "query": "What is the Unknown staging gateway port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What is the Lumen test gateway port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What are the Lumen production gateway retries?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "retries"
+          ]
+        },
+        {
+          "query": "What is the Lumen staging worker timeout?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "timeout"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "harbor-structured-scope",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic scope, environment, partial and conflict controls; expected metadata is corpus-based and may expose retrieval omissions.",
+      "memories": [
+        {
+          "key": "stage-port",
+          "text": "Harbor staging gateway port is 7102."
+        },
+        {
+          "key": "prod-port",
+          "text": "Harbor production gateway port is 8102."
+        },
+        {
+          "key": "timeout-a",
+          "text": "Harbor staging gateway timeout is 30 seconds. Operators record this in the request settings."
+        },
+        {
+          "key": "timeout-b",
+          "text": "Harbor staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+        },
+        {
+          "key": "retries",
+          "text": "Harbor staging gateway retries are 3."
+        },
+        {
+          "key": "database",
+          "text": "Harbor production database port is 5432."
+        },
+        {
+          "key": "no-password",
+          "text": "No password is required for the Harbor production gateway."
+        },
+        {
+          "key": "other-timeout",
+          "text": "Harbor staging database timeout is 5 seconds."
+        },
+        {
+          "key": "foreign-port",
+          "text": "Foreign staging gateway port is 9944."
+        },
+        {
+          "key": "runtime",
+          "text": "Harbor stores its local state in SQLite using WAL mode."
+        },
+        {
+          "key": "literal",
+          "text": "Harbor cache.max_entries = 200."
+        }
+      ],
+      "queries": [
+        {
+          "query": "What is the Harbor staging gateway port?",
+          "relevant": [
+            "stage-port"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Harbor production gateway port?",
+          "relevant": [
+            "prod-port"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What are the Harbor staging gateway retries?",
+          "relevant": [
+            "retries"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is `cache.max_entries` for Harbor?",
+          "relevant": [
+            "literal"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "Which database stores local state for Harbor?",
+          "relevant": [
+            "runtime"
+          ],
+          "expected_answerability": null,
+          "expected_missing": []
+        },
+        {
+          "query": "What are the Harbor staging gateway port and password?",
+          "relevant": [
+            "stage-port"
+          ],
+          "expected_answerability": "partial",
+          "expected_missing": [
+            "password"
+          ]
+        },
+        {
+          "query": "What are the Harbor staging gateway port and retries?",
+          "relevant": [
+            "stage-port",
+            "retries"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Harbor staging gateway timeout?",
+          "relevant": [
+            "timeout-a",
+            "timeout-b"
+          ],
+          "expected_answerability": "conflicting",
+          "expected_missing": []
+        },
+        {
+          "query": "What password does the Harbor production gateway require?",
+          "relevant": [
+            "no-password"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Harbor staging database port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What is the Harbor production gateway timeout?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "timeout"
+          ]
+        },
+        {
+          "query": "What is the Unknown staging gateway port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What is the Harbor test gateway port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What are the Harbor production gateway retries?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "retries"
+          ]
+        },
+        {
+          "query": "What is the Harbor staging worker timeout?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "timeout"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sable-structured-scope",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Frozen synthetic scope, environment, partial and conflict controls; expected metadata is corpus-based and may expose retrieval omissions.",
+      "memories": [
+        {
+          "key": "stage-port",
+          "text": "Sable staging gateway port is 7103."
+        },
+        {
+          "key": "prod-port",
+          "text": "Sable production gateway port is 8103."
+        },
+        {
+          "key": "timeout-a",
+          "text": "Sable staging gateway timeout is 30 seconds. Operators record this in the request settings."
+        },
+        {
+          "key": "timeout-b",
+          "text": "Sable staging gateway timeout is 45 seconds. The deployment checklist records a different current value."
+        },
+        {
+          "key": "retries",
+          "text": "Sable staging gateway retries are 3."
+        },
+        {
+          "key": "database",
+          "text": "Sable production database port is 5432."
+        },
+        {
+          "key": "no-password",
+          "text": "No password is required for the Sable production gateway."
+        },
+        {
+          "key": "other-timeout",
+          "text": "Sable staging database timeout is 5 seconds."
+        },
+        {
+          "key": "foreign-port",
+          "text": "Foreign staging gateway port is 9944."
+        },
+        {
+          "key": "runtime",
+          "text": "Sable stores its local state in SQLite using WAL mode."
+        },
+        {
+          "key": "literal",
+          "text": "Sable cache.max_entries = 200."
+        }
+      ],
+      "queries": [
+        {
+          "query": "What is the Sable staging gateway port?",
+          "relevant": [
+            "stage-port"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Sable production gateway port?",
+          "relevant": [
+            "prod-port"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What are the Sable staging gateway retries?",
+          "relevant": [
+            "retries"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is `cache.max_entries` for Sable?",
+          "relevant": [
+            "literal"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "Which database stores local state for Sable?",
+          "relevant": [
+            "runtime"
+          ],
+          "expected_answerability": null,
+          "expected_missing": []
+        },
+        {
+          "query": "What are the Sable staging gateway port and password?",
+          "relevant": [
+            "stage-port"
+          ],
+          "expected_answerability": "partial",
+          "expected_missing": [
+            "password"
+          ]
+        },
+        {
+          "query": "What are the Sable staging gateway port and retries?",
+          "relevant": [
+            "stage-port",
+            "retries"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Sable staging gateway timeout?",
+          "relevant": [
+            "timeout-a",
+            "timeout-b"
+          ],
+          "expected_answerability": "conflicting",
+          "expected_missing": []
+        },
+        {
+          "query": "What password does the Sable production gateway require?",
+          "relevant": [
+            "no-password"
+          ],
+          "expected_answerability": "supported",
+          "expected_missing": []
+        },
+        {
+          "query": "What is the Sable staging database port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What is the Sable production gateway timeout?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "timeout"
+          ]
+        },
+        {
+          "query": "What is the Unknown staging gateway port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What is the Sable test gateway port?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "port"
+          ]
+        },
+        {
+          "query": "What are the Sable production gateway retries?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "retries"
+          ]
+        },
+        {
+          "query": "What is the Sable staging worker timeout?",
+          "relevant": [],
+          "expected_answerability": "missing",
+          "expected_missing": [
+            "timeout"
+          ]
+        }
+      ]
+    }
+  ]
+}

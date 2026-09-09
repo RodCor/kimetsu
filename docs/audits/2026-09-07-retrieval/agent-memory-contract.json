@@ -1,0 +1,262 @@
+{
+  "scenarios": [
+    {
+      "id": "exact-code-evidence",
+      "dimension": "retrieval",
+      "tier": "easy",
+      "description": "Exact identifiers, multi-fact recall, and unrelated no-answer queries.",
+      "memories": [
+        {
+          "key": "stderr",
+          "text": "MCP diagnostic logs must go to stderr. Stdout is reserved for JSON-RPC messages."
+        },
+        {
+          "key": "foreign-keys",
+          "text": "Enable SQLite foreign key constraints explicitly on every new connection using PRAGMA foreign_keys = ON."
+        },
+        {
+          "key": "blocking",
+          "text": "Move long synchronous operations into tokio::task::spawn_blocking instead of blocking asynchronous executor threads."
+        },
+        {
+          "key": "test-isolation",
+          "text": "Initialize a Git boundary in each temporary test workspace so repository discovery cannot write to the real project."
+        }
+      ],
+      "queries": [
+        {
+          "query": "Where must MCP diagnostic logs be written?",
+          "relevant": [
+            "stderr"
+          ]
+        },
+        {
+          "query": "How do I enable SQLite foreign key constraints on a new connection?",
+          "relevant": [
+            "foreign-keys"
+          ]
+        },
+        {
+          "query": "How should I handle a long synchronous operation in the Tokio executor?",
+          "relevant": [
+            "blocking"
+          ]
+        },
+        {
+          "query": "What is the weather forecast for tomorrow?",
+          "relevant": []
+        },
+        {
+          "query": "What is the current production database password?",
+          "relevant": []
+        }
+      ]
+    },
+    {
+      "id": "related-but-unanswerable",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Related vocabulary must not imply that a stored fact answers a different question.",
+      "memories": [
+        {
+          "key": "http-port",
+          "text": "The local development HTTP server listens on port 4317."
+        },
+        {
+          "key": "storage",
+          "text": "The project stores local agent memories in a SQLite database."
+        },
+        {
+          "key": "logs",
+          "text": "Development request logs include the route and elapsed milliseconds."
+        }
+      ],
+      "queries": [
+        {
+          "query": "Which port does the local development HTTP server use?",
+          "relevant": [
+            "http-port"
+          ]
+        },
+        {
+          "query": "What authentication password does the local development HTTP server require?",
+          "relevant": []
+        },
+        {
+          "query": "Which encryption key protects the SQLite database?",
+          "relevant": []
+        },
+        {
+          "query": "What is the production request log retention duration?",
+          "relevant": []
+        }
+      ]
+    },
+    {
+      "id": "cross-language-code",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Small exploratory Spanish query track against English code memories.",
+      "memories": [
+        {
+          "key": "stderr",
+          "text": "Write MCP diagnostic messages to stderr because stdout carries the JSON-RPC protocol."
+        },
+        {
+          "key": "foreign-keys",
+          "text": "SQLite foreign key enforcement must be enabled separately for every connection with PRAGMA foreign_keys = ON."
+        },
+        {
+          "key": "blocking",
+          "text": "Use tokio::task::spawn_blocking for long synchronous work inside an asynchronous application."
+        }
+      ],
+      "queries": [
+        {
+          "query": "¿Dónde deben escribirse los mensajes de diagnóstico MCP para no romper JSON-RPC?",
+          "relevant": [
+            "stderr"
+          ]
+        },
+        {
+          "query": "¿Cómo se activan las claves foráneas de SQLite en cada conexión?",
+          "relevant": [
+            "foreign-keys"
+          ]
+        },
+        {
+          "query": "¿Cómo ejecuto trabajo síncrono largo sin bloquear Tokio?",
+          "relevant": [
+            "blocking"
+          ]
+        },
+        {
+          "query": "¿Cuál es el precio actual de la electricidad?",
+          "relevant": []
+        }
+      ]
+    },
+    {
+      "id": "multi-fact-retrieval",
+      "dimension": "retrieval",
+      "tier": "medium",
+      "description": "Fraction recall requires both expected facts; finding either is only a hit.",
+      "memories": [
+        {
+          "key": "git-boundary",
+          "text": "For safe temporary memory tests, run git init in the temporary workspace to establish a repository boundary."
+        },
+        {
+          "key": "user-brain",
+          "text": "For isolated memory tests, set KIMETSU_USER_BRAIN=0 to prevent cross-project memory leakage."
+        },
+        {
+          "key": "release",
+          "text": "Release packaging produces a compressed archive containing the executable."
+        }
+      ],
+      "queries": [
+        {
+          "query": "How do temporary memory tests establish a Git boundary and prevent user brain leakage?",
+          "relevant": [
+            "git-boundary",
+            "user-brain"
+          ]
+        },
+        {
+          "query": "Which executable signing certificate is used for releases?",
+          "relevant": []
+        }
+      ]
+    },
+    {
+      "id": "live-temporal-applicability",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "description": "Future starts and expired claims must not appear in current context; these are storage validity fields, not text hints.",
+      "memories": [
+        {
+          "key": "expired",
+          "text": "The Atlas staging listener uses port 4001.",
+          "valid_to": "2020-01-01T00:00:00Z"
+        },
+        {
+          "key": "future",
+          "text": "The Atlas staging listener uses port 4003.",
+          "valid_from": "2099-01-01T00:00:00Z"
+        },
+        {
+          "key": "current",
+          "text": "The Atlas staging listener uses port 4002."
+        }
+      ],
+      "queries": [
+        {
+          "query": "Which port does the Atlas staging listener currently use?",
+          "relevant": [
+            "current"
+          ],
+          "stale": [
+            "expired",
+            "future"
+          ]
+        },
+        {
+          "query": "What authentication password does the Atlas staging listener require?",
+          "relevant": [],
+          "stale": [
+            "expired",
+            "future"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "persistent-mcp-observes-new-writes",
+      "dimension": "workflow",
+      "tier": "medium",
+      "description": "A persistent MCP process must see new claims written by another process, while related unknowns remain unanswered.",
+      "workflow": {
+        "seed": [],
+        "episodes": [
+          {
+            "task": "Which port does the Zephyr local development HTTP server use?",
+            "relevant": [],
+            "record": [
+              {
+                "key": "port",
+                "text": "The Zephyr local development HTTP server listens on port 5243."
+              }
+            ]
+          },
+          {
+            "task": "Which port does the Zephyr local development HTTP server use?",
+            "relevant": [
+              "port"
+            ]
+          },
+          {
+            "task": "What authentication password does the Zephyr HTTP server require?",
+            "relevant": []
+          },
+          {
+            "task": "Where should MCP diagnostic logs be written?",
+            "relevant": [],
+            "record": [
+              {
+                "key": "logs",
+                "text": "MCP diagnostic logs go to stderr; stdout is reserved for JSON-RPC messages."
+              }
+            ]
+          },
+          {
+            "task": "Where should MCP diagnostic logs be written?",
+            "relevant": [
+              "logs"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

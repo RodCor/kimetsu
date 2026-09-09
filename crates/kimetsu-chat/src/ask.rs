@@ -35,6 +35,8 @@ use kimetsu_core::paths::{ProjectPaths, user_brain_enabled, user_kimetsu_dir};
 /// Stable JSON-serialisable output from the composer (3.1 + 3.2).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AskAnswer {
+    #[serde(default)]
+    pub exposure_id: Option<String>,
     /// The composed (or verbatim) answer text.
     pub answer: String,
     /// Memory / file citation ids (`memory:<id>` or `file:<path>`).
@@ -127,6 +129,7 @@ pub fn compose_answer(workspace: &Path, question: &str) -> AskAnswer {
         Ok(b) => b,
         Err(err) => {
             return AskAnswer {
+                exposure_id: None,
                 answer: format!(
                     "Brain unavailable for this workspace: {err}. \
                      Is the project initialized (`kimetsu init`)?"
@@ -142,6 +145,7 @@ pub fn compose_answer(workspace: &Path, question: &str) -> AskAnswer {
     // ── Grounded-only refusal ─────────────────────────────────────────────────
     if bundle.skipped || bundle.capsules.is_empty() {
         return AskAnswer {
+            exposure_id: None,
             answer: "Nothing in project memory answers that.".to_string(),
             citations: Vec::new(),
             grounded: false,
@@ -161,10 +165,18 @@ pub fn compose_answer(workspace: &Path, question: &str) -> AskAnswer {
         .collect();
 
     // ── DP-B: resolve cheap model (local preferred) ───────────────────────────
-    match resolve_ask_provider(workspace) {
+    let mut exposure_id = None;
+    let mut answer = match resolve_ask_provider(workspace) {
         Some((mut provider, model_id)) => {
-            match call_composer(&capsules, question, provider.as_mut()) {
+            match call_composer(
+                workspace,
+                &capsules,
+                question,
+                provider.as_mut(),
+                &mut exposure_id,
+            ) {
                 Some(answer) => AskAnswer {
+                    exposure_id: None,
                     answer,
                     citations,
                     grounded: true,
@@ -175,7 +187,32 @@ pub fn compose_answer(workspace: &Path, question: &str) -> AskAnswer {
             }
         }
         None => verbatim_answer(&capsules, &citations),
-    }
+    };
+    answer.exposure_id = exposure_id
+        .or_else(|| record_ask_exposure(workspace, &capsules, answer.answer.len(), "ask_verbatim"));
+    answer
+}
+
+fn record_ask_exposure(
+    workspace: &Path,
+    capsules: &[ContextCapsule],
+    rendered_bytes: usize,
+    surface: &str,
+) -> Option<String> {
+    let mut payload = kimetsu_brain::context::delivery::injected_payload(
+        capsules,
+        rendered_bytes.min(u32::MAX as usize) as u32,
+    );
+    payload["surface"] = serde_json::json!(surface);
+    payload["cost_unit"] = serde_json::json!("rendered_utf8_bytes");
+    let exposure = kimetsu_core::event::Event::new(
+        kimetsu_core::ids::RunId::new(),
+        "context.injected",
+        payload,
+    );
+    project::record_context_exposure(workspace, &exposure)
+        .ok()
+        .map(|_| exposure.event_id.to_string())
 }
 
 /// Record a citation for each memory handle in `citation_handles`, wiring
@@ -186,6 +223,24 @@ pub fn record_helpful_mark(workspace: &Path, citation_handles: &[String]) {
     for handle in citation_handles {
         if let Some(memory_id) = handle.strip_prefix("memory:") {
             project::record_mcp_citation(workspace, memory_id, Some("marked helpful via ask")).ok();
+        }
+    }
+}
+
+/// Bind an explicit helpful mark to the claims in the original answer.
+pub fn record_helpful_mark_scoped(
+    workspace: &Path,
+    exposure_id: &str,
+    citation_handles: &[String],
+) {
+    for handle in citation_handles {
+        if let Some(id) = handle.strip_prefix("memory:") {
+            let _ = project::record_exposure_citation(
+                workspace,
+                exposure_id,
+                id,
+                Some("marked helpful via ask"),
+            );
         }
     }
 }
@@ -211,6 +266,7 @@ fn verbatim_answer(capsules: &[ContextCapsule], citations: &[String]) -> AskAnsw
         )
     };
     AskAnswer {
+        exposure_id: None,
         answer,
         citations: citations.to_vec(),
         grounded: true,
@@ -221,9 +277,11 @@ fn verbatim_answer(capsules: &[ContextCapsule], citations: &[String]) -> AskAnsw
 
 /// Call the composer model and return the answer text, or `None` on failure.
 fn call_composer(
+    workspace: &Path,
     capsules: &[ContextCapsule],
     question: &str,
     provider: &mut dyn ModelProvider,
+    exposure_id: &mut Option<String>,
 ) -> Option<String> {
     let context_block = capsules
         .iter()
@@ -268,6 +326,12 @@ fn call_composer(
         metadata: serde_json::Value::Null,
     };
 
+    *exposure_id = record_ask_exposure(
+        workspace,
+        capsules,
+        user_msg.len() + system.len(),
+        "ask_composer",
+    );
     let response = provider.complete(request).ok()?;
     let text = response.text?.trim().to_string();
     if text.is_empty() { None } else { Some(text) }
@@ -409,6 +473,10 @@ mod tests {
             score: 0.9,
             superseded_hint: false,
             rerank_policy_tier: 0,
+            claim_revision: None,
+            facts: vec![],
+            rerank_usefulness: None,
+            rerank_trust: None,
         }
     }
 

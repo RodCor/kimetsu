@@ -94,9 +94,8 @@ impl BedrockProvider {
             return Ok(None);
         };
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.model.request_timeout_secs))
-            .build()?;
+        bedrock_endpoint(&region, &config.model.model)?;
+        let client = bedrock_client(config.model.request_timeout_secs)?;
 
         Ok(Some(Self {
             client,
@@ -123,16 +122,17 @@ impl BedrockProvider {
         temperature: f32,
         timeout_secs: u64,
     ) -> KimetsuResult<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()?;
+        let region = region.into();
+        let model_id = model_id.into();
+        bedrock_endpoint(&region, &model_id)?;
+        let client = bedrock_client(timeout_secs)?;
         Ok(Self {
             client,
             access_key: SecretString::new(access_key.into()),
             secret_key: SecretString::new(secret_key.into()),
             session_token: session_token.map(SecretString::new),
-            region: region.into(),
-            model_id: model_id.into(),
+            region,
+            model_id,
             max_output_tokens,
             temperature,
             timeout_secs,
@@ -238,23 +238,19 @@ impl ModelProvider for BedrockProvider {
             &request,
         );
         let payload = serde_json::to_vec(&body)?;
-        let url = format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke",
-            self.region,
-            url_encode_model_id(&self.model_id),
-        );
+        let url = bedrock_endpoint(&self.region, &self.model_id)?;
 
         let headers = sign_bedrock_headers(
             self.access_key.expose_secret(),
             self.secret_key.expose_secret(),
             self.session_token.as_ref().map(|s| s.expose_secret()),
             &self.region,
-            &url,
+            url.as_str(),
             &payload,
             SystemTime::now(),
         )?;
 
-        let mut req = self.client.post(&url);
+        let mut req = self.client.post(url);
         for (name, value) in &headers {
             req = req.header(name.as_str(), value.as_str());
         }
@@ -274,13 +270,35 @@ impl ModelProvider for BedrockProvider {
     }
 }
 
-/// Percent-encode characters in model IDs that could be misinterpreted in URL
-/// paths. Bedrock model IDs typically contain only alphanumerics, hyphens,
-/// dots, and colons — but the colon must be percent-encoded in URL paths to
-/// avoid ambiguity with `scheme:`.
-fn url_encode_model_id(model_id: &str) -> String {
-    // Only colons need encoding in practice; percent-encode the rest if needed.
-    model_id.replace(':', "%3A")
+fn bedrock_client(timeout_secs: u64) -> KimetsuResult<Client> {
+    Ok(Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()?)
+}
+
+/// Only an AWS region label can influence the fixed HTTPS authority. Model IDs
+/// are encoded as one path segment; credentials are never sent across redirects.
+fn bedrock_endpoint(region: &str, model_id: &str) -> KimetsuResult<reqwest::Url> {
+    if region.is_empty()
+        || region.len() > 63
+        || !region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        || region.starts_with('-')
+        || region.ends_with('-')
+    {
+        return Err("invalid AWS region: expected a lowercase region label".into());
+    }
+    if model_id.is_empty() {
+        return Err("Bedrock model id is empty".into());
+    }
+    let mut url = reqwest::Url::parse(&format!("https://bedrock-runtime.{region}.amazonaws.com"))?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid Bedrock endpoint")?
+        .extend(["model", model_id, "invoke"]);
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -288,6 +306,52 @@ mod tests {
     use super::*;
     use crate::model::{MessageContent, MessageRole, ModelMessage, ToolChoice};
     use serde_json::json;
+
+    #[test]
+    fn endpoint_rejects_region_authority_injection_and_encodes_model_id() {
+        for region in [
+            "",
+            "us-east-1@attacker.test",
+            "us-east-1/evil",
+            "us-east-1?x",
+            "us-east-1#x",
+            "us-east-1:443",
+            "US-EAST-1",
+            "us-east-1.evil",
+        ] {
+            assert!(
+                bedrock_endpoint(region, "test-model").is_err(),
+                "region {region}"
+            );
+        }
+        let endpoint = bedrock_endpoint(
+            "us-east-1",
+            "arn:aws:bedrock:us-east-1:123:model/example?x#y",
+        )
+        .unwrap();
+        assert_eq!(endpoint.scheme(), "https");
+        assert_eq!(
+            endpoint.host_str(),
+            Some("bedrock-runtime.us-east-1.amazonaws.com")
+        );
+        assert_eq!(endpoint.query(), None);
+        assert_eq!(endpoint.fragment(), None);
+        assert!(endpoint.path().contains("%2F"));
+        assert!(endpoint.path().ends_with("/invoke"));
+    }
+
+    #[test]
+    fn bedrock_client_rejects_plaintext_before_connecting() {
+        let error = bedrock_client(1)
+            .unwrap()
+            .post("http://127.0.0.1:9/")
+            .send()
+            .unwrap_err();
+        assert!(
+            error.is_builder(),
+            "HTTPS-only validation must reject before I/O: {error}"
+        );
+    }
 
     fn simple_request() -> ModelRequest {
         ModelRequest {

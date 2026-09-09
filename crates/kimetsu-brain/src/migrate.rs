@@ -104,6 +104,26 @@ fn migrations() -> &'static [Migration] {
             description: "add memory_entities projection (v2.6 first-class tags + ingest-time edges)",
             up: crate::schema::migrate_v10_to_v11,
         },
+        Migration {
+            version: 12,
+            description: "durable correction revisions and corpus freshness",
+            up: crate::schema::migrate_v11_to_v12,
+        },
+        Migration {
+            version: 13,
+            description: "preserve proposal temporal applicability",
+            up: crate::schema::migrate_v12_to_v13,
+        },
+        Migration {
+            version: 14,
+            description: "scope work episodes by explicit identity",
+            up: crate::schema::migrate_v13_to_v14,
+        },
+        Migration {
+            version: 15,
+            description: "derive structured fact evidence from redacted memories",
+            up: crate::schema::migrate_v14_to_v15,
+        },
     ]
 }
 
@@ -504,6 +524,8 @@ mod tests {
                  ('e2','r1','2024-01-02T00:00:00Z','memory.cited',1,'{}');",
         )
         .expect("seed v7 events");
+        // Newer migrations install corpus-change triggers on the baseline table.
+        conn.execute_batch("CREATE TABLE memories(memory_id TEXT PRIMARY KEY, text TEXT, embedding BLOB, embedding_model TEXT, invalidated_at TEXT, superseded_by TEXT);").unwrap();
 
         let target = target_version();
         let outcome = run_with(&conn, migrations(), target).expect("migrate v7->current");

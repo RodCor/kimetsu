@@ -2,6 +2,7 @@ pub mod ambient;
 pub mod analytics;
 #[cfg(feature = "embeddings")]
 pub mod ann;
+pub mod answerability;
 /// S5.1: retrieval backend trait + FlatBackend implementation.
 pub(crate) mod backend;
 /// S5.4: cross-backend benchmark harness (flat / graph-lite / petgraph).
@@ -21,6 +22,10 @@ pub mod embeddings;
 /// Flagship 1 / Story 1.3: episodic work-resume capture, storage, and surface.
 pub mod episode;
 pub mod eval;
+pub mod fact_query;
+pub mod fact_store;
+pub mod fact_values;
+pub mod facts;
 pub mod feedback;
 pub mod framing;
 /// #2 knowledge graph: rule-based relation-edge extraction for `memory_edges`.
@@ -45,6 +50,7 @@ pub mod reinforce;
 pub mod roi;
 pub mod schema;
 pub(crate) mod scoring;
+pub mod serving;
 pub mod skill_synthesis;
 /// Epic S3: personal brain sync — event-log replication.
 pub mod sync;
@@ -54,3 +60,6 @@ pub mod tune;
 pub mod tuneset;
 pub mod user_brain;
 pub mod user_profile;
+
+#[cfg(test)]
+mod hardening_evidence_tests;

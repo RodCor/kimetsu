@@ -1,0 +1,630 @@
+{
+  "generated_at": "2026-09-07T03:51:15.9695372Z",
+  "dataset": "E:\\tmp\\kimetsu-brain-hardening\\bench\\datasets\\brainbench\\agent-memory-contract.json",
+  "session_configuration": {
+    "include_ambient": false,
+    "warm_start": false
+  },
+  "scenarios": [
+    {
+      "observations": [
+        {
+          "query": "Where must MCP diagnostic logs be written?",
+          "ranked": [
+            "stderr"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZTV1ZVAPZBAJDCV2JFP8T",
+              "id": "01M1WZTXCYTQZ7D5VHHZ9YWZJT",
+              "kind": "memory",
+              "score": 0.9986107349395752,
+              "summary": "project:fact - MCP diagnostic logs must go to stderr. Stdout is reserved for JSON-RPC messages."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2356.9606,
+          "first_query": true,
+          "server_startup_ms": 102.2836,
+          "model_text_bytes": 468,
+          "mcp_result_bytes": 549,
+          "wire_bytes": 584,
+          "reported_used_tokens": 549,
+          "working_set_bytes": 629903360,
+          "peak_working_set_bytes": 684896256
+        },
+        {
+          "query": "How do I enable SQLite foreign key constraints on a new connection?",
+          "ranked": [
+            "foreign-keys"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZTV2H4B33HA305CYW8MB2",
+              "id": "01M1WZTXVA9SS8SDYCY9E2TTD0",
+              "kind": "memory",
+              "score": 0.999981164932251,
+              "summary": "project:fact - Enable SQLite foreign key constraints explicitly on every new connection using PRAGMA foreign_keys = ON."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 454.8856,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 492,
+          "mcp_result_bytes": 573,
+          "wire_bytes": 608,
+          "reported_used_tokens": 573,
+          "working_set_bytes": 632070144,
+          "peak_working_set_bytes": 684896256
+        },
+        {
+          "query": "How should I handle a long synchronous operation in the Tokio executor?",
+          "ranked": [
+            "blocking"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZTV2Z5HD9KE5R8EMHJQ90",
+              "id": "01M1WZTY9ZEK2X14DMB3M5AS7Z",
+              "kind": "memory",
+              "score": 0.9949350953102112,
+              "summary": "project:fact - Move long synchronous operations into tokio::task::spawn_blocking instead of blocking asynchronous executor threads."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 479.6293,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 504,
+          "mcp_result_bytes": 585,
+          "wire_bytes": 620,
+          "reported_used_tokens": 585,
+          "working_set_bytes": 632602624,
+          "peak_working_set_bytes": 684896256
+        },
+        {
+          "query": "What is the weather forecast for tomorrow?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 447.7583,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 632639488,
+          "peak_working_set_bytes": 684896256
+        },
+        {
+          "query": "What is the current production database password?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 470.27200000000005,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 632672256,
+          "peak_working_set_bytes": 684896256
+        }
+      ],
+      "id": "exact-code-evidence",
+      "dimension": "retrieval",
+      "tier": "easy",
+      "score": 1.0,
+      "skipped": false,
+      "detail": "positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.000 (n=2) positive-n=3 negative-n=2 (5 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "Which port does the local development HTTP server use?",
+          "ranked": [
+            "http-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZV0RW98W8F7FBK8QZB2WD",
+              "id": "01M1WZV2WVXGW9TZD2S7G9YW6Y",
+              "kind": "memory",
+              "score": 0.9999812841415404,
+              "summary": "project:fact - The local development HTTP server listens on port 4317."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2136.8434,
+          "first_query": true,
+          "server_startup_ms": 97.3645,
+          "model_text_bytes": 444,
+          "mcp_result_bytes": 525,
+          "wire_bytes": 560,
+          "reported_used_tokens": 525,
+          "working_set_bytes": 630190080,
+          "peak_working_set_bytes": 685039616
+        },
+        {
+          "query": "What authentication password does the local development HTTP server require?",
+          "ranked": [
+            "http-port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZV0RW98W8F7FBK8QZB2WD",
+              "id": "01M1WZV3BFDGZ6P8TT075BJKF5",
+              "kind": "memory",
+              "score": 0.7880221605300903,
+              "summary": "project:fact - The local development HTTP server listens on port 4317."
+            }
+          ],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": true,
+          "stale_injection": null,
+          "latency_ms": 447.4881,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 443,
+          "mcp_result_bytes": 524,
+          "wire_bytes": 559,
+          "reported_used_tokens": 524,
+          "working_set_bytes": 631746560,
+          "peak_working_set_bytes": 685039616
+        },
+        {
+          "query": "Which encryption key protects the SQLite database?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 433.30400000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 631799808,
+          "peak_working_set_bytes": 685039616
+        },
+        {
+          "query": "What is the production request log retention duration?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 437.8376,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 631816192,
+          "peak_working_set_bytes": 685039616
+        }
+      ],
+      "id": "related-but-unanswerable",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 0.75,
+      "skipped": false,
+      "detail": "positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.333 (n=3) positive-n=1 negative-n=3 (4 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "\u00bfD\u00f3nde deben escribirse los mensajes de diagn\u00f3stico MCP para no romper JSON-RPC?",
+          "ranked": [
+            "stderr"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZV5Q9S4Z4MWBWXRW815ZY",
+              "id": "01M1WZV7XV88ZSWSHQ5APGCMSE",
+              "kind": "memory",
+              "score": 0.9584800601005554,
+              "summary": "project:fact - Write MCP diagnostic messages to stderr because stdout carries the JSON-RPC protocol."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2226.572,
+          "first_query": true,
+          "server_startup_ms": 97.6527,
+          "model_text_bytes": 473,
+          "mcp_result_bytes": 554,
+          "wire_bytes": 589,
+          "reported_used_tokens": 554,
+          "working_set_bytes": 631300096,
+          "peak_working_set_bytes": 684892160
+        },
+        {
+          "query": "\u00bfC\u00f3mo se activan las claves for\u00e1neas de SQLite en cada conexi\u00f3n?",
+          "ranked": [
+            "foreign-keys"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZV5QXSYFAX6DNW0WD081B",
+              "id": "01M1WZV8CJQWR5VKCM29C8P1EF",
+              "kind": "memory",
+              "score": 0.993928074836731,
+              "summary": "project:fact - SQLite foreign key enforcement must be enabled separately for every connection with PRAGMA foreign_keys = ON."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 457.5797,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 496,
+          "mcp_result_bytes": 577,
+          "wire_bytes": 612,
+          "reported_used_tokens": 577,
+          "working_set_bytes": 632168448,
+          "peak_working_set_bytes": 684892160
+        },
+        {
+          "query": "\u00bfC\u00f3mo ejecuto trabajo s\u00edncrono largo sin bloquear Tokio?",
+          "ranked": [
+            "blocking"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZV5RB0RZ8RNB6CH88733E",
+              "id": "01M1WZV8TNZG0FCCNZFD9AH7K9",
+              "kind": "memory",
+              "score": 0.9620424509048462,
+              "summary": "project:fact - Use tokio::task::spawn_blocking for long synchronous work inside an asynchronous application."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 459.3469,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 481,
+          "mcp_result_bytes": 562,
+          "wire_bytes": 597,
+          "reported_used_tokens": 562,
+          "working_set_bytes": 632254464,
+          "peak_working_set_bytes": 684892160
+        },
+        {
+          "query": "\u00bfCu\u00e1l es el precio actual de la electricidad?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 434.1946,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 632274944,
+          "peak_working_set_bytes": 684892160
+        }
+      ],
+      "id": "cross-language-code",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 1.0,
+      "skipped": false,
+      "detail": "positive-recall@4=1.00 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.000 (n=1) positive-n=3 negative-n=1 (4 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "How do temporary memory tests establish a Git boundary and prevent user brain leakage?",
+          "ranked": [
+            "git-boundary"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZVAT824N0AQ3J5XFGHX62",
+              "id": "01M1WZVCYNX2YD0QDPYED40DQ9",
+              "kind": "memory",
+              "score": 0.9905676245689392,
+              "summary": "project:fact - For safe temporary memory tests, run git init in the temporary workspace to establish a repository boundary."
+            }
+          ],
+          "positive_recall_at_4": 0.5,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 2115.249,
+          "first_query": true,
+          "server_startup_ms": 100.7616,
+          "model_text_bytes": 497,
+          "mcp_result_bytes": 578,
+          "wire_bytes": 613,
+          "reported_used_tokens": 578,
+          "working_set_bytes": 626737152,
+          "peak_working_set_bytes": 684793856
+        },
+        {
+          "query": "Which executable signing certificate is used for releases?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 463.9161,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 626929664,
+          "peak_working_set_bytes": 684793856
+        }
+      ],
+      "id": "multi-fact-retrieval",
+      "dimension": "retrieval",
+      "tier": "medium",
+      "score": 0.75,
+      "skipped": false,
+      "detail": "positive-recall@4=0.50 mrr=1.00 stale-hit=n/a resolution=n/a false-injection=0.000 (n=1) positive-n=1 negative-n=1 (2 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "Which port does the Atlas staging listener currently use?",
+          "ranked": [
+            "current"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZVF257705XNKQVNDQ725C",
+              "id": "01M1WZVH4D99VZDVKR7ZCC381W",
+              "kind": "memory",
+              "score": 0.999972939491272,
+              "summary": "project:fact - The Atlas staging listener uses port 4002."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": false,
+          "latency_ms": 2128.8614,
+          "first_query": true,
+          "server_startup_ms": 106.8232,
+          "model_text_bytes": 429,
+          "mcp_result_bytes": 510,
+          "wire_bytes": 545,
+          "reported_used_tokens": 510,
+          "working_set_bytes": 628359168,
+          "peak_working_set_bytes": 685191168
+        },
+        {
+          "query": "What authentication password does the Atlas staging listener require?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": false,
+          "latency_ms": 452.8955,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 629186560,
+          "peak_working_set_bytes": 685191168
+        }
+      ],
+      "id": "live-temporal-applicability",
+      "dimension": "retrieval",
+      "tier": "hard",
+      "score": 1.0,
+      "skipped": false,
+      "detail": "positive-recall@4=1.00 mrr=1.00 stale-hit=0.000 (n=2) resolution=0.500 (n=2) false-injection=0.000 (n=1) positive-n=1 negative-n=1 (2 queries)"
+    },
+    {
+      "observations": [
+        {
+          "query": "Which port does the Zephyr local development HTTP server use?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 2216.2516,
+          "first_query": true,
+          "server_startup_ms": 100.64389999999999,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 623370240,
+          "peak_working_set_bytes": 684752896
+        },
+        {
+          "query": "Which port does the Zephyr local development HTTP server use?",
+          "ranked": [
+            "port"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZVNBEAZCAVN3DQAWVPYG6",
+              "id": "01M1WZVNPAT3XXEYNQVSHYPGJ0",
+              "kind": "memory",
+              "score": 0.99998140335083,
+              "summary": "project:fact - The Zephyr local development HTTP server listens on port 5243."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 444.8203,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 451,
+          "mcp_result_bytes": 532,
+          "wire_bytes": 567,
+          "reported_used_tokens": 532,
+          "working_set_bytes": 624906240,
+          "peak_working_set_bytes": 684752896
+        },
+        {
+          "query": "What authentication password does the Zephyr HTTP server require?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 433.2609,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 625143808,
+          "peak_working_set_bytes": 684752896
+        },
+        {
+          "query": "Where should MCP diagnostic logs be written?",
+          "ranked": [],
+          "positive_recall_at_4": null,
+          "positive_hit_at_4": null,
+          "positive_mrr": null,
+          "negative_injection": false,
+          "stale_injection": null,
+          "latency_ms": 433.7088,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 226,
+          "mcp_result_bytes": 289,
+          "wire_bytes": 324,
+          "reported_used_tokens": 289,
+          "working_set_bytes": 625733632,
+          "peak_working_set_bytes": 684752896
+        },
+        {
+          "query": "Where should MCP diagnostic logs be written?",
+          "ranked": [
+            "logs"
+          ],
+          "delivered_capsules": [
+            {
+              "expansion_handle": "memory:01M1WZVQ652K9086GQS1JDX25A",
+              "id": "01M1WZVQHJ9V2R70HT4Z5A264W",
+              "kind": "memory",
+              "score": 0.9523543119430542,
+              "summary": "project:fact - MCP diagnostic logs go to stderr; stdout is reserved for JSON-RPC messages."
+            }
+          ],
+          "positive_recall_at_4": 1.0,
+          "positive_hit_at_4": true,
+          "positive_mrr": 1.0,
+          "negative_injection": null,
+          "stale_injection": null,
+          "latency_ms": 460.90930000000003,
+          "first_query": false,
+          "server_startup_ms": 0.0,
+          "model_text_bytes": 463,
+          "mcp_result_bytes": 544,
+          "wire_bytes": 579,
+          "reported_used_tokens": 544,
+          "working_set_bytes": 627052544,
+          "peak_working_set_bytes": 684752896
+        }
+      ],
+      "id": "persistent-mcp-observes-new-writes",
+      "dimension": "workflow",
+      "tier": "medium",
+      "score": 1.0,
+      "skipped": false,
+      "detail": "useful-hit=1.00 mrr=1.00 false-inj=0.00 trap-hit=n/a resolution=n/a curve=1.00\u21921.00 (5 episodes: 2 gold, 3 abstention; brain=2 mems)"
+    }
+  ],
+  "by_dimension_tier": {
+    "retrieval/easy": [
+      1.0,
+      1
+    ],
+    "retrieval/hard": [
+      2.75,
+      3
+    ],
+    "retrieval/medium": [
+      0.75,
+      1
+    ],
+    "workflow/medium": [
+      1.0,
+      1
+    ]
+  },
+  "by_dimension": {
+    "retrieval": {
+      "mean": 0.9,
+      "n": 5,
+      "ci95": 0.12002499739637572
+    },
+    "workflow": {
+      "mean": 1.0,
+      "n": 1,
+      "ci95": null
+    }
+  },
+  "overall_index": 0.95,
+  "scenario_weighted_index": 0.9166666666666666
+}

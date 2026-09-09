@@ -556,25 +556,10 @@ pub(crate) fn detect_and_record_with_vec(
     recorded
 }
 
-/// Story 1.3 / Pass B: detect conflicts AND attempt auto-resolution.
-///
-/// For each conflict hit:
-///   1. Read confidence + created_at from the existing memory row.
-///   2. Compute `resolution_score` for both sides.
-///   3. When |Δ| ≥ `NEAR_TIE_BAND`: stamp the loser's `valid_to` to now via
-///      `mark_memory_temporal` (event-sourced, rebuild-safe). Also record the
-///      conflict row with a pre-filled `resolution` label so the operator can
-///      see it was auto-resolved.
-///   4. When |Δ| < `NEAR_TIE_BAND`: record to `memory_conflicts` for operator
-///      review (same as v0.5.2 behavior). Nothing auto-stamped.
-///
-/// `new_confidence`: the confidence of the newly-added memory (0-1).
-/// `new_created_at`: RFC 3339 timestamp of the newly-added memory.
-///
-/// Returns `(auto_resolved, queued)` counts.
-///
-/// Best-effort: errors inside resolution are downgraded to a stderr line —
-/// never fail an otherwise-valid memory write.
+/// Queue similarity candidates for explicit review. Similarity and a score gap
+/// cannot establish a contradiction or which claim is correct. The legacy
+/// confidence/time arguments and `(auto_resolved, queued)` return shape remain
+/// compatible, but auto_resolved is always zero. Recording is best-effort.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_record_and_resolve_with_vec(
     conn: &Connection,
@@ -604,117 +589,19 @@ pub(crate) fn detect_record_and_resolve_with_vec(
         }
     };
 
-    let mut auto_resolved = 0usize;
-    let mut queued = 0usize;
-
+    // Cosine and confidence/age gaps cannot establish a contradiction. Preserve
+    // the legacy entry point for callers/config compatibility, but leave destructive
+    // resolution to explicit corrections or operator decisions until structured
+    // claim identity and independent contradiction evidence are available.
+    let _ = (new_confidence, new_created_at);
+    let mut queued = 0;
     for hit in &hits {
-        // Fetch existing memory's confidence + created_at for scoring.
-        let existing_row: Option<(f64, String)> = conn
-            .query_row(
-                "SELECT confidence, created_at FROM memories WHERE memory_id = ?1",
-                params![hit.existing_memory_id],
-                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .unwrap_or(None);
-
-        let outcome = if let Some((existing_conf, existing_created_at)) = existing_row {
-            let new_score = resolution_score(new_confidence, new_created_at);
-            let existing_score = resolution_score(existing_conf as f32, &existing_created_at);
-            let delta = (new_score - existing_score).abs();
-
-            if delta >= NEAR_TIE_BAND {
-                // Clear winner: stamp the loser's valid_to to now.
-                let now_str = match OffsetDateTime::now_utc().format(&Rfc3339) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("kimetsu-brain: timestamp format error: {e}");
-                        // Fall back to queue on timestamp error.
-                        if let Err(e) = record_conflict(conn, new_memory_id, scope, kind, hit) {
-                            eprintln!(
-                                "kimetsu-brain: failed to record near-tie conflict {} <-> {}: {e}",
-                                new_memory_id, hit.existing_memory_id
-                            );
-                        }
-                        queued += 1;
-                        continue;
-                    }
-                };
-
-                let (loser_id, resolution_label) = if new_score >= existing_score {
-                    // New memory wins; existing loses.
-                    (hit.existing_memory_id.as_str(), "auto_resolved:new_won")
-                } else {
-                    // Existing memory wins; new memory loses.
-                    (new_memory_id, "auto_resolved:existing_won")
-                };
-
-                // Stamp valid_to on the loser (event-sourced via mark_memory_temporal).
-                if let Err(e) =
-                    crate::projector::mark_memory_temporal(conn, loser_id, None, Some(&now_str))
-                {
-                    eprintln!("kimetsu-brain: auto-resolution stamp failed for {loser_id}: {e}");
-                    // Fall back to queue.
-                    if let Err(e) = record_conflict(conn, new_memory_id, scope, kind, hit) {
-                        eprintln!(
-                            "kimetsu-brain: fallback queue failed {} <-> {}: {e}",
-                            new_memory_id, hit.existing_memory_id
-                        );
-                    }
-                    queued += 1;
-                    continue;
-                }
-
-                // Record in memory_conflicts with resolution pre-filled so the
-                // operator can audit auto-resolved pairs.
-                match record_conflict(conn, new_memory_id, scope, kind, hit) {
-                    Ok(conflict_id) => {
-                        // Stamp resolved_at + resolution label.
-                        conn.execute(
-                            "UPDATE memory_conflicts \
-                             SET resolved_at = ?2, resolution = ?3 \
-                             WHERE conflict_id = ?1 AND resolved_at IS NULL",
-                            params![conflict_id, now_str, resolution_label],
-                        )
-                        .unwrap_or(0);
-                        auto_resolved += 1;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "kimetsu-brain: failed to record auto-resolved conflict {} <-> {}: {e}",
-                            new_memory_id, hit.existing_memory_id
-                        );
-                    }
-                }
-
-                if new_score >= existing_score {
-                    ResolutionOutcome::AutoResolvedNewWon
-                } else {
-                    ResolutionOutcome::AutoResolvedExistingWon
-                }
-            } else {
-                // Near-tie: queue for operator review.
-                ResolutionOutcome::NearTieQueued
-            }
-        } else {
-            // Existing memory row not found (race/deleted): fall back to queue.
-            ResolutionOutcome::NearTieQueued
-        };
-
-        if outcome == ResolutionOutcome::NearTieQueued {
-            match record_conflict(conn, new_memory_id, scope, kind, hit) {
-                Ok(_) => queued += 1,
-                Err(e) => {
-                    eprintln!(
-                        "kimetsu-brain: failed to record near-tie conflict {} <-> {}: {e}",
-                        new_memory_id, hit.existing_memory_id
-                    );
-                }
-            }
+        match record_conflict(conn, new_memory_id, scope, kind, hit) {
+            Ok(_) => queued += 1,
+            Err(e) => eprintln!("kimetsu-brain: could not queue related claims: {e}"),
         }
     }
-
-    (auto_resolved, queued)
+    (0, queued)
 }
 
 /// List open (unresolved) conflicts ordered by most recent first,
@@ -782,65 +669,82 @@ pub fn resolve_conflict(
         )
         .into());
     }
-    // Pull the pair so we know which (if any) memory to invalidate.
+    let mut changed = false;
+    crate::projector::with_write_txn(conn, |conn| {
+        let metadata: Option<(String,String,String,String,f64,String)> = conn.query_row(
+            "SELECT new_memory_id,existing_memory_id,scope,kind,similarity,detected_at FROM memory_conflicts WHERE conflict_id=?1 AND resolved_at IS NULL",
+            [conflict_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+        let Some((new_id, existing_id, scope, kind, similarity, detected_at)) = metadata else {
+            return Ok(());
+        };
+        let event = kimetsu_core::event::Event::new(
+            kimetsu_core::ids::RunId::new(),
+            "conflict.resolved",
+            serde_json::json!({
+                "conflict_id":conflict_id,"new_memory_id":new_id,"existing_memory_id":existing_id,
+                "scope":scope,"kind":kind,"similarity":similarity,"detected_at":detected_at,"resolution":resolution
+            }),
+        );
+        crate::projector::apply_event(conn, &event)?;
+        changed = true;
+        Ok(())
+    })?;
+    Ok(changed)
+}
+
+/// Self-contained pair metadata makes explicit decisions replayable even when
+/// the original similarity detection was a derived-only row.
+pub(crate) fn project_resolution(
+    conn: &Connection,
+    event: &kimetsu_core::event::Event,
+) -> KimetsuResult<()> {
+    let field = |key| {
+        event
+            .payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("conflict.resolved missing {key}"))
+    };
+    let id = field("conflict_id")?;
+    let new_id = field("new_memory_id")?;
+    let existing_id = field("existing_memory_id")?;
+    let resolution = field("resolution")?;
+    if new_id == existing_id || !matches!(resolution, "kept_new" | "kept_existing" | "kept_both") {
+        return Err("invalid conflict pair or resolution".into());
+    }
     let pair: Option<(String, String)> = conn
         .query_row(
-            "
-            SELECT new_memory_id, existing_memory_id
-            FROM memory_conflicts
-            WHERE conflict_id = ?1 AND resolved_at IS NULL
-            ",
-            params![conflict_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            "SELECT new_memory_id,existing_memory_id FROM memory_conflicts WHERE conflict_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((new_memory_id, existing_memory_id)) = pair else {
-        return Ok(false);
-    };
-
-    let now = OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| format!("timestamp format: {e}"))?;
-
-    // Invalidate the losing side, if any. We do this BEFORE marking
-    // the conflict resolved so a crash mid-resolve leaves the row
-    // still actionable for the operator.
-    let invalidation_reason = format!("v0.5.2 conflict {conflict_id} resolved as {resolution}");
-    if resolution == "kept_new" {
-        conn.execute(
-            "
-            UPDATE memories
-            SET invalidated_at = COALESCE(invalidated_at, ?2),
-                invalidated_reason = COALESCE(invalidated_reason, ?3)
-            WHERE memory_id = ?1
-            ",
-            params![existing_memory_id, now, invalidation_reason],
-        )?;
-        #[cfg(feature = "embeddings")]
-        crate::ann::on_invalidate(conn, &existing_memory_id);
-    } else if resolution == "kept_existing" {
-        conn.execute(
-            "
-            UPDATE memories
-            SET invalidated_at = COALESCE(invalidated_at, ?2),
-                invalidated_reason = COALESCE(invalidated_reason, ?3)
-            WHERE memory_id = ?1
-            ",
-            params![new_memory_id, now, invalidation_reason],
-        )?;
-        #[cfg(feature = "embeddings")]
-        crate::ann::on_invalidate(conn, &new_memory_id);
+    if pair.is_some_and(|(a, b)| a != new_id || b != existing_id) {
+        return Err("conflict pair mismatch".into());
     }
-
-    let updated = conn.execute(
-        "
-        UPDATE memory_conflicts
-        SET resolved_at = ?2, resolution = ?3
-        WHERE conflict_id = ?1 AND resolved_at IS NULL
-        ",
-        params![conflict_id, now, resolution],
+    let ts = event
+        .ts
+        .format(&time::format_description::well_known::Rfc3339)?;
+    conn.execute("INSERT OR IGNORE INTO memory_conflicts(conflict_id,new_memory_id,existing_memory_id,scope,kind,similarity,detected_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![id,new_id,existing_id,field("scope")?,field("kind")?,event.payload["similarity"].as_f64().unwrap_or(0.0),field("detected_at")?])?;
+    let loser = match resolution {
+        "kept_new" => Some(existing_id),
+        "kept_existing" => Some(new_id),
+        _ => None,
+    };
+    if let Some(loser) = loser {
+        // Explicit rejection ends archival eligibility. Keeping a previous
+        // `forgotten` reason would let restore resurrect the rejected claim.
+        conn.execute("UPDATE memories SET invalidated_at=COALESCE(invalidated_at,?2),invalidated_reason=CASE WHEN invalidated_reason IS NULL OR invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived') THEN ?3 ELSE invalidated_reason END WHERE memory_id=?1",params![loser,ts,format!("conflict {id} resolved as {resolution}")])?;
+        conn.execute("DELETE FROM memories_fts WHERE memory_id=?1", [loser])?;
+        #[cfg(feature = "embeddings")]
+        crate::ann::on_invalidate(conn, loser);
+    }
+    conn.execute(
+        "UPDATE memory_conflicts SET resolved_at=?2,resolution=?3 WHERE conflict_id=?1",
+        params![id, ts, resolution],
     )?;
-    Ok(updated > 0)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1760,6 +1664,51 @@ mod tests {
                 "near-tie must add unresolved row to memory_conflicts"
             );
         }
+    }
+
+    #[test]
+    fn high_similarity_and_score_gap_do_not_prove_contradiction() {
+        let conn = open_test_brain();
+        let stub = StubEmbedder::new();
+        let old = "The development service uses SQLite.";
+        let new = "The production service uses SQLite.";
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        insert_memory_with_meta(
+            &conn,
+            "old",
+            "global_user",
+            "fact",
+            old,
+            0.1,
+            "2020-01-01T00:00:00Z",
+            &stub,
+        );
+        insert_memory_with_meta(&conn, "new", "global_user", "fact", new, 1.0, &now, &stub);
+        let vector = stub.embed(old).unwrap();
+        let (resolved, queued) = detect_record_and_resolve_with_vec(
+            &conn,
+            "new",
+            &MemoryScope::GlobalUser,
+            "fact",
+            new,
+            Some(&vector),
+            &stub,
+            1.0,
+            &now,
+        );
+        assert_eq!(
+            resolved, 0,
+            "no automatic retirement without a proven conflicting claim"
+        );
+        assert_eq!(queued, 1, "related claims remain reviewable");
+        let retired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE valid_to IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 0);
     }
 
     /// Pass B: auto-resolved stamped valid_to survives rebuild_in_place

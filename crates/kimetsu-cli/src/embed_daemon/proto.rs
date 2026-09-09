@@ -43,6 +43,8 @@ pub enum Response {
         capsules: Vec<Capsule>,
         skipped: bool,
         top_score: f32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        known_fact_conflicts: Vec<String>,
     },
     /// Warm/Ping identity.
     Info {
@@ -62,6 +64,14 @@ pub enum Response {
 /// `ContextCapsule` — only what the hook needs to render the injection).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Capsule {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub expansion_handle: String,
+    #[serde(default)]
+    pub claim_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<kimetsu_brain::fact_store::StoredFact>,
     pub summary: String,
     pub kind: String,
     pub score: f32,
@@ -95,6 +105,15 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn legacy_capsule_is_explicitly_unbound() {
+        let c: Capsule =
+            serde_json::from_str(r#"{"summary":"legacy", "kind":"memory", "score":0.8}"#).unwrap();
+        assert!(c.id.is_empty());
+        assert!(c.expansion_handle.is_empty());
+        assert!(c.claim_revision.is_none());
+    }
+
+    #[test]
     fn request_round_trips_through_a_line() {
         let req = Request::Retrieve(RetrieveArgs {
             v: 1,
@@ -122,15 +141,31 @@ mod tests {
     }
 
     #[test]
+    fn capsule_wire_preserves_optional_structured_evidence() {
+        let wire = serde_json::json!({"id":"c", "expansion_handle":"memory:m", "claim_revision":"baseline:m", "summary":"Orchid gateway port is 7319.", "kind":"memory", "score":0.99,
+            "facts":[{"memory_id":"m","claim_revision":"baseline:m","source_event_id":"accepted", "valid_from":null,"valid_to":null,
+                "claim":{"subject":"orchid gateway","environment":null,"attribute":"port","value":"7319","evidence":"Orchid gateway port is 7319."}}]});
+        let capsule: Capsule = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            serde_json::to_value(capsule).unwrap()["facts"][0]["claim"]["value"],
+            "7319"
+        );
+    }
+    #[test]
     fn response_round_trips() {
         let resp = Response::Capsules {
             capsules: vec![Capsule {
+                id: "m1".into(),
+                expansion_handle: "memory:m1".into(),
+                claim_revision: Some("rev1".into()),
+                facts: vec![],
                 summary: "repo:fact - x".into(),
                 kind: "memory".into(),
                 score: 0.9,
             }],
             skipped: false,
             top_score: 0.9,
+            known_fact_conflicts: vec![],
         };
         let mut buf = Vec::new();
         write_line(&mut buf, &resp).unwrap();
@@ -144,5 +179,30 @@ mod tests {
         let mut cur = Cursor::new(Vec::new());
         let got: io::Result<Request> = read_line(&mut cur);
         assert_eq!(got.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+}
+
+#[cfg(test)]
+mod conflict_wire_tests {
+    use super::*;
+    #[test]
+    fn response_preserves_conflicts_after_capsules_have_been_trimmed() {
+        let json = serde_json::json!({"capsules":{"capsules":[],"skipped":true,"top_score":0.0,"known_fact_conflicts":["port"]}});
+        let response: Response = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["capsules"]["known_fact_conflicts"],
+            serde_json::json!(["port"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_conflict_wire_tests {
+    use super::*;
+    #[test]
+    fn legacy_response_without_conflicts_still_roundtrips_without_new_fields() {
+        let legacy = serde_json::json!({"capsules":{"capsules":[],"skipped":true,"top_score":0.0}});
+        let response: Response = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), legacy);
     }
 }

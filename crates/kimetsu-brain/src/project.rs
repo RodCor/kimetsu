@@ -371,6 +371,45 @@ pub struct BrainSession {
 }
 
 impl BrainSession {
+    pub fn config(&self) -> &ProjectConfig {
+        &self.config
+    }
+
+    /// Resolve explicit overrides before legacy sentinels. The explicit zero
+    /// survives a second resolution at the injected/production boundary.
+    pub fn resolve_request_floors(&self, request: &mut ContextRequest) {
+        request.include_fact_evidence |= self.config.broker.explicit_fact_guard;
+        let semantic = request.min_semantic_score_override.unwrap_or({
+            if request.min_semantic_score == 0.0 {
+                self.config.broker.min_semantic_score
+            } else {
+                request.min_semantic_score
+            }
+        });
+        request.min_semantic_score = if semantic < 0.0 {
+            let model = embeddings::resolve_embedder_id(Some(&self.config.embedder.model));
+            if model.starts_with("bge") { 0.35 } else { 0.0 }
+        } else {
+            semantic
+        };
+        request.min_lexical_coverage = request.min_lexical_coverage_override.unwrap_or({
+            if request.min_lexical_coverage == 0.0 {
+                self.config.broker.min_lexical_coverage
+            } else {
+                request.min_lexical_coverage
+            }
+        });
+        request.abstain_evidence = match request.abstain_evidence_override {
+            Some(v) if v >= 0.0 => v,
+            Some(_) => {
+                let mut cfg = self.config.clone();
+                cfg.broker.abstain_min_score = -1.0;
+                resolved_abstain_evidence_for(&cfg)
+            }
+            None if request.abstain_evidence == 0.0 => self.resolved_abstain_evidence(),
+            None => request.abstain_evidence,
+        };
+    }
     pub fn open(start: &Path) -> KimetsuResult<Self> {
         let (paths, config, conn) = load_project(start)?;
         // Read/write user brain — created on demand so a v0.4 binary
@@ -437,25 +476,7 @@ impl BrainSession {
         &self,
         mut request: ContextRequest,
     ) -> KimetsuResult<ContextBundle> {
-        // v1.0.0: drive the lexical + semantic relevance floors from config
-        // unless the caller set its own (non-zero) values.
-        if request.min_lexical_coverage == 0.0 {
-            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
-        }
-        if request.min_semantic_score == 0.0 {
-            request.min_semantic_score = self.resolved_min_semantic_score();
-        }
-        // v2.7: whole-retrieval abstention floor, now on the ABSOLUTE evidence
-        // cosine scale rather than the
-        // normalized composite — the composite's top candidate always carries
-        // relevance 1.0, so no composite threshold can express "nothing here
-        // is relevant" (measured: false-injection 1.00 on the workflow bench).
-        // 0.0 = off; explicit request values win; -1.0 in config = per-model
-        // auto. The env var exists so benchmarks can sweep without config
-        // edits.
-        if request.abstain_evidence == 0.0 {
-            request.abstain_evidence = self.resolved_abstain_evidence();
-        }
+        self.resolve_request_floors(&mut request);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -482,23 +503,6 @@ impl BrainSession {
             embeddings::open_embedder_for(self.config.embedder.enabled),
             backend.as_ref(),
         )
-    }
-
-    /// v1.0.0: resolve the semantic floor for this session's embedder. The
-    /// config default is the AUTO sentinel (-1.0): cosine scales are
-    /// MODEL-DEPENDENT — 0.35 suits bge-family distributions, but the remote
-    /// benchmark showed the same floor killing relevant jina-v2 results
-    /// outright (MRR 0.90 → 0.77, recall@2 == recall@4) — so auto applies
-    /// the bge-calibrated floor only to bge models and disables it
-    /// elsewhere (jina-v2's own precision keeps noise low without it).
-    /// Explicit non-negative config values are used as-is for any model.
-    fn resolved_min_semantic_score(&self) -> f32 {
-        let configured = self.config.broker.min_semantic_score;
-        if configured >= 0.0 {
-            return configured;
-        }
-        let model = embeddings::resolve_embedder_id(Some(self.config.embedder.model.as_str()));
-        if model.starts_with("bge") { 0.35 } else { 0.0 }
     }
 
     /// v2.7: resolve the absolute abstention floor for this session's config.
@@ -606,25 +610,7 @@ impl BrainSession {
         mut request: ContextRequest,
         embedder: &dyn embeddings::Embedder,
     ) -> KimetsuResult<ContextBundle> {
-        if request.min_lexical_coverage == 0.0 {
-            request.min_lexical_coverage = self.config.broker.min_lexical_coverage;
-        }
-        // v1.0.0: semantic floor from config too — this is the daemon's path,
-        // where a real query embedding makes the cosine floor effective.
-        if request.min_semantic_score == 0.0 {
-            request.min_semantic_score = self.resolved_min_semantic_score();
-        }
-        // v2.7: whole-retrieval abstention floor, now on the ABSOLUTE evidence
-        // cosine scale rather than the
-        // normalized composite — the composite's top candidate always carries
-        // relevance 1.0, so no composite threshold can express "nothing here
-        // is relevant" (measured: false-injection 1.00 on the workflow bench).
-        // 0.0 = off; explicit request values win; -1.0 in config = per-model
-        // auto. The env var exists so benchmarks can sweep without config
-        // edits.
-        if request.abstain_evidence == 0.0 {
-            request.abstain_evidence = self.resolved_abstain_evidence();
-        }
+        self.resolve_request_floors(&mut request);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -782,6 +768,19 @@ pub fn add_memory(
     kind: MemoryKind,
     text: &str,
 ) -> KimetsuResult<String> {
+    add_memory_with_validity(start, scope, kind, text, None, None)
+}
+
+/// Add with temporal bounds in the same durable write. Duplicate claims retain
+/// their original bounds; observing them again does not renew their lifetime.
+pub fn add_memory_with_validity(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<String> {
     // v0.4.5: redact secrets at the ingest boundary. The redaction
     // pipeline catches Anthropic/OpenAI/GitHub/AWS/Slack/Google
     // credentials, JWTs, PEM blocks, and generic `api_key=...` /
@@ -824,7 +823,9 @@ pub fn add_memory(
             .map(|cfg| cfg.kimetsu.use_user_brain)
             .unwrap_or(true);
         if let Some(user_conn) = user_brain::open_user_brain_for_config(use_user_brain)? {
-            return user_brain::add_user_memory(&user_conn, kind, text, 1.0);
+            return user_brain::add_user_memory_with_validity(
+                &user_conn, kind, text, 1.0, valid_from, valid_to,
+            );
         }
         // User brain disabled/unreachable → fall through to the project DB
         // (which DOES require a valid project — same pre-P0 behavior for
@@ -837,7 +838,7 @@ pub fn add_memory(
 
     let embedder = embeddings::open_embedder_for(config.embedder.enabled);
     add_memory_inner(
-        &conn, &paths, &config, scope, kind, text, None, None, embedder,
+        &conn, &paths, &config, scope, kind, text, valid_from, valid_to, embedder,
     )
 }
 
@@ -931,6 +932,8 @@ fn add_memory_inner(
             "normalized_text": normalized,
             "confidence": DIRECT_ADD_CONFIDENCE,
             "initial_usefulness": initial_kind_weight,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "provenance_snapshot": build_provenance(run_id, text),
         }),
     );
@@ -947,12 +950,6 @@ fn add_memory_inner(
     );
 
     projector::apply_events(conn, &[started, accepted, finished])?;
-
-    // Flagship 1 / temporal: stamp valid_from / valid_to when requested.
-    // This is event-sourced (rebuild-safe) via mark_memory_temporal.
-    if valid_from.is_some() || valid_to.is_some() {
-        projector::mark_memory_temporal(conn, &memory_id, valid_from, valid_to)?;
-    }
 
     // v0.4.2: post-projection embedding write. v0.4.3 wired the
     // default embedder behind a feature flag — see
@@ -1225,6 +1222,20 @@ pub fn propose_memory(
     confidence: f32,
     rationale: &str,
 ) -> KimetsuResult<String> {
+    propose_memory_with_validity(start, scope, kind, text, confidence, rationale, None, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_memory_with_validity(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<String> {
     let redaction = redact::redact_secrets(text);
     if redaction.was_redacted() {
         eprintln!("kimetsu-brain: {}", redaction.summary());
@@ -1252,6 +1263,8 @@ pub fn propose_memory(
             "text": text,
             "rationale": rationale,
             "proposed_confidence": confidence.clamp(0.0, 1.0),
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "source_event_ids": [],
         }),
     );
@@ -1271,16 +1284,10 @@ pub enum ProposeResult {
     Duplicate(String), // memory_id of the identical existing memory
 }
 
-/// v0.7: capture a lesson, automatically deduplicating against the existing brain.
-///
-/// Decision tree:
-/// 1. Exact normalized-text match → `Duplicate` (no write).
-/// 2. Cosine similarity ≥ 0.85 with an existing memory → `Merged` (append & re-embed).
-/// 3. confidence ≥ 0.7 and no close match → `Added` (direct acceptance).
-/// 4. confidence < 0.7 → `Proposed` (pending for human review).
-///
-/// Step 2 only fires when the embedder is active (bge-small or similar). In lean builds
-/// the cosine scan returns nothing and the function falls through to step 3/4.
+/// Capture a lesson without combining semantically similar claims. Exact
+/// duplicates reuse an ID; confidence >= 0.7 accepts a distinct claim, while
+/// lower-confidence lessons remain proposals. Similarity candidates are queued
+/// by the ordinary ingestion path for explicit review.
 pub fn propose_or_merge_memory(
     start: &Path,
     scope: MemoryScope,
@@ -1289,6 +1296,22 @@ pub fn propose_or_merge_memory(
     confidence: f32,
     rationale: &str,
 ) -> KimetsuResult<ProposeResult> {
+    propose_or_merge_memory_with_validity(
+        start, scope, kind, text, confidence, rationale, None, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_or_merge_memory_with_validity(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    confidence: f32,
+    rationale: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> KimetsuResult<ProposeResult> {
     let redaction = redact::redact_secrets(text);
     if redaction.was_redacted() {
         eprintln!("kimetsu-brain: {}", redaction.summary());
@@ -1296,9 +1319,8 @@ pub fn propose_or_merge_memory(
     let text = redaction.text.as_str();
 
     // Step 1: exact normalized-text dedup (same as add_memory).
-    // W3.1: load config here so Step 2 can use open_embedder_for.
-    let (_, config, _) = {
-        let (paths, config, ro_conn) = load_project_readonly(start)?;
+    {
+        let (_, _, ro_conn) = load_project_readonly(start)?;
         let normalized = normalize_memory_text(text);
         let existing: Option<String> = ro_conn
             .query_row(
@@ -1314,53 +1336,16 @@ pub fn propose_or_merge_memory(
         if let Some(id) = existing {
             return Ok(ProposeResult::Duplicate(id));
         }
-        (paths, config, ro_conn)
-    };
-
-    // Step 2: semantic dedup — look for a high-cosine existing memory.
-    // W3.1: route through open_embedder_for so `[embedder] enabled = false`
-    // skips cosine dedup (NoopEmbedder → find_potential_conflicts returns 0).
-    // v1.0: honor the [ingestion] detect_conflicts off-switch so bulk-seeding
-    // skips the cosine scan (find_potential_conflicts returns empty → no merge).
-    let embedder = embeddings::open_embedder_for(config.embedder.enabled);
-    {
-        let (_, _, ro_conn) = load_project_readonly(start)?;
-        let conflicts = if conflict::conflict_detection_enabled(config.ingestion.detect_conflicts) {
-            conflict::find_potential_conflicts(&ro_conn, &scope, text, embedder, 1, 0.85)?
-        } else {
-            Vec::new()
-        };
-        if let Some(hit) = conflicts.into_iter().next() {
-            // Append the new lesson to the existing memory and re-embed it.
-            let (paths, _config, conn) = load_project(start)?;
-            let run_id = RunId::new();
-            let _lock = ProjectLock::acquire(&paths, "memory merge", Some(run_id))?;
-            let merged_text = format!("{}\n\nAlso: {text}", hit.existing_text);
-            let new_normalized = normalize_memory_text(&merged_text);
-            conn.execute(
-                "UPDATE memories
-                 SET text = ?1, normalized_text = ?2, use_count = use_count + 1
-                 WHERE memory_id = ?3",
-                rusqlite::params![merged_text, new_normalized, hit.existing_memory_id],
-            )?;
-            // Return value not needed — no conflict scan after a merge.
-            embeddings::embed_and_persist(&conn, &hit.existing_memory_id, &merged_text, embedder)?;
-            // v2.6: the merged text may carry entities the survivor did not
-            // have, so reproject and re-link. Skipping this would leave the
-            // absorbed lesson unreachable through the graph even though its
-            // words are now in the corpus.
-            let _ = crate::graph::project_entities(&conn, &hit.existing_memory_id, &merged_text);
-            link_memory_into_graph(&conn, &hit.existing_memory_id);
-            return Ok(ProposeResult::Merged(hit.existing_memory_id));
-        }
     }
 
-    // Step 3/4: no close match found — accept or propose based on confidence.
+    // Related claims can disagree. Never append them or inflate use counts.
     if confidence >= 0.7 {
-        let memory_id = add_memory(start, scope, kind, text)?;
+        let memory_id = add_memory_with_validity(start, scope, kind, text, valid_from, valid_to)?;
         Ok(ProposeResult::Added(memory_id))
     } else {
-        let proposal_id = propose_memory(start, scope, kind, text, confidence, rationale)?;
+        let proposal_id = propose_memory_with_validity(
+            start, scope, kind, text, confidence, rationale, valid_from, valid_to,
+        )?;
         Ok(ProposeResult::Proposed(proposal_id))
     }
 }
@@ -1515,16 +1500,14 @@ pub fn ingest_repo_at_root(
     brain_root: &Path,
     files_root: &Path,
 ) -> KimetsuResult<RepoIngestSummary> {
-    let (mut paths, config, conn) = load_project_at_root(brain_root)?;
-    // Walk the checkout, but keep the brain/lock under brain_root.
-    paths.repo_root = files_root
-        .canonicalize()
-        .unwrap_or_else(|_| files_root.to_path_buf());
+    let (paths, config, conn) = load_project_at_root(brain_root)?;
+    // Keep the storage identity/lock at the brain root; traverse the checkout
+    // separately so retrieval uses the same key as file and manifest indexing.
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain ingest-repo (remote)", Some(run_id))?;
 
     let started = admin_started_event(&paths, &config, run_id, "repo ingest")?;
-    let summary = ingest::ingest_repo(&conn, &paths, &config)?;
+    let summary = ingest::ingest_repo_from_root(&conn, &paths, &config, files_root)?;
     let ingested = Event::new(
         run_id,
         "repo.ingested",
@@ -1894,6 +1877,11 @@ pub fn accept_proposal(
 ) -> KimetsuResult<String> {
     let (paths, config, conn) = load_project(start)?;
     let proposal = load_pending_proposal(&conn, proposal_id)?;
+    let (valid_from, valid_to): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT valid_from, valid_to FROM memory_proposals WHERE proposal_id=?1",
+        [proposal_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory accept", Some(run_id))?;
     let memory_id = Ulid::new().to_string();
@@ -1920,6 +1908,8 @@ pub fn accept_proposal(
             "kind": proposal.kind,
             "text": proposal.text,
             "normalized_text": normalized,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "confidence": resolved_confidence,
             "provenance_snapshot": {
                 "source": "memory_proposal",
@@ -2009,20 +1999,9 @@ pub struct UndoneMemory {
     pub kind: String,
 }
 
-/// QoL: edit an existing active memory in-place, preserving its usefulness history.
-///
-/// - `new_text`: if given, the text (and normalized_text) are updated, the FTS
-///   index row is refreshed, and a new embedding is stored via the configured
-///   embedder (no-op in lean builds). Secret-redaction is applied at the same
-///   boundary as `add_memory`.
-/// - `new_kind`: if given, the `kind` column is updated.
-///
-/// At least one of `new_text` / `new_kind` must be `Some`; otherwise an error
-/// is returned. `use_count`, `usefulness_score`, `confidence`, and `created_at`
-/// are intentionally left unchanged — the whole point of edit-in-place is to
-/// preserve the memory's learned history.
-///
-/// Errors if the memory id is unknown or already invalidated.
+/// Record a durable correction to an active memory. Text changes reset
+/// claim-specific evidence and invalidate embeddings atomically with FTS.
+/// Kind-only changes preserve evidence; all corrections retain text lineage.
 pub fn edit_memory(
     start: &Path,
     memory_id: &str,
@@ -2034,92 +2013,35 @@ pub fn edit_memory(
     }
 
     let (paths, config, conn) = load_project(start)?;
-
-    // Verify memory exists and is active (not invalidated).
-    let row: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT scope, kind, invalidated_at FROM memories WHERE memory_id = ?1",
-            params![memory_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2).unwrap_or_default(),
-                ))
-            },
-        )
-        .optional()?;
-
-    let (scope, current_kind, invalidated_at) = match row {
-        None => return Err(format!("memory not found: {memory_id}").into()),
-        Some(r) => r,
-    };
-    if !invalidated_at.is_empty() {
-        return Err(format!("memory {memory_id} is already invalidated").into());
-    }
-
     let run_id = RunId::new();
     let _lock = ProjectLock::acquire(&paths, "brain memory edit", Some(run_id))?;
-
-    // Apply text update.
-    if let Some(raw_text) = new_text {
-        let redaction = redact::redact_secrets(raw_text);
-        if redaction.was_redacted() {
-            eprintln!("kimetsu-brain: {}", redaction.summary());
-        }
-        let text = &redaction.text;
-        let normalized = normalize_memory_text(text);
-
-        conn.execute(
-            "UPDATE memories SET text = ?1, normalized_text = ?2 WHERE memory_id = ?3",
-            params![text, normalized, memory_id],
-        )?;
-
-        // Refresh the FTS index row.
-        conn.execute(
-            "DELETE FROM memories_fts WHERE memory_id = ?1",
+    let corrected = Event::new(
+        run_id,
+        "memory.corrected",
+        serde_json::json!({
+            "memory_id": memory_id,
+            "text": new_text.map(|text| redact::redact_secrets(text).text),
+            "kind": new_kind.map(|kind| kind.to_string()),
+        }),
+    );
+    projector::apply_events(
+        &conn,
+        &[
+            admin_started_event(&paths, &config, run_id, "memory edit")?,
+            corrected,
+            admin_finished_event(run_id),
+        ],
+    )?;
+    // Correction and vector invalidation are committed together. Re-embedding
+    // is recoverable derived work and cannot leave an old vector on new text.
+    if new_text.is_some() {
+        let text: String = conn.query_row(
+            "SELECT text FROM memories WHERE memory_id=?1",
             params![memory_id],
+            |r| r.get(0),
         )?;
-        let kind_for_fts = new_kind
-            .as_ref()
-            .map(|k| k.to_string())
-            .unwrap_or(current_kind.clone());
-        conn.execute(
-            "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
-            params![memory_id, text, kind_for_fts, scope],
-        )?;
-
-        // Re-embed so semantic retrieval reflects the corrected text.
         let embedder = embeddings::open_embedder_for(config.embedder.enabled);
-        embeddings::embed_and_persist(&conn, memory_id, text, embedder)?;
-        // (return value not needed here — no conflict scan after an edit)
-    }
-
-    // Apply kind update (FTS row may need refreshing if text wasn't also changed).
-    if let Some(kind) = new_kind {
-        conn.execute(
-            "UPDATE memories SET kind = ?1 WHERE memory_id = ?2",
-            params![kind.to_string(), memory_id],
-        )?;
-
-        // Only refresh FTS kind column if we didn't already rebuild it above.
-        if new_text.is_none() {
-            // Re-read the current text from DB to rebuild the FTS row with
-            // the new kind (text unchanged).
-            let current_text: String = conn.query_row(
-                "SELECT text FROM memories WHERE memory_id = ?1",
-                params![memory_id],
-                |row| row.get(0),
-            )?;
-            conn.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?1",
-                params![memory_id],
-            )?;
-            conn.execute(
-                "INSERT INTO memories_fts (memory_id, text, kind, scope) VALUES (?1, ?2, ?3, ?4)",
-                params![memory_id, current_text, kind.to_string(), scope],
-            )?;
-        }
+        embeddings::embed_and_persist(&conn, memory_id, &text, embedder)?;
     }
 
     Ok(())
@@ -2411,6 +2333,59 @@ mod tests {
     /// (e.g. a developer's `$HOME` git repo) — which would otherwise
     /// make parallel tests share one brain.db + project.lock. Without
     /// this, tests pass only when `TMP` points outside any git repo.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[ignore = "requires a cached local embedding model"]
+    fn similar_ingested_correction_preserves_both_claims_and_rebuild() {
+        with_user_brain_disabled(|| {
+            let root = test_root();
+            init_project(&root, false).unwrap();
+            let old = "For the Atlas integration service in the local staging environment, the HTTP listener uses port 4317 and binds to localhost.";
+            let new = "For the Atlas integration service in the local staging environment, the HTTP listener uses port 4318 and binds to localhost.";
+            let id = add_memory(&root, MemoryScope::Project, MemoryKind::Fact, old).unwrap();
+            let (_, config, conn) = load_project(&root).unwrap();
+            let embedder = embeddings::open_embedder_for(config.embedder.enabled);
+            assert!(
+                !embedder.is_noop(),
+                "this regression requires real semantic candidates"
+            );
+            let hits = conflict::find_potential_conflicts(
+                &conn,
+                &MemoryScope::Project,
+                new,
+                embedder,
+                1,
+                0.85,
+            )
+            .unwrap();
+            assert!(
+                !hits.is_empty(),
+                "fixture must trigger the former semantic merge"
+            );
+            assert!(matches!(
+                propose_or_merge_memory(
+                    &root,
+                    MemoryScope::Project,
+                    MemoryKind::Fact,
+                    new,
+                    0.9,
+                    "port correction"
+                )
+                .unwrap(),
+                ProposeResult::Added(_)
+            ));
+            let stored: String = conn
+                .query_row("SELECT text FROM memories WHERE memory_id=?1", [&id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(stored, old);
+            projector::rebuild_in_place(&conn).unwrap();
+            let count: i64 = conn.query_row("SELECT count(*) FROM memories WHERE text IN (?1,?2) AND invalidated_at IS NULL", [old,new], |r| r.get(0)).unwrap();
+            assert_eq!(count, 2);
+        });
+    }
+
     fn test_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("kimetsu-test-{}", Ulid::new()));
         kimetsu_core::paths::git_init_boundary(&root);
@@ -5609,10 +5584,10 @@ max_total_cost_usd = 250.0
                 assert_eq!(text, "corrected text for edit test");
                 assert!(!normalized.is_empty(), "normalized_text must not be empty");
                 // History preserved.
-                assert_eq!(use_count, 7, "use_count must not be reset");
+                assert_eq!(use_count, 0, "changed claim must reset evidence");
                 assert!(
-                    (usefulness_score - 3.5).abs() < 0.01,
-                    "usefulness_score must not be reset"
+                    usefulness_score.abs() < 0.01,
+                    "changed claim must reset usefulness"
                 );
             }
 
@@ -5944,13 +5919,7 @@ max_total_cost_usd = 250.0
         });
     }
 
-    /// Q8-3: event trim removes old events but materialized memories survive.
-    ///
-    /// Uses trim_events_older_than = Duration::ZERO so ALL events are
-    /// classified as "old" relative to `now`. After trim:
-    ///   - events_trimmed > 0
-    ///   - list_memories still returns the seeded memory (projection survives)
-    ///   - memories are NOT deleted by event trimming
+    /// Compaction removes expendable telemetry while retaining claim history.
     #[test]
     fn compact_brain_event_trim_keeps_materialized_memories() {
         with_user_brain_disabled(|| {
@@ -5965,10 +5934,7 @@ max_total_cost_usd = 250.0
             )
             .expect("add memory");
 
-            // Trim with a 1-second Duration — but we add a 2-second sleep
-            // alternative: use Duration::from_secs(0) which means cutoff =
-            // now, so events older than "right now" are ALL deleted.
-            // Using 0 ensures even events written 1ms ago are trimmed.
+            seed_old_compaction_telemetry(&root);
             let trim_dur = std::time::Duration::from_secs(0);
 
             // Small sleep to ensure events are definitively in the past
@@ -5999,17 +5965,23 @@ max_total_cost_usd = 250.0
         });
     }
 
-    /// Q8-4: rebuild_projection after event trim does not error.
-    ///
-    /// Even with a partially trimmed event log, rebuild_in_place can complete —
-    /// it replays whatever events remain without panicking or returning an error.
+    fn seed_old_compaction_telemetry(root: &std::path::Path) {
+        let (_, _, conn) = load_project(root).unwrap();
+        let mut telemetry = Event::new(RunId::new(), "context.served", serde_json::json!({}));
+        telemetry.ts = time::OffsetDateTime::from_unix_timestamp(946684800).unwrap();
+        crate::projector::apply_events(&conn, &[telemetry]).unwrap();
+        conn.execute("UPDATE events SET ts='2000-01-01T00:00:00Z'", [])
+            .unwrap();
+    }
+
+    /// A successful rebuild must preserve the memory, not merely avoid errors.
     #[test]
     fn compact_brain_event_trim_then_rebuild_is_consistent() {
         with_user_brain_disabled(|| {
             let root = test_root();
             init_project(&root, false).expect("init");
 
-            add_memory(
+            let mid = add_memory(
                 &root,
                 MemoryScope::Project,
                 MemoryKind::Fact,
@@ -6017,19 +5989,20 @@ max_total_cost_usd = 250.0
             )
             .expect("add memory");
 
-            // Trim all events (cutoff = now).
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            seed_old_compaction_telemetry(&root);
             let report = compact_brain(&root, Some(std::time::Duration::from_secs(0)), false)
                 .expect("compact_brain");
             assert!(report.events_trimmed > 0, "events must have been trimmed");
 
-            // rebuild_projection must not error — it replays whatever events remain.
             let replayed =
                 rebuild_projection(&root, false).expect("rebuild_projection after event trim");
-            // The events are gone so the replay count should be 0 (empty log).
-            assert_eq!(
-                replayed, 0,
-                "replayed should be 0 after all events are trimmed"
+            assert!(replayed > 0, "durable claim history must survive trim");
+            assert!(
+                list_memories(&root)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.memory_id == mid),
+                "compaction followed by rebuild erased the memory"
             );
         });
     }
@@ -6454,10 +6427,9 @@ max_total_cost_usd = 250.0
         .expect("stats")
     }
 
-    // Story 2.4: a standalone citation raises use_count + usefulness (outcome
-    // signal applied because the run_id is the sentinel).
+    // Standalone reliance metadata does not imply a successful outcome.
     #[test]
-    fn standalone_cite_raises_usefulness() {
+    fn standalone_cite_records_reliance_without_outcome_credit() {
         with_user_brain_disabled(|| {
             let root = test_root();
             std::fs::create_dir_all(&root).expect("create root");
@@ -6474,14 +6446,18 @@ max_total_cost_usd = 250.0
             record_mcp_citation(&root, &memory_id, None).expect("cite");
             let (uc1, us1, cf1) = read_outcome_stats(&root, &memory_id);
 
-            assert_eq!(uc1, uc0 + 1, "use_count must increment on standalone cite");
-            assert!(us1 > us0, "usefulness must rise: {us0} -> {us1}");
-            // A fresh memory starts below the ceiling (DIRECT_ADD_CONFIDENCE), so a
-            // positive outcome nudges confidence UP toward 1.0 — letting a proven
-            // memory outrank a never-evaluated one.
-            assert!(
-                cf1 > cf0,
-                "confidence must rise toward 1.0 on a positive outcome: {cf0} -> {cf1}"
+            assert_eq!((uc1, us1, cf1), (uc0, us0, cf0));
+            rebuild_projection(&root, false).unwrap();
+            assert_eq!(read_outcome_stats(&root, &memory_id), (uc0, us0, cf0));
+            let (_, _, conn) = load_project(&root).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM memory_citations WHERE memory_id=?1",
+                    [&memory_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
             );
             std::fs::remove_dir_all(&root).ok();
         });

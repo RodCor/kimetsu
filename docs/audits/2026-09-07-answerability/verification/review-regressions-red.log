@@ -1,0 +1,43 @@
+   Compiling kimetsu-core v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-core)
+   Compiling kimetsu-brain v2.7.0 (E:\tmp\kimetsu-brain-hardening\crates\kimetsu-brain)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.35s
+     Running unittests src\lib.rs (E:/Kimetsu/target\debug\deps\kimetsu_brain-aca789751d649d80.exe)
+
+running 3 tests
+test answerability::tests::review_scope_regressions ... FAILED
+test answerability::tests::review_competing_clause ... FAILED
+test answerability::tests::review_negated_values ... FAILED
+
+failures:
+
+---- answerability::tests::review_scope_regressions stdout ----
+
+thread 'answerability::tests::review_scope_regressions' (29556) panicked at crates\kimetsu-brain\src\answerability.rs:398:13:
+assertion `left == right` failed: What causes a version conflict?
+  left: MissingValue
+ right: Unrecognized
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- answerability::tests::review_competing_clause stdout ----
+
+thread 'answerability::tests::review_competing_clause' (30272) panicked at crates\kimetsu-brain\src\answerability.rs:409:9:
+assertion `left == right` failed
+  left: ValuePresent
+ right: MissingValue
+
+---- answerability::tests::review_negated_values stdout ----
+
+thread 'answerability::tests::review_negated_values' (12544) panicked at crates\kimetsu-brain\src\answerability.rs:404:13:
+assertion `left == right` failed: We do not use SQLite version 3.45.
+  left: ValuePresent
+ right: MissingValue
+
+
+failures:
+    answerability::tests::review_competing_clause
+    answerability::tests::review_negated_values
+    answerability::tests::review_scope_regressions
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 700 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p kimetsu-brain --lib`

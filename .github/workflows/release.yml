@@ -197,11 +197,15 @@ jobs:
               BEGIN { include = 0 }
               /^## / {
                 if (include == 1) exit
-                if ($2 == v) include = 1
+                if ($2 == v || $2 == v ":") include = 1
                 else next
               }
               include == 1 { print }
             ' CHANGELOG.md > release-notes.md
+            if [ ! -s release-notes.md ]; then
+              echo "::error::No changelog content extracted for v${VERSION}"
+              exit 1
+            fi
           else
             echo "Release v${VERSION}" > release-notes.md
             echo "" >> release-notes.md

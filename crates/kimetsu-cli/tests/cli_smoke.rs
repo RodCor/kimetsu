@@ -1241,3 +1241,149 @@ fn standing_preferences_reach_the_agent_without_being_retrieved() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn hardening_free_hooks_never_cue_host_after_resolution_or_stop() {
+    for configured_model in [false, true] {
+        let (root, cache_home) = seeded_proactive_project(if configured_model {
+            "free_configured_hooks"
+        } else {
+            "free_default_hooks"
+        });
+        let (paths, mut config, conn) = brain_project::load_project(&root).unwrap();
+        drop(conn);
+        config.kimetsu.tier = Some(kimetsu_core::config::Tier::Free);
+        config.cheap_model = configured_model.then(|| kimetsu_core::config::CheapModelSection {
+            enabled: true,
+            ..Default::default()
+        });
+        fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+        run_posttool_hook(
+            &root,
+            &cache_home,
+            "free-resolution",
+            "cargo test",
+            "error[E0433]: failed to resolve crate",
+        );
+        let success = run_posttool_hook(
+            &root,
+            &cache_home,
+            "free-resolution",
+            "cargo test",
+            "test result: ok. 1 passed; 0 failed",
+        );
+        assert!(
+            success.trim().is_empty(),
+            "Free resolution must not invoke host learning: {success}"
+        );
+        let payload = serde_json::json!({"session_id":"free-stop", "transcript": vec![serde_json::json!({"role":"assistant","content":"work"}); 14]});
+        let mut child = Command::new(kimetsu_bin())
+            .args(["brain", "stop-hook", "--distill-on-stop", "--workspace"])
+            .arg(&root)
+            .env("KIMETSU_TIER", "free")
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "Free Stop must not request learning: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn hardening_episode_cli_identity_and_archive_restore() {
+    let (root, cache_home) = seeded_proactive_project("episode_archive");
+    let run = |args: &[&str]| {
+        let output = Command::new(kimetsu_bin())
+            .args(args)
+            .current_dir(&root)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+            .env("KIMETSU_TIER", "free")
+            .env("KIMETSU_BRAIN_EMBEDDER", "noop")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&["checkpoint", "lane alpha", "--task-id", "alpha"]);
+    run(&["checkpoint", "lane beta", "--task-id", "beta"]);
+    assert!(run(&["resume", "--task-id", "alpha"]).contains("lane alpha"));
+    assert!(!run(&["resume", "--task-id", "alpha"]).contains("lane beta"));
+    assert!(!run(&["resume", "--task-id", "missing"]).contains("lane beta"));
+    run(&["checkpoint", "unrelated legacy lane"]);
+    for (payload, expected, rejected) in [
+        (
+            r#"{"prompt":"hi","worktree_id":"alpha"}"#,
+            "lane alpha",
+            "lane beta",
+        ),
+        (
+            r#"{"prompt":"hi","task_id":null,"session_id":null,"worktree_id":"beta"}"#,
+            "lane beta",
+            "lane alpha",
+        ),
+    ] {
+        let text = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+        assert!(
+            text.contains(expected),
+            "missing explicit lane {expected}: {text}"
+        );
+        assert!(!text.contains(rejected) && !text.contains("unrelated legacy lane"));
+    }
+    let added = run(&[
+        "brain",
+        "memory",
+        "add",
+        "--scope",
+        "project",
+        "--kind",
+        "fact",
+        "archive-cli-quokka",
+    ]);
+    let (_, _, c) = brain_project::load_project(&root).unwrap();
+    let id: String = c
+        .query_row(
+            "SELECT memory_id FROM memories WHERE text='archive-cli-quokka'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("{e}: {added}"));
+    drop(c);
+    run(&[
+        "brain",
+        "memory",
+        "invalidate",
+        &id,
+        "--reason",
+        "forgotten",
+    ]);
+    assert!(run(&["brain", "archives"]).contains(&id));
+    assert!(run(&["brain", "restore", &id]).contains("true"));
+    assert!(!run(&["brain", "archives"]).contains(&id));
+    assert!(run(&["brain", "roi", "--json"]).contains("Assumption-based estimate"));
+    fs::remove_dir_all(root).unwrap();
+}
