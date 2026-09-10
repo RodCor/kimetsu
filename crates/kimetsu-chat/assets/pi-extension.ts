@@ -14,10 +14,15 @@
 // crash, unparseable output. Kimetsu is a sidecar — it must never break Pi.
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-/** Hard cap on any single kimetsu invocation. A hung binary must not stall a turn. */
+/** Interactive hooks must not leave a turn waiting on a hung binary. */
 const EXEC_TIMEOUT_MS = 10000;
+
+/** Session saving may distill lessons and an episode in two model calls
+ *  (120s each by default). Leave time for both plus local persistence. */
+const SESSION_SAVE_TIMEOUT_MS = 300000;
 
 /** Fallback session id when Pi's context does not expose one. Stable per process,
  *  which is what the brain's per-session dedupe and refractory windows need. */
@@ -30,7 +35,7 @@ const FALLBACK_SESSION_ID = `pi-${process.pid}`;
  * stdout is PIPED, not ignored: the context hook communicates entirely through
  * it. stderr stays ignored so diagnostics never mix into the parsed payload.
  */
-function kimetsuRun(args: string[], input?: string): Promise<string> {
+function kimetsuRun(args: string[], input?: string, timeoutMs = EXEC_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -52,7 +57,7 @@ function kimetsuRun(args: string[], input?: string): Promise<string> {
       timer = setTimeout(() => {
         child.kill();
         done();
-      }, EXEC_TIMEOUT_MS);
+      }, timeoutMs);
       if (typeof timer.unref === "function") timer.unref();
 
       child.stdout?.setEncoding("utf8");
@@ -147,11 +152,17 @@ function workspaceArgs(ctx: any): string[] {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Pi persists injected messages, including display:false messages. Only the
+  // current task's injection belongs in future model calls. A unique marker
+  // survives Pi's message cloning without trusting content or timestamps.
+  let activeContext: { id: string; sessionId: string } | undefined;
+
   // session_start fires once when Pi starts up or a new session begins.
   // Warming spawns the embedder daemon so the first real retrieval is semantic
   // rather than falling back to lexical FTS.
   // (`brain warm` takes no --workspace: it resolves the project from its cwd.)
   pi.on("session_start", async (_event, _ctx) => {
+    activeContext = undefined;
     await kimetsuRun(["brain", "warm"]);
   });
 
@@ -161,14 +172,19 @@ export default function (pi: ExtensionAPI) {
   // --warm-on-first-prompt folds the repo digest and episodic resume into the
   // first turn of each session.
   pi.on("before_agent_start", async (event, ctx) => {
+    const request = { id: randomUUID(), sessionId: sessionIdOf(ctx) };
+    // Expire the last task immediately, even if retrieval is empty or fails.
+    activeContext = request;
     const payload = JSON.stringify({
-      session_id: sessionIdOf(ctx),
+      session_id: request.sessionId,
       prompt: typeof event?.prompt === "string" ? event.prompt : "",
     });
     const stdout = await kimetsuRun(
       ["brain", "context-hook", "--warm-on-first-prompt", ...workspaceArgs(ctx)],
       payload,
     );
+    // A session switch or a newer prompt can supersede an in-flight request.
+    if (activeContext !== request) return;
     const content = parseAdditionalContext(stdout);
     if (content === undefined) return; // nothing relevant — zero tokens
     return {
@@ -176,8 +192,62 @@ export default function (pi: ExtensionAPI) {
         customType: "kimetsu-brain",
         content,
         display: false,
+        details: { kimetsuContextId: request.id },
       },
     };
+  });
+
+  pi.on("context", async (event, ctx) => {
+    const context = activeContext;
+    const currentIndex = context && context.sessionId === sessionIdOf(ctx)
+      ? event.messages.findIndex((message) => {
+        if (message.role !== "custom" || message.customType !== "kimetsu-brain") return false;
+        const details = message.details as { kimetsuContextId?: unknown } | undefined;
+        return details?.kimetsuContextId === context.id;
+      })
+      : -1;
+    // Queued steering/follow-up messages bypass before_agent_start. Expire
+    // the old injection when a newer user message arrives; tool results alone
+    // do not end the current task's context.
+    if (currentIndex >= 0 && event.messages.some((message, index) =>
+      index > currentIndex && message.role === "user"
+    )) activeContext = undefined;
+
+    // Filter the model's copy only; preserve the persisted session history.
+    return {
+      messages: event.messages.filter((message, index) =>
+        message.role !== "custom" || message.customType !== "kimetsu-brain"
+        || (activeContext !== undefined && index === currentIndex)
+      ),
+    };
+  });
+
+  pi.on("session_before_compact", async (event) => {
+    // Summarization bypasses the context event. Do not turn retrieved evidence
+    // into a durable summary that could outlive a correction or invalidation.
+    event.preparation.messagesToSummarize = event.preparation.messagesToSummarize.filter(
+      (message) => message.role !== "custom" || message.customType !== "kimetsu-brain",
+    );
+    event.preparation.turnPrefixMessages = event.preparation.turnPrefixMessages.filter(
+      (message) => message.role !== "custom" || message.customType !== "kimetsu-brain",
+    );
+  });
+
+  pi.on("session_before_tree", async (event) => {
+    // Pi retains a reference to this temporary summary input array, so filter
+    // in place. The persisted session entries themselves are left untouched.
+    const entries = event.preparation.entriesToSummarize;
+    let kept = 0;
+    for (const entry of entries) {
+      if (entry.type !== "custom_message" || entry.customType !== "kimetsu-brain") {
+        entries[kept++] = entry;
+      }
+    }
+    entries.length = kept;
+  });
+
+  pi.on("session_tree", async () => {
+    activeContext = undefined;
   });
 
   // agent_end fires after the LLM turn completes (maps to Kimetsu stop-hook).
@@ -190,9 +260,11 @@ export default function (pi: ExtensionAPI) {
 
   // session_shutdown fires on clean session close (maps to session-end-hook).
   pi.on("session_shutdown", async (_event, ctx) => {
+    activeContext = undefined;
     await kimetsuRun(
       ["brain", "session-end-hook", ...workspaceArgs(ctx)],
       lifecyclePayload(ctx),
+      SESSION_SAVE_TIMEOUT_MS,
     );
   });
 }

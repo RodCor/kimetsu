@@ -142,6 +142,15 @@ jobs:
               echo "Run scripts/sync-pi-package.sh against a kimetsu-pi checkout and commit the result there."
               exit 1
             }
+      - name: Diff the Pi skill against the published copy
+        run: |
+          diff -u crates/kimetsu-chat/assets/pi-skill.md \
+                  .kimetsu-pi/skills/kimetsu-brain/SKILL.md \
+            || {
+              echo "::error::The canonical Pi skill and kimetsu-pi skill have drifted."
+              echo "Run scripts/sync-pi-package.sh against a kimetsu-pi checkout and commit the result there."
+              exit 1
+            }
 
   sdk:
     name: TypeScript SDK

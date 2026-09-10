@@ -306,28 +306,8 @@ const PI_EXTENSION_TS: &str = include_str!("../assets/pi-extension.ts");
 /// Pi skills are plain Markdown with optional YAML frontmatter. No MCP is
 /// available in Pi, so the skill describes the brain commands the agent can
 /// shell out to via `pi.exec()` or custom tools if wired.
-const PI_SKILL_MD: &str = r#"---
-name: kimetsu-brain
-description: Use Kimetsu brain shell commands as a persistent memory sidecar across Pi sessions.
----
-Kimetsu is a persistent brain sidecar accessible via the `kimetsu` CLI. Use it
-when the task may benefit from prior session knowledge, workflow memory, or
-durable cross-session context.
-
-Run `kimetsu brain context <query>` when you start a task and read the returned
-capsules before deciding on a plan. An empty result means the brain held nothing
-relevant and cost nothing — retrieving is cheaper than rediscovering.
-
-Run `kimetsu brain memory add --scope project --kind <kind> "<lesson>"` once
-you know something a later session would otherwise have to work out again.
-Choose `fact`, `preference`, `convention`, `command`, or `failure_pattern` for
-`<kind>`.
-
-`kimetsu brain status` reports whether the brain is initialized, has accepted
-memories, or has pending proposals.
-
-If the binary is unavailable, note the absence and continue normally.
-"#;
+/// The npm package vendors this same asset alongside the extension.
+const PI_SKILL_MD: &str = include_str!("../assets/pi-skill.md");
 
 #[cfg(feature = "openclaw")]
 /// TypeScript plugin installed at `<oc_dir>/plugins/kimetsu/index.ts`.
