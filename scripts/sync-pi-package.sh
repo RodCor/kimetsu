@@ -33,4 +33,5 @@ copy() {
 
 echo "syncing $repo_root -> $target"
 copy "$repo_root/crates/kimetsu-chat/assets/pi-extension.ts" "$target/extensions/kimetsu.ts"
+copy "$repo_root/crates/kimetsu-chat/assets/pi-skill.md" "$target/skills/kimetsu-brain/SKILL.md"
 echo "done. Commit the changes in $target."
