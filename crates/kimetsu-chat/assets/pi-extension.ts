@@ -172,12 +172,17 @@ export default function (pi: ExtensionAPI) {
   // --warm-on-first-prompt folds the repo digest and episodic resume into the
   // first turn of each session.
   pi.on("before_agent_start", async (event, ctx) => {
+    // Pi 1.x also starts turns from custom messages. Those are not user
+    // prompts: expire earlier evidence without retrieving for an empty task.
+    // Checking the prompt field also preserves pre-1.x user events.
+    activeContext = undefined;
+    if (!("prompt" in event) || typeof event.prompt !== "string") return;
     const request = { id: randomUUID(), sessionId: sessionIdOf(ctx) };
     // Expire the last task immediately, even if retrieval is empty or fails.
     activeContext = request;
     const payload = JSON.stringify({
       session_id: request.sessionId,
-      prompt: typeof event?.prompt === "string" ? event.prompt : "",
+      prompt: event.prompt,
     });
     const stdout = await kimetsuRun(
       ["brain", "context-hook", "--warm-on-first-prompt", ...workspaceArgs(ctx)],

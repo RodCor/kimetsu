@@ -121,36 +121,55 @@ pub(crate) fn brain(command: BrainCommand) -> KimetsuResult<()> {
                     0,
                 )
             };
+            let mut bundle = bundle;
+            let decision_report = if args.decisions {
+                let config = context_config
+                    .as_ref()
+                    .ok_or("decision pass requires a valid project config")?;
+                Some(kimetsu_agent::decisions::apply(
+                    config.decisions.provider,
+                    &args.query,
+                    &mut bundle,
+                    args.decision_min_probability
+                        .ok_or("decision pass requires an explicit probability threshold")?,
+                )?)
+            } else {
+                None
+            };
             if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "stage": bundle.stage,
-                        "query": args.query,
-                        "augmented_query": effective_query,
-                        "ambient": ambient_payload,
-                        "budget_tokens": bundle.budget_tokens,
-                        "used_tokens": bundle.used_tokens,
-                        "capsule_count": bundle.capsules.len(),
-                        "excluded_count": bundle.excluded.len(),
-                        // v2.6: the bundle's own judgement of itself, which the
-                        // MCP surface has exposed since abstention landed. It
-                        // belongs here too — a JSON caller cannot tell a bundle
-                        // that answers the question from one that touches half
-                        // of it without these, and that is exactly the
-                        // difference BrainBench's sycophancy track scores.
-                        "top_score": bundle.top_score,
-                        "top_abs_evidence": bundle.top_abs_evidence,
-                        "skipped": bundle.skipped,
-                        "evidence_coverage": bundle.evidence_coverage,
-                        "uncovered_terms": bundle.uncovered_terms,
-                        "chronological": bundle.chronological,
-                        "capsules": bundle.capsules,
-                        "excluded": bundle.excluded,
-                    }))?
-                );
+                let mut output = serde_json::json!({
+                    "ok": true,
+                    "stage": bundle.stage,
+                    "query": args.query,
+                    "augmented_query": effective_query,
+                    "ambient": ambient_payload,
+                    "budget_tokens": bundle.budget_tokens,
+                    "used_tokens": bundle.used_tokens,
+                    "capsule_count": bundle.capsules.len(),
+                    "excluded_count": bundle.excluded.len(),
+                    // v2.6: the bundle's own judgement of itself, which the
+                    // MCP surface has exposed since abstention landed. It
+                    // belongs here too — a JSON caller cannot tell a bundle
+                    // that answers the question from one that touches half
+                    // of it without these, and that is exactly the
+                    // difference BrainBench's sycophancy track scores.
+                    "top_score": bundle.top_score,
+                    "top_abs_evidence": bundle.top_abs_evidence,
+                    "skipped": bundle.skipped,
+                    "evidence_coverage": bundle.evidence_coverage,
+                    "uncovered_terms": bundle.uncovered_terms,
+                    "chronological": bundle.chronological,
+                    "capsules": bundle.capsules,
+                    "excluded": bundle.excluded,
+                });
+                if let Some(report) = decision_report {
+                    output["decisions"] = report;
+                }
+                println!("{}", serde_json::to_string_pretty(&output)?);
                 return Ok(());
+            }
+            if let Some(report) = decision_report {
+                eprintln!("decisions: {report}");
             }
             println!(
                 "stage: {} used_tokens: {}/{} capsules: {} excluded: {}",

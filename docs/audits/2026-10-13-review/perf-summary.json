@@ -1,0 +1,34 @@
+[
+  {
+    "workload": "Orchid gateway",
+    "baseline_us": 45567.98,
+    "candidate_us": 44166.16,
+    "reduction_percent": 3.076326841786714,
+    "samples_per_side": 15,
+    "fingerprint": "8115f7d3af0dcab676d7a335ab4282be860d05e654da162a614f673859823352"
+  },
+  {
+    "workload": "file-2048",
+    "baseline_us": 77.193,
+    "candidate_us": 71.508,
+    "reduction_percent": 7.364657417123322,
+    "samples_per_side": 15,
+    "fingerprint": "b301a56f8d7092160e0afd7b32eebabfaa47a25a7d69c2a0129c7ac5fc5587b2"
+  },
+  {
+    "workload": "file-33554432",
+    "baseline_us": 10949.579000000002,
+    "candidate_us": 68.392,
+    "reduction_percent": 99.3753915104864,
+    "samples_per_side": 15,
+    "fingerprint": "abd3accc3c52cb3bb8fb3e6d8c78d2a1ef11bd6a412175a70be10e3b4d2ec62e"
+  },
+  {
+    "workload": "no_matching_lexical_token",
+    "baseline_us": 9774.508,
+    "candidate_us": 5416.608,
+    "reduction_percent": 44.58434122720038,
+    "samples_per_side": 15,
+    "fingerprint": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab"
+  }
+]

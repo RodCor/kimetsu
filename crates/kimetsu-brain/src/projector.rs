@@ -3136,18 +3136,17 @@ pub(crate) fn claim_revision_at(
     memory_id: &str,
     known_at: Option<&str>,
 ) -> KimetsuResult<String> {
-    let revision = conn
-        .query_row(
-            "SELECT event_id FROM (
+    let mut statement = conn.prepare_cached(
+        "SELECT event_id FROM (
         SELECT event_id, known_at, revision_id, text,
                LAG(text) OVER (ORDER BY revision_id) AS previous_text
         FROM memory_revisions WHERE memory_id=?1)
         WHERE (previous_text IS NULL OR text != previous_text)
           AND (?2 IS NULL OR julianday(known_at)<julianday(?2))
         ORDER BY revision_id DESC LIMIT 1",
-            params![memory_id, known_at],
-            |r| r.get::<_, String>(0),
-        )
+    )?;
+    let revision = statement
+        .query_row(params![memory_id, known_at], |r| r.get::<_, String>(0))
         .optional()?;
     Ok(revision.unwrap_or_else(|| format!("baseline:{memory_id}")))
 }

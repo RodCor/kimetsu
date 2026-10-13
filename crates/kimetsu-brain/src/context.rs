@@ -3132,7 +3132,15 @@ pub fn resolve_capsule(
             }
         }
         let full_path = repo_root.join(path);
-        let bytes = std::fs::read(&full_path)
+        // One byte of lookahead distinguishes an exact-size file from a
+        // truncated one and preserves the UTF-8 boundary check below.
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(FILE_EXPAND_CAP_BYTES + 1);
+        std::fs::File::open(&full_path)
+            .and_then(|file| {
+                file.take((FILE_EXPAND_CAP_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+            })
             .map_err(|e| format!("expand_capsule: could not read `{rel_path}`: {e}"))?;
         // Bound the returned slice so huge files don't blow the context window.
         let bounded = if bytes.len() > FILE_EXPAND_CAP_BYTES {
@@ -6074,6 +6082,43 @@ mod tests {
             "truncation marker should be present"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_capsule_file_preserves_exact_cap_and_utf8_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        for (text, prefix, truncated) in [
+            (
+                "A".repeat(FILE_EXPAND_CAP_BYTES),
+                "A".repeat(FILE_EXPAND_CAP_BYTES),
+                false,
+            ),
+            (
+                "A".repeat(FILE_EXPAND_CAP_BYTES + 1),
+                "A".repeat(FILE_EXPAND_CAP_BYTES),
+                true,
+            ),
+            (
+                format!("{}éZ", "A".repeat(FILE_EXPAND_CAP_BYTES - 1)),
+                "A".repeat(FILE_EXPAND_CAP_BYTES - 1),
+                true,
+            ),
+            (
+                format!("{}é", "A".repeat(FILE_EXPAND_CAP_BYTES - 2)),
+                format!("{}é", "A".repeat(FILE_EXPAND_CAP_BYTES - 2)),
+                false,
+            ),
+        ] {
+            std::fs::write(dir.path().join("text"), &text).unwrap();
+            let result = resolve_capsule(&conn, dir.path(), "file:text").unwrap();
+            if truncated {
+                assert!(result.starts_with(&format!("{prefix}\n[... truncated")));
+            } else {
+                assert_eq!(result, prefix);
+            }
+            assert!(!result.contains('\u{fffd}'));
+        }
     }
 
     /// F2-5: unknown handle format returns Err.

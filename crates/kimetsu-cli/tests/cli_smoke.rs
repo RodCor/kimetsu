@@ -183,6 +183,87 @@ fn temp_project_dir(label: &str) -> std::path::PathBuf {
     root
 }
 
+#[test]
+fn decisions_require_explicit_invocation_and_existing_provider_credentials() {
+    let root = temp_project_dir("decisions");
+    let fixture_home = root.join("home");
+    fs::create_dir_all(&fixture_home).unwrap();
+    let run = |args: &[&str]| {
+        let mut command = Command::new(kimetsu_bin());
+        command.args(args).current_dir(&root).env_clear();
+        for key in ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", &fixture_home)
+            .env("USERPROFILE", &fixture_home)
+            .env("APPDATA", &fixture_home)
+            .env("LOCALAPPDATA", &fixture_home)
+            .env("TEMP", &fixture_home)
+            .env("TMP", &fixture_home)
+            .env("TMPDIR", &fixture_home)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .env("KIMETSU_USER_BRAIN_DIR", root.join("user-brain"))
+            .env("KIMETSU_EMBED_DAEMON", "0")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec!["config", "set", "embedder.enabled", "false"],
+        vec!["config", "set", "decisions.provider", "openai"],
+        vec![
+            "brain",
+            "memory",
+            "add",
+            "--scope",
+            "project",
+            "--kind",
+            "fact",
+            "Orchid gateway port is 4000.",
+        ],
+    ] {
+        let result = run(&args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let normal = run(&[
+        "brain",
+        "context",
+        "Orchid gateway port",
+        "--no-ambient",
+        "--json",
+    ]);
+    assert!(normal.status.success());
+    let output: serde_json::Value = serde_json::from_slice(&normal.stdout).unwrap();
+    assert!(output.get("decisions").is_none());
+    assert!(output["capsule_count"].as_u64().unwrap() > 0);
+    let missing_threshold = run(&["brain", "context", "Orchid gateway port", "--decisions"]);
+    assert!(!missing_threshold.status.success());
+    let no_key = run(&[
+        "brain",
+        "context",
+        "Orchid gateway port",
+        "--no-ambient",
+        "--json",
+        "--decisions",
+        "--decision-min-probability",
+        "0.8",
+    ]);
+    assert!(!no_key.status.success());
+    assert!(String::from_utf8_lossy(&no_key.stderr).contains("requires existing OPENAI_API_KEY"));
+    assert!(no_key.stdout.is_empty());
+    let invalid = run(&["config", "set", "decisions.provider", "invented_api"]);
+    assert!(!invalid.status.success());
+    // The fixture is independently rooted and created uniquely under temp.
+    assert!(root.starts_with(std::env::temp_dir()));
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Count `context.served` events by running `kimetsu brain insights --json`
 /// and parsing the `retrieval.served` field.
 fn count_context_served_via_insights(bin: &str, root: &std::path::Path) -> u64 {

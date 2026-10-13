@@ -1,0 +1,20 @@
+{"fingerprint":"8115f7d3af0dcab676d7a335ab4282be860d05e654da162a614f673859823352","microseconds":44819.555,"sample":0,"workload":"Orchid gateway"}
+{"fingerprint":"8115f7d3af0dcab676d7a335ab4282be860d05e654da162a614f673859823352","microseconds":44690.21,"sample":1,"workload":"Orchid gateway"}
+{"fingerprint":"8115f7d3af0dcab676d7a335ab4282be860d05e654da162a614f673859823352","microseconds":45703.483,"sample":2,"workload":"Orchid gateway"}
+{"fingerprint":"8115f7d3af0dcab676d7a335ab4282be860d05e654da162a614f673859823352","microseconds":45741.00399999999,"sample":3,"workload":"Orchid gateway"}
+{"fingerprint":"8115f7d3af0dcab676d7a335ab4282be860d05e654da162a614f673859823352","microseconds":46493.79899999999,"sample":4,"workload":"Orchid gateway"}
+{"fingerprint":"d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab","microseconds":5834.308000000001,"sample":0,"workload":"no_matching_lexical_token"}
+{"fingerprint":"d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab","microseconds":5416.608,"sample":1,"workload":"no_matching_lexical_token"}
+{"fingerprint":"d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab","microseconds":5392.715999999999,"sample":2,"workload":"no_matching_lexical_token"}
+{"fingerprint":"d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab","microseconds":5411.393,"sample":3,"workload":"no_matching_lexical_token"}
+{"fingerprint":"d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab","microseconds":5464.272,"sample":4,"workload":"no_matching_lexical_token"}
+{"fingerprint":"b301a56f8d7092160e0afd7b32eebabfaa47a25a7d69c2a0129c7ac5fc5587b2","microseconds":69.398,"sample":0,"workload":"file-2048"}
+{"fingerprint":"b301a56f8d7092160e0afd7b32eebabfaa47a25a7d69c2a0129c7ac5fc5587b2","microseconds":71.71,"sample":1,"workload":"file-2048"}
+{"fingerprint":"b301a56f8d7092160e0afd7b32eebabfaa47a25a7d69c2a0129c7ac5fc5587b2","microseconds":92.999,"sample":2,"workload":"file-2048"}
+{"fingerprint":"b301a56f8d7092160e0afd7b32eebabfaa47a25a7d69c2a0129c7ac5fc5587b2","microseconds":73.251,"sample":3,"workload":"file-2048"}
+{"fingerprint":"b301a56f8d7092160e0afd7b32eebabfaa47a25a7d69c2a0129c7ac5fc5587b2","microseconds":78.76700000000001,"sample":4,"workload":"file-2048"}
+{"fingerprint":"abd3accc3c52cb3bb8fb3e6d8c78d2a1ef11bd6a412175a70be10e3b4d2ec62e","microseconds":70.812,"sample":0,"workload":"file-33554432"}
+{"fingerprint":"abd3accc3c52cb3bb8fb3e6d8c78d2a1ef11bd6a412175a70be10e3b4d2ec62e","microseconds":65.25,"sample":1,"workload":"file-33554432"}
+{"fingerprint":"abd3accc3c52cb3bb8fb3e6d8c78d2a1ef11bd6a412175a70be10e3b4d2ec62e","microseconds":71.925,"sample":2,"workload":"file-33554432"}
+{"fingerprint":"abd3accc3c52cb3bb8fb3e6d8c78d2a1ef11bd6a412175a70be10e3b4d2ec62e","microseconds":74.885,"sample":3,"workload":"file-33554432"}
+{"fingerprint":"abd3accc3c52cb3bb8fb3e6d8c78d2a1ef11bd6a412175a70be10e3b4d2ec62e","microseconds":74.504,"sample":4,"workload":"file-33554432"}

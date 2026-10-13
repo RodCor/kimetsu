@@ -9,6 +9,29 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+## v2.9.0: Pi compatibility, bounded retrieval work, and optional decisions
+
+### Added
+
+- Experimental `brain context --decisions --decision-min-probability <0..1>`:
+  one explicit post-retrieval batch through TypeSafe Jev, OpenAI Decisions, or
+  Perplexity Decisions, selected with `decisions.provider`. Defaults stay
+  disabled; existing keys and a user-chosen threshold are required. No automatic
+  Pi/MCP/hook integration, distiller replacement, or live-service quality claim.
+  See [setup and limits](examples/decisions/README.md).
+- A reproducible model-free release benchmark for retrieval with revision
+  histories and bounded file expansion.
+
+### Fixed
+
+- Update locked `quinn-proto` to 0.11.18 and `rustls` to 0.23.45 (including
+  required transitive updates) to address six RustSec advisories found by CI.
+- Pi 1.2 custom-triggered turns expire old memory without treating background
+  notifications as user prompts. Canonical asset matches kimetsu-pi 0.1.5.
+- Cache prepared claim-revision SQL without changing revision/snapshot semantics.
+- Read at most 2,049 bytes when expanding a file into the 2,048-byte capsule
+  prefix, preserving truncation markers and UTF-8 boundaries.
+
 ## v2.8.0: Durable memory and scoped answerability
 
 Structured answerability remains opt-in. Existing brains
