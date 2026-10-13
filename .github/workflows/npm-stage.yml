@@ -64,6 +64,13 @@ jobs:
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
             --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$(git rev-parse HEAD)"
           (cd dist && sha256sum --check --strict checksums.txt)
+          # A signed manifest only authenticates files it actually lists. Also
+          # authenticate every archive, including any asset absent from that list.
+          for archive in dist/*.tar.gz dist/*.zip; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$(git rev-parse HEAD)"
+          done
 
       - uses: actions/setup-node@v5
         with:

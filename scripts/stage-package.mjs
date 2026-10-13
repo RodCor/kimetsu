@@ -53,8 +53,13 @@ export async function stagePackage(directory, io = liveIO(directory)) {
   }
   const result = io.run(['stage', 'publish', path.resolve(directory, packed[0].filename),
     '--tag', 'latest', '--access', 'public', '--provenance', '--ignore-scripts', '--json']);
-  if (typeof result.stageId !== 'string' || !result.stageId) throw new Error('Missing stage ID; inspect npm before retrying');
-  return { name, version, state: 'staged', stageId: result.stageId, shasum: packed[0].shasum };
+  // npm 11.21 publish JSON is keyed by package name (unlike stage list).
+  const staged = result?.[name];
+  if (typeof staged?.stageId !== 'string' || !staged.stageId) throw new Error('Missing stage ID; inspect npm before retrying');
+  if (staged.name !== name || staged.version !== version || staged.shasum !== packed[0].shasum) {
+    throw new Error('Unexpected staged package metadata; inspect npm before retrying');
+  }
+  return { name, version, state: 'staged', stageId: staged.stageId, shasum: packed[0].shasum };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

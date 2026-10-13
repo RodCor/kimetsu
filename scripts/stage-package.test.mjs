@@ -4,7 +4,10 @@ import { stagePackage } from './stage-package.mjs';
 
 const shasum = 'a'.repeat(40);
 
-function fixture({ status = 404, stages = [], response = { stageId: 'new-stage' } } = {}) {
+const packageName = '@kimetsu-ai/linux-x64';
+const stagedResponse = { [packageName]: { name: packageName, version: '2.9.0', shasum, stageId: 'new-stage' } };
+
+function fixture({ status = 404, stages = [], response = stagedResponse } = {}) {
   const calls = [];
   return {
     calls,
@@ -64,6 +67,13 @@ test('malformed or failed stage listing never triggers submission', async () => 
 test('a successful response without a stage ID is not called staged', async () => {
   const f = fixture({ response: {} });
   await assert.rejects(stagePackage('/package', f.io), /Missing stage ID/);
+});
+
+test('incorrect staged package identity fails instead of claiming success', async () => {
+  for (const changes of [{ name: 'kimetsu-ai' }, { version: '2.8.0' }, { shasum: 'b'.repeat(40) }]) {
+    const f = fixture({ response: { [packageName]: { ...stagedResponse[packageName], ...changes } } });
+    await assert.rejects(stagePackage('/package', f.io), /Unexpected staged package metadata/);
+  }
 });
 
 test('stage-list failure is propagated without submission', async () => {

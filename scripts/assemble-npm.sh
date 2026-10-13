@@ -157,4 +157,3 @@ node -e '
   }
   fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
 ' "$VERSION"
-

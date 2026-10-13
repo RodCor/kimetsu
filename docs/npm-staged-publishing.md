@@ -25,7 +25,9 @@ This uses package sources from the tag and downloads the existing release assets
 It checks that the tag's commit belongs to main, that Cargo's version agrees,
 and that the release is public and stable. It verifies the checksum manifest's
 GitHub attestation against that exact tag/commit and the original release workflow,
-then verifies the asset checksums. It never rebuilds binaries, changes tags or
+then verifies the asset checksums and each archive's own attestation. This also
+rejects an unauthenticated archive that was omitted from the checksum list.
+It never rebuilds binaries, changes tags or
 release assets, or reruns crates.io publication. npm provenance describes the
 staging workflow run; the verified original asset attestation binds binaries to
 the release commit.
