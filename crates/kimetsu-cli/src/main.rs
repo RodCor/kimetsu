@@ -1744,6 +1744,12 @@ struct SearchArgs {
 
 #[derive(Debug, Args)]
 struct ContextArgs {
+    /// Experimental: send selected evidence to the configured decision API.
+    #[arg(long, requires = "decision_min_probability")]
+    decisions: bool,
+    /// User-chosen retention threshold; requires --decisions. No calibrated default.
+    #[arg(long, requires = "decisions")]
+    decision_min_probability: Option<f64>,
     /// Query the retrieval ranks capsules against.
     query: String,
     /// Pipeline stage the bundle is shaped for (e.g. localization).

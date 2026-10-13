@@ -56,6 +56,25 @@ pub struct ProjectConfig {
     /// [`ProjectConfig::apply_retrieval_level`].
     #[serde(default)]
     pub retrieval: RetrievalSection,
+    /// Used only by an explicit `brain context --decisions` invocation.
+    #[serde(default)]
+    pub decisions: DecisionSection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecisionSection {
+    #[serde(default)]
+    pub provider: DecisionProvider,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionProvider {
+    #[default]
+    Disabled,
+    Jev,
+    Openai,
+    Perplexity,
 }
 
 impl ProjectConfig {
@@ -97,6 +116,7 @@ impl ProjectConfig {
             retrieval: RetrievalSection {
                 level: "deep".to_string(),
             },
+            decisions: DecisionSection::default(),
         }
     }
 
@@ -1459,6 +1479,25 @@ impl Default for LifecycleSection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decisions_are_disabled_in_old_configs_and_only_known_providers_parse() {
+        use super::{DecisionProvider, ProjectConfig};
+        let config = ProjectConfig::default_for_project("decision-test");
+        assert_eq!(config.decisions.provider, DecisionProvider::Disabled);
+        let mut old: toml::Value = toml::from_str(&config.to_toml().unwrap()).unwrap();
+        old.as_table_mut().unwrap().remove("decisions");
+        let loaded = ProjectConfig::from_toml(&toml::to_string(&old).unwrap()).unwrap();
+        assert_eq!(loaded.decisions.provider, DecisionProvider::Disabled);
+        old.as_table_mut().unwrap().insert(
+            "decisions".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "provider".into(),
+                toml::Value::String("invented_api".into()),
+            )])),
+        );
+        assert!(ProjectConfig::from_toml(&toml::to_string(&old).unwrap()).is_err());
+    }
+
     #[test]
     fn explicit_fact_guard_is_opt_in_and_round_trips() {
         let default = ProjectConfig::default_for_project("guard");

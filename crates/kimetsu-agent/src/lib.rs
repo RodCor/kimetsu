@@ -3,6 +3,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod bench;
 pub mod claude_code;
+pub mod decisions;
 pub mod harness;
 pub mod model;
 pub mod openai;

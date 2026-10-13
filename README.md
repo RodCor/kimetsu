@@ -28,8 +28,14 @@ Kimetsu is a sidecar brain for your agent. One Rust binary and one SQLite file
 per project, wired into Claude Code, Codex, Pi, OpenClaw, or Cursor over MCP,
 or driven from its own terminal chat. It captures the lessons an agent earns,
 learns which ones actually help, and hands them back before the next task. The
-memory pipeline calls no LLM: storage and retrieval are 100% local, free, and
+default memory pipeline calls no LLM: storage and retrieval are local, free, and
 offline-capable.
+
+An [experimental decision-provider pass](examples/decisions/README.md) is available
+for explicit `brain context --decisions` calls using TypeSafe Jev, OpenAI
+Decisions, or Perplexity Decisions. It sends selected evidence to the chosen
+service, requires an existing API key and a user-chosen threshold, and can incur
+charges. Configuring it does not change Pi, MCP, hooks, or default retrieval.
 
 | | |
 |---:|---|
@@ -39,7 +45,7 @@ offline-capable.
 | **83.0%** | LongMemEval, the public long-term-memory benchmark |
 | **13x** | cheaper per solved task: $0.19 vs $2.47 on a 16-task Terminal-Bench slice |
 | **~1M** | memories held in ~3 GB RAM with sub-2s retrieval, one SQLite file |
-| **$0** | API cost to store and recall: zero LLM calls in the memory pipeline |
+| **$0** | Default API cost to store and recall: zero LLM calls in the default memory pipeline |
 
 ---
 
