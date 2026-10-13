@@ -1,0 +1,104 @@
+name: stage npm release
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable GitHub release tag (for example v2.9.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-stage-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    if: ${{ vars.PUBLISH_NPM == 'true' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: validate stable release tag
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: verify release source and download existing assets
+        working-directory: release-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor HEAD origin/main
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as f:
+              assert tomllib.load(f)['workspace']['package']['version'] == os.environ['RELEASE_TAG'][1:]
+          PY
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease > /tmp/npm-release.json
+          jq -e '.isDraft == false and .isPrerelease == false' /tmp/npm-release.json
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+          gh attestation verify dist/checksums.txt --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$(git rev-parse HEAD)"
+          (cd dist && sha256sum --check --strict checksums.txt)
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: install staging-capable npm
+        run: |
+          npm install --global npm@11.21.0 --ignore-scripts
+          test "$(npm --version)" = 11.21.0
+          npm stage --help
+
+      - name: assemble packages without registry credentials
+        working-directory: release-source
+        run: bash "$GITHUB_WORKSPACE/scripts/assemble-npm.sh" "${RELEASE_TAG#v}"
+
+      - name: build independently versioned SDK without registry credentials
+        working-directory: release-source/npm/kimetsu-sdk
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+
+      - name: stage packages (never approve)
+        working-directory: release-source
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo '::error::NPM_TOKEN is not configured'
+            exit 1
+          fi
+          echo '## npm stages awaiting maintainer approval' >> "$GITHUB_STEP_SUMMARY"
+          for directory in stage/* stage-remote/* npm/kimetsu npm/kimetsu-remote npm/kimetsu-sdk; do
+            node "$GITHUB_WORKSPACE/scripts/stage-package.mjs" "$directory"
+          done
+          echo 'Staging does not make a version public. Review and approve platform packages before their wrappers; see docs/npm-staged-publishing.md.' >> "$GITHUB_STEP_SUMMARY"

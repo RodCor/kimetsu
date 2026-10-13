@@ -31,6 +31,20 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  npm-staging:
+    name: npm staging regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: node --test scripts/stage-package.test.mjs
+      - run: python3 scripts/test-assemble-npm.py
+
   decision-examples:
     name: decision provider examples
     runs-on: ubuntu-latest
