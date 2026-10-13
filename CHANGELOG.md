@@ -24,6 +24,8 @@ breaking changes require a major bump.
 
 ### Fixed
 
+- Update locked `quinn-proto` to 0.11.18 and `rustls` to 0.23.45 (including
+  required transitive updates) to address six RustSec advisories found by CI.
 - Pi 1.2 custom-triggered turns expire old memory without treating background
   notifications as user prompts. Canonical asset matches kimetsu-pi 0.1.5.
 - Cache prepared claim-revision SQL without changing revision/snapshot semantics.
