@@ -30,7 +30,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd 'pg_isready -U kimetsu_test -d kimetsu_test'
+          --health-cmd "pg_isready -U kimetsu_test -d kimetsu_test"
           --health-interval 2s --health-timeout 3s --health-retries 30
     steps:
       - uses: actions/checkout@v5
