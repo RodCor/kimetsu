@@ -36,6 +36,8 @@ breaking changes require a major bump.
 - Update async-trait for current Clippy compatibility without relaxing lint gates.
 - Coordinate PostgreSQL schema initialization across independent instances to
   prevent concurrent startup from racing on catalog constraints.
+- Move Apple Silicon CI and release builds to macOS 15 runners before the
+  macOS 14 runner retirement.
 
 ## v2.9.0: Pi compatibility, bounded retrieval work, and optional decisions
 
