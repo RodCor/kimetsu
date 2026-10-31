@@ -1,0 +1,66 @@
+name: remote storage
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/kimetsu-remote/**'
+      - 'crates/kimetsu-brain/**'
+      - 'crates/kimetsu-core/**'
+      - 'deploy/remote-stateless/**'
+      - '.github/workflows/remote-storage.yml'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  KIMETSU_USER_BRAIN: '0'
+  AWS_EC2_METADATA_DISABLED: 'true'
+jobs:
+  local-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: kimetsu_test
+          POSTGRES_USER: kimetsu_test
+          POSTGRES_PASSWORD: local-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd 'pg_isready -U kimetsu_test -d kimetsu_test'
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start dedicated Redis and DynamoDB Local
+        run: |
+          docker run --detach --name kimetsu-redis -p 127.0.0.1:6379:6379 redis:7.4-bookworm redis-server --appendonly yes --appendfsync always --maxmemory-policy noeviction
+          docker run --detach --name kimetsu-dynamodb -p 127.0.0.1:8000:8000 amazon/dynamodb-local:latest -jar DynamoDBLocal.jar -inMemory -sharedDb -disableTelemetry
+          for attempt in $(seq 1 60); do
+            if docker exec kimetsu-redis redis-cli ping | grep -q PONG && curl --silent --output /dev/null http://127.0.0.1:8000; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs kimetsu-redis
+          docker logs kimetsu-dynamodb
+          exit 1
+      - name: Lean remote suite
+        run: cargo test --locked -p kimetsu-remote
+      - name: Providers and Lambda suite
+        run: cargo test --locked -p kimetsu-remote --features stores,lambda,tls
+      - name: Live local PostgreSQL and Redis contracts
+        env:
+          KIMETSU_TEST_POSTGRES_URL: postgresql://kimetsu_test:local-test-only@127.0.0.1:5432/kimetsu_test?sslmode=disable
+          KIMETSU_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          cargo test --locked -p kimetsu-remote --features postgres,redis --test storage_contract -- --ignored
+          cargo test --locked -p kimetsu-remote --features postgres,redis --test stateless -- --ignored
+      - name: DynamoDB Local contract (explicit dummy SDK credentials)
+        env:
+          KIMETSU_TEST_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
+        run: cargo test --locked -p kimetsu-remote --features dynamodb local_emulator_contract --lib -- --ignored

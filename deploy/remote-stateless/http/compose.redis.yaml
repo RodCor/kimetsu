@@ -1,0 +1,34 @@
+# Standalone Redis alternative; do not combine with compose.yaml.
+services:
+  redis:
+    image: redis:7.4-bookworm
+    command: [redis-server, /usr/local/etc/redis/redis.conf]
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  remote:
+    build:
+      context: ../../..
+      dockerfile: deploy/remote-stateless/http/Dockerfile
+    environment:
+      KIMETSU_REMOTE_STORAGE: redis
+      KIMETSU_REMOTE_DATABASE_URL: redis://redis:6379/0
+      KIMETSU_REMOTE_STORAGE_NAMESPACE: ${KIMETSU_REMOTE_STORAGE_NAMESPACE:-local-team}
+      KIMETSU_REMOTE_TOKEN: ${KIMETSU_REMOTE_TOKEN:?set a bearer token}
+      KIMETSU_REMOTE_SHARED_ORG: ${KIMETSU_REMOTE_SHARED_ORG:-false}
+      KIMETSU_MCP_ENABLE_WRITE_TOOLS: ${KIMETSU_MCP_ENABLE_WRITE_TOOLS:-0}
+    ports:
+      - '127.0.0.1:8787:8787'
+    depends_on:
+      redis:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:size=1073741824,mode=1777
+    init: true
+volumes:
+  redis-data:

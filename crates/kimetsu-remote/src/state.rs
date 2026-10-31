@@ -16,6 +16,9 @@ pub struct AppState {
     pub auth: Arc<AuthConfig>,
     pub skills: Arc<SkillConfig>,
     pub limiter: Arc<RateLimiter>,
+    pub rate_limit: u32,
+    /// Present only when durable state is external to the request projection.
+    pub durable: Option<Arc<crate::durable::DurableState>>,
     pub metrics: Arc<Metrics>,
     /// Present when `--repos-file` enables server-side ingest.
     pub ingest: Option<Arc<IngestState>>,
@@ -45,11 +48,24 @@ impl AppState {
             auth: Arc::new(auth),
             skills: Arc::new(skills),
             limiter: Arc::new(RateLimiter::new(per_minute)),
+            rate_limit: per_minute,
+            durable: None,
             metrics: Arc::new(Metrics::default()),
             ingest: None,
             reranker: None,
             server_node: Arc::new("remote".to_string()),
         }
+    }
+
+    pub fn with_storage(
+        mut self,
+        storage: Arc<dyn crate::storage::BrainStore>,
+        shared_org: bool,
+    ) -> Self {
+        self.durable = Some(Arc::new(crate::durable::DurableState::new(
+            storage, shared_org,
+        )));
+        self
     }
 
     pub fn with_ingest(mut self, ingest: Arc<IngestState>) -> Self {

@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Kimetsu Remote custom runtime with durable DynamoDB checkpoints
+Parameters:
+  TokenSecretArn:
+    Type: String
+    Description: Existing Secrets Manager secret ARN; JSON field token contains the global bearer token
+  StorageNamespace:
+    Type: String
+    Default: team
+    AllowedPattern: '[A-Za-z0-9_.-]{1,64}'
+  SharedOrg:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  EnableWriteTools:
+    Type: String
+    Default: '0'
+    AllowedValues: ['0', '1']
+    Description: Set to 1 to expose authenticated memory write tools; default 0 keeps writes disabled
+Resources:
+  Checkpoints:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+  Remote:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: provided.al2023
+      Architectures: [x86_64]
+      Handler: bootstrap
+      # cargo lambda build creates this directory with an executable bootstrap.
+      CodeUri: ../../../target/lambda/kimetsu-remote-lambda/
+      MemorySize: 2048
+      Timeout: 28
+      EphemeralStorage:
+        Size: 2048
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          KIMETSU_REMOTE_STORAGE: dynamodb
+          KIMETSU_REMOTE_DYNAMODB_TABLE: !Ref Checkpoints
+          KIMETSU_REMOTE_STORAGE_NAMESPACE: !Ref StorageNamespace
+          KIMETSU_REMOTE_SHARED_ORG: !Ref SharedOrg
+          KIMETSU_MCP_ENABLE_WRITE_TOOLS: !Ref EnableWriteTools
+          KIMETSU_REMOTE_TOKEN: !Sub '{{resolve:secretsmanager:${TokenSecretArn}:SecretString:token}}'
+          # AWS_REGION and execution-role credentials are supplied by Lambda.
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:ConditionCheckItem
+              Resource: !GetAtt Checkpoints.Arn
+      Events:
+        Mcp:
+          Type: HttpApi
+          Properties:
+            Path: /mcp/{repo}
+            Method: POST
+            PayloadFormatVersion: '2.0'
+        Health:
+          Type: HttpApi
+          Properties:
+            Path: /healthz
+            Method: GET
+            PayloadFormatVersion: '2.0'
+Outputs:
+  BaseUrl:
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  TableName:
+    Value: !Ref Checkpoints

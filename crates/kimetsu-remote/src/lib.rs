@@ -5,13 +5,16 @@ pub mod app;
 pub mod auth;
 pub mod catalog;
 pub mod config;
+pub mod durable;
 pub mod git;
 pub mod ingest;
 pub mod metrics;
+pub mod projection;
 pub mod ratelimit;
 pub mod repo;
 pub mod rpc;
 pub mod state;
+pub mod storage;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::state::AppState;
 
 /// Parse → isolate → bind → serve. Blocks until shutdown.
-pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
+fn prepare_state(args: &config::ServeArgs, durable: bool) -> Result<AppState, String> {
     init_tracing(args.log.as_deref());
 
     tracing::warn!(
@@ -31,8 +34,13 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     // enclosing repo).
     kimetsu_core::paths::pin_discover_to_root();
 
-    let auth = config::build_auth(&args)?;
-    let data_dir = prepare_data_dir(&args.data)?;
+    let auth = config::build_auth(args)?;
+    let data_dir = if durable {
+        // A placeholder only; durable dispatch never resolves a brain here.
+        std::env::temp_dir().join("kimetsu-remote-projections")
+    } else {
+        prepare_data_dir(args.data.as_deref().ok_or("local mode requires --data")?)?
+    };
 
     // Slice C: this server's node id (HLC node + origin machine). Set the clock
     // node ONCE so server-written events sort/attribute as this server, distinct
@@ -49,15 +57,21 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     // Cross-project brain: off by default (standalone repos). With --org-brain,
     // point the user brain at that shared dir and force it on, so global_user
     // memories are shared + merged into every repo's retrieval.
-    let org_brain = prepare_org_brain(args.org_brain.as_deref(), &data_dir)?;
+    let org_brain = if durable {
+        None
+    } else {
+        prepare_org_brain(args.org_brain.as_deref(), &data_dir)?
+    };
     // SAFETY: set before the tokio runtime starts any worker threads.
-    unsafe {
-        match &org_brain {
-            Some(dir) => {
-                std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
-                std::env::set_var("KIMETSU_USER_BRAIN", "1");
+    if !durable {
+        unsafe {
+            match &org_brain {
+                Some(dir) => {
+                    std::env::set_var("KIMETSU_USER_BRAIN_DIR", dir);
+                    std::env::set_var("KIMETSU_USER_BRAIN", "1");
+                }
+                None => std::env::set_var("KIMETSU_USER_BRAIN", "0"),
             }
-            None => std::env::set_var("KIMETSU_USER_BRAIN", "0"),
         }
     }
     if let Some(dir) = &org_brain {
@@ -113,12 +127,20 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     if let Some(ing) = ingest {
         state = state.with_ingest(std::sync::Arc::new(ing));
     }
+    Ok(state)
+}
+
+pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
+    let storage = config::StorageSettings::from_args(&args)?;
+    let mut state = prepare_state(&args, storage.is_some())?;
 
     // Background-warm existing repos so the first real request to each doesn't
     // pay the cold ANN build. Detached thread — does NOT block startup. Compiles
     // to nothing on lean (no-embeddings) builds.
     #[cfg(feature = "embeddings")]
-    spawn_prewarm((*state.data_dir).clone());
+    if storage.is_none() {
+        spawn_prewarm((*state.data_dir).clone());
+    }
 
     let tls = match (args.tls_cert.clone(), args.tls_key.clone()) {
         (Some(cert), Some(key)) => Some((cert, key)),
@@ -145,6 +167,10 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
         .build()
         .map_err(|e| format!("build runtime: {e}"))?;
 
+    if let Some(settings) = storage {
+        let store = runtime.block_on(settings.open())?;
+        state = state.with_storage(store, settings.shared_org);
+    }
     let result = runtime.block_on(serve(args.addr, state, tls));
 
     // Graceful shutdown returned: flush every warm ANN index to its sidecar so
@@ -154,6 +180,21 @@ pub fn run_serve(args: config::ServeArgs) -> Result<(), String> {
     kimetsu_brain::ann::save_all();
 
     result
+}
+
+#[cfg(feature = "lambda")]
+pub mod lambda_adapter;
+
+#[cfg(feature = "lambda")]
+pub async fn run_lambda(args: config::ServeArgs) -> Result<(), String> {
+    let settings = config::StorageSettings::from_args(&args)?
+        .ok_or("Lambda requires an explicit durable storage backend")?;
+    let state = prepare_state(&args, true)?;
+    let store = settings.open().await?;
+    let router = app::build_router(state.with_storage(store, settings.shared_org));
+    lambda_adapter::run(router)
+        .await
+        .map_err(|_| "Lambda runtime failed".to_string())
 }
 
 /// Background pre-warm: load-or-build + cache each repo's ANN index on startup
