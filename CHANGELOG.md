@@ -9,6 +9,32 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+## v2.10.0: Conservative proactive recall and stateless remote storage
+
+### Added
+
+- Durable SQLite, PostgreSQL, Redis and DynamoDB checkpoint stores for Kimetsu
+  Remote. Each request uses a disposable SQLite retrieval projection; concurrent
+  repo and shared-org changes publish atomically before a successful response.
+- Shared durable rate limits, isolated request-local org/cache paths, an AWS
+  Lambda runtime adapter, HTTP container and SAM deployment examples, and live
+  provider contract checks. Existing local-file mode and HTTP MCP clients remain
+  compatible. See [storage setup and limits](docs/remote-storage.md).
+
+### Fixed
+
+- Proactive prompt/tool recall stays silent for greetings, mismatched evidence
+  and uncertain candidate pools. Admission runs before output trimming and checks
+  the rendered text; rejected turns preserve warm-start state and delivery credit.
+- Restore canonical repository paths so cold projections retain file retrieval;
+  release temporary ANN registrations and reject corrupt checkpoint trailers.
+- Require a global token for conflict resolution that can affect shared org data.
+- Update the TLS, certificate-root, constant-time utility and Tokio dependencies
+  to patched releases; disable the AWS SDK's legacy HTTP/TLS feature path.
+- Update async-trait for current Clippy compatibility without relaxing lint gates.
+- Coordinate PostgreSQL schema initialization across independent instances to
+  prevent concurrent startup from racing on catalog constraints.
+
 ## v2.9.0: Pi compatibility, bounded retrieval work, and optional decisions
 
 ### Added

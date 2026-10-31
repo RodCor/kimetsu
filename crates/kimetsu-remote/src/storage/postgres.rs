@@ -4,6 +4,9 @@ use postgres_native_tls::MakeTlsConnector;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, Row, error::SqlState};
 
+// Database-wide bootstrap protocol shared by every namespace and instance.
+const INITIALIZATION_LOCK: i64 = 0x4b49_4d45_5453_5501;
+
 pub struct PostgresStore {
     client: Mutex<Client>,
     namespace: String,
@@ -21,7 +24,7 @@ impl PostgresStore {
         let tls = native_tls::TlsConnector::builder()
             .build()
             .map_err(|_| unavailable())?;
-        let (client, connection) = tokio_postgres::connect(url, MakeTlsConnector::new(tls))
+        let (mut client, connection) = tokio_postgres::connect(url, MakeTlsConnector::new(tls))
             .await
             .map_err(|_| unavailable())?;
         // Driver errors can include endpoint details. Callers receive a sanitized
@@ -29,7 +32,21 @@ impl PostgresStore {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        client
+        let transaction = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .map_err(|_| unavailable())?;
+        // IF NOT EXISTS still races on PostgreSQL's catalog unique constraints
+        // when independent instances start in an empty schema. Take the lock in
+        // a separate command before DDL so its snapshot sees the prior commit.
+        // Transaction scoping releases the lock on success, error or cancellation.
+        transaction
+            .query_one("SELECT pg_advisory_xact_lock($1)", &[&INITIALIZATION_LOCK])
+            .await
+            .map_err(|_| unavailable())?;
+        transaction
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS kimetsu_checkpoints (
                  namespace TEXT NOT NULL, key TEXT NOT NULL,
@@ -46,6 +63,7 @@ impl PostgresStore {
             )
             .await
             .map_err(|_| unavailable())?;
+        transaction.commit().await.map_err(|_| unavailable())?;
         Ok(Self {
             client: Mutex::new(client),
             namespace: namespace.into(),

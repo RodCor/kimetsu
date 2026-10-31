@@ -251,6 +251,109 @@ fn sqlite_refuses_memory_databases_that_cannot_survive_restarts() {
 }
 
 #[cfg(feature = "postgres")]
+async fn postgres_client(url: &str) -> tokio_postgres::Client {
+    let tls = native_tls::TlsConnector::builder().build().unwrap();
+    let (client, connection) =
+        tokio_postgres::connect(url, postgres_native_tls::MakeTlsConnector::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires explicit KIMETSU_TEST_POSTGRES_URL dedicated test database"]
+async fn postgres_concurrent_initialization_on_a_fresh_schema() {
+    use kimetsu_remote::storage::postgres::PostgresStore;
+    use std::time::Duration;
+
+    let url = std::env::var("KIMETSU_TEST_POSTGRES_URL").expect("set dedicated test URL");
+    let schema = format!("startup_{}", ulid::Ulid::new()).to_ascii_lowercase();
+    let mut initializer = postgres_client(&url).await;
+    let observer = postgres_client(&url).await;
+    initializer
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let scoped_url = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        format!(
+            "{url}{}options=-csearch_path%3D{schema}&application_name={schema}",
+            if url.contains('?') { '&' } else { '?' }
+        )
+    } else {
+        format!("{url} options='-csearch_path={schema}' application_name='{schema}'")
+    };
+
+    // Hold a partially completed bootstrap invisible to the new connections.
+    // Without startup coordination, IF NOT EXISTS sees no table and waits on
+    // pg_type's unique constraint, then fails when this transaction commits.
+    let transaction = initializer.transaction().await.unwrap();
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&0x4b49_4d45_5453_5501_i64],
+        )
+        .await
+        .unwrap();
+    transaction
+        .batch_execute(&format!(
+            "CREATE TABLE {schema}.kimetsu_checkpoints (
+                namespace TEXT NOT NULL, key TEXT NOT NULL,
+                revision TEXT NOT NULL, data BYTEA NOT NULL,
+                PRIMARY KEY(namespace,key)
+            )"
+        ))
+        .await
+        .unwrap();
+    let mut jobs = Vec::new();
+    for index in 0..4 {
+        let scoped_url = scoped_url.clone();
+        jobs.push(tokio::spawn(async move {
+            let namespace = if index == 2 { "other" } else { "startup" };
+            PostgresStore::connect(&scoped_url, namespace).await
+        }));
+    }
+    // Observe every constructor blocked in PostgreSQL before releasing the
+    // transaction; this forces the overlap without depending on sleep timing.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE application_name=$1
+                       AND cardinality(pg_blocking_pids(pid)) > 0",
+                    &[&schema],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("constructors must overlap the uncommitted schema bootstrap");
+    transaction.commit().await.unwrap();
+
+    let mut stores = Vec::new();
+    for job in jobs {
+        stores.push(Arc::new(job.await.unwrap().unwrap()));
+    }
+    contract(stores[0].clone(), stores[1].clone(), stores[2].clone()).await;
+    assert!(stores[3].load("repo").await.unwrap().is_some());
+    drop(stores);
+    observer
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires explicit KIMETSU_TEST_POSTGRES_URL dedicated test database"]
 async fn postgres_contract_across_independent_instances() {
@@ -277,14 +380,7 @@ async fn postgres_rejects_corrupt_records_without_publishing_a_batch() {
     let url = std::env::var("KIMETSU_TEST_POSTGRES_URL").expect("set dedicated test URL");
     let ns = format!("corrupt_{}", ulid::Ulid::new());
     let store = PostgresStore::connect(&url, &ns).await.unwrap();
-    let tls = native_tls::TlsConnector::builder().build().unwrap();
-    let (client, connection) =
-        tokio_postgres::connect(&url, postgres_native_tls::MakeTlsConnector::new(tls))
-            .await
-            .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let client = postgres_client(&url).await;
     client.execute("INSERT INTO kimetsu_checkpoints(namespace,key,revision,data) VALUES($1,'bad','bad revision',$2)", &[&ns, &vec![1_u8]]).await.unwrap();
     assert!(matches!(
         store.load("bad").await,
