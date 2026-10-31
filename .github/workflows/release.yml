@@ -70,8 +70,8 @@ jobs:
           # macOS Intel
           - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
           # macOS Apple Silicon
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
-          - { os: macos-14,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
+          - { os: macos-15,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
+          - { os: macos-15,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
           # Windows
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }

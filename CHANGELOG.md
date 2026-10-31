@@ -31,9 +31,13 @@ breaking changes require a major bump.
 - Require a global token for conflict resolution that can affect shared org data.
 - Update the TLS, certificate-root, constant-time utility and Tokio dependencies
   to patched releases; disable the AWS SDK's legacy HTTP/TLS feature path.
+- Update aws-config to remove the vulnerable aws-smithy-json 0.61 dependency
+  (GHSA-8ffr-xgwf-xj56 / CVE-2026-18140); all AWS JSON parsing uses 0.62.7.
 - Update async-trait for current Clippy compatibility without relaxing lint gates.
 - Coordinate PostgreSQL schema initialization across independent instances to
   prevent concurrent startup from racing on catalog constraints.
+- Move Apple Silicon CI and release builds to macOS 15 runners before the
+  macOS 14 runner retirement.
 
 ## v2.9.0: Pi compatibility, bounded retrieval work, and optional decisions
 
