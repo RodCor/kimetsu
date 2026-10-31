@@ -187,11 +187,43 @@ impl ServingPolicy {
     pub fn retrieve(
         &self,
         session: &BrainSession,
-        mut request: ContextRequest,
+        request: ContextRequest,
         embedder: &dyn Embedder,
         reranker: Option<&dyn Reranker>,
         exposure_id: &str,
     ) -> KimetsuResult<Delivery> {
+        self.retrieve_with_admission(session, request, embedder, reranker, exposure_id, false)
+    }
+
+    pub fn retrieve_unsolicited(
+        &self,
+        session: &BrainSession,
+        request: ContextRequest,
+        embedder: &dyn Embedder,
+        reranker: Option<&dyn Reranker>,
+        exposure_id: &str,
+    ) -> KimetsuResult<Delivery> {
+        self.retrieve_with_admission(session, request, embedder, reranker, exposure_id, true)
+    }
+
+    fn retrieve_with_admission(
+        &self,
+        session: &BrainSession,
+        mut request: ContextRequest,
+        embedder: &dyn Embedder,
+        reranker: Option<&dyn Reranker>,
+        exposure_id: &str,
+        unsolicited: bool,
+    ) -> KimetsuResult<Delivery> {
+        let pool_policy = if unsolicited {
+            request.defer_recall_budget = true;
+            Self {
+                cap: self.cap.max(crate::recall_gate::CANDIDATE_POOL),
+                ..*self
+            }
+        } else {
+            *self
+        };
         session.resolve_request_floors(&mut request);
         let abstain = request.abstain_evidence;
         let query = request.query.clone();
@@ -218,7 +250,7 @@ impl ServingPolicy {
             .map(|v| v as &dyn Embedder)
             .unwrap_or(embedder);
         let bundle = session.retrieve_context_with_injected_embedder(
-            self.prepare(request, reranker.is_some()),
+            pool_policy.prepare(request, reranker.is_some()),
             checked_embedder,
         )?;
         let checked_scores = if let Some(rr) = reranker.filter(|_| !bundle.capsules.is_empty()) {
@@ -240,12 +272,18 @@ impl ServingPolicy {
         } else {
             None
         };
-        let bundle = self.arbitrate(
+        let mut bundle = pool_policy.arbitrate(
             &query,
             bundle,
             checked_scores.as_ref().map(|r| r as &dyn Reranker),
             abstain,
         );
+        if unsolicited {
+            crate::recall_gate::filter_bundle(&query, &mut bundle);
+            if self.cap > 0 && bundle.capsules.len() > self.cap {
+                bundle.excluded.extend(bundle.capsules.split_off(self.cap));
+            }
+        }
         Ok(self.render_for_query(
             &query,
             bundle,
@@ -264,6 +302,69 @@ mod tests {
         project,
     };
     use kimetsu_core::memory::{MemoryKind, MemoryScope};
+    #[test]
+    fn unsolicited_retrieval_checks_entropy_before_budget_and_cap() {
+        crate::user_brain::with_user_brain_disabled(|| {
+            let root =
+                std::env::temp_dir().join(format!("kimetsu-unsolicited-{}", ulid::Ulid::new()));
+            kimetsu_core::paths::git_init_boundary(&root);
+            project::init_project(&root, false).unwrap();
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
+            let mut config = project::load_config(&paths).unwrap();
+            config.embedder.enabled = false;
+            std::fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+            for (prefix, padding) in [
+                ("Cache timeout latency.", "a "),
+                ("Retry queue latency.", "b "),
+            ] {
+                project::add_memory(
+                    &root,
+                    MemoryScope::Project,
+                    MemoryKind::Convention,
+                    &format!("{prefix} {}", padding.repeat(500)),
+                )
+                .unwrap();
+            }
+            let session = BrainSession::open_readonly(&root).unwrap();
+            let policy = ServingPolicy {
+                budget: 2000,
+                cap: 1,
+                ..Default::default()
+            };
+            let request = ContextRequest {
+                query: "cache timeout retry queue latency".into(),
+                ..Default::default()
+            };
+            let explicit = policy
+                .retrieve(
+                    &session,
+                    request.clone(),
+                    &crate::embeddings::NoopEmbedder,
+                    None,
+                    EVAL_EXPOSURE_ID,
+                )
+                .unwrap();
+            assert_eq!(
+                explicit.capsules.len(),
+                1,
+                "the ordinary request retains its existing cap/budget behavior"
+            );
+            let automatic = policy
+                .retrieve_unsolicited(
+                    &session,
+                    request,
+                    &crate::embeddings::NoopEmbedder,
+                    None,
+                    EVAL_EXPOSURE_ID,
+                )
+                .unwrap();
+            assert!(automatic.capsules.is_empty());
+            assert_eq!(automatic.payload["skipped"], true);
+            drop(session);
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
     struct FailedEmbedder;
     impl Embedder for FailedEmbedder {
         fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {

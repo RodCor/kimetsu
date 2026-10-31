@@ -44,6 +44,7 @@ pub mod ordering;
 pub mod packs;
 pub mod project;
 pub mod projector;
+pub mod recall_gate;
 pub mod redact;
 pub mod reindex;
 pub mod reinforce;

@@ -1977,7 +1977,9 @@ pub(crate) fn daemon_capsules_to_bundle(
     let capsules: Vec<ContextCapsule> = capsules
         .into_iter()
         .map(|c| {
+            let token_estimate = kimetsu_brain::context::estimate_tokens(&c.summary) + 8;
             let mut capsule = ContextCapsule::wire_minimal(c.summary, c.kind, c.score);
+            capsule.token_estimate = token_estimate;
             capsule.id = c.id;
             capsule.expansion_handle = c.expansion_handle;
             capsule.claim_revision = c.claim_revision;

@@ -510,6 +510,11 @@ fn run_context_hook(
         let _ = stdin.write_all(payload.as_bytes());
     }
     let out = child.wait_with_output().expect("wait context-hook");
+    assert!(
+        out.status.success(),
+        "context-hook failed: {:?}",
+        out.status
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -534,7 +539,8 @@ fn context_hook_warm_starts_once_per_session() {
     )
     .expect("add_memory");
 
-    let payload = r#"{"session_id":"warm-session-1","prompt":"investigate this failing test in the CI pipeline"}"#;
+    let payload =
+        r#"{"session_id":"warm-session-1","prompt":"regenerate the schema with cargo xtask gen"}"#;
 
     let first = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
     assert!(
@@ -751,10 +757,10 @@ fn context_hook_without_the_flag_never_warm_starts() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// A prompt too short for retrieval still gets the warm start: the guard exists
-/// to skip meaningless *retrieval*, not to withhold the session's orientation.
+/// Social turns need neither retrieval nor a repo digest. Skipping them must
+/// leave the first useful turn eligible for the session's warm start.
 #[test]
-fn context_hook_warm_starts_even_on_a_short_prompt() {
+fn context_hook_skips_social_turns_without_consuming_warm_start() {
     let root = temp_project_dir("warm_short_prompt");
     let cache_home = root.join("cache-home");
     fs::create_dir_all(&cache_home).expect("create cache home");
@@ -767,13 +773,359 @@ fn context_hook_warm_starts_even_on_a_short_prompt() {
     )
     .expect("add_memory");
 
-    let payload = r#"{"session_id":"warm-session-3","prompt":"hi"}"#;
+    for prompt in [
+        "",
+        "   ",
+        "Hi",
+        "  HI!                 ",
+        "Hello there!",
+        "Hey, how are you?",
+        "Good morning!",
+        "Thanks, that's all!",
+        "Thank you very much!",
+        "OK, sounds good.",
+        "Yes",
+        "No",
+        "Hola, buenos días!",
+        "Muchas gracias!",
+        "👋🙂",
+        "!!!...........",
+    ] {
+        let payload = serde_json::json!({"session_id":"warm-session-3", "prompt":prompt});
+        let out = run_context_hook(
+            &root,
+            &cache_home,
+            &["--warm-on-first-prompt"],
+            &payload.to_string(),
+        );
+        assert!(
+            out.is_empty(),
+            "social turn {prompt:?} must be silent; got: {out}"
+        );
+    }
+    assert!(
+        !root.join(".kimetsu/digest.md").exists(),
+        "social turns must not even prepare the digest"
+    );
+
+    let payload = r#"{"session_id":"warm-session-3","prompt":"Hi, investigate how the broker fills capsules"}"#;
     let out = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
     assert!(
         out.contains("## Repo context"),
-        "a short prompt must still receive the warm start; got: {out}"
+        "the first real request must still receive the warm start; got: {out}"
     );
 
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A greeting may overlap memory text. It must be skipped before the lexical
+/// fallback or semantic daemon can turn that overlap into an injection.
+#[test]
+fn context_hook_skips_social_retrieval_with_and_without_warm_start() {
+    let root = temp_project_dir("social_retrieval");
+    let cache_home = root.join("cache-home");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Hello there, good morning! Thank you very much. Use cargo xtask gen for schemas.",
+    )
+    .expect("add memory");
+
+    for extra_args in [&[][..], &["--warm-on-first-prompt"][..]] {
+        for prompt in ["Hello there!", "Good morning!", "Thank you very much!"] {
+            for payload in [
+                prompt.to_string(),
+                serde_json::json!({"session_id":"social-retrieval", "prompt":prompt}).to_string(),
+            ] {
+                let out = run_context_hook(&root, &cache_home, extra_args, &payload);
+                assert!(
+                    out.is_empty(),
+                    "social retrieval must be silent for {payload}; got: {out}"
+                );
+            }
+        }
+    }
+
+    let request = r#"{"session_id":"social-retrieval","prompt":"Hi, how do we regenerate schemas with cargo xtask gen?"}"#;
+    let out = run_context_hook(&root, &cache_home, &[], request);
+    assert!(
+        out.contains("Use cargo xtask gen for schemas"),
+        "a greeting followed by a task must still retrieve relevant memory; got: {out}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_keeps_warm_start_for_brief_requests() {
+    let root = temp_project_dir("brief_request_warm_start");
+    let cache_home = root.join("cache-home");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Fix tests and HiDPI CI by regenerating the schema with cargo xtask gen before committing",
+    )
+    .expect("add memory");
+    for (idx, prompt) in ["fix tests", "continue", "resume", "Hi, fix CI", "fix HiDPI"]
+        .iter()
+        .enumerate()
+    {
+        if matches!(*prompt, "continue" | "resume") {
+            let output = Command::new(kimetsu_bin())
+                .args(["checkpoint", "Fix tests in CI", "--session-id"])
+                .arg(format!("brief-{idx}"))
+                .current_dir(&root)
+                .env("KIMETSU_USER_BRAIN", "0")
+                .env("KIMETSU_USER_BRAIN_DIR", &cache_home)
+                .env("KIMETSU_BRAIN_EMBEDDER", "noop")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let payload = serde_json::json!({"session_id":format!("brief-{idx}"), "prompt":prompt});
+        let out = run_context_hook(
+            &root,
+            &cache_home,
+            &["--warm-on-first-prompt"],
+            &payload.to_string(),
+        );
+        assert!(
+            out.contains("## Repo context"),
+            "brief request {prompt:?} must warm start; got: {out}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_abstains_on_turn_result_discrepancy() {
+    let root = temp_project_dir("turn_result_discrepancy");
+    let cache_home = root.join("cache-home");
+    for text in [
+        "Run cargo fmt before committing Rust changes",
+        "The Orchid gateway listens on port 7319",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            text,
+        )
+        .unwrap();
+    }
+    for extra_args in [&[][..], &["--warm-on-first-prompt"][..]] {
+        for prompt in [
+            "Kubernetes pod eviction cargo",
+            "Explain Saturn rings orbital resonance",
+            "please do that for me",
+            "Saturn",
+            "continue",
+            "resume",
+        ] {
+            let payload = serde_json::json!({"session_id":"discrepancy", "prompt":prompt});
+            let out = run_context_hook(&root, &cache_home, extra_args, &payload.to_string());
+            assert!(
+                out.is_empty(),
+                "mismatched turn {prompt:?} must emit nothing; got: {out}"
+            );
+        }
+    }
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &["--warm-on-first-prompt"],
+        r#"{"session_id":"discrepancy","prompt":"What port does the Orchid gateway listen on?"}"#,
+    );
+    assert!(
+        out.contains("## Repo context") && out.contains("7319"),
+        "a rejected turn must not consume the later relevant warm start: {out}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_abstains_on_diffuse_results_before_the_output_cap() {
+    let root = temp_project_dir("diffuse_results");
+    let cache_home = root.join("cache-home");
+    for text in [
+        "Cache timeout is configured in the frontend preferences",
+        "Retry queue is configured in the payment worker",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            text,
+        )
+        .unwrap();
+    }
+    for extra_args in [
+        &["--max-capsules", "1"][..],
+        &["--warm-on-first-prompt", "--max-capsules", "1"][..],
+    ] {
+        let out = run_context_hook(
+            &root,
+            &cache_home,
+            extra_args,
+            r#"{"session_id":"diffuse","prompt":"cache timeout retry queue"}"#,
+        );
+        assert!(
+            out.is_empty(),
+            "flat, weakly aligned results must be silent even at cap one: {out}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_delivers_equally_relevant_results() {
+    let root = temp_project_dir("aligned_results");
+    let cache_home = root.join("cache-home");
+    for text in [
+        "Cache timeout uses a retry policy",
+        "Cache timeout uses a circuit breaker",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            text,
+        )
+        .unwrap();
+    }
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"aligned","prompt":"cache timeout"}"#,
+    );
+    assert!(
+        out.contains("retry policy") && out.contains("circuit breaker"),
+        "equally relevant memories are useful evidence: {out}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_strips_social_prefixes_from_task_admission() {
+    let root = temp_project_dir("greeting_task_alignment");
+    let cache_home = root.join("cache-home");
+    brain_project::add_memory(
+        &root,
+        kimetsu_core::memory::MemoryScope::Project,
+        kimetsu_core::memory::MemoryKind::Convention,
+        "Fix CI with cargo test",
+    )
+    .unwrap();
+    for prompt in [
+        "Good morning, fix CI",
+        "Hey there, fix CI",
+        "Hello, please fix CI",
+    ] {
+        let payload = serde_json::json!({"session_id":prompt,"prompt":prompt});
+        let out = run_context_hook(&root, &cache_home, &[], &payload.to_string());
+        assert!(
+            out.contains("Fix CI"),
+            "the social prefix must not dilute the task {prompt:?}: {out}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_assesses_entropy_before_token_budgeting() {
+    let root = temp_project_dir("entropy_before_budget");
+    let cache_home = root.join("cache-home");
+    for (prefix, padding) in [
+        ("Cache timeout latency.", "frontend "),
+        ("Retry queue latency.", "payments "),
+    ] {
+        let text = format!("{prefix} {}", padding.repeat(500));
+        let estimate = kimetsu_brain::context::estimate_tokens(&text) + 8;
+        assert!(
+            estimate > 500 && estimate < 1000,
+            "each competitor fits alone, but not together"
+        );
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            &text,
+        )
+        .unwrap();
+    }
+    let (_, _, conn) = brain_project::load_project(&root).unwrap();
+    let count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "the entropy fixture needs two distinct competitors"
+    );
+    drop(conn);
+    let out = run_context_hook(
+        &root,
+        &cache_home,
+        &[],
+        r#"{"session_id":"budget-entropy","prompt":"cache timeout retry queue latency"}"#,
+    );
+    assert!(
+        out.is_empty(),
+        "one fitting result must not hide an equally scored competitor: {out}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_hook_abstains_if_compression_removes_the_supporting_text() {
+    let root = temp_project_dir("rendered_discrepancy");
+    let cache_home = root.join("cache-home");
+    for text in [
+        "Use cargo fmt for formatting. Prefer snake_case for names. Keep modules small. Orchid gateway port is 7319.",
+        "The database backup uses a SQLite checkpoint",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::Convention,
+            text,
+        )
+        .unwrap();
+    }
+    let payload = r#"{"session_id":"rendered-discrepancy","prompt":"Orchid gateway port"}"#;
+    let out = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        out.is_empty(),
+        "a full-text match cannot justify unrelated rendered text: {out}"
+    );
+    let (paths, mut config, conn) = brain_project::load_project(&root).unwrap();
+    let injected: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind IN ('context.injected', 'digest_served', 'resume_served')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        injected, 0,
+        "silent abstention must not record delivery credit"
+    );
+    let hits: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind='context.served' AND json_extract(payload_json, '$.skipped')=0",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(hits, 0, "render rejection must be logged as a miss");
+    config.broker.compress_capsules = false;
+    fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+    drop(conn);
+    let out = run_context_hook(&root, &cache_home, &["--warm-on-first-prompt"], payload);
+    assert!(
+        out.contains("7319") && out.contains("## Repo context"),
+        "the next complete rendering must retain warm-start eligibility: {out}"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -1003,13 +1355,18 @@ fn seeded_proactive_project(label: &str) -> (std::path::PathBuf, std::path::Path
     let root = temp_project_dir(label);
     let cache_home = root.join("cache-home");
     fs::create_dir_all(&cache_home).expect("create cache home");
-    brain_project::add_memory(
-        &root,
-        kimetsu_core::memory::MemoryScope::Project,
-        kimetsu_core::memory::MemoryKind::FailurePattern,
+    for text in [
         "cargo test needs --test-threads=1; the brain tests share on-disk state",
-    )
-    .expect("add_memory");
+        "For cargo test error E0433 failed to resolve undeclared crate foo, add the missing crate to Cargo.toml",
+    ] {
+        brain_project::add_memory(
+            &root,
+            kimetsu_core::memory::MemoryScope::Project,
+            kimetsu_core::memory::MemoryKind::FailurePattern,
+            text,
+        )
+        .expect("add_memory");
+    }
     (root, cache_home)
 }
 
@@ -1027,6 +1384,34 @@ fn a_real_failure_surfaces_a_matching_memory() {
     assert!(
         out.contains("additionalContext"),
         "a real failure should surface the lesson; got: {out:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn proactive_recall_abstains_on_a_different_failure_in_the_same_command() {
+    let (root, cache_home) = seeded_proactive_project("unrelated_failure");
+    let out = run_posttool_hook(
+        &root,
+        &cache_home,
+        "mismatch-then-match",
+        "cargo test",
+        "error: kubernetes eviction rollout pod latency",
+    );
+    assert!(
+        out.is_empty(),
+        "the same command is insufficient evidence of the same failure: {out}"
+    );
+    let relevant = run_posttool_hook(
+        &root,
+        &cache_home,
+        "mismatch-then-match",
+        "cargo test",
+        "error[E0433]: failed to resolve: use of undeclared crate `foo`",
+    );
+    assert!(
+        relevant.contains("missing crate"),
+        "a rejected recall must not mark the lesson surfaced or start its refractory timer: {relevant}"
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -1286,7 +1671,7 @@ fn standing_preferences_reach_the_agent_without_being_retrieved() {
         &root,
         &cache_home,
         &["--warm-on-first-prompt"],
-        r#"{"session_id":"prefs-1","prompt":"rename the widget module to gadget"}"#,
+        r#"{"session_id":"prefs-1","prompt":"what is the schema version"}"#,
     );
     let context = serde_json::from_str::<serde_json::Value>(&out)
         .ok()
@@ -1418,12 +1803,12 @@ fn hardening_episode_cli_identity_and_archive_restore() {
     run(&["checkpoint", "unrelated legacy lane"]);
     for (payload, expected, rejected) in [
         (
-            r#"{"prompt":"hi","worktree_id":"alpha"}"#,
+            r#"{"prompt":"continue","worktree_id":"alpha"}"#,
             "lane alpha",
             "lane beta",
         ),
         (
-            r#"{"prompt":"hi","task_id":null,"session_id":null,"worktree_id":"beta"}"#,
+            r#"{"prompt":"continue","task_id":null,"session_id":null,"worktree_id":"beta"}"#,
             "lane beta",
             "lane alpha",
         ),
