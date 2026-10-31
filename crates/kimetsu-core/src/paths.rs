@@ -7,6 +7,52 @@ use crate::KimetsuResult;
 
 static DISCOVER_AT_ROOT_ONLY: OnceLock<bool> = OnceLock::new();
 
+thread_local! {
+    // None inherits process configuration; a scoped None directory isolates the
+    // current request from every user/org brain, including the developer home.
+    static SCOPED_USER_BRAIN: std::cell::RefCell<Option<ScopedUserBrain>> = const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct ScopedUserBrain {
+    directory: Option<PathBuf>,
+    cache_root: Option<PathBuf>,
+}
+
+/// Request-local user/org brain routing for one blocking worker. The guard is
+/// deliberately !Send so it cannot restore another thread's configuration.
+pub struct UserBrainScope {
+    previous: Option<ScopedUserBrain>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl UserBrainScope {
+    pub fn new(directory: Option<PathBuf>) -> Self {
+        Self::enter(directory, None)
+    }
+    pub fn with_cache(directory: Option<PathBuf>, cache_root: PathBuf) -> Self {
+        Self::enter(directory, Some(cache_root))
+    }
+    fn enter(directory: Option<PathBuf>, cache_root: Option<PathBuf>) -> Self {
+        let previous = SCOPED_USER_BRAIN.with(|slot| {
+            slot.replace(Some(ScopedUserBrain {
+                directory,
+                cache_root,
+            }))
+        });
+        Self {
+            previous,
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for UserBrainScope {
+    fn drop(&mut self) {
+        SCOPED_USER_BRAIN.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
 /// Pin discovery to at_root semantics process-wide (remote server calls once
 /// at startup): every [`ProjectPaths::discover`] call thereafter behaves like
 /// [`ProjectPaths::at_root`] — no git subprocess, never climbs to an
@@ -193,6 +239,9 @@ fn git_root(start: &Path) -> Option<PathBuf> {
 /// always have a home dir, so this almost never returns None outside
 /// of stripped CI environments.
 pub fn user_kimetsu_dir() -> Option<PathBuf> {
+    if let Some(scoped) = SCOPED_USER_BRAIN.with(|slot| slot.borrow().clone()) {
+        return scoped.directory;
+    }
     if let Ok(override_dir) = std::env::var("KIMETSU_USER_BRAIN_DIR") {
         let trimmed = override_dir.trim();
         if !trimmed.is_empty() {
@@ -235,6 +284,9 @@ pub fn user_brain_enabled() -> bool {
 /// `config.kimetsu.use_user_brain`; back-compat callers can use
 /// `user_brain_enabled()`.
 pub fn user_brain_enabled_with(config_use_user_brain: bool) -> bool {
+    if let Some(scoped) = SCOPED_USER_BRAIN.with(|slot| slot.borrow().clone()) {
+        return scoped.directory.is_some();
+    }
     // Precedence: env override > config > default.
     match std::env::var("KIMETSU_USER_BRAIN") {
         Ok(value) => {
@@ -288,6 +340,13 @@ fn slug(value: &str) -> String {
 /// alphanumeric + hyphens only, non-empty).
 pub fn user_cache_dir_for(repo_root: &Path) -> PathBuf {
     let hash = default_project_id(repo_root);
+    if let Some(root) = SCOPED_USER_BRAIN.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|scope| scope.cache_root.clone())
+    }) {
+        return root.join(&hash);
+    }
     match user_kimetsu_dir() {
         Some(home) => home.join("cache").join(&hash),
         None => std::env::temp_dir().join("kimetsu-cache").join(&hash),
@@ -319,6 +378,47 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Mutex;
+
+    #[test]
+    fn user_brain_scope_is_thread_local_nested_and_panic_safe() {
+        let _disabled = UserBrainScope::new(None);
+        assert_eq!(user_kimetsu_dir(), None);
+        assert!(!user_brain_enabled_with(true));
+        {
+            let cache = std::env::temp_dir().join("isolated-request-cache");
+            let _cache = UserBrainScope::with_cache(None, cache.clone());
+            assert_eq!(
+                user_cache_dir_for(Path::new("/repo/test")),
+                cache.join("test")
+            );
+            assert!(!user_brain_enabled());
+        }
+        let path = std::env::temp_dir().join("kimetsu-scoped-brain");
+        {
+            let _enabled = UserBrainScope::new(Some(path.clone()));
+            assert_eq!(user_kimetsu_dir(), Some(path.clone()));
+            assert!(user_brain_enabled_with(false));
+            std::thread::scope(|threads| {
+                threads
+                    .spawn(|| {
+                        let other = path.join("other");
+                        let _scope = UserBrainScope::new(Some(other.clone()));
+                        assert_eq!(user_kimetsu_dir(), Some(other));
+                    })
+                    .join()
+                    .unwrap();
+                assert_eq!(user_kimetsu_dir(), Some(path.clone()));
+            });
+            let _ = std::panic::catch_unwind(|| {
+                let _inner = UserBrainScope::new(None);
+                assert!(!user_brain_enabled());
+                panic!("scope restoration");
+            });
+            assert_eq!(user_kimetsu_dir(), Some(path));
+        }
+        assert_eq!(user_kimetsu_dir(), None);
+        assert!(!user_brain_enabled());
+    }
 
     /// Process-wide mutex for env-mutating path tests.  Any test that
     /// temporarily modifies `KIMETSU_USER_BRAIN_DIR`, `HOME`, or

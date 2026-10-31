@@ -335,6 +335,8 @@ pub struct ContextRequest {
     pub include_fact_evidence: bool,
     /// Defer intermediate budgeting to a final evidence-aware renderer; requires a bounded pool.
     pub defer_fact_budget: bool,
+    /// Preserve a bounded diagnostic pool until unsolicited recall admission.
+    pub defer_recall_budget: bool,
     pub stage: String,
     pub query: String,
     pub budget_tokens: u32,
@@ -1065,7 +1067,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             excluded.push(capsule);
             continue;
         }
-        if (request.defer_fact_budget && request.max_capsules > 0)
+        if ((request.defer_fact_budget || request.defer_recall_budget) && request.max_capsules > 0)
             || used_tokens.saturating_add(capsule.token_estimate) <= capsule_budget
         {
             used_tokens = used_tokens.saturating_add(capsule.token_estimate);
@@ -2470,7 +2472,7 @@ const STOPWORDS: &[&str] = &[
 /// split as [`query_tokens`] but with stopwords removed and WITHOUT the
 /// `CLASS_HINTS` tool-name expansions (those are a retrieval *boost*, not
 /// part of the user's topical intent). Used only by the lexical floor.
-fn content_tokens(query: &str) -> Vec<String> {
+pub(crate) fn content_tokens(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     query
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')

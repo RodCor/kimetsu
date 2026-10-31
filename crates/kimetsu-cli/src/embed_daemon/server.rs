@@ -84,7 +84,7 @@ impl DaemonState {
             tags: args.tags,
             ..Default::default()
         };
-        match policy.retrieve(
+        match policy.retrieve_unsolicited(
             &session,
             request,
             self.embedder.as_ref(),

@@ -143,13 +143,31 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Handle>> {
 /// Per-key build lock so builds of the SAME brain serialize without blocking
 /// other repos. The global `registry()` mutex is only held briefly (cache check
 /// / insert) — never across a build.
-fn build_lock_for(key: &Path) -> Arc<Mutex<()>> {
+fn build_locks() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let m = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_lock_for(key: &Path) -> Arc<Mutex<()>> {
+    let mut g = build_locks().lock().unwrap_or_else(|p| p.into_inner());
     g.entry(key.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+/// Release caches owned by a finished disposable projection. Call only after
+/// its requests/builds have completed; live handles held by callers remain valid.
+pub fn forget_projection(conn: &Connection) {
+    if let Some(key) = AnnIndex::sidecar_for(conn) {
+        registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        build_locks()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+    }
 }
 
 /// Persist a built/updated index to its sidecar on a background thread so the
@@ -1347,6 +1365,25 @@ mod tests {
             h2.read().unwrap().len(),
             n + m,
             "cached index reconciled to include bulk-added rows"
+        );
+    }
+
+    #[test]
+    fn disposable_projection_releases_registry_and_build_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("brain.db")).unwrap();
+        crate::schema::initialize(&conn).unwrap();
+        let handle = handle_for_query(&conn, 8, "stub-d8").unwrap();
+        let key = AnnIndex::sidecar_for(&conn).unwrap();
+        assert!(registry().lock().unwrap().contains_key(&key));
+        assert!(build_locks().lock().unwrap().contains_key(&key));
+        forget_projection(&conn);
+        assert!(!registry().lock().unwrap().contains_key(&key));
+        assert!(!build_locks().lock().unwrap().contains_key(&key));
+        assert_eq!(
+            handle.read().unwrap().len(),
+            0,
+            "existing handles remain valid"
         );
     }
 

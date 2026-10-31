@@ -1,0 +1,11 @@
+# This Dockerfile-specific ignore file applies to the root build context.
+**
+!Cargo.toml
+!Cargo.lock
+!README.md
+!crates/
+!crates/**
+**/target
+**/.env
+**/.kimetsu
+**/.fastembed_cache

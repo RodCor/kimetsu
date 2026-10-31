@@ -195,7 +195,8 @@ yourself across machines:
 
 ```bash
 # server
-kimetsu-remote serve --addr 0.0.0.0:8787 --data /srv/kimetsu-brains --token <secret>
+export KIMETSU_MCP_ENABLE_WRITE_TOOLS=1  # opt in to authenticated memory writes
+kimetsu-remote serve --addr 127.0.0.1:8787 --data /srv/kimetsu-brains --token <secret>
 # each client
 kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
 ```
@@ -203,6 +204,15 @@ kimetsu plugin install claude-code --remote https://kimetsu.example.com:8787
 Bearer auth, per-repo brains, an optional shared org-brain, server-side repo
 ingest, TLS, Prometheus metrics, and a server-side reranker. Full setup in
 **[the Kimetsu Remote guide](https://kimetsu.dev/docs/remote)**.
+Write tools are disabled by default; omit the opt-in above for read-only use.
+
+For disposable containers or Lambda, select an external durable checkpoint store
+with `--storage postgres|redis|dynamodb`. Each request rebuilds a private SQLite
+retrieval projection and publishes changes atomically before replying. Instances
+share state and rate limits through the store. `--storage sqlite` also supports
+checkpoints on a persistent filesystem; existing `--data` mode remains available.
+See [storage configuration and limits](docs/remote-storage.md) and
+[HTTP Compose / Lambda SAM examples](deploy/remote-stateless/README.md).
 
 ---
 

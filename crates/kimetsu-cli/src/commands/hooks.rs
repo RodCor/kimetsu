@@ -58,6 +58,14 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         None => String::new(),
     };
 
+    // Social turns carry no task to retrieve for. Gate before preparing the
+    // warm start, whose digest otherwise bypasses retrieval abstention, and
+    // leave the session unwarmed until a substantive request arrives.
+    if is_social_prompt(&prompt) {
+        return Ok(());
+    }
+    let prompt = strip_social_prefix(&prompt).to_string();
+
     // v1.5 (Story 2.3): session-scoped cross-turn state, loaded here rather
     // than just before rendering because the warm-start fallback below has to
     // consult it ahead of every early return.
@@ -72,21 +80,23 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .map(proactive_state::load)
         .unwrap_or_default();
 
-    // v2.6: warm-start fallback for hosts with no session-start event (Codex,
-    // Pi, OpenClaw). Those harnesses only expose a per-turn hook, so the repo
-    // digest and episodic resume ride along with the session's first prompt
-    // instead. Claude Code does not pass `--warm-on-first-prompt`: it already
-    // gets the identical block from `brain session-start-hook`.
-    let warm_start_block = if args.warm_on_first_prompt && state.warm_started_unix == 0 {
-        kimetsu_brain::digest::warm_start_block_scoped(&workspace, episode_identity.unwrap_or(""))
-    } else {
-        None
-    };
-
-    // Too short for retrieval to mean anything — but a first turn still
-    // deserves its warm start, so hand that over before bailing.
-    if prompt.len() < 10 {
-        return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
+    let may_warm_start = args.warm_on_first_prompt && state.warm_started_unix == 0;
+    // A bare continuation has no retrieval intent. Only a real, explicitly
+    // selected resume lane can justify unsolicited context for that turn.
+    if matches!(
+        prompt.trim().to_ascii_lowercase().as_str(),
+        "continue" | "resume"
+    ) {
+        let block = if may_warm_start && episode_identity.is_some() {
+            kimetsu_brain::digest::prepare_warm_start_block_scoped(
+                &workspace,
+                episode_identity.unwrap_or(""),
+            )
+            .filter(|block| block.resume_chars > 0)
+        } else {
+            None
+        };
+        return flush_warm_start(&workspace, block, &mut state, state_path.as_deref());
     }
 
     let explicit_fact_guard = kimetsu_core::paths::ProjectPaths::discover(&workspace)
@@ -96,12 +106,16 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         .unwrap_or(false);
 
     let request = ContextRequest {
+        defer_recall_budget: true,
         include_fact_evidence: explicit_fact_guard,
         stage: "localization".to_string(),
         query: prompt,
         budget_tokens: 2000,
         min_score: args.min_score,
-        max_capsules: args.max_capsules,
+        // Assess uncertainty before the user's output cap can hide ambiguity.
+        max_capsules: args
+            .max_capsules
+            .max(kimetsu_brain::recall_gate::CANDIDATE_POOL),
         ..Default::default()
     };
 
@@ -136,24 +150,6 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             bundle.known_fact_conflicts.sort();
             bundle.known_fact_conflicts.dedup();
         }
-        if retrieval_path == "fts_fallback" && defer_fact_budget {
-            // Observe eligible contradictions first, then restore the hook's
-            // original half-budget and cap before any text is rendered.
-            let capsule_budget = request.budget_tokens / 2;
-            let mut used = 0u32;
-            for capsule in std::mem::take(&mut bundle.capsules) {
-                if (args.max_capsules == 0 || bundle.capsules.len() < args.max_capsules)
-                    && used.saturating_add(capsule.token_estimate) <= capsule_budget
-                {
-                    used += capsule.token_estimate;
-                    bundle.capsules.push(capsule);
-                } else {
-                    bundle.excluded.push(capsule);
-                }
-            }
-        } else if args.max_capsules > 0 {
-            bundle.capsules.truncate(args.max_capsules);
-        }
         bundle.skipped |= bundle.capsules.is_empty();
         bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
         bundle.top_score = bundle
@@ -163,36 +159,25 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             .fold(0.0_f32, f32::max);
     }
 
-    // C7: emit a context.served event BEFORE the early-return so misses are
-    // logged. Best-effort (let _ =) — telemetry must never break the hook.
-    // Gate behind KIMETSU_BRAIN_LOG_RETRIEVAL=0 opt-out (default ON).
-    if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() != Ok("0") {
-        // Change A: load store_queries from project config best-effort.
-        // Telemetry must never break the hook, so any config error just
-        // falls through to the safe default (true = store the query).
-        let store_queries = kimetsu_core::paths::ProjectPaths::discover(&workspace)
-            .ok()
-            .and_then(|paths| project::load_config(&paths).ok())
-            .map(|cfg| cfg.learning.store_queries)
-            .unwrap_or(true);
-
-        let payload = build_served_event_payload(ServedEventArgs {
-            query: &request.query,
-            capsule_count: bundle.capsules.len(),
-            top_score: bundle.top_score,
-            skipped: bundle.skipped,
-            stage: &request.stage,
-            retrieval_path,
-            store_queries,
-            session_id: session_id.as_deref(),
-        });
-        let _ = project::log_telemetry_event(&workspace, "context.served", payload);
+    kimetsu_brain::recall_gate::filter_bundle(&request.query, &mut bundle);
+    // Token trimming follows uncertainty assessment, just like the output cap.
+    bundle.used_tokens = 0;
+    for capsule in std::mem::take(&mut bundle.capsules) {
+        if (args.max_capsules == 0 || bundle.capsules.len() < args.max_capsules)
+            && bundle.used_tokens.saturating_add(capsule.token_estimate)
+                <= request.budget_tokens / 2
+        {
+            bundle.used_tokens += capsule.token_estimate;
+            bundle.capsules.push(capsule);
+        } else {
+            bundle.excluded.push(capsule);
+        }
     }
+    bundle.skipped |= bundle.capsules.is_empty();
 
     // Change C1: capture top-10 dropped MEMORY capsules to the rolling
     // sidecar. Best-effort — telemetry must never break the hook.
-    // We capture AFTER the telemetry event so a slow sidecar write
-    // doesn't block the event. Only capsules whose expansion_handle
+    // Only capsules whose expansion_handle
     // starts with "memory:" are interesting for regret detection.
     {
         use kimetsu_brain::dropped_capsule;
@@ -216,9 +201,16 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     }
 
     if bundle.skipped || bundle.capsules.is_empty() {
-        // Nothing relevant to retrieve — zero output, except that the
-        // warm-start block is not conditional on retrieval finding anything.
-        return flush_warm_start(warm_start_block, &mut state, state_path.as_deref());
+        // An abstention is completely silent, including startup context.
+        log_context_hook_result(
+            &workspace,
+            &request,
+            retrieval_path,
+            session_id.as_deref(),
+            0,
+            bundle.top_score,
+        );
+        return Ok(());
     }
 
     // v1.5 / F3 Pass B: load broker render-flags best-effort.
@@ -305,12 +297,6 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         });
 
     let mut additional_context = String::new();
-    // v2.6: on hosts without a session-start event, the warm-start block leads
-    // — the agent needs to know the repo before it is told what to recall.
-    if let Some(block) = &warm_start_block {
-        additional_context.push_str(block);
-        additional_context.push_str("\n\n");
-    }
     // v2.6: memory arrives looking like ground truth unless the framing says
     // otherwise, and MemSyco-Bench finds that deference is what makes most
     // memory systems score worse than no memory at all. See
@@ -364,11 +350,9 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             additional_context.push_str("Relevant project memory (not independently verified): ");
         }
         additional_context.push_str(&text);
-        if explicit_fact_guard {
-            let mut visible = (**capsule).clone();
-            visible.summary = text;
-            rendered_fact_capsules.push(visible);
-        }
+        let mut visible = (**capsule).clone();
+        visible.summary = text;
+        rendered_fact_capsules.push(visible);
     }
     if explicit_fact_guard {
         if let Some(notice) = kimetsu_brain::fact_query::notice_with_conflicts(
@@ -381,22 +365,49 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         }
     }
 
-    // v2.6: when the bundle collectively covers only part of the question, say
-    // so and name what is missing. Without this a reader handed three capsules
-    // that touch half the query cannot tell that from three that answer it,
-    // and fills the gap by inference — which is what BEAM's abstention track
-    // measures, and where Kimetsu scores worst.
-    if let Some(notice) = kimetsu_brain::context::partial_evidence_notice(&bundle) {
-        additional_context.push('\n');
-        additional_context.push_str(&notice);
+    // Cap, dedupe and compression may remove the text that justified admission.
+    // Recheck exactly what will be delivered; never replace rejection with a
+    // warning about missing evidence or with an unrelated startup digest.
+    let rendered_assessment =
+        kimetsu_brain::recall_gate::assess(&request.query, &rendered_fact_capsules);
+    if !rendered_assessment.allows_injection()
+        || rendered_assessment.eligible.len() != rendered_fact_capsules.len()
+    {
+        log_context_hook_result(
+            &workspace,
+            &request,
+            retrieval_path,
+            session_id.as_deref(),
+            0,
+            bundle.top_score,
+        );
+        return Ok(());
+    }
+    let warm_start_block = if may_warm_start {
+        kimetsu_brain::digest::prepare_warm_start_block_scoped(
+            &workspace,
+            episode_identity.unwrap_or(""),
+        )
+    } else {
+        None
+    };
+    if let Some(block) = &warm_start_block {
+        additional_context = format!("{}\n\n{additional_context}", block.context);
     }
 
     print_user_prompt_submit_context(&additional_context)?;
+    log_context_hook_result(
+        &workspace,
+        &request,
+        retrieval_path,
+        session_id.as_deref(),
+        rendered_fact_capsules.len(),
+        bundle.top_score,
+    );
 
-    let delivered: Vec<_> = capsules_to_render.iter().map(|c| (*c).clone()).collect();
     record_hook_delivery(
         &workspace,
-        &delivered,
+        &rendered_fact_capsules,
         &additional_context,
         session_id.as_deref(),
         "user_prompt",
@@ -412,7 +423,12 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
             }
         }
     }
-    if warm_start_block.is_some() {
+    if let Some(block) = &warm_start_block {
+        kimetsu_brain::digest::record_warmstart_served(
+            &workspace,
+            block.digest_chars,
+            block.resume_chars,
+        );
         state.warm_started_unix = proactive_state::now_unix();
     }
     if session_dedupe || warm_start_block.is_some() {
@@ -424,22 +440,172 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
     Ok(())
 }
 
+fn log_context_hook_result(
+    workspace: &Path,
+    request: &kimetsu_brain::context::ContextRequest,
+    retrieval_path: &str,
+    session_id: Option<&str>,
+    capsule_count: usize,
+    top_score: f32,
+) {
+    if std::env::var("KIMETSU_BRAIN_LOG_RETRIEVAL").as_deref() == Ok("0") {
+        return;
+    }
+    let store_queries = kimetsu_core::paths::ProjectPaths::discover(workspace)
+        .ok()
+        .and_then(|paths| project::load_config(&paths).ok())
+        .map(|cfg| cfg.learning.store_queries)
+        .unwrap_or(true);
+    let payload = build_served_event_payload(ServedEventArgs {
+        query: &request.query,
+        capsule_count,
+        top_score,
+        skipped: capsule_count == 0,
+        stage: &request.stage,
+        retrieval_path,
+        store_queries,
+        session_id,
+    });
+    let _ = project::log_telemetry_event(workspace, "context.served", payload);
+}
+
+/// Reuse social recognition on a bounded prefix while preserving original task
+/// spelling and punctuation. Identifier prefixes such as `hello_world` stay intact.
+fn strip_social_prefix(prompt: &str) -> &str {
+    let separator = |ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '!' | '?');
+    let mut cut = 0;
+    for (idx, ch) in prompt.char_indices().take_while(|(idx, _)| *idx <= 128) {
+        let prefix = &prompt[..idx];
+        let social_punctuation = prefix.chars().all(|c| {
+            c.is_alphabetic()
+                || c.is_whitespace()
+                || matches!(c, ',' | ';' | '!' | '?' | '.' | '\'' | '’')
+        });
+        if ch.is_whitespace() && social_punctuation && is_social_prompt(prefix) {
+            cut = idx;
+        }
+    }
+    if cut == 0 {
+        prompt
+    } else {
+        prompt[cut..].trim_start_matches(separator)
+    }
+}
+
+#[cfg(test)]
+mod social_prefix_tests {
+    #[test]
+    fn social_prefix_preserves_qualified_identifiers() {
+        for prompt in [
+            "hello::world",
+            "hello:: world",
+            "hello_world",
+            "hi.rs",
+            "hi/path",
+            "hi/ path",
+        ] {
+            assert_eq!(super::strip_social_prefix(prompt), prompt);
+        }
+    }
+}
+
+/// Recognize whole social utterances, never greetings embedded in a request.
+/// Unknown words keep the ordinary retrieval path, including brief task cues
+/// such as "continue" and technical identifiers that happen to start with "hi".
+fn is_social_prompt(prompt: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "hi",
+        "hi there",
+        "hello",
+        "hello there",
+        "hey",
+        "hey there",
+        "hey everyone",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good night",
+        "how are you",
+        "how are you doing",
+        "how s it going",
+        "what s up",
+        "thanks",
+        "thanks a lot",
+        "thank you",
+        "thank you very much",
+        "that s all",
+        "ok",
+        "okay",
+        "yes",
+        "yep",
+        "yeah",
+        "no",
+        "nope",
+        "sure",
+        "great",
+        "awesome",
+        "cool",
+        "sounds good",
+        "got it",
+        "understood",
+        "all right",
+        "please",
+        "bye",
+        "goodbye",
+        "see you",
+        "see you later",
+        "hola",
+        "buenas",
+        "buenos dias",
+        "buenos días",
+        "buenas tardes",
+        "buenas noches",
+        "gracias",
+        "muchas gracias",
+        "de nada",
+    ];
+    let normalized = prompt
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut rest = normalized.as_str();
+    while !rest.is_empty() {
+        // Prefer the longest complete phrase, so "hi there" does not leave
+        // "there" behind. Requiring a boundary preserves "high DPI", etc.
+        let Some(tail) = PHRASES
+            .iter()
+            .filter_map(|phrase| rest.strip_prefix(phrase))
+            .filter(|tail| tail.is_empty() || tail.starts_with(' '))
+            .min_by_key(|tail| tail.len())
+        else {
+            return false;
+        };
+        rest = tail.trim_start();
+    }
+    true
+}
+
 /// Emit a warm-start-only injection and mark the session warmed.
 ///
-/// Used by [`brain_context_hook`]'s early returns: a short prompt, or a
-/// retrieval that found nothing, must not swallow the first-turn warm start on
-/// hosts that have no session-start event. A `None` block (not a first turn, or
-/// the host has its own session-start hook) makes this a silent no-op, which is
-/// the pre-v2.6 behaviour.
+/// Used for explicit continuation turns with a live scoped episode. Other
+/// turns must pass evidence admission before any startup text is prepared.
 fn flush_warm_start(
-    block: Option<String>,
+    workspace: &Path,
+    block: Option<kimetsu_brain::digest::PreparedWarmStart>,
     state: &mut proactive_state::SessionState,
     state_path: Option<&Path>,
 ) -> KimetsuResult<()> {
     let Some(block) = block else {
         return Ok(());
     };
-    print_user_prompt_submit_context(&block)?;
+    print_user_prompt_submit_context(&block.context)?;
+    kimetsu_brain::digest::record_warmstart_served(
+        workspace,
+        block.digest_chars,
+        block.resume_chars,
+    );
     state.warm_started_unix = proactive_state::now_unix();
     if let Some(path) = state_path {
         proactive_state::save(path, state);
@@ -1164,16 +1330,20 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         .min(inject_policy::POLICY_RECALL_FLOOR);
 
     let request = ContextRequest {
+        defer_recall_budget: true,
         stage: "localization".to_string(),
-        query,
+        query: query.clone(),
         budget_tokens: 600,
         min_score: recall_floor,
-        max_capsules: args.max_capsules.max(1),
+        max_capsules: args
+            .max_capsules
+            .max(kimetsu_brain::recall_gate::CANDIDATE_POOL),
         kinds: kinds.iter().map(|k| k.to_string()).collect(),
         ..Default::default()
     };
 
-    let bundle = match project::retrieve_proactive_readonly(&workspace, request) {
+    let capsule_budget = request.budget_tokens / 2;
+    let mut bundle = match project::retrieve_proactive_readonly(&workspace, request) {
         Ok(b) => b,
         Err(_) => {
             proactive_state::save(&state_path, &state);
@@ -1181,10 +1351,12 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         }
     };
 
+    kimetsu_brain::recall_gate::filter_bundle(&query, &mut bundle);
+
     let Some(capsule) = bundle
         .capsules
         .iter()
-        .find(|c| !state.is_surfaced(&c.expansion_handle))
+        .find(|c| c.token_estimate <= capsule_budget && !state.is_surfaced(&c.expansion_handle))
     else {
         // Nothing relevant, or the only match already surfaced this
         // session (it's already in working memory).
@@ -1213,7 +1385,22 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         evidence,
     };
     let policy = inject_policy::load(&paths.kimetsu_dir);
-    let should_inject = policy.should_inject(&features);
+
+    let rendered = if compress_capsules {
+        kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
+    } else {
+        capsule.summary.clone()
+    };
+    let body = rendered
+        .split_once(" - ")
+        .filter(|(prefix, _)| prefix.contains(':') && !prefix.contains(' '))
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(rendered);
+    let mut visible = capsule.clone();
+    visible.summary = body.clone();
+    let should_inject = policy.should_inject(&features)
+        && kimetsu_brain::recall_gate::assess(&query, std::slice::from_ref(&visible))
+            .allows_injection();
 
     // Record the decision either way: a suppressed injection is as much a
     // training sample as one that fired, provided it is labelled as such.
@@ -1233,18 +1420,6 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
         return Ok(());
     }
 
-    // v1.5 (Story 2.1): render-time compression for the proactive hook.
-    // Runs AFTER retrieval — ranking and stored text are unaffected.
-    let rendered: String = if compress_capsules {
-        kimetsu_brain::context::compress_for_render(&capsule.summary, 3)
-    } else {
-        capsule.summary.clone()
-    };
-    let body = rendered
-        .split(" - ")
-        .nth(1)
-        .map(str::to_string)
-        .unwrap_or(rendered);
     let header = proactive_header(event, loop_mode);
     // The suffix rather than a second line: this hook interrupts work already
     // underway on a one-capsule budget, and a preamble longer than the memory
@@ -1258,7 +1433,7 @@ pub(crate) fn proactive_hook(event: ProactiveEvent, args: ProactiveHookArgs) -> 
 
     record_hook_delivery(
         &workspace,
-        std::slice::from_ref(capsule),
+        std::slice::from_ref(&visible),
         &additional_context,
         hook.session_id.as_deref(),
         "proactive",

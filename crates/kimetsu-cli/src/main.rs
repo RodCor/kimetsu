@@ -1209,9 +1209,10 @@ struct ContextHookArgs {
     #[arg(long, default_value_t = 2usize)]
     max_capsules: usize,
     /// For hosts with no session-start event (Codex, Pi, OpenClaw): prepend the
-    /// warm-start block (repo digest + episodic resume) to the FIRST prompt of
-    /// each session. Claude Code leaves this off — it gets the same block from
-    /// `brain session-start-hook` and would otherwise receive it twice.
+    /// warm-start block (repo digest + episodic resume) to the first admitted task prompt
+    /// of each session; greetings and acknowledgments stay silent. Claude Code
+    /// leaves this off — it gets the same block from `brain session-start-hook`
+    /// and would otherwise receive it twice.
     #[arg(long)]
     warm_on_first_prompt: bool,
     /// Override the brain workspace path (defaults to current directory).
@@ -4196,6 +4197,11 @@ scope = 0.1
         assert_eq!(bundle.capsules[0].expansion_handle, "memory:m1");
         assert_eq!(bundle.capsules[0].claim_revision.as_deref(), Some("rev1"));
         assert_eq!(bundle.capsules[0].kind, "memory");
+        assert_eq!(
+            bundle.capsules[0].token_estimate,
+            kimetsu_brain::context::estimate_tokens("repo:fact - x") + 8,
+            "wire capsules need real estimates for the hook's delivery budget"
+        );
         assert!(!bundle.skipped);
         assert!((bundle.top_score - 0.9).abs() < 1e-6);
         assert!(

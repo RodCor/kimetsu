@@ -142,17 +142,49 @@ async fn dispatch_request(
     }
 
     // 2. Per-token rate limit.
-    if let Some(tok) = bearer
-        && !state.limiter.allow(tok)
-    {
-        return (
-            Outcome::RateLimited,
-            http_error(StatusCode::TOO_MANY_REQUESTS, "rate limited", session),
-        );
+    if let Some(token) = bearer {
+        let allowed = if let Some(durable) = &state.durable {
+            use sha2::{Digest, Sha256};
+            let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+            let window = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                / 60;
+            match durable
+                .store
+                .allow_rate(&key, window, state.rate_limit)
+                .await
+            {
+                Ok(allowed) => allowed,
+                Err(_) => {
+                    return (
+                        Outcome::Error,
+                        http_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "durable rate limiter unavailable",
+                            session,
+                        ),
+                    );
+                }
+            }
+        } else {
+            state.limiter.allow(token)
+        };
+        if !allowed {
+            return (
+                Outcome::RateLimited,
+                http_error(StatusCode::TOO_MANY_REQUESTS, "rate limited", session),
+            );
+        }
     }
 
     // 3. Resolve the brain root (path-traversal safe).
-    let root = match repo::resolve_brain_root(&state.data_dir, &repo) {
+    let root = match if state.durable.is_some() {
+        Ok(std::path::PathBuf::new())
+    } else {
+        repo::resolve_brain_root(&state.data_dir, &repo)
+    } {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -200,6 +232,10 @@ async fn dispatch_request(
                 session,
             ),
         );
+    }
+
+    if let Some(durable) = &state.durable {
+        return dispatch_durable(state, durable, &repo, bearer, req, id, session).await;
     }
 
     // 6. Ensure the brain exists (first-use init).
@@ -322,6 +358,81 @@ async fn dispatch_request(
     }
 }
 
+async fn dispatch_durable(
+    state: &AppState,
+    durable: &crate::durable::DurableState,
+    repo_id: &str,
+    bearer: Option<&str>,
+    request: JsonRpcRequest,
+    id: Value,
+    session: Option<HeaderValue>,
+) -> (Outcome, Response) {
+    let origin = format!(
+        "{}/user:{}",
+        state.server_node,
+        auth::user_for_token(&state.auth, bearer)
+    );
+    let tool = tool_name_of(&request.method, &request.params);
+    let allow = crate::catalog::allowlist(state.ingest.is_some());
+    let skills = state.skills.clone();
+    let reranker = state.reranker.clone();
+    let ingest = state.ingest.clone();
+    let repo_name = repo_id.to_string();
+    let result = durable.execute(repo_id, origin, move |root| {
+        if request.method == "tools/call" {
+            match request.params.get("name").and_then(Value::as_str) {
+                Some("kimetsu_brain_context") => {
+                    let arguments = request.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    let value = kimetsu_chat::brain_context_tool(root, &arguments, reranker.as_deref())?;
+                    return Ok(json!({"content":[{"type":"text","text":value.to_string()}]}));
+                }
+                Some("kimetsu_brain_ingest_repo") if ingest.is_some() => {
+                    let ingest = ingest.as_ref().unwrap();
+                    let spec = ingest.repos.get(&repo_name).ok_or_else(|| "repo is not registered for server-side ingest".to_string())?;
+                    let _checkout = ingest.lock.blocking_lock();
+                    let files = crate::git::ensure_checkout(&ingest.checkout_dir, &repo_name, &spec.url, spec.branch.as_deref())?;
+                    let summary = kimetsu_brain::project::ingest_repo_at_root(root, &files).map_err(|e| e.to_string())?;
+                    return Ok(json!({"content":[{"type":"text","text":json!({"ingested":true,"indexed_files":summary.indexed_files,"skipped_files":summary.skipped_files,"manifests":summary.manifests}).to_string()}]}));
+                }
+                _ => {},
+            }
+        }
+        kimetsu_chat::dispatch(&request.method, request.params.clone(), root, skills.as_ref(), Some(allow))
+    }).await;
+    match result {
+        Ok(value) => {
+            if tool.as_deref().is_some_and(crate::metrics::is_write_tool) {
+                state.metrics.record_write();
+            }
+            (Outcome::Ok, jsonrpc_ok(id, value, session))
+        }
+        Err(crate::durable::DurableError::Operation(message)) => (
+            Outcome::Ok,
+            jsonrpc_err(StatusCode::OK, id, -32000, &message, session),
+        ),
+        Err(crate::durable::DurableError::Conflict) => (
+            Outcome::Error,
+            jsonrpc_err(
+                StatusCode::CONFLICT,
+                id,
+                -32009,
+                "concurrent update; retry request",
+                session,
+            ),
+        ),
+        Err(error) => (
+            Outcome::Error,
+            jsonrpc_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                id,
+                -32603,
+                &error.to_string(),
+                session,
+            ),
+        ),
+    }
+}
+
 /// The tool name of a `tools/call` request, if any (Slice C: used to count
 /// successful writes).
 fn tool_name_of(method: &str, params: &Value) -> Option<String> {
@@ -343,7 +454,9 @@ fn requires_global_memory_grant(method: &str, params: &Value) -> bool {
     };
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
     match name {
-        "kimetsu_benchmark_record_outcome" => true,
+        // Conflict resolution can fall through to the shared org brain; require
+        // an administrative grant until the tool has a project-only variant.
+        "kimetsu_benchmark_record_outcome" | "kimetsu_brain_conflict_resolve" => true,
         "kimetsu_brain_memory_add" => argument_scope_is_global_user(arguments),
         "kimetsu_brain_memory_accept" => argument_scope_is_global_user(arguments),
         _ => false,
