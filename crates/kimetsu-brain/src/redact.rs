@@ -18,10 +18,15 @@
 //!   1. Exact-prefix patterns: `sk-ant-`, `sk-`, `ghp_`, `gho_`,
 //!      `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `xox[bopasr]-`,
 //!      `AKIA`/`ASIA` (AWS access key IDs), `eyJ` (JWT header).
-//!   2. Generic key/token assignments: `api[_-]?key\s*=\s*<value>`,
-//!      `token\s*[:=]\s*<value>`, `password\s*[:=]\s*<value>`,
-//!      `bearer\s+<value>` (the value must look secret — high
-//!      entropy, no spaces, length ≥ 12).
+//!   2. Generic key assignments: a key whose name contains a secret
+//!      word (`token`, `password`/`passwd`, `api_key`/`apikey`,
+//!      `private_key`, `secret`, `credential`, `auth`) in env form
+//!      (`export KEY=value`, quoted or not) or JSON/YAML form
+//!      (`"key": "value"`). The value must still look secret (long
+//!      enough, no bare spaces). `token` and `auth` only count as
+//!      the last segment of the key, so `token_count` / `max_tokens`
+//!      / `auth_type` are left alone. `bearer <value>` is the same
+//!      idea for HTTP logs.
 //!   3. High-entropy fallback (off by default): would catch random
 //!      base64 strings of length ≥ 40 with entropy > 4.5 bits/char.
 //!      Deferred to v0.4.5.1 so we don't false-positive on hashes,
@@ -104,8 +109,25 @@ pub fn scrub_for_export(text: &str) -> RedactionResult {
 fn collect_spans(text: &str, patterns: &[SecretPattern]) -> Vec<(usize, usize, &'static str)> {
     let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
     for pat in patterns {
-        for m in pat.regex.find_iter(text) {
-            spans.push((m.start(), m.end(), pat.kind));
+        // Assignment patterns capture the secret value in a group so the
+        // key stays visible. Every other pattern has no groups and the
+        // whole match is the secret.
+        if pat.regex.captures_len() > 1 {
+            for caps in pat.regex.captures_iter(text) {
+                if let Some(value) = (1..caps.len()).find_map(|i| caps.get(i)) {
+                    // Ingest redacts, then the projector redacts the stored
+                    // string again. A placeholder must not be treated as a
+                    // fresh secret on that second pass.
+                    if is_redaction_placeholder(value.as_str()) {
+                        continue;
+                    }
+                    spans.push((value.start(), value.end(), pat.kind));
+                }
+            }
+        } else {
+            for m in pat.regex.find_iter(text) {
+                spans.push((m.start(), m.end(), pat.kind));
+            }
         }
     }
     spans
@@ -308,32 +330,67 @@ fn patterns() -> &'static [SecretPattern] {
                 // the host stays readable.
                 regex: Regex::new(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s:/@]{4,}@").unwrap(),
             },
-            // Generic-assignment patterns. Lower-priority than the
-            // shape-specific ones above; ordered after them so e.g.
-            // `api_key=sk-...` claims the openai_api_key kind, not the
-            // generic_api_key kind.
+            // Generic-assignment patterns. The value is a capture group
+            // (see `collect_spans`) so a shape-specific pattern that
+            // matches the same bytes — `api_key=sk-...` — keeps its
+            // own kind. Key match: the keyword is a `_`/`-` segment,
+            // not a prefix of a longer word (`author` ≠ `auth`).
             SecretPattern {
                 kind: "generic_bearer",
                 // `Bearer <token>` in HTTP-style logs.
                 regex: Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]{12,}").unwrap(),
             },
-            SecretPattern {
-                kind: "generic_api_key",
-                // `api_key = "..."` / `api-key:"..."` / `api_key=...`.
-                // Captures both quoted and bare values; value must be
-                // ≥12 chars of secret-looking content.
-                regex: Regex::new(r#"(?i)api[_\-]?key\s*[:=]\s*"?[A-Za-z0-9_\-]{12,}"?"#).unwrap(),
-            },
-            SecretPattern {
-                kind: "generic_token",
-                regex: Regex::new(r#"(?i)\btoken\s*[:=]\s*"?[A-Za-z0-9_\-\.]{20,}"?"#).unwrap(),
-            },
-            SecretPattern {
-                kind: "generic_password",
-                regex: Regex::new(r#"(?i)\bpassword\s*[:=]\s*"?[^\s"]{8,}"?"#).unwrap(),
-            },
+            // `token` and `auth` must be the last segment. That keeps
+            // `token_count`, `max_tokens`, and `auth_type` visible.
+            generic_assignment("generic_token", "token", 20, false),
+            generic_assignment("generic_auth", "auth", 20, false),
+            // High-signal words match in any segment, so
+            // `AWS_SECRET_ACCESS_KEY` and `DB_PASSWORD` are covered.
+            generic_assignment("generic_password", "password|passwd", 8, true),
+            generic_assignment("generic_api_key", r"api[_\-]?key", 12, true),
+            generic_assignment("generic_private_key", r"private[_\-]?key", 12, true),
+            generic_assignment("generic_secret", "secret|credential", 8, true),
         ]
     })
+}
+
+/// True when `value` is one of this module's `[REDACTED:<kind>]` placeholders.
+fn is_redaction_placeholder(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix("[REDACTED:")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+}
+
+/// Env (`export KEY=value`, quoted or not) and JSON/YAML (`"key": "value"`)
+/// assignment. `keyword` is a regex alternation of secret words. When
+/// `allow_trailing` is set, the word may sit in the middle of the key
+/// (`AWS_SECRET_ACCESS_KEY`); otherwise it must be the final segment.
+fn generic_assignment(
+    kind: &'static str,
+    keyword: &str,
+    min_len: usize,
+    allow_trailing: bool,
+) -> SecretPattern {
+    let trailing = if allow_trailing {
+        r"(?:[_\-][A-Za-z0-9]+)*"
+    } else {
+        ""
+    };
+    // `{min}` is formatted into the quantifier `{N,}`. Quoted values may
+    // contain spaces; bare values may not, so prose doesn't get swallowed.
+    let pattern = format!(
+        r#"(?i)(?:^|[^A-Za-z0-9])(?:export\s+)?["']?(?:[A-Za-z0-9]+[_\-])*(?:{keyword}){trailing}["']?\s*[:=]\s*(?:"([^"\n]{{{min_len},}})"|'([^'\n]{{{min_len},}})'|([^\s"']{{{min_len},}}))"#
+    );
+    SecretPattern {
+        kind,
+        regex: Regex::new(&pattern).unwrap_or_else(|err| {
+            panic!("generic assignment regex for {kind} failed: {err}; pattern: {pattern}")
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -572,5 +629,115 @@ mod tests {
             r.text
                 .contains("CLAUDE_CODE_OAUTH_TOKEN=[REDACTED:anthropic_oauth]")
         );
+    }
+
+    fn assert_value_redacted(raw: &str, secret: &str) {
+        let r = redact_secrets(raw);
+        assert!(
+            r.was_redacted(),
+            "expected redaction of {secret:?} in {raw:?} -> {r:?}"
+        );
+        assert!(
+            !r.text.contains(secret),
+            "secret leaked in {raw:?} -> {}",
+            r.text
+        );
+    }
+
+    fn assert_unchanged(raw: &str) {
+        let r = redact_secrets(raw);
+        assert!(!r.was_redacted(), "false positive: {raw:?} -> {}", r.text);
+        assert_eq!(r.text, raw);
+    }
+
+    #[test]
+    fn embedded_env_secret_names_are_redacted() {
+        // Underscore is a word character, so a `\btoken` / `\bpassword`
+        // rule misses these. The value must go; the key stays.
+        let token = "GITHUB_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789";
+        assert_value_redacted(token, "abcdefghijklmnopqrstuvwxyz0123456789");
+        assert!(redact_secrets(token).text.contains("GITHUB_TOKEN="));
+
+        let exported = "export DB_PASSWORD=\"hunter2hunter2\"";
+        assert_value_redacted(exported, "hunter2hunter2");
+        assert!(redact_secrets(exported).text.contains("DB_PASSWORD="));
+
+        let spaced = "export GITHUB_TOKEN = 'abcdefghijklmnopqrstuvwxyz012345'";
+        assert_value_redacted(spaced, "abcdefghijklmnopqrstuvwxyz012345");
+
+        let passwd = "DB_PASSWD=hunter2hunter2";
+        assert_value_redacted(passwd, "hunter2hunter2");
+
+        let secret = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        assert_value_redacted(secret, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert!(
+            redact_secrets(secret)
+                .text
+                .contains("AWS_SECRET_ACCESS_KEY=")
+        );
+
+        assert_value_redacted("APIKEY=abcdef1234567890", "abcdef1234567890");
+        assert_value_redacted("private_key=abcdef1234567890", "abcdef1234567890");
+        assert_value_redacted("user_credential=hunter2hunter2", "hunter2hunter2");
+        assert_value_redacted("proxy_auth=abcdefghijklmnopqrst", "abcdefghijklmnopqrst");
+    }
+
+    #[test]
+    fn json_and_yaml_secret_keys_are_redacted() {
+        let json = r#"{"github_token": "abcdefghijklmnopqrstuvwxyz0123456789", "db_password": "hunter2hunter2", "api_key": "abcdef1234567890"}"#;
+        assert_value_redacted(json, "abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_value_redacted(json, "hunter2hunter2");
+        assert_value_redacted(json, "abcdef1234567890");
+        let redacted = redact_secrets(json);
+        assert!(redacted.text.contains("\"github_token\""));
+        assert!(redacted.text.contains("\"db_password\""));
+
+        let compact = r#"{"github_token":"abcdefghijklmnopqrstuvwxyz0123456789"}"#;
+        assert_value_redacted(compact, "abcdefghijklmnopqrstuvwxyz0123456789");
+
+        let yaml = "db_password: hunter2hunter2\napi-key: \"abcdef1234567890\"\nprivate_key: 'abcdef1234567890'\n";
+        assert_value_redacted(yaml, "hunter2hunter2");
+        assert_value_redacted(yaml, "abcdef1234567890");
+    }
+
+    #[test]
+    fn second_pass_does_not_rewrite_placeholders() {
+        // add_memory redacts, then the projector redacts the stored text again.
+        let raw = "Add CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf to .env";
+        let once = redact_secrets(raw);
+        assert!(
+            once.text.contains("[REDACTED:anthropic_oauth]"),
+            "{}",
+            once.text
+        );
+        let twice = redact_secrets(&once.text);
+        assert_eq!(twice.text, once.text);
+        assert!(!twice.was_redacted(), "{twice:?}");
+
+        let json = r#"{"github_token":"abcdefghijklmnopqrstuvwxyz0123456789"}"#;
+        let once = redact_secrets(json);
+        assert_eq!(redact_secrets(&once.text).text, once.text);
+    }
+
+    #[test]
+    fn shaped_secret_assigned_to_generic_key_keeps_specific_kind() {
+        let raw = "api_key=sk-1234567890abcdef1234567890abcdef1234";
+        let r = redact_secrets(raw);
+        assert_eq!(r.matches.len(), 1, "{r:?}");
+        assert_eq!(r.matches[0].kind, "openai_api_key", "{r:?}");
+        assert!(r.text.starts_with("api_key="), "{}", r.text);
+        assert!(!r.text.contains("sk-1234"), "{}", r.text);
+    }
+
+    #[test]
+    fn non_secret_token_and_auth_names_stay_visible() {
+        // Values are long enough that a key-name miss is the only thing
+        // that can keep these from being redacted.
+        assert_unchanged("token_count=12345678901234567890");
+        assert_unchanged("max_tokens: 12345678901234567890");
+        assert_unchanged("max_tokens=12345678901234567890");
+        assert_unchanged("tokens=12345678901234567890");
+        assert_unchanged("author=JaneDoeTheWriterPersonExtra");
+        assert_unchanged("auth_type=application-default-login");
     }
 }
