@@ -70,6 +70,22 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Compare a dotenv lookup without putting either value in the failure text.
+    fn assert_dotenv(dir: &std::path::Path, name: &str, expected: Option<&str>) {
+        let got = read_dotenv(dir, name);
+        let matched = match (&got, expected) {
+            (Some(value), Some(expected)) => value == expected,
+            (None, None) => true,
+            _ => false,
+        };
+        assert!(
+            matched,
+            "dotenv mismatch for {name} (got len {:?}, expected len {:?})",
+            got.as_ref().map(String::len),
+            expected.map(str::len)
+        );
+    }
+
     fn write_env(body: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -93,12 +109,12 @@ SINGLE='single-value'
 EMPTY=
 ",
         );
-        assert_eq!(read_dotenv(&dir, "PLAIN").as_deref(), Some("plain-value"));
-        assert_eq!(read_dotenv(&dir, "QUOTED").as_deref(), Some("quoted value"));
-        assert_eq!(read_dotenv(&dir, "SPACED").as_deref(), Some("spaced-value"));
-        assert_eq!(read_dotenv(&dir, "SINGLE").as_deref(), Some("single-value"));
-        assert_eq!(read_dotenv(&dir, "EMPTY"), None);
-        assert_eq!(read_dotenv(&dir, "MISSING"), None);
+        assert_dotenv(&dir, "PLAIN", Some("plain-value"));
+        assert_dotenv(&dir, "QUOTED", Some("quoted value"));
+        assert_dotenv(&dir, "SPACED", Some("spaced-value"));
+        assert_dotenv(&dir, "SINGLE", Some("single-value"));
+        assert_dotenv(&dir, "EMPTY", None);
+        assert_dotenv(&dir, "MISSING", None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -114,29 +130,13 @@ export KIMETSU_DOTENV_EXPORT_SINGLE='single-value'
 export_region=not-the-keyword
 ",
         );
-        assert_eq!(
-            read_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_PROBE").as_deref(),
-            Some("quoted-value"),
-            "export KEY=\"value\" must not be read as unset"
-        );
-        assert_eq!(
-            read_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_BARE").as_deref(),
-            Some("bare-value")
-        );
-        assert_eq!(
-            read_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_SPACED").as_deref(),
-            Some("spaced-value")
-        );
-        assert_eq!(
-            read_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_SINGLE").as_deref(),
-            Some("single-value")
-        );
+        assert_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_PROBE", Some("quoted-value"));
+        assert_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_BARE", Some("bare-value"));
+        assert_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_SPACED", Some("spaced-value"));
+        assert_dotenv(&dir, "KIMETSU_DOTENV_EXPORT_SINGLE", Some("single-value"));
         // `export` is only a keyword when whitespace follows it.
-        assert_eq!(
-            read_dotenv(&dir, "export_region").as_deref(),
-            Some("not-the-keyword")
-        );
-        assert_eq!(read_dotenv(&dir, "region"), None);
+        assert_dotenv(&dir, "export_region", Some("not-the-keyword"));
+        assert_dotenv(&dir, "region", None);
         let _ = fs::remove_dir_all(&dir);
     }
 }

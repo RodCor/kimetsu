@@ -631,23 +631,42 @@ mod tests {
         );
     }
 
-    fn assert_value_redacted(raw: &str, secret: &str) {
+    fn redaction_kinds(result: &RedactionResult) -> Vec<&'static str> {
+        result.matches.iter().map(|m| m.kind).collect()
+    }
+
+    /// Failure text stays free of the input and the value. Callers pass a
+    /// short `label` so a miss is identifiable without printing either.
+    fn assert_value_redacted(label: &str, raw: &str, secret: &str) {
         let r = redact_secrets(raw);
+        let kinds = redaction_kinds(&r);
         assert!(
             r.was_redacted(),
-            "expected redaction of {secret:?} in {raw:?} -> {r:?}"
+            "expected redaction for {label} (input len {}, kinds {kinds:?})",
+            raw.len()
         );
         assert!(
             !r.text.contains(secret),
-            "secret leaked in {raw:?} -> {}",
-            r.text
+            "value still present for {label} (input len {}, value len {}, kinds {kinds:?})",
+            raw.len(),
+            secret.len()
         );
     }
 
-    fn assert_unchanged(raw: &str) {
+    fn assert_unchanged(label: &str, raw: &str) {
         let r = redact_secrets(raw);
-        assert!(!r.was_redacted(), "false positive: {raw:?} -> {}", r.text);
-        assert_eq!(r.text, raw);
+        let kinds = redaction_kinds(&r);
+        assert!(
+            !r.was_redacted(),
+            "unexpected redaction for {label} (input len {}, kinds {kinds:?})",
+            raw.len()
+        );
+        assert!(
+            r.text == raw,
+            "text changed for {label} (input len {}, output len {})",
+            raw.len(),
+            r.text.len()
+        );
     }
 
     #[test]
@@ -655,49 +674,81 @@ mod tests {
         // Underscore is a word character, so a `\btoken` / `\bpassword`
         // rule misses these. The value must go; the key stays.
         let token = "GITHUB_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789";
-        assert_value_redacted(token, "abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_value_redacted(
+            "github_token",
+            token,
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+        );
         assert!(redact_secrets(token).text.contains("GITHUB_TOKEN="));
 
         let exported = "export DB_PASSWORD=\"hunter2hunter2\"";
-        assert_value_redacted(exported, "hunter2hunter2");
+        assert_value_redacted("export_db_password", exported, "hunter2hunter2");
         assert!(redact_secrets(exported).text.contains("DB_PASSWORD="));
 
         let spaced = "export GITHUB_TOKEN = 'abcdefghijklmnopqrstuvwxyz012345'";
-        assert_value_redacted(spaced, "abcdefghijklmnopqrstuvwxyz012345");
+        assert_value_redacted(
+            "export_github_token_quoted",
+            spaced,
+            "abcdefghijklmnopqrstuvwxyz012345",
+        );
 
         let passwd = "DB_PASSWD=hunter2hunter2";
-        assert_value_redacted(passwd, "hunter2hunter2");
+        assert_value_redacted("db_passwd", passwd, "hunter2hunter2");
 
         let secret = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-        assert_value_redacted(secret, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_value_redacted(
+            "aws_secret_access_key",
+            secret,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
         assert!(
             redact_secrets(secret)
                 .text
                 .contains("AWS_SECRET_ACCESS_KEY=")
         );
 
-        assert_value_redacted("APIKEY=abcdef1234567890", "abcdef1234567890");
-        assert_value_redacted("private_key=abcdef1234567890", "abcdef1234567890");
-        assert_value_redacted("user_credential=hunter2hunter2", "hunter2hunter2");
-        assert_value_redacted("proxy_auth=abcdefghijklmnopqrst", "abcdefghijklmnopqrst");
+        assert_value_redacted("apikey", "APIKEY=abcdef1234567890", "abcdef1234567890");
+        assert_value_redacted(
+            "private_key",
+            "private_key=abcdef1234567890",
+            "abcdef1234567890",
+        );
+        assert_value_redacted(
+            "user_credential",
+            "user_credential=hunter2hunter2",
+            "hunter2hunter2",
+        );
+        assert_value_redacted(
+            "proxy_auth",
+            "proxy_auth=abcdefghijklmnopqrst",
+            "abcdefghijklmnopqrst",
+        );
     }
 
     #[test]
     fn json_and_yaml_secret_keys_are_redacted() {
         let json = r#"{"github_token": "abcdefghijklmnopqrstuvwxyz0123456789", "db_password": "hunter2hunter2", "api_key": "abcdef1234567890"}"#;
-        assert_value_redacted(json, "abcdefghijklmnopqrstuvwxyz0123456789");
-        assert_value_redacted(json, "hunter2hunter2");
-        assert_value_redacted(json, "abcdef1234567890");
+        assert_value_redacted(
+            "json_github_token",
+            json,
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+        );
+        assert_value_redacted("json_db_password", json, "hunter2hunter2");
+        assert_value_redacted("json_api_key", json, "abcdef1234567890");
         let redacted = redact_secrets(json);
         assert!(redacted.text.contains("\"github_token\""));
         assert!(redacted.text.contains("\"db_password\""));
 
         let compact = r#"{"github_token":"abcdefghijklmnopqrstuvwxyz0123456789"}"#;
-        assert_value_redacted(compact, "abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_value_redacted(
+            "json_github_token_compact",
+            compact,
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+        );
 
         let yaml = "db_password: hunter2hunter2\napi-key: \"abcdef1234567890\"\nprivate_key: 'abcdef1234567890'\n";
-        assert_value_redacted(yaml, "hunter2hunter2");
-        assert_value_redacted(yaml, "abcdef1234567890");
+        assert_value_redacted("yaml_db_password", yaml, "hunter2hunter2");
+        assert_value_redacted("yaml_api_key", yaml, "abcdef1234567890");
     }
 
     #[test]
@@ -705,39 +756,68 @@ mod tests {
         // add_memory redacts, then the projector redacts the stored text again.
         let raw = "Add CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789AbCdEf to .env";
         let once = redact_secrets(raw);
+        let once_kinds = redaction_kinds(&once);
         assert!(
             once.text.contains("[REDACTED:anthropic_oauth]"),
-            "{}",
-            once.text
+            "missing anthropic_oauth placeholder (len {}, kinds {once_kinds:?})",
+            once.text.len()
         );
         let twice = redact_secrets(&once.text);
-        assert_eq!(twice.text, once.text);
-        assert!(!twice.was_redacted(), "{twice:?}");
+        let twice_kinds = redaction_kinds(&twice);
+        assert!(
+            twice.text == once.text,
+            "second pass changed text (first len {}, second len {})",
+            once.text.len(),
+            twice.text.len()
+        );
+        assert!(
+            !twice.was_redacted(),
+            "second pass redacted again (kinds {twice_kinds:?})"
+        );
 
         let json = r#"{"github_token":"abcdefghijklmnopqrstuvwxyz0123456789"}"#;
         let once = redact_secrets(json);
-        assert_eq!(redact_secrets(&once.text).text, once.text);
+        let again = redact_secrets(&once.text);
+        assert!(
+            again.text == once.text,
+            "second json pass changed text (first len {}, second len {})",
+            once.text.len(),
+            again.text.len()
+        );
     }
 
     #[test]
     fn shaped_secret_assigned_to_generic_key_keeps_specific_kind() {
         let raw = "api_key=sk-1234567890abcdef1234567890abcdef1234";
         let r = redact_secrets(raw);
-        assert_eq!(r.matches.len(), 1, "{r:?}");
-        assert_eq!(r.matches[0].kind, "openai_api_key", "{r:?}");
-        assert!(r.text.starts_with("api_key="), "{}", r.text);
-        assert!(!r.text.contains("sk-1234"), "{}", r.text);
+        let kinds = redaction_kinds(&r);
+        assert_eq!(kinds.len(), 1, "kinds {kinds:?}");
+        assert_eq!(
+            kinds.first().copied(),
+            Some("openai_api_key"),
+            "kinds {kinds:?}"
+        );
+        assert!(
+            r.text.starts_with("api_key="),
+            "key prefix missing (output len {}, kinds {kinds:?})",
+            r.text.len()
+        );
+        assert!(
+            !r.text.contains("sk-1234"),
+            "shaped value still present (output len {}, kinds {kinds:?})",
+            r.text.len()
+        );
     }
 
     #[test]
     fn non_secret_token_and_auth_names_stay_visible() {
         // Values are long enough that a key-name miss is the only thing
         // that can keep these from being redacted.
-        assert_unchanged("token_count=12345678901234567890");
-        assert_unchanged("max_tokens: 12345678901234567890");
-        assert_unchanged("max_tokens=12345678901234567890");
-        assert_unchanged("tokens=12345678901234567890");
-        assert_unchanged("author=JaneDoeTheWriterPersonExtra");
-        assert_unchanged("auth_type=application-default-login");
+        assert_unchanged("token_count", "token_count=12345678901234567890");
+        assert_unchanged("max_tokens_colon", "max_tokens: 12345678901234567890");
+        assert_unchanged("max_tokens_eq", "max_tokens=12345678901234567890");
+        assert_unchanged("tokens", "tokens=12345678901234567890");
+        assert_unchanged("author", "author=JaneDoeTheWriterPersonExtra");
+        assert_unchanged("auth_type", "auth_type=application-default-login");
     }
 }
