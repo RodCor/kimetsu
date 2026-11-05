@@ -1,0 +1,36 @@
+[package]
+name = "kimetsu-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+# iroh 1.4 and iroh-mdns-address-lookup require 1.91. The rest of the
+# workspace stays on its own rust-version.
+rust-version = "1.91"
+description = "ADR 0001 F2 memory bus: iroh transport, static roster, request_pack."
+keywords = ["kimetsu", "iroh", "p2p", "memory"]
+categories = ["network-programming"]
+
+[dependencies]
+blake3.workspace = true
+ed25519-dalek = "2"
+getrandom = { version = "0.3", features = ["std"] }
+iroh = "1.4.1"
+iroh-mdns-address-lookup = "0.6.1"
+iroh-relay = "1.4.1"
+kimetsu-brain = { path = "../kimetsu-brain" }
+kimetsu-core = { path = "../kimetsu-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# In-process relay for tests. Not linked into the library's default build
+# for dependents; cargo enables it when this crate's tests are built.
+iroh = { version = "1.4.1", features = ["test-utils"] }
+tempfile = "3"
