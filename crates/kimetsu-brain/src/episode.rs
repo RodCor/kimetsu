@@ -355,7 +355,7 @@ pub fn render_resume_context_scoped(workspace: &Path, identity: &str) -> Option<
         .unwrap_or_default();
     if !session_lines.is_empty() {
         if !text.is_empty() {
-            text.push_str("\n");
+            text.push('\n');
         }
         text.push_str("Session lane:\n");
         text.push_str(&session_lines.join("\n"));
