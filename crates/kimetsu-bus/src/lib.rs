@@ -1,7 +1,8 @@
 //! ADR 0001 F2 memory bus.
 //!
 //! iroh carries announcements and `kimetsu_pack` 2 bytes. The store path is
-//! [`kimetsu_sdk::import_signed_pack`], the same function a local file uses.
+//! [`kimetsu_brain::mount::import_signed_pack`], the same function a local
+//! file uses through `kimetsu_sdk::import_signed_pack`.
 //! This crate does not reimplement merge, quarantine, scrub, or supersede.
 //!
 //! Presence is a side file and a side task. [`kimetsu_brain::mount::context`]

@@ -3496,6 +3496,7 @@ name = "kimetsu-sdk"
 version = "2.10.0"
 dependencies = [
  "kimetsu-brain",
+ "kimetsu-bus",
  "kimetsu-core",
  "tempfile",
 ]

@@ -3,7 +3,8 @@
 //! Hole-punch is iroh's path selection. It runs when a relay is configured
 //! and [`BusEndpoint::online`] has observed a relay connection. The relay
 //! sees ciphertext. Pack bytes are verified with the F1 verifier and then
-//! imported by [`kimetsu_sdk::import_signed_pack`].
+//! imported by [`kimetsu_brain::mount::import_signed_pack`], the same
+//! function `kimetsu_sdk::import_signed_pack` forwards to.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,10 +21,10 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_relay::tls::CaTlsConfig;
+use kimetsu_brain::mount::MountGrants;
 use kimetsu_brain::packs::ImportSummary;
 use kimetsu_brain::signed_pack::{self, PackManifest, PackSigner, TrustStore};
 use kimetsu_core::memory::MountLevel;
-use kimetsu_sdk::MountGrants;
 
 /// Where this endpoint sends relayed ciphertext.
 ///
@@ -324,7 +325,7 @@ impl BusEndpoint {
         })
     }
 
-    /// Dial a roster member, verify, then [`kimetsu_sdk::import_signed_pack`].
+    /// Dial a roster member, verify, then [`kimetsu_brain::mount::import_signed_pack`].
     pub async fn request_pack(&self, request: PackRequest) -> Result<ImportSummary, String> {
         self.ensure_member(request.peer.id)?;
         if !self
@@ -352,7 +353,7 @@ impl BusEndpoint {
         }
         let fetched = self.fetch_verified(request.peer, &request.digest).await?;
         // Signature and scope checks finish inside import_signed_pack, before SQL.
-        kimetsu_sdk::import_signed_pack(
+        kimetsu_brain::mount::import_signed_pack(
             &request.brain,
             &request.grants,
             &fetched.gzip,

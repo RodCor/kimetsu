@@ -1,10 +1,9 @@
-//! In-process entry for the seven ADR 0001 store operations.
+//! In-process entry for the ADR 0001 store operations and `request_pack`.
 //!
-//! `kimetsu-cli` and `kimetsu-remote` call these functions. The bodies stay
-//! in `kimetsu-brain`: this crate does not open a second database, does not
-//! verify pack signatures on its own, and does not dial the bus.
-//! `request_pack` stays on `kimetsu-bus` and enters the store through
-//! [`import_signed_pack`].
+//! `kimetsu-cli` and `kimetsu-remote` call the store functions. Those bodies
+//! stay in `kimetsu-brain`: this crate does not open a second database and
+//! does not verify pack signatures on its own. [`request_pack`] forwards to
+//! `kimetsu-bus`, which imports through [`import_signed_pack`].
 //!
 //! `@kimetsu-ai/sdk` is a different package. It is an HTTP client of Remote's
 //! MCP surface and does not link this crate.
@@ -126,6 +125,14 @@ pub fn export_signed_pack(
         strict,
         signer,
     )
+}
+
+/// `request_pack`. The bus dials, verifies, then calls [`import_signed_pack`].
+pub async fn request_pack(
+    endpoint: &kimetsu_bus::BusEndpoint,
+    request: kimetsu_bus::PackRequest,
+) -> Result<ImportSummary, String> {
+    endpoint.request_pack(request).await
 }
 
 /// Signed `import_pack`. Signature and scope checks finish before SQL.

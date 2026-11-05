@@ -15,6 +15,7 @@ categories = ["database"]
 
 [dependencies]
 kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
+kimetsu-bus = { path = "../kimetsu-bus" }
 kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
 
 [dev-dependencies]

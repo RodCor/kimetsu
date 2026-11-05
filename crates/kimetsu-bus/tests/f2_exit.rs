@@ -293,6 +293,38 @@ async fn relay_path_still_verifies_before_import() {
 }
 
 #[tokio::test]
+async fn sdk_request_pack_reaches_the_bus() {
+    let built = members(&[MountLevel::Repo], false);
+    let server = bind_one(
+        built.server_key.clone(),
+        built.roster.clone(),
+        BusRelay::Disabled,
+        false,
+        "sdk-forward",
+    )
+    .await;
+    let stranger = SecretKey::generate();
+    let brain = brain_root("sdk-forward");
+    let err = kimetsu_sdk::request_pack(
+        &server,
+        request(
+            EndpointAddr::new(stranger.public()).with_ip_addr("127.0.0.1:1".parse().unwrap()),
+            &"ab".repeat(32),
+            MountLevel::Repo,
+            TrustStore::empty(),
+            &brain,
+            &[MountLevel::Repo],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("non-member"), "{err}");
+    assert_eq!(counts(&brain).0, 0);
+    server.close().await;
+    let _ = std::fs::remove_dir_all(&brain);
+}
+
+#[tokio::test]
 async fn non_member_handshake_fails_and_is_not_dialed() {
     let built = members(&[MountLevel::Repo], true);
     let server = bind_one(
