@@ -105,6 +105,7 @@ pub fn import_pack(
 }
 
 /// Signed `export_pack`. Scrub finishes before the signature.
+#[allow(clippy::too_many_arguments)]
 pub fn export_signed_pack(
     start: &Path,
     grants: &MountGrants,
