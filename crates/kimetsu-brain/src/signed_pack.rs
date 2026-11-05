@@ -978,10 +978,7 @@ mod tests {
             let body = std::str::from_utf8(&verified.canonical_body).unwrap();
             assert!(!body.contains("alice@example.com"));
             assert!(body.contains("[REDACTED:email]"));
-            assert_eq!(
-                verified.memories[0].text.contains("alice@example.com"),
-                false
-            );
+            assert!(!verified.memories[0].text.contains("alice@example.com"));
             let round = decode_pack_bytes(&encode_gzip(&json).unwrap()).unwrap();
             verify_pack_json(&round).unwrap();
 
