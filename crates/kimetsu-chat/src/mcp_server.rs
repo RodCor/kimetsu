@@ -1734,7 +1734,7 @@ fn kimetsu_brain_memory_search(workspace: &Path, arguments: &Value) -> Result<Va
             "text": h.text,
             "rank": h.rank,
         })).collect::<Vec<_>>(),
-        "usage": "Page with limit+offset. Filter by kind (failure_pattern/command/convention/preference/fact) or scope (global_user/project/repo/run)."
+        "usage": "Page with limit+offset. Filter by kind (failure_pattern/command/convention/preference/fact) or scope (global_user/project/repo/run/session/org/skill)."
     }))
 }
 
@@ -2062,6 +2062,21 @@ fn u32_arg(arguments: &Value, name: &str, default: u32, min: u32, max: u32) -> u
     value.clamp(u64::from(min), u64::from(max)) as u32
 }
 
+/// Canonical `MemoryScope` wire strings these tools already persist and filter.
+///
+/// `MemoryScope` also accepts aliases (`user`, `global-user`, `repository`).
+/// The schema lists each variant's display value, including the `project`
+/// input alias, and not the extra spellings.
+const MEMORY_SCOPE_VALUES: &[&str] = &[
+    "global_user",
+    "project",
+    "repo",
+    "run",
+    "session",
+    "org",
+    "skill",
+];
+
 fn tool_definitions() -> Value {
     json!([
         {
@@ -2213,7 +2228,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "scope": { "type": "string", "enum": MEMORY_SCOPE_VALUES },
                     "min_uses": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
                 }
@@ -2225,7 +2240,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "scope": { "type": "string", "enum": MEMORY_SCOPE_VALUES },
                     "kind": { "type": "string", "enum": ["preference", "convention", "command", "failure_pattern", "fact"] },
                     "text": { "type": "string" }
                 },
@@ -2238,7 +2253,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "scope": { "type": "string", "enum": MEMORY_SCOPE_VALUES },
                     "kind": { "type": "string", "enum": ["preference", "convention", "command", "failure_pattern", "fact"] },
                     "from_run": { "type": "string" },
                     "min_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
@@ -2254,7 +2269,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "proposal_id": { "type": "string" },
-                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "scope": { "type": "string", "enum": MEMORY_SCOPE_VALUES },
                     "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
                 },
                 "required": ["proposal_id"]
@@ -2424,7 +2439,7 @@ fn tool_definitions() -> Value {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "offset": { "type": "integer", "minimum": 0 },
                     "kind": { "type": "string", "enum": ["preference", "convention", "command", "failure_pattern", "fact"] },
-                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] }
+                    "scope": { "type": "string", "enum": MEMORY_SCOPE_VALUES }
                 },
                 "required": ["query"]
             }
@@ -2447,7 +2462,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope": { "type": "string", "enum": ["global_user", "project", "repo", "run"] },
+                    "scope": { "type": "string", "enum": MEMORY_SCOPE_VALUES },
                     "min_uses": { "type": "integer", "minimum": 1 },
                     "max_ratio": { "type": "number" },
                     "apply": { "type": "boolean" }
@@ -2613,6 +2628,62 @@ mod tests {
                     "{name} must advertise the supported {field} lane"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn memory_scope_enums_match_supported_levels() {
+        let supported: Vec<String> = [
+            MemoryScope::GlobalUser,
+            MemoryScope::Project,
+            MemoryScope::Repo,
+            MemoryScope::Run,
+            MemoryScope::Session,
+            MemoryScope::Org,
+            MemoryScope::Skill,
+        ]
+        .into_iter()
+        .map(|scope| scope.to_string())
+        .collect();
+        assert_eq!(
+            supported.iter().map(String::as_str).collect::<Vec<_>>(),
+            MEMORY_SCOPE_VALUES,
+            "advertised scopes must be exactly the MemoryScope variants"
+        );
+        for value in MEMORY_SCOPE_VALUES {
+            MemoryScope::from_str(value)
+                .unwrap_or_else(|err| panic!("schema scope {value} is not supported: {err}"));
+        }
+
+        let tools = super::tool_definitions();
+        for name in [
+            "kimetsu_brain_memory_top",
+            "kimetsu_brain_memory_add",
+            "kimetsu_brain_memory_proposals",
+            "kimetsu_brain_memory_accept",
+            "kimetsu_brain_memory_search",
+            "kimetsu_brain_prune",
+        ] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("{name} missing from tool definitions"));
+            let advertised: Vec<&str> = tool["inputSchema"]["properties"]["scope"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} scope enum missing"))
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{name} scope enum entry"))
+                })
+                .collect();
+            assert_eq!(
+                advertised, MEMORY_SCOPE_VALUES,
+                "{name} advertises a different scope set than MemoryScope supports"
+            );
         }
     }
 
