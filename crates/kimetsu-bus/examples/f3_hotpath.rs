@@ -227,7 +227,7 @@ fn load_corpus(root: &Path, n: usize) -> usize {
         };
         project::add_memory(root, MemoryScope::Repo, MemoryKind::Fact, &text).unwrap();
         inserted += 1;
-        if inserted % 500 == 0 {
+        if inserted.is_multiple_of(500) {
             eprintln!("inserted {inserted}/{n}");
         }
     }
