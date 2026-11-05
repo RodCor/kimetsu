@@ -62,8 +62,22 @@ pub struct PackRef {
 /// for a bare array) and the memory entries.
 pub fn parse_pack_or_array(json: &str) -> KimetsuResult<(PackRef, Vec<MemoryExport>)> {
     // A Pack is a JSON object with `kimetsu_pack` + `memories`; a bare array is
-    // a JSON array. Try the envelope first; fall back to the array.
-    if let Ok(pack) = serde_json::from_str::<Pack>(json) {
+    // a JSON array. Version 2 is signed and must not fall through this unsigned
+    // parser (see `signed_pack`).
+    let trimmed = json.trim_start();
+    if trimmed.starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("pack: not a Pack envelope or a memory array: {e}"))?;
+        if let Some(version) = value.get("kimetsu_pack").and_then(|v| v.as_u64()) {
+            if version == 2 {
+                return Err("kimetsu_pack 2 is signed; refusing an unsigned import".into());
+            }
+            if version != 1 {
+                return Err(format!("unknown kimetsu_pack version {version}").into());
+            }
+        }
+        let pack: Pack = serde_json::from_value(value)
+            .map_err(|e| format!("pack: not a Pack envelope or a memory array: {e}"))?;
         return Ok((
             PackRef {
                 name: pack.name,

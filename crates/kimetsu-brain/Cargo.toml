@@ -63,6 +63,11 @@ serde_json.workspace = true
 time.workspace = true
 tracing.workspace = true
 ulid.workspace = true
+# F1 signed packs. The `digest` feature stays off: verification is pure
+# Ed25519 (RFC 8032 via `verify_strict`), not Ed25519ph.
+ed25519-dalek = "2"
+flate2 = "1"
+getrandom = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

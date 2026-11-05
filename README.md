@@ -126,7 +126,13 @@ kimetsu brain import other-brain.json.gz --mode replace --yes
 
 Every export is scrubbed before it leaves your machine: credentials and PII
 are redacted automatically, and `--strict` aborts the export if anything was
-found. Merge is idempotent, so re-importing is safe. Replace supersedes rather
+found. `kimetsu brain export --scope repo --sign-key signer.json` writes
+`kimetsu_pack` 2. The signature is Ed25519 over a BLAKE3 digest of the
+scrubbed canonical body (`kimetsu-canon-json/1`). `~/.kimetsu/trust.json`
+lists the public keys allowed to merge into a mount. A valid signature from
+an unlisted key is quarantined. A scope outside the signed list is rejected
+and does not touch the database. Unsigned v1 packs still import into the
+mount you name. Merge is idempotent, so re-importing is safe. Replace supersedes rather
 than deletes, so a swap can always be undone. For continuous sharing,
 `kimetsu brain sync` replicates a brain across machines with no server, and
 **[Kimetsu Remote](https://kimetsu.dev/docs/remote)** serves one
