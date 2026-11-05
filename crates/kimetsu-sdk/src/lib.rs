@@ -2,8 +2,9 @@
 //!
 //! `kimetsu-cli` and `kimetsu-remote` call the store functions. Those bodies
 //! stay in `kimetsu-brain`: this crate does not open a second database and
-//! does not verify pack signatures on its own. [`request_pack`] forwards to
-//! `kimetsu-bus`, which imports through [`import_signed_pack`].
+//! does not verify pack signatures on its own. With the `bus` feature,
+//! `request_pack` forwards to `kimetsu-bus`, which imports through
+//! [`import_signed_pack`]. Remote does not enable that feature.
 //!
 //! `@kimetsu-ai/sdk` is a different package. It is an HTTP client of Remote's
 //! MCP surface and does not link this crate.
@@ -128,6 +129,7 @@ pub fn export_signed_pack(
 }
 
 /// `request_pack`. The bus dials, verifies, then calls [`import_signed_pack`].
+#[cfg(feature = "bus")]
 pub async fn request_pack(
     endpoint: &kimetsu_bus::BusEndpoint,
     request: kimetsu_bus::PackRequest,

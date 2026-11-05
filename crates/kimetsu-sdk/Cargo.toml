@@ -13,9 +13,16 @@ description = "In-process Rust entry for the ADR 0001 store operations. Not @kim
 keywords = ["kimetsu", "memory", "sdk"]
 categories = ["database"]
 
+[features]
+# Off by default. `cargo test -p kimetsu-remote` must not compile kimetsu-bus:
+# that library calls CaTlsConfig::insecure_skip_verify, which iroh-relay
+# exposes only under cfg(test) or its test-utils feature. Bus tests turn
+# test-utils on; the lean remote suite does not.
+bus = ["dep:kimetsu-bus"]
+
 [dependencies]
 kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
-kimetsu-bus = { path = "../kimetsu-bus" }
+kimetsu-bus = { path = "../kimetsu-bus", optional = true }
 kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
 
 [dev-dependencies]
