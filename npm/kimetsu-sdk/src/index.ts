@@ -34,6 +34,7 @@ export {
 } from './transport.js';
 export type {
   BrainStatus,
+  CiteOutcome,
   ContextBundle,
   ContextCapsule,
   Memory,

@@ -82,7 +82,19 @@ export interface BrainStatus {
 /** Any tool response this SDK does not model more specifically. */
 export type ToolResult = Record<string, unknown>;
 
-export type MemoryScope = 'global_user' | 'project' | 'repo' | 'run';
+/** Citation outcome. Omitted on the wire is `noop` and does not raise usefulness. */
+export type CiteOutcome = 'helped' | 'noop' | 'harmed';
+
+/** `project` is an input alias of `repo`. `user` is an alias of `global_user`. */
+export type MemoryScope =
+  | 'global_user'
+  | 'user'
+  | 'project'
+  | 'repo'
+  | 'run'
+  | 'session'
+  | 'org'
+  | 'skill';
 
 export type MemoryKind =
   | 'fact'

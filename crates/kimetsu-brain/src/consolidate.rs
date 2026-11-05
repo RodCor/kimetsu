@@ -336,6 +336,9 @@ pub fn find_merge_clusters(rows: &[ConsolidateRow], threshold: f32) -> Vec<Merge
         if row.text.trim().is_empty() {
             continue;
         }
+        // Bucket on the stored scope string. `project` and `repo` are one
+        // mount for grants, and a cosine merge must not collapse either
+        // string into the other.
         buckets
             .entry((&row.scope, &row.kind, &row.model_id, row.text.trim()))
             .or_insert_with(Vec::new)
@@ -557,7 +560,9 @@ pub fn find_distill_clusters(
 
     for i in 0..n {
         for j in (i + 1)..n {
-            if rows[i].model_id != rows[j].model_id {
+            if rows[i].model_id != rows[j].model_id || rows[i].scope != rows[j].scope {
+                // Exact stored scope, not the mount alias. `project` and
+                // `repo` are one mount for grants and must still not collapse.
                 continue;
             }
             let sim = cosine(&rows[i].embedding, &rows[j].embedding);

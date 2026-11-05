@@ -452,8 +452,50 @@ fn apply_memory_cited(conn: &Connection, event: &Event) -> KimetsuResult<()> {
         )?;
     }
 
-    // A citation records reliance only. Outcomes are credited separately.
+    // Reliance is the citation row. Usefulness moves only for an explicit
+    // outcome: helped may rise, harmed is the strong negative and leaves
+    // injection, omitted or noop changes nothing. Scope is not touched.
+    let outcome = event
+        .payload
+        .get("outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("noop");
+    match outcome {
+        "helped" => apply_cited_outcome(conn, memory_id, CITED_DELTA, 1.0, &cited_at, true)?,
+        "harmed" => {
+            apply_cited_outcome(conn, memory_id, -CITED_DELTA, 0.0, &cited_at, false)?;
+            let changed = conn.execute(
+                "UPDATE memories
+                 SET invalidated_at = ?2, invalidated_reason = 'cite_harmed'
+                 WHERE memory_id = ?1 AND invalidated_at IS NULL",
+                params![memory_id, cited_at],
+            )?;
+            if changed > 0 {
+                conn.execute("DELETE FROM memories_fts WHERE memory_id = ?1", [memory_id])?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+fn cite_outcome_for(
+    conn: &Connection,
+    run_id: &str,
+    memory_id: &str,
+) -> KimetsuResult<Option<String>> {
+    let outcome: Option<Option<String>> = conn
+        .query_row(
+            "SELECT json_extract(payload_json, '$.outcome')
+             FROM events
+             WHERE run_id = ?1 AND kind = 'memory.cited'
+               AND json_extract(payload_json, '$.memory_id') = ?2
+             ORDER BY rowid DESC LIMIT 1",
+            params![run_id, memory_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(outcome.flatten())
 }
 
 /// Story 2.4: a memory the model flagged as unhelpful/misleading. Mirrors the
@@ -638,9 +680,9 @@ fn apply_terminal_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 ///
 /// Delta rules:
 ///   run.finished:
-///     cited memory     -> +1.0 usefulness (matches MP-4a baseline)
-///     silent passenger -> +0.1 usefulness (weaker signal — it was on
-///                         screen but the model didn't reach for it)
+///     cite(helped)     -> +1.0 already applied when the cite was projected
+///     noop / omitted   -> no usefulness increase (omitted outcome is noop)
+///     silent passenger -> +0.0 (F0 drops the +0.1 success nudge)
 ///   run.failed (cat != "Gate"):
 ///     cited memory     -> -1.0 usefulness (the brain pushed wrong)
 ///     silent passenger -> -0.1 usefulness (was retrieved, didn't help)
@@ -659,7 +701,9 @@ fn apply_terminal_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
 /// citation usage where the brain is under-rewarding good capsules.
 fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuResult<()> {
     let (strong, weak): (f64, f64) = match event.kind.as_str() {
-        "run.finished" => (CITED_DELTA, PASSENGER_DELTA),
+        // Positive usefulness is cite(helped) only. Success no longer adds
+        // PASSENGER_DELTA, and a cite that omitted outcome is noop.
+        "run.finished" => (0.0, 0.0),
         "run.failed" => {
             let category = event
                 .payload
@@ -681,10 +725,6 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
     }
     let cited = collect_cited_memory_ids(conn, &run_id)?;
     let ts = ts_text(event)?;
-    // v0.5.1: bump `last_useful_at` only on cited + run.finished.
-    // Cited + run.failed doesn't count (the memory misled the
-    // model). Silent passengers never bump regardless of outcome.
-    let bump_last_useful = event.kind == "run.finished";
 
     // Flagship 2 / Story 2.4: confidence calibration target.
     // run.finished → target 1.0 (success), run.failed → target 0.0 (failure).
@@ -720,6 +760,17 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
             }
         }
         let is_cited = cited.contains(memory_id);
+        let cite_outcome = cite_outcome_for(conn, &run_id, memory_id)?;
+        // cite(helped) and cite(harmed) already moved usefulness. Do not
+        // apply that delta again when the run terminates.
+        if event.kind == "run.finished"
+            && matches!(cite_outcome.as_deref(), Some("helped") | Some("harmed"))
+        {
+            continue;
+        }
+        if event.kind == "run.failed" && cite_outcome.as_deref() == Some("harmed") {
+            continue;
+        }
         let delta = if is_cited {
             if strong < 0.0 {
                 // v2.5.1: citation-aware failure penalty. A memory cited in a
@@ -758,21 +809,11 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
             ",
             params![memory_id, delta, ts],
         )?;
-        if is_cited && bump_last_useful {
-            // v0.5.1: separate column for the decay reference. We
-            // intentionally only touch it for confirmed successful
-            // citations so the half-life curve in `usefulness_-
-            // multiplier` reflects when the memory was last
-            // PROVEN to help — not just when it was retrieved.
-            conn.execute(
-                "UPDATE memories SET last_useful_at = ?2 WHERE memory_id = ?1",
-                params![memory_id, ts],
-            )?;
-        }
-        // Flagship 2 / Story 2.4: update confidence only for cited memories.
-        // Silent passengers do not get a confidence update — only explicitly
-        // cited memories affect the calibration.
-        if is_cited {
+        // last_useful_at moves on cite(helped) only. A successful run does
+        // not promote a noop cite or a silent passenger.
+        // Failure still calibrates cited memories toward 0. Success
+        // calibration for helped already ran when the cite was projected.
+        if is_cited && event.kind == "run.failed" {
             if let Some(target) = conf_target {
                 // Read current confidence, apply Bayesian-ish posterior, clamp.
                 let old_conf: f64 = conn
@@ -1114,7 +1155,7 @@ fn apply_memory_restored(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     let changed = conn.execute(
         "UPDATE memories SET invalidated_at=NULL, invalidated_reason=NULL
       WHERE memory_id=?1 AND superseded_by IS NULL AND invalidated_at IS NOT NULL
-      AND invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived')",
+      AND invalidated_reason IN ('forgotten','forgotten/archived','forgotten_archived','cite_harmed')",
         [id],
     )?;
     if changed > 0 {
@@ -2579,7 +2620,7 @@ mod tests {
             make_event(
                 run_id,
                 "memory.cited",
-                json!({"memory_id": mem_id, "turn": 1}),
+                json!({"memory_id": mem_id, "turn": 1, "outcome": "helped"}),
             ),
             make_event(run_id, terminal_kind, json!({"total_cost_usd": 0.0})),
         ];
@@ -2969,7 +3010,9 @@ mod correction_regressions {
                 .unwrap();
             assert_eq!(current, (0, 0.0));
             let retired:(i64,f64)=c.query_row("SELECT use_count,usefulness_score FROM memory_revisions WHERE event_id='baseline:m'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-            assert_eq!(retired, (1, 1.0));
+            // The use stays on the retiring claim. The cite omitted outcome,
+            // so usefulness does not rise.
+            assert_eq!(retired, (1, 0.0));
             rebuild_in_place(&c).unwrap();
         }
         // Pre-binding events also must not transfer evidence at equal times.

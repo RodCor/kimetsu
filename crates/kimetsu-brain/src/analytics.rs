@@ -927,9 +927,9 @@ mod tests {
             assert_eq!(ch.active, 2, "active count");
             assert_eq!(ch.invalidated, 1, "invalidated count");
 
-            // by_scope must include "project" with count 2.
-            let project_scope = ch.by_scope.iter().find(|(s, _)| s == "project");
-            assert!(project_scope.is_some(), "project scope missing");
+            // New writes store `repo`. `project` is only an input alias.
+            let project_scope = ch.by_scope.iter().find(|(s, _)| s == "repo");
+            assert!(project_scope.is_some(), "repo scope missing");
             assert_eq!(project_scope.unwrap().1, 2);
 
             // by_kind must include "fact" with count 1 (m3 was repo, invalidated).
@@ -1435,12 +1435,12 @@ mod tests {
                 "active count must exclude superseded memories; got {}",
                 ch.active
             );
-            // by_scope must also reflect only 1 active project-scope memory.
-            let project_scope = ch.by_scope.iter().find(|(s, _)| s == "project");
+            // by_scope reflects the stored level. New rows are `repo`.
+            let project_scope = ch.by_scope.iter().find(|(s, _)| s == "repo");
             assert_eq!(
                 project_scope.map(|(_, n)| *n),
                 Some(1),
-                "by_scope[project] must be 1 (superseded excluded)"
+                "by_scope[repo] must be 1 (superseded excluded)"
             );
             // by_kind must reflect only 1 active fact.
             let fact_kind = ch.by_kind.iter().find(|(k, _)| k == "fact");

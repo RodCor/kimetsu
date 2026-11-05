@@ -62,7 +62,7 @@ const BRIDGE_SYNC_DESCRIPTION: &str = "Bulk-import all discovered non-Kimetsu sk
 
 const PLUGIN_INSTALL_DESCRIPTION: &str = "Install Kimetsu MCP/plugin wiring for a target harness in this workspace. For codex, writes .codex/config.toml, .codex/hooks.json, the kimetsu-bridge skill, and the kimetsu-memory-harvester custom agent; for claude-code, writes .mcp.json, command docs, and .claude/settings.json hooks. Set mode=optional to recommend brain-first usage, or mode=required to tell the host harness that non-trivial work must load Kimetsu brain context. Installed guidance tells benchmark agents to prefer kimetsu_benchmark_context and record outcomes through kimetsu_benchmark_record_outcome. Set scope=workspace (default) to install into this workspace, or scope=global to install into the user's home (~/.claude, ~/.claude.json, ~/.codex) for all sessions. Existing user hooks are preserved (merged, not replaced).";
 
-const BRAIN_CITE_DESCRIPTION: &str = "Record reliance on a memory actually delivered in context. Pass exposure_id from the context response and memory_id from its capsule handle. Reliance does not verify truth or prove success; origin penalties remain.";
+const BRAIN_CITE_DESCRIPTION: &str = "Record reliance on a memory actually delivered in context. Pass exposure_id from the context response and memory_id from its capsule handle. Optional outcome is helped, noop, or harmed; omitted outcome is noop and does not increase usefulness. Only helped may raise usefulness. Reliance does not verify truth or prove success; origin penalties remain.";
 
 #[derive(Debug, Clone)]
 pub struct McpServeConfig {
@@ -745,6 +745,7 @@ fn stdio_brain_context_with_model_loaders(
             reranker.as_deref(),
             warm.as_ref().map(|(_, block)| block.context.clone()),
             load_embedder,
+            None,
         )?;
         if let Some((key, block)) = warm {
             if output["warm_start"]["context"].as_str() == Some(block.context.as_str()) {
@@ -838,6 +839,7 @@ fn brain_context_tool_with_warm(
         reranker,
         warm_start,
         kimetsu_brain::embeddings::open_embedder_for_checked,
+        None,
     )
 }
 
@@ -847,6 +849,7 @@ fn brain_context_tool_with_embedder_loader(
     reranker: Option<&dyn kimetsu_brain::embeddings::Reranker>,
     warm_start: Option<String>,
     load_embedder: impl FnOnce(bool) -> Result<&'static dyn kimetsu_brain::embeddings::Embedder, String>,
+    readable_mounts: Option<Vec<kimetsu_core::memory::MountLevel>>,
 ) -> Result<Value, String> {
     use kimetsu_brain::context::ContextRequest;
 
@@ -938,6 +941,12 @@ fn brain_context_tool_with_embedder_loader(
             .get("abstain_evidence")
             .and_then(Value::as_f64)
             .map(|v| v as f32),
+        readable_mounts: Some(readable_mounts.unwrap_or_else(|| {
+            vec![
+                kimetsu_core::memory::MountLevel::Repo,
+                kimetsu_core::memory::MountLevel::User,
+            ]
+        })),
         ..Default::default()
     };
     let exposure = kimetsu_core::event::Event::new(
@@ -1026,7 +1035,7 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
 
     match project::propose_or_merge_memory(
         workspace,
-        MemoryScope::Project,
+        MemoryScope::Repo,
         kind,
         &full_text,
         confidence,
@@ -1036,6 +1045,7 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "ok": true,
             "memory_id": memory_id,
             "result": "added",
+            "level": "repo",
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
@@ -1045,6 +1055,7 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "ok": true,
             "memory_id": memory_id,
             "result": "merged",
+            "level": "repo",
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
@@ -1054,6 +1065,7 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "ok": true,
             "memory_id": memory_id,
             "result": "duplicate",
+            "level": "repo",
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
@@ -1063,6 +1075,7 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "ok": true,
             "proposal_id": proposal_id,
             "result": "proposed",
+            "level": "repo",
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
@@ -1086,12 +1099,42 @@ fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, Stri
         }
     };
     let note = arguments.get("note").and_then(Value::as_str);
+    let outcome = match arguments.get("outcome").and_then(Value::as_str) {
+        None => "noop",
+        Some(value @ ("helped" | "noop" | "harmed")) => value,
+        Some(other) => {
+            return Ok(json!({
+                "ok": false,
+                "error": format!("outcome must be helped, noop, or harmed (got {other})")
+            }));
+        }
+    };
+    // Stdio cite is a repo write. It does not open user, org, or skill.
+    if let Ok((_, _, conn)) = project::load_project_readonly(workspace) {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT scope FROM memories WHERE memory_id = ?1",
+                [memory_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(stored) = stored {
+            let mount = kimetsu_core::memory::mount_of_stored(&stored);
+            if mount != Some(kimetsu_core::memory::MountLevel::Repo) {
+                return Ok(json!({
+                    "ok": false,
+                    "error": "cite requires write on the memory's home mount"
+                }));
+            }
+        }
+    }
     match arguments
         .get("exposure_id")
         .and_then(Value::as_str)
         .ok_or_else(|| "exposure_id from delivered context is required".into())
-        .and_then(|id| project::record_exposure_citation(workspace, id, memory_id, note))
-    {
+        .and_then(|id| {
+            project::record_exposure_citation(workspace, id, memory_id, note, Some(outcome))
+        }) {
         Ok(()) => Ok(json!({
             "ok": true,
             "memory_id": memory_id,
@@ -1794,6 +1837,7 @@ fn kimetsu_brain_answer(workspace: &Path, arguments: &Value) -> Result<Value, St
                 &exposure_id,
                 id,
                 Some("marked helpful via answer"),
+                Some("helped"),
             )
             .map_err(|e| e.to_string())?;
         }
@@ -2063,8 +2107,9 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "exposure_id": {"type":"string","description":"Exact exposure_id returned by context delivery."},
-                    "memory_id": { "type": "string", "description": "The memory_id of the retrieved memory that helped (from capsule provenance or kimetsu_brain_memory_list)." },
-                    "note": { "type": "string", "description": "Optional short description of how the memory helped." }
+                    "memory_id": { "type": "string", "description": "The memory_id of the retrieved memory (from capsule provenance or kimetsu_brain_memory_list)." },
+                    "note": { "type": "string", "description": "Optional short note. This records reliance, not verification." },
+                    "outcome": { "type": "string", "enum": ["helped", "noop", "harmed"], "description": "helped may raise usefulness. noop (the default when omitted) and harmed do not. harmed removes the memory from injection." }
                 },
                 "required": ["memory_id", "exposure_id"]
             }
@@ -2937,6 +2982,65 @@ mod tests {
             // permit bounded numeric metadata, never rejected summary growth.
             assert!(after.to_string().len() <= before.to_string().len() + 32);
             assert!(!after.to_string().contains("do_not_leak_long_identifier"));
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn f0_repo_read_context_excludes_user_and_org_text() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let root = temp_root("f0-mcp-mount-contamination");
+            fs::create_dir_all(&root).unwrap();
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Fact,
+                "sharedtoken REPO_VISIBLE_ANCHOR convention",
+            )
+            .unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::GlobalUser,
+                MemoryKind::Fact,
+                "sharedtoken USER_SECRET_LEAK preference text",
+            )
+            .unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Org,
+                MemoryKind::Fact,
+                "sharedtoken ORG_SECRET_LEAK policy text",
+            )
+            .unwrap();
+            let result = brain_context_tool_with_embedder_loader(
+                &root,
+                &json!({
+                    "query": "sharedtoken",
+                    "budget_tokens": 4000,
+                    "max_capsules": 8,
+                    "min_score": 0.0,
+                    "include_ambient": false
+                }),
+                None,
+                None,
+                kimetsu_brain::embeddings::open_embedder_for_checked,
+                Some(vec![kimetsu_core::memory::MountLevel::Repo]),
+            )
+            .unwrap();
+            let payload = result.to_string();
+            assert!(
+                payload.contains("REPO_VISIBLE_ANCHOR"),
+                "repo fact should be readable: {payload}"
+            );
+            assert!(
+                !payload.contains("USER_SECRET_LEAK"),
+                "user text leaked into repo-only context: {payload}"
+            );
+            assert!(
+                !payload.contains("ORG_SECRET_LEAK"),
+                "org text leaked into repo-only context: {payload}"
+            );
             fs::remove_dir_all(root).unwrap();
         });
     }

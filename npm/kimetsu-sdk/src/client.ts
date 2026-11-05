@@ -31,6 +31,7 @@ import type {
   ContextBundle,
   Memory,
   MemoryKind,
+  CiteOutcome,
   MemoryScope,
   ToolResult,
 } from './types.js';
@@ -216,8 +217,16 @@ export class KimetsuClient {
     return this.t.call('kimetsu_brain_insights', {});
   }
 
-  /** Record that a memory materially helped — the brain's usefulness signal. */
-  cite(memoryId: string, extra: Args = {}): Promise<ToolResult> {
+  /**
+   * Record reliance on a delivered memory.
+   *
+   * Pass `outcome: 'helped' | 'noop' | 'harmed'`. Omitting it is `noop` and
+   * does not increase usefulness. Only `helped` may.
+   */
+  cite(
+    memoryId: string,
+    extra: Args & { outcome?: CiteOutcome; exposure_id?: string; note?: string } = {},
+  ): Promise<ToolResult> {
     return this.t.call('kimetsu_brain_cite', clean({ memory_id: memoryId, ...extra }));
   }
 

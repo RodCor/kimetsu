@@ -4,9 +4,8 @@
 //! loop, surfaces in `report.context.recorded_citations` with the
 //! correct turn index. Then projects the event into the brain (the
 //! step a real transport — chat / harbor — would perform) and asserts
-//! the `memory_citations` table is populated and the strong-signal
-//! (+1.0) usefulness delta lands on cited memories vs the weak
-//! (+0.1) on silent passengers.
+//! the `memory_citations` table is populated and a cite with outcome
+//! `helped` earns +1.0. A silent passenger on success does not earn +0.1.
 //!
 //! This is the "the brain learns from outcomes" path in miniature —
 //! tests every wire from agent → harness → projector → memory row.
@@ -132,6 +131,7 @@ fn cited_memory_earns_strong_signal_after_run_finished_projection() {
             json!({
                 "memory_id": &cited_id,
                 "turn": 1,
+                "outcome": "helped",
                 "rationale": "answering an embeddings question"
             }),
         );
@@ -172,10 +172,10 @@ fn cited_memory_earns_strong_signal_after_run_finished_projection() {
             (cited_score - 1.1).abs() < 1e-6,
             "cited memory should have usefulness_score = +1.1 (0.1 seed + 1.0 strong); got {cited_score}"
         );
-        // Fact kind seed = 0.1; silent passenger earns +0.1 weak signal → 0.2
+        // Fact kind seed = 0.1; a silent passenger on success no longer earns +0.1.
         assert!(
-            (silent_score - 0.2).abs() < 1e-6,
-            "silent passenger should have usefulness_score = +0.2 (0.1 seed + 0.1 weak); got {silent_score}"
+            (silent_score - 0.1).abs() < 1e-6,
+            "silent passenger should keep the 0.1 kind seed and not gain +0.1; got {silent_score}"
         );
         assert_eq!(cited_uses, 1, "cited memory use_count should be 1");
         assert_eq!(silent_uses, 1, "silent memory use_count should be 1");

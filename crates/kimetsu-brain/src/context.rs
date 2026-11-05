@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use kimetsu_core::config::{BrokerWeights, StageWeights};
-use kimetsu_core::memory::MemoryScope;
+use kimetsu_core::memory::{MemoryScope, MountLevel, mount_of_stored, retrieval_label};
 use kimetsu_core::{KimetsuResult, ids::new_id};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -425,6 +425,10 @@ pub struct ContextRequest {
     pub abstain_evidence: f32,
     /// Some(0) disables abstention; Some(-1) uses model auto; None inherits.
     pub abstain_evidence_override: Option<f32>,
+    /// When set, candidates outside these mounts are dropped before scoring.
+    /// Rejected text then cannot enter the model payload or the excluded pool.
+    /// `None` keeps every stored scope for internal callers.
+    pub readable_mounts: Option<Vec<MountLevel>>,
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +738,9 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             request.include_fact_evidence,
         )?);
     }
+    if let Some(mounts) = request.readable_mounts.as_ref() {
+        candidates.retain(|candidate| capsule_on_mounts(&candidate.capsule, mounts));
+    }
     // v2.5.2 consolidation v1: bounded query-association routing boost —
     // memories that repeatedly answered SIMILAR past queries (per the
     // citation-derived query_routes table) gain up to ROUTING_BOOST_CAP
@@ -748,6 +755,11 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
 
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
+    if let Some(mounts) = request.readable_mounts.as_ref() {
+        if !mounts.contains(&MountLevel::Repo) {
+            candidates.retain(|candidate| candidate.capsule.kind == "memory");
+        }
+    }
 
     // v0.8: proactive kind filter — restrict to actionable kinds BEFORE
     // scoring + capping so a higher-ranked repo file or off-kind memory
@@ -1771,6 +1783,7 @@ pub(crate) fn memory_row_to_candidate(
 
     let freshness = freshness(&created_at);
     let scope_weight = scope_weight(&scope);
+    let scope_label = retrieval_label(&scope);
     // v0.5.1: usefulness multiplier with half-life decay applied to
     // the *deviation from neutral*. A 6-month-old memory that scored
     // 1.5 (max boost) decays toward 1.0 (neutral) — NOT toward 0,
@@ -1802,7 +1815,7 @@ pub(crate) fn memory_row_to_candidate(
         capsule: ContextCapsule {
             id: new_id().to_string(),
             kind: "memory".to_string(),
-            summary: format!("{scope}:{kind} - {text}"),
+            summary: format!("{scope_label}:{kind} - {text}"),
             token_estimate: estimate_tokens(&text) + 8,
             expansion_handle: format!("memory:{memory_id}"),
             provenance: vec![ProvenanceRef {
@@ -2415,10 +2428,20 @@ fn scope_weight(scope: &str) -> f32 {
     match scope.parse::<MemoryScope>() {
         Ok(MemoryScope::Run) => 1.0,
         Ok(MemoryScope::Repo) => 0.9,
-        Ok(MemoryScope::Project) => 0.7,
-        Ok(MemoryScope::GlobalUser) => 0.5,
+        Ok(MemoryScope::Project) | Ok(MemoryScope::Session) | Ok(MemoryScope::Skill) => 0.7,
+        Ok(MemoryScope::GlobalUser) | Ok(MemoryScope::Org) => 0.5,
         Err(_) => 0.3,
     }
+}
+
+/// A memory capsule's summary prefix is its retrieval label (`repo:fact - …`).
+/// Non-memory capsules are repo-file or manifest evidence.
+fn capsule_on_mounts(capsule: &ContextCapsule, mounts: &[MountLevel]) -> bool {
+    if capsule.kind != "memory" {
+        return mounts.contains(&MountLevel::Repo);
+    }
+    let label = capsule.summary.split(':').next().unwrap_or("");
+    mount_of_stored(label).is_some_and(|level| mounts.contains(&level))
 }
 
 fn freshness(created_at: &str) -> f32 {

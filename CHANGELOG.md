@@ -9,6 +9,12 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+### Changed
+
+- Local mounts follow ADR 0001 F0. New memory events store `repo` when the caller sends `project`; retrieval still reads stored `project` rows and labels them `repo`. `session`, `org`, and `skill` are real levels on the durable event. Similarity merge does not collapse `project` into `repo`.
+- `kimetsu_brain_cite` takes `outcome`: `helped`, `noop`, or `harmed`. An omitted outcome is `noop` and does not increase usefulness. Only `helped` may. A successful run no longer adds the +0.1 passenger bump. `harmed` removes the memory from injection until restore or supersede.
+- Pack replace retires only the named mount (and alias-window `project` rows when the mount is `repo`). `run` and session resume text stay out of export. Directory sync allowlist is unchanged.
+
 ## v2.10.0: Conservative proactive recall and stateless remote storage
 
 ### Added

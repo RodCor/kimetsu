@@ -255,11 +255,12 @@ fn hardening_exposure_no_invention_stale_feedback_and_unknown_outcome() {
                 &root,
                 &exposure.event_id.to_string(),
                 "unknown",
-                None
+                None,
+                None,
             )
             .is_err()
         );
-        project::record_exposure_citation(&root, &exposure.event_id.to_string(), &id, None)
+        project::record_exposure_citation(&root, &exposure.event_id.to_string(), &id, None, None)
             .unwrap();
         let (_, _, c) = project::load_project(&root).unwrap();
         assert_eq!(
@@ -314,7 +315,8 @@ fn hardening_exposure_no_invention_stale_feedback_and_unknown_outcome() {
             json!({"memory_ids":[id],"memory_revisions":{id.clone():revision}}),
         );
         project::record_context_exposure(&root, &current).unwrap();
-        project::record_exposure_citation(&root, &current.event_id.to_string(), &id, None).unwrap();
+        project::record_exposure_citation(&root, &current.event_id.to_string(), &id, None, None)
+            .unwrap();
         assert_eq!(
             project::record_exposure_outcome(&root, &current.event_id.to_string(), Some(true))
                 .unwrap(),

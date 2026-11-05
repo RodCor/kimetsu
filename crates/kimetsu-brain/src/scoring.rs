@@ -8,7 +8,7 @@
 //! | constant | value | applied in |
 //! |---|---|---|
 //! | [`CITED_DELTA`] | ±1.0 | projector, on run terminal events |
-//! | [`PASSENGER_DELTA`] | ±0.1 | projector, on run terminal events |
+//! | [`PASSENGER_DELTA`] | −0.1 on failure; 0 on success | projector, on run terminal events |
 //! | [`FAILURE_PENALTY_CITES_DIVISOR`] | 3.0 | projector, cited-in-failed-run scaling |
 //! | [`CONF_ALPHA`] | 0.05 | projector, confidence calibration |
 //! | [`USEFULNESS_BOOST_CAP`] | 0.10 | broker ranking (context) |
@@ -25,11 +25,11 @@
 /// [`FAILURE_PENALTY_CITES_DIVISOR`]) when it fails for a non-Gate reason.
 pub(crate) const CITED_DELTA: f64 = 1.0;
 
-/// Weak usefulness delta for silent passengers — retrieved into context but
-/// never cited. Deliberately small: without citation evidence we should not
-/// claim the memory helped (or hurt) much. A pure silent passenger's ratio
-/// bottoms out at `-0.1`, which can never cross the prune floor of `-0.2` —
-/// only repeated cited failures can make a memory prunable.
+/// Weak usefulness delta for silent passengers on a failed run.
+///
+/// F0 removes the upward `+0.1` nudge on `run.finished`. A passenger that
+/// was only retrieved must not become more useful. The failure side stays
+/// `-0.1`, which still cannot cross the prune floor of `-0.2` by itself.
 pub(crate) const PASSENGER_DELTA: f64 = 0.1;
 
 /// v2.5.1: cited-in-failure penalty scaling. The effective penalty is
