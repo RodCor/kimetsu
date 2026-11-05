@@ -300,6 +300,7 @@ mod tests {
                 &a.event_id.to_string(),
                 &mid,
                 Some("used"),
+                None,
             )
             .unwrap();
             let eval = build_personal_eval(&conn, 1800).unwrap();

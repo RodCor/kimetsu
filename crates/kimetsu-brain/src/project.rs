@@ -5,7 +5,7 @@ use kimetsu_core::config::ProjectConfig;
 use kimetsu_core::env_file::resolve_env_value;
 use kimetsu_core::event::Event;
 use kimetsu_core::ids::RunId;
-use kimetsu_core::memory::{MemoryKind, MemoryScope, normalize_memory_text};
+use kimetsu_core::memory::{MemoryKind, MemoryScope, mount_stored_scopes, normalize_memory_text};
 use kimetsu_core::paths::{ProjectPaths, default_project_id};
 use kimetsu_core::{KIMETSU_CONFIG_VERSION, KimetsuResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -762,6 +762,33 @@ pub struct BatchMemoryEntry {
 /// uniform case; the value only matters once outcomes differentiate memories.
 const DIRECT_ADD_CONFIDENCE: f32 = 0.85;
 
+fn duplicate_on_mount(
+    conn: &Connection,
+    scope: MemoryScope,
+    kind: &MemoryKind,
+    normalized: &str,
+) -> KimetsuResult<Option<String>> {
+    let scopes = mount_stored_scopes(scope.mount());
+    let marks = (0..scopes.len())
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT memory_id FROM memories
+         WHERE kind = ?1 AND normalized_text = ?2
+           AND invalidated_at IS NULL
+           AND superseded_by IS NULL
+           AND scope IN ({marks})
+         LIMIT 1"
+    );
+    let mut values = vec![kind.to_string(), normalized.to_string()];
+    values.extend(scopes.iter().copied().map(str::to_string));
+    let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|value| value as _).collect();
+    conn.query_row(&sql, refs.as_slice(), |row| row.get(0))
+        .optional()
+        .map_err(Into::into)
+}
+
 pub fn add_memory(
     start: &Path,
     scope: MemoryScope,
@@ -780,6 +807,21 @@ pub fn add_memory_with_validity(
     text: &str,
     valid_from: Option<&str>,
     valid_to: Option<&str>,
+) -> KimetsuResult<String> {
+    add_memory_for_lane(start, scope, kind, text, valid_from, valid_to, None)
+}
+
+/// Like [`add_memory_with_validity`], and stamps `session_id` on the durable
+/// event when the mount is `session`. Session rows live in the project
+/// database, distinguished by level.
+pub fn add_memory_for_lane(
+    start: &Path,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    text: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+    session_id: Option<&str>,
 ) -> KimetsuResult<String> {
     // v0.4.5: redact secrets at the ingest boundary. The redaction
     // pipeline catches Anthropic/OpenAI/GitHub/AWS/Slack/Google
@@ -838,7 +880,7 @@ pub fn add_memory_with_validity(
 
     let embedder = embeddings::open_embedder_for(config.embedder.enabled);
     add_memory_inner(
-        &conn, &paths, &config, scope, kind, text, valid_from, valid_to, embedder,
+        &conn, &paths, &config, scope, kind, text, valid_from, valid_to, session_id, embedder,
     )
 }
 
@@ -860,30 +902,18 @@ fn add_memory_inner(
     text: &str,
     valid_from: Option<&str>,
     valid_to: Option<&str>,
+    session_id: Option<&str>,
     embedder: &dyn embeddings::Embedder,
 ) -> KimetsuResult<String> {
     let run_id = RunId::new();
     let memory_id = Ulid::new().to_string();
     let normalized = normalize_memory_text(text);
 
-    // MP-17 #14: dedup. If an ACTIVE memory with the same scope + kind +
-    // normalized text already exists, return its ID without writing a
-    // duplicate. The scope/kind tuple keeps task-specific duplicates
-    // separate from global ones; the normalized form makes minor
-    // whitespace / punctuation differences collapse to the same row.
-    let existing: Option<String> = conn
-        .query_row(
-            "
-            SELECT memory_id FROM memories
-            WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
-              AND invalidated_at IS NULL
-              AND superseded_by IS NULL
-            LIMIT 1
-            ",
-            rusqlite::params![scope.to_string(), kind.to_string(), normalized],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
+    // Dedup is per mount, not per stored string. A `project` row and a new
+    // `repo` write are the same mount, so the second record returns the
+    // existing id and does not mint another accepted row. The existing
+    // row's stored scope is left as it is.
+    let existing = duplicate_on_mount(conn, scope, &kind, &normalized)?;
     if let Some(existing_id) = existing {
         return Ok(existing_id);
     }
@@ -920,13 +950,20 @@ fn add_memory_inner(
             "config_hash": config_hash(&paths.project_toml)?,
         }),
     );
+    let mut provenance = crate::packs::build_provenance(run_id, text);
+    if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
+        if let Some(obj) = provenance.as_object_mut() {
+            obj.insert("session_id".into(), serde_json::json!(session_id));
+        }
+    }
     let accepted = Event::new(
         run_id,
         "memory.accepted",
         serde_json::json!({
             "proposal_id": null,
             "memory_id": memory_id,
-            "scope": scope.to_string(),
+            "scope": scope.stored_level(),
+            "session_id": session_id,
             "kind": kind.to_string(),
             "text": text,
             "normalized_text": normalized,
@@ -934,7 +971,7 @@ fn add_memory_inner(
             "initial_usefulness": initial_kind_weight,
             "valid_from": valid_from,
             "valid_to": valid_to,
-            "provenance_snapshot": build_provenance(run_id, text),
+            "provenance_snapshot": provenance,
         }),
     );
 
@@ -1002,6 +1039,7 @@ fn add_memory_inner(
     // v2.5 Pass B (Story 1.3): when resolve_conflicts is also enabled, run
     // auto-resolution: clear winners (confidence×recency gap ≥ 0.15) have
     // the loser's valid_to stamped; near-ties go to the queue.
+    let stored_scope = scope.stored_level().parse::<MemoryScope>().unwrap_or(scope);
     if conflict::conflict_detection_enabled(config.ingestion.detect_conflicts) {
         // Fetch the created_at timestamp of the newly-written memory for
         // scoring (needed by resolve_conflicts).  We read it back from the DB
@@ -1024,7 +1062,7 @@ fn add_memory_inner(
             let (auto_resolved, queued) = conflict::detect_record_and_resolve_with_vec(
                 conn,
                 &memory_id,
-                &scope,
+                &stored_scope,
                 &kind.to_string(),
                 text,
                 embedding_vec.as_deref(),
@@ -1049,7 +1087,7 @@ fn add_memory_inner(
             let conflicts = conflict::detect_and_record_with_vec(
                 conn,
                 &memory_id,
-                &scope,
+                &stored_scope,
                 &kind.to_string(),
                 text,
                 embedding_vec.as_deref(),
@@ -1202,6 +1240,7 @@ pub fn add_memories_batch(
             text,
             entry.valid_from.as_deref(),
             entry.valid_to.as_deref(),
+            None,
             embedder,
         )?;
         ids.push(id);
@@ -1258,7 +1297,7 @@ pub fn propose_memory_with_validity(
         "memory.proposed",
         serde_json::json!({
             "proposal_id": proposal_id,
-            "scope": scope.to_string(),
+            "scope": scope.stored_level(),
             "kind": kind.to_string(),
             "text": text,
             "rationale": rationale,
@@ -1322,17 +1361,7 @@ pub fn propose_or_merge_memory_with_validity(
     {
         let (_, _, ro_conn) = load_project_readonly(start)?;
         let normalized = normalize_memory_text(text);
-        let existing: Option<String> = ro_conn
-            .query_row(
-                "SELECT memory_id FROM memories
-                 WHERE scope = ?1 AND kind = ?2 AND normalized_text = ?3
-                   AND invalidated_at IS NULL
-                   AND superseded_by IS NULL
-                 LIMIT 1",
-                rusqlite::params![scope.to_string(), kind.to_string(), normalized],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let existing = duplicate_on_mount(&ro_conn, scope, &kind, &normalized)?;
         if let Some(id) = existing {
             return Ok(ProposeResult::Duplicate(id));
         }
@@ -1997,6 +2026,62 @@ pub struct UndoneMemory {
     pub text: String,
     pub scope: String,
     pub kind: String,
+}
+
+/// Replace one memory with another on the same mount.
+///
+/// Writes `memory.superseded` naming the successor. Repeating the same pair
+/// is success and does not chain a second successor. Cross-mount pairs error.
+/// Stored scope strings are not rewritten, including the `project`/`repo` alias.
+pub fn supersede_memory(start: &Path, predecessor: &str, successor: &str) -> KimetsuResult<()> {
+    if predecessor == successor {
+        return Err("supersede requires a distinct successor".into());
+    }
+    let (paths, config, conn) = load_project(start)?;
+    let run_id = RunId::new();
+    let _lock = ProjectLock::acquire(&paths, "memory supersede", Some(run_id))?;
+    let load = |id: &str| -> KimetsuResult<(String, Option<String>)> {
+        conn.query_row(
+            "SELECT scope, superseded_by FROM memories
+             WHERE memory_id = ?1 AND invalidated_at IS NULL",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("missing memory {id}").into()
+        })
+    };
+    let (pred_scope, pred_super) = load(predecessor)?;
+    let (succ_scope, _) = load(successor)?;
+    if !kimetsu_core::memory::same_mount_stored(&pred_scope, &succ_scope) {
+        return Err("supersede requires both memories on one mount".into());
+    }
+    if let Some(existing) = pred_super {
+        if existing == successor {
+            return Ok(());
+        }
+        return Err("memory already has a different successor".into());
+    }
+    let superseded = Event::new(
+        run_id,
+        "memory.superseded",
+        serde_json::json!({
+            "memory_id": predecessor,
+            "survivor_id": successor,
+            "use_count_delta": 0,
+            "score_delta": 0.0,
+            "level": pred_scope,
+        }),
+    );
+    projector::apply_events(
+        &conn,
+        &[
+            admin_started_event(&paths, &config, run_id, "memory supersede")?,
+            superseded,
+            admin_finished_event(run_id),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Record a durable correction to an active memory. Text changes reset
@@ -2758,6 +2843,7 @@ mod tests {
                             "memory_id": memory_id,
                             "turn": 3,
                             "rationale": "using rg from memory",
+                            "outcome": "helped",
                         }),
                     ),
                     Event::new(
@@ -2788,10 +2874,8 @@ mod tests {
         });
     }
 
-    /// v0.5.1: silent-passenger path. A memory that was retrieved
-    /// (in context.injected) but the model never cited gets the
-    /// weak +0.1 delta on run.finished, not the full +1.0.
-    /// Encourages the model to actually call `cite_memory`.
+    /// A retrieved memory the model never cited does not gain usefulness
+    /// when the run succeeds. F0 removed the +0.1 passenger nudge.
     #[test]
     fn run_finished_gives_weak_signal_to_silent_passenger_memories() {
         with_user_brain_disabled(|| {
@@ -2842,9 +2926,9 @@ mod tests {
             let memories = list_memories(&root).expect("list memories");
             let m = memories.iter().find(|m| m.memory_id == memory_id).unwrap();
             assert_eq!(m.use_count, 1);
-            // Flagship 2 / Story 2.1: memory starts with initial_kind_weight = 0.05
-            // (Preference) and earns +0.1 weak delta on run.finished → 0.15.
-            let expected = 0.1 + 0.05; // 0.1 weak delta + Preference kind weight
+            // F0: a silent passenger on success no longer earns +0.1.
+            // Preference kind weight stays 0.05.
+            let expected = 0.05;
             assert!(
                 (m.usefulness_score - expected).abs() < 1e-4,
                 "silent passenger should get +0.1 on top of seed, got {}",
@@ -4942,17 +5026,17 @@ max_total_cost_usd = 250.0
             .expect("export filtered");
             assert_eq!(
                 filtered.len(),
-                2,
-                "must return only the 2 project-scope failure_patterns, got: {filtered:?}"
+                3,
+                "project is the repo mount, so stored repo rows are included, got: {filtered:?}"
             );
-            assert!(filtered.iter().all(|e| e.scope == "project"));
+            assert!(filtered.iter().all(|e| e.scope == "repo"));
             assert!(filtered.iter().all(|e| e.kind == "failure_pattern"));
 
-            // Scope-only filter: all project memories
+            // Scope-only filter: every memory written through the repo mount.
             let (scope_only, _) =
                 export_memories(&root, Some(MemoryScope::Project), None, false, false)
                     .expect("scope filter");
-            assert_eq!(scope_only.len(), 3, "3 project-scope memories total");
+            assert_eq!(scope_only.len(), 4, "repo mount holds all four new rows");
 
             // Kind-only filter: all failure_patterns (project + repo)
             let (kind_only, _) =
@@ -5353,7 +5437,7 @@ max_total_cost_usd = 250.0
                 let (_p, _c, conn) = load_project_readonly(&root_b).expect("ro2");
                 conn.query_row(
                     "SELECT COUNT(*) FROM memories
-                     WHERE scope='project' AND invalidated_at IS NULL AND superseded_by IS NULL",
+                     WHERE scope IN ('repo','project') AND invalidated_at IS NULL AND superseded_by IS NULL",
                     [],
                     |r| r.get::<_, i64>(0),
                 )

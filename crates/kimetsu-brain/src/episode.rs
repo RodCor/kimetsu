@@ -344,8 +344,63 @@ pub fn render_resume_context_scoped(workspace: &Path, identity: &str) -> Option<
     let repo_root = paths.repo_root.to_string_lossy().to_string();
     let episode = load_live_episode_scoped(&conn, &repo_root, identity)
         .ok()
-        .flatten()?;
-    Some(format_episode_for_context(&episode))
+        .flatten();
+    let session_lines = session_lane_lines(&conn, identity);
+    if episode.is_none() && session_lines.is_empty() {
+        return None;
+    }
+    let mut text = episode
+        .as_ref()
+        .map(format_episode_for_context)
+        .unwrap_or_default();
+    if !session_lines.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("Session lane:\n");
+        text.push_str(&session_lines.join("\n"));
+    }
+    Some(text)
+}
+
+/// Session-scoped memories stay on the resume lane. They are not repo digest
+/// input. When `identity` is set, only that session's rows are included.
+fn session_lane_lines(conn: &Connection, identity: &str) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT text, provenance_snapshot_json FROM memories
+         WHERE scope = 'session'
+           AND invalidated_at IS NULL
+           AND superseded_by IS NULL
+         ORDER BY created_at DESC
+         LIMIT 8",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|(text, provenance)| {
+            if identity.is_empty() {
+                return Some(text);
+            }
+            let session_id = serde_json::from_str::<serde_json::Value>(&provenance)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("session_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                });
+            match session_id.as_deref() {
+                Some(id) if id == identity => Some(text),
+                Some(_) => None,
+                None => None,
+            }
+        })
+        .collect()
 }
 
 /// Format an episode row as the resume context string.

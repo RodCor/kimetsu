@@ -240,6 +240,7 @@ pub fn record_helpful_mark_scoped(
                 exposure_id,
                 id,
                 Some("marked helpful via ask"),
+                Some("helped"),
             );
         }
     }

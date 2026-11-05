@@ -6,7 +6,7 @@ use std::path::Path;
 
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::ids::RunId;
-use kimetsu_core::memory::{MemoryKind, MemoryScope};
+use kimetsu_core::memory::{MemoryKind, MemoryScope, mount_stored_scopes};
 use rusqlite::params;
 
 use crate::project::{add_memory, invalidate_memory, load_project, load_project_readonly};
@@ -305,53 +305,45 @@ pub fn export_memories(
     redact: bool,
     redact_tags: bool,
 ) -> KimetsuResult<(Vec<MemoryExport>, ScrubReport)> {
-    // Build the SQL dynamically based on the optional filters, including
-    // `created_at` so the JSON record carries the origin timestamp.
-    let (sql, params_vec): (&str, Vec<String>) = match (scope.as_ref(), kind.as_ref()) {
-        (Some(s), Some(k)) => (
-            "SELECT scope, kind, text, confidence, created_at
-             FROM memories
-             WHERE invalidated_at IS NULL
-               AND superseded_by IS NULL
-               AND lower(scope) = lower(?1)
-               AND lower(kind)  = lower(?2)
-             ORDER BY created_at DESC",
-            vec![s.to_string(), k.to_string()],
-        ),
-        (Some(s), None) => (
-            "SELECT scope, kind, text, confidence, created_at
-             FROM memories
-             WHERE invalidated_at IS NULL
-               AND superseded_by IS NULL
-               AND lower(scope) = lower(?1)
-             ORDER BY created_at DESC",
-            vec![s.to_string()],
-        ),
-        (None, Some(k)) => (
-            "SELECT scope, kind, text, confidence, created_at
-             FROM memories
-             WHERE invalidated_at IS NULL
-               AND superseded_by IS NULL
-               AND lower(kind) = lower(?1)
-             ORDER BY created_at DESC",
-            vec![k.to_string()],
-        ),
-        (None, None) => (
-            "SELECT scope, kind, text, confidence, created_at
-             FROM memories
-             WHERE invalidated_at IS NULL
-               AND superseded_by IS NULL
-             ORDER BY created_at DESC",
-            vec![],
-        ),
-    };
+    if matches!(scope, Some(MemoryScope::Run) | Some(MemoryScope::Session)) {
+        return Err("export_pack refuses run and session mounts".into());
+    }
+    // `created_at` rides in the JSON so an import can keep origin order.
+    // Unfiltered export still drops run telemetry and session resume text.
+    // A named repo mount also reads alias-window `project` rows, and the
+    // exported `scope` string stays the stored value.
+    let mut params_vec: Vec<String> = Vec::new();
+    let mut sql = String::from(
+        "SELECT scope, kind, text, confidence, created_at
+         FROM memories
+         WHERE invalidated_at IS NULL
+           AND superseded_by IS NULL",
+    );
+    if let Some(scope) = scope {
+        let stored = mount_stored_scopes(scope.mount());
+        let marks = (0..stored.len())
+            .map(|index| {
+                params_vec.push(stored[index].to_string());
+                format!("?{}", params_vec.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND lower(scope) IN ({marks})"));
+    } else {
+        sql.push_str(" AND lower(scope) NOT IN ('run', 'session')");
+    }
+    if let Some(kind) = kind {
+        params_vec.push(kind.to_string());
+        sql.push_str(&format!(" AND lower(kind) = lower(?{})", params_vec.len()));
+    }
+    sql.push_str(" ORDER BY created_at DESC");
 
     // Project-level memories only (user brain memories live in a separate DB;
     // callers wanting the user brain should call with scope=GlobalUser on the
     // user-brain path, or simply use list_memories which merges both).
     let (_paths, _config, conn) = load_project(start)?;
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let refs: Vec<&dyn rusqlite::ToSql> = params_vec
         .iter()
         .map(|s| s as &dyn rusqlite::ToSql)
@@ -608,6 +600,26 @@ pub fn import_pack(
     pack: Option<&PackRef>,
     quarantine: bool,
 ) -> KimetsuResult<ImportSummary> {
+    if replace && quarantine {
+        return Err("replace and quarantine cannot be combined".into());
+    }
+    if let Some(dest) = scope_override {
+        for entry in entries {
+            let parsed = entry.scope.parse::<MemoryScope>().map_err(
+                |err| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("unparsable entry scope: {err}").into()
+                },
+            )?;
+            if parsed.mount() != dest.mount() {
+                return Err(format!(
+                    "scope mismatch: entry scope {} is outside destination {}",
+                    entry.scope,
+                    dest.mount()
+                )
+                .into());
+            }
+        }
+    }
     let mut superseded = 0usize;
     if replace {
         let scopes = pack_target_scopes(entries, scope_override);
@@ -681,14 +693,20 @@ fn active_memory_ids_in_scopes(start: &Path, scopes: &[MemoryScope]) -> KimetsuR
     }
     let (_p, _c, conn) = load_project_readonly(start)?;
     let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for sc in scopes {
-        let mut stmt = conn.prepare(
-            "SELECT memory_id FROM memories
-             WHERE scope = ?1 AND invalidated_at IS NULL AND superseded_by IS NULL",
-        )?;
-        let rows = stmt.query_map(params![sc.to_string()], |r| r.get::<_, String>(0))?;
-        for r in rows {
-            ids.push(r?);
+        for stored in mount_stored_scopes(sc.mount()) {
+            let mut stmt = conn.prepare(
+                "SELECT memory_id FROM memories
+                 WHERE scope = ?1 AND invalidated_at IS NULL AND superseded_by IS NULL",
+            )?;
+            let rows = stmt.query_map(params![stored], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let id = row?;
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                }
+            }
         }
     }
     Ok(ids)

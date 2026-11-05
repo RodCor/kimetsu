@@ -270,7 +270,7 @@ fn skills_block(workspace: &Path) -> Option<String> {
 ///
 /// Best-effort: an unreadable brain means no preferences block, never a failed
 /// warm start.
-fn user_profile_block(workspace: &Path) -> Option<String> {
+pub(crate) fn user_profile_block(workspace: &Path) -> Option<String> {
     let (_paths, config, conn) = load_project_readonly(workspace).ok()?;
     // The cross-project user brain is opened separately; when it is disabled or
     // unreachable the project's own preferences stand on their own.
@@ -376,6 +376,7 @@ fn gather_inputs(conn: &Connection, repo_root: &str) -> KimetsuResult<DigestInpu
                AND (valid_from IS NULL OR julianday(valid_from) <= julianday('now'))
                AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))
                AND kind != 'preference'
+               AND scope IN ('repo', 'project', 'repository')
              ORDER BY
                CASE WHEN use_count > 0
                     THEN (usefulness_score / CAST(use_count AS REAL))

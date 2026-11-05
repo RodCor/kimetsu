@@ -134,14 +134,25 @@ fn load_exposure(
     ))
 }
 
-/// Record reliance on exactly one delivered claim. This does not verify truth
-/// or credit success. Repeated citations for an exposure/memory are idempotent.
+/// Record reliance on exactly one delivered claim.
+///
+/// `outcome` is `helped`, `noop`, or `harmed`. Omitted means `noop` and does
+/// not increase usefulness. The same triple twice is success with no second
+/// delta. A different outcome for the same exposure and memory is a conflict.
+/// The memory's stored level is copied onto the event and is not rewritten.
 pub fn record_exposure_citation(
     start: &Path,
     exposure_id: &str,
     memory_id: &str,
     note: Option<&str>,
+    outcome: Option<&str>,
 ) -> KimetsuResult<()> {
+    let outcome = match outcome.unwrap_or("noop") {
+        "helped" | "noop" | "harmed" => outcome.unwrap_or("noop"),
+        other => {
+            return Err(format!("outcome must be helped, noop, or harmed (got {other})").into());
+        }
+    };
     let (paths, _, conn) = load_project(start)?;
     let _lock = ProjectLock::acquire(&paths, "exposure citation", None)?;
     projector::with_write_txn(&conn, |conn| {
@@ -156,14 +167,48 @@ pub fn record_exposure_citation(
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or("delivered claim is unbound")?;
-        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='memory.cited' AND json_extract(payload_json,'$.exposure_id')=?1 AND json_extract(payload_json,'$.memory_id')=?2)",rusqlite::params![exposure_id,memory_id],|r|r.get(0))?;
-        if exists {
-            return Ok(());
+        let home: Option<(String, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT scope, invalidated_at, superseded_by FROM memories WHERE memory_id = ?1",
+                [memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (stored_scope, invalidated, superseded) = home.ok_or("memory is not accepted")?;
+        if invalidated.is_some() || superseded.is_some() {
+            return Err("memory is not accepted".into());
         }
+        let previous: Option<Option<String>> = conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.outcome') FROM events
+                 WHERE kind = 'memory.cited'
+                   AND json_extract(payload_json, '$.exposure_id') = ?1
+                   AND json_extract(payload_json, '$.memory_id') = ?2
+                 LIMIT 1",
+                rusqlite::params![exposure_id, memory_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            let previous = previous.unwrap_or_else(|| "noop".to_string());
+            if previous == outcome {
+                return Ok(());
+            }
+            return Err("conflicting cite outcome for this exposure and memory".into());
+        }
+        let level = kimetsu_core::memory::retrieval_label(&stored_scope);
         let event = Event::new(
             run,
             "memory.cited",
-            serde_json::json!({"memory_id":memory_id,"revision_event_id":revision,"exposure_id":exposure_id,"rationale":note,"evidence_kind":"reliance"}),
+            serde_json::json!({
+                "memory_id": memory_id,
+                "revision_event_id": revision,
+                "exposure_id": exposure_id,
+                "rationale": note,
+                "evidence_kind": "reliance",
+                "outcome": outcome,
+                "level": level,
+            }),
         );
         projector::apply_event(conn, &event)
     })
