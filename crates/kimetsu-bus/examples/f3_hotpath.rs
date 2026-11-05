@@ -9,7 +9,9 @@
 //! Prints hardware, corpus size, and cold versus warm next to every figure.
 //! The `context` timer is local FTS with embeddings, the reranker, and the
 //! network left out. The `request_pack` timer stops when the pack is verified
-//! in memory. It does not import and does not rebuild FTS. Relay-down and
+//! in memory. It does not import and does not rebuild FTS. That timer is
+//! loopback: both endpoints on this host, dialed at `127.0.0.1`. ADR §7 asks
+//! for direct LAN QUIC. That LAN measurement is still pending. Relay-down and
 //! relay-up samples are separate `context` runs.
 
 use std::fs::File;
@@ -88,8 +90,9 @@ network on context: none
 cold context: {cold_ms:.3} ms (posix_fadvise DONTNEED, then the first call)
 warm context, relay down: n={n} p50={p50:.3} ms p99={p99:.3} ms max={max:.3} ms
 warm context, relay up: n={n2} p50={p50b:.3} ms p99={p99b:.3} ms max={maxb:.3} ms ({presence_note})
-request_pack direct QUIC until verified in memory: n={qn} p50={qp50:.3} ms p99={qp99:.3} ms max={qmax:.3} ms
-pack: {pack_bytes} gzip bytes, {pack_rows} memories, relay disabled, loopback direct address
+request_pack direct QUIC until verified in memory: loopback, both endpoints on this host, dialed at 127.0.0.1. n={qn} p50={qp50:.3} ms p99={qp99:.3} ms max={qmax:.3} ms
+pack: {pack_bytes} gzip bytes, {pack_rows} memories, relay disabled
+§7 direct LAN QUIC measurement: still pending. This run does not report a LAN number.
 import and FTS rebuild: not included in the request_pack timer
 ",
         hw = hardware.summary(),

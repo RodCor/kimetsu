@@ -24,12 +24,12 @@ The acceptance row is the warm sample. Cold is reported beside it and is not the
 | Path | Budget | Result | Verdict |
 | --- | --- | --- | --- |
 | Local `context`, warm FTS, no embeddings, no reranker, no network | p99 of a few milliseconds | relay down: n=200, p50 3.964 ms, p99 **4.226 ms**, max 4.274 ms | pass |
-| `request_pack` of a small pack over direct QUIC, until verified in memory | around 100 ms | n=30, p50 1.198 ms, p99 **1.482 ms**, max 1.482 ms. Pack is 396 gzip bytes, 8 memories. Relay disabled. Both endpoints on this host, dialed at `127.0.0.1`. Import and FTS rebuild are not in the timer | pass |
+| `request_pack` of a small pack over direct QUIC, until verified in memory | §7 budget is around 100 ms on direct LAN QUIC | Loopback only: n=30, p50 1.198 ms, p99 **1.482 ms**, max 1.482 ms. Pack is 396 gzip bytes, 8 memories. Relay disabled. Both endpoints on this host, dialed at `127.0.0.1`. Import and FTS rebuild are not in the timer. This is not the §7 LAN topology. The LAN measurement is still pending | pending |
 | Presence off versus on for `context` | a down relay does not change local recall latency | relay up, after the in-process relay reported connected: n=200, p50 3.975 ms, p99 **4.999 ms**, max 5.357 ms. p99 delta versus relay down is 0.773 ms | pass |
 
 `context` does not dial the relay in either sample. The relay-up process was connected and then left running only so the comparison includes a live relay. Stopping it is the relay-down sample above.
 
-This host has one machine. The QUIC figure is direct loopback, not a second LAN host, and it does not include a relay hop, a failed hole-punch, or an FTS rebuild. Signature verification is inside the timer.
+This host has one machine. The `request_pack` p99 above is direct loopback: both endpoints on this host, dialed at `127.0.0.1`. It is not the §7 measurement of direct LAN QUIC between two LAN hosts. That LAN measurement is still pending. No LAN number is reported here. The loopback sample does not include a relay hop, a failed hole-punch, or an FTS rebuild. Signature verification is inside the timer.
 
 ## Journal and lock scope
 
@@ -39,6 +39,6 @@ Announce persistence is a JSON file, not `brain.db` and not the FTS index. Recor
 
 ## Phase
 
-The hot path meets the §7 budgets on this host. The phase is not left open. No presence work was moved onto `context`, and no model was called to produce these numbers.
+The warm local `context` rows meet their §7 budgets on this host. The §7 `request_pack` row is direct LAN QUIC, and that measurement is still pending; the p99 in the table is the loopback sample above. No presence work was moved onto `context`, and no model was called to produce these numbers.
 
 Remote checkpoint limits stay 64 MiB compressed, 256 MiB decoded, and 2,000,000 rows. The per-request SQLite file stays a disposable projection. Remote does not dial the bus. See [remote-storage.md](../remote-storage.md) and [remote-namespace-roster.md](../operators/remote-namespace-roster.md).
