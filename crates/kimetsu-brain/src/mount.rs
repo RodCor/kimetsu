@@ -249,6 +249,7 @@ pub fn import_pack(
 /// `export_pack` version 2. Scrub runs before the canonical body is hashed.
 /// `--strict` / `strict` aborts when the scrub report is non-empty and does
 /// not sign. `run` and `session` are not emitted.
+#[allow(clippy::too_many_arguments)]
 pub fn export_signed_pack(
     start: &Path,
     grants: &MountGrants,
