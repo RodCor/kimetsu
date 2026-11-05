@@ -3,7 +3,7 @@
 //! Hole-punch is iroh's path selection. It runs when a relay is configured
 //! and [`BusEndpoint::online`] has observed a relay connection. The relay
 //! sees ciphertext. Pack bytes are verified with the F1 verifier and then
-//! imported by [`kimetsu_brain::mount::import_signed_pack`].
+//! imported by [`kimetsu_sdk::import_signed_pack`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,10 +20,10 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_relay::tls::CaTlsConfig;
-use kimetsu_brain::mount::{self, MountGrants};
 use kimetsu_brain::packs::ImportSummary;
 use kimetsu_brain::signed_pack::{self, PackManifest, PackSigner, TrustStore};
 use kimetsu_core::memory::MountLevel;
+use kimetsu_sdk::MountGrants;
 
 /// Where this endpoint sends relayed ciphertext.
 ///
@@ -63,6 +63,16 @@ pub struct PackRequest {
     pub grants: MountGrants,
     pub trust: TrustStore,
     pub brain: PathBuf,
+}
+
+/// Signed pack bytes after QUIC delivery and in-memory verification.
+/// Import has not run.
+#[derive(Debug, Clone)]
+pub struct FetchedPack {
+    pub gzip: Vec<u8>,
+    pub digest_hex: String,
+    pub signer_hex: String,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -265,39 +275,20 @@ impl BusEndpoint {
         Ok(dialed.announcements)
     }
 
-    /// Dial a roster member, require an announcement for `digest`, verify,
-    /// then [`mount::import_signed_pack`].
-    pub async fn request_pack(&self, request: PackRequest) -> Result<ImportSummary, String> {
-        self.ensure_member(request.peer.id)?;
-        if !self
-            .inner
-            .roster
-            .may_use_mount(self.inner.endpoint_id, request.destination)
-        {
-            return Err(format!(
-                "roster does not let this endpoint request {}",
-                request.destination
-            ));
-        }
-        if !self
-            .inner
-            .roster
-            .may_use_mount(request.peer.id, request.destination)
-        {
-            return Err(format!(
-                "roster does not let the peer serve {}",
-                request.destination
-            ));
-        }
-        if !request.grants.can_write(request.destination) {
-            return Err(format!("import requires write on {}", request.destination));
-        }
-        let digest = request.digest.trim().to_ascii_lowercase();
+    /// Dial a roster member, require an announcement for `digest`, and verify
+    /// the pack in memory. Does not import and does not rebuild FTS.
+    pub async fn fetch_verified(
+        &self,
+        peer: EndpointAddr,
+        digest: &str,
+    ) -> Result<FetchedPack, String> {
+        self.ensure_member(peer.id)?;
+        let digest = digest.trim().to_ascii_lowercase();
         if digest.len() != 64 {
             return Err("digest is not 64 hex chars".into());
         }
-        let peer_id = request.peer.id;
-        let dialed = self.round_trip(request.peer, Some(digest.clone())).await?;
+        let peer_id = peer.id;
+        let dialed = self.round_trip(peer, Some(digest.clone())).await?;
         let announced = dialed
             .announcements
             .iter()
@@ -325,11 +316,46 @@ impl BusEndpoint {
         {
             return Err("pack signer is not published by that endpoint".into());
         }
+        Ok(FetchedPack {
+            gzip,
+            digest_hex: verified.digest_hex,
+            signer_hex: verified.signer_hex,
+            scopes: verified.scopes,
+        })
+    }
+
+    /// Dial a roster member, verify, then [`kimetsu_sdk::import_signed_pack`].
+    pub async fn request_pack(&self, request: PackRequest) -> Result<ImportSummary, String> {
+        self.ensure_member(request.peer.id)?;
+        if !self
+            .inner
+            .roster
+            .may_use_mount(self.inner.endpoint_id, request.destination)
+        {
+            return Err(format!(
+                "roster does not let this endpoint request {}",
+                request.destination
+            ));
+        }
+        if !self
+            .inner
+            .roster
+            .may_use_mount(request.peer.id, request.destination)
+        {
+            return Err(format!(
+                "roster does not let the peer serve {}",
+                request.destination
+            ));
+        }
+        if !request.grants.can_write(request.destination) {
+            return Err(format!("import requires write on {}", request.destination));
+        }
+        let fetched = self.fetch_verified(request.peer, &request.digest).await?;
         // Signature and scope checks finish inside import_signed_pack, before SQL.
-        mount::import_signed_pack(
+        kimetsu_sdk::import_signed_pack(
             &request.brain,
             &request.grants,
-            &gzip,
+            &fetched.gzip,
             request.destination,
             false,
             false,

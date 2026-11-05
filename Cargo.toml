@@ -8,6 +8,7 @@ members = [
     "crates/kimetsu-core",
     "crates/kimetsu-e2e",
     "crates/kimetsu-remote",
+    "crates/kimetsu-sdk",
 ]
 resolver = "3"
 

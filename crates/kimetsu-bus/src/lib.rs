@@ -1,12 +1,12 @@
 //! ADR 0001 F2 memory bus.
 //!
 //! iroh carries announcements and `kimetsu_pack` 2 bytes. The store path is
-//! [`kimetsu_brain::mount::import_signed_pack`], the same function a local
-//! file uses. This crate does not reimplement merge, quarantine, scrub, or
-//! supersede.
+//! [`kimetsu_sdk::import_signed_pack`], the same function a local file uses.
+//! This crate does not reimplement merge, quarantine, scrub, or supersede.
 //!
 //! Presence is a side file and a side task. [`kimetsu_brain::mount::context`]
-//! and [`kimetsu_brain::mount::search`] do not call into this crate.
+//! and [`kimetsu_brain::mount::search`] do not call into this crate. Callers
+//! reach those reads through `kimetsu-sdk`.
 //!
 //! # Open-question picks
 //!
@@ -29,7 +29,7 @@ mod presence;
 pub mod protocol;
 mod roster;
 
-pub use endpoint::{BusEndpoint, BusRelay, BusStats, EndpointConfig, PackRequest};
+pub use endpoint::{BusEndpoint, BusRelay, BusStats, EndpointConfig, FetchedPack, PackRequest};
 pub use presence::PresenceStore;
 pub use protocol::{
     ALPN, Announcement, FrameKind, LEGAL_FRAME_NAMES, discovery_user_data, parse_frame_kind,

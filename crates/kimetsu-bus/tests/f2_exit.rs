@@ -794,3 +794,30 @@ impl ProtocolHandler for V1Handler {
         Ok(())
     }
 }
+
+#[tokio::test]
+async fn fetch_verified_stops_before_sql() {
+    let built = members(&[MountLevel::Repo], true);
+    let (server, client) = bind_pair(&built, BusRelay::Disabled, false).await;
+    let lesson = "F3_VERIFY_ONLY do not import";
+    let announcement = server
+        .publish_memories(
+            &manifest(),
+            &["repo".into()],
+            &[memory("repo", lesson)],
+            &built.signer,
+        )
+        .unwrap();
+    let root = brain_root("verify-only");
+    let before = counts(&root);
+    let fetched = client
+        .fetch_verified(server.direct_addr().await.unwrap(), &announcement.digest)
+        .await
+        .unwrap();
+    assert_eq!(fetched.digest_hex, announcement.digest);
+    assert!(!fetched.gzip.is_empty());
+    assert_eq!(counts(&root), before, "verify must not write the brain");
+    server.close().await;
+    client.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+}

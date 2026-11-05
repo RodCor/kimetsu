@@ -53,6 +53,7 @@ kimetsu-core = { path = "../kimetsu-core" }
 # safe: all graph code is behind `#[cfg(feature = "graph")]` and default config
 # still selects "flat". The local lean CLI never enables this path.
 kimetsu-brain = { path = "../kimetsu-brain", features = ["graph"] }
+kimetsu-sdk = { path = "../kimetsu-sdk" }
 kimetsu-chat = { path = "../kimetsu-chat" }
 tokio = { workspace = true, features = ["sync", "net"] }
 axum = "0.7"

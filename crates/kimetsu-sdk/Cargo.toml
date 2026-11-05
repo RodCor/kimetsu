@@ -1,0 +1,21 @@
+[package]
+name = "kimetsu-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "In-process Rust entry for the ADR 0001 store operations. Not @kimetsu-ai/sdk."
+keywords = ["kimetsu", "memory", "sdk"]
+categories = ["database"]
+
+[dependencies]
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
+
+[dev-dependencies]
+tempfile = "3"

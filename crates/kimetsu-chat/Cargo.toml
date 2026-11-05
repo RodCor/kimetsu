@@ -40,6 +40,7 @@ openclaw = ["dep:json5"]
 [dependencies]
 kimetsu-agent = { path = "../kimetsu-agent", version = "2.10.0" }
 kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
+kimetsu-sdk = { path = "../kimetsu-sdk", version = "2.10.0" }
 kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
 base64.workspace = true
 crossterm.workspace = true

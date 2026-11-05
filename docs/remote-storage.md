@@ -141,7 +141,16 @@ brains. `/tmp` must hold decoded projections and rebuilt indexes for simultaneou
 requests. Cold starts also pay model loading/download costs in semantic builds;
 model caches are disposable and never authoritative. Package model assets or
 provide initialization network access as needed. Lambda and API Gateway payload
-and time limits are independent of checkpoint limits.
+and time limits are independent of checkpoint limits. Remote does not dial the
+memory bus. A bearer token is not a pack signer. Binding a namespace to a roster
+is a manual operator record
+([remote-namespace-roster.md](operators/remote-namespace-roster.md)). The limits
+above are unchanged by that bind.
+
+Remote does not dial the memory bus. A bearer token is not a pack signer.
+Binding a namespace to a roster is a manual operator record; see
+[remote-namespace-roster.md](operators/remote-namespace-roster.md). The limits
+in this section are unchanged by that bind.
 
 ## Provider operations
 
