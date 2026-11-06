@@ -198,7 +198,7 @@ mod tests {
     use super::*;
     use crate::storage::{StoreResult, sqlite::SqliteStore};
     use async_trait::async_trait;
-    use kimetsu_core::memory::{MemoryKind, MemoryScope};
+    use kimetsu_core::memory::{MemoryKind, MountLevel};
 
     fn durable(store: Arc<dyn BrainStore>, org: bool) -> DurableState {
         let mut state = DurableState::new(store, org);
@@ -214,15 +214,20 @@ mod tests {
         for idx in 0..4 {
             let store = Arc::new(SqliteStore::open(path.clone(), "test").unwrap());
             tasks.push(tokio::spawn(async move {
+                let mut grants = kimetsu_sdk::MountGrants::default();
+                grants.allow_write(MountLevel::Repo);
                 durable(store, true)
                     .execute("one", "test/user:one".into(), move |root| {
-                        kimetsu_brain::project::add_memory(
+                        crate::store::record(
                             root,
-                            MemoryScope::Project,
+                            &grants,
+                            MountLevel::Repo,
                             MemoryKind::Convention,
                             &format!("Durable project marker number {idx}"),
+                            0.95,
+                            None,
                         )
-                        .map(|id| serde_json::json!({"id":id}))
+                        .map(|id| serde_json::json!({"id": format!("{id:?}")}))
                         .map_err(|e| e.to_string())
                     })
                     .await
@@ -247,11 +252,16 @@ mod tests {
         assert_eq!(rows, 4);
         fresh
             .execute("one", "test".into(), |root| {
-                kimetsu_brain::project::add_memory(
+                let mut grants = kimetsu_sdk::MountGrants::default();
+                grants.allow_write(MountLevel::User);
+                crate::store::record(
                     root,
-                    MemoryScope::GlobalUser,
+                    &grants,
+                    MountLevel::User,
                     MemoryKind::Convention,
                     "Shared Orchid port is 7319",
+                    0.95,
+                    None,
                 )
                 .map(|_| Value::Null)
                 .map_err(|e| e.to_string())
@@ -297,12 +307,18 @@ mod tests {
         let store = Arc::new(SqliteStore::open(home.path().join("authority.db"), "test").unwrap());
         let result = durable(Arc::new(RejectCommit(store.clone())), true)
             .execute("one", "test".into(), |root| {
-                for scope in [MemoryScope::Project, MemoryScope::GlobalUser] {
-                    kimetsu_brain::project::add_memory(
+                let mut grants = kimetsu_sdk::MountGrants::default();
+                grants.allow_write(MountLevel::Repo);
+                grants.allow_write(MountLevel::User);
+                for level in [MountLevel::Repo, MountLevel::User] {
+                    crate::store::record(
                         root,
-                        scope,
+                        &grants,
+                        level,
                         MemoryKind::Convention,
                         "Must never be acknowledged",
+                        0.95,
+                        None,
                     )
                     .map_err(|e| e.to_string())?;
                 }

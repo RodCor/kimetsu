@@ -1033,13 +1033,15 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
         _ => MemoryKind::Fact, // semantic_operator and default both stored as Fact
     };
 
-    match project::propose_or_merge_memory(
+    let grants = kimetsu_sdk::MountGrants::stdio_mcp(true);
+    match kimetsu_sdk::record(
         workspace,
-        MemoryScope::Repo,
+        &grants,
+        kimetsu_core::memory::MountLevel::Repo,
         kind,
         &full_text,
         confidence,
-        "lesson from kimetsu_brain_record",
+        None,
     ) {
         Ok(project::ProposeResult::Added(memory_id)) => json!({
             "ok": true,
@@ -1110,30 +1112,22 @@ fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, Stri
         }
     };
     // Stdio cite is a repo write. It does not open user, org, or skill.
-    if let Ok((_, _, conn)) = project::load_project_readonly(workspace) {
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT scope FROM memories WHERE memory_id = ?1",
-                [memory_id],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(stored) = stored {
-            let mount = kimetsu_core::memory::mount_of_stored(&stored);
-            if mount != Some(kimetsu_core::memory::MountLevel::Repo) {
-                return Ok(json!({
-                    "ok": false,
-                    "error": "cite requires write on the memory's home mount"
-                }));
-            }
-        }
-    }
+    let grants = kimetsu_sdk::MountGrants::stdio_mcp(true);
     match arguments
         .get("exposure_id")
         .and_then(Value::as_str)
         .ok_or_else(|| "exposure_id from delivered context is required".into())
         .and_then(|id| {
-            project::record_exposure_citation(workspace, id, memory_id, note, Some(outcome))
+            kimetsu_sdk::cite(workspace, &grants, id, memory_id, Some(outcome), note).map_err(
+                |err| {
+                    let msg = err.to_string();
+                    if msg.starts_with("cite requires write") {
+                        "cite requires write on the memory's home mount".to_string()
+                    } else {
+                        msg
+                    }
+                },
+            )
         }) {
         Ok(()) => Ok(json!({
             "ok": true,
@@ -1831,13 +1825,15 @@ fn kimetsu_brain_answer(workspace: &Path, arguments: &Value) -> Result<Value, St
         if ids.is_empty() {
             return Err("mark_helpful requires original delivered memory_ids".into());
         }
+        let grants = kimetsu_sdk::MountGrants::stdio_mcp(true);
         for id in &ids {
-            project::record_exposure_citation(
+            kimetsu_sdk::cite(
                 workspace,
+                &grants,
                 &exposure_id,
                 id,
-                Some("marked helpful via answer"),
                 Some("helped"),
+                Some("marked helpful via answer"),
             )
             .map_err(|e| e.to_string())?;
         }

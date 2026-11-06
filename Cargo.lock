@@ -3379,6 +3379,7 @@ dependencies = [
  "iroh-relay",
  "kimetsu-brain",
  "kimetsu-core",
+ "kimetsu-sdk",
  "serde",
  "serde_json",
  "tempfile",
@@ -3396,6 +3397,7 @@ dependencies = [
  "kimetsu-agent",
  "kimetsu-brain",
  "kimetsu-core",
+ "kimetsu-sdk",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3413,6 +3415,7 @@ dependencies = [
  "kimetsu-brain",
  "kimetsu-chat",
  "kimetsu-core",
+ "kimetsu-sdk",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -3465,6 +3468,7 @@ dependencies = [
  "kimetsu-brain",
  "kimetsu-chat",
  "kimetsu-core",
+ "kimetsu-sdk",
  "lambda_http",
  "native-tls",
  "postgres-native-tls",
@@ -3485,6 +3489,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+]
+
+[[package]]
+name = "kimetsu-sdk"
+version = "2.10.0"
+dependencies = [
+ "kimetsu-brain",
+ "kimetsu-bus",
+ "kimetsu-core",
+ "tempfile",
 ]
 
 [[package]]

@@ -293,6 +293,38 @@ async fn relay_path_still_verifies_before_import() {
 }
 
 #[tokio::test]
+async fn sdk_request_pack_reaches_the_bus() {
+    let built = members(&[MountLevel::Repo], false);
+    let server = bind_one(
+        built.server_key.clone(),
+        built.roster.clone(),
+        BusRelay::Disabled,
+        false,
+        "sdk-forward",
+    )
+    .await;
+    let stranger = SecretKey::generate();
+    let brain = brain_root("sdk-forward");
+    let err = kimetsu_sdk::request_pack(
+        &server,
+        request(
+            EndpointAddr::new(stranger.public()).with_ip_addr("127.0.0.1:1".parse().unwrap()),
+            &"ab".repeat(32),
+            MountLevel::Repo,
+            TrustStore::empty(),
+            &brain,
+            &[MountLevel::Repo],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("non-member"), "{err}");
+    assert_eq!(counts(&brain).0, 0);
+    server.close().await;
+    let _ = std::fs::remove_dir_all(&brain);
+}
+
+#[tokio::test]
 async fn non_member_handshake_fails_and_is_not_dialed() {
     let built = members(&[MountLevel::Repo], true);
     let server = bind_one(
@@ -793,4 +825,31 @@ impl ProtocolHandler for V1Handler {
         let _ = recv.read_to_end(4096).await;
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn fetch_verified_stops_before_sql() {
+    let built = members(&[MountLevel::Repo], true);
+    let (server, client) = bind_pair(&built, BusRelay::Disabled, false).await;
+    let lesson = "F3_VERIFY_ONLY do not import";
+    let announcement = server
+        .publish_memories(
+            &manifest(),
+            &["repo".into()],
+            &[memory("repo", lesson)],
+            &built.signer,
+        )
+        .unwrap();
+    let root = brain_root("verify-only");
+    let before = counts(&root);
+    let fetched = client
+        .fetch_verified(server.direct_addr().await.unwrap(), &announcement.digest)
+        .await
+        .unwrap();
+    assert_eq!(fetched.digest_hex, announcement.digest);
+    assert!(!fetched.gzip.is_empty());
+    assert_eq!(counts(&root), before, "verify must not write the brain");
+    server.close().await;
+    client.close().await;
+    let _ = std::fs::remove_dir_all(&root);
 }

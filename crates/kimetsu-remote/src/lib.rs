@@ -15,6 +15,7 @@ pub mod repo;
 pub mod rpc;
 pub mod state;
 pub mod storage;
+pub mod store;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

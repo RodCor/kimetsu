@@ -864,4 +864,82 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
         });
     }
+
+    #[test]
+    fn wal_reader_misses_uncommitted_supersede_and_context_does_not_wait() {
+        user_brain::with_user_brain_disabled(|| {
+            let root = temp_project("wal");
+            project::init_project(&root, false).unwrap();
+            let id = project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Fact,
+                "committed wal lesson",
+            )
+            .unwrap();
+            let (_, _, writer) = project::load_project(&root).unwrap();
+            let mode: String = writer
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal", "cite and record use WAL");
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            writer
+                .execute(
+                    "UPDATE memories SET superseded_by = 'half-applied' WHERE memory_id = ?1",
+                    [&id],
+                )
+                .unwrap();
+            let started = std::time::Instant::now();
+            let (_, _, reader) = project::load_project_readonly(&root).unwrap();
+            let seen: Option<String> = reader
+                .query_row(
+                    "SELECT superseded_by FROM memories WHERE memory_id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut grants = MountGrants::default();
+            grants.allow_read(MountLevel::Repo);
+            context(&root, &grants, "committed wal lesson", 400).unwrap();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "a reader waited on the open cite/record transaction"
+            );
+            assert!(
+                seen.is_none(),
+                "reader observed a half-applied supersede: {seen:?}"
+            );
+            writer.execute_batch("ROLLBACK").unwrap();
+            drop(writer);
+            drop(reader);
+
+            let successor = project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Fact,
+                "successor wal lesson",
+            )
+            .unwrap();
+            grants.allow_write(MountLevel::Repo);
+            supersede(&root, &grants, &id, &successor).unwrap();
+            let (_, _, conn) = project::load_project_readonly(&root).unwrap();
+            let stamp: String = conn
+                .query_row(
+                    "SELECT superseded_by FROM memories WHERE memory_id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamp, successor);
+            let fts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fts, 0, "supersede must drop FTS in the same transaction");
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
 }

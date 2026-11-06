@@ -8,11 +8,11 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use kimetsu_brain::mount::{self, MountGrants};
 use kimetsu_brain::project;
 use kimetsu_brain::signed_pack::{self, PackManifest};
 use kimetsu_core::KimetsuResult;
 use kimetsu_core::memory::{MemoryKind, MemoryScope, MountLevel};
+use kimetsu_sdk::MountGrants;
 
 use crate::*;
 
@@ -1398,7 +1398,7 @@ fn export_signed_pack(
                 .unwrap_or_default(),
         ),
     };
-    let (gzip, scrub) = mount::export_signed_pack(
+    let (gzip, scrub) = kimetsu_sdk::export_signed_pack(
         workspace,
         &operator_pack_grants(),
         scope.mount(),
@@ -1640,7 +1640,7 @@ fn import_signed_pack(
     } else {
         signed_pack::load_default_trust_store()?
     };
-    let summary = mount::import_signed_pack(
+    let summary = kimetsu_sdk::import_signed_pack(
         workspace,
         &operator_pack_grants(),
         bytes,
