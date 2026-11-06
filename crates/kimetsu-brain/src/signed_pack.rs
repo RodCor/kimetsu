@@ -386,7 +386,11 @@ pub fn encode_gzip(json: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Verify a `kimetsu_pack` 2 document. Does not open a database.
+/// A directory sync batch is rejected here, before signature checks and SQL.
 pub fn verify_pack_json(json: &str) -> Result<VerifiedPack, String> {
+    if crate::replica::classify_replica_text(json) == crate::replica::ReplicaClass::DirectoryBatch {
+        return Err(crate::replica::BATCH_AS_PACK.into());
+    }
     let value: Value = serde_json::from_str(json).map_err(|e| format!("bad JSON: {e}"))?;
     let mut obj = match value {
         Value::Object(map) => map,
@@ -1220,6 +1224,18 @@ mod tests {
             err.to_string().contains("not strictly sorted"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn verify_and_v1_parser_refuse_a_directory_sync_batch() {
+        let event = r#"{"event_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","run_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ts":"2026-01-01T00:00:00Z","kind":"memory.accepted","schema_version":1,"payload":{"text":"stay local"}}"#;
+        let err = verify_pack_json(event).expect_err("one sync event is not a pack");
+        assert!(err.contains("not a kimetsu_pack"), "{err}");
+        let jsonl = format!("{event}\n{event}\n");
+        let err = verify_pack_json(&jsonl).expect_err("jsonl is not a pack");
+        assert!(err.contains("not a kimetsu_pack"), "{err}");
+        let err = packs::parse_pack_or_array(&jsonl).expect_err("unsigned import refuses jsonl");
+        assert!(err.to_string().contains("not a kimetsu_pack"), "{err}");
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! Legal frames are hello, announce, request_pack, pack, reject,
 //! roster_sync, and roster. Any other type byte closes the connection.
 //! Repository clone, fetch, checkout, and worktree transfer are not frames.
-//! `roster` carries one admin-signed `kimetsu_roster` document. It is not a
-//! memory pack and not a directory-sync batch.
+//! A directory-sync JSONL batch is not a frame either. `roster` carries one
+//! admin-signed `kimetsu_roster` document. It is not a memory pack and not
+//! a directory-sync batch.
 
 use std::fmt;
 
@@ -322,6 +323,10 @@ mod tests {
             "checkout",
             "clone",
             "repos_file",
+            "sync_batch",
+            "jsonl",
+            "event_log",
+            "brain_sync",
         ];
         let names = LEGAL_FRAME_NAMES.join(" ");
         for word in banned {
@@ -338,6 +343,7 @@ mod tests {
         }
         assert!(parse_frame_kind(64).is_none());
         assert!(parse_frame_kind(0).is_none());
+        assert!(parse_frame_kind(8).is_none(), "no directory-sync frame");
     }
 
     #[test]

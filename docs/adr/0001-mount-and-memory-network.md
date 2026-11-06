@@ -69,7 +69,7 @@ One rule that says which mount a byte belongs to, which grant was required to pu
 
 ## Decision
 
-Adopt six mounts, seven store operations, signed packs whose scopes are inside the signature, and a Rust store+bus SDK. MCP and `@kimetsu-ai/sdk` stay the agent-facing edge. Kimetsu Remote stays an HTTP checkpoint server of the same mounts. Personal directory sync stays a separate log replica through F3.
+Adopt six mounts, seven store operations, signed packs whose scopes are inside the signature, and a Rust store+bus SDK. MCP and `@kimetsu-ai/sdk` stay the agent-facing edge. Kimetsu Remote stays an HTTP checkpoint server of the same mounts. Directory sync is the offline event-log complement. The bus carries signed packs. The split is [Directory sync and the bus](#directory-sync-and-the-bus).
 
 ### 1. Mount contract
 
@@ -385,7 +385,27 @@ A trusted merge resolves those texts to local rows and writes `memory.superseded
 
 A cite conflict stays on the brain that holds the exposure. A second outcome for the same exposure and memory is an error and applies neither extra delta. Exposures are not pack fields and are not frames.
 
-`kimetsu brain sync` is unchanged through F3: directory of JSONL event batches, cursor per machine, no pack signature. The bus does not absorb it. Unifying them is a later decision. The stock relay stays disabled unless the operator sets one.
+#### Directory sync and the bus
+
+`kimetsu brain sync` and the bus are one replication policy with two carriers. They are not interchangeable, and neither carrier is a silent reading of the other's bytes.
+
+What stays on the machine, for both carriers, is the complement of `SYNC_ALLOWED_KINDS` in `crates/kimetsu-brain/src/sync.rs`: `work.episode`, `context.served`, `retrieval.regret`, `digest_served`, `resume_served`, `context.injected`, and every `run.*` kind. The SQLite file, embeddings, FTS, and any git object stay too. No carrier ships `brain.db` or a clone. The bus protocol still has no clone, fetch, checkout, or worktree frame.
+
+What the bus carries is announcements and signed `kimetsu_pack` 2 only. That is the accepted projection of a mount, plus the optional `supersedes` field from [Invitation, supersede, and conflicts](#invitation-supersede-and-conflicts). `memory_id` stays off that wire. There is no frame for a JSONL event-log batch, a chat message, or a directory cursor. A type byte outside hello, announce, request_pack, pack, reject, roster_sync, and roster drops the peer. Invitation and roster membership still gate every exchange on the bus. A non-member does not finish `request_pack`, and there is no second channel that would carry a sync batch. `BusRelay::Disabled` stays the default unless the operator sets a relay.
+
+What the directory carries is the offline complement. `kimetsu brain sync` keeps the directory of JSONL batches, a cursor per machine, and no pack signature. The operator-configured directory is the trust boundary. The durable allowlist is unchanged: `memory.accepted`, `memory.proposed`, `memory.rejected`, `memory.invalidated`, `memory.restored`, `memory.corrected`, `memory.cited`, `memory.superseded`. The CLI stays. Callers are not moved onto the bus, and this path does not dial it. Cite events stay on this allowlist. They are not pack fields.
+
+How a signed pack and an event-log batch relate:
+
+- A directory batch is not a pack. `import_events` rejects a `kimetsu_pack` document, a gzip pack, or a bare memory array before any SQL write. Those bytes belong to `import_pack` / `import_signed_pack`.
+- A pack is not a directory batch. `verify_pack_json` and the unsigned v1 parser reject a JSONL sync batch — a JSON object or line with `event_id` and `kind`, and no `kimetsu_pack` — before any SQL write. The bus does not call `import_events`.
+- Directory import does not call `import_pack`. Pack import does not insert the sender's event rows. Reading a sync batch as an unsigned pack, or a pack as an event-log replay, is a failed import.
+
+Trust, where a pack is involved, is the `import_pack` table in [§3](#3-signed-packs). A bad signature rejects before quarantine and before SQL. An unknown signer quarantines and does not enter retrieval. `replace` together with quarantine rejects. The directory carrier has no signer. It does not consult the roster, because it does not speak the bus. A shared directory does not make an untrusted pack signer trusted.
+
+Idempotency and conflicts use the F5 projector rule. Directory replay still dedups on `event_id` with `INSERT OR IGNORE`. A `memory.superseded` event whose `memory_id` and `survivor_id` are already in the log is a skip even when `event_id` is new: the same successor does not write a second event. Two successors are both kept. Replay applies events in HLC order. The link moves only when the incoming `source_hlc` (otherwise the event HLC) is later. That later one is `superseded_by`. The disagreement is one `sync_conflicts` row. Pack `supersedes` links still resolve by scrubbed text through `apply_links`, which skips a successor the local log already names and does not run for an untrusted signer. A pack does not learn the directory's `memory_id`. A directory batch is not rewritten into ids the pack minted. An operator does not point both carriers at the same bytes.
+
+`kimetsu brain sync` remains that offline complement. It is not deleted, and it is not a second bus.
 
 #### Threat model
 
@@ -398,7 +418,7 @@ A cite conflict stays on the brain that holds the exposure. A second outcome for
 | Malicious trusted signer | offer a false lesson inside a valid signature | widen scopes without breaking the signature; skip quarantine if the operator has not trusted them. Truth is not the signature's job |
 | Compromised agent on a member machine | `export_pack` of mounts it can read, then announce | export `run`; attach the git worktree; read mounts it was not granted. Export scrub still runs |
 
-What stays local even for a member: the SQLite file, the event log, embeddings, FTS, session resume text, `run.*`, episodes, and anything `export_pack` refuses. What is verified before any write: gzip framing, digest, signature, scope equality, entry scopes, destination grant. What is not verified by cryptography: usefulness, factual accuracy, or that the signer is a person the operator meant. That last step is the trust store and the quarantine queue.
+What stays local even for a member: the SQLite file, embeddings, FTS, session resume text, `run.*`, episodes, and anything `export_pack` refuses. The event log is not a bus frame. Only the allowlist in [Directory sync and the bus](#directory-sync-and-the-bus) may leave the machine, and only through the offline directory. What is verified before any write: gzip framing, digest, signature, scope equality, entry scopes, destination grant. What is not verified by cryptography: usefulness, factual accuracy, or that the signer is a person the operator meant. That last step is the trust store and the quarantine queue.
 
 ### 5. Unified Rust SDK
 
@@ -492,7 +512,13 @@ Each phase leaves the default path free of a generative LLM and free of a networ
 
 - **Deliverable.** Invitation, as in [Invitation, supersede, and conflicts](#invitation-supersede-and-conflicts), and supersede links inside signed packs. A disagreement is a `sync_conflicts` row. The later source HLC is the survivor. No generative model is on the path.
 - **Exit.** Two peers that supersede one text to two successors converge on the later source HLC and each keep one conflict row. An untrusted signer does not move the local link. A link for another mount writes no SQL. An announcement still has no memory text.
-- **Unchanged.** No default relay. `@kimetsu-ai/sdk` stays an HTTP client and does not open `brain.db`. No host adapters. Directory sync is not folded into the bus. No chat frame and no git clone.
+- **Unchanged.** No default relay. `@kimetsu-ai/sdk` stays an HTTP client and does not open `brain.db`. No host adapters. No chat frame and no git clone. Directory sync is not a bus frame; the carrier split is [Directory sync and the bus](#directory-sync-and-the-bus).
+
+#### F6 — Directory sync and the bus
+
+- **Deliverable.** The contract in [Directory sync and the bus](#directory-sync-and-the-bus). `kimetsu brain sync` remains the directory replica. The bus gains no sync-batch frame. Cross-carrier bytes are rejected before SQL. The same superseded pair does not append a second event.
+- **Exit.** A pack presented to directory import writes nothing. A JSONL batch presented to pack verify writes nothing. `run.*` still stays out of both. A repeated predecessor/survivor pair is one `memory.superseded` event. Two successors still produce one `sync_conflicts` row. Roster membership still gates `request_pack`. `BusRelay::Disabled` stays the default.
+- **Unchanged.** No TypeScript bus. Remote does not dial the bus. MCP stays the host edge. Cite conflicts are not pack fields. No default relay, no chat frame, no git operation.
 
 ## Consequences
 
@@ -512,7 +538,7 @@ Costs:
 - v1 URL imports (`kimetsu brain import https://…` as the README shows) cannot ride the bus. Publishers who want F2 sign the pack.
 - The relay is a trust dependency for connectivity and metadata (who talked, how much) even though it cannot read the pack. Networks where hole-punch fails do not get the 100 ms budget.
 - Roster key loss splits a group that still has healthy SQLite files. That is a new operational failure.
-- F0 and F1 do not share anything across machines. Directory sync and Remote remain the sharing tools until F2.
+- F0 and F1 do not share anything across machines. Directory sync and Remote remain the sharing tools until F2. From [Directory sync and the bus](#directory-sync-and-the-bus), roster members share signed packs on the bus, and directory sync remains the offline event-log complement.
 - Meeting a few-millisecond p99 means deleting the unbounded IDF scan from the hot path (audit finding 3) in F0's store work, not tuning the bus in F3.
 
 Left alone until a phase says otherwise: checkpoint format and size limits, the TypeScript client's lack of a SQLite dependency, sync's allowlist, warm-start's 0.35 / 60% / half-term heuristics, the 30-day half-life, broker weights, and skill drafting's optional model.
@@ -536,7 +562,7 @@ Left alone until a phase says otherwise: checkpoint format and size limits, the 
 - **Generative consolidation across mounts.** A distiller or a decision provider MUST NOT be the thing that moves a lesson from `repo` to `org` or from `repo` to `skill`. Those tools, when the operator enables them, emit the same `record` / `supersede` calls as anyone else, on one mount, with a grant.
 - **Replacing MCP hosts.** Claude Code, Codex, Pi, OpenClaw, and Cursor keep their MCP or hook wiring. This ADR does not introduce a second agent protocol.
 
-Also out of F0–F3, stated so they are not implied: rewriting `@kimetsu-ai/sdk` in Rust, replacing Remote's checkpoint backends, folding directory sync into the bus, retuning broker weights, changing the 30-day half-life, and claiming the few-millisecond budget for the semantic reranker.
+Also out of F0–F3, stated so they are not implied: rewriting `@kimetsu-ai/sdk` in Rust, replacing Remote's checkpoint backends, retuning broker weights, changing the 30-day half-life, and claiming the few-millisecond budget for the semantic reranker. Putting the event log on the bus as a frame is decided against in [Directory sync and the bus](#directory-sync-and-the-bus): the directory replica stays, and the bus stays signed packs.
 
 ## Open questions
 

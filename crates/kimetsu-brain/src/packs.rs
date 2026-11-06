@@ -63,7 +63,10 @@ pub struct PackRef {
 pub fn parse_pack_or_array(json: &str) -> KimetsuResult<(PackRef, Vec<MemoryExport>)> {
     // A Pack is a JSON object with `kimetsu_pack` + `memories`; a bare array is
     // a JSON array. Version 2 is signed and must not fall through this unsigned
-    // parser (see `signed_pack`).
+    // parser (see `signed_pack`). A directory sync batch is not either shape.
+    if crate::replica::classify_replica_text(json) == crate::replica::ReplicaClass::DirectoryBatch {
+        return Err(crate::replica::BATCH_AS_PACK.into());
+    }
     let trimmed = json.trim_start();
     if trimmed.starts_with('{') {
         let value: serde_json::Value = serde_json::from_str(json)

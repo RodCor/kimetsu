@@ -1,5 +1,9 @@
 /// Epic S3 — Personal brain sync (event-log replication).
 ///
+/// ADR 0001 keeps this directory replica as the offline complement. The bus
+/// carries signed `kimetsu_pack` 2 only. This module does not dial the bus
+/// and does not call `import_pack`. A pack file is refused before SQL.
+///
 /// Design insight: `events` is the durable source of truth and the projector
 /// rebuilds everything from it.  Sync = EVENT-LOG REPLICATION, not SQLite file
 /// copying.  We export durable events and import them through the projector with
@@ -49,7 +53,7 @@
 ///      and advance the cursor.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use kimetsu_core::KimetsuResult;
@@ -358,11 +362,19 @@ pub struct ImportSummary {
 /// When `dry_run` is true, parse and count but do NOT write anything.
 /// Otherwise, stage the entire batch and replay the merged durable log under
 /// one writer lock. Historical edits must not project against today's state.
+///
+/// A `kimetsu_pack` document or a bare memory array is refused before any
+/// write. The same `memory.superseded` predecessor/survivor pair is a skip
+/// even when `event_id` is new, matching federated supersede: the same
+/// successor does not write a second event. Two different survivors both apply.
 pub fn import_events(
     conn: &Connection,
     jsonl: &str,
     dry_run: bool,
 ) -> KimetsuResult<ImportSummary> {
+    if crate::replica::classify_replica_text(jsonl) == crate::replica::ReplicaClass::Pack {
+        return Err(crate::replica::PACK_AS_BATCH.into());
+    }
     let mut excluded = 0;
     let mut events = Vec::new();
     for (line_no, line) in jsonl.lines().enumerate() {
@@ -394,6 +406,7 @@ pub fn import_events(
             skipped: excluded,
         };
         let mut seen = BTreeSet::new();
+        let mut seen_pairs: BTreeSet<(String, String)> = BTreeSet::new();
         for event in &events {
             // Both the count and insertion run under the writer lock. Include
             // in-batch duplicates in dry-run counts without writing them.
@@ -408,7 +421,19 @@ pub fn import_events(
 
             if exists {
                 summary.skipped += 1;
+                if let Some(pair) = supersede_pair(event) {
+                    seen_pairs.insert(pair);
+                }
                 continue;
+            }
+            if let Some(pair) = supersede_pair(event) {
+                // F5: the same successor again is success and writes no second event.
+                if seen_pairs.contains(&pair) || supersede_pair_exists(c, &pair.0, &pair.1)? {
+                    summary.skipped += 1;
+                    seen_pairs.insert(pair);
+                    continue;
+                }
+                seen_pairs.insert(pair);
             }
             if !dry_run {
                 let redacted = Event {
@@ -450,16 +475,68 @@ pub fn import_events_from_file(
 }
 
 fn read_batch_file(path: &Path) -> KimetsuResult<String> {
-    let file = fs::File::open(path)
+    let bytes = fs::read(path)
         .map_err(|e| format!("sync import: cannot open {:?}: {e}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut buf = String::new();
-    for line in reader.lines() {
-        let l = line.map_err(|e| format!("sync import: read error {:?}: {e}", path.display()))?;
-        buf.push_str(&l);
-        buf.push('\n');
+    if crate::replica::is_gzip_pack(&bytes) {
+        return Err(format!(
+            "{}; refusing {:?}",
+            crate::replica::GZIP_AS_BATCH,
+            path.display()
+        )
+        .into());
     }
-    Ok(buf)
+    let mut text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => {
+            return Err(format!(
+                "sync import: batch is not UTF-8 JSONL {:?}: {err}",
+                path.display()
+            )
+            .into());
+        }
+    };
+    // Batches are concatenated before replay. A missing trailing newline would
+    // glue the next file's first event onto this file's last line.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// Predecessor and survivor already named by a `memory.superseded` event.
+fn supersede_pair(event: &Event) -> Option<(String, String)> {
+    if event.kind != "memory.superseded" {
+        return None;
+    }
+    let memory_id = event
+        .payload
+        .get("memory_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())?;
+    let survivor_id = event
+        .payload
+        .get("survivor_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())?;
+    Some((memory_id.to_string(), survivor_id.to_string()))
+}
+
+fn supersede_pair_exists(
+    conn: &Connection,
+    memory_id: &str,
+    survivor_id: &str,
+) -> KimetsuResult<bool> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM events
+             WHERE kind = 'memory.superseded'
+               AND json_extract(payload_json, '$.memory_id') = ?1
+               AND json_extract(payload_json, '$.survivor_id') = ?2",
+            rusqlite::params![memory_id, survivor_id],
+            |_| Ok(1i32),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,6 +1192,127 @@ mod tests {
             .unwrap(),
             "original"
         );
+    }
+
+    #[test]
+    fn directory_import_refuses_a_pack_before_sql() {
+        let conn = make_conn();
+        let pack = r#"{"kimetsu_pack":2,"name":"x","version":"1","memory_count":0,"memories":[]}"#;
+        let err = import_events(&conn, pack, false).unwrap_err();
+        assert!(err.to_string().contains("not a pack"), "{err}");
+        let array = r#"[{"text":"lesson","scope":"repo","kind":"fact","confidence":1.0}]"#;
+        let err = import_events(&conn, array, false).unwrap_err();
+        assert!(err.to_string().contains("not a pack"), "{err}");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a pack must not write events");
+    }
+
+    #[test]
+    fn directory_import_refuses_a_gzip_pack_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("pack.json.gz");
+        let gzip = crate::signed_pack::encode_gzip(r#"{"kimetsu_pack":2}"#).unwrap();
+        std::fs::write(&path, gzip).unwrap();
+        let conn = make_conn();
+        let err = import_events_from_file(&conn, &path, false).unwrap_err();
+        assert!(err.to_string().contains("gzip"), "{err}");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn same_supersede_pair_does_not_write_a_second_event() {
+        let conn = make_conn();
+        let run = RunId::new();
+        apply_events(
+            &conn,
+            &[
+                Event::new(
+                    run,
+                    "memory.accepted",
+                    json!({"memory_id":"m","text":"old","scope":"project","kind":"fact"}),
+                ),
+                Event::new(
+                    run,
+                    "memory.accepted",
+                    json!({"memory_id":"s","text":"new","scope":"project","kind":"fact"}),
+                ),
+                Event::new(
+                    run,
+                    "memory.superseded",
+                    json!({"memory_id":"m","survivor_id":"s"}),
+                ),
+            ],
+        )
+        .unwrap();
+        let again = Event::new(
+            run,
+            "memory.superseded",
+            json!({"memory_id":"m","survivor_id":"s","source_hlc":"1:1"}),
+        );
+        let summary = import_events(&conn, &wire(&[again.clone(), again]), false).unwrap();
+        assert_eq!((summary.applied, summary.skipped), (0, 2));
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'memory.superseded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(sync_conflict_count(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn two_directory_successors_still_record_one_conflict() {
+        let conn = make_conn();
+        let run = RunId::new();
+        apply_events(
+            &conn,
+            &[
+                Event::new(
+                    run,
+                    "memory.accepted",
+                    json!({"memory_id":"m","text":"old","scope":"project","kind":"fact"}),
+                ),
+                Event::new(
+                    run,
+                    "memory.accepted",
+                    json!({"memory_id":"s1","text":"one","scope":"project","kind":"fact"}),
+                ),
+                Event::new(
+                    run,
+                    "memory.accepted",
+                    json!({"memory_id":"s2","text":"two","scope":"project","kind":"fact"}),
+                ),
+            ],
+        )
+        .unwrap();
+        let first = Event::new(
+            run,
+            "memory.superseded",
+            json!({"memory_id":"m","survivor_id":"s1","source_hlc":"1:1"}),
+        );
+        let second = Event::new(
+            run,
+            "memory.superseded",
+            json!({"memory_id":"m","survivor_id":"s2","source_hlc":"2:1"}),
+        );
+        let summary = import_events(&conn, &wire(&[first, second]), false).unwrap();
+        assert_eq!(summary.applied, 2, "{summary:?}");
+        assert_eq!(sync_conflict_count(&conn).unwrap(), 1);
+        let winner: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM memories WHERE memory_id = 'm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(winner.as_deref(), Some("s2"));
     }
 
     #[test]
