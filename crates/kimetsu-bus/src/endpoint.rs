@@ -7,6 +7,7 @@
 //! function `kimetsu_sdk::import_signed_pack` forwards to.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +56,13 @@ pub struct EndpointConfig {
     /// Test and operator relays that use a private certificate.
     pub insecure_relay_tls: bool,
     pub presence_path: PathBuf,
+    /// IPv4 socket to bind instead of iroh's default `0.0.0.0:0`.
+    ///
+    /// `None` keeps that default. [`BusEndpoint::direct_addr`] rewrites an
+    /// unspecified address to loopback so two endpoints in one process can
+    /// dial each other. `Some` binds this address only, and `direct_addr`
+    /// advertises it as given when it is a specific address.
+    pub bind_v4: Option<SocketAddrV4>,
 }
 
 pub struct PackRequest {
@@ -136,6 +144,15 @@ impl BusEndpoint {
         if config.insecure_relay_tls {
             builder = builder.ca_tls_config(CaTlsConfig::insecure_skip_verify());
         }
+        if let Some(addr) = config.bind_v4 {
+            // Drop the default `0.0.0.0` / `[::]` sockets. A specific address
+            // has to be the one `direct_addr` advertises, or a peer on another
+            // interface is handed `127.0.0.1`.
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(addr)
+                .map_err(|err| format!("bind address: {err}"))?;
+        }
         let endpoint = builder
             .bind()
             .await
@@ -184,6 +201,12 @@ impl BusEndpoint {
 
     pub fn presence(&self) -> &PresenceStore {
         &self.inner.presence
+    }
+
+    /// Sockets the endpoint bound, including an unspecified address.
+    /// [`Self::direct_addr`] is the dial form of the preferred socket.
+    pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.router.endpoint().bound_sockets()
     }
 
     /// Direct socket addresses for a same-machine or LAN dial.
@@ -456,14 +479,26 @@ struct Dialed {
 }
 
 fn direct_addr(endpoint: &Endpoint) -> Result<EndpointAddr, String> {
-    let sockets = endpoint.bound_sockets();
-    let ip = sockets
+    let socket = advertise_socket(&endpoint.bound_sockets())?;
+    Ok(EndpointAddr::new(endpoint.id()).with_ip_addr(dialable(socket)))
+}
+
+/// Prefer a specific address over `0.0.0.0` / `::`. The first unspecified
+/// socket is only the fallback when nothing else is bound.
+fn advertise_socket(sockets: &[std::net::SocketAddr]) -> Result<std::net::SocketAddr, String> {
+    sockets
         .iter()
         .copied()
-        .find(|socket| socket.is_ipv4())
+        .find(|socket| socket.is_ipv4() && !socket.ip().is_unspecified())
+        .or_else(|| {
+            sockets
+                .iter()
+                .copied()
+                .find(|socket| !socket.ip().is_unspecified())
+        })
+        .or_else(|| sockets.iter().copied().find(|socket| socket.is_ipv4()))
         .or_else(|| sockets.first().copied())
-        .ok_or_else(|| "endpoint has no bound socket".to_string())?;
-    Ok(EndpointAddr::new(endpoint.id()).with_ip_addr(dialable(ip)))
+        .ok_or_else(|| "endpoint has no bound socket".to_string())
 }
 
 /// `0.0.0.0` / `::` is a bind address. Dial loopback with the same port.
@@ -602,5 +637,32 @@ impl Handler {
         let _ = send.finish();
         let _ = recv.read_to_end(1).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::{advertise_socket, dialable};
+
+    #[test]
+    fn unspecified_ipv4_is_dialed_as_loopback() {
+        let bound = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9));
+        assert_eq!(dialable(bound), SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+        assert_eq!(advertise_socket(&[bound]).unwrap(), bound);
+    }
+
+    #[test]
+    fn specific_ipv4_is_not_rewritten_to_loopback() {
+        let specific = SocketAddr::from((Ipv4Addr::new(10, 200, 0, 1), 9));
+        assert_eq!(dialable(specific), specific);
+        let sockets = [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1)),
+            specific,
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 1)),
+        ];
+        assert_eq!(advertise_socket(&sockets).unwrap(), specific);
+        assert_eq!(dialable(advertise_socket(&sockets).unwrap()), specific);
     }
 }

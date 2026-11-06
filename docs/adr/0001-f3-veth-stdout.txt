@@ -1,0 +1,14 @@
+f3 veth harness
+date: 2026-11-06T12:29:30Z
+rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+topology: two Linux netns connected by a veth pair on one physical host
+addresses: 10.200.0.1 <-> 10.200.0.2
+hardware: Linux 6.12.113+ x86_64 | Intel(R) Xeon(R) Processor | 4 cores | MemTotal 16387328 KiB
+topology: two Linux netns connected by a veth pair on one physical host
+bind: 10.200.0.2:55666
+peer: 10.200.0.1:49736
+request_pack direct QUIC until verified in memory: two Linux netns connected by a veth pair on one physical host. n=30 p50=1.271 ms p99=1.511 ms max=1.511 ms
+pack: 394 gzip bytes, 8 memories, relay disabled
+dialed address is 10.200.0.1:49736; local bind is 10.200.0.2:55666
+import and FTS rebuild: not included in the request_pack timer
+two physical LAN hosts: still pending. This run is not direct LAN QUIC between two LAN machines.

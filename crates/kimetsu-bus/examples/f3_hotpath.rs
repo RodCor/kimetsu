@@ -9,18 +9,26 @@
 //! Prints hardware, corpus size, and cold versus warm next to every figure.
 //! The `context` timer is local FTS with embeddings, the reranker, and the
 //! network left out. The `request_pack` timer stops when the pack is verified
-//! in memory. It does not import and does not rebuild FTS. That timer is
-//! loopback: both endpoints on this host, dialed at `127.0.0.1`. ADR §7 asks
-//! for direct LAN QUIC. That LAN measurement is still pending. Relay-down and
+//! in memory. It does not import and does not rebuild FTS. With no `--role`,
+//! that timer is loopback: both endpoints on this host, dialed at `127.0.0.1`.
+//!
+//! `--role serve` and `--role fetch` split the same pack across two processes.
+//! Each process binds `--bind` (not `127.0.0.1`) and the fetch side dials
+//! `--peer`. `scripts/f3-hotpath-lan.sh` runs that pair in two Linux network
+//! namespaces joined by a veth pair on one physical host. That is not two LAN
+//! machines. The §7 two-host measurement is still pending. Relay-down and
 //! relay-up samples are separate `context` runs.
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use iroh::{EndpointAddr, EndpointId};
 use kimetsu_brain::project;
 use kimetsu_brain::signed_pack::{PackManifest, PackSigner};
 use kimetsu_bus::protocol::Announcement;
@@ -51,6 +59,10 @@ async fn main() {
         std::env::set_var("KIMETSU_BRAIN_EMBEDDER", "off");
         std::env::set_var("KIMETSU_USER_BRAIN", "0");
         std::env::set_var("KIMETSU_BRAIN_AMBIENT", "off");
+    }
+    if args.role != Role::Both {
+        run_split(args).await;
+        return;
     }
 
     let hardware = hardware();
@@ -131,11 +143,23 @@ import and FTS rebuild: not included in the request_pack timer
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Both,
+    Serve,
+    Fetch,
+}
+
 struct Args {
     corpus: usize,
     samples: usize,
     quic_samples: usize,
     out: Option<PathBuf>,
+    role: Role,
+    bind: Option<Ipv4Addr>,
+    peer: Option<Ipv4Addr>,
+    session: Option<PathBuf>,
+    topology: Option<String>,
 }
 
 impl Args {
@@ -144,6 +168,11 @@ impl Args {
         let mut samples = 200usize;
         let mut quic_samples = 30usize;
         let mut out = None;
+        let mut role = Role::Both;
+        let mut bind = None;
+        let mut peer = None;
+        let mut session = None;
+        let mut topology = None;
         let mut iter = std::env::args().skip(1);
         while let Some(flag) = iter.next() {
             match flag.as_str() {
@@ -151,7 +180,41 @@ impl Args {
                 "--samples" => samples = iter.next().unwrap().parse().unwrap(),
                 "--quic-samples" => quic_samples = iter.next().unwrap().parse().unwrap(),
                 "--out" => out = Some(PathBuf::from(iter.next().unwrap())),
+                "--role" => {
+                    role = match iter.next().unwrap().as_str() {
+                        "both" => Role::Both,
+                        "serve" => Role::Serve,
+                        "fetch" => Role::Fetch,
+                        other => panic!("--role must be both, serve, or fetch, not {other}"),
+                    }
+                }
+                "--bind" => bind = Some(parse_v4(&iter.next().unwrap(), "--bind")),
+                "--peer" => peer = Some(parse_v4(&iter.next().unwrap(), "--peer")),
+                "--session" => session = Some(PathBuf::from(iter.next().unwrap())),
+                "--topology" => topology = Some(iter.next().unwrap()),
                 other => panic!("unknown argument {other}"),
+            }
+        }
+        match role {
+            Role::Serve => {
+                if bind.is_none() || session.is_none() {
+                    panic!("--role serve requires --bind and --session");
+                }
+                if peer.is_some() {
+                    panic!("--role serve does not take --peer");
+                }
+            }
+            Role::Fetch => {
+                if bind.is_none() || peer.is_none() || session.is_none() {
+                    panic!("--role fetch requires --bind, --peer, and --session");
+                }
+            }
+            Role::Both => {
+                if bind.is_some() || peer.is_some() || session.is_some() || topology.is_some() {
+                    panic!(
+                        "--bind, --peer, --session, and --topology require --role serve or --role fetch"
+                    );
+                }
             }
         }
         Self {
@@ -159,8 +222,18 @@ impl Args {
             samples,
             quic_samples,
             out,
+            role,
+            bind,
+            peer,
+            session,
+            topology,
         }
     }
+}
+
+fn parse_v4(text: &str, flag: &str) -> Ipv4Addr {
+    text.parse::<Ipv4Addr>()
+        .unwrap_or_else(|_| panic!("{flag} expects an IPv4 address, not {text}"))
 }
 
 struct Hardware {
@@ -332,9 +405,11 @@ async fn measure_with_relay(
                 roster.clone(),
                 BusRelay::Custom(map.clone()),
                 "on-a",
+                None,
             )
             .await;
-            let client = bind_endpoint(client_key, roster, BusRelay::Custom(map), "on-b").await;
+            let client =
+                bind_endpoint(client_key, roster, BusRelay::Custom(map), "on-b", None).await;
             let online = tokio::time::timeout(Duration::from_secs(20), async {
                 server.online().await;
                 client.online().await;
@@ -372,6 +447,7 @@ async fn bind_endpoint(
     roster: SignedRoster,
     relay: BusRelay,
     label: &str,
+    bind_v4: Option<SocketAddrV4>,
 ) -> BusEndpoint {
     let path = std::env::temp_dir().join(format!(
         "kimetsu-f3-presence-{label}-{}-{}.json",
@@ -388,6 +464,7 @@ async fn bind_endpoint(
         mdns: false,
         insecure_relay_tls: true,
         presence_path: path,
+        bind_v4,
     })
     .await
     .unwrap()
@@ -414,9 +491,39 @@ async fn measure_quic(samples: usize) -> QuicReport {
         RosterEndpoint::new(client_key.public(), &[MountLevel::Repo], None::<&str>).unwrap();
     let document = admin.sign("f3-quic", &[server, client]).unwrap();
     let roster = SignedRoster::open(&document, &admin.public_key_hex()).unwrap();
-    let server = bind_endpoint(server_key, roster.clone(), BusRelay::Disabled, "quic-a").await;
-    let client = bind_endpoint(client_key, roster, BusRelay::Disabled, "quic-b").await;
-    let memories: Vec<_> = (0..8)
+    let server = bind_endpoint(
+        server_key,
+        roster.clone(),
+        BusRelay::Disabled,
+        "quic-a",
+        None,
+    )
+    .await;
+    let client = bind_endpoint(client_key, roster, BusRelay::Disabled, "quic-b", None).await;
+    let (manifest, memories) = small_pack();
+    let announcement: Announcement = server
+        .publish_memories(&manifest, &["repo".into()], &memories, &signer)
+        .unwrap();
+    let addr = server.direct_addr().await.unwrap();
+    let brain = temp_root("quic-receiver");
+    project::init_project_at_root(&brain, true).unwrap();
+    let (samples, bytes) = time_fetches(&client, addr, &announcement.digest, samples).await;
+    let (_, _, conn) = project::load_project_readonly(&brain).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "verification must not import");
+    server.close().await;
+    client.close().await;
+    QuicReport {
+        samples,
+        bytes,
+        rows: memories.len(),
+    }
+}
+
+fn small_pack() -> (PackManifest, Vec<kimetsu_brain::packs::MemoryExport>) {
+    let memories = (0..8)
         .map(|i| kimetsu_brain::packs::MemoryExport {
             text: format!("onboarding lesson {i}: keep the wal checkpoint local"),
             scope: "repo".into(),
@@ -431,39 +538,240 @@ async fn measure_quic(samples: usize) -> QuicReport {
         description: Some("small pack".into()),
         exported_at: Some("2026-01-01T00:00:00Z".into()),
     };
-    let announcement: Announcement = server
-        .publish_memories(&manifest, &["repo".into()], &memories, &signer)
-        .unwrap();
-    let addr = server.direct_addr().await.unwrap();
-    let brain = temp_root("quic-receiver");
-    project::init_project_at_root(&brain, true).unwrap();
+    (manifest, memories)
+}
+
+async fn time_fetches(
+    client: &BusEndpoint,
+    addr: EndpointAddr,
+    digest: &str,
+    samples: usize,
+) -> (Dist, usize) {
     for _ in 0..3 {
-        client
-            .fetch_verified(addr.clone(), &announcement.digest)
-            .await
-            .unwrap();
+        client.fetch_verified(addr.clone(), digest).await.unwrap();
     }
     let mut timed = Vec::with_capacity(samples);
     let mut bytes = 0usize;
     for _ in 0..samples {
         let started = Instant::now();
-        let fetched = client
-            .fetch_verified(addr.clone(), &announcement.digest)
-            .await
-            .unwrap();
+        let fetched = client.fetch_verified(addr.clone(), digest).await.unwrap();
         timed.push(started.elapsed());
         bytes = fetched.gzip.len();
     }
+    (stats(&timed), bytes)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Ready {
+    admin_public_hex: String,
+    roster_json: String,
+    client_secret_hex: String,
+    server_endpoint_id: String,
+    server_ip: String,
+    server_port: u16,
+    digest: String,
+}
+
+async fn run_split(args: Args) {
+    match args.role {
+        Role::Serve => serve(&args).await,
+        Role::Fetch => fetch(&args).await,
+        Role::Both => unreachable!("run_split is only for serve and fetch"),
+    }
+}
+
+fn require_routable(ip: Ipv4Addr, flag: &str) {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_broadcast() {
+        panic!("{flag} {ip} must be a specific address other than 127.0.0.1");
+    }
+}
+
+fn check_topology(label: &str) {
+    let lower = label.to_ascii_lowercase();
+    if lower.contains("two lan hosts")
+        || lower.contains("two physical lan")
+        || lower.contains("between two lan")
+    {
+        panic!("topology label claims two LAN hosts; this process has no second physical host");
+    }
+}
+
+async fn serve(args: &Args) {
+    let bind_ip = args.bind.expect("--bind");
+    let session = args.session.as_deref().expect("--session");
+    require_routable(bind_ip, "--bind");
+    std::fs::create_dir_all(session).unwrap();
+    let server_key = iroh::SecretKey::generate();
+    let client_key = iroh::SecretKey::generate();
+    let signer = PackSigner::generate().unwrap();
+    let admin = RosterAdmin::generate().unwrap();
+    let server_entry = RosterEndpoint::new(
+        server_key.public(),
+        &[MountLevel::Repo],
+        [signer.public_key_hex()],
+    )
+    .unwrap();
+    let client_entry =
+        RosterEndpoint::new(client_key.public(), &[MountLevel::Repo], None::<&str>).unwrap();
+    let document = admin
+        .sign("f3-veth", &[server_entry, client_entry])
+        .unwrap();
+    let roster = SignedRoster::open(&document, &admin.public_key_hex()).unwrap();
+    let server = bind_endpoint(
+        server_key,
+        roster,
+        BusRelay::Disabled,
+        "veth-a",
+        Some(SocketAddrV4::new(bind_ip, 0)),
+    )
+    .await;
+    let (manifest, memories) = small_pack();
+    let announcement = server
+        .publish_memories(&manifest, &["repo".into()], &memories, &signer)
+        .unwrap();
+    let socket = sole_ipv4(server.direct_addr().await.unwrap());
+    assert_eq!(socket.ip(), std::net::IpAddr::V4(bind_ip));
+    let ready = Ready {
+        admin_public_hex: admin.public_key_hex(),
+        roster_json: document,
+        client_secret_hex: hex_encode(&client_key.to_bytes()),
+        server_endpoint_id: server.id().to_string(),
+        server_ip: bind_ip.to_string(),
+        server_port: socket.port(),
+        digest: announcement.digest,
+    };
+    let ready_path = session.join("ready.json");
+    let tmp = session.join("ready.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&ready).unwrap()).unwrap();
+    std::fs::rename(&tmp, &ready_path).unwrap();
+    eprintln!("serve ready {socket} endpoint {}", server.id());
+    let done = session.join("done");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !done.exists() {
+        if Instant::now() > deadline {
+            panic!("fetch did not finish within 180s");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    server.close().await;
+}
+
+async fn fetch(args: &Args) {
+    let bind_ip = args.bind.expect("--bind");
+    let peer_ip = args.peer.expect("--peer");
+    let session = args.session.as_deref().expect("--session");
+    require_routable(bind_ip, "--bind");
+    require_routable(peer_ip, "--peer");
+    let topology = args
+        .topology
+        .clone()
+        .unwrap_or_else(|| "unlabeled".to_string());
+    check_topology(&topology);
+    let ready = wait_ready(session).await;
+    if ready.server_ip != peer_ip.to_string() {
+        panic!(
+            "ready file says server {} but --peer is {peer_ip}",
+            ready.server_ip
+        );
+    }
+    let server_id = EndpointId::from_str(&ready.server_endpoint_id)
+        .unwrap_or_else(|err| panic!("server endpoint id: {err}"));
+    let peer_socket = SocketAddr::from((peer_ip, ready.server_port));
+    if peer_socket.ip().is_loopback() || peer_socket.ip().is_unspecified() {
+        panic!("refusing to time a dial of {peer_socket}");
+    }
+    let addr = EndpointAddr::new(server_id).with_ip_addr(peer_socket);
+    let client_key = iroh::SecretKey::from_bytes(&hex_decode_32(&ready.client_secret_hex));
+    let roster = SignedRoster::open(&ready.roster_json, &ready.admin_public_hex).unwrap();
+    let client = bind_endpoint(
+        client_key,
+        roster,
+        BusRelay::Disabled,
+        "veth-b",
+        Some(SocketAddrV4::new(bind_ip, 0)),
+    )
+    .await;
+    let local_socket = sole_ipv4(client.direct_addr().await.unwrap());
+    assert_eq!(local_socket.ip(), std::net::IpAddr::V4(bind_ip));
+    let brain = temp_root("veth-receiver");
+    project::init_project_at_root(&brain, true).unwrap();
+    let (samples, bytes) = time_fetches(&client, addr, &ready.digest, args.quic_samples).await;
     let (_, _, conn) = project::load_project_readonly(&brain).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "verification must not import");
-    server.close().await;
-    client.close().await;
-    QuicReport {
-        samples: stats(&timed),
-        bytes,
-        rows: memories.len(),
+    let hardware = hardware();
+    let report = format!(
+        "\
+hardware: {hw}
+topology: {topology}
+bind: {local_socket}
+peer: {peer_socket}
+request_pack direct QUIC until verified in memory: {topology}. n={n} p50={p50:.3} ms p99={p99:.3} ms max={max:.3} ms
+pack: {bytes} gzip bytes, 8 memories, relay disabled
+dialed address is {peer_socket}; local bind is {local_socket}
+import and FTS rebuild: not included in the request_pack timer
+two physical LAN hosts: still pending. This run is not direct LAN QUIC between two LAN machines.
+",
+        hw = hardware.summary(),
+        n = samples.n,
+        p50 = samples.p50_ms,
+        p99 = samples.p99_ms,
+        max = samples.max_ms,
+    );
+    print!("{report}");
+    if let Some(path) = &args.out {
+        std::fs::write(path, &report).unwrap();
+        eprintln!("wrote {}", path.display());
     }
+    std::fs::write(session.join("done"), b"ok\n").unwrap();
+    client.close().await;
+}
+
+fn sole_ipv4(addr: EndpointAddr) -> SocketAddr {
+    let sockets: Vec<_> = addr.ip_addrs().copied().collect();
+    assert_eq!(
+        sockets.len(),
+        1,
+        "expected one dial address, got {sockets:?}"
+    );
+    sockets[0]
+}
+
+async fn wait_ready(session: &Path) -> Ready {
+    let path = session.join("ready.json");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(ready) = serde_json::from_slice::<Ready>(&bytes)
+        {
+            return ready;
+        }
+        if Instant::now() > deadline {
+            panic!("timed out waiting for {}", path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode_32(text: &str) -> [u8; 32] {
+    let text = text.trim();
+    assert_eq!(text.len(), 64, "expected 64 hex chars");
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .unwrap_or_else(|_| panic!("bad hex in client secret"));
+    }
+    out
 }

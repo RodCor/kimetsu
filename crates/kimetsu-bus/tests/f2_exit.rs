@@ -163,6 +163,7 @@ async fn bind_one(
         mdns: true,
         insecure_relay_tls: insecure,
         presence_path: path,
+        bind_v4: None,
     })
     .await
     .unwrap_or_else(|err| panic!("bind {label}: {err}"))
