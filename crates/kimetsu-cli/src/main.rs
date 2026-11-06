@@ -1686,6 +1686,11 @@ struct BrainExportArgs {
     /// (instead of redacting + reporting). Use when publishing to fail loudly.
     #[arg(long)]
     strict: bool,
+    /// Ed25519 secret key (64 hex chars, or a `kimetsu_signer` JSON file).
+    /// Writes `kimetsu_pack` 2 signed over the scrubbed canonical body.
+    /// Requires `--scope`. Unsigned v1 export stays the path without this flag.
+    #[arg(long)]
+    sign_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1722,6 +1727,10 @@ struct BrainImportArgs {
     /// Import straight into retrieval, skipping review. See `--quarantine`.
     #[arg(long, overrides_with = "quarantine")]
     no_quarantine: bool,
+    /// Trust store JSON (`kimetsu_trust` 1). Defaults to `~/.kimetsu/trust.json`
+    /// or `$KIMETSU_TRUST_STORE`. Used when the file is a signed v2 pack.
+    #[arg(long)]
+    trust_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

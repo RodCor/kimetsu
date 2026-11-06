@@ -8,9 +8,11 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use kimetsu_brain::mount::{self, MountGrants};
 use kimetsu_brain::project;
+use kimetsu_brain::signed_pack::{self, PackManifest};
 use kimetsu_core::KimetsuResult;
-use kimetsu_core::memory::{MemoryKind, MemoryScope};
+use kimetsu_core::memory::{MemoryKind, MemoryScope, MountLevel};
 
 use crate::*;
 
@@ -1277,6 +1279,7 @@ pub(crate) fn brain_compact(args: CompactArgs) -> KimetsuResult<()> {
 pub(crate) fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
     let workspace = args
         .workspace
+        .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
 
     // Parse optional scope/kind filters.
@@ -1297,6 +1300,10 @@ pub(crate) fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
                 .map_err(|_| format!("unknown kind `{k}`; expected one of: preference, convention, command, failure_pattern, fact"))
         })
         .transpose()?;
+
+    if args.sign_key.is_some() {
+        return export_signed_pack(&workspace, args, scope, kind);
+    }
 
     let (memories, scrub) =
         project::export_memories(&workspace, scope, kind, args.redact, args.redact_tags)?;
@@ -1356,6 +1363,80 @@ pub(crate) fn brain_export(args: BrainExportArgs) -> KimetsuResult<()> {
     Ok(())
 }
 
+fn operator_pack_grants() -> MountGrants {
+    let mut grants = MountGrants::default();
+    grants.allow_write(MountLevel::Repo);
+    grants.allow_write(MountLevel::User);
+    grants
+}
+
+/// Signed v2 export. Scrub and `--strict` run before the signature, and the
+/// signature covers the scrubbed body.
+fn export_signed_pack(
+    workspace: &Path,
+    args: BrainExportArgs,
+    scope: Option<MemoryScope>,
+    kind: Option<MemoryKind>,
+) -> KimetsuResult<()> {
+    if kind.is_some() {
+        return Err("brain export --sign-key does not take --kind".into());
+    }
+    let Some(scope) = scope else {
+        return Err("brain export --sign-key requires --scope".into());
+    };
+    let Some(key_path) = args.sign_key.as_deref() else {
+        return Err("brain export --sign-key is missing a key path".into());
+    };
+    let signer = signed_pack::PackSigner::load(key_path)?;
+    let manifest = PackManifest {
+        name: args.name.clone(),
+        version: args.version.clone(),
+        description: args.description.clone(),
+        exported_at: Some(
+            time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        ),
+    };
+    let (gzip, scrub) = mount::export_signed_pack(
+        workspace,
+        &operator_pack_grants(),
+        scope.mount(),
+        args.redact,
+        args.redact_tags,
+        &manifest,
+        args.strict,
+        &signer,
+    )?;
+    if !scrub.is_clean() {
+        eprintln!("kimetsu: export security scrub — {}", scrub.summary());
+    }
+    let count = scrub_memory_count(&gzip)?;
+    if args.file == "-" {
+        let json = signed_pack::decode_pack_bytes(&gzip)?;
+        println!("{json}");
+    } else {
+        std::fs::write(&args.file, &gzip)
+            .map_err(|e| format!("brain export: could not write `{}`: {e}", args.file))?;
+        println!(
+            "exported {count} memories to {} ({} bytes, gzip, signed pack)",
+            args.file,
+            gzip.len()
+        );
+    }
+    Ok(())
+}
+
+fn scrub_memory_count(gzip: &[u8]) -> KimetsuResult<usize> {
+    let json = signed_pack::decode_pack_bytes(gzip)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("brain export: signed pack: {e}"))?;
+    Ok(value
+        .get("memory_count")
+        .and_then(|count| count.as_u64())
+        .unwrap_or(0) as usize)
+}
+
 /// gzip-compress `data` (flate2, default compression).
 pub(crate) fn gzip_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
     use flate2::Compression;
@@ -1390,6 +1471,7 @@ pub(crate) fn maybe_gunzip_to_string(data: &[u8]) -> KimetsuResult<String> {
 pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
     let workspace = args
         .workspace
+        .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
 
     // Parse optional scope_override.
@@ -1472,7 +1554,18 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
     };
 
     // Decompress if gzip; then parse a Pack envelope OR a bare array (back-compat).
+    // Version 2 verifies the signature before any of that import touches SQL.
     let json = maybe_gunzip_to_string(&bytes)?;
+    if signed_pack_version(&json) == Some(2) {
+        return import_signed_pack(
+            &workspace,
+            &args,
+            scope_override,
+            replace,
+            quarantine,
+            &bytes,
+        );
+    }
     let (pack_ref, entries) = project::parse_pack_or_array(&json)
         .map_err(|e| format!("brain import: `{}`: {e}", args.file))?;
 
@@ -1518,6 +1611,71 @@ pub(crate) fn brain_import(args: BrainImportArgs) -> KimetsuResult<()> {
         );
     }
 
+    Ok(())
+}
+
+fn signed_pack_version(json: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get("kimetsu_pack")?
+        .as_u64()
+}
+
+fn import_signed_pack(
+    workspace: &Path,
+    args: &BrainImportArgs,
+    scope_override: Option<MemoryScope>,
+    replace: bool,
+    quarantine: bool,
+    bytes: &[u8],
+) -> KimetsuResult<()> {
+    let Some(dest) = scope_override else {
+        return Err(
+            "brain import of a signed pack requires --scope-override naming the destination mount"
+                .into(),
+        );
+    };
+    let trust = if let Some(path) = &args.trust_store {
+        signed_pack::TrustStore::load(path)?
+    } else {
+        signed_pack::load_default_trust_store()?
+    };
+    let summary = mount::import_signed_pack(
+        workspace,
+        &operator_pack_grants(),
+        bytes,
+        dest.mount(),
+        replace,
+        quarantine,
+        &trust,
+    )?;
+    if summary.quarantined > 0 || quarantine {
+        println!(
+            "quarantined {}, deduped {}",
+            summary.quarantined, summary.deduped
+        );
+        if summary.quarantined > 0 {
+            let why = if quarantine {
+                ""
+            } else {
+                " The signer is not in the trust store for this mount."
+            };
+            println!(
+                "Nothing from this pack can reach a session until you accept it. \
+                 Review with `kimetsu brain memory proposals`.{why}"
+            );
+        }
+    } else if summary.superseded > 0 {
+        println!(
+            "installed {}, deduped {}, superseded {}",
+            summary.imported, summary.deduped, summary.superseded
+        );
+    } else {
+        println!(
+            "installed {}, deduped {}",
+            summary.imported, summary.deduped
+        );
+    }
     Ok(())
 }
 

@@ -1,8 +1,9 @@
-//! F0 mount grants and the seven local store operations.
+//! Mount grants and the seven local store operations.
 //!
 //! Session rows live in the project SQLite file, keyed by level and
 //! `session_id`. Cite outcome is a field on the existing citation event:
-//! omitted means `noop`. No signatures and no sockets.
+//! omitted means `noop`. F1 signatures live in [`crate::signed_pack`].
+//! This module still opens no sockets and does not dial a bus.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -13,6 +14,7 @@ use kimetsu_core::memory::{MemoryKind, MemoryScope, MountLevel, mount_of_stored}
 use crate::context::{ContextBundle, ContextRequest};
 use crate::packs::{self, ImportSummary, MemoryExport, PackRef, ScrubReport};
 use crate::project::{self, BrainSession, ProposeResult};
+use crate::signed_pack::{self, PackManifest, TrustStore};
 
 /// Read and write grants for one handle. Write includes read.
 #[derive(Debug, Clone, Default)]
@@ -239,6 +241,77 @@ pub fn import_pack(
         Some(&PackRef {
             name: Some("f0".into()),
             version: Some("1".into()),
+        }),
+        quarantine,
+    )
+}
+
+/// `export_pack` version 2. Scrub runs before the canonical body is hashed.
+/// `--strict` / `strict` aborts when the scrub report is non-empty and does
+/// not sign. `run` and `session` are not emitted.
+#[allow(clippy::too_many_arguments)]
+pub fn export_signed_pack(
+    start: &Path,
+    grants: &MountGrants,
+    level: MountLevel,
+    redact: bool,
+    redact_tags: bool,
+    manifest: &PackManifest,
+    strict: bool,
+    signer: &signed_pack::PackSigner,
+) -> KimetsuResult<(Vec<u8>, ScrubReport)> {
+    if matches!(level, MountLevel::Run | MountLevel::Session) {
+        return Err("export_pack refuses run and session mounts".into());
+    }
+    if !grants.can_read(level) {
+        return Err(format!("export requires read on {level}").into());
+    }
+    let (memories, scrub) =
+        packs::export_memories(start, Some(scope_for(level)), None, redact, redact_tags)?;
+    if strict && !scrub.is_clean() {
+        return Err(format!(
+            "brain export --strict: {} — fix the source memories or drop --strict",
+            scrub.summary()
+        )
+        .into());
+    }
+    let scopes = vec![level.as_str().to_string()];
+    let json = signer.seal_json(manifest, &scopes, &memories)?;
+    let bytes = signed_pack::encode_gzip(&json)?;
+    Ok((bytes, scrub))
+}
+
+/// `import_pack` for `kimetsu_pack` 2. Signature and scope checks finish
+/// before any SQLite call. An unknown signer is quarantined and does not
+/// enter retrieval. `replace` together with that quarantine is a reject.
+pub fn import_signed_pack(
+    start: &Path,
+    grants: &MountGrants,
+    bytes: &[u8],
+    destination: MountLevel,
+    replace: bool,
+    quarantine: bool,
+    trust: &TrustStore,
+) -> KimetsuResult<ImportSummary> {
+    let json = signed_pack::decode_pack_bytes(bytes)?;
+    let verified = signed_pack::verify_pack_json(&json)?;
+    signed_pack::reject_scope_mismatch(&verified, destination)?;
+    if !grants.can_write(destination) {
+        return Err(format!("import requires write on {destination}").into());
+    }
+    let trusted = trust.trusts(&verified.signer_hex, destination);
+    let quarantine = if trusted { quarantine } else { true };
+    if replace && quarantine {
+        return Err("replace and quarantine cannot be combined".into());
+    }
+    packs::import_pack(
+        start,
+        &verified.memories,
+        Some(scope_for(destination)),
+        replace,
+        Some(&PackRef {
+            name: verified.name.clone(),
+            version: verified.version.clone(),
         }),
         quarantine,
     )

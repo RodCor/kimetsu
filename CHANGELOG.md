@@ -9,6 +9,10 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+### Added
+
+- `kimetsu_pack` 2 signs the scrubbed body with BLAKE3 and Ed25519 (`kimetsu-canon-json/1`, RFC 8032 `verify_strict`). `kimetsu brain export --sign-key` writes it. `~/.kimetsu/trust.json` lists signers that may merge into a mount. An unknown signer is quarantined. A scope mismatch is rejected before any database write. Unsigned v1 import is unchanged.
+
 ### Changed
 
 - Local mounts follow ADR 0001 F0. New memory events store `repo` when the caller sends `project`; retrieval still reads stored `project` rows and labels them `repo`. `session`, `org`, and `skill` are real levels on the durable event. Similarity merge does not collapse `project` into `repo`.
