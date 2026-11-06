@@ -1165,6 +1165,59 @@ fn apply_memory_restored(conn: &Connection, event: &Event) -> KimetsuResult<()> 
     Ok(())
 }
 
+/// Order key for two supersedes of one member. Federated links carry the
+/// peer clock in `source_hlc`. A local event uses its own HLC.
+fn supersede_order_key(event: &Event) -> String {
+    event
+        .payload
+        .get("source_hlc")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| event.hlc.clone())
+        .unwrap_or_default()
+}
+
+/// True when `event` should move `superseded_by`. Equal keys keep today's
+/// last-applied-in-replay-order winner. A smaller key records the conflict
+/// and leaves the incumbent.
+fn incoming_supersede_outranks(
+    conn: &Connection,
+    event: &Event,
+    memory_id: &str,
+    incumbent: &str,
+) -> KimetsuResult<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT hlc, payload_json FROM events
+         WHERE kind = 'memory.superseded'
+           AND json_extract(payload_json, '$.memory_id') = ?1
+           AND json_extract(payload_json, '$.survivor_id') = ?2",
+    )?;
+    let rows = stmt.query_map(params![memory_id, incumbent], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut best: Option<String> = None;
+    for row in rows {
+        let (hlc, payload) = row?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        let key = parsed
+            .get("source_hlc")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or(hlc)
+            .unwrap_or_default();
+        if best.as_ref().is_none_or(|current| key > *current) {
+            best = Some(key);
+        }
+    }
+    Ok(match best {
+        None => true,
+        Some(key) => supersede_order_key(event) >= key,
+    })
+}
+
 /// Story 3.1: project a `memory.superseded` event.
 ///
 /// Payload fields:
@@ -1233,6 +1286,11 @@ fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()
                  VALUES (?1, ?2, ?3, ?4)",
                 params![memory_id, a, b, detected_at],
             )?;
+            // A later source clock moves the link. An earlier one stays
+            // recorded and does not pull the projection backwards.
+            if !incoming_supersede_outranks(conn, event, memory_id, &prev)? {
+                return Ok(());
+            }
         }
     }
 

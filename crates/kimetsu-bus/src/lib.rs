@@ -4,6 +4,8 @@
 //! [`kimetsu_brain::mount::import_signed_pack`], the same function a local
 //! file uses through `kimetsu_sdk::import_signed_pack`.
 //! This crate does not reimplement merge, quarantine, scrub, or supersede.
+//! A v2 pack may carry supersede links. [`import_signed_pack`] applies them.
+//! This crate does not choose a survivor and does not open a second store.
 //!
 //! Presence is a side file and a side task. [`kimetsu_brain::mount::context`]
 //! and [`kimetsu_brain::mount::search`] do not call into this crate. Callers

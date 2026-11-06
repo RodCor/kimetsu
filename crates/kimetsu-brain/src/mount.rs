@@ -266,8 +266,13 @@ pub fn export_signed_pack(
     if !grants.can_read(level) {
         return Err(format!("export requires read on {level}").into());
     }
-    let (memories, scrub) =
+    let (memories, mut scrub) =
         packs::export_memories(start, Some(scope_for(level)), None, redact, redact_tags)?;
+    let (links, link_scrub) = crate::federated::collect_links(start, level, redact, redact_tags)?;
+    scrub.total += link_scrub.total;
+    for (kind, count) in link_scrub.kinds {
+        *scrub.kinds.entry(kind).or_insert(0) += count;
+    }
     if strict && !scrub.is_clean() {
         return Err(format!(
             "brain export --strict: {} — fix the source memories or drop --strict",
@@ -276,7 +281,7 @@ pub fn export_signed_pack(
         .into());
     }
     let scopes = vec![level.as_str().to_string()];
-    let json = signer.seal_json(manifest, &scopes, &memories)?;
+    let json = signer.seal_with_supersedes(manifest, &scopes, &memories, &links)?;
     let bytes = signed_pack::encode_gzip(&json)?;
     Ok((bytes, scrub))
 }
@@ -296,6 +301,7 @@ pub fn import_signed_pack(
     let json = signed_pack::decode_pack_bytes(bytes)?;
     let verified = signed_pack::verify_pack_json(&json)?;
     signed_pack::reject_scope_mismatch(&verified, destination)?;
+    signed_pack::reject_supersede_links(&verified, destination)?;
     if !grants.can_write(destination) {
         return Err(format!("import requires write on {destination}").into());
     }
@@ -304,7 +310,7 @@ pub fn import_signed_pack(
     if replace && quarantine {
         return Err("replace and quarantine cannot be combined".into());
     }
-    packs::import_pack(
+    let mut summary = packs::import_pack(
         start,
         &verified.memories,
         Some(scope_for(destination)),
@@ -314,7 +320,15 @@ pub fn import_signed_pack(
             version: verified.version.clone(),
         }),
         quarantine,
-    )
+    )?;
+    // Replace already retires the mount by invalidation. Quarantine must not
+    // retire a local row on a signer the operator has not trusted.
+    if !replace && !quarantine {
+        let applied = crate::federated::apply_links(start, destination, &verified.supersedes)?;
+        summary.superseded += applied.superseded;
+        summary.conflicts = applied.conflicts;
+    }
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -939,6 +953,258 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(fts, 0, "supersede must drop FTS in the same transaction");
+            std::fs::remove_dir_all(&root).ok();
+        });
+    }
+
+    fn pack_manifest() -> PackManifest {
+        PackManifest {
+            name: Some("f5".into()),
+            version: Some("1".into()),
+            description: Some("federated supersede".into()),
+            exported_at: Some("2026-01-01T00:00:00Z".into()),
+        }
+    }
+
+    fn successor_of(root: &std::path::Path, predecessor: &str) -> Option<String> {
+        let (_, _, conn) = project::load_project_readonly(root).unwrap();
+        conn.query_row(
+            "SELECT succ.text
+             FROM memories pred
+             JOIN memories succ ON succ.memory_id = pred.superseded_by
+             WHERE pred.text = ?1 AND pred.invalidated_at IS NULL",
+            [predecessor],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn superseded_events(root: &std::path::Path) -> i64 {
+        let (_, _, conn) = project::load_project_readonly(root).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'memory.superseded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Two peers retire the same text to different successors. Signed packs
+    /// carry the links (not memory ids). Import keeps both events, replay
+    /// picks the later HLC, and one `sync_conflicts` row records the disagreement.
+    #[test]
+    fn federated_supersede_converges_on_the_later_hlc_and_records_one_conflict() {
+        user_brain::with_user_brain_disabled(|| {
+            let predecessor = "F5_PREDECESSOR alpha rule";
+            let earlier = "F5_SUCCESSOR earlier";
+            let later = "F5_SUCCESSOR later";
+            let left = temp_project("f5-left");
+            let right = temp_project("f5-right");
+            project::init_project(&left, false).unwrap();
+            project::init_project(&right, false).unwrap();
+            let grants = operator_repo();
+            let signer = signed_pack::PackSigner::generate().unwrap();
+            let mut trust = TrustStore::empty();
+            trust
+                .allow(&signer.public_key_hex(), &[MountLevel::Repo])
+                .unwrap();
+
+            let seed = |root: &std::path::Path, successor: &str| {
+                let pred =
+                    project::add_memory(root, MemoryScope::Repo, MemoryKind::Fact, predecessor)
+                        .unwrap();
+                let succ =
+                    project::add_memory(root, MemoryScope::Repo, MemoryKind::Fact, successor)
+                        .unwrap();
+                supersede(root, &grants, &pred, &succ).unwrap();
+            };
+            seed(&left, earlier);
+            seed(&right, later);
+
+            let export = |root: &std::path::Path| {
+                export_signed_pack(
+                    root,
+                    &grants,
+                    MountLevel::Repo,
+                    true,
+                    false,
+                    &pack_manifest(),
+                    false,
+                    &signer,
+                )
+                .unwrap()
+                .0
+            };
+            let import = |root: &std::path::Path, bytes: &[u8]| {
+                import_signed_pack(root, &grants, bytes, MountLevel::Repo, false, false, &trust)
+                    .unwrap()
+            };
+
+            let left_pack = export(&left);
+            let right_pack = export(&right);
+            let verified =
+                signed_pack::verify_pack_json(&signed_pack::decode_pack_bytes(&left_pack).unwrap())
+                    .unwrap();
+            assert!(
+                verified
+                    .supersedes
+                    .iter()
+                    .any(|link| link.predecessor.contains("alpha rule")
+                        && link.successor.contains("earlier")),
+                "the signed pack must name the predecessor text and its successor"
+            );
+            assert!(
+                !verified
+                    .memories
+                    .iter()
+                    .any(|row| row.text.contains("alpha rule")),
+                "superseded rows stay out of the memories array"
+            );
+
+            let into_right = import(&right, &left_pack);
+            let into_left = import(&left, &right_pack);
+            assert_eq!(into_right.conflicts, 1, "{into_right:?}");
+            assert_eq!(into_left.conflicts, 1, "{into_left:?}");
+            assert_eq!(successor_of(&left, predecessor).as_deref(), Some(later));
+            assert_eq!(successor_of(&right, predecessor).as_deref(), Some(later));
+            for root in [&left, &right] {
+                let (_, _, conn) = project::load_project_readonly(root).unwrap();
+                assert_eq!(crate::sync::sync_conflict_count(&conn).unwrap(), 1);
+                assert_eq!(superseded_events(root), 2);
+            }
+
+            let again = import(&left, &right_pack);
+            assert_eq!(
+                again.conflicts, 0,
+                "the same pair must not chain another event"
+            );
+            assert_eq!(superseded_events(&left), 2);
+            {
+                let (_, _, conn) = project::load_project(&left).unwrap();
+                projector::rebuild_in_place(&conn).unwrap();
+            }
+            assert_eq!(successor_of(&left, predecessor).as_deref(), Some(later));
+            let (_, _, conn) = project::load_project_readonly(&left).unwrap();
+            assert_eq!(
+                crate::sync::sync_conflict_count(&conn).unwrap(),
+                1,
+                "rebuild must keep the conflict row"
+            );
+
+            std::fs::remove_dir_all(&left).ok();
+            std::fs::remove_dir_all(&right).ok();
+        });
+    }
+
+    #[test]
+    fn untrusted_signer_does_not_move_a_local_supersede() {
+        user_brain::with_user_brain_disabled(|| {
+            let predecessor = "F5_UNTRUSTED predecessor";
+            let local = "F5_UNTRUSTED local successor";
+            let remote = "F5_UNTRUSTED remote successor";
+            let root = temp_project("f5-untrusted");
+            project::init_project(&root, false).unwrap();
+            let grants = operator_repo();
+            let pred = project::add_memory(&root, MemoryScope::Repo, MemoryKind::Fact, predecessor)
+                .unwrap();
+            let succ =
+                project::add_memory(&root, MemoryScope::Repo, MemoryKind::Fact, local).unwrap();
+            supersede(&root, &grants, &pred, &succ).unwrap();
+
+            let other = temp_project("f5-untrusted-src");
+            project::init_project(&other, false).unwrap();
+            let other_pred =
+                project::add_memory(&other, MemoryScope::Repo, MemoryKind::Fact, predecessor)
+                    .unwrap();
+            let other_succ =
+                project::add_memory(&other, MemoryScope::Repo, MemoryKind::Fact, remote).unwrap();
+            supersede(&other, &grants, &other_pred, &other_succ).unwrap();
+            let signer = signed_pack::PackSigner::generate().unwrap();
+            let bytes = export_signed_pack(
+                &other,
+                &grants,
+                MountLevel::Repo,
+                true,
+                false,
+                &pack_manifest(),
+                false,
+                &signer,
+            )
+            .unwrap()
+            .0;
+            let before = superseded_events(&root);
+            let summary = import_signed_pack(
+                &root,
+                &grants,
+                &bytes,
+                MountLevel::Repo,
+                false,
+                false,
+                &TrustStore::empty(),
+            )
+            .unwrap();
+            assert_eq!(summary.quarantined, 1, "{summary:?}");
+            assert_eq!(summary.conflicts, 0);
+            assert_eq!(successor_of(&root, predecessor).as_deref(), Some(local));
+            assert_eq!(superseded_events(&root), before);
+            let (_, _, conn) = project::load_project_readonly(&root).unwrap();
+            assert_eq!(crate::sync::sync_conflict_count(&conn).unwrap(), 0);
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::remove_dir_all(&other).ok();
+        });
+    }
+
+    #[test]
+    fn supersede_link_outside_the_destination_writes_no_sql() {
+        user_brain::with_user_brain_disabled(|| {
+            let root = temp_project("f5-scope");
+            project::init_project(&root, false).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Repo,
+                MemoryKind::Fact,
+                "F5_SCOPE sentinel",
+            )
+            .unwrap();
+            let before = superseded_events(&root);
+            let signer = signed_pack::PackSigner::generate().unwrap();
+            let memory = MemoryExport {
+                text: "F5_SCOPE successor".into(),
+                scope: "repo".into(),
+                kind: "fact".into(),
+                confidence: 0.9,
+                created_at: Some("2026-01-01T00:00:00Z".into()),
+            };
+            let link = signed_pack::SupersedeLink {
+                predecessor: "F5_SCOPE sentinel".into(),
+                predecessor_kind: "fact".into(),
+                successor: memory.text.clone(),
+                successor_kind: "fact".into(),
+                mount: "user".into(),
+                hlc: "1793992723501.0000000000.local".into(),
+            };
+            let json = signer
+                .seal_with_supersedes(&pack_manifest(), &["repo".into()], &[memory], &[link])
+                .unwrap();
+            let bytes = signed_pack::encode_gzip(&json).unwrap();
+            let err = import_signed_pack(
+                &root,
+                &operator_repo(),
+                &bytes,
+                MountLevel::Repo,
+                false,
+                false,
+                &TrustStore::empty(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("scope mismatch"), "{err}");
+            assert_eq!(superseded_events(&root), before);
+            let (_, _, conn) = project::load_project_readonly(&root).unwrap();
+            let memories: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(memories, 1, "a bad supersede link must not import the pack");
             std::fs::remove_dir_all(&root).ok();
         });
     }
