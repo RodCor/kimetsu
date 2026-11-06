@@ -4,7 +4,8 @@
 # Topology: two Linux netns connected by a veth pair on one physical host
 # (10.200.0.1 <-> 10.200.0.2). This is not two LAN hosts and it does not
 # fill the §7 "direct LAN QUIC between two LAN machines" row. That
-# measurement is still pending.
+# measurement is still pending. scripts/f3-hotpath-two-hosts.sh is the
+# two-PC harness. Do not relabel these netns addresses as that run.
 #
 # Same build as scripts/f3-hotpath.sh: release, embeddings feature off.
 # The example also sets KIMETSU_BRAIN_EMBEDDER=off. Needs root or
