@@ -148,6 +148,7 @@ pub(crate) fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
             BridgeTarget::Cursor => "Cursor",
+            BridgeTarget::GrokBot => "Grok Bot",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]
@@ -306,6 +307,7 @@ pub(crate) fn setup_cmd(args: SetupArgs) -> KimetsuResult<()> {
             BridgeTarget::Codex => "Codex",
             BridgeTarget::Kimetsu => "Kimetsu",
             BridgeTarget::Cursor => "Cursor",
+            BridgeTarget::GrokBot => "Grok Bot",
             #[cfg(feature = "openclaw")]
             BridgeTarget::OpenClaw => "OpenClaw",
             #[cfg(feature = "pi")]

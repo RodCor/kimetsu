@@ -26,6 +26,7 @@ pub mod ask;
 pub mod bridge;
 pub mod commands;
 pub mod cost;
+mod host_f4;
 pub mod mcp_server;
 pub mod repl;
 pub mod skills;

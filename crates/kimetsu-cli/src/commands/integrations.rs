@@ -283,6 +283,7 @@ pub(crate) fn run_plugin_install_remote(
 
     let host_label = match target {
         kimetsu_chat::BridgeTarget::ClaudeCode => "Claude Code",
+        kimetsu_chat::BridgeTarget::GrokBot => "Grok Bot",
         #[cfg(feature = "openclaw")]
         kimetsu_chat::BridgeTarget::OpenClaw => "OpenClaw",
         _ => "host",
@@ -359,6 +360,7 @@ pub(crate) fn plugin(command: PluginCommand) -> KimetsuResult<()> {
                 BridgeTarget::Codex => "Codex",
                 BridgeTarget::Kimetsu => "Kimetsu",
                 BridgeTarget::Cursor => "Cursor",
+                BridgeTarget::GrokBot => "Grok Bot",
                 #[cfg(feature = "openclaw")]
                 BridgeTarget::OpenClaw => "OpenClaw",
                 #[cfg(feature = "pi")]

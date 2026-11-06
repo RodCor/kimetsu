@@ -480,7 +480,7 @@ The durable `import_pack` after a verified `request_pack` is the same store oper
 
 WAL is already the Remote SQLite checkpoint adapter (`docs/remote-storage.md`). The local brain uses the same engine; F3's criterion is that the hot path's journal mode and the lock scope match the sentence above, not a new database.
 
-### 8. Phased delivery F0–F3
+### 8. Phased delivery
 
 Each phase leaves the default path free of a generative LLM and free of a network wait inside `context`. Later phases MUST NOT put work on the hot path that would make the F3 budgets impossible (no IDF scan, no LLM, no presence join).
 
@@ -508,11 +508,22 @@ Each phase leaves the default path free of a generative LLM and free of a networ
 - **Exit.** The hot path meets the budgets or the phase stays open. A failed budget does not get "fixed" by moving presence onto `context` or by calling a model. Remote checkpoint limits and the disposable projection stay as documented.
 - **Unchanged.** MCP as the agent edge, `@kimetsu-ai/sdk` as an HTTP client, decay constants, the decision not to clone repos.
 
+#### F4 — Host adapters
+
+- **Contract.** MCP stays the host edge. These adapters do not open `brain.db` and do not add a protocol. The Rust SDK stays in-process beside SQLite. `@kimetsu-ai/sdk` stays an HTTP client. `kimetsu plugin install` writes the host file, and the MCP `instructions` field plus that file state the same operator workflow. Stdio grants are read `repo`, read `user`, and write `repo` only while write tools are on. `kimetsu_brain_record` stores `repo` and does not accept another level. `kimetsu_brain_context` returns capsules from those read grants and does not call a generative model. Warm start is that evidence digest. `kimetsu_brain_cite` takes `exposure_id`, `memory_id`, and `outcome` `helped`, `noop`, or `harmed`. Omitting `outcome` records `noop`. Only `helped` raises usefulness. `harmed` sets `invalidated_reason` to `cite_harmed`.
+- **Claude Code.** Workspace `.mcp.json` sets `mcpServers.kimetsu` to `type` `stdio`, `command` `kimetsu`, `args` `mcp serve --workspace .`. The same object is still also written under the historical `servers` key. Global install writes `mcpServers` only, in `~/.claude.json`. Source checked 2026-11-06: `https://code.claude.com/docs/en/mcp`.
+- **Codex.** `.codex/config.toml` sets `[mcp_servers.kimetsu]` `command` and `args` to that same stdio server. Source checked 2026-11-06: `https://developers.openai.com/codex/mcp`.
+- **Cursor.** `.cursor/mcp.json` sets `mcpServers.kimetsu` `type` `stdio` with the same command and args. Workspace install also writes `.cursor/rules/kimetsu-brain/rule.md`. Source checked 2026-11-06: `https://cursor.com/docs/mcp`.
+- **Grok Bot.** No settings file is documented. Install writes `.kimetsu/hosts/grok-bot.md`. That file is an operator snippet: ask the Bot to add the stdio command, or, with `--remote`, the `https://<base>/mcp/<repo>` URL and `Authorization: Bearer ${KIMETSU_REMOTE_TOKEN}`. It does not draw a Connect card and it does not write Grok Build's `~/.grok/config.toml`. Source checked 2026-11-06: `https://docs.x.ai/grok-bot/computer-and-apps`.
+- **Verified.** `kimetsu-chat` `four_hosts_generate_stdio_mcp_and_drive_context_record_cite` installs the four workspace targets, checks the generated command, and drives MCP `initialize` plus `tools/call` for record, context, and cite. `grok_bot_remote_snippet_names_the_http_endpoint_and_no_config_file` checks the remote snippet. Context in that test returns the repo lesson and no org or skill text. `helped` raises usefulness, `noop` does not, `harmed` lowers it and records `cite_harmed`.
+- **Not verified.** No Claude Code, Codex, Cursor, or Grok Bot process loaded these files. Claude Code still asks a person to approve a project `.mcp.json`. Grok Bot's chat confirmation was not exercised. Pi and OpenClaw wiring is unchanged.
+- **Unchanged.** No second agent protocol. No TypeScript bus. No direct `brain.db` access from `@kimetsu-ai/sdk`. No default relay. Directory JSONL sync stays the offline complement. Roster membership still gates the bus. Signed packs stay the wire format. Remote HTTP checkpoints do not dial the bus.
+
 #### F5 — Federated supersede and conflicts
 
 - **Deliverable.** Invitation, as in [Invitation, supersede, and conflicts](#invitation-supersede-and-conflicts), and supersede links inside signed packs. A disagreement is a `sync_conflicts` row. The later source HLC is the survivor. No generative model is on the path.
 - **Exit.** Two peers that supersede one text to two successors converge on the later source HLC and each keep one conflict row. An untrusted signer does not move the local link. A link for another mount writes no SQL. An announcement still has no memory text.
-- **Unchanged.** No default relay. `@kimetsu-ai/sdk` stays an HTTP client and does not open `brain.db`. No host adapters. No chat frame and no git clone. Directory sync is not a bus frame; the carrier split is [Directory sync and the bus](#directory-sync-and-the-bus).
+- **Unchanged.** No default relay. `@kimetsu-ai/sdk` stays an HTTP client and does not open `brain.db`. Host adapters stay as F4 left them. No chat frame and no git clone. Directory sync is not a bus frame; the carrier split is [Directory sync and the bus](#directory-sync-and-the-bus).
 
 #### F6 — Directory sync and the bus
 
@@ -588,5 +599,6 @@ Also out of F0–F3, stated so they are not implied: rewriting `@kimetsu-ai/sdk`
 - `crates/kimetsu-brain/src/scoring.rs`, `crates/kimetsu-brain/src/projector.rs` — `CITED_DELTA`, `PASSENGER_DELTA`.
 - `crates/kimetsu-brain/src/skill_synthesis.rs` — citation threshold 3, staleness.
 - `crates/kimetsu-chat/src/mcp_server.rs` — `kimetsu_brain_context`, `kimetsu_brain_record`, `kimetsu_brain_cite`, write-tool gate.
+- `docs/host-adapters.md` — F4 install files and the stdio grant workflow.
 - `npm/kimetsu-sdk/README.md`, `npm/kimetsu-sdk/src/types.ts` — HTTP client, current scope union.
 - Reason Network design (external): `https://github.com/reason-machines/reason-network/blob/main/DESIGN.md` — iroh session bus this ADR does not adopt as memory.
