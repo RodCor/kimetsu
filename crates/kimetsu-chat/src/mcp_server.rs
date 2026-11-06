@@ -12,7 +12,14 @@ use crate::bridge::{
 };
 use crate::skills::{SkillConfig, SkillRegistry, skill_origin_label};
 
-const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant; the reply still has a small input-token cost — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations record reliance, not verification. Missing citations leave usefulness unknown; observed outcomes are associations with the delivered evidence. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills.";
+const KIMETSU_MCP_INSTRUCTIONS: &str = "Kimetsu is a persistent brain sidecar: it accumulates generalizable knowledge across sessions and retrieves it on demand. Retrieve with kimetsu_brain_context when you start a task. A `skipped: true` reply means the brain held nothing relevant; the reply still has a small input-token cost — retrieving is cheaper than rediscovering. Record with kimetsu_brain_record once you know something a later session would otherwise have to work out again: a constraint that was not obvious, an approach that turned out to be wrong, a convention this project follows. Concrete and actionable, with 2-5 domain tags. Cite with kimetsu_brain_cite when a retrieved memory changed what you did. Citations record reliance, not verification. Missing citations leave usefulness unknown; observed outcomes are associations with the delivered evidence. For Terminal-Bench tasks use kimetsu_benchmark_context instead — it prioritizes semantic_operator and anti_pattern memories over episodic summaries. kimetsu_bridge_status and kimetsu_skills_search surface portable skills. ";
+
+fn mcp_instructions() -> String {
+    format!(
+        "{KIMETSU_MCP_INSTRUCTIONS}{}",
+        crate::host_f4::OPERATOR_WORKFLOW
+    )
+}
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
@@ -156,7 +163,7 @@ pub fn dispatch(
                 "tools": {},
                 "prompts": {},
             },
-            "instructions": KIMETSU_MCP_INSTRUCTIONS,
+            "instructions": mcp_instructions(),
             "serverInfo": {
                 "name": "kimetsu",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -1051,7 +1058,8 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
-            "usage": "Memory accepted into brain. Future kimetsu_brain_context calls with matching queries will retrieve it."
+            "usage": "Memory accepted into brain. Future kimetsu_brain_context calls with matching queries will retrieve it.",
+            "grants": stdio_grant_json()
         }),
         Ok(project::ProposeResult::Merged(memory_id)) => json!({
             "ok": true,
@@ -1061,7 +1069,8 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
-            "usage": "Similar memory already exists and was updated with this lesson. No duplicate created."
+            "usage": "Similar memory already exists and was updated with this lesson. No duplicate created.",
+            "grants": stdio_grant_json()
         }),
         Ok(project::ProposeResult::Duplicate(memory_id)) => json!({
             "ok": true,
@@ -1071,7 +1080,8 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
-            "usage": "Identical memory already in brain. No write needed."
+            "usage": "Identical memory already in brain. No write needed.",
+            "grants": stdio_grant_json()
         }),
         Ok(project::ProposeResult::Proposed(proposal_id)) => json!({
             "ok": true,
@@ -1081,7 +1091,8 @@ fn kimetsu_brain_record(workspace: &Path, arguments: &Value) -> Value {
             "kind": kind_str,
             "lesson": lesson,
             "tags": tags,
-            "usage": "Memory proposed for review (low confidence). Run `kimetsu brain memory review` to accept or reject."
+            "usage": "Memory proposed for review (low confidence). Run `kimetsu brain memory review` to accept or reject.",
+            "grants": stdio_grant_json()
         }),
         Err(err) => json!({ "ok": false, "error": err.to_string() }),
     }
@@ -1132,11 +1143,20 @@ fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, Stri
         Ok(()) => Ok(json!({
             "ok": true,
             "memory_id": memory_id,
+            "outcome": outcome,
             "recorded": "memory.cited",
+            "grants": stdio_grant_json(),
             "usage": "Reliance recorded for the delivered claim; this is not verification."
         })),
         Err(err) => Ok(json!({ "ok": false, "error": err.to_string() })),
     }
+}
+
+fn stdio_grant_json() -> Value {
+    json!({
+        "read": ["repo", "user"],
+        "write": ["repo"]
+    })
 }
 
 /// W3.2: load `broker.ambient` from the project config, best-effort.

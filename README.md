@@ -25,7 +25,8 @@ same wrong turns, the same re-explained conventions, the same exploration you
 already paid for last week.
 
 Kimetsu is a sidecar brain for your agent. One Rust binary and one SQLite file
-per project, wired into Claude Code, Codex, Pi, OpenClaw, or Cursor over MCP,
+per project, wired into Claude Code, Codex, Cursor, Grok Bot, Pi, or OpenClaw over MCP
+([host adapters](docs/host-adapters.md)),
 or driven from its own terminal chat. It captures the lessons an agent earns,
 learns which ones actually help, and hands them back before the next task. The
 default memory pipeline calls no LLM: storage and retrieval are local, free, and

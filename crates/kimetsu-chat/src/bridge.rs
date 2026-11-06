@@ -14,6 +14,8 @@ pub enum BridgeTarget {
     Codex,
     Kimetsu,
     Cursor,
+    /// Grok Bot. No documented settings file; install writes an operator snippet.
+    GrokBot,
     #[cfg(feature = "openclaw")]
     OpenClaw,
     #[cfg(feature = "pi")]
@@ -27,6 +29,7 @@ impl BridgeTarget {
             "codex" => Ok(Self::Codex),
             "kimetsu" => Ok(Self::Kimetsu),
             "cursor" => Ok(Self::Cursor),
+            "grok-bot" | "grokbot" => Ok(Self::GrokBot),
             #[cfg(feature = "openclaw")]
             "openclaw" | "claw" => Ok(Self::OpenClaw),
             #[cfg(not(feature = "openclaw"))]
@@ -51,6 +54,7 @@ impl BridgeTarget {
             Self::Codex => "codex",
             Self::Kimetsu => "kimetsu",
             Self::Cursor => "cursor",
+            Self::GrokBot => "grok-bot",
             #[cfg(feature = "openclaw")]
             Self::OpenClaw => "openclaw",
             #[cfg(feature = "pi")]
@@ -516,6 +520,9 @@ pub fn bridge_export_skill(
         BridgeTarget::Codex => workspace.join(".codex").join("skills").join(&name),
         BridgeTarget::Kimetsu => workspace.join(".kimetsu").join("skills").join(&name),
         BridgeTarget::Cursor => workspace.join(".cursor").join("skills").join(&name),
+        // Grok Bot has no documented skill directory. Keep the copy in the
+        // local Kimetsu skill store; the snippet does not point the Bot at it.
+        BridgeTarget::GrokBot => workspace.join(".kimetsu").join("skills").join(&name),
         #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => workspace
             .join(".openclaw")
@@ -658,6 +665,10 @@ fn plugin_install_remote_inner(
             merge_claude_md(&claude_md)?;
             files.push(normalize_path(&claude_md));
         }
+        BridgeTarget::GrokBot => {
+            let path = install_grok_bot_snippet(&workspace, home, mode, Some((&endpoint, &auth)))?;
+            files.push(path);
+        }
         #[cfg(feature = "openclaw")]
         BridgeTarget::OpenClaw => {
             let server = serde_json::json!({
@@ -683,7 +694,7 @@ fn plugin_install_remote_inner(
         }
         other => {
             return Err(format!(
-                "remote install is supported for claude-code and openclaw, not `{}`",
+                "remote install is supported for claude-code, openclaw, and grok-bot, not `{}`",
                 other.as_str()
             ));
         }
@@ -784,14 +795,11 @@ fn plugin_install_inner(
             // Generated docs are Kimetsu-owned boilerplate (not user-editable),
             // so always overwrite them on install — unlike CLAUDE.md.
             let bridge = commands.join("bridge.md");
-            write_text_file(
-                &bridge,
-                match mode {
-                    PluginMode::Optional => CLAUDE_BRIDGE_COMMAND_OPTIONAL,
-                    PluginMode::Required => CLAUDE_BRIDGE_COMMAND_REQUIRED,
-                },
-                true,
-            )?;
+            let bridge_body = with_operator_workflow(match mode {
+                PluginMode::Optional => CLAUDE_BRIDGE_COMMAND_OPTIONAL,
+                PluginMode::Required => CLAUDE_BRIDGE_COMMAND_REQUIRED,
+            });
+            write_text_file(&bridge, &bridge_body, true)?;
             files.push(normalize_path(&bridge));
             let delegate = commands.join("delegate.md");
             write_text_file(
@@ -826,14 +834,11 @@ fn plugin_install_inner(
                 .join("skills")
                 .join("kimetsu-bridge")
                 .join("SKILL.md");
-            write_text_file(
-                &skill,
-                match mode {
-                    PluginMode::Optional => CODEX_KIMETSU_SKILL_OPTIONAL,
-                    PluginMode::Required => CODEX_KIMETSU_SKILL_REQUIRED,
-                },
-                true,
-            )?;
+            let skill_body = with_operator_workflow(match mode {
+                PluginMode::Optional => CODEX_KIMETSU_SKILL_OPTIONAL,
+                PluginMode::Required => CODEX_KIMETSU_SKILL_REQUIRED,
+            });
+            write_text_file(&skill, &skill_body, true)?;
             files.push(normalize_path(&skill));
             let agents = codex_dir.join("agents");
             fs::create_dir_all(&agents)
@@ -877,9 +882,19 @@ fn plugin_install_inner(
                     .join("rules")
                     .join("kimetsu-brain")
                     .join("rule.md");
-                write_text_file(&rule, CURSOR_RULES_MD, true)?;
+                let rule_body = with_operator_workflow(CURSOR_RULES_MD);
+                write_text_file(&rule, &rule_body, true)?;
                 files.push(normalize_path(&rule));
             }
+        }
+
+        BridgeTarget::GrokBot => {
+            let path = install_grok_bot_snippet(&workspace, home, mode, None)?;
+            files.push(path);
+            notes.push(
+                "Grok Bot has no settings file. Ask the Bot to add the command in the snippet."
+                    .to_string(),
+            );
         }
 
         #[cfg(feature = "openclaw")]
@@ -1268,6 +1283,7 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
         BridgeTarget::ClaudeCode,
         BridgeTarget::Codex,
         BridgeTarget::Cursor,
+        BridgeTarget::GrokBot,
     ];
     #[cfg(feature = "openclaw")]
     scan_targets.push(BridgeTarget::OpenClaw);
@@ -1434,6 +1450,30 @@ fn plugin_status_inner(workspace: &Path) -> Vec<PluginScopeStatus> {
                         present,
                         missing,
                         config_path: cursor_dir.to_string_lossy().to_string(),
+                    });
+                }
+
+                BridgeTarget::GrokBot => {
+                    let snippet = crate::host_f4::grok_bot_snippet_path(&workspace, home);
+                    let mcp_ok = snippet.is_file();
+                    let mut present = Vec::new();
+                    let mut missing = Vec::new();
+                    if mcp_ok {
+                        present.push("mcp".to_string());
+                    } else {
+                        missing.push("mcp".to_string());
+                    }
+                    let state = aggregate_state(
+                        &present.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &missing.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    );
+                    results.push(PluginScopeStatus {
+                        host: target.as_str().to_string(),
+                        scope: scope.as_str().to_string(),
+                        state,
+                        present,
+                        missing,
+                        config_path: snippet.to_string_lossy().to_string(),
                     });
                 }
 
@@ -1663,6 +1703,13 @@ fn plugin_uninstall_inner(
                 if remove_path_if_exists(&rules_dir)? {
                     report.removed.push(normalize_path(&rules_dir));
                 }
+            }
+        }
+
+        BridgeTarget::GrokBot => {
+            let snippet = crate::host_f4::grok_bot_snippet_path(&workspace, home);
+            if remove_path_if_exists(&snippet)? {
+                report.removed.push(normalize_path(&snippet));
             }
         }
 
@@ -1952,8 +1999,8 @@ fn write_cursor_mcp_config(path: &Path) -> Result<(), String> {
         "kimetsu".to_string(),
         serde_json::json!({
             "type": "stdio",
-            "command": "kimetsu",
-            "args": ["mcp", "serve", "--workspace", "."]
+            "command": crate::host_f4::STDIO_COMMAND,
+            "args": crate::host_f4::STDIO_ARGS
         }),
     );
     let text = serde_json::to_string_pretty(&root)
@@ -2430,10 +2477,30 @@ fn resolve_bridge_skill_source(
 /// re-running just rewrites the same entry, preserving all other keys.
 /// `only_mcp_servers` is true for `~/.claude.json` (global), which uses
 /// only the `mcpServers` key; workspace `.mcp.json` also gets `servers`.
+fn with_operator_workflow(body: &str) -> String {
+    format!("{body}\n{}", crate::host_f4::OPERATOR_WORKFLOW)
+}
+
+fn install_grok_bot_snippet(
+    workspace: &Path,
+    home: Option<&Path>,
+    mode: PluginMode,
+    remote: Option<(&str, &str)>,
+) -> Result<PathBuf, String> {
+    let path = crate::host_f4::grok_bot_snippet_path(workspace, home);
+    write_text_file(
+        &path,
+        &crate::host_f4::grok_bot_snippet(mode.as_str(), remote),
+        true,
+    )?;
+    Ok(normalize_path(&path))
+}
+
 fn write_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<(), String> {
     let server = serde_json::json!({
-        "command": "kimetsu",
-        "args": ["mcp", "serve", "--workspace", "."]
+        "type": "stdio",
+        "command": crate::host_f4::STDIO_COMMAND,
+        "args": crate::host_f4::STDIO_ARGS
     });
     write_mcp_config_server(path, only_mcp_servers, server)
 }
@@ -2487,16 +2554,16 @@ fn write_codex_config(path: &Path) -> Result<(), String> {
     let mut kimetsu = toml::map::Map::new();
     kimetsu.insert(
         "command".to_string(),
-        toml::Value::String("kimetsu".to_string()),
+        toml::Value::String(crate::host_f4::STDIO_COMMAND.to_string()),
     );
     kimetsu.insert(
         "args".to_string(),
-        toml::Value::Array(vec![
-            toml::Value::String("mcp".to_string()),
-            toml::Value::String("serve".to_string()),
-            toml::Value::String("--workspace".to_string()),
-            toml::Value::String(".".to_string()),
-        ]),
+        toml::Value::Array(
+            crate::host_f4::STDIO_ARGS
+                .iter()
+                .map(|arg| toml::Value::String((*arg).to_string()))
+                .collect(),
+        ),
     );
     servers.insert("kimetsu".to_string(), toml::Value::Table(kimetsu));
 
@@ -2544,7 +2611,10 @@ const CLAUDE_MD_END: &str = "<!-- kimetsu:end -->";
 /// Used for both the workspace `.claude/CLAUDE.md` and the global
 /// `~/.claude/CLAUDE.md`.
 fn merge_claude_md(path: &Path) -> Result<(), String> {
-    let block = format!("{CLAUDE_MD_BEGIN}\n{CLAUDE_MD_CONTENT}{CLAUDE_MD_END}\n");
+    let block = format!(
+        "{CLAUDE_MD_BEGIN}\n{CLAUDE_MD_CONTENT}\n{}{CLAUDE_MD_END}\n",
+        crate::host_f4::OPERATOR_WORKFLOW
+    );
     let raw = if path.is_file() {
         fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?
     } else {

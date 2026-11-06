@@ -453,7 +453,7 @@ struct PluginStatusArgs {
 
 #[derive(Debug, Args)]
 struct PluginUninstallArgs {
-    /// Host to remove from: claude-code | codex | openclaw | pi.
+    /// Host to remove from: claude-code | codex | cursor | grok-bot | openclaw | pi.
     target: String,
     /// Workspace root to operate in. Defaults to current directory.
     #[arg(long, default_value = ".")]
@@ -471,7 +471,7 @@ struct PluginUninstallArgs {
 
 #[derive(Debug, Args)]
 struct PluginInstallArgs {
-    /// Host to install into: claude-code | codex | openclaw | pi | kimetsu.
+    /// Host to install into: claude-code | codex | cursor | grok-bot | openclaw | pi | kimetsu.
     target: String,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
@@ -502,7 +502,8 @@ struct PluginInstallArgs {
     /// Wire a REMOTE kimetsu-remote server (HTTP MCP) instead of the local
     /// stdio command. Pass the server base URL, e.g.
     /// https://kimetsu.example.com:8787 (the endpoint becomes <url>/mcp/<repo>).
-    /// Supported for claude-code and openclaw.
+    /// Supported for claude-code, openclaw, and grok-bot. Grok Bot receives an
+    /// operator snippet, not a settings file.
     #[arg(long)]
     remote: Option<String>,
     /// Repository id for the remote brain. Defaults to an id derived from this
