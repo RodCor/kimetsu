@@ -14,7 +14,9 @@
 //! for direct LAN QUIC. That LAN measurement is still pending. Relay-down and
 //! relay-up samples are separate `context` runs.
 
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,11 +31,18 @@ use kimetsu_core::memory::{MemoryKind, MemoryScope, MountLevel};
 use kimetsu_core::paths::git_init_boundary;
 use kimetsu_sdk::MountGrants;
 
+#[cfg(target_os = "linux")]
 const POSIX_FADV_DONTNEED: i32 = 4;
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
 }
+
+#[cfg(target_os = "linux")]
+const COLD_NOTE: &str = "posix_fadvise DONTNEED, then the first call";
+#[cfg(not(target_os = "linux"))]
+const COLD_NOTE: &str = "first call, page cache not dropped";
 
 #[tokio::main]
 async fn main() {
@@ -87,7 +96,7 @@ corpus: {corpus} accepted repo memories, brain.db {bytes} bytes, selective query
 embeddings: off (KIMETSU_BRAIN_EMBEDDER=off, crate built without the embeddings feature)
 reranker: not called (kimetsu_sdk::context does not rerank)
 network on context: none
-cold context: {cold_ms:.3} ms (posix_fadvise DONTNEED, then the first call)
+cold context: {cold_ms:.3} ms ({cold_note})
 warm context, relay down: n={n} p50={p50:.3} ms p99={p99:.3} ms max={max:.3} ms
 warm context, relay up: n={n2} p50={p50b:.3} ms p99={p99b:.3} ms max={maxb:.3} ms ({presence_note})
 request_pack direct QUIC until verified in memory: loopback, both endpoints on this host, dialed at 127.0.0.1. n={qn} p50={qp50:.3} ms p99={qp99:.3} ms max={qmax:.3} ms
@@ -99,6 +108,7 @@ import and FTS rebuild: not included in the request_pack timer
         corpus = inserted,
         hits = hit_count(&root, &grants, query),
         cold_ms = cold.as_secs_f64() * 1e3,
+        cold_note = COLD_NOTE,
         n = off.n,
         p50 = off.p50_ms,
         p99 = off.p99_ms,
@@ -250,6 +260,7 @@ fn hit_count(root: &Path, grants: &MountGrants, query: &str) -> usize {
         .len()
 }
 
+#[cfg(target_os = "linux")]
 fn drop_page_cache(root: &Path) {
     for name in ["brain.db", "brain.db-wal", "brain.db-shm"] {
         let path = root.join(".kimetsu").join(name);
@@ -260,6 +271,9 @@ fn drop_page_cache(root: &Path) {
         }
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn drop_page_cache(_root: &Path) {}
 
 struct Dist {
     n: usize,
