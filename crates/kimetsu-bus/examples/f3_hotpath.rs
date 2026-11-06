@@ -464,6 +464,7 @@ async fn bind_endpoint(
         mdns: false,
         insecure_relay_tls: true,
         presence_path: path,
+        roster_path: None,
         bind_v4,
     })
     .await

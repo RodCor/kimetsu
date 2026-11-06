@@ -21,7 +21,9 @@
 //! - **Roster shape.** `kimetsu_roster` 1. One `mounts` list per endpoint
 //!   covers both serve and request. `signers` is a separate list, so an
 //!   endpoint key is not a pack author unless it is named there. The admin
-//!   key is pinned by the operator. There is no invitation flow.
+//!   key is pinned by the operator. An invitation is a newer roster signed
+//!   by that key. Peers adopt the higher generation when they connect.
+//!   The same generation with a different digest is not merged.
 
 #![allow(clippy::result_large_err)]
 
@@ -35,4 +37,4 @@ pub use presence::PresenceStore;
 pub use protocol::{
     ALPN, Announcement, FrameKind, LEGAL_FRAME_NAMES, discovery_user_data, parse_frame_kind,
 };
-pub use roster::{RosterAdmin, RosterEndpoint, SignedRoster};
+pub use roster::{RosterAdmin, RosterEndpoint, RosterSupersede, SignedRoster};

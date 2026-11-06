@@ -60,6 +60,7 @@ async fn bind(
         mdns: false,
         insecure_relay_tls: false,
         presence_path: presence_path(label),
+        roster_path: None,
         bind_v4,
     })
     .await

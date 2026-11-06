@@ -163,6 +163,7 @@ async fn bind_one(
         mdns: true,
         insecure_relay_tls: insecure,
         presence_path: path,
+        roster_path: None,
         bind_v4: None,
     })
     .await
@@ -352,6 +353,16 @@ async fn non_member_handshake_fails_and_is_not_dialed() {
     if let Ok((mut send, mut recv)) = opened {
         let hello = protocol::encode_hello(&"ab".repeat(32)).unwrap();
         let _ = protocol::write_frame(&mut send, protocol::FRAME_HELLO, &hello).await;
+        if let Ok((kind, _)) = protocol::read_frame(&mut recv).await
+            && kind == protocol::FRAME_ROSTER_SYNC
+        {
+            let _ = protocol::write_frame(
+                &mut send,
+                protocol::FRAME_ROSTER,
+                br#"{"kimetsu_roster":1}"#,
+            )
+            .await;
+        }
         let _ = protocol::read_frame(&mut recv).await;
     }
     wait_stats(&server, |stats| stats.non_member_drops >= 1).await;
