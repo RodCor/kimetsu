@@ -1,8 +1,10 @@
 //! Team-protocol frames.
 //!
-//! Legal frames are hello, announce, request_pack, pack, and reject.
-//! Any other type byte closes the connection. Repository clone, fetch,
-//! checkout, and worktree transfer are not frames.
+//! Legal frames are hello, announce, request_pack, pack, reject,
+//! roster_sync, and roster. Any other type byte closes the connection.
+//! Repository clone, fetch, checkout, and worktree transfer are not frames.
+//! `roster` carries one admin-signed `kimetsu_roster` document. It is not a
+//! memory pack and not a directory-sync batch.
 
 use std::fmt;
 
@@ -13,15 +15,27 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"kimetsu-bus/2";
 
 /// Names of the only frames this protocol defines.
-pub const LEGAL_FRAME_NAMES: &[&str] = &["hello", "announce", "request_pack", "pack", "reject"];
+pub const LEGAL_FRAME_NAMES: &[&str] = &[
+    "hello",
+    "announce",
+    "request_pack",
+    "pack",
+    "reject",
+    "roster_sync",
+    "roster",
+];
 
 pub const FRAME_HELLO: u8 = 1;
 pub const FRAME_ANNOUNCE: u8 = 2;
 pub const FRAME_REQUEST_PACK: u8 = 3;
 pub const FRAME_PACK: u8 = 4;
 pub const FRAME_REJECT: u8 = 5;
+pub const FRAME_ROSTER_SYNC: u8 = 6;
+pub const FRAME_ROSTER: u8 = 7;
 
 const MAX_CONTROL_FRAME: usize = 16 * 1024;
+/// One signed roster. Larger than a control frame, far below a pack.
+pub const MAX_ROSTER_BYTES: usize = 64 * 1024;
 /// Above the onboarding-sized budget, below a Remote checkpoint.
 pub const MAX_PACK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TTL_SECS: u64 = 300;
@@ -33,6 +47,8 @@ pub enum FrameKind {
     RequestPack,
     Pack,
     Reject,
+    RosterSync,
+    Roster,
 }
 
 impl FrameKind {
@@ -43,6 +59,8 @@ impl FrameKind {
             Self::RequestPack => "request_pack",
             Self::Pack => "pack",
             Self::Reject => "reject",
+            Self::RosterSync => "roster_sync",
+            Self::Roster => "roster",
         }
     }
 
@@ -53,6 +71,8 @@ impl FrameKind {
             Self::RequestPack => FRAME_REQUEST_PACK,
             Self::Pack => FRAME_PACK,
             Self::Reject => FRAME_REJECT,
+            Self::RosterSync => FRAME_ROSTER_SYNC,
+            Self::Roster => FRAME_ROSTER,
         }
     }
 }
@@ -65,6 +85,8 @@ pub fn parse_frame_kind(kind: u8) -> Option<FrameKind> {
         FRAME_REQUEST_PACK => FrameKind::RequestPack,
         FRAME_PACK => FrameKind::Pack,
         FRAME_REJECT => FrameKind::Reject,
+        FRAME_ROSTER_SYNC => FrameKind::RosterSync,
+        FRAME_ROSTER => FrameKind::Roster,
         _ => return None,
     })
 }
@@ -229,11 +251,7 @@ pub async fn write_frame(
     kind: u8,
     body: &[u8],
 ) -> Result<(), String> {
-    let limit = if kind == FRAME_PACK {
-        64 + MAX_PACK_BYTES
-    } else {
-        MAX_CONTROL_FRAME
-    };
+    let limit = body_limit(kind);
     if body.len() > limit {
         return Err("frame exceeds its limit".into());
     }
@@ -257,13 +275,11 @@ pub async fn read_frame(recv: &mut (impl AsyncRead + Unpin)) -> Result<(u8, Vec<
         .map_err(|err| FrameError::Io(format!("frame read: {err}")))?;
     let kind = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    let limit = if kind == FRAME_PACK {
-        64 + MAX_PACK_BYTES
-    } else if parse_frame_kind(kind).is_some() {
-        MAX_CONTROL_FRAME
+    // Unknown type: read at most a control-sized body so a huge claim
+    // cannot allocate, then the caller drops the peer.
+    let limit = if parse_frame_kind(kind).is_some() {
+        body_limit(kind)
     } else {
-        // Unknown type: read at most a control-sized body so a huge claim
-        // cannot allocate, then the caller drops the peer.
         MAX_CONTROL_FRAME
     };
     if len > limit {
@@ -276,6 +292,16 @@ pub async fn read_frame(recv: &mut (impl AsyncRead + Unpin)) -> Result<(u8, Vec<
             .map_err(|err| FrameError::Io(format!("frame read: {err}")))?;
     }
     Ok((kind, body))
+}
+
+fn body_limit(kind: u8) -> usize {
+    if kind == FRAME_PACK {
+        64 + MAX_PACK_BYTES
+    } else if kind == FRAME_ROSTER {
+        MAX_ROSTER_BYTES
+    } else {
+        MAX_CONTROL_FRAME
+    }
 }
 
 fn is_hex_64(value: &str) -> bool {
@@ -304,8 +330,8 @@ mod tests {
                 "frame names must not define {word}: {names}"
             );
         }
-        assert_eq!(LEGAL_FRAME_NAMES.len(), 5);
-        for (name, kind) in LEGAL_FRAME_NAMES.iter().zip(1u8..=5) {
+        assert_eq!(LEGAL_FRAME_NAMES.len(), 7);
+        for (name, kind) in LEGAL_FRAME_NAMES.iter().zip(1u8..=7) {
             let parsed = parse_frame_kind(kind).unwrap();
             assert_eq!(parsed.name(), *name);
             assert_eq!(parsed.type_byte(), kind);
