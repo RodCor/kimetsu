@@ -26,6 +26,7 @@ pub mod fact_query;
 pub mod fact_store;
 pub mod fact_values;
 pub mod facts;
+mod federated;
 pub mod feedback;
 pub mod framing;
 /// #2 knowledge graph: rule-based relation-edge extraction for `memory_edges`.

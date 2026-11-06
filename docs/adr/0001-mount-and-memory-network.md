@@ -357,7 +357,7 @@ Roster, signed:
 
 - A roster document names the group, the endpoints, and for each endpoint the mounts it may serve and the pack-signing keys it may publish.
 - The document is signed by the org or user key that administers the group. Entries from an endpoint that is not on the roster are ignored.
-- An invitation flow is out of F2's minimum. F2 MUST ship a static signed roster the operator installs, plus rejection of non-members. Replication of roster edits can follow Reason's anti-entropy pattern later; F2 does not require a full mesh.
+- F2 ships a static signed roster the operator installs, plus rejection of non-members. F2 does not require a full mesh. Invitation and federated supersede are the later slice in [Invitation, supersede, and conflicts](#invitation-supersede-and-conflicts).
 - Remote namespaces are not auto-enrolled. Binding a namespace to a roster is an explicit operator act (F3).
 
 Announcements, light:
@@ -375,7 +375,17 @@ Announcements, light:
 4. A trusted signer imports under the destination grant. An untrusted signer quarantines only when the scope check passed.
 5. The call is explicit. `context` and warm-start MUST NOT invoke it.
 
-`kimetsu brain sync` is unchanged through F3: directory of JSONL event batches, cursor per machine, no pack signature. The bus does not absorb it. Unifying them is a later decision.
+#### Invitation, supersede, and conflicts
+
+F2's static roster is what the operator installs. An invitation is a later `kimetsu_roster` 1 document signed by that same admin key. Generation 0 omits the field, so an F2 document still verifies. Peers exchange the signed document when they connect. The higher generation replaces the lower one and is the document the next bind reads. The same generation with a different digest is not merged. The receiver keeps its current roster and reports a roster generation conflict. A removal is a reissue at the next generation. Once adopted, that endpoint cannot finish `request_pack`.
+
+Federated supersede is a field on `kimetsu_pack` 2, not a new frame and not a directory-sync batch. The `memories` array is unchanged: accepted rows only, no `memory_id`, no usefulness, no superseded row. When the brain has `memory.superseded` events for the exported mount, the pack adds `supersedes`. Each entry is the scrubbed predecessor text, the scrubbed successor text, the two kinds, the mount, and the HLC of that event (the peer clock, `source_hlc`, when the event was itself imported). Scrub runs before the signature. The field is omitted when empty, so a pack with no supersede stays the F1 canonical body. A link whose mount is not the destination, or whose successor is not in `memories`, rejects the whole pack before any SQL write.
+
+A trusted merge resolves those texts to local rows and writes `memory.superseded` through the projector. The same successor again is success and does not write a second event. Two successors are both kept. Replay orders them by that source HLC. The later one is `superseded_by`. The disagreement is one `sync_conflicts` row: the predecessor id and the two survivor ids, stored once. No model reads the two texts. An untrusted signer still quarantines and does not move a local link. `replace` stays wholesale invalidation of the destination and does not also apply these links.
+
+A cite conflict stays on the brain that holds the exposure. A second outcome for the same exposure and memory is an error and applies neither extra delta. Exposures are not pack fields and are not frames.
+
+`kimetsu brain sync` is unchanged through F3: directory of JSONL event batches, cursor per machine, no pack signature. The bus does not absorb it. Unifying them is a later decision. The stock relay stays disabled unless the operator sets one.
 
 #### Threat model
 
@@ -477,6 +487,12 @@ Each phase leaves the default path free of a generative LLM and free of a networ
 - **Deliverable.** Measurements for the [§7](#7-performance) table: warm FTS `context` p99, small-pack LAN QUIC, presence-off. Hardware, corpus size, and cold-vs-warm are reported beside the numbers, in the same spirit as the audit's refusal to treat a Python IDF microbench as a broker p99. An operator document for binding a Remote namespace to a roster without treating bearer tokens as pack signers. The Rust SDK is the single in-process entry both the CLI and `kimetsu-remote` call for these operations.
 - **Exit.** The hot path meets the budgets or the phase stays open. A failed budget does not get "fixed" by moving presence onto `context` or by calling a model. Remote checkpoint limits and the disposable projection stay as documented.
 - **Unchanged.** MCP as the agent edge, `@kimetsu-ai/sdk` as an HTTP client, decay constants, the decision not to clone repos.
+
+#### F5 — Federated supersede and conflicts
+
+- **Deliverable.** Invitation, as in [Invitation, supersede, and conflicts](#invitation-supersede-and-conflicts), and supersede links inside signed packs. A disagreement is a `sync_conflicts` row. The later source HLC is the survivor. No generative model is on the path.
+- **Exit.** Two peers that supersede one text to two successors converge on the later source HLC and each keep one conflict row. An untrusted signer does not move the local link. A link for another mount writes no SQL. An announcement still has no memory text.
+- **Unchanged.** No default relay. `@kimetsu-ai/sdk` stays an HTTP client and does not open `brain.db`. No host adapters. Directory sync is not folded into the bus. No chat frame and no git clone.
 
 ## Consequences
 

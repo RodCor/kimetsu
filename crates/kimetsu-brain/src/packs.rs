@@ -240,6 +240,10 @@ pub struct ImportSummary {
     /// v2.6: entries routed into the review queue instead of the retrieval
     /// pool. See [`quarantine_memories`].
     pub quarantined: usize,
+    /// Federated supersede links in this import that named a different
+    /// successor from one already on the predecessor. The events stay; replay
+    /// picks one survivor. Zero when the pack had no disagreement.
+    pub conflicts: usize,
 }
 
 thread_local! {

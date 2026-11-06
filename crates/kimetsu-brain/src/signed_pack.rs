@@ -35,7 +35,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use kimetsu_core::memory::{MountLevel, mount_of_stored};
+use kimetsu_core::memory::{MemoryKind, MountLevel, mount_of_stored, normalize_memory_text};
 use serde_json::{Map, Value};
 
 use crate::packs::MemoryExport;
@@ -57,6 +57,18 @@ pub struct PackManifest {
     pub exported_at: Option<String>,
 }
 
+/// One signed supersede inside a pack. Texts are scrubbed copies. Memory ids
+/// stay off the wire; peers match on normalized text, kind, and mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeLink {
+    pub predecessor: String,
+    pub predecessor_kind: String,
+    pub successor: String,
+    pub successor_kind: String,
+    pub mount: String,
+    pub hlc: String,
+}
+
 /// A `kimetsu_pack` 2 document whose signature and scope list have been checked.
 /// Entry-versus-destination checks happen in [`reject_scope_mismatch`], still
 /// before any SQLite call.
@@ -67,6 +79,8 @@ pub struct VerifiedPack {
     pub description: Option<String>,
     pub scopes: Vec<String>,
     pub memories: Vec<MemoryExport>,
+    /// Empty when the pack omits the field. Omission keeps an F1 body valid.
+    pub supersedes: Vec<SupersedeLink>,
     pub signer_hex: String,
     pub canonical_body: Vec<u8>,
     pub digest_hex: String,
@@ -127,13 +141,29 @@ impl PackSigner {
     /// Sign `memories` under `scopes` as they are given. Callers that export
     /// must pass a strictly sorted unique scope list; this function does not
     /// reorder, so a test can build an illegal pack the verifier must reject.
+    /// No supersede links: the field is omitted, and an F1 body stays valid.
     pub fn seal_json(
         &self,
         manifest: &PackManifest,
         scopes: &[String],
         memories: &[MemoryExport],
     ) -> Result<String, String> {
-        let body = pack_body(manifest, scopes, memories)?;
+        self.seal_with_supersedes(manifest, scopes, memories, &[])
+    }
+
+    /// [`Self::seal_json`] plus supersede links. An empty slice omits the
+    /// field. Links are sorted so the same set always hashes the same way.
+    pub fn seal_with_supersedes(
+        &self,
+        manifest: &PackManifest,
+        scopes: &[String],
+        memories: &[MemoryExport],
+        supersedes: &[SupersedeLink],
+    ) -> Result<String, String> {
+        let mut ordered = supersedes.to_vec();
+        ordered.sort_by(|left, right| link_key(left).cmp(&link_key(right)));
+        ordered.dedup();
+        let body = pack_body(manifest, scopes, memories, &ordered)?;
         let canonical = canonical_json(&body);
         let digest_hex = blake3::hash(&canonical).to_hex().to_string();
         let message = signed_message_bytes(&digest_hex, scopes);
@@ -419,6 +449,7 @@ pub fn verify_pack_json(json: &str) -> Result<VerifiedPack, String> {
         description: optional_string(&obj, "description")?,
         scopes,
         memories,
+        supersedes: parse_supersedes(&obj)?,
         signer_hex: encode_hex(&parse_public_key(&signer)?),
         canonical_body: canonical,
         digest_hex,
@@ -447,6 +478,121 @@ pub fn reject_scope_mismatch(pack: &VerifiedPack, destination: MountLevel) -> Re
     Ok(())
 }
 
+/// Reject a signed link whose mount is not the destination, or whose successor
+/// text is not one of the pack's memories. No SQL. An empty list passes.
+pub fn reject_supersede_links(pack: &VerifiedPack, destination: MountLevel) -> Result<(), String> {
+    let signed = signed_mounts(&pack.scopes)?;
+    for link in &pack.supersedes {
+        let mount: MountLevel = link
+            .mount
+            .parse()
+            .map_err(|_| format!("illegal supersede mount {}", link.mount))?;
+        if mount != destination || !signed.contains(&mount) {
+            return Err(format!(
+                "scope mismatch: supersede mount {mount} is outside destination {destination}"
+            ));
+        }
+        let kind = link.successor_kind.to_ascii_lowercase();
+        let text = normalized_scrubbed(&link.successor);
+        let present = pack.memories.iter().any(|memory| {
+            mount_of_stored(&memory.scope) == Some(destination)
+                && memory.kind.to_ascii_lowercase() == kind
+                && normalized_scrubbed(&memory.text) == text
+        });
+        if !present {
+            return Err("supersede successor is not in the pack".into());
+        }
+    }
+    Ok(())
+}
+
+fn parse_supersedes(obj: &Map<String, Value>) -> Result<Vec<SupersedeLink>, String> {
+    let Some(value) = obj.get("supersedes") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = value else {
+        return Err("supersedes must be an array".into());
+    };
+    items.iter().map(parse_supersede_link).collect()
+}
+
+fn parse_supersede_link(value: &Value) -> Result<SupersedeLink, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("supersede link must be an object".into());
+    };
+    const FIELDS: [&str; 6] = [
+        "hlc",
+        "mount",
+        "predecessor",
+        "predecessor_kind",
+        "successor",
+        "successor_kind",
+    ];
+    for key in obj.keys() {
+        if !FIELDS.contains(&key.as_str()) {
+            return Err(format!("unknown supersede field {key}"));
+        }
+    }
+    let link = SupersedeLink {
+        hlc: required_link_str(obj, "hlc")?,
+        mount: required_link_str(obj, "mount")?,
+        predecessor: required_link_str(obj, "predecessor")?,
+        predecessor_kind: required_link_str(obj, "predecessor_kind")?,
+        successor: required_link_str(obj, "successor")?,
+        successor_kind: required_link_str(obj, "successor_kind")?,
+    };
+    if link.predecessor.trim().is_empty() || link.successor.trim().is_empty() {
+        return Err("supersede text is empty".into());
+    }
+    if kimetsu_core::clock::Hlc::parse(&link.hlc).is_none() {
+        return Err("supersede hlc is not canonical".into());
+    }
+    let mount: MountLevel = link
+        .mount
+        .parse()
+        .map_err(|_| format!("illegal supersede mount {}", link.mount))?;
+    if matches!(mount, MountLevel::Run | MountLevel::Session) {
+        return Err("supersede refuses run and session mounts".into());
+    }
+    parse_link_kind(&link.predecessor_kind)?;
+    parse_link_kind(&link.successor_kind)?;
+    if link
+        .predecessor_kind
+        .eq_ignore_ascii_case(&link.successor_kind)
+        && normalized_scrubbed(&link.predecessor) == normalized_scrubbed(&link.successor)
+    {
+        return Err("supersede requires a distinct successor".into());
+    }
+    Ok(link)
+}
+
+fn required_link_str(obj: &Map<String, Value>, key: &str) -> Result<String, String> {
+    match obj.get(key) {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(format!("supersede link is missing {key}")),
+    }
+}
+
+fn parse_link_kind(kind: &str) -> Result<MemoryKind, String> {
+    kind.parse()
+        .map_err(|_| format!("unparsable supersede kind {kind}"))
+}
+
+fn normalized_scrubbed(text: &str) -> String {
+    normalize_memory_text(&crate::redact::scrub_for_export(text).text)
+}
+
+fn link_key(link: &SupersedeLink) -> (&str, &str, &str, &str, &str, &str) {
+    (
+        link.mount.as_str(),
+        link.predecessor_kind.as_str(),
+        link.predecessor.as_str(),
+        link.successor_kind.as_str(),
+        link.successor.as_str(),
+        link.hlc.as_str(),
+    )
+}
+
 fn signed_mounts(scopes: &[String]) -> Result<Vec<MountLevel>, String> {
     scopes
         .iter()
@@ -462,6 +608,7 @@ fn pack_body(
     manifest: &PackManifest,
     scopes: &[String],
     memories: &[MemoryExport],
+    supersedes: &[SupersedeLink],
 ) -> Result<Value, String> {
     let mut map = Map::new();
     map.insert("kimetsu_pack".into(), Value::from(2));
@@ -478,7 +625,24 @@ fn pack_body(
         "memories".into(),
         serde_json::to_value(memories).map_err(|e| format!("memories: {e}"))?,
     );
+    if !supersedes.is_empty() {
+        map.insert(
+            "supersedes".into(),
+            Value::Array(supersedes.iter().map(link_value).collect()),
+        );
+    }
     Ok(Value::Object(map))
+}
+
+fn link_value(link: &SupersedeLink) -> Value {
+    serde_json::json!({
+        "hlc": link.hlc,
+        "mount": link.mount,
+        "predecessor": link.predecessor,
+        "predecessor_kind": link.predecessor_kind,
+        "successor": link.successor,
+        "successor_kind": link.successor_kind,
+    })
 }
 
 fn insert_opt(map: &mut Map<String, Value>, key: &str, value: &Option<String>) {
