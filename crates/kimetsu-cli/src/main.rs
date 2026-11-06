@@ -968,9 +968,11 @@ enum BrainCommand {
     ///   kimetsu brain skills --reject 01ABCDEF
     ///   kimetsu brain skills --status
     Skills(SkillsArgs),
-    /// Epic S3: sync the brain across machines via event-log replication.
+    /// Epic S3: offline directory replica of the event log.
     ///
-    /// Sync = event-log replication (NOT SQLite file copying).  Only durable
+    /// This does not dial the bus and does not import a `kimetsu_pack`.
+    /// Roster members share signed packs on the bus. Sync = event-log
+    /// replication (NOT SQLite file copying).  Only durable
     /// memory-lifecycle events are replicated:
     ///   memory.accepted, memory.proposed, memory.rejected, memory.invalidated,
     ///   memory.cited, memory.superseded

@@ -50,6 +50,8 @@ pub mod recall_gate;
 pub mod redact;
 pub mod reindex;
 pub mod reinforce;
+/// ADR 0001: a directory sync batch and a pack are different carriers.
+pub mod replica;
 pub mod roi;
 pub mod schema;
 pub(crate) mod scoring;
@@ -57,7 +59,7 @@ pub mod serving;
 /// ADR 0001 F1: `kimetsu_pack` 2, BLAKE3, Ed25519, local trust store.
 pub mod signed_pack;
 pub mod skill_synthesis;
-/// Epic S3: personal brain sync — event-log replication.
+/// Epic S3: offline directory replica of the event log. Not a bus frame.
 pub mod sync;
 pub mod trace;
 pub mod trust;

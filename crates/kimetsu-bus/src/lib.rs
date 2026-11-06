@@ -3,6 +3,8 @@
 //! iroh carries announcements and `kimetsu_pack` 2 bytes. The store path is
 //! [`kimetsu_brain::mount::import_signed_pack`], the same function a local
 //! file uses through `kimetsu_sdk::import_signed_pack`.
+//! Directory sync stays an offline JSONL replica (`kimetsu brain sync`).
+//! This crate has no frame for that batch and does not call `import_events`.
 //! This crate does not reimplement merge, quarantine, scrub, or supersede.
 //! A v2 pack may carry supersede links. [`import_signed_pack`] applies them.
 //! This crate does not choose a survivor and does not open a second store.

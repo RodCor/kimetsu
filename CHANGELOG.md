@@ -15,6 +15,7 @@ breaking changes require a major bump.
 
 ### Changed
 
+- ADR 0001 unifies directory sync with the bus as two carriers. `kimetsu brain sync` stays the offline JSONL event-log replica: same allowlist, cursor per machine, `event_id` idempotency, no pack signature, and it does not dial the bus. The bus still carries announcements and signed `kimetsu_pack` 2 only. A sync batch is not a frame. Presenting a pack to directory import, or a sync batch to pack verify, rejects before SQL. The same `memory.superseded` predecessor and survivor do not write a second event. Two successors still record one `sync_conflicts` row. `run.*`, episodes, and telemetry stay local. Roster membership still gates the bus. The default relay stays disabled.
 - Local mounts follow ADR 0001 F0. New memory events store `repo` when the caller sends `project`; retrieval still reads stored `project` rows and labels them `repo`. `session`, `org`, and `skill` are real levels on the durable event. Similarity merge does not collapse `project` into `repo`.
 - `kimetsu_brain_cite` takes `outcome`: `helped`, `noop`, or `harmed`. An omitted outcome is `noop` and does not increase usefulness. Only `helped` may. A successful run no longer adds the +0.1 passenger bump. `harmed` removes the memory from injection until restore or supersede.
 - Pack replace retires only the named mount (and alias-window `project` rows when the mount is `repo`). `run` and session resume text stay out of export. Directory sync allowlist is unchanged.

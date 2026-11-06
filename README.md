@@ -133,10 +133,11 @@ lists the public keys allowed to merge into a mount. A valid signature from
 an unlisted key is quarantined. A scope outside the signed list is rejected
 and does not touch the database. Unsigned v1 packs still import into the
 mount you name. Merge is idempotent, so re-importing is safe. Replace supersedes rather
-than deletes, so a swap can always be undone. For continuous sharing,
-`kimetsu brain sync` replicates a brain across machines with no server, and
-**[Kimetsu Remote](https://kimetsu.dev/docs/remote)** serves one
-brain per repository to a whole team.
+than deletes, so a swap can always be undone. Roster members share that signed
+pack on the bus. `kimetsu brain sync` is the offline complement: a directory of
+allowlisted event-log batches, not an unsigned pack import, and it does not dial
+the bus. **[Kimetsu Remote](https://kimetsu.dev/docs/remote)** stays an HTTP
+checkpoint server and does not dial the bus either.
 
 ---
 
@@ -182,7 +183,7 @@ corpus with `kimetsu brain bench`.
 | `kimetsu ask "<q>"` | Grounded, cited answer from memory (local model) |
 | `kimetsu resume` / `kimetsu checkpoint` | Pick up where the last session left off |
 | `kimetsu brain export` / `import` | Share brains: scrubbed packs, merge or replace, file or URL |
-| `kimetsu brain sync` | Replicate your brain across machines, no server |
+| `kimetsu brain sync` | Offline directory replica of the allowlisted event log |
 | `kimetsu brain skills` | Turn often-cited lessons into runnable skills |
 | `kimetsu brain insights` / `roi` | Is the brain helping, and did it pay for itself |
 | `kimetsu brain tune` | Self-tune retrieval against your own query history |

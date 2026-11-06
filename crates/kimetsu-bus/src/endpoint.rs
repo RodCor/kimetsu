@@ -4,7 +4,8 @@
 //! and [`BusEndpoint::online`] has observed a relay connection. The relay
 //! sees ciphertext. Pack bytes are verified with the F1 verifier and then
 //! imported by [`kimetsu_brain::mount::import_signed_pack`], the same
-//! function `kimetsu_sdk::import_signed_pack` forwards to.
+//! function `kimetsu_sdk::import_signed_pack` forwards to. A directory
+//! sync batch is not a pack and is not accepted on this socket.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
