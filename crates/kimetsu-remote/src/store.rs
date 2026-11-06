@@ -37,15 +37,7 @@ pub fn record(
     confidence: f32,
     session_id: Option<&str>,
 ) -> KimetsuResult<ProposeResult> {
-    kimetsu_sdk::record(
-        start,
-        grants,
-        level,
-        kind,
-        text,
-        confidence,
-        session_id,
-    )
+    kimetsu_sdk::record(start, grants, level, kind, text, confidence, session_id)
 }
 
 pub fn cite(
@@ -93,14 +85,7 @@ pub fn import_pack(
     replace: bool,
     quarantine: bool,
 ) -> KimetsuResult<ImportSummary> {
-    kimetsu_sdk::import_pack(
-        start,
-        grants,
-        entries,
-        destination,
-        replace,
-        quarantine,
-    )
+    kimetsu_sdk::import_pack(start, grants, entries, destination, replace, quarantine)
 }
 
 #[cfg(test)]
@@ -149,14 +134,18 @@ mod tests {
                 ProposeResult::Added(id) => id,
                 other => panic!("{other:?}"),
             };
-            assert!(!context(&start, &grants, "lanternwick", 400)
-                .unwrap()
-                .capsules
-                .is_empty());
-            assert!(!search(&start, &grants, "lanternwick", None)
-                .unwrap()
-                .capsules
-                .is_empty());
+            assert!(
+                !context(&start, &grants, "lanternwick", 400)
+                    .unwrap()
+                    .capsules
+                    .is_empty()
+            );
+            assert!(
+                !search(&start, &grants, "lanternwick", None)
+                    .unwrap()
+                    .capsules
+                    .is_empty()
+            );
             let successor = match record(
                 &start,
                 &grants,
@@ -177,7 +166,17 @@ mod tests {
             let summary =
                 import_pack(&other, &grants, &rows, MountLevel::Repo, false, false).unwrap();
             assert!(summary.imported >= 1);
-            assert!(cite(&start, &grants, "no-exposure", &successor, Some("noop"), None).is_err());
+            assert!(
+                cite(
+                    &start,
+                    &grants,
+                    "no-exposure",
+                    &successor,
+                    Some("noop"),
+                    None
+                )
+                .is_err()
+            );
         });
     }
 }

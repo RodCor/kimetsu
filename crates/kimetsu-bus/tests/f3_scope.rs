@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use kimetsu_brain::lock::ProjectLock;
 use kimetsu_brain::mount::{self, MountGrants};
 use kimetsu_brain::project;
-use kimetsu_bus::protocol::Announcement;
 use kimetsu_bus::PresenceStore;
+use kimetsu_bus::protocol::Announcement;
 use kimetsu_core::memory::{MemoryKind, MemoryScope, MountLevel};
 use kimetsu_core::paths::{ProjectPaths, git_init_boundary};
 

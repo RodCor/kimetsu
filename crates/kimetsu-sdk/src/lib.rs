@@ -40,15 +40,7 @@ pub fn record(
     confidence: f32,
     session_id: Option<&str>,
 ) -> KimetsuResult<ProposeResult> {
-    kimetsu_brain::mount::record(
-        start,
-        grants,
-        level,
-        kind,
-        text,
-        confidence,
-        session_id,
-    )
+    kimetsu_brain::mount::record(start, grants, level, kind, text, confidence, session_id)
 }
 
 /// `cite`. `outcome` is `helped`, `noop`, or `harmed`. Omitted is `noop`.
@@ -203,9 +195,9 @@ mod tests {
             )
             .unwrap();
             let predecessor = match added {
-                ProposeResult::Added(id) | ProposeResult::Merged(id) | ProposeResult::Duplicate(id) => {
-                    id
-                }
+                ProposeResult::Added(id)
+                | ProposeResult::Merged(id)
+                | ProposeResult::Duplicate(id) => id,
                 ProposeResult::Proposed(id) => panic!("high confidence must accept, got {id}"),
             };
             let bundle = context(&first, &grants, "lanternwick", 800).unwrap();
@@ -237,12 +229,20 @@ mod tests {
             assert!(rows.iter().any(|row| row.text.contains("beta")));
 
             let second = root("b");
-            let summary = import_pack(&second, &grants, &rows, MountLevel::Repo, false, false).unwrap();
+            let summary =
+                import_pack(&second, &grants, &rows, MountLevel::Repo, false, false).unwrap();
             assert!(summary.imported + summary.deduped >= 1);
 
-            let err = cite(&first, &grants, "missing-exposure", &successor, Some("helped"), None)
-                .unwrap_err()
-                .to_string();
+            let err = cite(
+                &first,
+                &grants,
+                "missing-exposure",
+                &successor,
+                Some("helped"),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 err.contains("exposure") || err.contains("not"),
                 "cite without a delivery must fail, got {err}"

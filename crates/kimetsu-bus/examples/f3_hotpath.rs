@@ -305,11 +305,21 @@ async fn measure_with_relay(
             let server_key = iroh::SecretKey::generate();
             let client_key = iroh::SecretKey::generate();
             let admin = RosterAdmin::generate().unwrap();
-            let server = RosterEndpoint::new(server_key.public(), &[MountLevel::Repo], None::<&str>).unwrap();
-            let client = RosterEndpoint::new(client_key.public(), &[MountLevel::Repo], None::<&str>).unwrap();
+            let server =
+                RosterEndpoint::new(server_key.public(), &[MountLevel::Repo], None::<&str>)
+                    .unwrap();
+            let client =
+                RosterEndpoint::new(client_key.public(), &[MountLevel::Repo], None::<&str>)
+                    .unwrap();
             let document = admin.sign("f3", &[server, client]).unwrap();
             let roster = SignedRoster::open(&document, &admin.public_key_hex()).unwrap();
-            let server = bind_endpoint(server_key, roster.clone(), BusRelay::Custom(map.clone()), "on-a").await;
+            let server = bind_endpoint(
+                server_key,
+                roster.clone(),
+                BusRelay::Custom(map.clone()),
+                "on-a",
+            )
+            .await;
             let client = bind_endpoint(client_key, roster, BusRelay::Custom(map), "on-b").await;
             let online = tokio::time::timeout(Duration::from_secs(20), async {
                 server.online().await;
@@ -386,7 +396,8 @@ async fn measure_quic(samples: usize) -> QuicReport {
         [signer.public_key_hex()],
     )
     .unwrap();
-    let client = RosterEndpoint::new(client_key.public(), &[MountLevel::Repo], None::<&str>).unwrap();
+    let client =
+        RosterEndpoint::new(client_key.public(), &[MountLevel::Repo], None::<&str>).unwrap();
     let document = admin.sign("f3-quic", &[server, client]).unwrap();
     let roster = SignedRoster::open(&document, &admin.public_key_hex()).unwrap();
     let server = bind_endpoint(server_key, roster.clone(), BusRelay::Disabled, "quic-a").await;

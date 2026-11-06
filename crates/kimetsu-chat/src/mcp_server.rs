@@ -1118,15 +1118,16 @@ fn kimetsu_brain_cite(workspace: &Path, arguments: &Value) -> Result<Value, Stri
         .and_then(Value::as_str)
         .ok_or_else(|| "exposure_id from delivered context is required".into())
         .and_then(|id| {
-            kimetsu_sdk::cite(workspace, &grants, id, memory_id, Some(outcome), note)
-                .map_err(|err| {
+            kimetsu_sdk::cite(workspace, &grants, id, memory_id, Some(outcome), note).map_err(
+                |err| {
                     let msg = err.to_string();
                     if msg.starts_with("cite requires write") {
                         "cite requires write on the memory's home mount".to_string()
                     } else {
                         msg
                     }
-                })
+                },
+            )
         }) {
         Ok(()) => Ok(json!({
             "ok": true,
