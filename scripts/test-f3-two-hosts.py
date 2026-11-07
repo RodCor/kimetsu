@@ -15,7 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "f3-hotpath-two-hosts.sh"
-SECRET = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+FIXTURE_HEX = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 PENDING = (
     "two physical LAN hosts: still pending. "
     "This run is not direct LAN QUIC between two LAN machines."
@@ -60,7 +60,7 @@ def stub_source() -> str:
             directory = pathlib.Path(state)
             directory.mkdir(parents=True, exist_ok=True)
             secret = directory / "client.secret"
-            secret.write_text("{SECRET}\\n", encoding="utf-8")
+            secret.write_text("{FIXTURE_HEX}\\n", encoding="utf-8")
             secret.chmod(0o600)
             print("role: client-init")
             print("client_public: abcdef")
@@ -191,8 +191,8 @@ class HarnessScript(unittest.TestCase):
         result = self.run_script(["client-init", "--state", state])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("client_public: abcdef", result.stdout)
-        self.assertNotIn(SECRET, result.stdout)
-        self.assertNotIn(SECRET, result.stderr)
+        self.assertNotIn(FIXTURE_HEX, result.stdout)
+        self.assertNotIn(FIXTURE_HEX, result.stderr)
         self.assertTrue((Path(state) / "client.secret").is_file())
 
     def test_self_test_guard_rejects_a_lan_label_and_accepts_pending(self):
@@ -232,7 +232,7 @@ class HarnessScript(unittest.TestCase):
         (marked / "kimetsu-f3-two-host-state").write_text(
             "kimetsu-f3-two-host-state\n", encoding="utf-8"
         )
-        (marked / "client.secret").write_text(SECRET, encoding="utf-8")
+        (marked / "client.secret").write_text(FIXTURE_HEX, encoding="utf-8")
         removed = self.run_script(["cleanup", "--state", str(marked)])
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(marked.exists())
