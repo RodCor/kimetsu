@@ -6,8 +6,10 @@ feature was off. `KIMETSU_BRAIN_EMBEDDER=off`, `KIMETSU_USER_BRAIN=0`.
 `kimetsu_sdk::context` does not call a reranker and does not dial the network.
 
 Re-run that command to replace the loopback and `context` figures. The veth
-row below is `scripts/f3-hotpath-lan.sh`. Nothing below is copied from the
-audit microbench.
+row below is `scripts/f3-hotpath-lan.sh`. The two-physical-host harness is
+`scripts/f3-hotpath-two-hosts.sh`. It is available and it is not a source of
+the loopback or veth numbers below. Nothing below is copied from the audit
+microbench.
 
 ## Hardware, corpus, cold versus warm
 
@@ -27,6 +29,7 @@ The acceptance row is the warm sample. Cold is reported beside it and is not the
 | Local `context`, warm FTS, no embeddings, no reranker, no network | p99 of a few milliseconds | relay down: n=200, p50 3.964 ms, p99 **4.226 ms**, max 4.274 ms | pass |
 | `request_pack` of a small pack over direct QUIC, until verified in memory | §7 budget is around 100 ms on direct LAN QUIC | Loopback only: n=30, p50 1.198 ms, p99 **1.482 ms**, max 1.482 ms. Pack is 396 gzip bytes, 8 memories. Relay disabled. Both endpoints on this host, dialed at `127.0.0.1`. Import and FTS rebuild are not in the timer. This is not the §7 LAN topology. The LAN measurement is still pending | pending |
 | `request_pack` of a small pack over direct QUIC between two Linux netns connected by a veth pair on one physical host, until verified in memory | §7 budget is around 100 ms on direct LAN QUIC between two LAN machines. This row is not that topology | n=30, p50 1.271 ms, p99 **1.511 ms**, max 1.511 ms. Pack is 394 gzip bytes, 8 memories. Relay disabled. Local bind `10.200.0.2:55666`, peer `10.200.0.1:49736`. Import and FTS rebuild are not in the timer. Measured 2026-11-06, rustc 1.99.1, on the hardware in the veth section below | not the §7 LAN row; two-physical-host LAN is still pending |
+| `request_pack` of a small pack over direct QUIC between two physical LAN hosts, until verified in memory | §7 budget is around 100 ms | No number yet. The harness is `scripts/f3-hotpath-two-hosts.sh` ([operator page](../operators/f3-two-physical-hosts.md)). Loopback, the veth pair, and the harness self-test are not this row | pending |
 | Presence off versus on for `context` | a down relay does not change local recall latency | relay up, after the in-process relay reported connected: n=200, p50 3.975 ms, p99 **4.999 ms**, max 5.357 ms. p99 delta versus relay down is 0.773 ms | pass |
 
 `context` does not dial the relay in either sample. The relay-up process was connected and then left running only so the comparison includes a live relay. Stopping it is the relay-down sample above.
@@ -69,6 +72,17 @@ two physical LAN hosts: still pending. This run is not direct LAN QUIC between t
 
 Two physical LAN hosts are still pending. This environment has no second machine on a real LAN.
 
+## Two physical hosts
+
+The harness is available. The measurement is not. `scripts/f3-hotpath-two-hosts.sh` and [f3-two-physical-hosts.md](../operators/f3-two-physical-hosts.md) tell an operator how to run the server on one PC and the client on another. Nothing in this file is that run. Loopback stdout, veth stdout, and the harness self-test stay out of the two-physical-host row.
+
+To record a real run later:
+
+1. Save the server stdout and the client stdout from the two machines. The client stdout is the measurement. Its `topology` line is `two physical LAN hosts`, and it does not say `still pending`.
+2. Check that `server_machine_id` and `client_machine_id` differ, that `bind` and `peer` are the addresses you chose, and that `build_profile` is `release`.
+3. Add a section here with that raw stdout, the way the veth section quotes its run, and fill only the two-physical-host row. Leave the loopback row and the veth row as they are.
+4. Keep the commit, rustc, OS, and CPU lines from both hosts next to the numbers.
+
 ## Journal and lock scope
 
 `PRAGMA journal_mode` is `wal` after project init. A reader during an open `BEGIN IMMEDIATE` that has stamped `superseded_by` still sees the previous snapshot, and `context` returns inside the test's 2 second bound (`wal_reader_misses_uncommitted_supersede_and_context_does_not_wait`). A finished `supersede` shows the stamp and the FTS delete together.
@@ -77,6 +91,6 @@ Announce persistence is a JSON file, not `brain.db` and not the FTS index. Recor
 
 ## Phase
 
-The warm local `context` rows meet their §7 budgets on this host. The §7 `request_pack` row is direct LAN QUIC between two LAN machines, and that measurement is still pending. The table's 1.482 ms p99 is the loopback sample. The 1.511 ms p99 is the veth pair on this one host. No presence work was moved onto `context`, and no model was called to produce these numbers.
+The warm local `context` rows meet their §7 budgets on this host. The §7 `request_pack` row is direct LAN QUIC between two LAN machines, and that measurement is still pending. The table's 1.482 ms p99 is the loopback sample. The 1.511 ms p99 is the veth pair on this one host. The two-physical-host row has no number yet. No presence work was moved onto `context`, and no model was called to produce these numbers.
 
 Remote checkpoint limits stay 64 MiB compressed, 256 MiB decoded, and 2,000,000 rows. The per-request SQLite file stays a disposable projection. Remote does not dial the bus. See [remote-storage.md](../remote-storage.md) and [remote-namespace-roster.md](../operators/remote-namespace-roster.md).

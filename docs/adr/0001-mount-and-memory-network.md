@@ -480,6 +480,8 @@ The durable `import_pack` after a verified `request_pack` is the same store oper
 
 WAL is already the Remote SQLite checkpoint adapter (`docs/remote-storage.md`). The local brain uses the same engine; F3's criterion is that the hot path's journal mode and the lock scope match the sentence above, not a new database.
 
+The two-physical-host `request_pack` figure is not recorded in this ADR. Operators measure it with `scripts/f3-hotpath-two-hosts.sh` on two LAN machines, as described in [f3-two-physical-hosts.md](../operators/f3-two-physical-hosts.md). A loopback run, the veth pair, and that script's self-test do not fill the figure. Numbers that already exist stay in [0001-f3-measurements.md](0001-f3-measurements.md).
+
 ### 8. Phased delivery
 
 Each phase leaves the default path free of a generative LLM and free of a network wait inside `context`. Later phases MUST NOT put work on the hot path that would make the F3 budgets impossible (no IDF scan, no LLM, no presence join).
