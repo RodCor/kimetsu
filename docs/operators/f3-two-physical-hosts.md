@@ -2,7 +2,7 @@
 
 This is the operator procedure for the ADR 0001 §7 direct-LAN measurement. It times `request_pack` until the signed pack is verified in memory. It does not import, it does not rebuild FTS, and it does not turn embeddings on.
 
-The §7 two-physical-host row stays empty until you paste stdout from two real PCs. Loopback (`scripts/f3-hotpath.sh`), the veth pair (`scripts/f3-hotpath-lan.sh`), and this script's `self-test` are not that row. `10.200.0.1` and `10.200.0.2` belong to the veth harness. The tool rejects them here.
+The §7 two-physical-host row stays empty until you paste stdout from two real PCs. Loopback (`scripts/f3-hotpath.sh`), the veth pair (`scripts/f3-hotpath-lan.sh`), and this script's `self-test` are not that row. `10.200.0.1` and `10.200.0.2` belong to the veth harness. The tool rejects them here. An internet/WAN run is a different command and a different label: [f3-internet-wan.md](f3-internet-wan.md). It does not fill this row.
 
 ## What you need
 

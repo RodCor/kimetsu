@@ -28,6 +28,8 @@ usage:
   scripts/f3-hotpath-two-hosts.sh serve --bind IP --client-public HEX --state DIR [--port N] [--hold-secs N] [--confirm-two-physical-hosts]
   scripts/f3-hotpath-two-hosts.sh fetch --bind IP --peer IP --state DIR --handoff FILE [--port N] [--quic-samples N] [--fetch-timeout-secs N] [--confirm-two-physical-hosts]
   scripts/f3-hotpath-two-hosts.sh self-test [--quic-samples N]
+  scripts/f3-hotpath-two-hosts.sh wan-serve --bind IP --port N --advertise PUBLIC:PORT --client-public HEX --state DIR --confirm-internet-wan [--stun-diagnostic IP:PORT]
+  scripts/f3-hotpath-two-hosts.sh wan-client --bind IP --port N --advertise PUBLIC:PORT --state DIR --confirm-internet-wan [--stun-diagnostic IP:PORT]
   scripts/f3-hotpath-two-hosts.sh cleanup --state DIR
 
 Paths should be absolute. The script cds to the repository root.
@@ -103,6 +105,9 @@ HOLD=
 SAMPLES=
 FETCH_TIMEOUT=
 CONFIRM=0
+CONFIRM_WAN=0
+ADVERTISE=
+STUN=
 while [ $# -gt 0 ]; do
     case $1 in
         --state)
@@ -154,6 +159,20 @@ while [ $# -gt 0 ]; do
             CONFIRM=1
             shift
             ;;
+        --confirm-internet-wan)
+            CONFIRM_WAN=1
+            shift
+            ;;
+        --advertise)
+            ADVERTISE=${2:-}
+            [ -n "$ADVERTISE" ] || die "missing value for --advertise"
+            shift 2
+            ;;
+        --stun-diagnostic)
+            STUN=${2:-}
+            [ -n "$STUN" ] || die "missing value for --stun-diagnostic"
+            shift 2
+            ;;
         *)
             die "unknown argument $1"
             ;;
@@ -176,6 +195,26 @@ if [ -n "$FETCH_TIMEOUT" ]; then
     need_int "--fetch-timeout-secs" "$FETCH_TIMEOUT"
     [ "$FETCH_TIMEOUT" -ge 5 ] && [ "$FETCH_TIMEOUT" -le 300 ] || die "--fetch-timeout-secs must be 5..=300, not $FETCH_TIMEOUT"
 fi
+if [ "$CONFIRM" -eq 1 ] && [ "$CONFIRM_WAN" -eq 1 ]; then
+    die "refusing to confirm both a physical LAN and an internet/WAN run"
+fi
+
+split_advertise() {
+    text=$1
+    label=$2
+    case $text in
+        *:*) ;;
+        *) die "$label expects ipv4:port, not $text" ;;
+    esac
+    addr=${text%:*}
+    port=${text##*:}
+    valid_ipv4 "$addr" || die "$label address $addr is not IPv4"
+    need_int "$label port" "$port"
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "$label port must be 1..=65535, not $port"
+    if [ "$addr" = "0.0.0.0" ]; then
+        die "refusing address 0.0.0.0; WAN bind is one explicit host address"
+    fi
+}
 
 commit=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf '%s' unknown)
 rustc_line=$(rustup run stable rustc --version 2>/dev/null || rustc --version 2>/dev/null || printf '%s' unknown)
@@ -299,13 +338,14 @@ run_self_test() {
 case $cmd in
     client-init)
         [ -n "$STATE" ] || die "client-init requires --state"
-        [ -z "$BIND" ] && [ -z "$PEER" ] && [ -z "$PUBLIC" ] && [ "$CONFIRM" -eq 0 ] || die "client-init only takes --state"
+        [ -z "$BIND" ] && [ -z "$PEER" ] && [ -z "$PUBLIC" ] && [ "$CONFIRM" -eq 0 ] && [ "$CONFIRM_WAN" -eq 0 ] && [ -z "$ADVERTISE" ] || die "client-init only takes --state"
         prepare_bin
         exec "$BIN" --role client-init --state "$STATE"
         ;;
     serve)
         [ -n "$STATE" ] && [ -n "$BIND" ] && [ -n "$PUBLIC" ] || die "serve requires --bind, --client-public, and --state"
         [ -z "$PEER" ] && [ -z "$HANDOFF" ] || die "serve does not take --peer or --handoff"
+        [ "$CONFIRM_WAN" -eq 0 ] && [ -z "$ADVERTISE" ] && [ -z "$STUN" ] || die "LAN serve cannot take internet/WAN flags"
         reject_lan_address "--bind" "$BIND"
         prepare_bin
         set -- --role serve-public --bind "$BIND" --client-public "$PUBLIC" --state "$STATE" --commit "$commit" --rustc "$rustc_line"
@@ -323,6 +363,7 @@ case $cmd in
     fetch)
         [ -n "$STATE" ] && [ -n "$BIND" ] && [ -n "$PEER" ] && [ -n "$HANDOFF" ] || die "fetch requires --bind, --peer, --state, and --handoff"
         [ -z "$PUBLIC" ] || die "fetch does not take --client-public"
+        [ "$CONFIRM_WAN" -eq 0 ] && [ -z "$ADVERTISE" ] && [ -z "$STUN" ] || die "LAN fetch cannot take internet/WAN flags"
         reject_lan_address "--bind" "$BIND"
         reject_lan_address "--peer" "$PEER"
         [ "$BIND" != "$PEER" ] || die "refusing identical bind and peer $BIND; a two-host run needs two addresses"
@@ -344,7 +385,49 @@ case $cmd in
         exec "$BIN" "$@"
         ;;
     self-test)
+        [ "$CONFIRM_WAN" -eq 0 ] && [ -z "$ADVERTISE" ] || die "self-test cannot confirm or advertise an internet/WAN path"
         run_self_test
+        ;;
+    wan-serve|wan-client)
+        [ "$CONFIRM" -eq 0 ] || die "refusing --confirm-two-physical-hosts on an internet/WAN command"
+        [ "$CONFIRM_WAN" -eq 1 ] || die "WAN mode requires --confirm-internet-wan"
+        [ -n "$STATE" ] && [ -n "$BIND" ] && [ -n "$PORT" ] && [ -n "$ADVERTISE" ] || die "$cmd requires --bind, --port, --advertise, and --state"
+        [ "$PORT" -ge 1 ] || die "WAN requires one explicit fixed UDP port, not 0"
+        if [ "$BIND" = "0.0.0.0" ]; then
+            die "refusing address 0.0.0.0; WAN bind is one explicit host address"
+        fi
+        split_advertise "$ADVERTISE" "--advertise"
+        if [ -n "$STUN" ]; then
+            split_advertise "$STUN" "--stun-diagnostic"
+        fi
+        if [ "$cmd" = "wan-serve" ]; then
+            [ -n "$PUBLIC" ] || die "wan-serve requires --client-public"
+            [ -z "$HANDOFF" ] && [ -z "$PEER" ] || die "wan-serve does not take --peer or --handoff"
+            role=wan-serve
+        else
+            [ -z "$PUBLIC" ] || die "wan-client does not take --client-public"
+            [ -z "$PEER" ] || die "wan-client dials the advertised address in the handoff; do not pass --peer"
+            role=wan-client
+        fi
+        reject_lan_address "--bind" "$BIND"
+        prepare_bin
+        set -- --role "$role" --bind "$BIND" --port "$PORT" --advertise "$ADVERTISE" --state "$STATE" --confirm-internet-wan --commit "$commit" --rustc "$rustc_line"
+        if [ "$cmd" = "wan-serve" ]; then
+            set -- "$@" --client-public "$PUBLIC"
+        fi
+        if [ -n "$HOLD" ]; then
+            set -- "$@" --hold-secs "$HOLD"
+        fi
+        if [ -n "$SAMPLES" ]; then
+            set -- "$@" --quic-samples "$SAMPLES"
+        fi
+        if [ -n "$FETCH_TIMEOUT" ]; then
+            set -- "$@" --fetch-timeout-secs "$FETCH_TIMEOUT"
+        fi
+        if [ -n "$STUN" ]; then
+            set -- "$@" --stun-diagnostic "$STUN"
+        fi
+        exec "$BIN" "$@"
         ;;
     cleanup)
         [ -n "$STATE" ] || die "cleanup requires --state"
