@@ -78,7 +78,7 @@ The diagnostic target is checked with the same global-unicast rule. Its mapped a
 
 `request_pack_elapsed_p50_ms` is the median client-side elapsed time of verified `request_pack`, from send through in-memory signature verification. `request_pack_elapsed_raw_ms` is those samples, in order. `p50`, `p99`, and `max` on the `request_pack` line are that same elapsed distribution. They are not a QUIC transport RTT and not a STUN RTT.
 
-`quic_transport_rtt_ms`, when present, is the median of iroh `Path::rtt` on the selected direct IP path after each verified fetch. That is QUIC's smoothed path estimate. If iroh reports no direct-path estimate, the line is `quic_transport_rtt: unavailable`. A missing estimate is not filled from the elapsed time or from STUN.
+`quic_transport_rtt_ms`, when present, is the median of iroh `Path::rtt` only for the one path iroh marks selected and that is a direct IP path, read after each verified fetch. That is QUIC's smoothed estimate for that path. If no path is selected, the selected path is a relay, more than one path is selected, or the estimate is zero, the line is `quic_transport_rtt: unavailable`. An unselected direct path is not used. A missing estimate is not filled from the elapsed time or from STUN.
 
 `n=0` does not print a report. `path` says direct UDP to the advertised endpoint with the relay disabled. `physical LAN section 7 row: not this run` is part of the text.
 

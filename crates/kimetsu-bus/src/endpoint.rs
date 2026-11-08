@@ -575,16 +575,47 @@ impl BusEndpoint {
     }
 }
 
-/// iroh's smoothed RTT on the selected direct IP path. A relay path is ignored.
-/// A zero estimate means QUIC has not measured the path yet.
+/// One observation of an open iroh path. `selected` is iroh's `Path::is_selected`:
+/// true only when the snapshot's selected id equals this path. A missing
+/// selection leaves every path unselected.
+#[derive(Clone)]
+struct ObservedPath {
+    selected: bool,
+    direct_ip: bool,
+    relay: bool,
+    rtt: Duration,
+}
+
+/// RTT only from the single selected direct IP path. An unselected path is
+/// not a substitute, and neither is a selected relay path. Zero means iroh
+/// has no estimate yet.
+fn selected_direct_rtt(paths: &[ObservedPath]) -> Option<Duration> {
+    let mut matched = paths
+        .iter()
+        .filter(|path| path.selected && path.direct_ip && !path.relay);
+    let path = matched.next()?;
+    if matched.next().is_some() {
+        return None;
+    }
+    if path.rtt.is_zero() {
+        None
+    } else {
+        Some(path.rtt)
+    }
+}
+
 fn direct_path_rtt(connection: &iroh::endpoint::Connection) -> Option<Duration> {
     let paths = connection.paths();
-    let selected = paths
+    let observed: Vec<ObservedPath> = paths
         .iter()
-        .find(|path| path.is_selected() && path.is_ip() && !path.is_relay());
-    let path = selected.or_else(|| paths.iter().find(|path| path.is_ip() && !path.is_relay()))?;
-    let rtt = path.rtt();
-    if rtt.is_zero() { None } else { Some(rtt) }
+        .map(|path| ObservedPath {
+            selected: path.is_selected(),
+            direct_ip: path.is_ip(),
+            relay: path.is_relay(),
+            rtt: path.rtt(),
+        })
+        .collect();
+    selected_direct_rtt(&observed)
 }
 
 struct Dialed {
@@ -931,5 +962,54 @@ mod tests {
         ];
         assert_eq!(advertise_socket(&sockets).unwrap(), specific);
         assert_eq!(dialable(advertise_socket(&sockets).unwrap()), specific);
+    }
+
+    #[test]
+    fn unselected_direct_path_cannot_supply_selected_rtt() {
+        use std::time::Duration;
+
+        use super::{ObservedPath, selected_direct_rtt};
+
+        let unselected = ObservedPath {
+            selected: false,
+            direct_ip: true,
+            relay: false,
+            rtt: Duration::from_millis(12),
+        };
+        assert_eq!(selected_direct_rtt(std::slice::from_ref(&unselected)), None);
+
+        let selected_relay = ObservedPath {
+            selected: true,
+            direct_ip: false,
+            relay: true,
+            rtt: Duration::from_millis(40),
+        };
+        assert_eq!(
+            selected_direct_rtt(&[unselected.clone(), selected_relay]),
+            None
+        );
+
+        let selected = ObservedPath {
+            selected: true,
+            direct_ip: true,
+            relay: false,
+            rtt: Duration::from_millis(3),
+        };
+        assert_eq!(
+            selected_direct_rtt(&[unselected, selected.clone()]),
+            Some(Duration::from_millis(3))
+        );
+
+        let zero = ObservedPath {
+            rtt: Duration::ZERO,
+            ..selected.clone()
+        };
+        assert_eq!(selected_direct_rtt(&[zero]), None);
+
+        let also_selected = ObservedPath {
+            rtt: Duration::from_millis(9),
+            ..selected.clone()
+        };
+        assert_eq!(selected_direct_rtt(&[selected, also_selected]), None);
     }
 }

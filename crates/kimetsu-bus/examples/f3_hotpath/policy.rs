@@ -749,7 +749,7 @@ fn transport_rtt_lines(samples: Option<&[f64]>) -> String {
             .to_string();
     };
     if samples.is_empty() {
-        return "quic_transport_rtt: unavailable\nquic_transport_rtt_source: iroh Path::rtt on the selected direct IP path after each verified fetch; no direct-path estimate was reported\n"
+        return "quic_transport_rtt: unavailable\nquic_transport_rtt_source: iroh Path::rtt only for the single selected direct IP path after each verified fetch; an unselected path is not used, and no such estimate was reported\n"
             .to_string();
     }
     let mut sorted = samples.to_vec();
@@ -761,7 +761,7 @@ fn transport_rtt_lines(samples: Option<&[f64]>) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "quic_transport_rtt_ms: {median:.3}\nquic_transport_rtt_raw_ms: {raw}\nquic_transport_rtt_source: median of iroh Path::rtt on the selected direct IP path after each verified fetch; QUIC smoothed estimate, not request_pack elapsed time and not STUN\n"
+        "quic_transport_rtt_ms: {median:.3}\nquic_transport_rtt_raw_ms: {raw}\nquic_transport_rtt_source: median of iroh Path::rtt on the single selected direct IP path after each verified fetch; an unselected path is not used. QUIC smoothed estimate, not request_pack elapsed time and not STUN\n"
     )
 }
 
