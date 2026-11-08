@@ -36,4 +36,5 @@ tracing.workspace = true
 # for dependents; cargo enables it when this crate's tests are built.
 iroh = { version = "1.4.1", features = ["test-utils"] }
 kimetsu-sdk = { path = "../kimetsu-sdk", features = ["bus"] }
+serde_json.workspace = true
 tempfile = "3"
