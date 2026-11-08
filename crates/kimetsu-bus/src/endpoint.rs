@@ -86,6 +86,9 @@ pub struct FetchedPack {
     pub digest_hex: String,
     pub signer_hex: String,
     pub scopes: Vec<String>,
+    /// QUIC smoothed RTT from iroh's selected direct IP path after this fetch.
+    /// `None` when that path has no estimate. This is not the caller's elapsed time.
+    pub quic_path_rtt: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -403,6 +406,7 @@ impl BusEndpoint {
             digest_hex: verified.digest_hex,
             signer_hex: verified.signer_hex,
             scopes: verified.scopes,
+            quic_path_rtt: dialed.quic_path_rtt,
         })
     }
 
@@ -566,13 +570,27 @@ impl BusEndpoint {
         Ok(Dialed {
             announcements,
             pack: payload,
+            quic_path_rtt: direct_path_rtt(&connection),
         })
     }
+}
+
+/// iroh's smoothed RTT on the selected direct IP path. A relay path is ignored.
+/// A zero estimate means QUIC has not measured the path yet.
+fn direct_path_rtt(connection: &iroh::endpoint::Connection) -> Option<Duration> {
+    let paths = connection.paths();
+    let selected = paths
+        .iter()
+        .find(|path| path.is_selected() && path.is_ip() && !path.is_relay());
+    let path = selected.or_else(|| paths.iter().find(|path| path.is_ip() && !path.is_relay()))?;
+    let rtt = path.rtt();
+    if rtt.is_zero() { None } else { Some(rtt) }
 }
 
 struct Dialed {
     announcements: Vec<Announcement>,
     pack: Option<Vec<u8>>,
+    quic_path_rtt: Option<Duration>,
 }
 
 fn direct_addr(endpoint: &Endpoint) -> Result<EndpointAddr, String> {

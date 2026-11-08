@@ -52,6 +52,7 @@ fn sample(kind: ReportKind) -> ReportInput {
         raw_ms: Vec::new(),
         advertised: String::new(),
         client_advertised: String::new(),
+        quic_transport_rtt_ms: None,
     }
 }
 
@@ -234,24 +235,54 @@ fn wan_advertise_is_explicit_and_never_taken_from_stun() {
     assert!(err.contains("loopback"));
     let err = validate_wan_bind(ip("10.200.0.1")).unwrap_err();
     assert!(err.contains("veth"));
-    validate_wan_advertise(ip("203.0.113.10"), 44144).unwrap();
-    let err = validate_wan_advertise(ip("192.168.1.29"), 44144).unwrap_err();
-    assert!(err.contains("not an internet route"));
-    let err = validate_wan_advertise(ip("100.64.0.1"), 44144).unwrap_err();
-    assert!(err.contains("not an internet route"));
-    let err = validate_wan_advertise(ip("10.1.1.1"), 44144).unwrap_err();
-    assert!(err.contains("not an internet route"));
+    validate_wan_advertise(ip("1.1.1.1"), 44144).unwrap();
+    validate_wan_advertise(ip("8.8.8.8"), 443).unwrap();
+    validate_wan_advertise(ip("203.0.114.1"), 44144).unwrap();
+    validate_wan_advertise(ip("192.0.0.9"), 443).unwrap();
+    validate_wan_advertise(ip("192.0.0.10"), 3478).unwrap();
+    validate_wan_advertise(ip("192.31.196.1"), 443).unwrap();
+    validate_wan_advertise(ip("192.52.193.1"), 443).unwrap();
+    for rejected in [
+        "0.1.2.3",
+        "10.1.1.1",
+        "100.64.0.1",
+        "127.0.0.1",
+        "169.254.1.1",
+        "172.16.0.1",
+        "192.0.0.1",
+        "192.0.0.8",
+        "192.0.2.1",
+        "192.88.99.1",
+        "192.88.99.2",
+        "192.168.1.29",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.10",
+        "224.0.0.1",
+        "240.0.0.1",
+        "255.255.255.255",
+    ] {
+        let err = validate_wan_advertise(ip(rejected), 44144).unwrap_err();
+        assert!(
+            err.contains("global unicast") || err.contains("refusing advertised address"),
+            "{rejected}: {err}"
+        );
+    }
+    let err = policy::parse_advertised_endpoint("[2001:db8::1]:443").unwrap_err();
+    assert!(err.contains("IPv6 is not accepted"));
+    let err = policy::parse_advertised_endpoint("203.0.113.10:44144").unwrap_err();
+    assert!(err.contains("global unicast"));
+    policy::parse_advertised_endpoint("1.1.1.1:44144").unwrap();
     assert!(require_fixed_udp_port(None).is_err());
     assert!(require_fixed_udp_port(Some(0)).is_err());
     assert_eq!(require_fixed_udp_port(Some(44144)).unwrap(), 44144);
-    require_distinct_mapping(ip("172.30.0.2"), 44144, ip("203.0.113.10"), 44144).unwrap();
-    require_distinct_mapping(ip("203.0.113.10"), 44144, ip("203.0.113.10"), 37749).unwrap();
-    let err =
-        require_distinct_mapping(ip("203.0.113.10"), 44144, ip("203.0.113.10"), 44144).unwrap_err();
+    require_distinct_mapping(ip("172.30.0.2"), 44144, ip("1.1.1.1"), 44144).unwrap();
+    require_distinct_mapping(ip("1.1.1.1"), 44144, ip("1.1.1.1"), 37749).unwrap();
+    let err = require_distinct_mapping(ip("1.1.1.1"), 44144, ip("1.1.1.1"), 44144).unwrap_err();
     assert!(err.contains("local bind"));
 
-    let stun = SocketAddrV4::new(ip("198.51.100.8"), 37749);
-    let explicit = SocketAddrV4::new(ip("203.0.113.10"), 44144);
+    let stun = SocketAddrV4::new(ip("198.18.0.1"), 37749);
+    let explicit = SocketAddrV4::new(ip("1.1.1.1"), 44144);
     let chosen = select_advertised(Some(explicit), Some(stun)).unwrap();
     assert_eq!(chosen, explicit);
     let err = select_advertised(None, Some(stun)).unwrap_err();
@@ -263,7 +294,7 @@ fn stun_mapped_address_parses_and_stays_out_of_the_handoff() {
     let transaction_id = [9u8; 12];
     let request = stun_binding_request(&transaction_id);
     assert_eq!(request.len(), 20);
-    let mapped = SocketAddrV4::new(ip("203.0.113.50"), 44144);
+    let mapped = SocketAddrV4::new(ip("1.1.1.1"), 44144);
     let response = xor_mapped_response(mapped, &transaction_id);
     assert_eq!(
         parse_stun_xor_mapped(&response, &transaction_id).unwrap(),
@@ -276,14 +307,14 @@ fn stun_mapped_address_parses_and_stays_out_of_the_handoff() {
     handoff.mode = HandoffMode::InternetWan;
     handoff.bind_ip = "172.30.0.2".into();
     handoff.bind_port = 44144;
-    handoff.server_ip = "203.0.113.10".into();
+    handoff.server_ip = "1.1.1.1".into();
     handoff.server_port = 44144;
     let text = build_handoff(&handoff).unwrap();
     assert!(!text.to_ascii_lowercase().contains("stun"));
     assert!(!text.to_ascii_lowercase().contains("secret"));
     let parsed = parse_public_handoff(&text).unwrap();
     assert_eq!(parsed.mode, HandoffMode::InternetWan);
-    assert_eq!(parsed.server_ip, "203.0.113.10");
+    assert_eq!(parsed.server_ip, "1.1.1.1");
     assert_eq!(parsed.bind_ip, "172.30.0.2");
     assert_eq!(parsed.bind_port, 44144);
     require_handoff_mode(HandoffMode::InternetWan, parsed.mode).unwrap();
@@ -304,19 +335,22 @@ fn wan_report_is_not_a_lan_row_and_has_no_invented_rtt() {
     input.p50_ms = 1.2;
     input.p99_ms = 1.5;
     input.max_ms = 1.5;
-    input.advertised = "203.0.113.10:44144".into();
-    input.client_advertised = "198.51.100.20:44144".into();
+    input.advertised = "1.1.1.1:44144".into();
+    input.client_advertised = "8.8.8.8:44144".into();
+    input.quic_transport_rtt_ms = Some(vec![]);
     input.bind = "192.168.1.29:44144".into();
-    input.peer = "203.0.113.10:44144".into();
+    input.peer = "1.1.1.1:44144".into();
     let report = render_report(&input).unwrap();
     assert!(report.contains("topology: internet/WAN, not a physical LAN\n"));
     assert!(report.contains("stun: not a route and not advertised\n"));
     assert!(report.contains(
-        "peer_rtt_metric: median of the timed verified request_pack samples on the client; not STUN and not ICMP\n"
+        "request_pack_elapsed_metric: median client-side elapsed time of verified request_pack, from send through in-memory signature verification; not a QUIC transport RTT and not STUN\n"
     ));
-    assert!(report.contains("peer_rtt_ms: 1.200\n"));
-    assert!(report.contains("raw_ms: 1.000,1.200,1.500\n"));
-    assert!(report.contains("advertised: 203.0.113.10:44144\n"));
+    assert!(report.contains("request_pack_elapsed_p50_ms: 1.200\n"));
+    assert!(report.contains("request_pack_elapsed_raw_ms: 1.000,1.200,1.500\n"));
+    assert!(report.contains("quic_transport_rtt: unavailable\n"));
+    assert!(!report.contains("peer_rtt"));
+    assert!(report.contains("advertised: 1.1.1.1:44144\n"));
     assert!(report.contains("pack: 394 gzip bytes, 8 memories, relay disabled\n"));
     assert!(report.contains("physical LAN section 7 row: not this run"));
     assert!(!report.contains("topology: two physical LAN hosts\n"));
@@ -326,6 +360,18 @@ fn wan_report_is_not_a_lan_row_and_has_no_invented_rtt() {
     input.n = 0;
     let err = render_report(&input).unwrap_err();
     assert!(err.contains("refusing to invent"));
+
+    input.n = 3;
+    input.raw_ms = vec![1.0, 1.2, 1.5];
+    input.quic_transport_rtt_ms = Some(vec![0.4, 0.6]);
+    let with_rtt = render_report(&input).unwrap();
+    assert!(
+        with_rtt.contains("quic_transport_rtt_ms: 0.400\n")
+            || with_rtt.contains("quic_transport_rtt_ms: 0.500\n")
+            || with_rtt.contains("quic_transport_rtt_ms: 0.600\n")
+    );
+    assert!(with_rtt.contains("quic_transport_rtt_source: median of iroh Path::rtt"));
+    assert!(with_rtt.contains("not request_pack elapsed time and not STUN"));
 }
 
 #[test]

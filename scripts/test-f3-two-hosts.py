@@ -271,7 +271,7 @@ class HarnessScript(unittest.TestCase):
                 "wan-client",
                 "--bind", "0.0.0.0",
                 "--port", "44144",
-                "--advertise", "203.0.113.10:44144",
+                "--advertise", "1.1.1.1:44144",
                 "--state", state,
                 "--confirm-internet-wan",
             ]
@@ -283,7 +283,7 @@ class HarnessScript(unittest.TestCase):
                 "wan-client",
                 "--bind", "192.168.1.29",
                 "--port", "44144",
-                "--advertise", "203.0.113.10:44144",
+                "--advertise", "1.1.1.1:44144",
                 "--state", state,
                 "--confirm-internet-wan",
                 "--confirm-two-physical-hosts",
@@ -300,18 +300,18 @@ class HarnessScript(unittest.TestCase):
                 "wan-client",
                 "--bind", "192.168.1.29",
                 "--port", "44144",
-                "--advertise", "203.0.113.20:44144",
+                "--advertise", "1.1.1.1:44144",
                 "--state", state,
                 "--confirm-internet-wan",
-                "--stun-diagnostic", "203.0.113.5:3478",
+                "--stun-diagnostic", "8.8.8.8:3478",
             ]
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         text = self.log.read_text(encoding="utf-8")
         self.assertIn("--role wan-client", text)
-        self.assertIn("--advertise 203.0.113.20:44144", text)
+        self.assertIn("--advertise 1.1.1.1:44144", text)
         self.assertIn("--confirm-internet-wan", text)
-        self.assertIn("--stun-diagnostic 203.0.113.5:3478", text)
+        self.assertIn("--stun-diagnostic 8.8.8.8:3478", text)
         self.assertNotIn("--confirm-two-physical-hosts", text)
         self.assertNotIn("--peer", text)
         self.assertNotIn("client.secret", text)
@@ -413,13 +413,52 @@ class LocalSmoke(unittest.TestCase):
             self.assertNotEqual(smuggled.returncode, 0)
             self.assertIn("private key", smuggled.stderr)
             server = Path(temporary) / "wan-server"
+            documentation = self.run_bin(
+                [
+                    "--role", "wan-serve",
+                    "--confirm-internet-wan",
+                    "--bind", "192.168.1.29",
+                    "--port", "44144",
+                    "--advertise", "203.0.113.10:44144",
+                    "--client-public", public,
+                    "--state", str(server),
+                ]
+            )
+            self.assertNotEqual(documentation.returncode, 0)
+            self.assertIn("global unicast", documentation.stderr)
+            reserved = self.run_bin(
+                [
+                    "--role", "wan-serve",
+                    "--confirm-internet-wan",
+                    "--bind", "192.168.1.29",
+                    "--port", "44144",
+                    "--advertise", "240.0.0.1:44144",
+                    "--client-public", public,
+                    "--state", str(server),
+                ]
+            )
+            self.assertNotEqual(reserved.returncode, 0)
+            self.assertIn("global unicast", reserved.stderr)
+            benchmarking = self.run_bin(
+                [
+                    "--role", "wan-serve",
+                    "--confirm-internet-wan",
+                    "--bind", "192.168.1.29",
+                    "--port", "44144",
+                    "--advertise", "198.18.0.1:44144",
+                    "--client-public", public,
+                    "--state", str(server),
+                ]
+            )
+            self.assertNotEqual(benchmarking.returncode, 0)
+            self.assertIn("global unicast", benchmarking.stderr)
             wildcard = self.run_bin(
                 [
                     "--role", "wan-serve",
                     "--confirm-internet-wan",
                     "--bind", "0.0.0.0",
                     "--port", "44144",
-                    "--advertise", "203.0.113.10:44144",
+                    "--advertise", "1.1.1.1:44144",
                     "--client-public", public,
                     "--state", str(server),
                 ]
@@ -433,7 +472,7 @@ class LocalSmoke(unittest.TestCase):
                     "--confirm-internet-wan",
                     "--bind", "192.168.1.29",
                     "--port", "44144",
-                    "--advertise", "203.0.113.20:44144",
+                    "--advertise", "1.1.1.1:443",
                     "--state", str(Path(temporary) / "wan-client"),
                 ]
             )

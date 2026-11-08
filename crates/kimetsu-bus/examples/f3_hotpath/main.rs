@@ -500,9 +500,7 @@ impl Args {
 }
 
 fn parse_advertise(text: &str) -> SocketAddrV4 {
-    text.parse::<SocketAddrV4>().unwrap_or_else(|_| {
-        panic!("--advertise and --stun-diagnostic expect ipv4:port, not {text}")
-    })
+    two_host::parse_advertised_endpoint(text).unwrap_or_else(|err| panic!("{err}"))
 }
 
 fn require_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -828,7 +826,7 @@ async fn measure_quic(samples: usize) -> QuicReport {
     let addr = server.direct_addr().await.unwrap();
     let brain = temp_root("quic-receiver");
     project::init_project_at_root(&brain, true).unwrap();
-    let (samples, bytes, _) = time_fetches(&client, addr, &announcement.digest, samples).await;
+    let (samples, bytes, _, _) = time_fetches(&client, addr, &announcement.digest, samples).await;
     let (_, _, conn) = project::load_project_readonly(&brain).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
@@ -867,23 +865,27 @@ async fn time_fetches(
     addr: EndpointAddr,
     digest: &str,
     samples: usize,
-) -> (Dist, usize, Vec<f64>) {
+) -> (Dist, usize, Vec<f64>, Vec<f64>) {
     for _ in 0..3 {
         client.fetch_verified(addr.clone(), digest).await.unwrap();
     }
     let mut timed = Vec::with_capacity(samples);
     let mut bytes = 0usize;
+    let mut quic_rtt_ms = Vec::new();
     for _ in 0..samples {
         let started = Instant::now();
         let fetched = client.fetch_verified(addr.clone(), digest).await.unwrap();
         timed.push(started.elapsed());
         bytes = fetched.gzip.len();
+        if let Some(rtt) = fetched.quic_path_rtt {
+            quic_rtt_ms.push(rtt.as_secs_f64() * 1e3);
+        }
     }
     let raw_ms = timed
         .iter()
         .map(|sample| sample.as_secs_f64() * 1e3)
         .collect();
-    (stats(&timed), bytes, raw_ms)
+    (stats(&timed), bytes, raw_ms, quic_rtt_ms)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1023,7 +1025,8 @@ async fn fetch(args: &Args) {
     assert_eq!(local_socket.ip(), std::net::IpAddr::V4(bind_ip));
     let brain = temp_root("veth-receiver");
     project::init_project_at_root(&brain, true).unwrap();
-    let (samples, bytes, _) = time_fetches(&client, addr, &ready.digest, args.quic_samples).await;
+    let (samples, bytes, _, _) =
+        time_fetches(&client, addr, &ready.digest, args.quic_samples).await;
     let (_, _, conn) = project::load_project_readonly(&brain).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
@@ -1343,7 +1346,7 @@ async fn fetch_public(args: &Args) {
     )
     .await
     .unwrap_or_else(|_| panic!("fetch did not finish within {}s", budget.as_secs()));
-    let (samples, bytes, _raw_ms) = timed;
+    let (samples, bytes, _raw_ms, _quic_rtt_ms) = timed;
     let (_, _, conn) = project::load_project_readonly(&brain.0).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
@@ -1370,6 +1373,7 @@ async fn fetch_public(args: &Args) {
         raw_ms: Vec::new(),
         advertised: String::new(),
         client_advertised: String::new(),
+        quic_transport_rtt_ms: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
     flush_stdout(&report);
@@ -1585,7 +1589,7 @@ note: this process holds the client key in memory. Copy only client_public to th
     let brain = RmDir(temp_root("wan-receiver"));
     project::init_project_at_root(&brain.0, true).unwrap();
     let budget = Duration::from_secs(args.fetch_timeout.unwrap_or(120));
-    let (samples, bytes, raw_ms) = tokio::time::timeout(
+    let (samples, bytes, raw_ms, quic_rtt_ms) = tokio::time::timeout(
         budget,
         time_fetches(&client, addr, &handoff.digest, args.quic_samples),
     )
@@ -1617,6 +1621,7 @@ note: this process holds the client key in memory. Copy only client_public to th
         raw_ms,
         advertised: format!("{}:{}", handoff.server_ip, handoff.server_port),
         client_advertised: client_advertised.to_string(),
+        quic_transport_rtt_ms: Some(quic_rtt_ms),
     })
     .unwrap_or_else(|err| panic!("{err}"));
     refuse_secret_material(&report);

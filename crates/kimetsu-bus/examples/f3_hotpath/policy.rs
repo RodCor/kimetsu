@@ -73,6 +73,9 @@ pub struct ReportInput {
     pub raw_ms: Vec<f64>,
     pub advertised: String,
     pub client_advertised: String,
+    /// `None` on a LAN report. `Some` is the set of QUIC path estimates that
+    /// iroh actually returned; empty means the transport RTT was unavailable.
+    pub quic_transport_rtt_ms: Option<Vec<f64>>,
 }
 
 pub fn require_mode(confirm: bool, self_test: bool) -> Result<ReportKind, String> {
@@ -204,12 +207,75 @@ pub fn validate_wan_advertise(ip: Ipv4Addr, port: u16) -> Result<(), String> {
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
         return Err(format!("refusing advertised address {ip}"));
     }
-    if is_non_global(ip) {
+    if !ipv4_globally_reachable(ip) {
         return Err(format!(
-            "refusing advertised address {ip}; a private, link-local, or shared address is not an internet route"
+            "refusing advertised address {ip}; an internet endpoint must be an IPv4 global unicast address under the IANA IPv4 Special-Purpose Address Registry"
         ));
     }
     Ok(())
+}
+
+/// IPv4 address the IANA special-purpose registry marks globally reachable,
+/// and which is unicast. `192.0.0.9/32` and `192.0.0.10/32` stay accepted
+/// because that registry marks them globally reachable. `192.88.99.0/24` is
+/// rejected: the 6to4 anycast allocation ended in 2015, and `192.88.99.2/32`
+/// is not globally reachable.
+pub fn ipv4_globally_reachable(ip: Ipv4Addr) -> bool {
+    let [a, b, c, d] = ip.octets();
+    if a == 0
+        || ip.is_private()
+        || shared_address_space(ip)
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_documentation()
+        || benchmarking_range(ip)
+        || reserved_for_future(ip)
+        || ip.is_broadcast()
+        || ip.is_multicast()
+    {
+        return false;
+    }
+    // 192.0.0.0/24 is IETF protocol assignments and is not globally reachable,
+    // except the two anycast addresses the registry marks globally reachable.
+    if a == 192 && b == 0 && c == 0 && d != 9 && d != 10 {
+        return false;
+    }
+    // Deprecated 6to4 relay anycast (RFC 7526). The leftover 192.88.99.2/32
+    // entry is not globally reachable either.
+    if a == 192 && b == 88 && c == 99 {
+        return false;
+    }
+    true
+}
+
+fn shared_address_space(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 100 && (b & 0b1100_0000) == 0b0100_0000
+}
+
+fn benchmarking_range(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 198 && (b & 0xfe) == 18
+}
+
+fn reserved_for_future(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240 && !ip.is_broadcast()
+}
+
+/// IPv6 is not a dial target for this harness. The bus bind is IPv4.
+pub fn parse_advertised_endpoint(text: &str) -> Result<SocketAddrV4, String> {
+    let text = text.trim();
+    if text.starts_with('[') || text.matches(':').count() > 1 {
+        return Err(
+            "IPv6 is not accepted; an advertised endpoint must be an IPv4 global unicast address"
+                .into(),
+        );
+    }
+    let addr: SocketAddrV4 = text
+        .parse()
+        .map_err(|_| format!("--advertise expects ipv4:port, not {text}"))?;
+    validate_wan_advertise(*addr.ip(), addr.port())?;
+    Ok(addr)
 }
 
 pub fn require_fixed_udp_port(port: Option<u16>) -> Result<u16, String> {
@@ -330,16 +396,6 @@ pub fn parse_stun_xor_mapped(
 }
 
 const STUN_MAGIC: u32 = 0x2112_A442;
-
-fn is_non_global(ip: Ipv4Addr) -> bool {
-    let [a, b, _, _] = ip.octets();
-    a == 0
-        || a == 10
-        || (a == 100 && (b & 0b1100_0000) == 64)
-        || (a == 172 && (16..=31).contains(&b))
-        || (a == 192 && b == 168)
-        || (a == 169 && b == 254)
-}
 
 pub fn build_handoff(handoff: &PublicHandoff) -> Result<String, String> {
     let value = Value::Object({
@@ -610,7 +666,8 @@ fn render_wan_report(input: &ReportInput) -> Result<String, String> {
     }
     if input.raw_ms.len() != input.n || input.n == 0 {
         return Err(
-            "no successful request_pack samples; refusing to invent an internet/WAN RTT".into(),
+            "no successful request_pack samples; refusing to invent request_pack timings or a transport RTT"
+                .into(),
         );
     }
     if input.advertised.trim().is_empty() {
@@ -625,6 +682,7 @@ fn render_wan_report(input: &ReportInput) -> Result<String, String> {
         .map(|sample| format!("{sample:.3}"))
         .collect::<Vec<_>>()
         .join(",");
+    let transport = transport_rtt_lines(input.quic_transport_rtt_ms.as_deref());
     let server_hw = hardware_line(&input.server);
     let client_hw = hardware_line(&input.client);
     let topology = "internet/WAN, not a physical LAN";
@@ -633,11 +691,11 @@ fn render_wan_report(input: &ReportInput) -> Result<String, String> {
 topology: {topology}
 path: direct UDP to the advertised endpoint, relay disabled
 stun: not a route and not advertised
-peer_rtt_metric: median of the timed verified request_pack samples on the client; not STUN and not ICMP
-peer_rtt_ms: {p50:.3}
-p95_ms: {p95:.3}
-raw_ms: {raw}
-server_hardware: {server_hw}
+request_pack_elapsed_metric: median client-side elapsed time of verified request_pack, from send through in-memory signature verification; not a QUIC transport RTT and not STUN
+request_pack_elapsed_p50_ms: {p50:.3}
+request_pack_elapsed_p95_ms: {p95:.3}
+request_pack_elapsed_raw_ms: {raw}
+{transport}server_hardware: {server_hw}
 client_hardware: {client_hw}
 server_hostname: {server_hostname}
 client_hostname: {client_hostname}
@@ -683,6 +741,28 @@ physical LAN section 7 row: not this run. No internet/WAN figure is recorded unt
         bytes = input.pack_bytes,
         memories = input.memories,
     ))
+}
+
+fn transport_rtt_lines(samples: Option<&[f64]>) -> String {
+    let Some(samples) = samples else {
+        return "quic_transport_rtt: unavailable\nquic_transport_rtt_source: not sampled\n"
+            .to_string();
+    };
+    if samples.is_empty() {
+        return "quic_transport_rtt: unavailable\nquic_transport_rtt_source: iroh Path::rtt on the selected direct IP path after each verified fetch; no direct-path estimate was reported\n"
+            .to_string();
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let median = percentile_nearest(&sorted, 0.50);
+    let raw = samples
+        .iter()
+        .map(|sample| format!("{sample:.3}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "quic_transport_rtt_ms: {median:.3}\nquic_transport_rtt_raw_ms: {raw}\nquic_transport_rtt_source: median of iroh Path::rtt on the selected direct IP path after each verified fetch; QUIC smoothed estimate, not request_pack elapsed time and not STUN\n"
+    )
 }
 
 fn percentile_nearest(sorted: &[f64], p: f64) -> f64 {

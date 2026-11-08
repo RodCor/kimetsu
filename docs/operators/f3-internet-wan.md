@@ -8,7 +8,7 @@ No WAN figure is recorded until both hosts print a report whose `topology` line 
 
 `wan-client` and `wan-serve` use the same verified `request_pack` timer as the LAN harness: signature check included, import and FTS rebuild excluded, embeddings off, `BusRelay::Disabled`. There is no relay and no second protocol.
 
-Each side binds one explicit local IPv4 address and one fixed UDP port. `--advertise ip:port` is the external address the other side can dial. It may differ from the bind address, or only the mapped port may differ. The tool refuses `0.0.0.0`, loopback, the veth addresses, and a private or shared address in `--advertise`. It also refuses to advertise the local bind unchanged.
+Each side binds one explicit local IPv4 address and one fixed UDP port. `--advertise ip:port` is the external address the other side can dial. It may differ from the bind address, or only the mapped port may differ. The tool accepts an advertised address only when the IANA IPv4 Special-Purpose Address Registry marks that block globally reachable, and only when the address is unicast. Private, shared (CGNAT), loopback, link-local, documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), benchmarking (`198.18.0.0/15`), reserved (`240.0.0.0/4`), multicast, the terminated 6to4 prefix `192.88.99.0/24`, and the rest of `192.0.0.0/24` are refused. `192.0.0.9` and `192.0.0.10` stay allowed because that registry marks those two anycast addresses globally reachable. IPv6 is not accepted: the bus bind is IPv4. Passing the registry check does not mean the path works, and nothing discovers an address for you.
 
 `--stun-diagnostic ip:port` sends one binding request from that same local socket, waits at most 3 seconds, and prints the mapped address on stderr. The mapping is not written to the handoff and is not dialed. A mapping often changes when the socket closes. Pass a numeric STUN address; a hostname can resolve to an address that is not the STUN server.
 
@@ -43,22 +43,22 @@ On the client (the process that dials), start it first and leave it running:
 
 ```sh
 scripts/f3-hotpath-two-hosts.sh wan-client \
-  --bind 192.168.1.29 \
+  --bind <lan-ipv4> \
   --port 44144 \
-  --advertise 203.0.113.20:44144 \
+  --advertise <globally-reachable-ipv4>:<external-port> \
   --state /var/tmp/kimetsu-f3-wan-client \
   --confirm-internet-wan
 ```
 
-The addresses above are documentation placeholders (`203.0.113.0/24` is TEST-NET-3). Use the host's real bind address and the external mapping you configured. Copy `client_public` to the server.
+`<globally-reachable-ipv4>` is the address you will actually dial. A documentation address such as `203.0.113.10` is rejected. Copy `client_public` to the server.
 
 On the server:
 
 ```sh
 scripts/f3-hotpath-two-hosts.sh wan-serve \
-  --bind 172.30.0.2 \
+  --bind <lan-or-host-ipv4> \
   --port 44144 \
-  --advertise 203.0.113.10:44144 \
+  --advertise <globally-reachable-ipv4>:<external-port> \
   --client-public <client_public> \
   --state /var/tmp/kimetsu-f3-wan-server \
   --confirm-internet-wan
@@ -69,12 +69,18 @@ Copy `handoff.json` into the client state directory while `wan-client` is still 
 Optional, on either side, before the QUIC bind:
 
 ```text
---stun-diagnostic 203.0.113.5:3478
+--stun-diagnostic <stun-server-ipv4>:3478
 ```
+
+The diagnostic target is checked with the same global-unicast rule. Its mapped answer is not copied into `--advertise`.
 
 ## What a real report contains
 
-`peer_rtt_ms` is the median of the timed verified `request_pack` samples on the client. It is not STUN and not ICMP. `raw_ms` is those samples, in order, so a later reader can compute another percentile. `p50`, `p99`, and `max` match the LAN fields. `n=0` does not print a report. `path` says direct UDP to the advertised endpoint with the relay disabled. `physical LAN section 7 row: not this run` is part of the text.
+`request_pack_elapsed_p50_ms` is the median client-side elapsed time of verified `request_pack`, from send through in-memory signature verification. `request_pack_elapsed_raw_ms` is those samples, in order. `p50`, `p99`, and `max` on the `request_pack` line are that same elapsed distribution. They are not a QUIC transport RTT and not a STUN RTT.
+
+`quic_transport_rtt_ms`, when present, is the median of iroh `Path::rtt` on the selected direct IP path after each verified fetch. That is QUIC's smoothed path estimate. If iroh reports no direct-path estimate, the line is `quic_transport_rtt: unavailable`. A missing estimate is not filled from the elapsed time or from STUN.
+
+`n=0` does not print a report. `path` says direct UDP to the advertised endpoint with the relay disabled. `physical LAN section 7 row: not this run` is part of the text.
 
 ## Example only
 
@@ -84,9 +90,10 @@ EXAMPLE ONLY — not a measurement
 topology: internet/WAN, not a physical LAN
 path: direct UDP to the advertised endpoint, relay disabled
 stun: not a route and not advertised
-peer_rtt_metric: median of the timed verified request_pack samples on the client; not STUN and not ICMP
-peer_rtt_ms: EXAMPLE
-raw_ms: EXAMPLE
+request_pack_elapsed_metric: median client-side elapsed time of verified request_pack, from send through in-memory signature verification; not a QUIC transport RTT and not STUN
+request_pack_elapsed_p50_ms: EXAMPLE
+request_pack_elapsed_raw_ms: EXAMPLE
+quic_transport_rtt: unavailable
 bind: EXAMPLE-local:port
 advertised: EXAMPLE-public:port
 client_advertised: EXAMPLE-public:port
