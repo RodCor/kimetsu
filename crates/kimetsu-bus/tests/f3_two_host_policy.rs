@@ -7,12 +7,14 @@
 #[path = "../examples/f3_hotpath/policy.rs"]
 mod policy;
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use policy::{
-    EndpointPolicy, HostFacts, PublicHandoff, ReportInput, ReportKind, build_handoff,
-    parse_public_handoff, reject_false_lan_label, render_report, require_mode, validate_ip,
-    validate_pair, validate_release_profile, validate_two_host_claim,
+    EndpointPolicy, HandoffMode, HostFacts, PublicHandoff, ReportInput, ReportKind, build_handoff,
+    parse_public_handoff, parse_stun_xor_mapped, reject_false_lan_label, render_report,
+    require_distinct_mapping, require_fixed_udp_port, require_handoff_mode, require_mode,
+    select_advertised, stun_binding_request, validate_ip, validate_pair, validate_release_profile,
+    validate_two_host_claim, validate_wan_advertise, validate_wan_bind,
 };
 
 fn ip(text: &str) -> Ipv4Addr {
@@ -47,6 +49,9 @@ fn sample(kind: ReportKind) -> ReportInput {
         server: facts("pc-a", "machine-a"),
         client: facts("pc-b", "machine-b"),
         build_profile: "release".into(),
+        raw_ms: Vec::new(),
+        advertised: String::new(),
+        client_advertised: String::new(),
     }
 }
 
@@ -129,6 +134,9 @@ fn handoff_is_public_and_rejects_a_carried_secret() {
         server_port: 43111,
         digest: "cd".repeat(32),
         server: facts("pc-a", "machine-a"),
+        mode: policy::HandoffMode::Lan,
+        bind_ip: "192.168.1.10".into(),
+        bind_port: 43111,
     };
     let text = build_handoff(&handoff).unwrap();
     assert!(!text.to_ascii_lowercase().contains("secret"));
@@ -193,6 +201,7 @@ fn reports_keep_self_test_out_of_the_section_7_row() {
     assert!(!confirmed.contains("still pending"));
     assert!(!confirmed.contains("10.200.0."));
     assert!(!confirmed.contains("127.0.0.1"));
+    assert!(!confirmed.contains("internet/WAN"));
 
     let smoke = render_report(&sample(ReportKind::LocalSelfTest)).unwrap();
     assert!(smoke.contains("topology: local self-test on one host, not two physical LAN hosts\n"));
@@ -213,4 +222,167 @@ fn reports_keep_self_test_out_of_the_section_7_row() {
     unnamed.server.hostname.clear();
     let err = render_report(&unnamed).unwrap_err();
     assert!(err.contains("hostname is missing"));
+}
+
+#[test]
+fn wan_advertise_is_explicit_and_never_taken_from_stun() {
+    validate_wan_bind(ip("192.168.1.29")).unwrap();
+    validate_wan_bind(ip("172.30.0.2")).unwrap();
+    let err = validate_wan_bind(ip("0.0.0.0")).unwrap_err();
+    assert!(err.contains("refusing address 0.0.0.0"));
+    let err = validate_wan_bind(ip("127.0.0.1")).unwrap_err();
+    assert!(err.contains("loopback"));
+    let err = validate_wan_bind(ip("10.200.0.1")).unwrap_err();
+    assert!(err.contains("veth"));
+    validate_wan_advertise(ip("203.0.113.10"), 44144).unwrap();
+    let err = validate_wan_advertise(ip("192.168.1.29"), 44144).unwrap_err();
+    assert!(err.contains("not an internet route"));
+    let err = validate_wan_advertise(ip("100.64.0.1"), 44144).unwrap_err();
+    assert!(err.contains("not an internet route"));
+    let err = validate_wan_advertise(ip("10.1.1.1"), 44144).unwrap_err();
+    assert!(err.contains("not an internet route"));
+    assert!(require_fixed_udp_port(None).is_err());
+    assert!(require_fixed_udp_port(Some(0)).is_err());
+    assert_eq!(require_fixed_udp_port(Some(44144)).unwrap(), 44144);
+    require_distinct_mapping(ip("172.30.0.2"), 44144, ip("203.0.113.10"), 44144).unwrap();
+    require_distinct_mapping(ip("203.0.113.10"), 44144, ip("203.0.113.10"), 37749).unwrap();
+    let err =
+        require_distinct_mapping(ip("203.0.113.10"), 44144, ip("203.0.113.10"), 44144).unwrap_err();
+    assert!(err.contains("local bind"));
+
+    let stun = SocketAddrV4::new(ip("198.51.100.8"), 37749);
+    let explicit = SocketAddrV4::new(ip("203.0.113.10"), 44144);
+    let chosen = select_advertised(Some(explicit), Some(stun)).unwrap();
+    assert_eq!(chosen, explicit);
+    let err = select_advertised(None, Some(stun)).unwrap_err();
+    assert!(err.contains("refusing to advertise a STUN mapping"));
+}
+
+#[test]
+fn stun_mapped_address_parses_and_stays_out_of_the_handoff() {
+    let transaction_id = [9u8; 12];
+    let request = stun_binding_request(&transaction_id);
+    assert_eq!(request.len(), 20);
+    let mapped = SocketAddrV4::new(ip("203.0.113.50"), 44144);
+    let response = xor_mapped_response(mapped, &transaction_id);
+    assert_eq!(
+        parse_stun_xor_mapped(&response, &transaction_id).unwrap(),
+        mapped
+    );
+    let err = parse_stun_xor_mapped(&response, &[1u8; 12]).unwrap_err();
+    assert!(err.contains("transaction id"));
+
+    let mut handoff = lan_handoff();
+    handoff.mode = HandoffMode::InternetWan;
+    handoff.bind_ip = "172.30.0.2".into();
+    handoff.bind_port = 44144;
+    handoff.server_ip = "203.0.113.10".into();
+    handoff.server_port = 44144;
+    let text = build_handoff(&handoff).unwrap();
+    assert!(!text.to_ascii_lowercase().contains("stun"));
+    assert!(!text.to_ascii_lowercase().contains("secret"));
+    let parsed = parse_public_handoff(&text).unwrap();
+    assert_eq!(parsed.mode, HandoffMode::InternetWan);
+    assert_eq!(parsed.server_ip, "203.0.113.10");
+    assert_eq!(parsed.bind_ip, "172.30.0.2");
+    assert_eq!(parsed.bind_port, 44144);
+    require_handoff_mode(HandoffMode::InternetWan, parsed.mode).unwrap();
+    let err = require_handoff_mode(HandoffMode::Lan, parsed.mode).unwrap_err();
+    assert!(err.contains("does not match"));
+
+    let lan = parse_public_handoff(&build_handoff(&lan_handoff()).unwrap()).unwrap();
+    assert_eq!(lan.mode, HandoffMode::Lan);
+    let err = require_handoff_mode(HandoffMode::InternetWan, lan.mode).unwrap_err();
+    assert!(err.contains("does not match"));
+}
+
+#[test]
+fn wan_report_is_not_a_lan_row_and_has_no_invented_rtt() {
+    let mut input = sample(ReportKind::InternetWan);
+    input.raw_ms = vec![1.0, 1.2, 1.5];
+    input.n = 3;
+    input.p50_ms = 1.2;
+    input.p99_ms = 1.5;
+    input.max_ms = 1.5;
+    input.advertised = "203.0.113.10:44144".into();
+    input.client_advertised = "198.51.100.20:44144".into();
+    input.bind = "192.168.1.29:44144".into();
+    input.peer = "203.0.113.10:44144".into();
+    let report = render_report(&input).unwrap();
+    assert!(report.contains("topology: internet/WAN, not a physical LAN\n"));
+    assert!(report.contains("stun: not a route and not advertised\n"));
+    assert!(report.contains(
+        "peer_rtt_metric: median of the timed verified request_pack samples on the client; not STUN and not ICMP\n"
+    ));
+    assert!(report.contains("peer_rtt_ms: 1.200\n"));
+    assert!(report.contains("raw_ms: 1.000,1.200,1.500\n"));
+    assert!(report.contains("advertised: 203.0.113.10:44144\n"));
+    assert!(report.contains("pack: 394 gzip bytes, 8 memories, relay disabled\n"));
+    assert!(report.contains("physical LAN section 7 row: not this run"));
+    assert!(!report.contains("topology: two physical LAN hosts\n"));
+    assert!(!report.contains("two physical LAN hosts: measured"));
+
+    input.raw_ms.clear();
+    input.n = 0;
+    let err = render_report(&input).unwrap_err();
+    assert!(err.contains("refusing to invent"));
+}
+
+#[test]
+fn tampered_roster_is_rejected_and_a_stranger_is_not_a_member() {
+    let admin = kimetsu_bus::RosterAdmin::generate().unwrap();
+    let server = iroh::SecretKey::generate();
+    let client = iroh::SecretKey::generate();
+    let stranger = iroh::SecretKey::generate();
+    let server_entry = kimetsu_bus::RosterEndpoint::new(
+        server.public(),
+        &[kimetsu_core::memory::MountLevel::Repo],
+        None::<&str>,
+    )
+    .unwrap();
+    let client_entry = kimetsu_bus::RosterEndpoint::new(
+        client.public(),
+        &[kimetsu_core::memory::MountLevel::Repo],
+        None::<&str>,
+    )
+    .unwrap();
+    let document = admin.sign("f3-wan", &[server_entry, client_entry]).unwrap();
+    let roster = kimetsu_bus::SignedRoster::open(&document, &admin.public_key_hex()).unwrap();
+    assert!(roster.allows(client.public()));
+    assert!(!roster.allows(stranger.public()));
+    let mut tampered: serde_json::Value = serde_json::from_str(&document).unwrap();
+    tampered["signature"] = serde_json::Value::String("00".repeat(64));
+    let err = kimetsu_bus::SignedRoster::open(&tampered.to_string(), &admin.public_key_hex())
+        .unwrap_err();
+    assert!(!err.is_empty());
+}
+
+fn lan_handoff() -> PublicHandoff {
+    PublicHandoff {
+        admin_public_hex: "ab".repeat(32),
+        roster_json: r#"{"kimetsu_roster":1,"group":"f3-two-host"}"#.into(),
+        server_endpoint_id: "endpoint-a".into(),
+        server_ip: "192.168.1.10".into(),
+        server_port: 43111,
+        digest: "cd".repeat(32),
+        server: facts("pc-a", "machine-a"),
+        mode: HandoffMode::Lan,
+        bind_ip: "192.168.1.10".into(),
+        bind_port: 43111,
+    }
+}
+
+fn xor_mapped_response(mapped: SocketAddrV4, transaction_id: &[u8; 12]) -> Vec<u8> {
+    let magic = 0x2112_A442u32;
+    let xport = mapped.port() ^ ((magic >> 16) as u16);
+    let xaddr = u32::from(*mapped.ip()) ^ magic;
+    let mut attr = vec![0x00, 0x20, 0x00, 0x08, 0x00, 0x01];
+    attr.extend_from_slice(&xport.to_be_bytes());
+    attr.extend_from_slice(&xaddr.to_be_bytes());
+    let mut msg = vec![0x01, 0x01];
+    msg.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+    msg.extend_from_slice(&magic.to_be_bytes());
+    msg.extend_from_slice(transaction_id);
+    msg.extend_from_slice(&attr);
+    msg
 }

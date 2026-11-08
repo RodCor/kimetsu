@@ -327,6 +327,29 @@ async fn sdk_request_pack_reaches_the_bus() {
 }
 
 #[tokio::test]
+async fn fetch_verified_refuses_a_stranger_before_any_pack() {
+    let built = members(&[MountLevel::Repo], true);
+    let (server, client) = bind_pair(&built, BusRelay::Disabled, false).await;
+    let stranger = SecretKey::generate();
+    let started = Instant::now();
+    let err = client
+        .fetch_verified(
+            EndpointAddr::new(stranger.public()).with_ip_addr("127.0.0.1:9".parse().unwrap()),
+            &"ab".repeat(32),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a non-member must be refused before dial or pack work: {err}"
+    );
+    assert!(err.contains("non-member"), "{err}");
+    assert!(err.contains("before dial"), "{err}");
+    server.close().await;
+    client.close().await;
+}
+
+#[tokio::test]
 async fn non_member_handshake_fails_and_is_not_dialed() {
     let built = members(&[MountLevel::Repo], true);
     let server = bind_one(

@@ -71,6 +71,10 @@ def stub_source() -> str:
             (directory / "handoff.json").write_text('{{"kind":"public"}}\\n', encoding="utf-8")
         elif role == "fetch-public":
             sys.stdout.write(os.environ.get("FIXTURE_FETCH", ""))
+        elif role in ("wan-client", "wan-serve"):
+            if any(arg == "--client-secret" or "secret" in arg for arg in args):
+                sys.stderr.write("wan args must not carry a secret\\n")
+                sys.exit(2)
         else:
             sys.stderr.write("stub missing role\\n")
             sys.exit(2)
@@ -237,6 +241,81 @@ class HarnessScript(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(marked.exists())
 
+    def test_wan_flags_do_not_relabel_lan_or_omit_advertise(self):
+        state = str(Path(self.tmp.name) / "state")
+        mixed = self.run_script(
+            [
+                "serve",
+                "--bind", "192.168.1.10",
+                "--client-public", "abc",
+                "--state", state,
+                "--confirm-internet-wan",
+            ]
+        )
+        self.assertNotEqual(mixed.returncode, 0)
+        self.assertIn("cannot take internet/WAN flags", mixed.stderr)
+        missing = self.run_script(
+            [
+                "wan-serve",
+                "--bind", "172.30.0.2",
+                "--port", "44144",
+                "--client-public", "abc",
+                "--state", state,
+                "--confirm-internet-wan",
+            ]
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("--advertise", missing.stderr)
+        wildcard = self.run_script(
+            [
+                "wan-client",
+                "--bind", "0.0.0.0",
+                "--port", "44144",
+                "--advertise", "203.0.113.10:44144",
+                "--state", state,
+                "--confirm-internet-wan",
+            ]
+        )
+        self.assertNotEqual(wildcard.returncode, 0)
+        self.assertIn("0.0.0.0", wildcard.stderr)
+        both = self.run_script(
+            [
+                "wan-client",
+                "--bind", "192.168.1.29",
+                "--port", "44144",
+                "--advertise", "203.0.113.10:44144",
+                "--state", state,
+                "--confirm-internet-wan",
+                "--confirm-two-physical-hosts",
+            ]
+        )
+        self.assertNotEqual(both.returncode, 0)
+        self.assertIn("physical LAN", both.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_wan_client_forwards_advertise_and_not_a_peer_secret(self):
+        state = str(Path(self.tmp.name) / "state")
+        result = self.run_script(
+            [
+                "wan-client",
+                "--bind", "192.168.1.29",
+                "--port", "44144",
+                "--advertise", "203.0.113.20:44144",
+                "--state", state,
+                "--confirm-internet-wan",
+                "--stun-diagnostic", "203.0.113.5:3478",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.log.read_text(encoding="utf-8")
+        self.assertIn("--role wan-client", text)
+        self.assertIn("--advertise 203.0.113.20:44144", text)
+        self.assertIn("--confirm-internet-wan", text)
+        self.assertIn("--stun-diagnostic 203.0.113.5:3478", text)
+        self.assertNotIn("--confirm-two-physical-hosts", text)
+        self.assertNotIn("--peer", text)
+        self.assertNotIn("client.secret", text)
+
 
 @unittest.skipUnless(os.environ.get("F3_TWO_HOST_SMOKE") == "1", "set F3_TWO_HOST_SMOKE=1")
 class LocalSmoke(unittest.TestCase):
@@ -333,6 +412,36 @@ class LocalSmoke(unittest.TestCase):
             )
             self.assertNotEqual(smuggled.returncode, 0)
             self.assertIn("private key", smuggled.stderr)
+            server = Path(temporary) / "wan-server"
+            wildcard = self.run_bin(
+                [
+                    "--role", "wan-serve",
+                    "--confirm-internet-wan",
+                    "--bind", "0.0.0.0",
+                    "--port", "44144",
+                    "--advertise", "203.0.113.10:44144",
+                    "--client-public", public,
+                    "--state", str(server),
+                ]
+            )
+            self.assertNotEqual(wildcard.returncode, 0)
+            self.assertIn("0.0.0.0", wildcard.stderr)
+            self.assertFalse((server / "client.secret").exists())
+            debug = self.run_bin(
+                [
+                    "--role", "wan-client",
+                    "--confirm-internet-wan",
+                    "--bind", "192.168.1.29",
+                    "--port", "44144",
+                    "--advertise", "203.0.113.20:44144",
+                    "--state", str(Path(temporary) / "wan-client"),
+                ]
+            )
+            self.assertNotEqual(debug.returncode, 0)
+            self.assertIn("debug build", debug.stderr)
+            self.assertNotIn(secret, debug.stdout)
+            self.assertNotIn(secret, debug.stderr)
+            self.assertFalse((Path(temporary) / "wan-client" / "client.secret").exists())
 
     def test_script_self_test_stays_pending(self):
         env = self.env.copy()

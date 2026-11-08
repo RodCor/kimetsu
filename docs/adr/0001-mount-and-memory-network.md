@@ -482,6 +482,8 @@ WAL is already the Remote SQLite checkpoint adapter (`docs/remote-storage.md`). 
 
 The two-physical-host `request_pack` figure is not recorded in this ADR. Operators measure it with `scripts/f3-hotpath-two-hosts.sh` on two LAN machines, as described in [f3-two-physical-hosts.md](../operators/f3-two-physical-hosts.md). A loopback run, the veth pair, and that script's self-test do not fill the figure. Numbers that already exist stay in [0001-f3-measurements.md](0001-f3-measurements.md).
 
+An internet/WAN run is a different path. `wan-serve` and `wan-client` in that script dial an operator-supplied external UDP endpoint and label the report internet/WAN. They do not fill the physical-LAN row. No WAN number is recorded here. The operator page is [f3-internet-wan.md](../operators/f3-internet-wan.md). Relay stays disabled.
+
 ### 8. Phased delivery
 
 Each phase leaves the default path free of a generative LLM and free of a network wait inside `context`. Later phases MUST NOT put work on the hot path that would make the F3 budgets impossible (no IDF scan, no LLM, no presence join).

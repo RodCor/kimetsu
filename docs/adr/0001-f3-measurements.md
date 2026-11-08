@@ -72,6 +72,8 @@ two physical LAN hosts: still pending. This run is not direct LAN QUIC between t
 
 Two physical LAN hosts are still pending. This environment has no second machine on a real LAN.
 
+Internet/WAN is not a row in this table. `scripts/f3-hotpath-two-hosts.sh` can run that path when the operator passes an external UDP mapping; the report says internet/WAN and does not fill the physical-LAN row. No WAN sample is recorded here. See [f3-internet-wan.md](../operators/f3-internet-wan.md).
+
 ## Two physical hosts
 
 The harness is available. The measurement is not. `scripts/f3-hotpath-two-hosts.sh` and [f3-two-physical-hosts.md](../operators/f3-two-physical-hosts.md) tell an operator how to run the server on one PC and the client on another. Nothing in this file is that run. Loopback stdout, veth stdout, and the harness self-test stay out of the two-physical-host row.

@@ -82,6 +82,14 @@ async fn main() {
             fetch_public(&args).await;
             return;
         }
+        Role::WanServe => {
+            wan_serve(&args).await;
+            return;
+        }
+        Role::WanClient => {
+            wan_client(&args).await;
+            return;
+        }
         Role::Serve | Role::Fetch => {
             run_split(args).await;
             return;
@@ -175,6 +183,8 @@ enum Role {
     ClientInit,
     ServePublic,
     FetchPublic,
+    WanServe,
+    WanClient,
 }
 
 struct Args {
@@ -191,6 +201,9 @@ struct Args {
     client_public: Option<String>,
     handoff: Option<PathBuf>,
     confirm: bool,
+    confirm_wan: bool,
+    advertise: Option<SocketAddrV4>,
+    stun_diagnostic: Option<SocketAddrV4>,
     self_test: bool,
     hold_secs: Option<u64>,
     port: Option<u16>,
@@ -214,6 +227,9 @@ impl Args {
         let mut client_public = None;
         let mut handoff = None;
         let mut confirm = false;
+        let mut confirm_wan = false;
+        let mut advertise = None;
+        let mut stun_diagnostic = None;
         let mut self_test = false;
         let mut hold_secs = None;
         let mut port = None;
@@ -241,8 +257,10 @@ impl Args {
                         "client-init" => Role::ClientInit,
                         "serve-public" => Role::ServePublic,
                         "fetch-public" => Role::FetchPublic,
+                        "wan-serve" => Role::WanServe,
+                        "wan-client" => Role::WanClient,
                         other => panic!(
-                            "--role must be both, serve, fetch, client-init, serve-public, or fetch-public, not {other}"
+                            "--role must be both, serve, fetch, client-init, serve-public, fetch-public, wan-serve, or wan-client, not {other}"
                         ),
                     }
                 }
@@ -256,6 +274,16 @@ impl Args {
                 }
                 "--handoff" => handoff = Some(PathBuf::from(require_arg(&mut iter, "--handoff"))),
                 "--confirm-two-physical-hosts" => confirm = true,
+                "--confirm-internet-wan" => confirm_wan = true,
+                "--advertise" => {
+                    advertise = Some(parse_advertise(&require_arg(&mut iter, "--advertise")))
+                }
+                "--stun-diagnostic" => {
+                    stun_diagnostic = Some(parse_advertise(&require_arg(
+                        &mut iter,
+                        "--stun-diagnostic",
+                    )))
+                }
                 "--self-test" => self_test = true,
                 "--hold-secs" => {
                     hold_secs = Some(require_arg(&mut iter, "--hold-secs").parse().unwrap())
@@ -287,6 +315,9 @@ impl Args {
             panic!("--fetch-timeout-secs must be 5..=300, not {secs}");
         }
         let two_host_flags = confirm
+            || confirm_wan
+            || advertise.is_some()
+            || stun_diagnostic.is_some()
             || self_test
             || state.is_some()
             || client_public.is_some()
@@ -341,6 +372,9 @@ impl Args {
                     || session.is_some()
                     || topology.is_some()
                     || confirm
+                    || confirm_wan
+                    || advertise.is_some()
+                    || stun_diagnostic.is_some()
                     || self_test
                     || client_public.is_some()
                     || handoff.is_some()
@@ -392,6 +426,50 @@ impl Args {
                     two_host::validate_pair(bind_ip, peer_ip, policy)
                         .unwrap_or_else(|err| panic!("{err}"));
                 }
+                if confirm_wan || advertise.is_some() || stun_diagnostic.is_some() {
+                    panic!(
+                        "internet/WAN flags require --role wan-serve or --role wan-client; they cannot relabel a LAN run"
+                    );
+                }
+            }
+            Role::WanServe | Role::WanClient => {
+                if self_test || confirm || session.is_some() || topology.is_some() {
+                    panic!(
+                        "WAN mode cannot use --self-test, --confirm-two-physical-hosts, --session, or --topology"
+                    );
+                }
+                if !confirm_wan {
+                    panic!("WAN mode requires --confirm-internet-wan");
+                }
+                if state.is_none() || bind.is_none() {
+                    panic!("WAN mode requires --state and --bind");
+                }
+                let bind_ip = bind.expect("--bind");
+                two_host::validate_wan_bind(bind_ip).unwrap_or_else(|err| panic!("{err}"));
+                let fixed =
+                    two_host::require_fixed_udp_port(port).unwrap_or_else(|err| panic!("{err}"));
+                let advertised = two_host::select_advertised(advertise, stun_diagnostic)
+                    .unwrap_or_else(|err| panic!("{err}"));
+                two_host::require_distinct_mapping(
+                    bind_ip,
+                    fixed,
+                    *advertised.ip(),
+                    advertised.port(),
+                )
+                .unwrap_or_else(|err| panic!("{err}"));
+                two_host::validate_release_profile(true, cfg!(debug_assertions))
+                    .map_err(|_| {
+                        "refusing --confirm-internet-wan on a debug build; use the script's release build"
+                    })
+                    .unwrap_or_else(|err| panic!("{err}"));
+                if matches!(role, Role::WanServe) && client_public.is_none() {
+                    panic!("--role wan-serve requires --client-public");
+                }
+                if matches!(role, Role::WanClient) && client_public.is_some() {
+                    panic!(
+                        "--role wan-client keeps its key in this process; do not pass --client-public"
+                    );
+                }
             }
         }
         Self {
@@ -408,6 +486,9 @@ impl Args {
             client_public,
             handoff,
             confirm,
+            confirm_wan,
+            advertise,
+            stun_diagnostic,
             self_test,
             hold_secs,
             port,
@@ -416,6 +497,12 @@ impl Args {
             fetch_timeout,
         }
     }
+}
+
+fn parse_advertise(text: &str) -> SocketAddrV4 {
+    text.parse::<SocketAddrV4>().unwrap_or_else(|_| {
+        panic!("--advertise and --stun-diagnostic expect ipv4:port, not {text}")
+    })
 }
 
 fn require_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -440,7 +527,13 @@ Two physical LAN hosts:
     serve --bind IP --client-public HEX --state DIR --confirm-two-physical-hosts
     fetch --bind IP --peer IP --state DIR --handoff FILE --confirm-two-physical-hosts
 
+Internet/WAN (not a LAN measurement):
+  scripts/f3-hotpath-two-hosts.sh
+    wan-client --bind IP --port N --advertise PUBLIC:PORT --state DIR --confirm-internet-wan
+    wan-serve --bind IP --port N --advertise PUBLIC:PORT --client-public HEX --state DIR --confirm-internet-wan
+
 --self-test is loopback on one machine. It does not fill the §7 row.
+--stun-diagnostic prints a mapping and does not advertise it.
 "
     );
 }
@@ -735,7 +828,7 @@ async fn measure_quic(samples: usize) -> QuicReport {
     let addr = server.direct_addr().await.unwrap();
     let brain = temp_root("quic-receiver");
     project::init_project_at_root(&brain, true).unwrap();
-    let (samples, bytes) = time_fetches(&client, addr, &announcement.digest, samples).await;
+    let (samples, bytes, _) = time_fetches(&client, addr, &announcement.digest, samples).await;
     let (_, _, conn) = project::load_project_readonly(&brain).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
@@ -774,7 +867,7 @@ async fn time_fetches(
     addr: EndpointAddr,
     digest: &str,
     samples: usize,
-) -> (Dist, usize) {
+) -> (Dist, usize, Vec<f64>) {
     for _ in 0..3 {
         client.fetch_verified(addr.clone(), digest).await.unwrap();
     }
@@ -786,7 +879,11 @@ async fn time_fetches(
         timed.push(started.elapsed());
         bytes = fetched.gzip.len();
     }
-    (stats(&timed), bytes)
+    let raw_ms = timed
+        .iter()
+        .map(|sample| sample.as_secs_f64() * 1e3)
+        .collect();
+    (stats(&timed), bytes, raw_ms)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -804,9 +901,12 @@ async fn run_split(args: Args) {
     match args.role {
         Role::Serve => serve(&args).await,
         Role::Fetch => fetch(&args).await,
-        Role::Both | Role::ClientInit | Role::ServePublic | Role::FetchPublic => {
-            unreachable!("run_split is only for serve and fetch")
-        }
+        Role::Both
+        | Role::ClientInit
+        | Role::ServePublic
+        | Role::FetchPublic
+        | Role::WanServe
+        | Role::WanClient => unreachable!("run_split is only for serve and fetch"),
     }
 }
 
@@ -923,7 +1023,7 @@ async fn fetch(args: &Args) {
     assert_eq!(local_socket.ip(), std::net::IpAddr::V4(bind_ip));
     let brain = temp_root("veth-receiver");
     project::init_project_at_root(&brain, true).unwrap();
-    let (samples, bytes) = time_fetches(&client, addr, &ready.digest, args.quic_samples).await;
+    let (samples, bytes, _) = time_fetches(&client, addr, &ready.digest, args.quic_samples).await;
     let (_, _, conn) = project::load_project_readonly(&brain).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
@@ -1095,6 +1195,9 @@ async fn serve_public(args: &Args) {
         server_port: socket.port(),
         digest: announcement.digest,
         server: facts.clone(),
+        mode: two_host::HandoffMode::Lan,
+        bind_ip: bind_ip.to_string(),
+        bind_port: socket.port(),
     };
     let text = two_host::build_handoff(&handoff).unwrap_or_else(|err| panic!("{err}"));
     if text.to_ascii_lowercase().contains("secret") {
@@ -1166,6 +1269,8 @@ async fn fetch_public(args: &Args) {
         .unwrap_or_else(|err| panic!("read {}: {err}", handoff_path.display()));
     let handoff =
         two_host::parse_public_handoff(&handoff_text).unwrap_or_else(|err| panic!("{err}"));
+    two_host::require_handoff_mode(two_host::HandoffMode::Lan, handoff.mode)
+        .unwrap_or_else(|err| panic!("{err}"));
     if handoff.server_ip != peer_ip.to_string() {
         panic!(
             "handoff server address {} does not match --peer {peer_ip}",
@@ -1238,7 +1343,7 @@ async fn fetch_public(args: &Args) {
     )
     .await
     .unwrap_or_else(|_| panic!("fetch did not finish within {}s", budget.as_secs()));
-    let (samples, bytes) = timed;
+    let (samples, bytes, _raw_ms) = timed;
     let (_, _, conn) = project::load_project_readonly(&brain.0).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
@@ -1262,6 +1367,9 @@ async fn fetch_public(args: &Args) {
         server: handoff.server,
         client: client_facts,
         build_profile: profile.into(),
+        raw_ms: Vec::new(),
+        advertised: String::new(),
+        client_advertised: String::new(),
     })
     .unwrap_or_else(|err| panic!("{err}"));
     flush_stdout(&report);
@@ -1270,6 +1378,300 @@ async fn fetch_public(args: &Args) {
         eprintln!("wrote {}", path.display());
     }
     client.close().await;
+}
+
+async fn wan_serve(args: &Args) {
+    if !args.confirm_wan {
+        panic!("WAN mode requires --confirm-internet-wan");
+    }
+    let state = args.state.as_deref().expect("--state");
+    let bind_ip = args.bind.expect("--bind");
+    let bind_port =
+        two_host::require_fixed_udp_port(args.port).unwrap_or_else(|err| panic!("{err}"));
+    let advertised = args.advertise.expect("--advertise");
+    ensure_state(state);
+    stun_diagnostic_line(args, SocketAddrV4::new(bind_ip, bind_port)).await;
+    let client_public = args.client_public.as_deref().expect("--client-public");
+    let client_id = EndpointId::from_str(client_public.trim())
+        .unwrap_or_else(|err| panic!("--client-public is not an endpoint id ({err})"));
+    let server_key = iroh::SecretKey::generate();
+    if server_key.public() == client_id {
+        panic!("--client-public matches the server key; generate the client on the other machine");
+    }
+    let signer = PackSigner::generate().unwrap();
+    let admin = RosterAdmin::generate().unwrap();
+    let server_entry = RosterEndpoint::new(
+        server_key.public(),
+        &[MountLevel::Repo],
+        [signer.public_key_hex()],
+    )
+    .unwrap();
+    let client_entry = RosterEndpoint::new(client_id, &[MountLevel::Repo], None::<&str>).unwrap();
+    let document = admin.sign("f3-wan", &[server_entry, client_entry]).unwrap();
+    let roster = SignedRoster::open(&document, &admin.public_key_hex()).unwrap();
+    if !roster.allows(client_id) || !roster.allows(server_key.public()) {
+        panic!("roster did not admit the expected endpoint before any pack work");
+    }
+    let server = tokio::time::timeout(
+        Duration::from_secs(20),
+        bind_endpoint(
+            server_key,
+            roster,
+            BusRelay::Disabled,
+            "wan-a",
+            Some(SocketAddrV4::new(bind_ip, bind_port)),
+            Some(state),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("bind did not become ready within 20s"));
+    let socket = sole_ipv4(server.direct_addr().await.unwrap());
+    assert_eq!(socket.ip(), std::net::IpAddr::V4(bind_ip));
+    assert_eq!(
+        socket.port(),
+        bind_port,
+        "bound port is not the explicit UDP port"
+    );
+    let (manifest, memories) = small_pack();
+    let announcement = server
+        .publish_memories(&manifest, &["repo".into()], &memories, &signer)
+        .unwrap();
+    let facts = host_facts(args);
+    let handoff = two_host::PublicHandoff {
+        admin_public_hex: admin.public_key_hex(),
+        roster_json: document,
+        server_endpoint_id: server.id().to_string(),
+        server_ip: advertised.ip().to_string(),
+        server_port: advertised.port(),
+        digest: announcement.digest,
+        server: facts.clone(),
+        mode: two_host::HandoffMode::InternetWan,
+        bind_ip: bind_ip.to_string(),
+        bind_port,
+    };
+    let text = two_host::build_handoff(&handoff).unwrap_or_else(|err| panic!("{err}"));
+    refuse_secret_material(&text);
+    let handoff_path = state.join("handoff.json");
+    write_atomic(&handoff_path, text.as_bytes());
+    let hold = args.hold_secs.unwrap_or(600);
+    flush_stdout(&format!(
+        "\
+role: wan-serve
+ready: yes
+mode: internet-wan
+handoff: {path}
+bind: {socket}
+advertised: {advertised}
+relay: disabled
+embeddings: off
+timer: verified request_pack, not import
+stun: not advertised
+hold_secs: {hold}
+server_hostname: {hostname}
+server_machine_id: {machine}
+server_commit: {commit}
+server_rustc: {rustc}
+note: handoff has no private key. Copy that file into the client state directory and leave this process running.
+",
+        path = handoff_path.display(),
+        hostname = facts.hostname,
+        machine = facts.machine_id,
+        commit = facts.commit,
+        rustc = facts.rustc,
+    ));
+    let done = state.join("done");
+    let deadline = Instant::now() + Duration::from_secs(hold);
+    while !done.exists() {
+        if Instant::now() > deadline {
+            eprintln!("hold of {hold}s elapsed");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    server.close().await;
+    let _ = std::fs::remove_file(state.join("presence-wan-a.json"));
+}
+
+async fn wan_client(args: &Args) {
+    if !args.confirm_wan {
+        panic!("WAN mode requires --confirm-internet-wan");
+    }
+    let state = args.state.as_deref().expect("--state");
+    let bind_ip = args.bind.expect("--bind");
+    let bind_port =
+        two_host::require_fixed_udp_port(args.port).unwrap_or_else(|err| panic!("{err}"));
+    let client_advertised = args.advertise.expect("--advertise");
+    ensure_state(state);
+    if state.join("client.secret").exists() {
+        panic!(
+            "WAN client refuses an existing client.secret; this mode does not store a private key"
+        );
+    }
+    stun_diagnostic_line(args, SocketAddrV4::new(bind_ip, bind_port)).await;
+    let client_key = iroh::SecretKey::generate();
+    let public = client_key.public().to_string();
+    flush_stdout(&format!(
+        "\
+role: wan-client
+ready: waiting-for-handoff
+client_public: {public}
+bind: {bind_ip}:{bind_port}
+client_advertised: {client_advertised}
+note: this process holds the client key in memory. Copy only client_public to the server. Copy the server handoff.json into this state directory. Do not write the key down.
+"
+    ));
+    let handoff_path = state.join("handoff.json");
+    let hold = args.hold_secs.unwrap_or(600);
+    let deadline = Instant::now() + Duration::from_secs(hold);
+    loop {
+        if handoff_path.is_file() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for {} after {hold}s",
+                handoff_path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let handoff_text = std::fs::read_to_string(&handoff_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", handoff_path.display()));
+    refuse_secret_material(&handoff_text);
+    let handoff =
+        two_host::parse_public_handoff(&handoff_text).unwrap_or_else(|err| panic!("{err}"));
+    two_host::require_handoff_mode(two_host::HandoffMode::InternetWan, handoff.mode)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let server_id = EndpointId::from_str(&handoff.server_endpoint_id)
+        .unwrap_or_else(|err| panic!("server endpoint id: {err}"));
+    let roster = SignedRoster::open(&handoff.roster_json, &handoff.admin_public_hex)
+        .unwrap_or_else(|err| panic!("roster: {err}"));
+    if !roster.allows(client_key.public()) {
+        panic!(
+            "local client key is not on the roster; unauthorized peer rejected before any pack work"
+        );
+    }
+    if !roster.allows(server_id) {
+        panic!("handoff server endpoint is not on the roster; rejected before any pack work");
+    }
+    let peer_ip: Ipv4Addr = handoff.server_ip.parse().unwrap_or_else(|_| {
+        panic!(
+            "handoff advertised address {} is not IPv4",
+            handoff.server_ip
+        )
+    });
+    let peer_socket = SocketAddr::from((peer_ip, handoff.server_port));
+    let client = tokio::time::timeout(
+        Duration::from_secs(20),
+        bind_endpoint(
+            client_key,
+            roster,
+            BusRelay::Disabled,
+            "wan-b",
+            Some(SocketAddrV4::new(bind_ip, bind_port)),
+            Some(state),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("bind did not become ready within 20s"));
+    let local_socket = sole_ipv4(client.direct_addr().await.unwrap());
+    assert_eq!(local_socket.ip(), std::net::IpAddr::V4(bind_ip));
+    assert_eq!(
+        local_socket.port(),
+        bind_port,
+        "bound port is not the explicit UDP port"
+    );
+    let addr = EndpointAddr::new(server_id).with_ip_addr(peer_socket);
+    let brain = RmDir(temp_root("wan-receiver"));
+    project::init_project_at_root(&brain.0, true).unwrap();
+    let budget = Duration::from_secs(args.fetch_timeout.unwrap_or(120));
+    let (samples, bytes, raw_ms) = tokio::time::timeout(
+        budget,
+        time_fetches(&client, addr, &handoff.digest, args.quic_samples),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("fetch did not finish within {}s", budget.as_secs()));
+    let (_, _, conn) = project::load_project_readonly(&brain.0).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "verification must not import");
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let report = two_host::render_report(&two_host::ReportInput {
+        kind: two_host::ReportKind::InternetWan,
+        n: samples.n,
+        p50_ms: samples.p50_ms,
+        p99_ms: samples.p99_ms,
+        max_ms: samples.max_ms,
+        pack_bytes: bytes,
+        memories: 8,
+        bind: local_socket.to_string(),
+        peer: peer_socket.to_string(),
+        server: handoff.server,
+        client: host_facts(args),
+        build_profile: profile.into(),
+        raw_ms,
+        advertised: format!("{}:{}", handoff.server_ip, handoff.server_port),
+        client_advertised: client_advertised.to_string(),
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+    refuse_secret_material(&report);
+    flush_stdout(&report);
+    if let Some(path) = &args.out {
+        std::fs::write(path, &report).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+    std::fs::write(state.join("done"), b"ok\n").unwrap();
+    client.close().await;
+    let _ = std::fs::remove_file(state.join("presence-wan-b.json"));
+}
+
+async fn stun_diagnostic_line(args: &Args, local: SocketAddrV4) {
+    let Some(server) = args.stun_diagnostic else {
+        return;
+    };
+    match query_stun(local, server).await {
+        Ok(mapped) => eprintln!(
+            "stun_diagnostic: mapped {mapped} from local {local}. This is not a route and was not written to the handoff. A mapping often changes after this socket closes; --advertise stays {advertise}.",
+            advertise = args.advertise.expect("--advertise")
+        ),
+        Err(err) => eprintln!(
+            "stun_diagnostic failed: {err}. --advertise is unchanged and STUN was not used as a route."
+        ),
+    }
+}
+
+async fn query_stun(local: SocketAddrV4, server: SocketAddrV4) -> Result<SocketAddrV4, String> {
+    let socket = tokio::net::UdpSocket::bind(local)
+        .await
+        .map_err(|err| format!("STUN diagnostic bind {local}: {err}"))?;
+    let mut transaction_id = [0u8; 12];
+    getrandom::fill(&mut transaction_id).map_err(|err| format!("STUN transaction id: {err}"))?;
+    let request = two_host::stun_binding_request(&transaction_id);
+    socket
+        .send_to(&request, server)
+        .await
+        .map_err(|err| format!("STUN send: {err}"))?;
+    let mut buffer = [0u8; 512];
+    let received = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut buffer))
+        .await
+        .map_err(|_| "STUN diagnostic timed out after 3s".to_string())?
+        .map_err(|err| format!("STUN recv: {err}"))?;
+    two_host::parse_stun_xor_mapped(&buffer[..received], &transaction_id)
+}
+
+fn refuse_secret_material(text: &str) {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("client_secret")
+        || lower.contains("private_key")
+        || lower.contains("secret_key")
+    {
+        panic!("refusing to emit private-key material");
+    }
 }
 
 fn host_facts(args: &Args) -> two_host::HostFacts {
