@@ -685,12 +685,11 @@ fn read_machine_batches(
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            if let Ok(cursor_val) = stem.parse::<i64>() {
-                if cursor_val > since_cursor {
-                    batches.push((cursor_val, path));
-                }
-            }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(cursor_val) = stem.parse::<i64>()
+            && cursor_val > since_cursor
+        {
+            batches.push((cursor_val, path));
         }
     }
     batches.sort_by_key(|(c, _)| *c);
@@ -741,12 +740,11 @@ pub fn sync_dir(
         let mut other_machines: Vec<String> = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("sync: dir entry error: {e}"))?;
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name != machine_id {
-                        other_machines.push(name.to_string());
-                    }
-                }
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && name != machine_id
+            {
+                other_machines.push(name.to_string());
             }
         }
         other_machines.sort(); // deterministic order
@@ -823,31 +821,30 @@ pub fn sync_status(
     let local_pending = push_dry.exported;
 
     let mut sources: Vec<(String, i64, usize)> = Vec::new();
-    if let Some(sd) = sync_dir_opt {
-        if sd.exists() {
-            let entries = fs::read_dir(sd)
-                .map_err(|e| format!("sync status: cannot read {:?}: {e}", sd.display()))?;
-            let mut other_machines: Vec<String> = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|e| format!("sync status: dir entry error: {e}"))?;
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name != machine_id {
-                            other_machines.push(name.to_string());
-                        }
-                    }
-                }
+    if let Some(sd) = sync_dir_opt
+        && sd.exists()
+    {
+        let entries = fs::read_dir(sd)
+            .map_err(|e| format!("sync status: cannot read {:?}: {e}", sd.display()))?;
+        let mut other_machines: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("sync status: dir entry error: {e}"))?;
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && name != machine_id
+            {
+                other_machines.push(name.to_string());
             }
-            other_machines.sort();
-            for other_id in &other_machines {
-                let since = cursors.cursor_for(other_id);
-                let (pull_summary, _) = pull_machine_batches(conn, sd, other_id, since, true)?;
-                sources.push((
-                    other_id.clone(),
-                    since,
-                    pull_summary.applied + pull_summary.skipped,
-                ));
-            }
+        }
+        other_machines.sort();
+        for other_id in &other_machines {
+            let since = cursors.cursor_for(other_id);
+            let (pull_summary, _) = pull_machine_batches(conn, sd, other_id, since, true)?;
+            sources.push((
+                other_id.clone(),
+                since,
+                pull_summary.applied + pull_summary.skipped,
+            ));
         }
     }
 

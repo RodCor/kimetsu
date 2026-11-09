@@ -94,15 +94,15 @@ pub fn parse(query: &str) -> Option<FactRequest> {
     }
     let normalized = folded(query);
     let q = normalized.trim_matches(['¿', '?', ' ', '.', '\n', '\t']);
-    if let Some(rest) = q.strip_prefix("what ") {
-        if let Some((attrs, subject)) = rest.split_once(" does ") {
-            for suffix in [" use", " require", " run", " have"] {
-                if let Some(subject) = subject.strip_suffix(suffix) {
-                    return request(subject, attrs);
-                }
+    if let Some(rest) = q.strip_prefix("what ")
+        && let Some((attrs, subject)) = rest.split_once(" does ")
+    {
+        for suffix in [" use", " require", " run", " have"] {
+            if let Some(subject) = subject.strip_suffix(suffix) {
+                return request(subject, attrs);
             }
-            return None;
         }
+        return None;
     }
     let rest = [
         "what is ",
@@ -121,10 +121,10 @@ pub fn parse(query: &str) -> Option<FactRequest> {
         .find_map(|p| rest.strip_prefix(p))
         .unwrap_or(rest);
     for separator in [" for ", " of ", " del ", " de "] {
-        if let Some((attrs, subject)) = rest.split_once(separator) {
-            if attributes(attrs).is_some() {
-                return request(subject, attrs);
-            }
+        if let Some((attrs, subject)) = rest.split_once(separator)
+            && attributes(attrs).is_some()
+        {
+            return request(subject, attrs);
         }
     }
     // Split at every word boundary: exactly one split must form a complete

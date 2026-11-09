@@ -498,10 +498,10 @@ pub fn uninstall(options: UninstallOptions) -> KimetsuResult<()> {
             );
         }
         if tier >= Tier::WithBrains {
-            if let Some(user_data) = user_data_dir() {
-                if user_data.exists() {
-                    println!("dry-run: would remove user brain {}", user_data.display());
-                }
+            if let Some(user_data) = user_data_dir()
+                && user_data.exists()
+            {
+                println!("dry-run: would remove user brain {}", user_data.display());
             }
             if project_brain.exists() {
                 println!(

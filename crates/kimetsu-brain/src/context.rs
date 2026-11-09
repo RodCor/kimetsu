@@ -755,10 +755,10 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
 
     candidates.extend(repo_file_candidates(conn, repo_root, &request.query, 30)?);
     candidates.extend(manifest_candidates(conn, repo_root, &request.query)?);
-    if let Some(mounts) = request.readable_mounts.as_ref() {
-        if !mounts.contains(&MountLevel::Repo) {
-            candidates.retain(|candidate| candidate.capsule.kind == "memory");
-        }
+    if let Some(mounts) = request.readable_mounts.as_ref()
+        && !mounts.contains(&MountLevel::Repo)
+    {
+        candidates.retain(|candidate| candidate.capsule.kind == "memory");
     }
 
     // v0.8: proactive kind filter — restrict to actionable kinds BEFORE
@@ -1373,13 +1373,13 @@ pub(crate) fn hydrate_fact_evidence(
     candidate: &mut Candidate,
     include_facts: bool,
 ) -> KimetsuResult<()> {
-    if include_facts {
-        if let (Some(id), Some(revision)) = (
+    if include_facts
+        && let (Some(id), Some(revision)) = (
             candidate.capsule.expansion_handle.strip_prefix("memory:"),
             candidate.capsule.claim_revision.as_deref(),
-        ) {
-            candidate.capsule.facts = crate::fact_store::load(conn, id, revision)?;
-        }
+        )
+    {
+        candidate.capsule.facts = crate::fact_store::load(conn, id, revision)?;
     }
     Ok(())
 }

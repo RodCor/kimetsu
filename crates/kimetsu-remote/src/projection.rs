@@ -118,12 +118,12 @@ fn rebase(cell: &mut Cell, column: &str, from: &[String], to: &str) {
     let Cell::Text(text) = cell else { return };
     if column == "repo_root" && from.iter().any(|old| old == text) {
         *text = to.to_string();
-    } else if column.ends_with("_json") {
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) {
-            rebase_json(&mut value, from, to);
-            // Canonicalize JSON object ordering on both sides of the round trip.
-            *text = value.to_string();
-        }
+    } else if column.ends_with("_json")
+        && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text)
+    {
+        rebase_json(&mut value, from, to);
+        // Canonicalize JSON object ordering on both sides of the round trip.
+        *text = value.to_string();
     }
 }
 

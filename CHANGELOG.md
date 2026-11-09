@@ -9,6 +9,10 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+### Security
+
+- Bump `rusqlite` to 0.41.1 and its bundled `libsqlite3-sys` to 0.39.1, fixing `RUSTSEC-2026-0459` (bundled SQLite in `libsqlite3-sys` 0.35.0). The workspace `rust-version` is 1.89, which `rusqlite` 0.41 requires. `kimetsu-bus` stays on 1.91.
+
 ### Added
 
 - ADR 0001 F4 host adapters. `kimetsu plugin install` writes stdio MCP config for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), and Cursor (`.cursor/mcp.json`). Grok Bot has no documented settings file, so `kimetsu plugin install grok-bot` writes an operator snippet at `.kimetsu/hosts/grok-bot.md` (command, or `--remote` URL). The MCP `instructions` field and the installed guidance state stdio grants: read `repo` and `user`, write `repo` only. `kimetsu_brain_record` stays on `repo`. `kimetsu_brain_cite` outcomes are `helped`, `noop`, and `harmed`. Context on that grant does not return `org` or `skill` text, and it does not call a generative model. Live host processes were not exercised. See [host adapters](docs/host-adapters.md).

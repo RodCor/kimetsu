@@ -153,12 +153,12 @@ pub fn redact_context_suffix(text: &str) -> &str {
 /// ```
 pub fn redact_tags_prefix(text: &str) -> &str {
     let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("[tags: ") {
-        if let Some(close) = rest.find(']') {
-            let after = rest[close + 1..].trim_start();
-            if !after.is_empty() {
-                return after;
-            }
+    if let Some(rest) = trimmed.strip_prefix("[tags: ")
+        && let Some(close) = rest.find(']')
+    {
+        let after = rest[close + 1..].trim_start();
+        if !after.is_empty() {
+            return after;
         }
     }
     text
@@ -698,10 +698,10 @@ fn pack_target_scopes(
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for e in entries {
-        if let Ok(s) = e.scope.parse::<MemoryScope>() {
-            if seen.insert(s.to_string()) {
-                out.push(s);
-            }
+        if let Ok(s) = e.scope.parse::<MemoryScope>()
+            && seen.insert(s.to_string())
+        {
+            out.push(s);
         }
     }
     out

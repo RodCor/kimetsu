@@ -197,10 +197,10 @@ pub fn dispatch(
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "tools/call missing name".to_string())?;
-            if let Some(set) = allowed_tools {
-                if !set.contains(name) {
-                    return Err(format!("tool `{name}` is not available in remote mode"));
-                }
+            if let Some(set) = allowed_tools
+                && !set.contains(name)
+            {
+                return Err(format!("tool `{name}` is not available in remote mode"));
             }
             // `allowed_tools.is_some()` is the remote-mode marker (see the
             // dispatch docstring): remote serves cloned repos whose
@@ -754,15 +754,15 @@ fn stdio_brain_context_with_model_loaders(
             load_embedder,
             None,
         )?;
-        if let Some((key, block)) = warm {
-            if output["warm_start"]["context"].as_str() == Some(block.context.as_str()) {
-                mark_session_warm_start_served(key);
-                kimetsu_brain::digest::record_warmstart_served(
-                    workspace,
-                    block.digest_chars,
-                    block.resume_chars,
-                );
-            }
+        if let Some((key, block)) = warm
+            && output["warm_start"]["context"].as_str() == Some(block.context.as_str())
+        {
+            mark_session_warm_start_served(key);
+            kimetsu_brain::digest::record_warmstart_served(
+                workspace,
+                block.digest_chars,
+                block.resume_chars,
+            );
         }
         Ok(output)
     })();
@@ -796,10 +796,9 @@ fn record_context_delivery(
         .ok()
         .and_then(|p| project::load_config(&p).ok())
         .is_some_and(|cfg| cfg.learning.store_queries)
+        && let Some(query) = arguments.get("query").or_else(|| arguments.get("task"))
     {
-        if let Some(query) = arguments.get("query").or_else(|| arguments.get("task")) {
-            payload["query"] = query.clone();
-        }
+        payload["query"] = query.clone();
     }
     payload["task_id"] = arguments.get("task_id").cloned().unwrap_or(Value::Null);
     payload["exposure_id"] = json!(exposure.event_id.to_string());
