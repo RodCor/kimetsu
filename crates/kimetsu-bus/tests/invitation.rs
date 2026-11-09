@@ -155,6 +155,7 @@ async fn bind(
         presence_path: scratch(&format!("presence-{label}")),
         roster_path: Some(roster_path),
         bind_v4: None,
+        map_ports: false,
     })
     .await
     .unwrap_or_else(|err| panic!("bind {label}: {err}"))
@@ -355,6 +356,7 @@ async fn removal_reissue_blocks_request_pack_and_the_next_bind() {
         presence_path: scratch("bob-rebind-presence"),
         roster_path: Some(bob_path),
         bind_v4: None,
+        map_ports: false,
     })
     .await;
     let Err(rebound) = rebound else {

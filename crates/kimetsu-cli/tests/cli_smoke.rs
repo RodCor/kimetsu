@@ -69,6 +69,7 @@ fn kimetsu_help_lists_top_level_subcommands() {
         "doctor",
         "bridge",
         "mcp",
+        "network",
         "update",
         "uninstall",
     ] {
@@ -111,6 +112,59 @@ fn kimetsu_update_help_lists_check_mode() {
             "update --help should mention `{expected}`; got: {stdout}"
         );
     }
+}
+
+#[test]
+fn kimetsu_network_help_lists_membership_and_pack_commands() {
+    let output = Command::new(kimetsu_bin())
+        .args(["network", "--help"])
+        .output()
+        .expect("spawn kimetsu network --help");
+    assert!(output.status.success(), "network --help should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in ["invite", "join", "status", "leave", "share", "request"] {
+        assert!(
+            stdout.contains(expected),
+            "network --help should mention `{expected}`; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn kimetsu_network_status_is_not_listening_before_anyone_joins() {
+    let dir = std::env::temp_dir().join(format!(
+        "kimetsu-net-status-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let output = Command::new(kimetsu_bin())
+        .args([
+            "network",
+            "status",
+            "--json",
+            "--state-dir",
+            dir.to_str().unwrap(),
+        ])
+        .env("KIMETSU_USER_BRAIN", "0")
+        .output()
+        .expect("spawn kimetsu network status");
+    assert!(
+        output.status.success(),
+        "status should exit 0; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!("status --json should be JSON ({err}): {stdout}");
+    });
+    assert_eq!(value["joined"], false);
+    assert_eq!(value["listening"], false);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -36,6 +36,11 @@ embeddings = [
 ]
 pi = ["kimetsu-chat/pi"]
 openclaw = ["kimetsu-chat/openclaw"]
+# Peer network (ADR 0001). Off at runtime until `kimetsu network join`
+# or `invite`. Release and npm builds pass this feature. It is not a
+# default feature: `cargo test --workspace` must not feature-unify
+# kimetsu-bus into kimetsu-remote.
+network = ["kimetsu-sdk/bus", "dep:kimetsu-bus", "dep:tokio", "dep:base64"]
 
 [[bin]]
 name = "kimetsu"
@@ -46,11 +51,13 @@ clap.workspace = true
 kimetsu-agent = { path = "../kimetsu-agent", version = "2.10.0" }
 kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
 kimetsu-sdk = { path = "../kimetsu-sdk", version = "2.10.0" }
+kimetsu-bus = { path = "../kimetsu-bus", version = "2.10.0", optional = true, default-features = false }
 kimetsu-chat = { path = "../kimetsu-chat", version = "2.10.0" }
 kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
 # v0.4.6: `kimetsu doctor` serializes its report struct so --json
 # output can be piped into CI / hooks.
 flate2 = "1"
+base64 = { workspace = true, optional = true }
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -62,6 +69,7 @@ toml_edit.workspace = true
 interprocess = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio = { workspace = true, optional = true }
 ulid.workspace = true
 
 # Daemon spawn hygiene: clear HANDLE_FLAG_INHERIT on our std handles before

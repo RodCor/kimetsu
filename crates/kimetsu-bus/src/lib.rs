@@ -22,6 +22,10 @@
 //!   Operators pass [`BusRelay::Custom`] with their own relay URLs. The
 //!   relay carries QUIC ciphertext. Hole-punch is iroh's path selection,
 //!   ready once a relay is configured and [`BusEndpoint::online`] returns.
+//! - **Port mapping.** iroh would probe the gateway (UPnP, NAT-PMP, PCP)
+//!   as soon as the socket binds. [`EndpointConfig::map_ports`] defaults
+//!   off. The CLI turns it on only with `network share --map-ports` or
+//!   `network request --map-ports`.
 //! - **Roster shape.** `kimetsu_roster` 1. One `mounts` list per endpoint
 //!   covers both serve and request. `signers` is a separate list, so an
 //!   endpoint key is not a pack author unless it is named there. The admin
@@ -37,6 +41,7 @@ pub mod protocol;
 mod roster;
 
 pub use endpoint::{BusEndpoint, BusRelay, BusStats, EndpointConfig, FetchedPack, PackRequest};
+pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 pub use presence::PresenceStore;
 pub use protocol::{
     ALPN, Announcement, FrameKind, LEGAL_FRAME_NAMES, discovery_user_data, parse_frame_kind,

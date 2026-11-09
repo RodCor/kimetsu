@@ -79,6 +79,9 @@ jobs:
           shared-key: ci-clippy
       - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - run: cargo clippy --workspace --all-targets --features embeddings -- -D warnings
+      # The peer network is not a default feature, so the workspace clippy
+      # above does not type-check `kimetsu network`.
+      - run: cargo clippy -p kimetsu-cli --all-targets --features network -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -111,6 +114,11 @@ jobs:
         env:
           KIMETSU_USER_BRAIN: "0"
         run: cargo test --workspace --locked -- --test-threads=1
+      - name: cargo test (network feature)
+        shell: bash
+        env:
+          KIMETSU_USER_BRAIN: "0"
+        run: cargo test -p kimetsu-cli --locked --features network -- --test-threads=1
 
   test-embeddings:
     name: test (embeddings, ubuntu)

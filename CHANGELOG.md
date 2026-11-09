@@ -11,10 +11,11 @@ breaking changes require a major bump.
 
 ### Security
 
-- Bump `rusqlite` to 0.41.1 and its bundled `libsqlite3-sys` to 0.39.1, fixing `RUSTSEC-2026-0459` (bundled SQLite in `libsqlite3-sys` 0.35.0). The workspace `rust-version` is 1.89, which `rusqlite` 0.41 requires. `kimetsu-bus` stays on 1.91.
+- Bump `rusqlite` to 0.41.1 and its bundled `libsqlite3-sys` to 0.39.1, fixing `RUSTSEC-2026-0459` (bundled SQLite in `libsqlite3-sys` 0.35.0). `rusqlite` 0.41 requires Rust 1.89. The workspace floor is 1.91 because iroh does.
 
 ### Added
 
+- `kimetsu network` in the release binary (`--features network`, included in prebuilt and npm builds). `invite`, `join <code>`, `status`, `leave`, `share`, and `request` move signed repo packs over the existing bus. The socket, mDNS, and relay stay off until `share` or `request`. UPnP / NAT-PMP stays off unless `--map-ports` is set. MCP adds `kimetsu_network_status` and `kimetsu_network_request` on that build.
 - ADR 0001 F4 host adapters. `kimetsu plugin install` writes stdio MCP config for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), and Cursor (`.cursor/mcp.json`). Grok Bot has no documented settings file, so `kimetsu plugin install grok-bot` writes an operator snippet at `.kimetsu/hosts/grok-bot.md` (command, or `--remote` URL). The MCP `instructions` field and the installed guidance state stdio grants: read `repo` and `user`, write `repo` only. `kimetsu_brain_record` stays on `repo`. `kimetsu_brain_cite` outcomes are `helped`, `noop`, and `harmed`. Context on that grant does not return `org` or `skill` text, and it does not call a generative model. Live host processes were not exercised. See [host adapters](docs/host-adapters.md).
 - `scripts/f3-hotpath-two-hosts.sh` times verified `request_pack` between two physical LAN hosts. Each machine keeps its own key. The file copied across the LAN is a public handoff. The operator page is [f3-two-physical-hosts.md](docs/operators/f3-two-physical-hosts.md). The §7 two-host figure stays pending until stdout from those two machines is recorded. Loopback and veth results are unchanged.
 - `scripts/f3-hotpath-two-hosts.sh wan-serve` and `wan-client` time the same verified `request_pack` over an operator-supplied internet/WAN UDP mapping. The advertised `ip:port` is separate from the local bind. A STUN result is a diagnostic and is not advertised. The report is labeled internet/WAN, not LAN. No WAN figure is recorded. See [f3-internet-wan.md](docs/operators/f3-internet-wan.md).
@@ -22,6 +23,7 @@ breaking changes require a major bump.
 
 ### Changed
 
+- MSRV is 1.91 for the whole workspace, matching iroh. `kimetsu-sdk` depends on `kimetsu-bus` with version 2.10.0. The release binary links that crate only with the `network` feature.
 - ADR 0001 unifies directory sync with the bus as two carriers. `kimetsu brain sync` stays the offline JSONL event-log replica: same allowlist, cursor per machine, `event_id` idempotency, no pack signature, and it does not dial the bus. The bus still carries announcements and signed `kimetsu_pack` 2 only. A sync batch is not a frame. Presenting a pack to directory import, or a sync batch to pack verify, rejects before SQL. The same `memory.superseded` predecessor and survivor do not write a second event. Two successors still record one `sync_conflicts` row. `run.*`, episodes, and telemetry stay local. Roster membership still gates the bus. The default relay stays disabled.
 - Local mounts follow ADR 0001 F0. New memory events store `repo` when the caller sends `project`; retrieval still reads stored `project` rows and labels them `repo`. `session`, `org`, and `skill` are real levels on the durable event. Similarity merge does not collapse `project` into `repo`.
 - `kimetsu_brain_cite` takes `outcome`: `helped`, `noop`, or `harmed`. An omitted outcome is `noop` and does not increase usefulness. Only `helped` may. A successful run no longer adds the +0.1 passenger bump. `harmed` removes the memory from injection until restore or supersede.

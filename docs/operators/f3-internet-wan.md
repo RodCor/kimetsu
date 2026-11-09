@@ -37,7 +37,7 @@ Nothing here changes a firewall or a router. Either step can be necessary. Neith
 
 ## Commands
 
-Build with stable Rust, 1.91 or newer (`kimetsu-bus`'s `rust-version`). Do not pass `--features embeddings`. WSL rustc 1.95 is new enough for that floor; this change was checked with `cargo +stable` on Linux, not on that WSL.
+Build with stable Rust, 1.91 or newer (the workspace MSRV; iroh requires it). Do not pass `--features embeddings`. WSL rustc 1.95 is new enough for that floor; this change was checked with `cargo +stable` on Linux, not on that WSL.
 
 On the client (the process that dials), start it first and leave it running:
 

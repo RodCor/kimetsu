@@ -18,11 +18,11 @@ use std::time::Duration;
 use crate::presence::PresenceStore;
 use crate::protocol::{self, Announcement, FrameError, FrameKind};
 use crate::roster::{RosterSupersede, SignedRoster};
+use iroh::endpoint::PortmapperConfig;
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use iroh_relay::tls::CaTlsConfig;
 use kimetsu_brain::mount::MountGrants;
 use kimetsu_brain::packs::ImportSummary;
 use kimetsu_brain::signed_pack::{self, PackManifest, PackSigner, TrustStore};
@@ -67,6 +67,9 @@ pub struct EndpointConfig {
     /// dial each other. `Some` binds this address only, and `direct_addr`
     /// advertises it as given when it is a specific address.
     pub bind_v4: Option<SocketAddrV4>,
+    /// UPnP / NAT-PMP / PCP. Off unless the operator opts in. iroh's builder
+    /// default is on, which probes the gateway as soon as the socket binds.
+    pub map_ports: bool,
 }
 
 pub struct PackRequest {
@@ -153,6 +156,13 @@ impl BusEndpoint {
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(config.secret_key.clone())
             .relay_mode(config.relay.mode())
+            .portmapper_config(if config.map_ports {
+                // `Enabled` is a non-exhaustive struct variant. `Default` is
+                // that variant, which is what iroh uses when nobody sets this.
+                PortmapperConfig::default()
+            } else {
+                PortmapperConfig::Disabled
+            })
             .user_data_for_address_lookup(
                 iroh::address_lookup::UserData::from_str(&user_data)
                     .map_err(|err| format!("discovery user-data: {err}"))?,
@@ -162,7 +172,7 @@ impl BusEndpoint {
                 builder.address_lookup(MdnsAddressLookup::builder().service_name("kimetsuv1"));
         }
         if config.insecure_relay_tls {
-            builder = builder.ca_tls_config(CaTlsConfig::insecure_skip_verify());
+            builder = enable_insecure_relay_tls(builder)?;
         }
         if let Some(addr) = config.bind_v4 {
             // Drop the default `0.0.0.0` / `[::]` sockets. A specific address
@@ -622,6 +632,23 @@ struct Dialed {
     announcements: Vec<Announcement>,
     pack: Option<Vec<u8>>,
     quic_path_rtt: Option<Duration>,
+}
+
+/// Private relay certificates. The constructor exists only when this crate
+/// is built with `insecure-relay` (its default for tests and the measurement
+/// example). Release binaries turn that feature off.
+#[cfg(feature = "insecure-relay")]
+fn enable_insecure_relay_tls(
+    builder: iroh::endpoint::Builder,
+) -> Result<iroh::endpoint::Builder, String> {
+    Ok(builder.ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify()))
+}
+
+#[cfg(not(feature = "insecure-relay"))]
+fn enable_insecure_relay_tls(
+    _builder: iroh::endpoint::Builder,
+) -> Result<iroh::endpoint::Builder, String> {
+    Err("insecure relay TLS is not compiled into this build".into())
 }
 
 fn direct_addr(endpoint: &Endpoint) -> Result<EndpointAddr, String> {

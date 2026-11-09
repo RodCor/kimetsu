@@ -62,6 +62,7 @@ async fn bind(
         presence_path: presence_path(label),
         roster_path: None,
         bind_v4,
+        map_ports: false,
     })
     .await
     .unwrap_or_else(|err| panic!("bind {label}: {err}"))
