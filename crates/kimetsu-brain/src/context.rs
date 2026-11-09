@@ -3198,12 +3198,17 @@ pub fn resolve_capsule(
 
 // ── v1.0.0: cross-encoder reranking ──────────────────────────────────────
 
-/// v1.0.0: final-stage cross-encoder rerank over already-retrieved capsules.
+/// Final-stage cross-encoder rerank over already-retrieved capsules.
 /// Reranks by `summary`, overwrites `score` with the sigmoid-normalized
-/// rerank score, sorts descending, drops capsules below `floor`, truncates
-/// to `cap` (0 = no cap). Fail-open: on a rerank error the input ordering
-/// is returned unchanged (truncated to `cap`) — a broken reranker must
-/// never lose retrieval entirely.
+/// rerank score, and sorts descending. `floor` drops capsules below it only
+/// when at least one candidate scores at or above it. Cross-encoder sigmoids
+/// are not calibrated probabilities (TinyBERT evidence sits near 0.11, under
+/// the historical 0.3 default), so a floor that would delete every candidate
+/// is ignored and the reranker only reorders. `cap` (0 = no cap) is applied
+/// after that. Capsules removed by the floor or the cap are returned
+/// separately so callers can count them in `excluded`. Fail-open: on a
+/// rerank error the input ordering is returned unchanged (truncated to
+/// `cap`) — a broken reranker must never lose retrieval entirely.
 /// v2.7: width of the evidence band below `abstain_evidence` in which the
 /// cross-encoder arbitrates instead of the raw cosine. Below
 /// `abstain_evidence - ABSTAIN_BAND_WIDTH` the retrieval hard-abstains.
@@ -3293,6 +3298,7 @@ pub fn rerank_and_arbitrate(
             // ranking policy is applied. Otherwise usefulness or supersession
             // could silently alter abstention behavior.
             let best_raw_rerank = reranked.best_raw_score.unwrap_or(0.0);
+            bundle.excluded.extend(reranked.dropped);
             bundle.capsules = reranked.capsules;
             bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
             if in_band && best_raw_rerank < abstain_rerank_floor() {
@@ -3319,8 +3325,9 @@ pub fn rerank_capsules(
 
 struct RerankOutcome {
     capsules: Vec<ContextCapsule>,
-    /// Best raw cross-encoder score among capsules that survived the ranking
-    /// floor.
+    /// Capsules removed by `cap`. The score floor does not contribute.
+    dropped: Vec<ContextCapsule>,
+    /// Best raw cross-encoder score before the output cap.
     /// `None` means the reranker did not produce a usable verdict.
     best_raw_score: Option<f32>,
 }
@@ -3345,6 +3352,7 @@ fn rerank_capsules_with_diagnostics(
     if capsules.is_empty() {
         return RerankOutcome {
             capsules,
+            dropped: Vec::new(),
             best_raw_score: None,
         };
     }
@@ -3364,11 +3372,14 @@ fn rerank_capsules_with_diagnostics(
         _ => {
             // Fail-open: preserve input order, just apply cap.
             let mut out = capsules;
-            if cap > 0 && out.len() > cap {
-                out.truncate(cap);
-            }
+            let dropped = if cap > 0 && out.len() > cap {
+                out.split_off(cap)
+            } else {
+                Vec::new()
+            };
             return RerankOutcome {
                 capsules: out,
+                dropped,
                 best_raw_score: None,
             };
         }
@@ -3396,11 +3407,23 @@ fn rerank_capsules_with_diagnostics(
 
     ranked.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
 
-    // This is the ordinary per-capsule retention floor. The separate
-    // evidence-band decision reads `best_raw_score` before the supersession
-    // policy is reapplied, because its 0.9 threshold was calibrated on the
-    // cross-encoder's sigmoid scale.
-    ranked.retain(|(_, raw_score)| *raw_score >= floor);
+    // Drop below `floor` only when that leaves at least one capsule. TinyBERT
+    // evidence sigmoids cluster near 0.11, so the historical 0.3 default
+    // otherwise deleted the whole candidate set and the bundle came back
+    // empty. Evidence-band abstention above is the calibrated empty-bundle
+    // decision; this floor is not.
+    let mut dropped = Vec::new();
+    if ranked.iter().any(|(_, raw_score)| *raw_score >= floor) {
+        let mut kept = Vec::with_capacity(ranked.len());
+        for (capsule, raw_score) in ranked {
+            if raw_score >= floor {
+                kept.push((capsule, raw_score));
+            } else {
+                dropped.push(capsule);
+            }
+        }
+        ranked = kept;
+    }
 
     // Admission evidence is independent of policy ordering and output cap.
     // A high-confidence neutral capsule displaced by a cited one still proves
@@ -3411,11 +3434,17 @@ fn rerank_capsules_with_diagnostics(
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     if cap > 0 && ranked.len() > cap {
-        ranked.truncate(cap);
+        dropped.extend(
+            ranked
+                .split_off(cap)
+                .into_iter()
+                .map(|(capsule, _)| capsule),
+        );
     }
 
     RerankOutcome {
-        capsules: ranked.into_iter().map(|(c, _)| c).collect(),
+        capsules: ranked.into_iter().map(|(capsule, _)| capsule).collect(),
+        dropped,
         best_raw_score,
     }
 }
@@ -6250,9 +6279,10 @@ mod tests {
         );
     }
 
-    /// RR-2: floor drops a zero-overlap capsule.
-    /// StubReranker scores a zero-overlap doc at 0.05.
-    /// A floor of 0.3 must drop it.
+    /// RR-2: floor drops a zero-overlap capsule when another candidate clears it.
+    /// StubReranker scores a zero-overlap doc at 0.05. A floor of 0.3 drops
+    /// that doc and keeps the overlapping one. It must not drop every capsule
+    /// when none of them clear the floor; that case is covered separately.
     #[test]
     fn rerank_capsules_floor_drops_zero_overlap() {
         use crate::embeddings::StubReranker;
@@ -6264,7 +6294,6 @@ mod tests {
         let capsules = vec![high, zero];
         let ranked = rerank_capsules(query, capsules, &StubReranker, 0.3, 0);
 
-        // The zero-overlap capsule (score 0.05) must be dropped by floor=0.3.
         assert_eq!(ranked.len(), 1, "zero-overlap capsule must be dropped");
         assert!(
             ranked[0].summary.contains("rust"),
@@ -6488,6 +6517,58 @@ mod tests {
         assert!(out.capsules.is_empty());
         assert_eq!(out.used_tokens, 0);
         assert_eq!(out.excluded.len(), 1, "rejected capsules land in excluded");
+    }
+
+    /// A retention floor below every raw score must not delete a candidate set.
+    /// TinyBERT evidence sigmoids sit near 0.11, under the 0.3 default, and the
+    /// reranker is an orderer. Abstention stays on the evidence band, not here.
+    #[test]
+    fn rerank_floor_does_not_empty_bundle_when_every_score_is_under_the_floor() {
+        let mut bundle = band_bundle(0.80);
+        bundle.capsules.push(make_capsule("second memory", 0.4));
+        bundle.capsules.push(make_capsule("third memory", 0.2));
+        let out = rerank_and_arbitrate("q", bundle, Some(&FixedReranker(0.11)), 0.0, 0.3, 0);
+        assert!(
+            !out.skipped,
+            "a non-empty candidate set must not become a skipped bundle"
+        );
+        assert_eq!(
+            out.capsules.len(),
+            3,
+            "every candidate stays when the floor is below all scores"
+        );
+        assert!(
+            out.excluded.is_empty(),
+            "nothing was dropped, so excluded stays empty"
+        );
+    }
+
+    /// A capsule under the floor is excluded, not discarded, when another
+    /// candidate clears the floor.
+    #[test]
+    fn rerank_floor_drops_are_counted_in_excluded() {
+        let mut bundle = band_bundle(0.80);
+        bundle
+            .capsules
+            .push(make_capsule("unrelated distractor", 0.2));
+        let out = rerank_and_arbitrate("q", bundle, Some(&TwoScoreReranker(0.8, 0.1)), 0.0, 0.3, 0);
+        assert_eq!(out.capsules.len(), 1);
+        assert_eq!(out.excluded.len(), 1, "floor drops must land in excluded");
+    }
+
+    /// Capsules the cap cuts off are drops and have to land in `excluded`.
+    #[test]
+    fn rerank_cap_drops_are_counted_in_excluded() {
+        let mut bundle = band_bundle(0.80);
+        bundle.capsules.push(make_capsule("second memory", 0.4));
+        bundle.capsules.push(make_capsule("third memory", 0.2));
+        let out = rerank_and_arbitrate("q", bundle, Some(&FixedReranker(0.11)), 0.0, 0.3, 2);
+        assert_eq!(out.capsules.len(), 2, "cap keeps a non-empty prefix");
+        assert_eq!(
+            out.excluded.len(),
+            1,
+            "the capsule past the cap is excluded, not discarded"
+        );
     }
 
     /// The evidence-band threshold is calibrated on raw cross-encoder scores,
