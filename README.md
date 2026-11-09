@@ -171,6 +171,20 @@ with the default reranker (up to 0.975 / 0.933 with the quality-best one), on a
 210-case dataset of real exported memories. Reproduce or re-tune on your own
 corpus with `kimetsu brain bench`.
 
+`scripts/retrieval_eval.py` reruns lexical, vector, fused, and fused+reranker
+(floor 0 and 0.3) on one binary. It accepts a LongMemEval oracle file, a LoCoMo
+export, or the bundled fixture at `scripts/fixtures/retrieval_eval.json`. The
+fixture run is a smoke measurement, not a LoCoMo or LongMemEval score. One ONNX
+thread is pinned and peak RSS is logged.
+
+```bash
+python3 scripts/retrieval_eval.py --self-test
+python3 scripts/retrieval_eval.py \
+  --dataset scripts/fixtures/retrieval_eval.json \
+  --bin target/debug/kimetsu \
+  --out retrieval-eval.jsonl
+```
+
 ---
 
 ## Command reference

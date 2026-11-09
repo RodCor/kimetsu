@@ -895,8 +895,13 @@ pub struct BrokerSection {
     /// unchanged (off).
     #[serde(default = "default_abstain_min_score")]
     pub abstain_min_score: f32,
-    /// Final cross-encoder admission floor. Scores are model-specific, not
-    /// calibrated probabilities. Zero disables this floor (not cosine gating).
+    /// Cross-encoder score floor. Scores are model-specific sigmoids, not
+    /// calibrated probabilities. Capsules under this value are dropped only
+    /// when at least one candidate scores at or above it, and those drops are
+    /// counted in `excluded_count`. If every candidate is under the floor the
+    /// reranker only reorders: the historical default 0.30 sits above typical
+    /// TinyBERT evidence scores (~0.11) and used to delete the whole set.
+    /// Zero disables the floor. Evidence-band abstention is a separate gate.
     #[serde(
         default = "default_rerank_min_score",
         deserialize_with = "deserialize_rerank_min_score"

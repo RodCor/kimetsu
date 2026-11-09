@@ -1,0 +1,86 @@
+{
+  "note": "Synthetic fixture for scripts/retrieval_eval.py. Not a LoCoMo or LongMemEval score.",
+  "questions": [
+    {
+      "id": "fix-wal",
+      "type": "single-session-user",
+      "query": "Where is the SQLite WAL checkpoint configured?",
+      "chunks": [
+        {
+          "id": "fix:t0",
+          "evidence": false,
+          "text": "The release workflow builds the lean binary and the embeddings binary as separate artifacts."
+        },
+        {
+          "id": "fix:t1",
+          "evidence": true,
+          "text": "SQLite checkpoints the write-ahead log when wal_autocheckpoint reaches 1000 pages, set in the open pragma."
+        },
+        {
+          "id": "fix:t2",
+          "evidence": false,
+          "text": "The UI theme token for the sidebar is slate-800 and is unrelated to storage."
+        },
+        {
+          "id": "fix:t3",
+          "evidence": false,
+          "text": "Continuous integration runs rustfmt, clippy, and the workspace tests."
+        }
+      ]
+    },
+    {
+      "id": "fix-port",
+      "type": "temporal-reasoning",
+      "query": "Which port did the staging listener move to after the March change?",
+      "chunks": [
+        {
+          "id": "fix:t4",
+          "evidence": false,
+          "text": "In January the staging listener bound port 8080 next to the documentation site."
+        },
+        {
+          "id": "fix:t5",
+          "evidence": true,
+          "text": "After the March change the staging listener moved from port 8080 to port 6319."
+        },
+        {
+          "id": "fix:t6",
+          "evidence": false,
+          "text": "The production listener has always used port 443 behind the load balancer."
+        },
+        {
+          "id": "fix:t7",
+          "evidence": false,
+          "text": "Developer laptops use port 3000 for the local preview server."
+        }
+      ]
+    },
+    {
+      "id": "fix-search",
+      "type": "multi-session",
+      "query": "What should an agent run before reading a whole source file?",
+      "chunks": [
+        {
+          "id": "fix:t8",
+          "evidence": false,
+          "text": "Format Rust changes with cargo fmt before opening a pull request."
+        },
+        {
+          "id": "fix:t9",
+          "evidence": true,
+          "text": "Run ripgrep for the symbol before reading an entire source file into context."
+        },
+        {
+          "id": "fix:t10",
+          "evidence": false,
+          "text": "The logo file lives under the site assets directory."
+        },
+        {
+          "id": "fix:t11",
+          "evidence": false,
+          "text": "Pack signatures use Ed25519 over a BLAKE3 digest of the canonical body."
+        }
+      ]
+    }
+  ]
+}

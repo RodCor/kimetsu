@@ -812,8 +812,8 @@ fn record_context_delivery(
 /// cap. Mirrors `RERANK_POOL` in `kimetsu-cli/src/embed_daemon/server.rs`.
 pub const REMOTE_RERANK_POOL: usize = kimetsu_brain::serving::RERANK_POOL;
 
-/// Sigmoid-score floor for the remote reranker — capsules scored below this
-/// are noise. Mirrors `RERANK_FLOOR` in `kimetsu-cli/src/embed_daemon/server.rs`.
+/// Historical sigmoid default mirrored from serving. The floor drops
+/// capsules only when doing so would leave at least one.
 pub const REMOTE_RERANK_FLOOR: f32 = kimetsu_brain::serving::RERANK_FLOOR;
 
 /// Transport-agnostic body of the `kimetsu_brain_context` tool.
@@ -3264,7 +3264,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_rerank_cutoff_controls_actual_mcp_admission() {
+    fn configured_rerank_floor_does_not_empty_mcp_context() {
         struct ModerateScore;
         impl kimetsu_brain::embeddings::Reranker for ModerateScore {
             fn model_id(&self) -> &str {
@@ -3292,7 +3292,7 @@ mod tests {
             let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
             let original = fs::read_to_string(&paths.project_toml).unwrap();
             let args = json!({"query":"ripgrep search files","include_ambient":false,"budget_tokens":6000});
-            for (floor, count) in [(0.75, 0), (0.0, 1)] {
+            for floor in [0.75, 0.0] {
                 let mut value: toml::Value = toml::from_str(&original).unwrap();
                 value["broker"]
                     .as_table_mut()
@@ -3301,9 +3301,10 @@ mod tests {
                 fs::write(&paths.project_toml, toml::to_string(&value).unwrap()).unwrap();
                 let result = brain_context_tool(&root, &args, Some(&ModerateScore)).unwrap();
                 assert_eq!(
-                    result["capsule_count"], count,
-                    "configured floor {floor}: {result}"
+                    result["capsule_count"], 1,
+                    "floor {floor} must not empty a candidate bundle: {result}"
                 );
+                assert_eq!(result["skipped"], false, "floor {floor}: {result}");
             }
             fs::remove_dir_all(root).unwrap();
         });

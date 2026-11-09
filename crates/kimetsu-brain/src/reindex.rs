@@ -158,8 +158,10 @@ pub fn reindex_all_with_embedder(
     })
 }
 
-/// Chunk size for batch embedding during reindex. Tuned to keep the
-/// ONNX input tensor at a manageable size while maximising throughput.
+/// How many rows to hand `embed_batch` before flushing SQL updates.
+/// The ONNX batch inside `embed_batch` is capped separately at
+/// [`crate::embeddings::EMBED_BATCH_LIMIT`] so this chunk cannot become
+/// one 256×512 token tensor.
 const REINDEX_CHUNK: usize = 256;
 
 /// Flush a pending `(memory_id, text)` chunk through `embed_batch`,

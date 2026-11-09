@@ -11,7 +11,10 @@ use kimetsu_core::KimetsuResult;
 use serde_json::json;
 
 pub const RERANK_POOL: usize = 6;
-/// A score threshold, not a calibrated relevance probability.
+/// Historical default for `broker.rerank_min_score`. Applied only when at
+/// least one candidate scores at or above it, so a TinyBERT sigmoid cluster
+/// near 0.11 cannot delete a whole candidate set. The cap still limits how
+/// many capsules are served.
 pub const RERANK_FLOOR: f32 = 0.30;
 pub const DEFAULT_BUDGET: u32 = 6000;
 pub const DEFAULT_CAP: usize = 3;
@@ -118,8 +121,8 @@ impl ServingPolicy {
                 bundle.known_fact_conflicts.dedup();
             }
         }
-        if self.cap > 0 {
-            bundle.capsules.truncate(self.cap);
+        if self.cap > 0 && bundle.capsules.len() > self.cap {
+            bundle.excluded.extend(bundle.capsules.split_off(self.cap));
         }
         bundle.used_tokens = bundle.capsules.iter().map(|c| c.token_estimate).sum();
         if bundle.capsules.is_empty() {
@@ -297,7 +300,7 @@ impl ServingPolicy {
 mod tests {
     use super::*;
     use crate::{
-        context::ContextCapsule,
+        context::{ContextBundle, ContextCapsule},
         embeddings::{StubEmbedder, StubReranker},
         project,
     };
@@ -702,5 +705,79 @@ mod conflict_carry_tests {
             delivery.payload["answerability"]["conflicting"],
             serde_json::json!(["port"])
         );
+    }
+
+    struct UnderFloor;
+    impl Reranker for UnderFloor {
+        fn rerank(
+            &self,
+            _: &str,
+            docs: &[&str],
+        ) -> Result<Vec<f32>, crate::embeddings::EmbedderError> {
+            Ok(vec![0.11; docs.len()])
+        }
+        fn model_id(&self) -> &str {
+            "under-floor"
+        }
+    }
+
+    fn low_score_bundle() -> ContextBundle {
+        let capsule = |summary: &str| ContextCapsule {
+            id: summary.into(),
+            kind: "memory".into(),
+            summary: summary.into(),
+            token_estimate: 8,
+            expansion_handle: format!("memory:{summary}"),
+            provenance: vec![],
+            confidence: 1.0,
+            freshness: 1.0,
+            relevance: 1.0,
+            scope_weight: 1.0,
+            score: 0.5,
+            superseded_hint: false,
+            rerank_policy_tier: 0,
+            claim_revision: None,
+            facts: vec![],
+            rerank_usefulness: None,
+            rerank_trust: None,
+        };
+        ContextBundle {
+            stage: "localization".into(),
+            budget_tokens: 6000,
+            used_tokens: 24,
+            capsules: vec![
+                capsule("alpha evidence"),
+                capsule("beta evidence"),
+                capsule("gamma evidence"),
+            ],
+            excluded: vec![],
+            skipped: false,
+            top_score: 0.5,
+            top_abs_evidence: 0.8,
+            evidence_coverage: 1.0,
+            uncovered_terms: vec![],
+            chronological: false,
+            known_fact_conflicts: vec![],
+        }
+    }
+
+    /// Serving JSON: every candidate under the floor still yields capsules,
+    /// and a cap drop shows up in `excluded_count`.
+    #[test]
+    fn serving_rerank_floor_keeps_capsules_and_counts_drops() {
+        let policy = ServingPolicy {
+            cap: 2,
+            budget: 6000,
+            rerank_floor: 0.3,
+            ..Default::default()
+        };
+        let bundle = policy.arbitrate("q", low_score_bundle(), Some(&UnderFloor), 0.0);
+        assert!(!bundle.skipped);
+        assert_eq!(bundle.capsules.len(), 2);
+        assert_eq!(bundle.excluded.len(), 1);
+        let delivery = policy.render(bundle, false, EVAL_EXPOSURE_ID);
+        assert_eq!(delivery.payload["skipped"], json!(false));
+        assert_eq!(delivery.payload["capsule_count"], json!(2));
+        assert_eq!(delivery.payload["excluded_count"], json!(1));
     }
 }

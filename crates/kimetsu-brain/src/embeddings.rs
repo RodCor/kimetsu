@@ -766,6 +766,43 @@ pub fn pick_builtin_model_from_env() -> &'static str {
     resolve_embedder_id(None)
 }
 
+/// Largest ONNX batch passed to fastembed.
+///
+/// fastembed's default is 256 and each batch is padded to its longest
+/// sequence, capped at 512 tokens. A 256×512 batch peaked near 10 GiB and
+/// is OOM-killed on 15 GiB machines. 16×512 was measured at about 677 MiB.
+/// Output order matches the input. Per-text vectors match `embed` one row
+/// at a time when the model masks padding.
+pub const EMBED_BATCH_LIMIT: usize = 16;
+
+/// Run `embed_chunk` on successive slices of at most `limit` texts.
+///
+/// The concatenated vectors are in input order. An empty input is an empty
+/// output and does not call `embed_chunk`.
+pub fn embed_in_bounded_batches<T>(
+    texts: &[&str],
+    limit: usize,
+    mut embed_chunk: impl FnMut(&[&str]) -> Result<Vec<T>, EmbedderError>,
+) -> Result<Vec<T>, EmbedderError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.max(1);
+    let mut out = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(limit) {
+        let part = embed_chunk(chunk)?;
+        if part.len() != chunk.len() {
+            return Err(EmbedderError::EmbedFailed(format!(
+                "embed chunk returned {} vectors for {} texts",
+                part.len(),
+                chunk.len()
+            )));
+        }
+        out.extend(part);
+    }
+    Ok(out)
+}
+
 // v0.4.3: real fastembed-backed embedder. Lives behind the
 // `embeddings` Cargo feature so the default build skips the
 // ~50-transitive-crate dep tree (ONNX runtime, tokenizers, etc).
@@ -952,32 +989,36 @@ mod fastembed_backend {
         }
 
         fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
-            if texts.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut guard = self
-                .engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let out = guard
-                .embed(texts, None)
-                .map_err(|e| EmbedderError::EmbedFailed(format!("fastembed embed_batch: {e}")))?;
-            if out.len() != texts.len() {
-                return Err(EmbedderError::EmbedFailed(format!(
-                    "fastembed returned {} vectors for {} texts",
-                    out.len(),
-                    texts.len()
-                )));
-            }
-            for v in &out {
-                if v.len() != self.dim {
-                    return Err(EmbedderError::DimMismatch {
-                        expected: self.dim,
-                        got: v.len(),
-                    });
+            let dim = self.dim;
+            super::embed_in_bounded_batches(texts, super::EMBED_BATCH_LIMIT, |chunk| {
+                let mut guard = self
+                    .engine
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // `Some(limit)` caps fastembed's own internal batch as well.
+                // `None` is 256 and pads every row in that batch to 512 tokens.
+                let out = guard
+                    .embed(chunk, Some(super::EMBED_BATCH_LIMIT))
+                    .map_err(|e| {
+                        EmbedderError::EmbedFailed(format!("fastembed embed_batch: {e}"))
+                    })?;
+                if out.len() != chunk.len() {
+                    return Err(EmbedderError::EmbedFailed(format!(
+                        "fastembed returned {} vectors for {} texts",
+                        out.len(),
+                        chunk.len()
+                    )));
                 }
-            }
-            Ok(out)
+                for v in &out {
+                    if v.len() != dim {
+                        return Err(EmbedderError::DimMismatch {
+                            expected: dim,
+                            got: v.len(),
+                        });
+                    }
+                }
+                Ok(out)
+            })
         }
     }
 
@@ -1531,6 +1572,27 @@ mod tests {
         assert!(result.is_empty(), "expected empty Vec, got {result:?}");
     }
 
+    /// Reindex used to hand fastembed 256 texts. The helper must split that
+    /// into batches of at most [`EMBED_BATCH_LIMIT`] and keep input order.
+    #[test]
+    fn embed_batch_chunks_stay_within_limit_and_keep_order() {
+        let texts: Vec<String> = (0..40).map(|i| format!("row-{i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut seen = Vec::new();
+        let out = embed_in_bounded_batches(&refs, EMBED_BATCH_LIMIT, |chunk| {
+            assert!(
+                chunk.len() <= EMBED_BATCH_LIMIT,
+                "chunk of {} exceeds limit {EMBED_BATCH_LIMIT}",
+                chunk.len()
+            );
+            seen.push(chunk.len());
+            Ok(chunk.iter().map(|text| (*text).to_string()).collect())
+        })
+        .expect("bounded embed");
+        assert_eq!(seen, vec![16, 16, 8]);
+        assert_eq!(out, texts);
+    }
+
     /// N texts → N vectors, each of length `dim()`.
     #[test]
     fn embed_batch_length_matches_input() {
@@ -1796,5 +1858,39 @@ mod correction_race_tests {
             )
             .unwrap();
         assert_eq!(decode_embedding(&blob, Some(2)).unwrap(), vec![0.0, 1.0]);
+    }
+
+    /// More texts than [`EMBED_BATCH_LIMIT`] must still match one-row embed.
+    /// This is the batch-invariance check for the bounded fastembed path.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn fastembed_bounded_batches_match_per_row_vectors() {
+        let embedder = fastembed_backend::FastembedEmbedder::try_open("bge-small-en-v1.5")
+            .expect("load bge-small-en-v1.5");
+        let texts: Vec<String> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("short row {i}")
+                } else {
+                    format!("longer retrieval passage {i} {}", "token ".repeat(40))
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let batched = embedder.embed_batch(&refs).expect("bounded batch");
+        assert!(
+            texts.len() > EMBED_BATCH_LIMIT,
+            "fixture must cross the batch limit"
+        );
+        for (i, text) in texts.iter().enumerate() {
+            let single = embedder.embed(text).expect("per-row embed");
+            assert_eq!(batched[i].len(), single.len(), "dim at {i}");
+            for (got, want) in batched[i].iter().zip(single.iter()) {
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "row {i} drifted: batch {got} vs single {want}"
+                );
+            }
+        }
     }
 }
