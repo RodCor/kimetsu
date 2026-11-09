@@ -351,14 +351,10 @@ fn resolve_ask_provider(workspace: &Path) -> Option<(Box<dyn ModelProvider>, Str
     // 1. Workspace config.
     if let Ok(paths) = ProjectPaths::discover(workspace)
         && let Ok(config) = project::load_config(&paths)
+        && let Some(cm) = config.cheap_model()
+        && let Some(pair) = build_provider(&cm, &paths.repo_root, config.model.request_timeout_secs)
     {
-        if let Some(cm) = config.cheap_model() {
-            if let Some(pair) =
-                build_provider(&cm, &paths.repo_root, config.model.request_timeout_secs)
-            {
-                return Some(pair);
-            }
-        }
+        return Some(pair);
     }
     // 2. Global ~/.kimetsu config.
     let global_dir = if user_brain_enabled() {
@@ -369,12 +365,10 @@ fn resolve_ask_provider(workspace: &Path) -> Option<(Box<dyn ModelProvider>, Str
     if let Some(dir) = global_dir
         && let Ok(text) = std::fs::read_to_string(dir.join("project.toml"))
         && let Ok(config) = ProjectConfig::from_toml(&text)
+        && let Some(cm) = config.cheap_model()
+        && let Some(pair) = build_provider(&cm, &dir, config.model.request_timeout_secs)
     {
-        if let Some(cm) = config.cheap_model() {
-            if let Some(pair) = build_provider(&cm, &dir, config.model.request_timeout_secs) {
-                return Some(pair);
-            }
-        }
+        return Some(pair);
     }
     None
 }

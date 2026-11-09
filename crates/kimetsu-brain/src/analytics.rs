@@ -643,10 +643,10 @@ pub fn compute_insights(start: &Path, opts: InsightsOptions) -> KimetsuResult<In
                 let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
                 if let Some(ids) = payload.get("memory_ids").and_then(|v| v.as_array()) {
                     for id in ids {
-                        if let Some(s) = id.as_str() {
-                            if !s.is_empty() {
-                                retrieved_set.insert(s.to_string());
-                            }
+                        if let Some(s) = id.as_str()
+                            && !s.is_empty()
+                        {
+                            retrieved_set.insert(s.to_string());
                         }
                     }
                 }

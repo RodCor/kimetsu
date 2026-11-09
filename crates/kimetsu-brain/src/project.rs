@@ -46,12 +46,12 @@ fn max_corpus_cosine(conn: &Connection, query_vec: &[f32]) -> f32 {
     };
     let mut max_cos: f32 = 0.0;
     for row in rows.flatten() {
-        if let Ok(vec) = embeddings::decode_embedding(&row, None) {
-            if vec.len() == query_vec.len() {
-                let cos = cosine_sim(query_vec, &vec);
-                if cos > max_cos {
-                    max_cos = cos;
-                }
+        if let Ok(vec) = embeddings::decode_embedding(&row, None)
+            && vec.len() == query_vec.len()
+        {
+            let cos = cosine_sim(query_vec, &vec);
+            if cos > max_cos {
+                max_cos = cos;
             }
         }
     }
@@ -951,10 +951,10 @@ fn add_memory_inner(
         }),
     );
     let mut provenance = crate::packs::build_provenance(run_id, text);
-    if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
-        if let Some(obj) = provenance.as_object_mut() {
-            obj.insert("session_id".into(), serde_json::json!(session_id));
-        }
+    if let Some(session_id) = session_id.filter(|id| !id.is_empty())
+        && let Some(obj) = provenance.as_object_mut()
+    {
+        obj.insert("session_id".into(), serde_json::json!(session_id));
     }
     let accepted = Event::new(
         run_id,
@@ -1008,20 +1008,21 @@ fn add_memory_inner(
     // This is NOT rebuild-safe (rarity depends on the corpus snapshot at write
     // time), which is acceptable: on rebuild, the kind-weight from the event
     // is used and the rarity bonus is 0.
-    if importance_enabled && !embedder.is_noop() {
-        if let Some(vec) = embedding_vec.as_deref() {
-            let rarity_bonus = {
-                let max_cos = max_corpus_cosine(conn, vec);
-                if max_cos < 0.5 { 0.1_f32 } else { 0.0 }
-            };
-            if rarity_bonus > 0.0 {
-                let full_score = (initial_kind_weight + rarity_bonus).min(0.5);
-                conn.execute(
-                    "UPDATE memories SET usefulness_score = ?2 WHERE memory_id = ?1",
-                    rusqlite::params![memory_id, full_score],
-                )
-                .ok(); // best-effort
-            }
+    if importance_enabled
+        && !embedder.is_noop()
+        && let Some(vec) = embedding_vec.as_deref()
+    {
+        let rarity_bonus = {
+            let max_cos = max_corpus_cosine(conn, vec);
+            if max_cos < 0.5 { 0.1_f32 } else { 0.0 }
+        };
+        if rarity_bonus > 0.0 {
+            let full_score = (initial_kind_weight + rarity_bonus).min(0.5);
+            conn.execute(
+                "UPDATE memories SET usefulness_score = ?2 WHERE memory_id = ?1",
+                rusqlite::params![memory_id, full_score],
+            )
+            .ok(); // best-effort
         }
     }
 

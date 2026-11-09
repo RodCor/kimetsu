@@ -327,10 +327,10 @@ pub(crate) fn find_potential_conflicts_with_vec(
                     continue;
                 }
                 // Skip: the new memory itself.
-                if let Some(excl) = exclude_id {
-                    if existing_id == excl {
-                        continue;
-                    }
+                if let Some(excl) = exclude_id
+                    && existing_id == excl
+                {
+                    continue;
                 }
                 let Ok(existing_vec) = decode_embedding(&bytes, Some(query_vec.len())) else {
                     continue;
@@ -411,10 +411,10 @@ fn find_potential_conflicts_sql(
         if normalized == new_normalized {
             continue;
         }
-        if let Some(excl) = exclude_id {
-            if existing_id == excl {
-                continue;
-            }
+        if let Some(excl) = exclude_id
+            && existing_id == excl
+        {
+            continue;
         }
         let Ok(existing_vec) = decode_embedding(&bytes, Some(query_vec.len())) else {
             continue;

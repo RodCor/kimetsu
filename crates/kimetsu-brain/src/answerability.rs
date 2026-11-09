@@ -173,10 +173,11 @@ pub fn assess(query: &str, text: &str) -> FactEvidence {
     }
     let normalized = folded(text);
     let mut body = normalized.as_str();
-    if let Some((prefix, rest)) = body.split_once(" - ") {
-        if prefix.contains(':') && !prefix.contains(' ') {
-            body = rest;
-        }
+    if let Some((prefix, rest)) = body.split_once(" - ")
+        && prefix.contains(':')
+        && !prefix.contains(' ')
+    {
+        body = rest;
     }
     while body.starts_with('[') {
         if let Some((_, rest)) = body.split_once(']') {

@@ -332,10 +332,10 @@ async fn dispatch_request(
     match res {
         Ok(Ok(value)) => {
             // Slice C: count successful memory-write tool calls (aggregate).
-            if let Some(name) = &tool_name {
-                if crate::metrics::is_write_tool(name) {
-                    state.metrics.record_write();
-                }
+            if let Some(name) = &tool_name
+                && crate::metrics::is_write_tool(name)
+            {
+                state.metrics.record_write();
             }
             (Outcome::Ok, jsonrpc_ok(id, value, session))
         }

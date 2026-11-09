@@ -386,12 +386,11 @@ fn derive_skill_meta(
     memory_texts: &[(String, String)],
 ) -> (String, String) {
     // Try to extract name/description from draft frontmatter first.
-    if let Some(draft) = draft {
-        if let Some((name, desc)) = extract_frontmatter_meta(draft) {
-            if !name.is_empty() {
-                return (name, desc);
-            }
-        }
+    if let Some(draft) = draft
+        && let Some((name, desc)) = extract_frontmatter_meta(draft)
+        && !name.is_empty()
+    {
+        return (name, desc);
     }
 
     // Fall back: derive from the memory kind + text snippet.

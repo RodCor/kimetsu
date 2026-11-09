@@ -69,12 +69,10 @@ pub(crate) fn brain_eval_inner(args: EvalArgs) -> KimetsuResult<()> {
         }
     }
     for memory in &fixture.memories {
-        if let Some(survivor) = &memory.superseded_by_key {
-            if !all_keys.contains(survivor.as_str()) {
-                return Err(
-                    format!("fixture references missing superseding key {survivor:?}").into(),
-                );
-            }
+        if let Some(survivor) = &memory.superseded_by_key
+            && !all_keys.contains(survivor.as_str())
+        {
+            return Err(format!("fixture references missing superseding key {survivor:?}").into());
         }
     }
 
@@ -1795,27 +1793,27 @@ pub(crate) fn brain_bench_single(args: BrainBenchArgs) -> KimetsuResult<()> {
                 // because the bench seeder just needs the retrieval exclusion; it
                 // doesn't need the full edge + citation reassignment that the
                 // consolidation path does.
-                if let Some(ref survivor_key) = mem.superseded_by_key {
-                    if let Some(survivor_id) = key_to_id.get(survivor_key) {
-                        conn.execute(
-                            "UPDATE memories SET superseded_by = ?2 WHERE memory_id = ?1",
-                            rusqlite::params![&memory_id, survivor_id],
+                if let Some(ref survivor_key) = mem.superseded_by_key
+                    && let Some(survivor_id) = key_to_id.get(survivor_key)
+                {
+                    conn.execute(
+                        "UPDATE memories SET superseded_by = ?2 WHERE memory_id = ?1",
+                        rusqlite::params![&memory_id, survivor_id],
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "stamp superseded_by {:?} → {:?}: {e}",
+                            mem.key, survivor_key
                         )
-                        .map_err(|e| {
-                            format!(
-                                "stamp superseded_by {:?} → {:?}: {e}",
-                                mem.key, survivor_key
-                            )
-                        })?;
-                        // Also remove from FTS so FTS path doesn't surface it.
-                        conn.execute(
-                            "DELETE FROM memories_fts WHERE memory_id = ?1",
-                            rusqlite::params![&memory_id],
-                        )
-                        .map_err(|e| {
-                            format!("delete memories_fts for superseded {:?}: {e}", mem.key)
-                        })?;
-                    }
+                    })?;
+                    // Also remove from FTS so FTS path doesn't surface it.
+                    conn.execute(
+                        "DELETE FROM memories_fts WHERE memory_id = ?1",
+                        rusqlite::params![&memory_id],
+                    )
+                    .map_err(|e| {
+                        format!("delete memories_fts for superseded {:?}: {e}", mem.key)
+                    })?;
                 }
             }
         }

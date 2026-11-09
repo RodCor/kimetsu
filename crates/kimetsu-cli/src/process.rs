@@ -114,10 +114,10 @@ pub fn extract_workspace(command_line: &str) -> Option<String> {
     let tokens = tokenize_cmdline(command_line);
     let mut iter = tokens.iter().peekable();
     while let Some(tok) = iter.next() {
-        if tok == "--workspace" || tok == "-workspace" {
-            if let Some(next) = iter.next() {
-                return Some(next.trim_matches('"').to_string());
-            }
+        if (tok == "--workspace" || tok == "-workspace")
+            && let Some(next) = iter.next()
+        {
+            return Some(next.trim_matches('"').to_string());
         }
     }
     None
