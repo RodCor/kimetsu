@@ -371,11 +371,11 @@ pub(crate) fn run_with(
     }
 
     // Prune old backups (best-effort; swallows errors).
-    if let Some(ref bp) = backup_path {
-        if let Some(parent) = bp.parent() {
-            let db_ref = db_file_path(conn).unwrap_or_else(|| parent.join("brain.db"));
-            prune_backups(&db_ref, 3);
-        }
+    if let Some(ref bp) = backup_path
+        && let Some(parent) = bp.parent()
+    {
+        let db_ref = db_file_path(conn).unwrap_or_else(|| parent.join("brain.db"));
+        prune_backups(&db_ref, 3);
     }
 
     // Emit a structured trace event so operators using RUST_LOG can see

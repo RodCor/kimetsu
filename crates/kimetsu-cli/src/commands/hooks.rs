@@ -354,15 +354,15 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         visible.summary = text;
         rendered_fact_capsules.push(visible);
     }
-    if explicit_fact_guard {
-        if let Some(notice) = kimetsu_brain::fact_query::notice_with_conflicts(
+    if explicit_fact_guard
+        && let Some(notice) = kimetsu_brain::fact_query::notice_with_conflicts(
             &request.query,
             &rendered_fact_capsules,
             &known_fact_conflicts,
-        ) {
-            additional_context.push('\n');
-            additional_context.push_str(&notice);
-        }
+        )
+    {
+        additional_context.push('\n');
+        additional_context.push_str(&notice);
     }
 
     // Cap, dedupe and compression may remove the text that justified admission.
@@ -431,10 +431,10 @@ pub(crate) fn brain_context_hook(args: ContextHookArgs) -> KimetsuResult<()> {
         );
         state.warm_started_unix = proactive_state::now_unix();
     }
-    if session_dedupe || warm_start_block.is_some() {
-        if let Some(ref path) = state_path {
-            proactive_state::save(path, &state);
-        }
+    if (session_dedupe || warm_start_block.is_some())
+        && let Some(ref path) = state_path
+    {
+        proactive_state::save(path, &state);
     }
 
     Ok(())

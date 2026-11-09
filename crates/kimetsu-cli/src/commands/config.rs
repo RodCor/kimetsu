@@ -376,10 +376,11 @@ pub(crate) fn infer_scalar(input: &str) -> toml::Value {
     }
     // Integer: optional leading `-`, then all digits.
     let digit_part = input.strip_prefix('-').unwrap_or(input);
-    if !digit_part.is_empty() && digit_part.bytes().all(|b| b.is_ascii_digit()) {
-        if let Ok(n) = input.parse::<i64>() {
-            return toml::Value::Integer(n);
-        }
+    if !digit_part.is_empty()
+        && digit_part.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(n) = input.parse::<i64>()
+    {
+        return toml::Value::Integer(n);
     }
     if let Ok(f) = input.parse::<f64>() {
         // Distinguish "1.0" (float) from "1" (already caught as integer above).

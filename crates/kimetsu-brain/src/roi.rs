@@ -762,18 +762,18 @@ fn session_served_stats(
     let served_count = served_payloads.len() as u64;
 
     // Parse timestamps from the events table for the served events.
-    if let Some(sid) = session_id {
-        if served_count > 0 {
-            let ts_row: (Option<String>, Option<String>) = conn.query_row(
-                "SELECT MIN(ts), MAX(ts) FROM events \
+    if let Some(sid) = session_id
+        && served_count > 0
+    {
+        let ts_row: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT MIN(ts), MAX(ts) FROM events \
                  WHERE kind = 'context.served' \
                    AND json_extract(payload_json, '$.session_id') = ?1",
-                params![sid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            earliest = ts_row.0;
-            latest = ts_row.1;
-        }
+            params![sid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        earliest = ts_row.0;
+        latest = ts_row.1;
     }
 
     // Injected tokens: sum from context.injected events in [earliest, latest].

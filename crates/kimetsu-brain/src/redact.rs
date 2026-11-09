@@ -213,7 +213,7 @@ fn luhn_valid(digits: &str) -> bool {
         sum += d;
         double = !double;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// PII pattern set (kept high-precision to avoid scrubbing legit technical text).

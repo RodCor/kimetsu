@@ -611,35 +611,31 @@ fn resolve_distiller_with(
     // in priority order, providing back-compat for existing configs.
     if let Ok(paths) = ProjectPaths::discover(workspace)
         && let Ok(config) = project::load_config(&paths)
+        && let Some(cm) = config.cheap_model()
+        && let Some(resolved) = resolve_from_cheap_model(
+            &cm,
+            &paths.repo_root,
+            config.model.request_timeout_secs,
+            MemoryScope::Project,
+            paths.repo_root.clone(),
+        )
     {
-        if let Some(cm) = config.cheap_model() {
-            if let Some(resolved) = resolve_from_cheap_model(
-                &cm,
-                &paths.repo_root,
-                config.model.request_timeout_secs,
-                MemoryScope::Project,
-                paths.repo_root.clone(),
-            ) {
-                return Some(resolved);
-            }
-        }
+        return Some(resolved);
     }
     // 2. Global cheap model (GlobalUser scope).
     if let Some(dir) = global_dir
         && let Ok(text) = std::fs::read_to_string(dir.join("project.toml"))
         && let Ok(config) = ProjectConfig::from_toml(&text)
+        && let Some(cm) = config.cheap_model()
+        && let Some(resolved) = resolve_from_cheap_model(
+            &cm,
+            &dir,
+            config.model.request_timeout_secs,
+            MemoryScope::GlobalUser,
+            workspace.to_path_buf(),
+        )
     {
-        if let Some(cm) = config.cheap_model() {
-            if let Some(resolved) = resolve_from_cheap_model(
-                &cm,
-                &dir,
-                config.model.request_timeout_secs,
-                MemoryScope::GlobalUser,
-                workspace.to_path_buf(),
-            ) {
-                return Some(resolved);
-            }
-        }
+        return Some(resolved);
     }
     None
 }

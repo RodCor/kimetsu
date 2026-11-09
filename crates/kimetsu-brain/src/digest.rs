@@ -97,12 +97,11 @@ fn build_or_load_digest_inner(
     }
 
     // 4. Reuse the disk cache only as a reason to skip an unchanged write.
-    if !force_rebuild {
-        if let Some(cached) = try_load_cache(&cache_path, &meta_path, hash) {
-            if cached == digest_text {
-                return Ok(Some(digest_text));
-            }
-        }
+    if !force_rebuild
+        && let Some(cached) = try_load_cache(&cache_path, &meta_path, hash)
+        && cached == digest_text
+    {
+        return Ok(Some(digest_text));
     }
 
     // 6. Write cache atomically.

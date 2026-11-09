@@ -1273,7 +1273,7 @@ pub fn encode_embedding(vec: &[f32]) -> Vec<u8> {
 /// Decode a BLOB back into a float vector. Optionally validates the
 /// expected dimension; pass `None` to accept any length.
 pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuResult<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(format!("embedding blob length {} not a multiple of 4", bytes.len()).into());
     }
     let dim = bytes.len() / 4;
@@ -1283,7 +1283,7 @@ pub fn decode_embedding(bytes: &[u8], expected_dim: Option<usize>) -> KimetsuRes
         return Err(format!("embedding blob dim {dim} does not match expected {expected}").into());
     }
     let mut out = Vec::with_capacity(dim);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let mut buf = [0u8; 4];
         buf.copy_from_slice(chunk);
         out.push(f32::from_le_bytes(buf));

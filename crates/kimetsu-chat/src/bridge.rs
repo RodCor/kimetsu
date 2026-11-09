@@ -1871,20 +1871,18 @@ fn uninstall_mcp_config(path: &Path, only_mcp_servers: bool) -> Result<bool, Str
 
     let mut changed = false;
 
-    if !only_mcp_servers {
-        if let Some(servers) = root_obj.get_mut("servers").and_then(|v| v.as_object_mut()) {
-            if servers.remove("kimetsu").is_some() {
-                changed = true;
-            }
-        }
+    if !only_mcp_servers
+        && let Some(servers) = root_obj.get_mut("servers").and_then(|v| v.as_object_mut())
+        && servers.remove("kimetsu").is_some()
+    {
+        changed = true;
     }
     if let Some(mcp_servers) = root_obj
         .get_mut("mcpServers")
         .and_then(|v| v.as_object_mut())
+        && mcp_servers.remove("kimetsu").is_some()
     {
-        if mcp_servers.remove("kimetsu").is_some() {
-            changed = true;
-        }
+        changed = true;
     }
 
     if !changed {

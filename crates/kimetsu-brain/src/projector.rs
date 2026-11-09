@@ -742,22 +742,22 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
             // have no safely attributable claim, including the baseline claim.
             continue;
         }
-        if let ClaimExposure::Bound(exposed_revision) = exposure {
-            if exposed_revision != claim_revision_at(conn, memory_id, None)? {
-                // The run saw the old proposition. Its delayed outcome belongs
-                // to that retained revision, even if correction removed the
-                // old citation projection in the meantime.
-                let was_cited: bool = conn.query_row(
+        if let ClaimExposure::Bound(exposed_revision) = exposure
+            && exposed_revision != claim_revision_at(conn, memory_id, None)?
+        {
+            // The run saw the old proposition. Its delayed outcome belongs
+            // to that retained revision, even if correction removed the
+            // old citation projection in the meantime.
+            let was_cited: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='memory.cited' AND json_extract(payload_json,'$.memory_id')=?2
                      AND (json_extract(payload_json,'$.revision_event_id') IS NULL OR json_extract(payload_json,'$.revision_event_id')=?3)
                      AND rowid <= (SELECT rowid FROM events WHERE event_id=?4))",
                     params![run_id,memory_id,exposed_revision,event.event_id.to_string()], |r| r.get(0))?;
-                let delta = if was_cited { strong } else { weak };
-                conn.execute("UPDATE memory_revisions SET use_count=use_count+1,usefulness_score=usefulness_score+?2,
+            let delta = if was_cited { strong } else { weak };
+            conn.execute("UPDATE memory_revisions SET use_count=use_count+1,usefulness_score=usefulness_score+?2,
                     confidence=CASE WHEN ?3 THEN MAX(0.1,MIN(0.99,confidence+?4*(?5-confidence))) ELSE confidence END
                     WHERE event_id=?1 AND memory_id=?6", params![exposed_revision,delta,was_cited,CONF_ALPHA,conf_target.unwrap_or(1.0),memory_id])?;
-                continue;
-            }
+            continue;
         }
         let is_cited = cited.contains(memory_id);
         let cite_outcome = cite_outcome_for(conn, &run_id, memory_id)?;
@@ -813,22 +813,23 @@ fn apply_memory_usefulness_for_run(conn: &Connection, event: &Event) -> KimetsuR
         // not promote a noop cite or a silent passenger.
         // Failure still calibrates cited memories toward 0. Success
         // calibration for helped already ran when the cite was projected.
-        if is_cited && event.kind == "run.failed" {
-            if let Some(target) = conf_target {
-                // Read current confidence, apply Bayesian-ish posterior, clamp.
-                let old_conf: f64 = conn
-                    .query_row(
-                        "SELECT confidence FROM memories WHERE memory_id = ?1",
-                        params![memory_id],
-                        |row| row.get::<_, f64>(0),
-                    )
-                    .unwrap_or(1.0);
-                let new_conf = (old_conf + CONF_ALPHA * (target - old_conf)).clamp(0.1, 0.99);
-                conn.execute(
-                    "UPDATE memories SET confidence = ?2 WHERE memory_id = ?1",
-                    params![memory_id, new_conf],
-                )?;
-            }
+        if is_cited
+            && event.kind == "run.failed"
+            && let Some(target) = conf_target
+        {
+            // Read current confidence, apply Bayesian-ish posterior, clamp.
+            let old_conf: f64 = conn
+                .query_row(
+                    "SELECT confidence FROM memories WHERE memory_id = ?1",
+                    params![memory_id],
+                    |row| row.get::<_, f64>(0),
+                )
+                .unwrap_or(1.0);
+            let new_conf = (old_conf + CONF_ALPHA * (target - old_conf)).clamp(0.1, 0.99);
+            conn.execute(
+                "UPDATE memories SET confidence = ?2 WHERE memory_id = ?1",
+                params![memory_id, new_conf],
+            )?;
         }
     }
     Ok(())
@@ -1272,25 +1273,25 @@ fn apply_memory_superseded(conn: &Connection, event: &Event) -> KimetsuResult<()
         )
         .optional()?
         .flatten();
-    if let Some(prev) = prior_survivor {
-        if prev != survivor_id {
-            let (a, b) = if prev.as_str() < survivor_id {
-                (prev.as_str(), survivor_id)
-            } else {
-                (survivor_id, prev.as_str())
-            };
-            let detected_at = ts_text(event)?;
-            conn.execute(
-                "INSERT OR IGNORE INTO sync_conflicts
+    if let Some(prev) = prior_survivor
+        && prev != survivor_id
+    {
+        let (a, b) = if prev.as_str() < survivor_id {
+            (prev.as_str(), survivor_id)
+        } else {
+            (survivor_id, prev.as_str())
+        };
+        let detected_at = ts_text(event)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_conflicts
                      (member_id, survivor_a, survivor_b, detected_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![memory_id, a, b, detected_at],
-            )?;
-            // A later source clock moves the link. An earlier one stays
-            // recorded and does not pull the projection backwards.
-            if !incoming_supersede_outranks(conn, event, memory_id, &prev)? {
-                return Ok(());
-            }
+            params![memory_id, a, b, detected_at],
+        )?;
+        // A later source clock moves the link. An earlier one stays
+        // recorded and does not pull the projection backwards.
+        if !incoming_supersede_outranks(conn, event, memory_id, &prev)? {
+            return Ok(());
         }
     }
 
@@ -1745,7 +1746,7 @@ mod tests {
         let writer = Connection::open(&path).unwrap();
         schema::initialize(&writer).unwrap();
         writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        let rebuilding = Connection::open(&path).unwrap();
+        let mut rebuilding = Connection::open(&path).unwrap();
         rebuilding.busy_handler(Some(busy)).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
         let event = Event::new(

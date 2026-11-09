@@ -279,11 +279,11 @@ impl TrustStore {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("trust store {}: {e}", path.display()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("trust store {}: {e}", path.display()))?;
         }
         let mut signers = Vec::new();
         for signer in &self.signers {
@@ -685,10 +685,10 @@ fn scopes_not_canonical(scopes: &[String]) -> Option<String> {
         if !LEGAL_SCOPES.contains(&scope.as_str()) {
             return Some(format!("illegal signed scope {scope}"));
         }
-        if let Some(prev) = prev {
-            if scope.as_str() <= prev {
-                return Some("scopes are not strictly sorted".into());
-            }
+        if let Some(prev) = prev
+            && scope.as_str() <= prev
+        {
+            return Some("scopes are not strictly sorted".into());
         }
         prev = Some(scope.as_str());
     }
@@ -751,7 +751,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
     let bytes = text.as_bytes();

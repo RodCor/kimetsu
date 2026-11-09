@@ -192,10 +192,10 @@ impl ProjectConfig {
     /// FUTURE consumers (digest/resume/skill/ask) must call this resolver so
     /// resolution stays in ONE place.
     pub fn cheap_model(&self) -> Option<CheapModelSection> {
-        if let Some(ref cm) = self.cheap_model {
-            if cm.enabled {
-                return Some(cm.clone());
-            }
+        if let Some(ref cm) = self.cheap_model
+            && cm.enabled
+        {
+            return Some(cm.clone());
         }
         // Back-compat: treat an enabled [learning.distiller] as the cheap model.
         if self.learning.distiller.enabled {

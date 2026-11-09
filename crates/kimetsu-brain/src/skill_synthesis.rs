@@ -234,20 +234,20 @@ pub fn find_synthesis_candidates(conn: &Connection) -> KimetsuResult<Vec<Synthes
         let clusters = crate::consolidate::find_distill_clusters(&all_rows, &opts);
         for cluster in clusters {
             // Use the first memory in the cluster as the representative.
-            if let Some(rep) = cluster.memories.first() {
-                if !candidates.contains_key(&rep.memory_id) {
-                    candidates.insert(
-                        rep.memory_id.clone(),
-                        SynthesisCandidate {
-                            memory_id: rep.memory_id.clone(),
-                            scope: rep.scope.clone(),
-                            kind: rep.kind.clone(),
-                            text: rep.text.clone(),
-                            trigger_kind: "cluster".to_string(),
-                            trigger_count: cluster.memories.len() as i64,
-                        },
-                    );
-                }
+            if let Some(rep) = cluster.memories.first()
+                && !candidates.contains_key(&rep.memory_id)
+            {
+                candidates.insert(
+                    rep.memory_id.clone(),
+                    SynthesisCandidate {
+                        memory_id: rep.memory_id.clone(),
+                        scope: rep.scope.clone(),
+                        kind: rep.kind.clone(),
+                        text: rep.text.clone(),
+                        trigger_kind: "cluster".to_string(),
+                        trigger_count: cluster.memories.len() as i64,
+                    },
+                );
             }
         }
     }
