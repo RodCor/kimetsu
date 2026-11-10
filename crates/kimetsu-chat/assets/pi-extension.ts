@@ -10,12 +10,20 @@
 // the hook payload goes in on stdin, the `additionalContext` block comes back
 // on stdout, and Pi carries it into the turn as a context message.
 //
-// Every failure mode is a silent no-op: a missing binary, a hung binary, a
-// crash, unparseable output. Kimetsu is a sidecar — it must never break Pi.
+// Every failure mode of a lifecycle hook is a silent no-op: a missing binary,
+// a hung binary, a crash, unparseable output. Kimetsu is a sidecar — it must
+// never break Pi.
+//
+// The peer network is separate. Pi has no MCP, so `kimetsu_network_status`
+// and `kimetsu_network_request` shell out to the local binary. They require
+// Kimetsu 2.11.0 and a build with the `network` feature. Anything older
+// degrades with an explanation. Sharing is never started from here: it
+// listens until the user stops it, and that stays a terminal command.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 /** Interactive hooks must not leave a turn waiting on a hung binary. */
 const EXEC_TIMEOUT_MS = 10000;
@@ -151,6 +159,374 @@ function workspaceArgs(ctx: any): string[] {
   return typeof cwd === "string" && cwd.trim() !== "" ? ["--workspace", cwd] : [];
 }
 
+/** First Kimetsu release that ships `kimetsu network` in release builds. */
+const NETWORK_MIN_VERSION: readonly [number, number, number] = [2, 11, 0];
+
+/** `request` exchanges announcements for up to 20s, then transfers one pack. */
+const NETWORK_REQUEST_TIMEOUT_MS = 60_000;
+
+const SHARE_INSTRUCTIONS = [
+  "Sharing stays off until you run it yourself. In this project directory, run: kimetsu network share",
+  "That command listens until you press Ctrl-C. The relay stays off. Only this repo's memories are sent, after they are signed and scrubbed. Do not add --map-ports unless you want the router to open a UDP port. Nothing is listening now.",
+].join("\n");
+
+type Capture = {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  timedOut: boolean;
+  aborted: boolean;
+};
+
+type StatusDetails = {
+  available: boolean;
+  compiled: boolean | null;
+  joined: boolean;
+  listening: boolean;
+  group: string | null;
+  role: string | null;
+  generation: number | null;
+  endpoint_id: string | null;
+  message: string;
+};
+
+type RequestDetails = {
+  available: boolean;
+  listening: boolean;
+  verified: boolean;
+  imported: number;
+  deduped: number;
+  quarantined: number;
+  superseded: number;
+  digest: string | null;
+  message: string;
+};
+
+type ToolResult<T> = {
+  content: [{ type: "text"; text: string }];
+  details: T;
+  structuredContent: T;
+  isError?: boolean;
+};
+
+/**
+ * Run `kimetsu <args>` and keep stdout, stderr, and the exit code.
+ * stdin is ignored. A timeout or abort kills the child so a request
+ * cannot keep a socket open after Pi has moved on.
+ */
+function kimetsuCapture(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<Capture> {
+  if (signal?.aborted) {
+    return Promise.resolve({ stdout: "", stderr: "", code: null, timedOut: false, aborted: true });
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let aborted = false;
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+      resolve({ stdout, stderr, code, timedOut, aborted });
+    };
+    const onAbort = () => {
+      aborted = true;
+      child.kill();
+      finish(null);
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("kimetsu", args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        windowsHide: true,
+      });
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill();
+        finish(null);
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+      child.stdout?.on("error", () => {});
+      child.stderr?.on("error", () => {});
+      child.on("error", () => finish(null));
+      child.on("close", (code) => finish(typeof code === "number" ? code : 0));
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+function parseVersion(output: string): { numbers: [number, number, number]; label: string } | undefined {
+  const match = output.match(/(\d+)\.(\d+)\.(\d+)(\s*\([^)]*\))?/);
+  if (match === null) return undefined;
+  return {
+    numbers: [Number(match[1]), Number(match[2]), Number(match[3])],
+    label: `${match[1]}.${match[2]}.${match[3]}${match[4] ?? ""}`,
+  };
+}
+
+function versionAtLeast(version: readonly [number, number, number], min: readonly [number, number, number]): boolean {
+  for (let index = 0; index < 3; index += 1) {
+    if (version[index] !== min[index]) return version[index] > min[index];
+  }
+  return true;
+}
+
+function parseLastJson(stdout: string): Record<string, unknown> | undefined {
+  const lines = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").reverse();
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // Keep looking at earlier lines.
+    }
+  }
+  return undefined;
+}
+
+function textResult<T extends { message: string }>(details: T, isError = false): ToolResult<T> {
+  return {
+    content: [{ type: "text", text: details.message }],
+    details,
+    structuredContent: details,
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function emptyStatus(message: string, compiled: boolean | null = null): StatusDetails {
+  return {
+    available: false,
+    compiled,
+    joined: false,
+    listening: false,
+    group: null,
+    role: null,
+    generation: null,
+    endpoint_id: null,
+    message,
+  };
+}
+
+function emptyRequest(message: string): RequestDetails {
+  return {
+    available: false,
+    listening: false,
+    verified: false,
+    imported: 0,
+    deduped: 0,
+    quarantined: 0,
+    superseded: 0,
+    digest: null,
+    message,
+  };
+}
+
+function commandFailure(captured: Capture, fallback: string): string {
+  const text = `${captured.stderr}\n${captured.stdout}`
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .join(" ");
+  if (text === "") return fallback;
+  if (/nothing is listening|nothing was contacted/i.test(text)) return text;
+  return `${text} Nothing is listening.`;
+}
+
+function normalizePeer(peer: string): string | undefined {
+  const value = peer.trim();
+  const at = value.indexOf("@");
+  if (at <= 0 || at !== value.lastIndexOf("@") || at === value.length - 1) return undefined;
+  if (/\s/.test(value)) return undefined;
+  const id = value.slice(0, at);
+  const address = value.slice(at + 1);
+  if (id.startsWith("-") || address.startsWith("-")) return undefined;
+  return value;
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+function asCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+type Gate =
+  | { ok: true; status: StatusDetails }
+  | { ok: false; status: StatusDetails };
+
+/** Version gate, then `network status --json`. Status never opens a socket. */
+async function networkGate(signal?: AbortSignal): Promise<Gate> {
+  const version = await kimetsuCapture(["--version"], EXEC_TIMEOUT_MS, signal);
+  if (version.aborted) {
+    return { ok: false, status: emptyStatus("The network check was cancelled. Nothing is listening.") };
+  }
+  if (version.timedOut) {
+    return { ok: false, status: emptyStatus("Kimetsu did not respond and was stopped. Nothing is listening.") };
+  }
+  if (version.code === null) {
+    return { ok: false, status: emptyStatus("Kimetsu is not on PATH. Nothing is listening.") };
+  }
+  const parsed = parseVersion(`${version.stdout}\n${version.stderr}`);
+  if (parsed !== undefined && !versionAtLeast(parsed.numbers, NETWORK_MIN_VERSION)) {
+    return {
+      ok: false,
+      status: emptyStatus(
+        `Peer network needs Kimetsu ${NETWORK_MIN_VERSION.join(".")} or newer. This binary is ${parsed.label}. Nothing is listening.`,
+      ),
+    };
+  }
+  if (version.code !== 0 && parsed === undefined) {
+    return { ok: false, status: emptyStatus(commandFailure(version, "Kimetsu is not on PATH. Nothing is listening.")) };
+  }
+  const status = await kimetsuCapture(["network", "status", "--json"], EXEC_TIMEOUT_MS, signal);
+  if (status.aborted) {
+    return { ok: false, status: emptyStatus("The network check was cancelled. Nothing is listening.") };
+  }
+  if (status.timedOut) {
+    return { ok: false, status: emptyStatus("Kimetsu did not respond and was stopped. Nothing is listening.") };
+  }
+  if (status.code === null) {
+    return { ok: false, status: emptyStatus("Kimetsu is not on PATH. Nothing is listening.") };
+  }
+  if (status.code !== 0) {
+    return {
+      ok: false,
+      status: emptyStatus(commandFailure(status, "Kimetsu network status failed. Nothing is listening.")),
+    };
+  }
+  const body = parseLastJson(status.stdout);
+  if (body === undefined) {
+    return { ok: false, status: emptyStatus("Kimetsu network status returned nothing readable. Nothing is listening.") };
+  }
+  if (body.compiled !== true) {
+    return { ok: false, status: emptyStatus("Peer network is not included in this build. Nothing is listening.", false) };
+  }
+  const details: StatusDetails = {
+    available: true,
+    compiled: true,
+    joined: body.joined === true,
+    listening: body.listening === true,
+    group: asNullableString(body.group),
+    role: asNullableString(body.role),
+    generation: typeof body.generation === "number" && Number.isFinite(body.generation) ? body.generation : null,
+    endpoint_id: asNullableString(body.endpoint_id),
+    message: "",
+  };
+  if (!details.joined) {
+    details.message = "Peer network: not joined. Nothing is listening.";
+  } else {
+    const endpoint = details.endpoint_id === null ? "" : ` Endpoint ${details.endpoint_id}.`;
+    details.message = `Peer network: joined "${details.group ?? "network"}" (${details.role ?? "member"}).${endpoint} Nothing is listening.`;
+  }
+  return { ok: true, status: details };
+}
+
+async function networkStatus(signal?: AbortSignal): Promise<ToolResult<StatusDetails>> {
+  const gate = await networkGate(signal);
+  return textResult(gate.status, false);
+}
+
+async function networkRequest(
+  params: { peer?: string; discover?: boolean; map_ports?: boolean },
+  ctx: { cwd?: string },
+  signal?: AbortSignal,
+): Promise<ToolResult<RequestDetails>> {
+  const discover = params.discover === true;
+  const mapPorts = params.map_ports === true;
+  if (typeof params.peer === "string" && normalizePeer(params.peer) === undefined) {
+    return textResult(emptyRequest(
+      "Peer should look like <endpoint-id>@host:port, the line `kimetsu network share` prints. Nothing was contacted.",
+    ), true);
+  }
+  const peer = typeof params.peer === "string" ? normalizePeer(params.peer) : undefined;
+  if (peer === undefined && !discover) {
+    return textResult(emptyRequest(
+      "Pass peer (endpoint-id@host:port) or set discover to true. Nothing was contacted.",
+    ), true);
+  }
+  const gate = await networkGate(signal);
+  if (!gate.ok) return textResult(emptyRequest(gate.status.message), true);
+  const args = ["network", "request", "--json"];
+  if (!discover) args.push("--no-mdns");
+  args.push(...workspaceArgs(ctx));
+  if (peer !== undefined) args.push("--peer", peer);
+  if (mapPorts) args.push("--map-ports");
+  const captured = await kimetsuCapture(args, NETWORK_REQUEST_TIMEOUT_MS, signal);
+  if (captured.aborted) {
+    return textResult(emptyRequest("The peer request was cancelled and the socket was closed. Nothing is listening."), true);
+  }
+  if (captured.timedOut) {
+    return textResult(emptyRequest("The peer request timed out and the socket was closed. Nothing is listening."), true);
+  }
+  if (captured.code === null) {
+    return textResult(emptyRequest("Kimetsu is not on PATH. Nothing is listening."), true);
+  }
+  if (captured.code !== 0) {
+    return textResult(emptyRequest(commandFailure(captured, "Kimetsu network request failed. Nothing is listening.")), true);
+  }
+  const body = parseLastJson(captured.stdout);
+  if (body === undefined || body.verified !== true) {
+    return textResult(emptyRequest(commandFailure(captured, "Kimetsu network request returned nothing readable. Nothing is listening.")), true);
+  }
+  const quarantined = asCount(body.quarantined);
+  let message = `Verified the signature. Imported ${asCount(body.imported)}, already had ${asCount(body.deduped)}, quarantined ${quarantined}, superseded ${asCount(body.superseded)}. Nothing is listening now.`;
+  if (quarantined > 0) {
+    message += " Quarantined memories stay out of retrieval until you accept them.";
+  }
+  const details: RequestDetails = {
+    available: true,
+    listening: body.listening === true,
+    verified: true,
+    imported: asCount(body.imported),
+    deduped: asCount(body.deduped),
+    quarantined,
+    superseded: asCount(body.superseded),
+    digest: asNullableString(body.digest),
+    message,
+  };
+  return textResult(details, false);
+}
+
+const networkNamespace = {
+  name: "kimetsu-network",
+  description: "Peer memory network. Nothing listens until a request runs. Sharing is a terminal command.",
+};
+
+const statusOutput = Type.Object({
+  available: Type.Boolean(),
+  compiled: Type.Union([Type.Boolean(), Type.Null()]),
+  joined: Type.Boolean(),
+  listening: Type.Boolean(),
+  group: Type.Union([Type.String(), Type.Null()]),
+  role: Type.Union([Type.String(), Type.Null()]),
+  generation: Type.Union([Type.Number(), Type.Null()]),
+  endpoint_id: Type.Union([Type.String(), Type.Null()]),
+  message: Type.String(),
+});
+
+const requestOutput = Type.Object({
+  available: Type.Boolean(),
+  listening: Type.Boolean(),
+  verified: Type.Boolean(),
+  imported: Type.Number(),
+  deduped: Type.Number(),
+  quarantined: Type.Number(),
+  superseded: Type.Number(),
+  digest: Type.Union([Type.String(), Type.Null()]),
+  message: Type.String(),
+});
+
 export default function (pi: ExtensionAPI) {
   // Pi persists injected messages, including display:false messages. Only the
   // current task's injection belongs in future model calls. A unique marker
@@ -271,5 +647,89 @@ export default function (pi: ExtensionAPI) {
       lifecyclePayload(ctx),
       SESSION_SAVE_TIMEOUT_MS,
     );
+  });
+
+  // Registered after the lifecycle hooks. Neither tool runs during a turn
+  // unless the model or the user calls it. Share is a command, not a tool,
+  // and that command does not spawn the binary.
+  pi.registerTool({
+    name: "kimetsu_network_status",
+    label: "Kimetsu network status",
+    description: "Whether this machine has joined a Kimetsu peer network. Does not listen, discover peers, or contact a relay. Sharing stays a terminal command: kimetsu network share.",
+    promptSnippet: "Check Kimetsu peer-network membership without listening",
+    promptGuidelines: [
+      "Does not listen, discover peers, or contact a relay.",
+      "Never run `kimetsu network share` unless the user explicitly asks in this turn. It listens until Ctrl-C; tell them to run it in a terminal.",
+    ],
+    parameters: Type.Object({}),
+    outputSchema: statusOutput,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    namespace: networkNamespace,
+    async execute(_toolCallId, _params, signal) {
+      return networkStatus(signal);
+    },
+  });
+
+  pi.registerTool({
+    name: "kimetsu_network_request",
+    label: "Kimetsu network request",
+    description: "Fetch repo memories a peer is sharing. Verifies the pack signature before any write. Refuses packs that are not scoped to repo. Does nothing and opens no socket when this machine has not joined. Router port mapping stays off unless map_ports is true.",
+    promptSnippet: "Fetch a signed repo memory pack from a Kimetsu peer",
+    promptGuidelines: [
+      "Call only when the user asks to fetch memories from a peer.",
+      "Nothing listens until this call, and the socket closes when it finishes, times out, or Pi cancels it. The relay stays off.",
+      "Packs are signed and scrubbed and must be the repo mount. An unknown signer is quarantined and stays out of retrieval.",
+      "Leave discover false, and do not set map_ports, unless the user explicitly asks.",
+      "Never run `kimetsu network share` from the agent. Tell the user to run it in a terminal; it listens until they press Ctrl-C.",
+    ],
+    parameters: Type.Object({
+      peer: Type.Optional(Type.String({
+        description: "endpoint-id@host:port from kimetsu network share",
+      })),
+      discover: Type.Optional(Type.Boolean({
+        description: "Look for roster peers on the local network. Default false.",
+      })),
+      map_ports: Type.Optional(Type.Boolean({
+        description: "Ask the router to open a UDP port. Default false.",
+      })),
+    }),
+    outputSchema: requestOutput,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    executionMode: "sequential",
+    namespace: networkNamespace,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      return networkRequest(params, ctx, signal);
+    },
+  });
+
+  pi.registerCommand("kimetsu-network-status", {
+    description: "Show whether this machine has joined a Kimetsu peer network. Does not listen.",
+    handler: async (_args, ctx) => {
+      const result = await networkStatus(ctx.signal);
+      ctx.ui.notify(result.content[0].text, result.details.available ? "info" : "warning");
+    },
+  });
+
+  pi.registerCommand("kimetsu-network-request", {
+    description: "Fetch repo memories a peer is sharing. Listens only while the fetch runs.",
+    handler: async (args, ctx) => {
+      const peer = args.trim();
+      if (peer === "") {
+        ctx.ui.notify(
+          "Pass the peer line from kimetsu network share: /kimetsu-network-request <endpoint-id>@host:port",
+          "warning",
+        );
+        return;
+      }
+      const result = await networkRequest({ peer }, ctx, ctx.signal);
+      ctx.ui.notify(result.content[0].text, result.isError ? "error" : "info");
+    },
+  });
+
+  pi.registerCommand("kimetsu-network-share", {
+    description: "Show the terminal command that shares repo memories. Does not open a socket.",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(SHARE_INSTRUCTIONS, "info");
+    },
   });
 }

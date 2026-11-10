@@ -1,6 +1,6 @@
 {
   "name": "@kimetsu-ai/sdk",
-  "version": "0.1.0",
+  "version": "2.11.0",
   "description": "Typed TypeScript client for Kimetsu Remote's MCP surface \u2014 the counterpart to the kimetsu Python SDK.",
   "keywords": [
     "kimetsu",

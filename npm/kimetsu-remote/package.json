@@ -1,6 +1,6 @@
 {
   "name": "kimetsu-remote",
-  "version": "0.0.0",
+  "version": "2.11.0",
   "description": "Kimetsu Remote (beta) — server-hosted Kimetsu brain over HTTP MCP. Installs the prebuilt native server binary for your platform. Separate from the `kimetsu-ai` CLI.",
   "keywords": [
     "kimetsu",
@@ -31,8 +31,8 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@kimetsu-ai/remote-linux-x64": "0.0.0",
-    "@kimetsu-ai/remote-darwin-arm64": "0.0.0",
-    "@kimetsu-ai/remote-win32-x64": "0.0.0"
+    "@kimetsu-ai/remote-linux-x64": "2.11.0",
+    "@kimetsu-ai/remote-darwin-arm64": "2.11.0",
+    "@kimetsu-ai/remote-win32-x64": "2.11.0"
   }
 }

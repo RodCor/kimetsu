@@ -45,16 +45,16 @@ path = "src/bin/lambda.rs"
 required-features = ["lambda"]
 
 [dependencies]
-kimetsu-core = { path = "../kimetsu-core" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.11.0" }
 # S5.3: kimetsu-remote always enables the `graph` feature in kimetsu-brain so
 # the petgraph Tier-2 backend compiles for remote builds. During `cargo test
 # --workspace`, this causes Cargo feature-unification to compile the petgraph
 # code for kimetsu-brain even when the lean crates don't request it — which is
 # safe: all graph code is behind `#[cfg(feature = "graph")]` and default config
 # still selects "flat". The local lean CLI never enables this path.
-kimetsu-brain = { path = "../kimetsu-brain", features = ["graph"] }
-kimetsu-sdk = { path = "../kimetsu-sdk" }
-kimetsu-chat = { path = "../kimetsu-chat" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.11.0", features = ["graph"] }
+kimetsu-sdk = { path = "../kimetsu-sdk", version = "2.11.0" }
+kimetsu-chat = { path = "../kimetsu-chat", version = "2.11.0" }
 tokio = { workspace = true, features = ["sync", "net"] }
 axum = "0.7"
 serde = { workspace = true }

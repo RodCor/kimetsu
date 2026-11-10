@@ -9,7 +9,8 @@ minimum for staged publishing. The existing `NPM_TOKEN` can stay stage-only;
 this workflow does not require direct-publish permission, change account or
 trusted-publisher settings, or approve/reject stages. `PUBLISH_NPM=true` remains
 the repository gate. Lifecycle scripts are disabled while packing/staging. The
-SDK is built separately without the npm credential and retains its own version.
+SDK is built separately without the npm credential and publishes at the
+workspace version (`npm/kimetsu-sdk/package.json`).
 
 ## Recover an existing release
 

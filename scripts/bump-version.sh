@@ -17,7 +17,14 @@
 # It updates:
 #   1. the [workspace.package] version in the root Cargo.toml,
 #   2. every inter-crate path-dependency `version = "…"` pin,
-#   3. Cargo.lock (via `cargo update -p` for each workspace crate).
+#   3. Cargo.lock (via `cargo update -p` for each workspace crate),
+#   4. the npm package versions that track the workspace
+#      (kimetsu-ai, kimetsu-remote, their optionalDependencies, and
+#      @kimetsu-ai/sdk plus its package-lock).
+#
+# kimetsu-bus's dev-dependency on kimetsu-sdk is path-only (no version) so
+# Cargo can publish the bus before the SDK. This script does not add a
+# version to that line.
 #
 # It does NOT commit or tag — review the diff, commit (INCLUDING Cargo.lock),
 # then tag `v<new-version>`.
@@ -51,10 +58,38 @@ for f in crates/*/Cargo.toml; do
 done
 
 # 3) regenerate Cargo.lock entries for the workspace crates
-cargo update -p kimetsu-core -p kimetsu-brain -p kimetsu-agent \
-             -p kimetsu-chat -p kimetsu-cli -p kimetsu-e2e -p kimetsu-remote
+cargo update -p kimetsu-core -p kimetsu-brain -p kimetsu-agent -p kimetsu-bus \
+             -p kimetsu-sdk -p kimetsu-chat -p kimetsu-cli -p kimetsu-e2e \
+             -p kimetsu-remote
 
-# 4) verify no stale pins survived
+# 4) npm packages that publish at the workspace version.
+# Replace only the previous version string so descriptions and key order stay
+# as committed. Those strings are the package version and, for the launchers,
+# every optionalDependency pin.
+CUR="$CUR" NEW="$NEW" python3 - <<'PY'
+import json, os
+from pathlib import Path
+
+cur, new = os.environ["CUR"], os.environ["NEW"]
+paths = [
+    Path("npm/kimetsu/package.json"),
+    Path("npm/kimetsu-remote/package.json"),
+    Path("npm/kimetsu-sdk/package.json"),
+    Path("npm/kimetsu-sdk/package-lock.json"),
+]
+for path in paths:
+    data = json.loads(path.read_text())
+    if data.get("version") != cur:
+        raise SystemExit(f"{path} version is {data.get('version')!r}, expected {cur}")
+    text = path.read_text().replace(f'"{cur}"', f'"{new}"')
+    path.write_text(text)
+    bumped = json.loads(path.read_text())
+    if bumped["version"] != new:
+        raise SystemExit(f"{path} did not land on {new}")
+print(f"npm packages set to {new}")
+PY
+
+# 5) verify no stale pins survived
 if grep -rn "\"$CUR\"" Cargo.toml crates/*/Cargo.toml; then
   echo "ERROR: stale \"$CUR\" version pins remain (see above)" >&2
   exit 1

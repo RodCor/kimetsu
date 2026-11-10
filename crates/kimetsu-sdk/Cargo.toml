@@ -21,11 +21,11 @@ categories = ["database"]
 bus = ["dep:kimetsu-bus"]
 
 [dependencies]
-kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.11.0" }
 # `default-features = false` keeps iroh's test-only TLS skip out of any
 # binary that enables `bus` (the release `kimetsu` build does).
-kimetsu-bus = { path = "../kimetsu-bus", version = "2.10.0", optional = true, default-features = false }
-kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
+kimetsu-bus = { path = "../kimetsu-bus", version = "2.11.0", optional = true, default-features = false }
+kimetsu-core = { path = "../kimetsu-core", version = "2.11.0" }
 
 [dev-dependencies]
 tempfile = "3"
