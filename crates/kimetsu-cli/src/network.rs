@@ -555,17 +555,18 @@ async fn request(
             continue;
         }
         for item in wanted {
-            let summary = online
-                .endpoint
-                .request_pack(PackRequest {
+            let summary = kimetsu_sdk::request_pack(
+                &online.endpoint,
+                PackRequest {
                     peer: target.clone(),
                     digest: item.digest.clone(),
                     destination: MountLevel::Repo,
                     grants: grants.clone(),
                     trust: trust.clone(),
                     brain: workspace.to_path_buf(),
-                })
-                .await?;
+                },
+            )
+            .await?;
             imported += summary.imported;
             deduped += summary.deduped;
             quarantined += summary.quarantined;
