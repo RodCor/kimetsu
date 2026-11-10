@@ -1,6 +1,6 @@
 ---
 name: kimetsu-brain
-description: Use when Pi tasks benefit from prior session knowledge, durable lessons, memory corrections, or feedback on helpful memories.
+description: Use when Pi tasks benefit from prior session knowledge, durable lessons, memory corrections, feedback on helpful memories, or the peer memory network.
 ---
 Kimetsu is a persistent memory sidecar accessed through the `kimetsu` CLI.
 Run commands from the relevant project directory. If the binary is unavailable,
@@ -62,3 +62,38 @@ repeat credit for the same use.
 `kimetsu brain status` reports initialization, accepted memories, and pending
 proposals. Automatic session saving is separate from these deliberate actions;
 model-based lesson distillation requires a configured distiller.
+
+## Peer network
+
+Kimetsu 2.11.0 adds a peer memory network. Check `kimetsu --version` before
+using it. If the binary is older, or `kimetsu network status --json` reports
+`"compiled": false`, say so and continue the task. Nothing listens until
+`share` or `request` runs. The relay stays off. Packs are signed and scrubbed,
+and only the repo mount is exchanged.
+
+`kimetsu_network_status` and `kimetsu network status` report membership. They
+do not discover peers or contact a relay.
+
+Fetch a pack only when the user asks. Prefer `kimetsu_network_request` with
+the peer line printed by `kimetsu network share` (`endpoint-id@host:port`).
+That tool passes `--no-mdns` unless discovery was requested, passes
+`--map-ports` only when the user asks the router to open a UDP port, and
+closes the socket when the fetch finishes, times out, or Pi cancels it. The
+signature is checked before any write. An unknown signer is quarantined and
+stays out of retrieval. A pack that is not scoped to the repo is refused.
+
+Do not run `kimetsu network share` unless the user explicitly asks to share
+memories in this turn. Even then, do not start it in the background or from a
+tool. Tell the user to run `kimetsu network share` in a terminal. It listens
+until they press Ctrl-C. `/kimetsu-network-share` prints that command and does
+not open a socket.
+
+Membership commands also stay quiet until the user asks. They do not listen:
+
+```sh
+kimetsu network invite
+kimetsu network join <code>
+kimetsu network leave
+```
+
+`invite` and `join` only save keys. `leave` forgets them.
