@@ -1,16 +1,31 @@
 # ADR 0001 — Mount contract and memory network
 
-- **Status:** Proposed
+- **Status:** Implemented on main, with the gaps listed in this header. The sections below stay the contract.
 - **Date:** 2026-11-05
-- **Scope:** design only. This pull request changes no code, no MCP schema, no SQLite schema, and no transport.
+- **Scope:** The phases below are what main actually contains. This file adds no benchmark number. The two-physical-host LAN row and the WAN row stay pending.
 
-Kimetsu is a sidecar brain: one Rust binary, one SQLite file per project, delivered to a coding agent over MCP. This ADR names the mount contract those brains already half-implement, the store operations that must respect it, signed packs, and a peer-to-peer bus that moves packs. The bus is inspired by the transport shape of [Reason Network](https://github.com/reason-machines/reason-network/blob/main/DESIGN.md). It is not that system, and it does not carry chat.
+Kimetsu is a sidecar brain: one Rust binary, one SQLite file per project, delivered to a coding agent over MCP. This ADR names the mount contract, the store operations that respect it, signed packs, and a peer-to-peer bus that moves packs. The bus is inspired by the transport shape of [Reason Network](https://github.com/reason-machines/reason-network/blob/main/DESIGN.md). It is not that system, and it does not carry chat.
+
+Landed on main. Each line is a file or test that exists in the tree:
+
+- **F0 — local mounts and the seven operations.** `crates/kimetsu-brain/src/mount.rs` (`context`, `record`, `cite`, `search`, `supersede`, `export_pack`, `import_pack`). Levels are `MountLevel` and `MemoryScope` in `crates/kimetsu-core/src/memory.rs`. Contamination tests in `mount.rs`: `merge_refuses_cross_mount_and_alias_collapse`, `replace_retires_repo_alias_and_leaves_user`, `replay_preserves_session_level`, `warm_start_keeps_session_off_the_repo_digest`, `cite_helped_raises_usefulness_without_changing_level`. MCP payload: `f0_repo_read_context_excludes_user_and_org_text` in `crates/kimetsu-chat/src/mcp_server.rs`.
+- **F1 — signed packs.** `crates/kimetsu-brain/src/signed_pack.rs` (`kimetsu_pack` 2, BLAKE3, Ed25519). Tests `canonical_profile_is_pinned`, `tamper_scope_memory_reorder_and_strip_signature_reject_with_no_sql`, and `trusted_signer_merges_and_untrusted_signer_only_proposes`.
+- **F2 — bus.** `crates/kimetsu-bus` (`src/lib.rs`, `src/endpoint.rs`, `src/protocol.rs`). Exit tests in `crates/kimetsu-bus/tests/f2_exit.rs`: `direct_announce_request_verifies_and_imports`, `non_member_handshake_fails_and_is_not_dialed`, `scope_mismatch_does_not_write`.
+- **Invitations.** `crates/kimetsu-bus/src/roster.rs`. Tests in `crates/kimetsu-bus/tests/invitation.rs`: `invitation_converges_and_then_a_signed_pack_imports`, `removal_reissue_blocks_request_pack_and_the_next_bind`, `same_generation_fork_and_other_group_do_not_replace_the_roster`.
+- **F4 — host adapters.** `crates/kimetsu-chat/src/host_f4.rs`: `four_hosts_generate_stdio_mcp_and_drive_context_record_cite`, `grok_bot_remote_snippet_names_the_http_endpoint_and_no_config_file`.
+- **F5 — federated supersede.** `crates/kimetsu-brain/src/federated.rs`. Two peers and one conflict row: `peers_exchange_disagreeing_supersedes_and_record_one_conflict` in `crates/kimetsu-bus/tests/f5_supersede.rs`.
+- **Directory sync (F6), the offline complement of the bus.** `crates/kimetsu-brain/src/sync.rs`. Tests `directory_import_refuses_a_pack_before_sql`, `directory_import_refuses_a_gzip_pack_file`, `same_supersede_pair_does_not_write_a_second_event`, `two_directory_successors_still_record_one_conflict`. A JSONL batch is refused by `verify_and_v1_parser_refuse_a_directory_sync_batch` in `crates/kimetsu-brain/src/signed_pack.rs`.
+
+Partial. These are not closed:
+
+- **F3 — budgets, Remote alignment, and the Rust SDK.** The in-process store entry is `crates/kimetsu-sdk/src/lib.rs`. `kimetsu-remote` calls the store functions from `crates/kimetsu-remote/src/store.rs` and does not enable the `bus` feature (`crates/kimetsu-remote/Cargo.toml`). The namespace-to-roster note is `docs/operators/remote-namespace-roster.md`. Warm `context`, presence, loopback, and veth samples live in `docs/adr/0001-f3-measurements.md`. That file's two-physical-host LAN row and its WAN row have no number. They stay pending. Loopback and the veth pair are not the [§7](#7-performance) LAN figure, and no number from that file is copied here.
+- **CLI `request_pack`.** Pending on a separate branch, not done. `crates/kimetsu-cli/src/network.rs:560` calls `BusEndpoint::request_pack` directly. It does not call `kimetsu_sdk::request_pack`.
 
 How to read the rest of the document:
 
-- Paragraphs marked **Today** describe the repository as it is (workspace 2.11.0 and the docs cited below).
-- **MUST** / **MUST NOT** are the proposed contract. Where they differ from today, the phase in [§8](#8-phased-delivery-f0f3) is when the code is allowed to change.
-- Nothing in this file is a claim that the current binary meets the latency budgets. Budgets are acceptance criteria for later phases.
+- Paragraphs marked **Today**, and the Today column, are the baseline this decision was written against. A sentence that cited a current source file for a fact main no longer matches is corrected in place, with that file named.
+- **MUST** / **MUST NOT** remain the contract.
+- This file does not record a two-host LAN or WAN `request_pack` number. Those rows stay pending in [§7](#7-performance). Numbers that already exist stay in [0001-f3-measurements.md](0001-f3-measurements.md).
 
 ## Context
 
@@ -18,7 +33,7 @@ The pieces this contract has to name already exist. They do not share one defini
 
 ### Brains and scopes
 
-**Today** a project brain is one SQLite file. A second database, the user brain, holds cross-project preferences under `~/.kimetsu/` (`crates/kimetsu-core/src/paths.rs`). `MemoryScope` is exactly four variants (`crates/kimetsu-core/src/memory.rs`):
+**Today** a project brain is one SQLite file. A second database, the user brain, holds cross-project preferences under `~/.kimetsu/` (`crates/kimetsu-core/src/paths.rs`). The baseline `MemoryScope` had four variants. Main adds `Session`, `Org`, and `Skill` (`crates/kimetsu-core/src/memory.rs:108`, `crates/kimetsu-core/src/memory.rs:109`, `crates/kimetsu-core/src/memory.rs:110`):
 
 | Rust variant | Wire string | Accepted aliases |
 | --- | --- | --- |
@@ -26,12 +41,15 @@ The pieces this contract has to name already exist. They do not share one defini
 | `Project` | `project` | — |
 | `Repo` | `repo` | `repository` |
 | `Run` | `run` | — |
+| `Session` | `session` | — |
+| `Org` | `org` | — |
+| `Skill` | `skill` | — |
 
-`@kimetsu-ai/sdk` repeats that set and no other: `MemoryScope = 'global_user' | 'project' | 'repo' | 'run'` (`npm/kimetsu-sdk/src/types.ts`). Entries whose scope is `GlobalUser` are routed to the user-brain database; they are not rows in the project file (`crates/kimetsu-brain/src/project.rs`). `project` and `repo` are both stored as scope strings in the project database. They are not aliases in code.
+`@kimetsu-ai/sdk` lists those wire strings, including `session`, `org`, and `skill` (`npm/kimetsu-sdk/src/types.ts:89`). Entries whose scope is `GlobalUser` are routed to the user-brain database; they are not rows in the project file (`crates/kimetsu-brain/src/project.rs`). `project` and `repo` can both remain stored strings until a durable migration. `project` is an input alias of the `repo` mount (`crates/kimetsu-core/src/memory.rs:46`). A new event from `MemoryScope::Project` stores `repo` (`crates/kimetsu-core/src/memory.rs:127`).
 
-Three levels this ADR needs are not enum variants:
+`Session`, `Org`, and `Skill` are `MemoryScope` variants on main (`crates/kimetsu-core/src/memory.rs`). What each one holds:
 
-- **Session.** Warm-start puts task titles and progress only in the caller-selected task/session/worktree resume lane, and keeps them out of the shared repo digest (`docs/warm-start-contract.md`). The agent-memory audit found one live episode per repo root, with no task/session/branch/commit key on that payload (`docs/audits/2026-09-04-agent-memory-audit.md`, finding 9; `crates/kimetsu-brain/src/episode.rs`).
+- **Session.** Warm-start puts task titles and progress only in the caller-selected task/session/worktree resume lane, and keeps them out of the shared repo digest (`docs/warm-start-contract.md`). The agent-memory audit found one live episode per repo root, with no task/session/branch/commit key on that payload (`docs/audits/2026-09-04-agent-memory-audit.md`, finding 9). Main keeps one live episode per repo and explicit identity lane (`crates/kimetsu-brain/src/episode.rs:7`).
 - **Org.** Kimetsu Remote can store one org checkpoint shared by every repo in a namespace when `--shared-org-brain` / `KIMETSU_REMOTE_SHARED_ORG` is on. Repo tokens may retrieve it. Writing it, and resolving conflicts that can touch it, requires a global token (`docs/remote-storage.md`).
 - **Skill.** A memory becomes a synthesis candidate at `CITATION_THRESHOLD` (3) distinct-run `memory.cited` events, or as a member of a tag cluster of at least 3. Detection is a query, not a model call. Acceptance installs a skill; a skill is stale when any source memory is superseded or invalidated (`crates/kimetsu-brain/src/skill_synthesis.rs`). That is a proposal table plus a `SKILL.md` on disk, not a memory scope.
 
@@ -55,9 +73,9 @@ None of the three sharing paths signs the set of mounts a pack may enter. None o
 
 Warm-start (`docs/warm-start-contract.md`) assembles a bounded digest with no model and no network. A cached text match avoids a redundant disk write and never replaces the freshly assembled result. Automatic injection requires a candidate to cover at least half of the turn's content terms, admitted text to cover at least 60% collectively, and suppresses the entire injection when uncertainty (normalized Shannon score entropy times the score-weighted unsupported fraction) is above 0.35. Those thresholds are lexical heuristics, not calibrated probabilities. Dates and tag prefixes are not topical evidence. Missing intent, invalid scores, insufficient support, or excessive uncertainty produce empty output: no partial-evidence warning and no startup digest. Explicit MCP retrieval keeps partial-coverage reporting. Warm text is not treated as verified, and it does not receive fabricated capsule outcome credit. Stdio MCP remembers delivered warm-start keys for the latest 256 workspace/identity pairs; keys over 4096 combined path/identity units are not cached.
 
-`kimetsu_brain_context` is the MCP read (`crates/kimetsu-chat/src/mcp_server.rs`). `kimetsu_brain_record` always proposes into `MemoryScope::Project` (kind mapped from `anti_pattern` → `FailurePattern`, `convention` → `Convention`, otherwise `Fact`, default confidence 0.8). `kimetsu_brain_cite` requires `memory_id` and `exposure_id`, optionally a `note`, and writes `memory.cited`. The tool's own usage string says reliance was recorded and that this is not verification. The server instructions repeat that: "Citations record reliance, not verification."
+`kimetsu_brain_context` is the MCP read (`crates/kimetsu-chat/src/mcp_server.rs`). `kimetsu_brain_record` writes `repo` through `kimetsu_sdk::record` (kind mapped from `anti_pattern` → `FailurePattern`, `convention` → `Convention`, otherwise `Fact`, default confidence 0.8) (`crates/kimetsu-chat/src/mcp_server.rs:1116`). `kimetsu_brain_cite` requires `memory_id` and `exposure_id`, and takes an optional `note` and an optional `outcome` (`helped`, `noop`, or `harmed`; omitted is `noop`). It writes `memory.cited`. The tool's own usage string says reliance was recorded and that this is not verification. The server instructions repeat that: "Citations record reliance, not verification."
 
-The projector does not implement that sentence. On `run.finished`, a cited memory receives `CITED_DELTA` (+1.0) and a silent passenger receives `PASSENGER_DELTA` (+0.1). On `run.failed` outside category `Gate`, the signs flip, with the cited penalty scaled by `FAILURE_PENALTY_CITES_DIVISOR` (3.0). `run.aborted` and Gate failures do not move usefulness (`crates/kimetsu-brain/src/scoring.rs`, `crates/kimetsu-brain/src/projector.rs`). Usefulness decay is `exp(-ln(2) * age_days / half_life)` from `last_useful_at`, else `created_at`, default half-life 30 days (`crates/kimetsu-core/src/config.rs`). The broker turns the score into a capped multiplier; decay is not a license to change scope.
+Usefulness follows the cite outcome. `helped` adds `CITED_DELTA` (+1.0) when the cite is projected. `noop` and an omitted outcome add nothing. `harmed` subtracts `CITED_DELTA` and sets `invalidated_reason` to `cite_harmed`. On `run.finished`, a silent passenger stays at +0.0. On `run.failed` outside category `Gate`, a cited memory takes `-CITED_DELTA / (1 + prior_citations / FAILURE_PENALTY_CITES_DIVISOR)` with divisor 3.0, and a silent passenger takes `-PASSENGER_DELTA` (−0.1). `run.aborted` and Gate failures do not move usefulness (`crates/kimetsu-brain/src/projector.rs:464`, `crates/kimetsu-brain/src/projector.rs:469`, `crates/kimetsu-brain/src/projector.rs:706`, `crates/kimetsu-brain/src/projector.rs:795`, `crates/kimetsu-brain/src/scoring.rs:39`). Usefulness decay is `exp(-ln(2) * age_days / half_life)` from `last_useful_at`, else `created_at`, default half-life 30 days (`crates/kimetsu-core/src/config.rs`). The broker turns the score into a capped multiplier; decay is not a license to change scope.
 
 The agent-memory audit, commit `3ec56a8`, finding 6, is the reason a bare cite cannot stay a success signal: an MCP citation becomes a positive outcome with a fresh group id and no query, and trust treats `last_useful_at` as corroboration. No independent test is required. The same audit's finding 1 is in force for any new read path: `kimetsu_brain_context` was observed serializing excluded capsules into the model-visible payload, so a larger rejected pool grew the tool response. Finding 2: `edit_memory` updated the projection without a durable correction event, and rebuild restored the old text. A mount level that lives only in the projection will not survive replay.
 
@@ -78,7 +96,7 @@ A mount is the triple `(level, identity, grant)`.
 | Level | Identity | What lives here | What MUST NOT live here | Lifetime | Who opens the grant |
 | --- | --- | --- | --- | --- | --- |
 | `run` | one agent invocation (`RunId`) | run telemetry and the episode slice for that invocation | any byte that `export_pack` or directory sync would ship | the run | the CLI process or the MCP request that started the run |
-| `session` | task / session / worktree, not merely the repo root | resume lane: task title, progress, open thread, dead ends for that identity | the shared repo digest; another task's resume in the same checkout | while that session identity is current; survives later runs of the same identity | the host session. `session_id` and `task_id` already ride context-exposure payloads (`record_context_delivery` in `mcp_server.rs`). The episode row does not yet key on them |
+| `session` | task / session / worktree, not merely the repo root | resume lane: task title, progress, open thread, dead ends for that identity | the shared repo digest; another task's resume in the same checkout | while that session identity is current; survives later runs of the same identity | the host session. `session_id` and `task_id` already ride context-exposure payloads (`record_context_delivery` in `mcp_server.rs`). The episode projection keys on that identity lane (`crates/kimetsu-brain/src/episode.rs:7`) |
 | `repo` | one repository (the project `brain.db`) | project conventions, failure patterns, commands, facts, repo manifests | another repo's rows; the person's global preferences; org policy | the project database | workspace discovery. Local CLI and stdio MCP open this file |
 | `org` | one trust group, equal to one Remote namespace when Remote is the store | the shared org brain for every repo in that namespace | any other namespace; a single repo's unreviewed scratch | the org checkpoint / namespace | Remote, when shared org is enabled. A roster entry may name the same group later; until an operator binds them, namespace and roster are different boundaries |
 | `user` | one person (`~/.kimetsu/` user brain) | cross-project preferences, including project and environment opt-outs | org policy; a repo's task state | the user-brain file | the user-brain opener. Warm-start opens it read-only |
@@ -94,9 +112,9 @@ A mount is the triple `(level, identity, grant)`.
 | Stdio MCP session | Writes go through `is_privileged_write_tool`. Local default is on, via `kimetsu.mcp_write_tools`. `KIMETSU_MCP_ENABLE_WRITE_TOOLS` overrides and is required for remote. `kimetsu_brain_record` hardcodes `MemoryScope::Project`. Cite writes `memory.cited` against an `exposure_id`. | Read `repo`. Read `user` only through the read-only opener. Read `skill` when a skill's sources are current. `write` on `repo` only while write tools are enabled. No `write` on `user`, `org`, or `skill` from `kimetsu_brain_record`. A session-scoped write MUST name `session` and MUST NOT land in `repo`. |
 | Remote repo token | Bearer token bound to one repo (`--tokens-file` `[per_repo]`). May retrieve the shared org brain. MUST NOT write org or shared user memory. Write tools off unless `KIMETSU_MCP_ENABLE_WRITE_TOOLS=1` (`docs/remote-storage.md`). | With write tools on: `write` on that `repo`, `read` on `org` when sharing is on. Without write tools: `read` only. No `user` mount. No `skill` write. |
 | Remote global token | Required for shared org/user-memory writes and for `kimetsu_brain_conflict_resolve`, including project resolutions, because that path can affect inherited org conflicts. | `write` on `org` in that namespace. Repo write only where the token is also authorized for the repo. Conflict resolution MUST declare the mounts it can touch; a project-looking resolve that edits org state requires the org write grant. |
-| Bus peer | Does not exist. | The signed roster entry lists the mounts that endpoint may serve or request. An announcement is not a grant. `request_pack` still checks the destination write grant on the receiver. |
+| Bus peer | The baseline had none. The crate on main is `kimetsu-bus` (`crates/kimetsu-bus/src/lib.rs`). | The signed roster entry lists the mounts that endpoint may serve or request. An announcement is not a grant. `request_pack` still checks the destination write grant on the receiver. |
 
-A repo token that writes the org mount is a bug. A stdio record that writes `global_user` because the lesson "looks like a preference" is a bug. `kimetsu_brain_record` landing in `MemoryScope::Project` is the current behavior; under this contract that call is `write` on `repo` and the stored level becomes `repo` once the alias window in the next section closes.
+A repo token that writes the org mount is a bug. A stdio record that writes `global_user` because the lesson "looks like a preference" is a bug. `kimetsu_brain_record` is a `write` on `repo` and reports level `repo` (`crates/kimetsu-chat/src/mcp_server.rs:1116`, `crates/kimetsu-chat/src/mcp_server.rs:1126`). Callers may still send `project`. A new event stores `repo` (`crates/kimetsu-core/src/memory.rs:127`).
 
 #### Mapping from `MemoryScope`
 
@@ -106,9 +124,9 @@ A repo token that writes the org mount is a bug. A stdio record that writes `glo
 | `project` | `repo` | Input alias only, until an explicit migration. Callers, the CLI, and `@kimetsu-ai/sdk` may still send `project`. |
 | `repo` | `repo` | Already the canonical name. |
 | `global_user` / `user` | `user` | Same database. The alias `user` already parses. |
-| (no variant) | `session` | Not first-class. Resume state is an episode keyed by repo root. |
-| (no variant) | `org` | Not a `MemoryScope`. It is a Remote checkpoint selected by namespace and flag. |
-| (no variant) | `skill` | Not a `MemoryScope`. `MemoryKind` in Rust has no `skill` variant (`Preference`, `Convention`, `Command`, `FailurePattern`, `Fact`). The TypeScript client's `MemoryKind` includes `'skill'`; that string is not a mount. |
+| `session` | `session` | `MemoryScope::Session` stores `session` in the project database (`crates/kimetsu-brain/src/project.rs:815`). The episode projection is one live episode per repo and identity lane (`crates/kimetsu-brain/src/episode.rs:7`). |
+| `org` | `org` | `MemoryScope::Org` stores `org` (`crates/kimetsu-core/src/memory.rs:135`). The Remote org brain is still a checkpoint selected by namespace and flag (`docs/remote-storage.md`). |
+| `skill` | `skill` | `MemoryScope::Skill` stores `skill` (`crates/kimetsu-core/src/memory.rs:136`). `MemoryKind` in Rust has no `skill` variant (`Preference`, `Convention`, `Command`, `FailurePattern`, `Fact`). The TypeScript client's `MemoryKind` includes `'skill'`; that kind string is not a mount. |
 
 Alias window, which F0 MUST implement before any rewrite of old rows:
 
@@ -215,7 +233,7 @@ The model-visible payload MUST NOT grow because the rejected pool grew. Excluded
 Usefulness:
 
 - `helped` is the only outcome that may increase usefulness. The existing magnitude is `CITED_DELTA` (+1.0) until a measured replacement exists. `helped` is not "verified", and it MUST NOT clear an origin penalty by itself (audit finding 6 asked for this split: exposure, reliance, verified outcome, and harm are different facts).
-- `noop` is the silent passenger. It MUST NOT increase usefulness. It feeds decay (the 30-day half-life already configured). Today's `run.finished` path that adds `PASSENGER_DELTA` (+0.1) to an uncited memory contradicts this rule; F0 removes that upward nudge.
+- `noop` is the silent passenger. It MUST NOT increase usefulness. It feeds decay (the 30-day half-life already configured). `run.finished` leaves an uncited memory's usefulness unchanged. The upward `PASSENGER_DELTA` nudge is gone (`crates/kimetsu-brain/src/scoring.rs:30`, `crates/kimetsu-brain/src/projector.rs:706`).
 - `harmed` feeds the existing negative-feedback path (the scaled cited-failure penalty and the prune ratio). It MUST NOT increase usefulness. It removes the memory from injection until `supersede` or a human review restores it. A pure passenger still cannot fall through the prune floor on the weak delta alone (`scoring.rs`: a silent ratio bottoms out at −0.1, prune floor −0.2). `harmed` is the explicit signal that is allowed to count as the strong negative.
 
 A missing `outcome` on an old caller is `noop`, not `helped`. Treating "any cite" as success is the bug the audit named. `run.finished` and `run.failed` stay separate events. They MUST NOT be rewritten as a batch of `helped` or `harmed` cites. Gate failures and `run.aborted` still change nothing, matching the projector.
@@ -302,7 +320,7 @@ Canonical body, signed, UTF-8 JSON with sorted keys and no insignificant whitesp
 
 - Digest: BLAKE3 of the canonical body. BLAKE3 is already a workspace dependency (`Cargo.toml`).
 - Signed message: the canonical encoding of `{ "digest": <hex>, "scopes": <the same list> }`. Ed25519 over that message. The `scopes` inside the message and `scopes` inside the body MUST be equal; inequality is a failed signature, not a warning.
-- `signer` is the ed25519 public key. F1 introduces the dependency. This ADR does not choose a crate or a file format beyond the fields above.
+- `signer` is the ed25519 public key. F1 pinned the profile `kimetsu-canon-json/1` and checks the signature with `ed25519-dalek` `verify_strict` (`crates/kimetsu-brain/src/signed_pack.rs`). The pin is in [Resolved](#resolved).
 - Gzip wraps the JSON for the file and for the bus. It is outside the digest, so two compressors cannot break the signature. Scrub finishes before the canonical body is hashed. Scrubbing after signing would change the body and is a failed signature on import.
 
 Verification order on import: gunzip, parse, recompute digest, check `scopes` equality, verify Ed25519, then the mount checks in `import_pack`. Failure at any signature step rejects the pack before quarantine and before any SQL write.
@@ -351,7 +369,7 @@ Transport, iroh:
 - **QUIC.** An endpoint is dialed by its public key. The peer connection is authenticated by that key.
 - **mDNS.** LAN discovery without a public DNS dependency. The discovery payload is the endpoint id and the roster id. It MUST NOT contain memory text.
 - **Hole-punch.** Used when the peers are not on the same LAN segment.
-- **Encrypted relay.** Used when hole-punch does not open a direct path. The relay carries ciphertext. It is not an authority, it is not a second brain, and it MUST NOT be required for a local `context`. Operators MAY run their own relay and limit it to roster endpoint ids, which is the deployment Reason Network documents for a team that does not want a public relay. This ADR does not pick Reason's relay list, n0's relays, or a Kimetsu-hosted relay. The open question is in [§Open questions](#open-questions).
+- **Encrypted relay.** Used when hole-punch does not open a direct path. The relay carries ciphertext. It is not an authority, it is not a second brain, and it MUST NOT be required for a local `context`. Operators MAY run their own relay and limit it to roster endpoint ids, which is the deployment Reason Network documents for a team that does not want a public relay. Main does not ship Reason's relay list, n0's relays, or a Kimetsu-hosted relay. The pin is `BusRelay::Disabled` unless a caller passes `BusRelay::Custom` ([Resolved](#resolved)).
 
 Roster, signed:
 
@@ -422,7 +440,9 @@ What stays local even for a member: the SQLite file, embeddings, FTS, session re
 
 ### 5. Unified Rust SDK
 
-One Rust crate (new, or a facade over `kimetsu-core` + `kimetsu-brain` plus a bus module) exposes `context`, `record`, `cite`, `search`, `supersede`, `export_pack`, `import_pack`, and `request_pack`. The bus calls `import_pack`. It does not reimplement merge, quarantine, scrub, or supersede.
+One Rust crate, `kimetsu-sdk`, exposes `context`, `record`, `cite`, `search`, `supersede`, `export_pack`, `import_pack`, and `request_pack` (`crates/kimetsu-sdk/src/lib.rs`). The bus calls `import_signed_pack`, the signed path of that import (`crates/kimetsu-bus/src/endpoint.rs:452`). It does not reimplement merge, quarantine, scrub, or supersede.
+
+Pending, not done: `kimetsu network request` still calls `BusEndpoint::request_pack` directly (`crates/kimetsu-cli/src/network.rs:560`). It does not call `kimetsu_sdk::request_pack` (`crates/kimetsu-sdk/src/lib.rs:125`). A fix is pending on a separate branch.
 
 Why this crate is Rust:
 
@@ -508,8 +528,8 @@ Each phase leaves the default path free of a generative LLM and free of a networ
 
 #### F3 — Budgets and Remote alignment
 
-- **Deliverable.** Measurements for the [§7](#7-performance) table: warm FTS `context` p99, small-pack LAN QUIC, presence-off. Hardware, corpus size, and cold-vs-warm are reported beside the numbers, in the same spirit as the audit's refusal to treat a Python IDF microbench as a broker p99. An operator document for binding a Remote namespace to a roster without treating bearer tokens as pack signers. The Rust SDK is the single in-process entry both the CLI and `kimetsu-remote` call for these operations.
-- **Exit.** The hot path meets the budgets or the phase stays open. A failed budget does not get "fixed" by moving presence onto `context` or by calling a model. Remote checkpoint limits and the disposable projection stay as documented.
+- **Deliverable.** Measurements for the [§7](#7-performance) table: warm FTS `context` p99, small-pack LAN QUIC, presence-off. Hardware, corpus size, and cold-vs-warm are reported beside the numbers, in the same spirit as the audit's refusal to treat a Python IDF microbench as a broker p99. An operator document for binding a Remote namespace to a roster without treating bearer tokens as pack signers. The Rust SDK is the in-process entry `kimetsu-remote` calls for these operations (`crates/kimetsu-remote/src/store.rs`). The CLI uses that crate for the store calls except `network request`, which still calls `BusEndpoint::request_pack` directly. That call is pending, not done ([§5](#5-unified-rust-sdk)).
+- **Exit.** The hot path meets the budgets or the phase stays open. The two-physical-host LAN row and the WAN row have no number in `docs/adr/0001-f3-measurements.md`, so that part of the phase stays open. Loopback and veth rows in that file are not the LAN figure. A failed budget does not get "fixed" by moving presence onto `context` or by calling a model. Remote checkpoint limits and the disposable projection stay as documented.
 - **Unchanged.** MCP as the agent edge, `@kimetsu-ai/sdk` as an HTTP client, decay constants, the decision not to clone repos.
 
 #### F4 — Host adapters
@@ -547,9 +567,9 @@ If this is adopted:
 
 Costs:
 
-- Six mounts are stricter than four enum variants. `session`, `org`, and `skill` need events, grants, and tests before they are real. Until F0, `kimetsu_brain_record` still writes `project`.
+- Six mounts are stricter than four baseline enum variants. `session`, `org`, and `skill` are stored levels on main (`crates/kimetsu-core/src/memory.rs:134`, `crates/kimetsu-core/src/memory.rs:135`, `crates/kimetsu-core/src/memory.rs:136`). `kimetsu_brain_record` stores `repo` (`crates/kimetsu-chat/src/mcp_server.rs:1116`).
 - The alias window is easy to implement wrong. Reading both stored strings while forbidding cross-string merge is the whole trick. A migration that `UPDATE`s the projection without events will be reverted by the next rebuild.
-- Old clients that omit `outcome` become `noop` and stop promoting. That is a silent usefulness change for every current MCP cite. It is intentional, and it needs a changelog line when F0 ships. It does not ship in this pull request.
+- Old clients that omit `outcome` become `noop` and stop promoting. That is a silent usefulness change for every MCP cite that omits the field. It is intentional. `kimetsu_brain_cite` implements it (`crates/kimetsu-chat/src/mcp_server.rs:1185`).
 - v1 URL imports (`kimetsu brain import https://…` as the README shows) cannot ride the bus. Publishers who want F2 sign the pack.
 - The relay is a trust dependency for connectivity and metadata (who talked, how much) even though it cannot read the pack. Networks where hole-punch fails do not get the 100 ms budget.
 - Roster key loss splits a group that still has healthy SQLite files. That is a new operational failure.
@@ -579,14 +599,21 @@ Left alone until a phase says otherwise: checkpoint format and size limits, the 
 
 Also out of F0–F3, stated so they are not implied: rewriting `@kimetsu-ai/sdk` in Rust, replacing Remote's checkpoint backends, retuning broker weights, changing the 30-day half-life, and claiming the few-millisecond budget for the semantic reranker. Putting the event log on the bus as a frame is decided against in [Directory sync and the bus](#directory-sync-and-the-bus): the directory replica stays, and the bus stays signed packs.
 
+## Resolved
+
+Main settles these. The cite is the code that decides them.
+
+1. **Canonical JSON.** The profile is `kimetsu-canon-json/1`, not RFC 8785. The body is UTF-8, object keys are sorted by raw UTF-8 bytes, and separators are `:` and `,` with no insignificant whitespace. The Ed25519 message is that same profile applied to `{"digest":"<hex>","scopes":[...]}`. The signature is RFC 8032 Ed25519 over those raw UTF-8 bytes, checked with `ed25519-dalek` `verify_strict`. It is not Ed25519ph and not Ed25519ctx. `signer` is the 32-byte public key as lowercase hex. `signature` is the 64-byte signature as lowercase hex. `crates/kimetsu-brain/src/signed_pack.rs:3`, `crates/kimetsu-brain/src/signed_pack.rs:21`, `crates/kimetsu-brain/src/signed_pack.rs:44`, and the pin test at `crates/kimetsu-brain/src/signed_pack.rs:864`.
+2. **Where `session` rows sit.** They live in the project SQLite file, keyed by level `session` and `session_id`. `crates/kimetsu-brain/src/mount.rs:3` and `crates/kimetsu-brain/src/project.rs:815`. `replay_preserves_session_level` reads `scope` from that project `memories` table and expects `session` (`crates/kimetsu-brain/src/mount.rs:480`, `crates/kimetsu-brain/src/mount.rs:518`).
+3. **Default relay.** A stock endpoint uses `BusRelay::Disabled` and does not know a public relay list. LAN discovery is mDNS plus direct QUIC. `BusRelay::Custom` is the operator-supplied relay map. The CLI binds `Disabled` and has no relay flag. `crates/kimetsu-bus/src/lib.rs:20`, `crates/kimetsu-bus/src/endpoint.rs:33`, `crates/kimetsu-bus/src/endpoint.rs:44`, `crates/kimetsu-cli/src/network.rs:5`, `crates/kimetsu-cli/src/network.rs:654`.
+5. **MCP `outcome`.** `kimetsu_brain_cite` takes an `outcome` field on the existing tool. Omitted outcome is `noop`. There is no second tool name. `crates/kimetsu-chat/src/mcp_server.rs:72`, `crates/kimetsu-chat/src/mcp_server.rs:1185`, `crates/kimetsu-chat/src/mcp_server.rs:2204`, `crates/kimetsu-chat/src/mcp_server.rs:2212`.
+
 ## Open questions
 
-1. **Canonical JSON.** The decision requires sorted keys and no insignificant whitespace, and requires body scopes to match the signed message. F1 still has to pin the exact profile (a small Kimetsu canonicalizer versus RFC 8785) and the byte encoding of the Ed25519 message. That pin is an exit criterion of F1, not a reason to ship an unsigned scope list.
-2. **Where `session` rows sit.** Recommended: the project SQLite, distinguished by level and session identity, so one writer lock covers repo and session. A sidecar file would need its own lock story and would make the warm-start "do not mix lanes" test two databases. Not settled past the invariant that replay sees the level.
-3. **Default relay.** LAN mDNS with no relay is required. Whether a stock Kimetsu install also knows a public relay, only an operator-set relay, or no relay until configured, is unset. The 100 ms budget does not depend on the answer. Metadata exposure to a public relay does.
-4. **Namespace ↔ roster.** A Remote namespace and a bus roster are different trust domains (bearer tokens versus ed25519 roster signatures). The bind is manual in F3. Whether one org key should sign both the roster and be allowed to mint a global token is unset, and defaulting to "yes" would collapse the two.
-5. **MCP compatibility for `outcome`.** The decision is that an omitted outcome is `noop`. Whether F0 adds a field on `kimetsu_brain_cite` or a new tool name is an implementation choice. A new tool that leaves the old one as a hidden `helped` would undo the decision.
-6. **Skill files versus the skill mount.** `brain skills --accept` installs a `SKILL.md`. Drafting that file can call a model. The mount stores the source lessons. Whether the installed file is addressed by the bus at all (it MUST NOT be, under the current non-goals) should be re-read if a later ADR wants to ship skills as packs. This ADR ships the lessons, not the markdown body.
+Main does not settle these. Nothing below is a guessed decision.
+
+4. **Namespace ↔ roster.** A Remote namespace and a bus roster stay different trust domains. The operator page is a manual note, and it says defaulting one org key to both sign the roster and mint a global token is intentionally unset (`docs/operators/remote-namespace-roster.md:14`). `kimetsu-remote` does not dial the bus (`crates/kimetsu-remote/src/store.rs:5`) and its crate manifest does not enable `kimetsu-sdk`'s `bus` feature (`crates/kimetsu-remote/Cargo.toml:56`). Whether one org key should be allowed to do both is still undecided.
+6. **Skill files versus the skill mount.** The bus frames are `hello`, `announce`, `request_pack`, `pack`, `reject`, `roster_sync`, and `roster` (`crates/kimetsu-bus/src/protocol.rs:19`). None of them is a `SKILL.md` body. Drafted skill-file text still lives on the synthesis report (`crates/kimetsu-brain/src/skill_synthesis.rs:64`). Whether a later ADR should put that installed file on the bus is still undecided.
 
 ## References
 
