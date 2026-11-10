@@ -242,10 +242,18 @@ def main() -> int:
             row["dataset"] = args.name
             row["scored"] = scored[row["id"]]
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+    # rs.evaluate's printed table averages recall/MRR over every row, including
+    # questions with no gold label (always 0). Re-report over scored rows only.
+    scored_rows = [row for row in rows if row["scored"]]
+    print(f"\nscored questions only (recall/MRR denominator): {len(scored_rows)} of {len(rows)} rows")
+    if scored_rows:
+        print(rs.summarize(scored_rows))
     meta = {
         "dataset": args.name,
         "questions": len(questions),
         "rows": len(rows),
+        "rows_scored": len(scored_rows),
+        "metrics_note": "recall/MRR are valid only over rows with scored=true; empty rate and capsules over all rows",
         "exit": rc,
         "wall_s": round(time.time() - started, 1),
         "peak_child_rss_mib_rusage": round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024, 1),
