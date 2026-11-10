@@ -18,6 +18,16 @@ the same embedder. It does not call the cross-encoder.
 Not measured here (follow-ups): the bge query instruction prefix, RRF or
 bounded fusion, and the chronological date prefix applied before reranking.
 
+Profiles (`--profile`, default script):
+
+  script  the base above: level custom, reranker off, every floor 0,
+          including min_semantic_score.
+  bench   a fresh init (level deep, TinyBERT, rerank floor 0.3) plus
+          use_user_brain, session_dedupe, and warm_start off. MCP calls
+          omit min_semantic_score. Lexical and fused set embedder.reranker
+          off so a deep init does not load TinyBERT. See
+          scripts/retrieval_eval_profiles.py.
+
 Datasets:
   * this repo's fixture (scripts/fixtures/retrieval_eval.json):
     {"questions": [{id, type, query, chunks: [{id, text, evidence}]}]}
@@ -766,6 +776,9 @@ def self_test(fixture: Path) -> int:
     )
     if not locomo[0]["chunks"][0]["evidence"] or locomo[0]["type"] != "1":
         raise SystemExit("LoCoMo loader failed")
+    import retrieval_eval_profiles as profiles
+
+    profiles.self_test(sys.modules[__name__], fixture)
     print("self-test ok")
     print(f"fixture questions: {len(questions)} types: {sorted(types)}")
     return 0
@@ -777,6 +790,12 @@ def main() -> int:
     parser.add_argument("--bin", default="kimetsu")
     parser.add_argument("--out", type=Path, default=Path("retrieval-eval.jsonl"))
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--profile",
+        choices=("script", "bench"),
+        default="script",
+        help="script (default): level custom and every floor 0. bench: fresh init defaults plus the bench setup toggles",
+    )
     parser.add_argument("--rss-reindex", action="store_true", help="measure peak RSS of a long reindex")
     parser.add_argument("--docs", type=int, default=32)
     parser.add_argument("--tokens", type=int, default=400)
@@ -786,6 +805,10 @@ def main() -> int:
     dataset = args.dataset if args.dataset.is_absolute() else here / args.dataset
     if args.self_test:
         return self_test(dataset if dataset.exists() else here / "scripts/fixtures/retrieval_eval.json")
+    if args.profile == "bench":
+        import retrieval_eval_profiles as profiles
+
+        profiles.apply_to(sys.modules[__name__], "bench")
     binary = args.bin
     if Path(binary).exists():
         binary = str(Path(binary).resolve())
