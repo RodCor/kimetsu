@@ -10,7 +10,7 @@
 
 [![crates.io](https://img.shields.io/badge/crates.io-kimetsu--cli-orange)](https://crates.io/crates/kimetsu-cli)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-informational)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.91%2B-informational)](https://www.rust-lang.org)
 
 <img src="https://kimetsu.dev/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="720" />
 
@@ -135,7 +135,8 @@ an unlisted key is quarantined. A scope outside the signed list is rejected
 and does not touch the database. Unsigned v1 packs still import into the
 mount you name. Merge is idempotent, so re-importing is safe. Replace supersedes rather
 than deletes, so a swap can always be undone. Roster members share that signed
-pack on the bus. `kimetsu brain sync` is the offline complement: a directory of
+pack on the bus. Release builds include it as `kimetsu network` (it stays
+quiet until you invite or join). `kimetsu brain sync` is the offline complement: a directory of
 allowlisted event-log batches, not an unsigned pack import, and it does not dial
 the bus. **[Kimetsu Remote](https://kimetsu.dev/docs/remote)** stays an HTTP
 checkpoint server and does not dial the bus either.
@@ -199,6 +200,7 @@ python3 scripts/retrieval_eval.py \
 | `kimetsu resume` / `kimetsu checkpoint` | Pick up where the last session left off |
 | `kimetsu brain export` / `import` | Share brains: scrubbed packs, merge or replace, file or URL |
 | `kimetsu brain sync` | Offline directory replica of the allowlisted event log |
+| `kimetsu network` | Invite, join, share, or request signed repo packs. Off until you join |
 | `kimetsu brain skills` | Turn often-cited lessons into runnable skills |
 | `kimetsu brain insights` / `roi` | Is the brain helping, and did it pay for itself |
 | `kimetsu brain tune` | Self-tune retrieval against your own query history |

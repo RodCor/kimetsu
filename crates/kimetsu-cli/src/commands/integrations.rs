@@ -97,6 +97,10 @@ pub(crate) fn mcp(command: McpCommand) -> KimetsuResult<()> {
         McpCommand::Serve(args) => {
             let mut config = McpServeConfig::new(args.workspace);
             config.skills.include_user_roots = !args.no_user_skills;
+            #[cfg(feature = "network")]
+            {
+                config.extra_tools = crate::network::mcp_tools();
+            }
             let stdin = io::stdin();
             let stdout = io::stdout();
             serve_mcp(stdin.lock(), stdout.lock(), config)

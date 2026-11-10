@@ -8,6 +8,8 @@ mod distiller;
 mod doctor;
 mod embed_daemon;
 mod harvest_setup;
+#[cfg(feature = "network")]
+mod network;
 mod proactive_state;
 mod process;
 mod remote_client;
@@ -26,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 #[allow(unused_imports)]
 use commands::{
     bench::*, brain::*, chat::*, config::*, hooks::*, hosts::*, integrations::*, lifecycle::*,
-    memory::*, runs::*,
+    memory::*, network::*, runs::*,
 };
 
 /// User-facing version string: bare semver + build flavor in parentheses.
@@ -188,6 +190,15 @@ enum Command {
     ///   kimetsu resume
     ///   kimetsu resume --workspace /path/to/repo
     Resume(ResumeArgs),
+    /// Share repo memories with someone you invite
+    ///
+    /// The peer network is compiled into release builds and stays off until
+    /// you invite or join. `status` and `leave` never open a socket.
+    /// `share` and `request` are what listen, and only while they run.
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -2250,6 +2261,124 @@ enum LockCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum NetworkCommand {
+    /// Create a one-person join code.
+    ///
+    /// The code lets that person exchange repo memories with you. It does
+    /// not include your admin key, and this command does not listen.
+    Invite(NetworkInviteArgs),
+    /// Join with a code from `kimetsu network invite`.
+    ///
+    /// Saves membership and does not listen.
+    Join(NetworkJoinArgs),
+    /// Show whether this machine is on a network.
+    ///
+    /// Does not listen, discover, or contact a relay.
+    Status(NetworkStatusArgs),
+    /// Forget the network.
+    Leave(NetworkStateArgs),
+    /// Send this repo's memories and wait for someone to fetch them.
+    ///
+    /// Listens until you press Ctrl-C. Only the repo mount is shared.
+    /// Router port mapping stays off unless you pass `--map-ports`.
+    Share(NetworkShareArgs),
+    /// Fetch repo memories a peer is sharing right now.
+    ///
+    /// Checks the signature before anything is written. An unknown signer
+    /// is quarantined. Listens only while this command runs.
+    Request(NetworkRequestArgs),
+}
+
+#[derive(Debug, Args)]
+struct NetworkStateArgs {
+    /// Where network keys live. Defaults to ~/.kimetsu/network.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct NetworkInviteArgs {
+    /// Name for a new network. Letters, numbers, `-`, and `_`.
+    #[arg(long, default_value = "friends")]
+    name: String,
+    /// Where network keys live. Defaults to ~/.kimetsu/network.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Print the code as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct NetworkJoinArgs {
+    /// Code printed by `kimetsu network invite`.
+    code: String,
+    /// Where network keys live. Defaults to ~/.kimetsu/network.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct NetworkStatusArgs {
+    /// Where network keys live. Defaults to ~/.kimetsu/network.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Print JSON (`joined`, `listening`).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct NetworkShareArgs {
+    /// Where network keys live. Defaults to ~/.kimetsu/network.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Repo whose brain to share. Defaults to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// IPv4 socket to bind, for example `127.0.0.1:0`.
+    #[arg(long)]
+    bind: Option<String>,
+    /// Do not announce this machine on the local network.
+    #[arg(long)]
+    no_mdns: bool,
+    /// Ask the router to open a UDP port (UPnP / NAT-PMP). Off by default.
+    #[arg(long)]
+    map_ports: bool,
+    /// After the socket is up, write `{endpoint_id, dial, peer, digest}` here.
+    #[arg(long)]
+    ready_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct NetworkRequestArgs {
+    /// Sharer's `endpoint-id@host:port` line. Without it, local discovery is used.
+    #[arg(long)]
+    peer: Option<String>,
+    /// Where network keys live. Defaults to ~/.kimetsu/network.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Repo that receives the pack. Defaults to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// IPv4 socket to bind, for example `127.0.0.1:0`.
+    #[arg(long)]
+    bind: Option<String>,
+    /// Do not look for peers on the local network.
+    #[arg(long)]
+    no_mdns: bool,
+    /// Ask the router to open a UDP port (UPnP / NAT-PMP). Off by default.
+    #[arg(long)]
+    map_ports: bool,
+    /// Print import counts as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() {
     install_tracing();
 
@@ -2308,6 +2437,7 @@ fn run() -> KimetsuResult<()> {
         Command::Setup(args) => setup_cmd(args),
         Command::Checkpoint(args) => checkpoint_cmd(args),
         Command::Resume(args) => resume_cmd(args),
+        Command::Network { command } => network_cmd(command),
     }
 }
 

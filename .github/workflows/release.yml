@@ -65,16 +65,17 @@ jobs:
       matrix:
         include:
           # Linux
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
+          # `network` is in every prebuilt, including the lean archives npm packages.
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: lean,       extra_features: "--no-default-features --features pi,openclaw,network" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, flavor: embeddings, extra_features: "--features embeddings,pi,openclaw,network" }
           # macOS Intel
-          - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
+          - { os: macos-15-intel, target: x86_64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw,network" }
           # macOS Apple Silicon
-          - { os: macos-15,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
-          - { os: macos-15,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
+          - { os: macos-15,       target: aarch64-apple-darwin,     flavor: lean,       extra_features: "--no-default-features --features pi,openclaw,network" }
+          - { os: macos-15,       target: aarch64-apple-darwin,     flavor: embeddings, extra_features: "--features embeddings,pi,openclaw,network" }
           # Windows
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: "--no-default-features --features pi,openclaw" }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings,pi,openclaw" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: lean,       extra_features: "--no-default-features --features pi,openclaw,network" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   flavor: embeddings, extra_features: "--features embeddings,pi,openclaw,network" }
     steps:
       - uses: actions/checkout@v5
 
@@ -257,8 +258,13 @@ jobs:
     #   kimetsu-core   (no kimetsu deps)
     #   kimetsu-brain  (needs core)
     #   kimetsu-agent  (needs brain + core)
-    #   kimetsu-chat   (needs agent + brain + core)
-    #   kimetsu-cli    (needs agent + brain + chat + core)
+    #   kimetsu-chat   (needs agent + brain + sdk + core)
+    #   kimetsu-cli    (needs agent + brain + chat + sdk + core)
+    #
+    # kimetsu-bus and kimetsu-sdk are not in this job. sdk optionally
+    # depends on bus, and bus's dev-dependency is sdk, so neither can be
+    # the first crates.io upload. chat and cli already require sdk 2.10.0,
+    # which is not published. The path deps now carry that version.
     #
     # `cargo publish --no-verify` skips the local rebuild that
     # cargo does by default — the binary matrix already verified
@@ -329,7 +335,7 @@ jobs:
         run: |
           echo "## crates.io publish — v${GITHUB_REF_NAME#v} ✅" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Published 5 crates (kimetsu-harbor-rs intentionally not published; see Cargo.toml):" >> $GITHUB_STEP_SUMMARY
+          echo "Published 5 crates (kimetsu-harbor-rs, kimetsu-bus, and kimetsu-sdk are not in this job; see the comment above):" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           for c in kimetsu-core kimetsu-brain kimetsu-agent kimetsu-chat kimetsu-cli; do
             echo "- [\`${c}\`](https://crates.io/crates/${c}/${GITHUB_REF_NAME#v})" >> $GITHUB_STEP_SUMMARY
@@ -337,8 +343,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Users can now install with:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli  # lean build" >> $GITHUB_STEP_SUMMARY
-          echo "cargo install kimetsu-cli --features embeddings  # semantic build where ort supports the target" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli --features network  # peer network, same as the release binaries" >> $GITHUB_STEP_SUMMARY
+          echo "cargo install kimetsu-cli --features embeddings,network  # semantic build where ort supports the target" >> $GITHUB_STEP_SUMMARY
           echo "kimetsu update --check" >> $GITHUB_STEP_SUMMARY
           echo "kimetsu uninstall --dry-run" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

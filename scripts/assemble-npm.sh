@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Run from the verified release-source checkout, with flat release assets in dist/.
+# The kimetsu lean archive is built with `--features pi,openclaw,network`
+# (see .github/workflows/release.yml). This script packages that binary;
+# it does not compile Rust.
 set -euo pipefail
 VERSION="${1:?stable release version required}"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1

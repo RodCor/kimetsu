@@ -27,7 +27,9 @@ repository = "https://github.com/RodCor/kimetsu"
 homepage = "https://github.com/RodCor/kimetsu"
 documentation = "https://github.com/RodCor/kimetsu/tree/main/docs"
 readme = "README.md"
-rust-version = "1.89"
+# iroh 1.4 (kimetsu-bus) requires 1.91. rusqlite 0.41 needs 1.89.
+# The release binary links the bus behind `network`, so the floor is 1.91.
+rust-version = "1.91"
 
 [workspace.dependencies]
 aws-credential-types = { version = "1.2.14" }

@@ -10,4 +10,5 @@ pub(crate) mod hosts;
 pub(crate) mod integrations;
 pub(crate) mod lifecycle;
 pub(crate) mod memory;
+pub(crate) mod network;
 pub(crate) mod runs;

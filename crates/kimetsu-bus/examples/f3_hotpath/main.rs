@@ -783,6 +783,7 @@ async fn bind_endpoint(
         presence_path: path,
         roster_path: None,
         bind_v4,
+        map_ports: false,
     })
     .await
     .unwrap()

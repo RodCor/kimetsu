@@ -75,6 +75,31 @@ const BRAIN_CITE_DESCRIPTION: &str = "Record reliance on a memory actually deliv
 pub struct McpServeConfig {
     pub workspace: PathBuf,
     pub skills: SkillConfig,
+    /// Tools the binary adds when a feature is compiled in. Empty for the
+    /// stock brain catalog. The stdio server is the only path that sees them.
+    pub extra_tools: Vec<McpToolExtension>,
+}
+
+/// One tool the process hosts in addition to the brain catalog.
+///
+/// `call` must not open a socket unless the user already joined and the
+/// tool is an explicit network action.
+#[derive(Clone)]
+pub struct McpToolExtension {
+    pub name: &'static str,
+    pub definition: Value,
+    pub writes: bool,
+    pub call: fn(&Path, &Value) -> Result<Value, String>,
+}
+
+impl std::fmt::Debug for McpToolExtension {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpToolExtension")
+            .field("name", &self.name)
+            .field("writes", &self.writes)
+            .finish()
+    }
 }
 
 impl McpServeConfig {
@@ -83,7 +108,11 @@ impl McpServeConfig {
             include_user_roots: true,
             ..SkillConfig::default()
         };
-        Self { workspace, skills }
+        Self {
+            workspace,
+            skills,
+            extra_tools: Vec::new(),
+        }
     }
 }
 
@@ -117,7 +146,7 @@ pub fn serve_mcp<R: BufRead, W: Write>(
         };
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-        let response = match handle_mcp_method(method, params, &workspace, &config.skills) {
+        let response = match dispatch_stdio(method, params, &workspace, &config) {
             Ok(result) => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -279,6 +308,47 @@ pub fn dispatch(
         }
         other => Err(format!("unsupported MCP method `{other}`")),
     }
+}
+
+/// Stdio path: the brain catalog, plus any tools the binary registered.
+fn dispatch_stdio(
+    method: &str,
+    params: Value,
+    workspace: &Path,
+    config: &McpServeConfig,
+) -> Result<Value, String> {
+    if method == "tools/call" {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        if let Some(extra) = config.extra_tools.iter().find(|tool| tool.name == name) {
+            if extra.writes && !mcp_write_tools_enabled(workspace, false) {
+                return Err(format!(
+                    "tool `{name}` requires explicit approval; enable with \
+                     `kimetsu config set kimetsu.mcp_write_tools true` (local) or \
+                     KIMETSU_MCP_ENABLE_WRITE_TOOLS=1 (env override, required for remote)"
+                ));
+            }
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let value = (extra.call)(workspace, &arguments)?;
+            return Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": value.to_string(),
+                }]
+            }));
+        }
+    }
+    let mut result = handle_mcp_method(method, params, workspace, &config.skills)?;
+    if method == "tools/list"
+        && let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut)
+    {
+        for extra in &config.extra_tools {
+            tools.push(extra.definition.clone());
+        }
+    }
+    Ok(result)
 }
 
 /// Thin wrapper for the stdio path: full catalog, no allowlist.
