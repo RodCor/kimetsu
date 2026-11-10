@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use crate::benchmark;
 use crate::conflict;
-use crate::context::{self, ContextBundle, ContextRequest};
+use crate::context::{self, ContextBundle, ContextDiagnostics, ContextRequest};
 use crate::embeddings;
 use crate::ingest::{self, RepoIngestSummary};
 use crate::lock::ProjectLock;
@@ -493,6 +493,8 @@ impl BrainSession {
         mut request: ContextRequest,
     ) -> KimetsuResult<ContextBundle> {
         self.resolve_request_floors(&mut request);
+        let diagnostics =
+            ContextDiagnostics::resolved(&request, self.config.broker.rerank_min_score);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -510,7 +512,7 @@ impl BrainSession {
             &self.config.storage.backend,
             crate::fusion::Fusion::from_config(fusion),
         );
-        context::retrieve_context_with_embedder_and_backend(
+        let mut bundle = context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
@@ -518,7 +520,9 @@ impl BrainSession {
             &extras,
             embeddings::open_embedder_for(self.config.embedder.enabled),
             backend.as_ref(),
-        )
+        )?;
+        bundle.diagnostics = Some(diagnostics);
+        Ok(bundle)
     }
 
     /// v2.7: resolve the absolute abstention floor for this session's config.
@@ -627,6 +631,8 @@ impl BrainSession {
         embedder: &dyn embeddings::Embedder,
     ) -> KimetsuResult<ContextBundle> {
         self.resolve_request_floors(&mut request);
+        let diagnostics =
+            ContextDiagnostics::resolved(&request, self.config.broker.rerank_min_score);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -644,7 +650,7 @@ impl BrainSession {
             &self.config.storage.backend,
             crate::fusion::Fusion::from_config(fusion),
         );
-        context::retrieve_context_with_embedder_and_backend(
+        let mut bundle = context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
@@ -652,7 +658,9 @@ impl BrainSession {
             &extras,
             embedder,
             backend.as_ref(),
-        )
+        )?;
+        bundle.diagnostics = Some(diagnostics);
+        Ok(bundle)
     }
 
     pub fn repo_root(&self) -> &Path {

@@ -1,7 +1,7 @@
 //! Canonical brain-context retrieval and final MCP delivery policy. Evaluators
 //! supply the same request/configuration and measure this complete renderer.
 use crate::context::{
-    ContextBundle, ContextRequest,
+    ContextBundle, ContextDiagnostics, ContextRequest,
     delivery::{Delivery, compact_capsules, fit_json},
     rerank_and_arbitrate,
 };
@@ -309,12 +309,8 @@ impl ServingPolicy {
 /// [`crate::project::resolve_request_floors`] and the rerank floor passed
 /// into arbitration. Does not resolve them again.
 fn retrieval_diagnostics(request: &ContextRequest, rerank_min_score: f32) -> serde_json::Value {
-    json!({
-        "min_semantic_score": request.min_semantic_score,
-        "rerank_min_score": rerank_min_score,
-        "min_lexical_coverage": request.min_lexical_coverage,
-        "fusion": request.fusion,
-    })
+    serde_json::to_value(ContextDiagnostics::resolved(request, rerank_min_score))
+        .expect("context diagnostics")
 }
 
 #[cfg(test)]
@@ -565,6 +561,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy {
             explicit_fact_guard: true,
@@ -596,6 +593,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy {
             cap: 1,
@@ -632,6 +630,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy::default();
         let selected = policy.arbitrate("wal checkpoint", bundle, Some(&StubReranker), 0.0);
@@ -793,6 +792,7 @@ mod conflict_carry_tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy {
             cap: 1,
@@ -868,6 +868,7 @@ mod conflict_carry_tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         }
     }
 

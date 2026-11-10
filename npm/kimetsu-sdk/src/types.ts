@@ -8,6 +8,24 @@
  * can rely on; the index signature is how everything else still reaches them.
  */
 
+/**
+ * Floors one `kimetsu_brain_context` call applied.
+ *
+ * Present only when the brain emitted `diagnostics`. Older servers omit it,
+ * and a response drops it when the object would exceed the output budget.
+ * All four keys are present when the object is.
+ */
+export interface ContextDiagnostics {
+  /** Resolved cosine floor. A default bge brain reports `0.35`. */
+  min_semantic_score: number;
+  /** Rerank floor passed into arbitration. */
+  rerank_min_score: number;
+  /** Resolved lexical coverage floor. */
+  min_lexical_coverage: number;
+  /** Fusion mode: `"linear"` or `"rrf"`. */
+  fusion: string;
+}
+
 /** One retrieved memory or repo capsule. */
 export interface ContextCapsule {
   id?: string;
@@ -58,6 +76,11 @@ export interface ContextBundle {
   chronological_note?: string | null;
   /** Present only on a session's first call from a host without hooks. */
   warm_start?: string | null;
+  /**
+   * Floors this retrieval applied. Absent on older responses and when the
+   * object did not fit the output budget.
+   */
+  diagnostics?: ContextDiagnostics;
   [key: string]: unknown;
 }
 
