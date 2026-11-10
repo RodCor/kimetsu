@@ -42,15 +42,15 @@ and parsing its text output, which is how the Pi extension and its published npm
 copy drifted apart without anyone noticing. There was no shared typed surface
 for them to share. Now there is.
 
-Unlike the launcher packages, it has a build step (`tsc`) and its version is not
-stamped from the Cargo workspace: it versions independently, because it tracks
-the MCP tool surface rather than the binary.
+Unlike the launcher packages, it has a build step (`tsc`). Its version tracks
+the Cargo workspace, the same number as `kimetsu-ai` and `kimetsu-remote`.
+0.1.0 was the last release that versioned the MCP surface on its own.
 
 ## How publishing works (esbuild / turbo style)
 
 Platform packages are **not committed** — binaries never live in git. They are
 assembled and published entirely in CI (`.github/workflows/release.yml`, the
-`publish-npm` job) from the **lean** release archives the `build` matrix already
+`stage-npm` job) from the **lean** release archives the `build` matrix already
 produces:
 
 ```
@@ -72,8 +72,12 @@ no env var); `KIMETSU_NPM_FLAVOR=embeddings`/`=lean` remains a per-run override.
 
 ## Versioning
 
-The committed `kimetsu/package.json` carries a `0.0.0` sentinel. CI stamps the
-real version (`${GITHUB_REF_NAME#v}`) into the main package and every
-`@kimetsu-ai/*` package + `optionalDependencies` entry at publish time, so npm
-always matches the crates.io / GitHub Release for the same tag. The single
-source of truth remains `Cargo.toml` `[workspace.package] version`.
+`Cargo.toml` `[workspace.package] version` is the single source of truth.
+`npm/kimetsu/package.json`, `npm/kimetsu-remote/package.json`,
+`npm/kimetsu-sdk/package.json`, and the launchers' `optionalDependencies`
+carry that same number. `scripts/check-version-sync.py` fails CI when they
+drift. CI still stamps `${GITHUB_REF_NAME#v}` into the launcher packages and
+every `@kimetsu-ai/*` platform package at publish time, and the release
+version-guard refuses a tag that disagrees with the workspace. Platform
+packages are not committed; `scripts/assemble-npm.sh` writes them from the
+lean release archives.

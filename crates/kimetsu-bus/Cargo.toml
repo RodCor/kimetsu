@@ -28,8 +28,8 @@ getrandom = { version = "0.3", features = ["std"] }
 iroh = "1.4.1"
 iroh-mdns-address-lookup = "0.6.1"
 iroh-relay = "1.4.1"
-kimetsu-brain = { path = "../kimetsu-brain", version = "2.10.0" }
-kimetsu-core = { path = "../kimetsu-core", version = "2.10.0" }
+kimetsu-brain = { path = "../kimetsu-brain", version = "2.11.0" }
+kimetsu-core = { path = "../kimetsu-core", version = "2.11.0" }
 # Examples call `kimetsu_sdk::context`. The library does not depend on
 # kimetsu-sdk: that crate depends on this one to forward `request_pack`.
 serde.workspace = true
@@ -41,6 +41,10 @@ tracing.workspace = true
 # In-process relay for tests. Not linked into the library's default build
 # for dependents; cargo enables it when this crate's tests are built.
 iroh = { version = "1.4.1", features = ["test-utils"] }
-kimetsu-sdk = { path = "../kimetsu-sdk", version = "2.10.0", features = ["bus"] }
+# Path only, no version. kimetsu-sdk optionally depends on this crate, so a
+# versioned dev-dependency is a crates.io publish cycle. Cargo strips a
+# versionless path dev-dependency from the published manifest. Workspace
+# tests and the f3_hotpath example still resolve this path.
+kimetsu-sdk = { path = "../kimetsu-sdk", features = ["bus"] }
 serde_json.workspace = true
 tempfile = "3"

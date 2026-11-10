@@ -8,7 +8,7 @@ Kimetsu is a sidecar brain: one Rust binary, one SQLite file per project, delive
 
 How to read the rest of the document:
 
-- Paragraphs marked **Today** describe the repository as it is (workspace 2.10.0 and the docs cited below).
+- Paragraphs marked **Today** describe the repository as it is (workspace 2.11.0 and the docs cited below).
 - **MUST** / **MUST NOT** are the proposed contract. Where they differ from today, the phase in [§8](#8-phased-delivery-f0f3) is when the code is allowed to change.
 - Nothing in this file is a claim that the current binary meets the latency budgets. Budgets are acceptance criteria for later phases.
 
