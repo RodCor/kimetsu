@@ -307,8 +307,12 @@ def main() -> int:
     payload = [{key: value for key, value in question.items() if key != "scored"} for question in questions]
     # Replace retrieval_eval's table, which averages recall/MRR over every row,
     # including questions with no gold label (always 0).
+    original_summarize = rs.summarize
     rs.summarize = lambda rows: summarize_split(rows, scored)
-    rc = rs.evaluate(binary, payload, args.out)
+    try:
+        rc = rs.evaluate(binary, payload, args.out)
+    finally:
+        rs.summarize = original_summarize
     rows = [json.loads(line) for line in args.out.read_text().splitlines()]
     with args.out.open("w") as handle:
         for row in rows:
