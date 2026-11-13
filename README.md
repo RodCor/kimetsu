@@ -10,7 +10,7 @@
 
 [![crates.io](https://img.shields.io/badge/crates.io-kimetsu--cli-orange)](https://crates.io/crates/kimetsu-cli)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![rust](https://img.shields.io/badge/rust-1.91%2B-informational)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.94.1%2B-informational)](https://www.rust-lang.org)
 
 <img src="https://kimetsu.dev/demo.gif" alt="Kimetsu demo: one-command setup, selftest, record a lesson, retrieve it by meaning" width="720" />
 
