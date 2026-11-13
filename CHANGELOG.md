@@ -9,6 +9,8 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+- SDK `ContextBundle` and the `kimetsu_brain_context` tool schema include optional `diagnostics` (`min_semantic_score`, `rerank_min_score`, `min_lexical_coverage`, `fusion`).
+
 ## v2.11.0: Peer network
 
 ### Network

@@ -2171,6 +2171,7 @@ pub(crate) fn daemon_capsules_to_bundle(
         // declines them), so a bundle from here is never time-ordered.
         chronological: false,
         known_fact_conflicts,
+        diagnostics: None,
     }
 }
 

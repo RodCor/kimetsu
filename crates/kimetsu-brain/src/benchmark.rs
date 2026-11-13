@@ -692,6 +692,7 @@ mod tests {
             uncovered_terms: Vec::new(),
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
 
         let context = build_benchmark_context(
@@ -789,6 +790,7 @@ mod tests {
             uncovered_terms: Vec::new(),
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
 
         let context = build_benchmark_context(
@@ -831,6 +833,7 @@ mod tests {
             uncovered_terms: Vec::new(),
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
 
         let context = build_benchmark_context(
@@ -871,6 +874,7 @@ mod tests {
             uncovered_terms: Vec::new(),
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
 
         let context = build_benchmark_context(

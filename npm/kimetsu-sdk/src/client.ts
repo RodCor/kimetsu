@@ -185,6 +185,8 @@ export class KimetsuClient {
    * Check `skipped` and `evidence_coverage` before treating the capsules as an
    * answer — an empty bundle means the brain had nothing relevant, and a
    * low-coverage one means it has part of the answer and knows it.
+   * `diagnostics`, when present, is the floors this call applied
+   * (`min_semantic_score`, `rerank_min_score`, `min_lexical_coverage`, `fusion`).
    */
   async context(
     query: string,

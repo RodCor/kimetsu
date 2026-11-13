@@ -12,6 +12,14 @@
 use std::path::Path;
 
 use kimetsu_brain::context::ContextBundle;
+
+/// Floors on a context payload, and the tool JSON those floors deserialize from.
+///
+/// [`ContextToolResult::diagnostics`] is optional: payloads from before the
+/// field existed, and payloads that dropped it to stay inside the output
+/// budget, still deserialize. [`context`] returns [`ContextBundle`], which
+/// carries the same object after retrieval resolves the floors.
+pub use kimetsu_brain::context::{ContextDiagnostics, ContextToolResult};
 use kimetsu_brain::packs::{ImportSummary, MemoryExport, ScrubReport};
 use kimetsu_brain::project::ProposeResult;
 use kimetsu_brain::signed_pack::{self, PackManifest, TrustStore};
