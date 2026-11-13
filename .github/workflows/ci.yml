@@ -64,6 +64,24 @@ jobs:
           persist-credentials: false
       - run: python3 -B -m unittest discover -s examples/decisions -p 'test_*.py'
 
+  eval-scripts:
+    name: python eval self-tests
+    runs-on: ubuntu-latest
+    # Stdlib only: no Cargo build and no model download. The sweep profile's
+    # one-knob check lives in e0_eval.py --self-test; retrieval_eval.py
+    # --self-test repeats it and checks the bench profile.
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: python eval self-tests
+        run: |
+          python3 scripts/e0_eval.py --self-test
+          python3 scripts/retrieval_eval.py --self-test
+          python3 scripts/prepare_e0_data.py --self-test
+          python3 scripts/experiments/e0s/memcap.py --self-test
+          bash scripts/experiments/e0s/run_e0s.sh --self-test
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
