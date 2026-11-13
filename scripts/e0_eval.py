@@ -190,6 +190,23 @@ def self_test() -> int:
         raise SystemExit(f"bench lexical patch: {lexical}")
     if "fused_rerank_floor_0.3" not in bench["arms"]:
         raise SystemExit(f"bench arms: {bench['arms']}")
+    sweep = plan(fixture, "fixture", "bench-sweep", 0)
+    if sweep["arms"] != profiles.SWEEP_ARMS + ["vector (script extra)"]:
+        raise SystemExit(f"bench-sweep arms: {sweep['arms']}")
+    if sweep["mcp_args"] != bench["mcp_args"] or sweep["base"] != bench["base"]:
+        raise SystemExit("bench-sweep must share the bench base and MCP args")
+    patches = {arm: patch for arm, patch, _ in rs.BINARY_ARMS}
+    defaults = patches["fused_defaults"]
+    if defaults.get("broker.rerank_min_score") != "0.3" or defaults.get("embedder.reranker") in (None, '"off"'):
+        raise SystemExit(f"bench-sweep fused_defaults: {defaults}")
+    for arm, patch in patches.items():
+        if arm in ("lexical", "fused_defaults", "rerank_off"):
+            continue
+        diff = {key for key in patch.keys() | defaults.keys() if patch.get(key) != defaults.get(key)}
+        if len(diff) != 1:
+            raise SystemExit(f"bench-sweep arm {arm} changes {sorted(diff)}, expected one knob")
+    if patches["rrf_k60"].get("broker.fusion") != '"rrf"' or patches["semantic_floor_0"].get("broker.min_semantic_score") != "0.0":
+        raise SystemExit("bench-sweep rrf/semantic arms lost their knob")
     script = plan(fixture, "fixture", "script", 0)
     if script["mcp_args"].get("min_semantic_score") != 0.0:
         raise SystemExit(f"script plan dropped min_semantic_score: {script['mcp_args']}")
@@ -208,7 +225,7 @@ def main() -> int:
     parser.add_argument("--bin")
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--name")
-    parser.add_argument("--profile", choices=("bench", "script"), default="bench")
+    parser.add_argument("--profile", choices=("bench", "bench-sweep", "script"), default="bench")
     parser.add_argument("--out", type=Path, help="JSONL rows (retrieval_eval format + dataset/scored)")
     parser.add_argument("--config-only", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
