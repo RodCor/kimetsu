@@ -1,5 +1,6 @@
 //! Two processes on loopback: invite, join, share, request, check the
-//! signature by importing, then leave. Built only with `--features network`.
+//! signature by importing into the repo mount, then leave. Built only
+//! with `--features network`.
 
 #![cfg(feature = "network")]
 
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kimetsu_brain::project;
-use kimetsu_core::memory::{MemoryKind, MountLevel};
+use kimetsu_core::memory::{MemoryKind, MountLevel, mount_stored_scopes};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_kimetsu")
@@ -59,6 +60,46 @@ fn active(root: &Path, text: &str) -> i64 {
         |row| row.get(0),
     )
     .unwrap()
+}
+
+fn count_scope(root: &Path, sql: &str, scope: &str) -> i64 {
+    let (_, _, conn) = project::load_project_readonly(root).unwrap();
+    conn.query_row(sql, [scope], |row| row.get(0)).unwrap()
+}
+
+/// Active rows of `text` whose stored scope belongs to `level`.
+fn active_on(root: &Path, text: &str, level: MountLevel) -> i64 {
+    let (_, _, conn) = project::load_project_readonly(root).unwrap();
+    mount_stored_scopes(level)
+        .iter()
+        .map(|scope| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories
+                 WHERE text = ?1 AND scope = ?2 AND invalidated_at IS NULL",
+                (text, *scope),
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        })
+        .sum()
+}
+
+/// Memories and proposals stored on `level`, including invalidated rows.
+fn rows_on(root: &Path, level: MountLevel) -> i64 {
+    mount_stored_scopes(level)
+        .iter()
+        .map(|scope| {
+            count_scope(
+                root,
+                "SELECT COUNT(*) FROM memories WHERE scope = ?1",
+                scope,
+            ) + count_scope(
+                root,
+                "SELECT COUNT(*) FROM memory_proposals WHERE scope = ?1",
+                scope,
+            )
+        })
+        .sum()
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -298,6 +339,21 @@ fn two_nodes_invite_join_share_request_then_leave() {
         "the imported pack is the one that was announced"
     );
     assert_eq!(active(&bob_ws, lesson), 1);
+    assert_eq!(
+        active_on(&bob_ws, lesson, MountLevel::Repo),
+        1,
+        "the requested entry must land on the repo mount"
+    );
+    assert_eq!(
+        rows_on(&bob_ws, MountLevel::User),
+        0,
+        "a repo request must not write the user mount"
+    );
+    assert_eq!(
+        rows_on(&bob_ws, MountLevel::Org),
+        0,
+        "a repo request must not write the org mount"
+    );
 
     for state in [&alice_state, &bob_state] {
         let left = run(&["network", "leave", "--state-dir", state.to_str().unwrap()]);
