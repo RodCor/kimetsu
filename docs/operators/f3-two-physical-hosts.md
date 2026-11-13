@@ -7,7 +7,7 @@ The §7 two-physical-host row stays empty until you paste stdout from two real P
 ## What you need
 
 - Two Linux PCs on the same LAN. Each has its own `/etc/machine-id` and its own IPv4 address. Cloned images that share a machine id are refused.
-- The same git commit on both. `rustup` stable, new enough for `kimetsu-bus` (1.91 or newer). The script calls `cargo +stable`.
+- The same git commit on both. `rustup` stable, 1.94.1 or newer (the workspace MSRV; the aws-smithy stack requires it). The script calls `cargo +stable`.
 - A UDP path between the two addresses. Relay is disabled, so there is no fallback if UDP is blocked.
 - No source edits. Addresses, ports, and the client public key are arguments.
 

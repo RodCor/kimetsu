@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use crate::benchmark;
 use crate::conflict;
-use crate::context::{self, ContextBundle, ContextRequest};
+use crate::context::{self, ContextBundle, ContextDiagnostics, ContextRequest};
 use crate::embeddings;
 use crate::ingest::{self, RepoIngestSummary};
 use crate::lock::ProjectLock;
@@ -355,6 +355,52 @@ pub fn load_project_readonly(
     Ok((paths, config, conn))
 }
 
+/// Resolve explicit overrides before legacy sentinels. The explicit zero
+/// survives a second resolution at the injected/production boundary.
+///
+/// After this returns, `request.min_semantic_score`, `request.min_lexical_coverage`,
+/// and `request.fusion` are the values retrieval applies. `request.fusion` is the
+/// mode (`linear` or `rrf`), not the raw config string.
+pub fn resolve_request_floors(config: &ProjectConfig, request: &mut ContextRequest) {
+    request.include_fact_evidence |= config.broker.explicit_fact_guard;
+    let semantic = request.min_semantic_score_override.unwrap_or({
+        if request.min_semantic_score == 0.0 {
+            config.broker.min_semantic_score
+        } else {
+            request.min_semantic_score
+        }
+    });
+    request.min_semantic_score = if semantic < 0.0 {
+        let model = embeddings::resolve_embedder_id(Some(&config.embedder.model));
+        if model.starts_with("bge") { 0.35 } else { 0.0 }
+    } else {
+        semantic
+    };
+    request.min_lexical_coverage = request.min_lexical_coverage_override.unwrap_or({
+        if request.min_lexical_coverage == 0.0 {
+            config.broker.min_lexical_coverage
+        } else {
+            request.min_lexical_coverage
+        }
+    });
+    request.abstain_evidence = match request.abstain_evidence_override {
+        Some(v) if v >= 0.0 => v,
+        Some(_) => {
+            let mut cfg = config.clone();
+            cfg.broker.abstain_min_score = -1.0;
+            resolved_abstain_evidence_for(&cfg)
+        }
+        None if request.abstain_evidence == 0.0 => resolved_abstain_evidence_for(config),
+        None => request.abstain_evidence,
+    };
+    if request.fusion.is_empty() {
+        request.fusion.clone_from(&config.broker.fusion);
+    }
+    request.fusion = crate::fusion::Fusion::from_config(&request.fusion)
+        .as_str()
+        .to_string();
+}
+
 pub struct BrainSession {
     paths: ProjectPaths,
     config: ProjectConfig,
@@ -378,37 +424,7 @@ impl BrainSession {
     /// Resolve explicit overrides before legacy sentinels. The explicit zero
     /// survives a second resolution at the injected/production boundary.
     pub fn resolve_request_floors(&self, request: &mut ContextRequest) {
-        request.include_fact_evidence |= self.config.broker.explicit_fact_guard;
-        let semantic = request.min_semantic_score_override.unwrap_or({
-            if request.min_semantic_score == 0.0 {
-                self.config.broker.min_semantic_score
-            } else {
-                request.min_semantic_score
-            }
-        });
-        request.min_semantic_score = if semantic < 0.0 {
-            let model = embeddings::resolve_embedder_id(Some(&self.config.embedder.model));
-            if model.starts_with("bge") { 0.35 } else { 0.0 }
-        } else {
-            semantic
-        };
-        request.min_lexical_coverage = request.min_lexical_coverage_override.unwrap_or({
-            if request.min_lexical_coverage == 0.0 {
-                self.config.broker.min_lexical_coverage
-            } else {
-                request.min_lexical_coverage
-            }
-        });
-        request.abstain_evidence = match request.abstain_evidence_override {
-            Some(v) if v >= 0.0 => v,
-            Some(_) => {
-                let mut cfg = self.config.clone();
-                cfg.broker.abstain_min_score = -1.0;
-                resolved_abstain_evidence_for(&cfg)
-            }
-            None if request.abstain_evidence == 0.0 => self.resolved_abstain_evidence(),
-            None => request.abstain_evidence,
-        };
+        resolve_request_floors(&self.config, request);
     }
     pub fn open(start: &Path) -> KimetsuResult<Self> {
         let (paths, config, conn) = load_project(start)?;
@@ -477,6 +493,8 @@ impl BrainSession {
         mut request: ContextRequest,
     ) -> KimetsuResult<ContextBundle> {
         self.resolve_request_floors(&mut request);
+        let diagnostics =
+            ContextDiagnostics::resolved(&request, self.config.broker.rerank_min_score);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -494,7 +512,7 @@ impl BrainSession {
             &self.config.storage.backend,
             crate::fusion::Fusion::from_config(fusion),
         );
-        context::retrieve_context_with_embedder_and_backend(
+        let mut bundle = context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
@@ -502,7 +520,9 @@ impl BrainSession {
             &extras,
             embeddings::open_embedder_for(self.config.embedder.enabled),
             backend.as_ref(),
-        )
+        )?;
+        bundle.diagnostics = Some(diagnostics);
+        Ok(bundle)
     }
 
     /// v2.7: resolve the absolute abstention floor for this session's config.
@@ -611,6 +631,8 @@ impl BrainSession {
         embedder: &dyn embeddings::Embedder,
     ) -> KimetsuResult<ContextBundle> {
         self.resolve_request_floors(&mut request);
+        let diagnostics =
+            ContextDiagnostics::resolved(&request, self.config.broker.rerank_min_score);
         let extras: Vec<&Connection> = self.user_conn.as_ref().into_iter().collect();
         // v2.6: same override rule for the normalization mode — resolved onto
         // the request itself because that is where scoring reads it.
@@ -628,7 +650,7 @@ impl BrainSession {
             &self.config.storage.backend,
             crate::fusion::Fusion::from_config(fusion),
         );
-        context::retrieve_context_with_embedder_and_backend(
+        let mut bundle = context::retrieve_context_with_embedder_and_backend(
             &self.conn,
             &self.repo_root,
             &self.config.broker.weights,
@@ -636,7 +658,9 @@ impl BrainSession {
             &extras,
             embedder,
             backend.as_ref(),
-        )
+        )?;
+        bundle.diagnostics = Some(diagnostics);
+        Ok(bundle)
     }
 
     pub fn repo_root(&self) -> &Path {

@@ -79,7 +79,7 @@ string `pk`/`sk` keys match the adapter; TTL on `expires_at` applies only to rat
 items. Durable heads/chunks do not carry TTL. The template exposes MCP and
 health routes; `/metrics` is not exposed through this API configuration.
 
-Prerequisites: Rust **1.91.1+**, Cargo Lambda with its Zig build toolchain,
+Prerequisites: Rust **1.94.1+** (aws-smithy workspace floor), Cargo Lambda with its Zig build toolchain,
 AWS SAM CLI, and an existing Secrets Manager secret whose JSON has a `token`
 field. This token is a global/admin token. The deployer's CloudFormation role
 must be allowed to resolve that secret (and its KMS key if applicable). The

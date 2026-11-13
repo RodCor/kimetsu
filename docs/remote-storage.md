@@ -20,9 +20,9 @@ itself still needs a persistent filesystem.
 | DynamoDB | `dynamodb` | `KIMETSU_REMOTE_DYNAMODB_TABLE=TABLE`, AWS region and credentials |
 
 `stores` enables all optional providers. Selecting a provider absent from the
-build fails startup. DynamoDB dependencies, including through `stores`, require
-Rust **1.91.1+**; this optional requirement does not raise the lean workspace's
-declared Rust requirement. Release HTTP binaries use `embeddings,tls,stores`.
+build fails startup. Building from source requires Rust **1.94.1**, the
+workspace MSRV for every crate and feature set. Release HTTP
+binaries use `embeddings,tls,stores`.
 The separate Lambda binary needs `lambda` plus the selected provider.
 
 ```bash

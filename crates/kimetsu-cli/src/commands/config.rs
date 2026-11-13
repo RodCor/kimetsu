@@ -50,8 +50,7 @@ pub(crate) fn config(command: ConfigCommand) -> KimetsuResult<()> {
             // Use the EFFECTIVE config (serde defaults filled in) so fields
             // like `embedder.enabled` show even when absent from the file.
             let cfg = project::load_config(&paths)?;
-            let root: toml::Value = toml::Value::try_from(&cfg)
-                .map_err(|e| format!("config get: failed to serialise config: {e}"))?;
+            let root = config_get_root(&cfg)?;
             match get_toml_path(&root, &key) {
                 Some(toml::Value::Table(t)) => {
                     // Pretty-print tables so the output is readable.
@@ -208,6 +207,36 @@ pub(crate) fn config_edit_with(
 
     println!("config saved: {}", toml_path.display());
     Ok(())
+}
+
+/// Effective config `config get` prints. Adds `broker.diagnostics` with the
+/// floors [`kimetsu_brain::project::resolve_request_floors`] produces, plus
+/// `broker.rerank_min_score` (the floor serving copies onto its policy).
+pub(crate) fn config_get_root(
+    cfg: &kimetsu_core::config::ProjectConfig,
+) -> KimetsuResult<toml::Value> {
+    let mut root: toml::Value = toml::Value::try_from(cfg)
+        .map_err(|e| format!("config get: failed to serialise config: {e}"))?;
+    let mut request = kimetsu_brain::context::ContextRequest::default();
+    kimetsu_brain::project::resolve_request_floors(cfg, &mut request);
+    let mut diagnostics = toml::map::Map::new();
+    diagnostics.insert(
+        "min_semantic_score".into(),
+        toml::Value::Float(f64::from(request.min_semantic_score)),
+    );
+    diagnostics.insert(
+        "rerank_min_score".into(),
+        toml::Value::Float(f64::from(cfg.broker.rerank_min_score)),
+    );
+    diagnostics.insert(
+        "min_lexical_coverage".into(),
+        toml::Value::Float(f64::from(request.min_lexical_coverage)),
+    );
+    diagnostics.insert("fusion".into(), toml::Value::String(request.fusion));
+    if let Some(broker) = root.get_mut("broker").and_then(|v| v.as_table_mut()) {
+        broker.insert("diagnostics".into(), toml::Value::Table(diagnostics));
+    }
+    Ok(root)
 }
 
 // ── config get/set pure helpers ──────────────────────────────────────────────
@@ -419,4 +448,63 @@ pub(crate) fn closest_keys_hint(root: &toml::Value, key: &str) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod resolved_floor_tests {
+    use super::{config_get_root, get_toml_path};
+    use kimetsu_core::config::ProjectConfig;
+
+    fn float_of(value: &toml::Value) -> f64 {
+        match value {
+            toml::Value::Float(n) => *n,
+            other => panic!("expected float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_get_shows_resolved_floors_with_defaults_and_override() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+            unsafe {
+                std::env::remove_var("KIMETSU_BRAIN_EMBEDDER");
+            }
+
+            let mut cfg = ProjectConfig::default_for_project("floors");
+            cfg.embedder.model = "bge-small-en-v1.5".to_string();
+            let root = config_get_root(&cfg).unwrap();
+            let floors = get_toml_path(&root, "broker.diagnostics").expect("diagnostics");
+            assert!(
+                (float_of(floors.get("min_semantic_score").unwrap()) - 0.35).abs() < 1e-5,
+                "{floors:?}"
+            );
+            assert!((float_of(floors.get("rerank_min_score").unwrap()) - 0.30).abs() < 1e-5);
+            assert!((float_of(floors.get("min_lexical_coverage").unwrap()) - 0.5).abs() < 1e-5);
+            assert_eq!(
+                floors.get("fusion").and_then(toml::Value::as_str),
+                Some("linear")
+            );
+            let stored = get_toml_path(&root, "broker.min_semantic_score").unwrap();
+            assert!((float_of(stored) - (-1.0)).abs() < 1e-5);
+
+            cfg.broker.rerank_min_score = 0.55;
+            let root = config_get_root(&cfg).unwrap();
+            let floors = get_toml_path(&root, "broker.diagnostics").unwrap();
+            assert!(
+                (float_of(floors.get("rerank_min_score").unwrap()) - 0.55).abs() < 1e-5,
+                "{floors:?}"
+            );
+            assert_eq!(
+                get_toml_path(&root, "broker.diagnostics.fusion").and_then(toml::Value::as_str),
+                Some("linear")
+            );
+
+            unsafe {
+                match prev {
+                    Some(value) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", value),
+                    None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+                }
+            }
+        });
+    }
 }

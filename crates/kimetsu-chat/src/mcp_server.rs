@@ -23,7 +23,7 @@ fn mcp_instructions() -> String {
 
 const BRAIN_STATUS_DESCRIPTION: &str = "Inspect the Kimetsu brain for this workspace. Use this to see whether brain.db is initialized, how many memories/runs/proposals exist, and which memories have positive outcome usefulness. Call before relying on memory if you need to know whether the brain has signal.";
 
-const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Returns skipped:true when no capsule is delivered. Responses have a small framing cost; used_tokens reports a conservative bound on the complete serialized MCP content.";
+const BRAIN_CONTEXT_DESCRIPTION: &str = "Primary Kimetsu brain tool. Call early on non-trivial tasks with a concise task query to retrieve broker-ranked context capsules: accepted memories, repo snippets, manifests, and usefulness-weighted signals. Returns skipped:true when no capsule is delivered. Responses have a small framing cost; used_tokens reports a conservative bound on the complete serialized MCP content. When it fits the output budget, diagnostics reports the floors this call applied: min_semantic_score, rerank_min_score, min_lexical_coverage, and fusion. The object is omitted when it would exceed the budget.";
 
 // TODO (v0.6+): fold benchmark-tag filtering + semantic_operator/anti_pattern
 // preference into kimetsu_brain_context so kimetsu_benchmark_context becomes
@@ -2198,6 +2198,23 @@ fn tool_definitions() -> Value {
                     "prefer_roles": { "type": "array", "items": { "type": "string" }, "description": "Boost capsules whose kind matches (e.g. [\"semantic_operator\",\"anti_pattern\"] for bench use)." }
                 },
                 "required": ["query"]
+            },
+            "outputSchema": {
+                "type": "object",
+                "description": "Context payload. diagnostics is omitted when it does not fit the output budget.",
+                "properties": {
+                    "diagnostics": {
+                        "type": "object",
+                        "description": "Floors this retrieval applied.",
+                        "properties": {
+                            "min_semantic_score": {"type": "number", "description": "Resolved cosine floor."},
+                            "rerank_min_score": {"type": "number", "description": "Rerank floor passed into arbitration."},
+                            "min_lexical_coverage": {"type": "number", "description": "Resolved lexical coverage floor."},
+                            "fusion": {"type": "string", "description": "Fusion mode: linear or rrf."}
+                        },
+                        "required": ["min_semantic_score", "rerank_min_score", "min_lexical_coverage", "fusion"]
+                    }
+                }
             }
         },
         {
@@ -2653,6 +2670,51 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|value| value.as_str() == Some("required"))
+        );
+    }
+
+    #[test]
+    fn brain_context_schema_names_diagnostics() {
+        let tools = tool_definitions();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("kimetsu_brain_context"))
+            .expect("kimetsu_brain_context");
+        let description = tool["description"].as_str().unwrap();
+        for key in [
+            "diagnostics",
+            "min_semantic_score",
+            "rerank_min_score",
+            "min_lexical_coverage",
+            "fusion",
+        ] {
+            assert!(
+                description.contains(key),
+                "{key} missing from kimetsu_brain_context description"
+            );
+        }
+        let diagnostics = &tool["outputSchema"]["properties"]["diagnostics"];
+        assert_eq!(diagnostics["type"], "object");
+        for key in [
+            "min_semantic_score",
+            "rerank_min_score",
+            "min_lexical_coverage",
+            "fusion",
+        ] {
+            assert!(
+                diagnostics["properties"].get(key).is_some(),
+                "{key} missing from outputSchema"
+            );
+        }
+        let required = diagnostics["required"].as_array().unwrap();
+        assert_eq!(required.len(), 4);
+        let top_required = tool["outputSchema"]["required"].as_array();
+        assert!(
+            top_required
+                .is_none_or(|keys| { !keys.iter().any(|key| key.as_str() == Some("diagnostics")) }),
+            "diagnostics stays optional so older clients still accept the payload"
         );
     }
 
@@ -3270,6 +3332,87 @@ mod tests {
             "expected a memory capsule: {capsules:?}"
         );
         fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    /// A default bge brain reports `min_semantic_score` 0.35. The value is read
+    /// back through `kimetsu_sdk::ContextToolResult`, which is the deserializer
+    /// for the tool payload, and through `kimetsu_sdk::context`.
+    #[test]
+    fn brain_context_diagnostics_round_trip_through_the_sdk() {
+        kimetsu_brain::user_brain::with_user_brain_disabled(|| {
+            let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+            unsafe {
+                std::env::remove_var("KIMETSU_BRAIN_EMBEDDER");
+            }
+            let root = temp_root("kimetsu-mcp-diagnostics");
+            fs::create_dir_all(&root).expect("create temp root");
+            project::init_project(&root, false).expect("init project");
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
+            let mut config = project::load_config(&paths).unwrap();
+            config.embedder.model = "bge-small-en-v1.5".to_string();
+            config.embedder.enabled = false;
+            std::fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+
+            let payload = brain_context_tool(
+                &root,
+                &json!({
+                    "query": "wal checkpoint",
+                    "include_ambient": false,
+                    "budget_tokens": 6000
+                }),
+                None,
+            )
+            .expect("kimetsu_brain_context");
+            let parsed: kimetsu_sdk::ContextToolResult =
+                serde_json::from_value(payload.clone()).expect("deserialize tool payload");
+            let floors = parsed.diagnostics.expect("diagnostics on the tool payload");
+            assert!(
+                (floors.min_semantic_score - 0.35).abs() < 1e-5,
+                "bge auto floor: {floors:?}"
+            );
+            assert!(
+                (floors.rerank_min_score - 0.30).abs() < 1e-5,
+                "default rerank floor: {floors:?}"
+            );
+            assert!(
+                (floors.min_lexical_coverage - 0.5).abs() < 1e-5,
+                "default lexical floor: {floors:?}"
+            );
+            assert_eq!(floors.fusion, "linear");
+
+            let mut older = payload;
+            older.as_object_mut().expect("object").remove("diagnostics");
+            let parsed: kimetsu_sdk::ContextToolResult =
+                serde_json::from_value(older).expect("payload without diagnostics");
+            assert!(parsed.diagnostics.is_none());
+
+            let bundle = kimetsu_sdk::context(
+                &root,
+                &kimetsu_sdk::MountGrants::repo_read_only(),
+                "wal checkpoint",
+                4000,
+            )
+            .expect("sdk context");
+            let floors = bundle.diagnostics.expect("diagnostics on the sdk bundle");
+            assert!(
+                (floors.min_semantic_score - 0.35).abs() < 1e-5,
+                "{floors:?}"
+            );
+            assert!((floors.rerank_min_score - 0.30).abs() < 1e-5, "{floors:?}");
+            assert!(
+                (floors.min_lexical_coverage - 0.5).abs() < 1e-5,
+                "{floors:?}"
+            );
+            assert_eq!(floors.fusion, "linear");
+
+            unsafe {
+                match prev {
+                    Some(value) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", value),
+                    None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+                }
+            }
+            fs::remove_dir_all(root).ok();
+        });
     }
 
     /// v1.0.0: `brain_context_tool` with a `StubReranker` reorders and caps
