@@ -199,12 +199,31 @@ def self_test() -> int:
     defaults = patches["fused_defaults"]
     if defaults.get("broker.rerank_min_score") != "0.3" or defaults.get("embedder.reranker") in (None, '"off"'):
         raise SystemExit(f"bench-sweep fused_defaults: {defaults}")
+    # lexical is the FTS baseline, not a one-knob fused variant. The vector arm
+    # is appended by plan() and has no config patch. Every other arm changes
+    # exactly the key named here.
+    expected_diff = {
+        "rerank_off": {"embedder.reranker"},
+        "tinybert_floor_0_fill_to_cap": {"broker.rerank_min_score"},
+        "tinybert_floor_0.1": {"broker.rerank_min_score"},
+        "tinybert_floor_0.2": {"broker.rerank_min_score"},
+        "semantic_floor_0": {"broker.min_semantic_score"},
+        "rrf_k60": {"broker.fusion"},
+    }
     for arm, patch in patches.items():
-        if arm in ("lexical", "fused_defaults", "rerank_off"):
+        if arm in ("lexical", "fused_defaults"):
             continue
         diff = {key for key in patch.keys() | defaults.keys() if patch.get(key) != defaults.get(key)}
-        if len(diff) != 1:
-            raise SystemExit(f"bench-sweep arm {arm} changes {sorted(diff)}, expected one knob")
+        if diff != expected_diff.get(arm):
+            raise SystemExit(
+                f"bench-sweep arm {arm} changes {sorted(diff)}, expected {sorted(expected_diff.get(arm, []))}"
+            )
+    if set(expected_diff) != set(patches) - {"lexical", "fused_defaults"}:
+        raise SystemExit(f"bench-sweep arms drifted from the one-knob set: {sorted(patches)}")
+    if patches["rerank_off"].get("embedder.reranker") != '"off"':
+        raise SystemExit(f"bench-sweep rerank_off: {patches['rerank_off']}")
+    if patches["tinybert_floor_0_fill_to_cap"].get("broker.rerank_min_score") != "0.0":
+        raise SystemExit(f"bench-sweep fill-to-cap: {patches['tinybert_floor_0_fill_to_cap']}")
     if patches["rrf_k60"].get("broker.fusion") != '"rrf"' or patches["semantic_floor_0"].get("broker.min_semantic_score") != "0.0":
         raise SystemExit("bench-sweep rrf/semantic arms lost their knob")
     script = plan(fixture, "fixture", "script", 0)

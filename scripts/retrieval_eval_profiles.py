@@ -96,7 +96,7 @@ def bench_profile(embedder: str, reranker: str) -> dict:
     }
 
 
-# One-variable sweep from fused defaults (gauge, #68). Fused defaults = a deep
+# One-variable sweep from fused defaults (#68). Fused defaults = a deep
 # init: linear fusion, auto semantic floor (0.35 for bge), TinyBERT at the
 # shipped rerank floor 0.3. Each arm after `fused_defaults` changes exactly one
 # knob. RRF k is hardcoded on main (fusion.rs DEFAULT_RRF_K = 60), so only
@@ -121,7 +121,7 @@ def bench_sweep_profile(embedder: str, reranker: str) -> dict:
     arms = [
         bench["arms"][0],
         ("fused_defaults", dict(defaults), "fused defaults: linear, auto semantic floor, tinybert floor 0.3"),
-        ("rerank_off", {"embedder.reranker": '"off"'}, "embedder.reranker=off"),
+        ("rerank_off", {**defaults, "embedder.reranker": '"off"'}, "embedder.reranker=off"),
         (
             "tinybert_floor_0_fill_to_cap",
             {**defaults, "broker.rerank_min_score": "0.0"},
