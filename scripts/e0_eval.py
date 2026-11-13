@@ -260,6 +260,42 @@ def self_test() -> int:
         raise SystemExit(f"bench lexical patch: {lexical}")
     if "fused_rerank_floor_0.3" not in bench["arms"]:
         raise SystemExit(f"bench arms: {bench['arms']}")
+    sweep = plan(fixture, "fixture", "bench-sweep", 0)
+    if sweep["arms"] != profiles.SWEEP_ARMS + ["vector (script extra)"]:
+        raise SystemExit(f"bench-sweep arms: {sweep['arms']}")
+    if sweep["mcp_args"] != bench["mcp_args"] or sweep["base"] != bench["base"]:
+        raise SystemExit("bench-sweep must share the bench base and MCP args")
+    patches = {arm: patch for arm, patch, _ in rs.BINARY_ARMS}
+    defaults = patches["fused_defaults"]
+    if defaults.get("broker.rerank_min_score") != "0.3" or defaults.get("embedder.reranker") in (None, '"off"'):
+        raise SystemExit(f"bench-sweep fused_defaults: {defaults}")
+    # lexical is the FTS baseline, not a one-knob fused variant. The vector arm
+    # is appended by plan() and has no config patch. Every other arm changes
+    # exactly the key named here.
+    expected_diff = {
+        "rerank_off": {"embedder.reranker"},
+        "tinybert_floor_0_fill_to_cap": {"broker.rerank_min_score"},
+        "tinybert_floor_0.1": {"broker.rerank_min_score"},
+        "tinybert_floor_0.2": {"broker.rerank_min_score"},
+        "semantic_floor_0": {"broker.min_semantic_score"},
+        "rrf_k60": {"broker.fusion"},
+    }
+    for arm, patch in patches.items():
+        if arm in ("lexical", "fused_defaults"):
+            continue
+        diff = {key for key in patch.keys() | defaults.keys() if patch.get(key) != defaults.get(key)}
+        if diff != expected_diff.get(arm):
+            raise SystemExit(
+                f"bench-sweep arm {arm} changes {sorted(diff)}, expected {sorted(expected_diff.get(arm, []))}"
+            )
+    if set(expected_diff) != set(patches) - {"lexical", "fused_defaults"}:
+        raise SystemExit(f"bench-sweep arms drifted from the one-knob set: {sorted(patches)}")
+    if patches["rerank_off"].get("embedder.reranker") != '"off"':
+        raise SystemExit(f"bench-sweep rerank_off: {patches['rerank_off']}")
+    if patches["tinybert_floor_0_fill_to_cap"].get("broker.rerank_min_score") != "0.0":
+        raise SystemExit(f"bench-sweep fill-to-cap: {patches['tinybert_floor_0_fill_to_cap']}")
+    if patches["rrf_k60"].get("broker.fusion") != '"rrf"' or patches["semantic_floor_0"].get("broker.min_semantic_score") != "0.0":
+        raise SystemExit("bench-sweep rrf/semantic arms lost their knob")
     script = plan(fixture, "fixture", "script", 0)
     if script["mcp_args"].get("min_semantic_score") != 0.0:
         raise SystemExit(f"script plan dropped min_semantic_score: {script['mcp_args']}")
@@ -278,7 +314,7 @@ def main() -> int:
     parser.add_argument("--bin")
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--name")
-    parser.add_argument("--profile", choices=("bench", "script"), default="bench")
+    parser.add_argument("--profile", choices=("bench", "bench-sweep", "script"), default="bench")
     parser.add_argument("--out", type=Path, help="JSONL rows (retrieval_eval format + dataset/scored)")
     parser.add_argument("--config-only", action="store_true")
     parser.add_argument("--limit", type=int, default=0)

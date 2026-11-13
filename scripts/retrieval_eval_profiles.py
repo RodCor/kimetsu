@@ -96,6 +96,49 @@ def bench_profile(embedder: str, reranker: str) -> dict:
     }
 
 
+# One-variable sweep from fused defaults (#68). Fused defaults = a deep
+# init: linear fusion, auto semantic floor (0.35 for bge), TinyBERT at the
+# shipped rerank floor 0.3. Each arm after `fused_defaults` changes exactly one
+# knob. RRF k is hardcoded on main (fusion.rs DEFAULT_RRF_K = 60), so only
+# k=60 is expressible without a code change. main has no capsule-fill knob;
+# TinyBERT floor 0 is the fill-to-cap arm (rerank reorders, drops nothing).
+SWEEP_ARMS = [
+    "lexical",
+    "fused_defaults",
+    "rerank_off",
+    "tinybert_floor_0_fill_to_cap",
+    "tinybert_floor_0.1",
+    "tinybert_floor_0.2",
+    "semantic_floor_0",
+    "rrf_k60",
+]
+
+
+def bench_sweep_profile(embedder: str, reranker: str) -> dict:
+    bench = bench_profile(embedder, reranker)
+    tiny = f'"{reranker}"'
+    defaults = {"embedder.reranker": tiny, "broker.rerank_min_score": "0.3"}
+    arms = [
+        bench["arms"][0],
+        ("fused_defaults", dict(defaults), "fused defaults: linear, auto semantic floor, tinybert floor 0.3"),
+        ("rerank_off", {**defaults, "embedder.reranker": '"off"'}, "embedder.reranker=off"),
+        (
+            "tinybert_floor_0_fill_to_cap",
+            {**defaults, "broker.rerank_min_score": "0.0"},
+            "fill-to-cap (reorder only), tinybert floor 0: broker.rerank_min_score=0.0",
+        ),
+        ("tinybert_floor_0.1", {**defaults, "broker.rerank_min_score": "0.1"}, "broker.rerank_min_score=0.1"),
+        ("tinybert_floor_0.2", {**defaults, "broker.rerank_min_score": "0.2"}, "broker.rerank_min_score=0.2"),
+        ("semantic_floor_0", {**defaults, "broker.min_semantic_score": "0.0"}, "broker.min_semantic_score=0.0"),
+        (
+            "rrf_k60",
+            {**defaults, "broker.fusion": '"rrf"'},
+            "rrf k=60 (hardcoded DEFAULT_RRF_K): broker.fusion=rrf",
+        ),
+    ]
+    return {"base": bench["base"], "arms": arms, "mcp": bench["mcp"]}
+
+
 def capture_script(module) -> dict:
     """Snapshot script-profile knobs the first time this module is seen."""
     key = id(module)
@@ -114,6 +157,8 @@ def profile_for(module, name: str) -> dict:
         return copy.deepcopy(script)
     if name == "bench":
         return bench_profile(module.EMBEDDER, module.RERANKER)
+    if name == "bench-sweep":
+        return bench_sweep_profile(module.EMBEDDER, module.RERANKER)
     raise SystemExit(f"unknown retrieval profile: {name}")
 
 
