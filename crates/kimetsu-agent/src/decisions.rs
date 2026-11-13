@@ -253,6 +253,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec!["prior conflict".into()],
+            diagnostics: None,
         }
     }
 

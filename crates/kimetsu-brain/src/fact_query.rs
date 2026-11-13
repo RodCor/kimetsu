@@ -355,6 +355,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let mut found = false;
         for budget in (300..2000).step_by(20) {
@@ -401,6 +402,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = crate::serving::ServingPolicy {
             explicit_fact_guard: true,

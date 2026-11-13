@@ -9,6 +9,16 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+- SDK `ContextBundle` and the `kimetsu_brain_context` tool schema include optional `diagnostics` (`min_semantic_score`, `rerank_min_score`, `min_lexical_coverage`, `fusion`).
+
+### Changed
+
+- MSRV is now Rust 1.94.1 for all crates, including `cargo install kimetsu-cli`. The pin-utils-free aws-smithy stack requires it, and it is on the default graph through `kimetsu-agent`'s `aws-sigv4`.
+
+### Security
+
+- Bump `quinn-proto`, `quinn-udp`, and `rustix` for RUSTSEC advisories. Drop unmaintained `pin-utils` by raising the aws floors (`aws-sigv4`, `aws-credential-types`, `aws-smithy-runtime-api`, `aws-config` 1.13.0, `aws-sdk-dynamodb` 1.132.0).
+
 ## v2.11.0: Peer network
 
 ### Network

@@ -1,7 +1,7 @@
 //! Canonical brain-context retrieval and final MCP delivery policy. Evaluators
 //! supply the same request/configuration and measure this complete renderer.
 use crate::context::{
-    ContextBundle, ContextRequest,
+    ContextBundle, ContextDiagnostics, ContextRequest,
     delivery::{Delivery, compact_capsules, fit_json},
     rerank_and_arbitrate,
 };
@@ -228,6 +228,7 @@ impl ServingPolicy {
             *self
         };
         session.resolve_request_floors(&mut request);
+        let diagnostics = retrieval_diagnostics(&request, pool_policy.rerank_floor);
         let abstain = request.abstain_evidence;
         let query = request.query.clone();
         let query_vector = if embedder.is_noop() {
@@ -287,13 +288,29 @@ impl ServingPolicy {
                 bundle.excluded.extend(bundle.capsules.split_off(self.cap));
             }
         }
-        Ok(self.render_for_query(
+        let mut delivery = self.render_for_query(
             &query,
             bundle,
             session.config().broker.compress_capsules,
             exposure_id,
-        ))
+        );
+        // Optional and budget-checked so capsule selection is unchanged.
+        crate::context::delivery::add_optional_field(
+            &mut delivery,
+            "diagnostics",
+            diagnostics,
+            self.budget,
+        );
+        Ok(delivery)
     }
+}
+
+/// Floors this retrieval applied. Reads the request after
+/// [`crate::project::resolve_request_floors`] and the rerank floor passed
+/// into arbitration. Does not resolve them again.
+fn retrieval_diagnostics(request: &ContextRequest, rerank_min_score: f32) -> serde_json::Value {
+    serde_json::to_value(ContextDiagnostics::resolved(request, rerank_min_score))
+        .expect("context diagnostics")
 }
 
 #[cfg(test)]
@@ -474,16 +491,23 @@ mod tests {
                 let mut resolved = req;
                 session.resolve_request_floors(&mut resolved);
                 let abstain = resolved.abstain_evidence;
+                let diagnostics = super::retrieval_diagnostics(&resolved, policy.rerank_floor);
                 let bundle = session
                     .retrieve_context_with_injected_embedder(
                         policy.prepare(resolved, true),
                         &embedder,
                     )
                     .unwrap();
-                let production = policy.render(
+                let mut production = policy.render(
                     policy.arbitrate("wal checkpoint", bundle, Some(&rr), abstain),
                     false,
                     EVAL_EXPOSURE_ID,
+                );
+                crate::context::delivery::add_optional_field(
+                    &mut production,
+                    "diagnostics",
+                    diagnostics,
+                    policy.budget,
                 );
                 let mut produced = production.payload.clone();
                 let mut measured = eval.payload.clone();
@@ -537,6 +561,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy {
             explicit_fact_guard: true,
@@ -568,6 +593,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy {
             cap: 1,
@@ -604,6 +630,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy::default();
         let selected = policy.arbitrate("wal checkpoint", bundle, Some(&StubReranker), 0.0);
@@ -612,6 +639,88 @@ mod tests {
         let delivery = policy.render(selected, false, EVAL_EXPOSURE_ID);
         assert_eq!(delivery.capsules.len(), 1);
         assert!(!delivery.payload.to_string().contains("remote network"));
+    }
+
+    /// The context payload reports the floors retrieval actually applied.
+    /// A bge brain with the auto sentinel resolves `min_semantic_score` to 0.35.
+    #[test]
+    fn context_output_reports_resolved_floors_for_bge_and_an_override() {
+        crate::user_brain::with_user_brain_disabled(|| {
+            let prev = std::env::var("KIMETSU_BRAIN_EMBEDDER").ok();
+            unsafe {
+                std::env::remove_var("KIMETSU_BRAIN_EMBEDDER");
+            }
+            let root =
+                std::env::temp_dir().join(format!("kimetsu-resolved-floors-{}", ulid::Ulid::new()));
+            kimetsu_core::paths::git_init_boundary(&root);
+            project::init_project(&root, false).unwrap();
+            let paths = kimetsu_core::paths::ProjectPaths::discover(&root).unwrap();
+            let mut config = project::load_config(&paths).unwrap();
+            config.embedder.model = "bge-small-en-v1.5".to_string();
+            std::fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+            project::add_memory(
+                &root,
+                MemoryScope::Project,
+                MemoryKind::Fact,
+                "wal checkpoint protects sqlite commits",
+            )
+            .unwrap();
+
+            let session = BrainSession::open_readonly(&root).unwrap();
+            let embedder = StubEmbedder::default();
+            let request = ContextRequest {
+                query: "wal checkpoint".into(),
+                stage: "localization".into(),
+                ..Default::default()
+            };
+            let delivery = ServingPolicy::from_config(session.config())
+                .retrieve(&session, request, &embedder, None, EVAL_EXPOSURE_ID)
+                .unwrap();
+            let floors = &delivery.payload["diagnostics"];
+            assert!(
+                (floors["min_semantic_score"].as_f64().unwrap() - 0.35).abs() < 1e-5,
+                "bge auto floor: {floors}"
+            );
+            assert!(
+                (floors["rerank_min_score"].as_f64().unwrap() - 0.30).abs() < 1e-5,
+                "default rerank floor: {floors}"
+            );
+            assert!(
+                (floors["min_lexical_coverage"].as_f64().unwrap() - 0.5).abs() < 1e-5,
+                "default lexical floor: {floors}"
+            );
+            assert_eq!(floors["fusion"].as_str(), Some("linear"), "{floors}");
+
+            config.broker.rerank_min_score = 0.55;
+            std::fs::write(&paths.project_toml, config.to_toml().unwrap()).unwrap();
+            let session = BrainSession::open_readonly(&root).unwrap();
+            let request = ContextRequest {
+                query: "wal checkpoint".into(),
+                stage: "localization".into(),
+                ..Default::default()
+            };
+            let delivery = ServingPolicy::from_config(session.config())
+                .retrieve(&session, request, &embedder, None, EVAL_EXPOSURE_ID)
+                .unwrap();
+            let floors = &delivery.payload["diagnostics"];
+            assert!(
+                (floors["rerank_min_score"].as_f64().unwrap() - 0.55).abs() < 1e-5,
+                "override must be the value retrieval uses: {floors}"
+            );
+            assert!(
+                (floors["min_semantic_score"].as_f64().unwrap() - 0.35).abs() < 1e-5,
+                "{floors}"
+            );
+
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var("KIMETSU_BRAIN_EMBEDDER", v),
+                    None => std::env::remove_var("KIMETSU_BRAIN_EMBEDDER"),
+                }
+            }
+            drop(session);
+            std::fs::remove_dir_all(root).ok();
+        });
     }
 }
 
@@ -683,6 +792,7 @@ mod conflict_carry_tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         };
         let policy = ServingPolicy {
             cap: 1,
@@ -758,6 +868,7 @@ mod conflict_carry_tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         }
     }
 
