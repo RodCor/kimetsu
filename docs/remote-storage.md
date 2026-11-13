@@ -21,8 +21,8 @@ itself still needs a persistent filesystem.
 
 `stores` enables all optional providers. Selecting a provider absent from the
 build fails startup. DynamoDB dependencies, including through `stores`, require
-Rust **1.91.1+**; this optional requirement does not raise the lean workspace's
-declared Rust requirement. Release HTTP binaries use `embeddings,tls,stores`.
+Rust **1.94.1**, the workspace floor set by the aws-smithy stack. Release HTTP
+binaries use `embeddings,tls,stores`.
 The separate Lambda binary needs `lambda` plus the selected provider.
 
 ```bash

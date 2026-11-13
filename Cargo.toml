@@ -27,7 +27,7 @@ repository = "https://github.com/RodCor/kimetsu"
 homepage = "https://github.com/RodCor/kimetsu"
 documentation = "https://github.com/RodCor/kimetsu/tree/main/docs"
 readme = "README.md"
-# iroh 1.4 (kimetsu-bus) requires 1.91. rusqlite 0.41 needs 1.89.
+# iroh 1.4 (kimetsu-bus) needs 1.91 and rusqlite 0.41 needs 1.89; neither sets the floor.
 # aws-smithy-types 1.9 and aws-smithy-http 0.64.2 (the first releases
 # without unmaintained pin-utils) require 1.94.1. They sit on the default
 # kimetsu-agent graph, so the floor is 1.94.1.

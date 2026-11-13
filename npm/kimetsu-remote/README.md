@@ -39,8 +39,9 @@ server process to allow authenticated clients to record/curate memories; leave i
 unset or set it to `0` for read-only use. Health checks do not verify this opt-in.
 
 Source builds can select just `postgres` or `redis`. `dynamodb` and the `stores`
-umbrella require Rust **1.91.1+**; SQLite needs no storage feature. `lambda` builds
-the separate `kimetsu-remote-lambda` custom-runtime binary.
+umbrella require Rust **1.94.1**, the aws-smithy workspace floor; SQLite needs no
+storage feature. `lambda` builds the separate `kimetsu-remote-lambda`
+custom-runtime binary.
 See [storage configuration and limits](https://github.com/RodCor/kimetsu/blob/main/docs/remote-storage.md)
 and [Compose / SAM examples](https://github.com/RodCor/kimetsu/tree/main/deploy/remote-stateless).
 

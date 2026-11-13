@@ -9,6 +9,10 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+### Security
+
+- Bump `quinn-proto`, `quinn-udp`, and `rustix` for RUSTSEC advisories. Drop unmaintained `pin-utils` by moving `aws-config` to 1.13.0 and `aws-sdk-dynamodb` to 1.132.0. MSRV is now 1.94.1 because that aws-smithy stack requires it.
+
 ## v2.11.0: Peer network
 
 ### Network
