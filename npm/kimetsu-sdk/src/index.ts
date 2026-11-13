@@ -37,6 +37,7 @@ export type {
   CiteOutcome,
   ContextBundle,
   ContextCapsule,
+  ContextDiagnostics,
   Memory,
   MemoryKind,
   MemoryScope,

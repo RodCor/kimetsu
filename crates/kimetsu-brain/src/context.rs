@@ -431,7 +431,46 @@ pub struct ContextRequest {
     pub readable_mounts: Option<Vec<MountLevel>>,
 }
 
-#[derive(Debug, Clone)]
+/// Floors one retrieval applied.
+///
+/// Same object `kimetsu_brain_context` emits as `diagnostics`: the semantic
+/// floor, the rerank floor passed into arbitration, the lexical floor, and
+/// the fusion mode (`linear` or `rrf`). All four keys are present when the
+/// object is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextDiagnostics {
+    pub min_semantic_score: f32,
+    pub rerank_min_score: f32,
+    pub min_lexical_coverage: f32,
+    pub fusion: String,
+}
+
+impl ContextDiagnostics {
+    pub(crate) fn resolved(request: &ContextRequest, rerank_min_score: f32) -> Self {
+        Self {
+            min_semantic_score: request.min_semantic_score,
+            rerank_min_score,
+            min_lexical_coverage: request.min_lexical_coverage,
+            fusion: request.fusion.clone(),
+        }
+    }
+}
+
+/// `kimetsu_brain_context` JSON.
+///
+/// `diagnostics` is optional so a payload from before the field existed, and
+/// a payload that dropped the object to stay inside the output budget, still
+/// deserializes. Every other key is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextToolResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ContextDiagnostics>,
+    /// Keys this SDK does not name. Kept so a newer brain still deserializes.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextBundle {
     pub stage: String,
     pub budget_tokens: u32,
@@ -481,6 +520,10 @@ pub struct ContextBundle {
     pub chronological: bool,
     /// Conflicts observed in eligible evidence before delivery trimming.
     pub known_fact_conflicts: Vec<String>,
+    /// Floors this retrieval applied. Absent when the caller did not record
+    /// them. The tool payload uses the same object; see [`ContextToolResult`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ContextDiagnostics>,
 }
 
 /// Discriminating weight per query token, for *bundle* coverage.
@@ -1056,6 +1099,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
             // Nothing was rendered, so nothing was rendered in time order.
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         });
     }
 
@@ -1119,6 +1163,7 @@ pub(crate) fn retrieve_context_with_embedder_and_backend(
         uncovered_terms,
         chronological,
         known_fact_conflicts: vec![],
+        diagnostics: None,
     })
 }
 
@@ -6499,6 +6544,7 @@ mod tests {
             uncovered_terms: vec![],
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         }
     }
 
@@ -6869,6 +6915,7 @@ mod evidence_tests {
             uncovered_terms: uncovered.iter().map(|s| s.to_string()).collect(),
             chronological: false,
             known_fact_conflicts: vec![],
+            diagnostics: None,
         }
     }
 

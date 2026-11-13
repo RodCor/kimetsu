@@ -174,7 +174,77 @@ def plan(dataset: Path, name: str, profile_name: str, limit: int) -> dict:
     }
 
 
+def split_stats(group: list[dict], scored: dict) -> dict:
+    """Recall/MRR over rows with gold labels; empty rate and capsules over all rows."""
+    gold = [row for row in group if scored.get(row["id"], True)]
+
+    def mean(items, value):
+        return sum(value(item) for item in items) / len(items) if items else None
+
+    return {
+        "n": len(group),
+        "n_scored": len(gold),
+        "r1": mean(gold, lambda row: row["recall"]["@1"]),
+        "r3": mean(gold, lambda row: row["recall"]["@3"]),
+        "r8": mean(gold, lambda row: row["recall"]["@8"]),
+        "mrr": mean(gold, lambda row: row["mrr"]),
+        "empty": mean(group, lambda row: row["empty"]),
+        "capsules": mean(group, lambda row: row["capsules"]),
+    }
+
+
+def summarize_split(rows: list[dict], scored: dict) -> str:
+    def fmt(value, spec):
+        return "-" if value is None else format(value, spec)
+
+    lines = [
+        "recall@k and MRR over scored rows (n_sc); empty rate and mean capsules over all rows (n)",
+        f"{'arm':<56} {'n':>4} {'n_sc':>4} {'R@1':>6} {'R@3':>6} {'R@8':>6} {'MRR':>6} {'empty':>7} {'caps':>6}",
+    ]
+    arms = list(dict.fromkeys(row["arm"] for row in rows))
+    types = list(dict.fromkeys(row["type"] for row in rows))
+    groups = [(arm, [row for row in rows if row["arm"] == arm]) for arm in arms]
+    if len(types) > 1:
+        groups += [
+            (f"{arm} / {qtype}", [row for row in rows if row["arm"] == arm and row["type"] == qtype])
+            for arm in arms
+            for qtype in types
+        ]
+    for title, group in groups:
+        if not group:
+            continue
+        st = split_stats(group, scored)
+        lines.append(
+            f"{title[:56]:<56} {st['n']:4d} {st['n_scored']:4d} {fmt(st['r1'], '6.3f')} {fmt(st['r3'], '6.3f')} "
+            f"{fmt(st['r8'], '6.3f')} {fmt(st['mrr'], '6.3f')} {st['empty']:7.3f} {st['capsules']:6.2f}"
+        )
+    return "\n".join(lines)
+
+
+def self_test_split() -> None:
+    rows = [
+        {"id": "a", "arm": "fused", "type": "t", "recall": {"@1": 1, "@3": 1, "@8": 1}, "mrr": 1.0, "empty": 0, "capsules": 4},
+        {"id": "b", "arm": "fused", "type": "t", "recall": {"@1": 0, "@3": 1, "@8": 1}, "mrr": 0.5, "empty": 0, "capsules": 2},
+        {"id": "u", "arm": "fused", "type": "t", "recall": {"@1": 0, "@3": 0, "@8": 0}, "mrr": 0.0, "empty": 1, "capsules": 0},
+    ]
+    scored = {"a": True, "b": True, "u": False}
+    st = split_stats(rows, scored)
+    want = {"n": 3, "n_scored": 2, "r1": 0.5, "r3": 1.0, "r8": 1.0, "mrr": 0.75, "empty": 1 / 3, "capsules": 2.0}
+    for key, value in want.items():
+        if abs(st[key] - value) > 1e-9:
+            raise SystemExit(f"split_stats {key}: got {st[key]}, want {value}")
+    none = split_stats(rows[2:], scored)
+    if none["n_scored"] != 0 or none["r1"] is not None or none["empty"] != 1.0:
+        raise SystemExit(f"split_stats unscored-only group: {none}")
+    table = summarize_split(rows, scored)
+    if "   3    2  0.500  1.000  1.000  0.750   0.333   2.00" not in table:
+        raise SystemExit(f"summarize_split table:\n{table}")
+    if "-" not in summarize_split(rows[2:], scored).splitlines()[-1]:
+        raise SystemExit("summarize_split should print - for recall with no scored rows")
+
+
 def self_test() -> int:
+    self_test_split()
     fixture = HERE / "fixtures" / "retrieval_eval.json"
     bench = plan(fixture, "fixture", "bench", 0)
     if bench["questions"] < 2 or bench["scored"] != bench["questions"]:
@@ -235,19 +305,21 @@ def main() -> int:
         return 0
     started = time.time()
     payload = [{key: value for key, value in question.items() if key != "scored"} for question in questions]
-    rc = rs.evaluate(binary, payload, args.out)
+    # Replace retrieval_eval's table, which averages recall/MRR over every row,
+    # including questions with no gold label (always 0).
+    original_summarize = rs.summarize
+    rs.summarize = lambda rows: summarize_split(rows, scored)
+    try:
+        rc = rs.evaluate(binary, payload, args.out)
+    finally:
+        rs.summarize = original_summarize
     rows = [json.loads(line) for line in args.out.read_text().splitlines()]
     with args.out.open("w") as handle:
         for row in rows:
             row["dataset"] = args.name
             row["scored"] = scored[row["id"]]
             handle.write(json.dumps(row, sort_keys=True) + "\n")
-    # rs.evaluate's printed table averages recall/MRR over every row, including
-    # questions with no gold label (always 0). Re-report over scored rows only.
     scored_rows = [row for row in rows if row["scored"]]
-    print(f"\nscored questions only (recall/MRR denominator): {len(scored_rows)} of {len(rows)} rows")
-    if scored_rows:
-        print(rs.summarize(scored_rows))
     meta = {
         "dataset": args.name,
         "questions": len(questions),

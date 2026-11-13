@@ -9,6 +9,8 @@ breaking changes require a major bump.
 
 ## Unreleased
 
+- SDK `ContextBundle` and the `kimetsu_brain_context` tool schema include optional `diagnostics` (`min_semantic_score`, `rerank_min_score`, `min_lexical_coverage`, `fusion`).
+
 ### Security
 
 - Bump `quinn-proto`, `quinn-udp`, and `rustix` for RUSTSEC advisories. Drop unmaintained `pin-utils` by moving `aws-config` to 1.13.0 and `aws-sdk-dynamodb` to 1.132.0. MSRV is now 1.94.1 because that aws-smithy stack requires it.
