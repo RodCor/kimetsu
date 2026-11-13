@@ -7,7 +7,13 @@
 # /workspace/kimetsu-memory-bench/embeddings, model cache
 # /workspace/fuse/model-cache, cargo /home/box/.cargo/bin/cargo).
 # This script takes those from flags or the environment. Defaults are
-# repo-relative, and the commit defaults to HEAD.
+# repo-relative, and the commit defaults to HEAD. Data defaults to
+# $REPO/e0-data and output to $REPO/e0s-results; both are gitignored, and
+# a rerun into that output directory is a normal run. The Rust baseline
+# defaults to the merge-base of HEAD and origin/main, or to HEAD when
+# that ref is absent. E0S_MAIN_SHA overrides it. The 2026-11-13 run
+# compared against main 19112dae937fb3b1842983943a0def6fad75f4b1; that
+# pin is not the default.
 #
 # Usage:
 #   scripts/experiments/e0s/run_e0s.sh [--data-dir DIR] [--out DIR] [--bin PATH]
@@ -38,15 +44,112 @@ fi
 PROFILE=bench-sweep
 DATASETS=(locomo-conv26 lme-oracle)
 RUNS=(run1 run2)
-RECORDED_MAIN=19112dae937fb3b1842983943a0def6fad75f4b1
 
-usage() { sed -n '2,25p' "$SCRIPT_PATH"; }
+usage() { sed -n '2,31p' "$SCRIPT_PATH"; }
 die() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] FAIL: $2" >&2; exit "$1"; }
 ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 log() { echo "[$(ts)] $*"; }
 show_config() {
   printf 'repo=%s\nsha=%s\nmain=%s\ndata=%s\nout=%s\nbin=%s\nprofile=%s\n' \
     "$REPO" "$SHA" "$MAIN_SHA" "$DATA" "$OUT" "$BIN" "$PROFILE"
+}
+default_main_sha() {
+  if git -C "$REPO" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+    git -C "$REPO" merge-base HEAD refs/remotes/origin/main
+  else
+    git -C "$REPO" rev-parse HEAD
+  fi
+}
+# Path relative to REPO, when the path is inside it. Empty when it is the repo root.
+repo_rel() {
+  local parent base abs
+  parent=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  [[ -d $parent ]] || return 1
+  abs=$(cd -- "$parent" && pwd)/$base
+  case $abs in
+    "$REPO") printf '\n'; return 0 ;;
+    "$REPO"/*) printf '%s\n' "${abs#"$REPO"/}"; return 0 ;;
+  esac
+  return 1
+}
+# Source dirt only. Default data and output live in the tree and must not
+# fail a rerun; other paths inside the repo still do.
+source_porcelain() {
+  local spec=(-- .) rel
+  if rel=$(repo_rel "$OUT") && [[ -n $rel ]]; then
+    spec+=(":(exclude)$rel")
+  fi
+  if rel=$(repo_rel "$DATA") && [[ -n $rel ]]; then
+    spec+=(":(exclude)$rel")
+  fi
+  git -C "$REPO" status --porcelain -- "${spec[@]}"
+}
+# Fresh run and rerun on a clean clone, using the default data and output
+# directories and the default baseline (current HEAD, including a Rust
+# commit that is already on origin/main). A stub binary stands in for kimetsu.
+exercise_default_runs() {
+  local work src stub head base rc log i recorded
+  recorded=19112dae937fb3b1842983943a0def6fad75f4b1
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  src=$work/src
+  git clone --local --quiet "$REPO" "$src"
+  git -C "$src" checkout -q "$(git -C "$REPO" rev-parse HEAD)"
+  cp "$SCRIPT_PATH" "$src/scripts/experiments/e0s/run_e0s.sh"
+  cp "$REPO/.gitignore" "$src/.gitignore"
+  chmod +x "$src/scripts/experiments/e0s/run_e0s.sh"
+  git -C "$src" add scripts/experiments/e0s/run_e0s.sh .gitignore
+  if ! git -C "$src" diff --cached --quiet; then
+    git -C "$src" -c user.name='e0s self-test' -c user.email='e0s-self-test@example.com' \
+      commit -q -m "self-test runner defaults"
+  fi
+  printf '\n// e0s self-test marker\n' >> "$src/crates/kimetsu-core/src/lib.rs"
+  git -C "$src" add crates/kimetsu-core/src/lib.rs
+  git -C "$src" -c user.name='e0s self-test' -c user.email='e0s-self-test@example.com' \
+    commit -q -m "simulate main rust move"
+  git -C "$src" update-ref refs/remotes/origin/main HEAD
+  head=$(git -C "$src" rev-parse HEAD)
+  [[ $head != "$recorded" ]] || die 2 "clone HEAD is still the recorded main"
+  mkdir -p "$src/e0-data"
+  cp "$REPO/scripts/fixtures/retrieval_eval.json" "$src/e0-data/locomo-conv26.json"
+  cp "$REPO/scripts/fixtures/retrieval_eval.json" "$src/e0-data/lme-oracle.json"
+  stub=$work/stub-kimetsu
+  cat > "$stub" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  echo "kimetsu test (embeddings)"
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$stub"
+  for i in 1 2; do
+    log=$work/run$i.log
+    set +e
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 120 bash "$src/scripts/experiments/e0s/run_e0s.sh" --bin "$stub" >"$log" 2>&1
+    else
+      bash "$src/scripts/experiments/e0s/run_e0s.sh" --bin "$stub" >"$log" 2>&1
+    fi
+    rc=$?
+    set -e
+    if ! grep -q "preflight ok" "$log"; then
+      die 2 "default run $i did not pass preflight (rc $rc): $(tail -n 40 "$log")"
+    fi
+    [[ $rc -ne 2 && $rc -ne 3 ]] || die 2 "default run $i stopped in preflight (rc $rc): $(tail -n 40 "$log")"
+    base=$(sed -n 's/.*baseline \([^ ,]*\).*/\1/p' "$log")
+    [[ $base == "$head" ]] || die 2 "run $i baseline is $base, clone HEAD is $head"
+    [[ $base != "$recorded" ]] || die 2 "run $i baseline is still the recorded main"
+    if grep -q "checkout changes Rust" "$log"; then
+      die 2 "run $i rejected Rust vs baseline: $(tail -n 20 "$log")"
+    fi
+  done
+  git -C "$src" check-ignore -q e0s-results || die 2 "e0s-results is not ignored"
+  git -C "$src" check-ignore -q e0-data || die 2 "e0-data is not ignored"
+  [[ -d $src/e0s-results ]] || die 2 "default out dir was not created"
+  dirty=$(git -C "$src" status --porcelain)
+  [[ -z "$dirty" ]] || die 2 "clone dirty after default runs: $dirty"
 }
 
 DRY=0
@@ -88,7 +191,7 @@ DATA=${DATA:-$REPO/e0-data}
 PY=${PYTHON:-python3}
 CARGO=${CARGO:-cargo}
 SHA=${SHA_ARG:-$(git -C "$REPO" rev-parse HEAD)}
-MAIN_SHA=${E0S_MAIN_SHA:-$RECORDED_MAIN}
+MAIN_SHA=${E0S_MAIN_SHA:-$(default_main_sha)}
 if [[ -n $BIN_ARG ]]; then
   BIN=$BIN_ARG
 else
@@ -105,7 +208,7 @@ if (( SELF_TEST )); then
   [[ $DATA == "$REPO/e0-data" ]] || die 2 "default data is $DATA"
   [[ $BIN == "$OUT/bin/kimetsu" ]] || die 2 "default bin is $BIN"
   [[ -f $REPO/Cargo.toml && -f $REPO/scripts/e0_eval.py ]] || die 2 "repo root $REPO is not a checkout"
-  [[ $MAIN_SHA == "$RECORDED_MAIN" ]] || die 2 "default main sha is $MAIN_SHA"
+  [[ $MAIN_SHA == "$(default_main_sha)" ]] || die 2 "default baseline is $MAIN_SHA"
   # Split so this check does not match its own source line.
   needle_ws=$(printf '%s%s' /work space)
   needle_home=$(printf '%s%s%s' /home / box)
@@ -131,6 +234,7 @@ if (( SELF_TEST )); then
     || die 2 "dry-run did not report locomo counts: $dry"
   [[ $dry == *"data lme-oracle: 3 questions, 3 scored"* ]] \
     || die 2 "dry-run did not report lme counts: $dry"
+  exercise_default_runs
   echo "run_e0s self-test ok"
   exit 0
 fi
@@ -140,7 +244,7 @@ if (( SHOW )); then
   exit 0
 fi
 
-log "E0 sweep runner pid $$, profile $PROFILE, sha $SHA, repo $REPO"
+log "E0 sweep runner pid $$, profile $PROFILE, sha $SHA, baseline $MAIN_SHA, repo $REPO"
 log "data $DATA out $OUT bin $BIN"
 
 [[ -f $REPO/Cargo.toml ]] || die 2 "missing $REPO/Cargo.toml"
@@ -226,7 +330,8 @@ if [[ -z $BIN_ARG ]]; then
   command -v "$CARGO" >/dev/null || die 2 "cargo not found: $CARGO"
 fi
 [[ $(git -C "$REPO" rev-parse HEAD) == "$SHA" ]] || die 2 "HEAD != $SHA"
-[[ -z $(git -C "$REPO" status --porcelain) ]] || die 2 "worktree has local changes"
+dirty=$(source_porcelain)
+[[ -z "$dirty" ]] || { printf '%s\n' "$dirty" >&2; die 2 "worktree has local changes"; }
 git -C "$REPO" diff --quiet "$MAIN_SHA" "$SHA" -- crates Cargo.toml Cargo.lock \
   || die 2 "checkout changes Rust vs $MAIN_SHA"
 if [[ -n ${E0S_MODEL_CACHE:-} && ! -d ${E0S_MODEL_CACHE} ]]; then
@@ -247,7 +352,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-( while :; do echo "$(date +%s) $(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"; sleep 30; done ) > "$LOGS/memavailable.log" &
+# Close the lock fd. Otherwise sleep inherits it and a rerun exits 5 until that sleep ends.
+( while :; do echo "$(date +%s) $(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"; sleep 30; done ) > "$LOGS/memavailable.log" 9>&- &
 MEMLOG=$!
 
 mkdir -p "$CACHE" "$OUT/bin" "$OUT/tmp"
@@ -269,7 +375,9 @@ VERSION=$("$BIN" --version)
 BIN_SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
 log "built $VERSION sha256=$BIN_SHA"
 grep -q embeddings <<<"$VERSION" || die 3 "binary is not an embeddings build: $VERSION"
-[[ -z $(git -C "$REPO" status --porcelain) ]] || die 3 "worktree dirty after build"
+dirty=$(source_porcelain)
+[[ -z "$dirty" ]] || { printf '%s\n' "$dirty" >&2; die 3 "worktree dirty after build"; }
+log "preflight ok"
 
 for r in "${RUNS[@]}"; do
   mkdir -p "$OUT/$r" "$OUT/tmp/$r"

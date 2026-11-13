@@ -59,3 +59,7 @@
 memories-export*.json
 
 target-linux/
+
+# Default data and output for scripts/experiments/e0s/run_e0s.sh.
+/e0-data/
+/e0s-results/
