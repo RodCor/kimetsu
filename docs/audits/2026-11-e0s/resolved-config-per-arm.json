@@ -1,0 +1,788 @@
+{
+  "locomo-conv26": {
+    "arms": {
+      "fused_defaults": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "fused defaults: linear, auto semantic floor, tinybert floor 0.3",
+        "patch": {
+          "broker.rerank_min_score": "0.3",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "lexical": {
+        "embedder_enabled": "false",
+        "embedder_model_effective": "bge-small-en-v1.5",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": "inert: no query embedding (embedder off)",
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"off\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "embedder.enabled=false, embedder.reranker=off (FTS only)",
+        "patch": {
+          "embedder.enabled": "false",
+          "embedder.reranker": "\"off\""
+        }
+      },
+      "rerank_off": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"off\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "embedder.reranker=off",
+        "patch": {
+          "embedder.reranker": "\"off\""
+        }
+      },
+      "rrf_k60": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"rrf\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "rrf k=60 (hardcoded DEFAULT_RRF_K): broker.fusion=rrf",
+        "patch": {
+          "broker.fusion": "\"rrf\"",
+          "broker.rerank_min_score": "0.3",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "semantic_floor_0": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.0,
+            "note": null,
+            "source": "config broker.min_semantic_score=0.0"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "broker.min_semantic_score=0.0",
+        "patch": {
+          "broker.min_semantic_score": "0.0",
+          "broker.rerank_min_score": "0.3",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "tinybert_floor_0.1": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.10000000149011612",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "broker.rerank_min_score=0.1",
+        "patch": {
+          "broker.rerank_min_score": "0.1",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "tinybert_floor_0.2": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.20000000298023224",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "broker.rerank_min_score=0.2",
+        "patch": {
+          "broker.rerank_min_score": "0.2",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "tinybert_floor_0_fill_to_cap": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.0",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "fill-to-cap (reorder only), tinybert floor 0: broker.rerank_min_score=0.0",
+        "patch": {
+          "broker.rerank_min_score": "0.0",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      }
+    },
+    "mcp_args": {
+      "abstain_evidence": 0.0,
+      "budget_tokens": 16000,
+      "max_capsules": 8,
+      "min_lexical_coverage": 0.0,
+      "min_score": 0.0
+    },
+    "base_patch": {
+      "broker.session_dedupe": "false",
+      "broker.warm_start": "false",
+      "embedder.enabled": "true",
+      "embedder.model": "\"bge-small-en-v1.5\"",
+      "kimetsu.use_user_brain": "false"
+    },
+    "semantic_floor_note": "fused_defaults semantic floor is inferred: config -1 -> auto 0.35 for bge (project.rs:389-391)",
+    "identical_run1_run2": false,
+    "full_dumps": [
+      "/workspace/fuse/e0s/results/run1/resolved-config-locomo-conv26.json",
+      "/workspace/fuse/e0s/results/run2/resolved-config-locomo-conv26.json"
+    ]
+  },
+  "lme-oracle": {
+    "arms": {
+      "fused_defaults": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "fused defaults: linear, auto semantic floor, tinybert floor 0.3",
+        "patch": {
+          "broker.rerank_min_score": "0.3",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "lexical": {
+        "embedder_enabled": "false",
+        "embedder_model_effective": "bge-small-en-v1.5",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": "inert: no query embedding (embedder off)",
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"off\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "embedder.enabled=false, embedder.reranker=off (FTS only)",
+        "patch": {
+          "embedder.enabled": "false",
+          "embedder.reranker": "\"off\""
+        }
+      },
+      "rerank_off": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"off\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "embedder.reranker=off",
+        "patch": {
+          "embedder.reranker": "\"off\""
+        }
+      },
+      "rrf_k60": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"rrf\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "rrf k=60 (hardcoded DEFAULT_RRF_K): broker.fusion=rrf",
+        "patch": {
+          "broker.fusion": "\"rrf\"",
+          "broker.rerank_min_score": "0.3",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "semantic_floor_0": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.0,
+            "note": null,
+            "source": "config broker.min_semantic_score=0.0"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "broker.min_semantic_score=0.0",
+        "patch": {
+          "broker.min_semantic_score": "0.0",
+          "broker.rerank_min_score": "0.3",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "tinybert_floor_0.1": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.10000000149011612",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "broker.rerank_min_score=0.1",
+        "patch": {
+          "broker.rerank_min_score": "0.1",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "tinybert_floor_0.2": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.20000000298023224",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "broker.rerank_min_score=0.2",
+        "patch": {
+          "broker.rerank_min_score": "0.2",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      },
+      "tinybert_floor_0_fill_to_cap": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.0",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\"",
+        "knob": "fill-to-cap (reorder only), tinybert floor 0: broker.rerank_min_score=0.0",
+        "patch": {
+          "broker.rerank_min_score": "0.0",
+          "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+        }
+      }
+    },
+    "mcp_args": {
+      "abstain_evidence": 0.0,
+      "budget_tokens": 16000,
+      "max_capsules": 8,
+      "min_lexical_coverage": 0.0,
+      "min_score": 0.0
+    },
+    "base_patch": {
+      "broker.session_dedupe": "false",
+      "broker.warm_start": "false",
+      "embedder.enabled": "true",
+      "embedder.model": "\"bge-small-en-v1.5\"",
+      "kimetsu.use_user_brain": "false"
+    },
+    "semantic_floor_note": "fused_defaults semantic floor is inferred: config -1 -> auto 0.35 for bge (project.rs:389-391)",
+    "identical_run1_run2": false,
+    "full_dumps": [
+      "/workspace/fuse/e0s/results/run1/resolved-config-lme-oracle.json",
+      "/workspace/fuse/e0s/results/run2/resolved-config-lme-oracle.json"
+    ]
+  }
+}

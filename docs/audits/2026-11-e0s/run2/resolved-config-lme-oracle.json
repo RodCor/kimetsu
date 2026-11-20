@@ -1,0 +1,1046 @@
+{
+  "arms": {
+    "fused_defaults": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.30000001192092896"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"ms-marco-tinybert-l-2-v2\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "fused defaults: linear, auto semantic floor, tinybert floor 0.3",
+      "patch": {
+        "broker.rerank_min_score": "0.3",
+        "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.3\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "lexical": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.30000001192092896"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"off\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": null,
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "embedder.enabled=false, embedder.reranker=off (FTS only)",
+      "patch": {
+        "embedder.enabled": "false",
+        "embedder.reranker": "\"off\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.3\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = false\ndaemon = true\nwarm_on_start = true\nreranker = \"off\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "false",
+        "embedder_model_effective": "bge-small-en-v1.5",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": "inert: no query embedding (embedder off)",
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"off\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "rerank_off": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.30000001192092896"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"off\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "embedder.reranker=off",
+      "patch": {
+        "embedder.reranker": "\"off\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.3\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"off\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"off\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "rrf_k60": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"rrf\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.30000001192092896"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"ms-marco-tinybert-l-2-v2\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "rrf k=60 (hardcoded DEFAULT_RRF_K): broker.fusion=rrf",
+      "patch": {
+        "broker.fusion": "\"rrf\"",
+        "broker.rerank_min_score": "0.3",
+        "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"rrf\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.3\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"rrf\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "semantic_floor_0": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "0.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.30000001192092896"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"ms-marco-tinybert-l-2-v2\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "broker.min_semantic_score=0.0",
+      "patch": {
+        "broker.min_semantic_score": "0.0",
+        "broker.rerank_min_score": "0.3",
+        "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = 0.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.3\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.0,
+            "note": null,
+            "source": "config broker.min_semantic_score=0.0"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.30000001192092896",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "tinybert_floor_0.1": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.10000000149011612"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"ms-marco-tinybert-l-2-v2\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "broker.rerank_min_score=0.1",
+      "patch": {
+        "broker.rerank_min_score": "0.1",
+        "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.1\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.10000000149011612",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "tinybert_floor_0.2": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.20000000298023224"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"ms-marco-tinybert-l-2-v2\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "broker.rerank_min_score=0.2",
+      "patch": {
+        "broker.rerank_min_score": "0.2",
+        "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.2\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.20000000298023224",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\""
+      }
+    },
+    "tinybert_floor_0_fill_to_cap": {
+      "config_get": {
+        "broker.abstain_min_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.ambient": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.compress_capsules": {
+          "rc": 0,
+          "value": "true"
+        },
+        "broker.default_budget_tokens": {
+          "rc": 0,
+          "value": "6000"
+        },
+        "broker.fusion": {
+          "rc": 0,
+          "value": "\"linear\""
+        },
+        "broker.max_capsules": {
+          "rc": 0,
+          "value": "8"
+        },
+        "broker.min_lexical_coverage": {
+          "rc": 0,
+          "value": "0.5"
+        },
+        "broker.min_semantic_score": {
+          "rc": 0,
+          "value": "-1.0"
+        },
+        "broker.normalization": {
+          "rc": 0,
+          "value": "\"per_kind\""
+        },
+        "broker.rerank_min_score": {
+          "rc": 0,
+          "value": "0.0"
+        },
+        "broker.session_dedupe": {
+          "rc": 0,
+          "value": "false"
+        },
+        "broker.warm_start": {
+          "rc": 0,
+          "value": "false"
+        },
+        "embedder.enabled": {
+          "rc": 0,
+          "value": "true"
+        },
+        "embedder.model": {
+          "rc": 0,
+          "value": "\"bge-small-en-v1.5\""
+        },
+        "embedder.reranker": {
+          "rc": 0,
+          "value": "\"ms-marco-tinybert-l-2-v2\""
+        },
+        "kimetsu.use_user_brain": {
+          "rc": 0,
+          "value": "false"
+        },
+        "retrieval.level": {
+          "rc": 0,
+          "value": "\"deep\""
+        }
+      },
+      "env": {
+        "FASTEMBED_CACHE_DIR": "/workspace/fuse/e0s/model-cache",
+        "HF_HOME": "/workspace/fuse/e0s/model-cache",
+        "KIMETSU_BRAIN_AMBIENT": "off",
+        "KIMETSU_BRAIN_EMBEDDER": "bge-small-en-v1.5",
+        "KIMETSU_INTRA_THREADS": "1",
+        "KIMETSU_USER_BRAIN": "0",
+        "OMP_NUM_THREADS": "1"
+      },
+      "knob": "fill-to-cap (reorder only), tinybert floor 0: broker.rerank_min_score=0.0",
+      "patch": {
+        "broker.rerank_min_score": "0.0",
+        "embedder.reranker": "\"ms-marco-tinybert-l-2-v2\""
+      },
+      "project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.0\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+      "resolved": {
+        "embedder_enabled": "true",
+        "embedder_model_effective": "bge-small-en-v1.5 (KIMETSU_BRAIN_EMBEDDER env wins over config)",
+        "fusion": "\"linear\"",
+        "max_capsules_config": "8",
+        "normalization": "\"per_kind\"",
+        "request_floors": {
+          "abstain_evidence": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "budget_tokens": {
+            "effective": 16000,
+            "source": "mcp arg"
+          },
+          "max_capsules": {
+            "effective": 8,
+            "source": "mcp arg"
+          },
+          "min_lexical_coverage": {
+            "effective": 0.0,
+            "source": "mcp arg 0.0"
+          },
+          "min_score": {
+            "effective": 0.0,
+            "source": "mcp arg"
+          },
+          "min_semantic_score": {
+            "effective": 0.35,
+            "note": null,
+            "source": "config broker.min_semantic_score=-1.0 -> auto (bge-small-en-v1.5) 0.35"
+          },
+          "stage": {
+            "effective": "localization",
+            "source": "mcp default"
+          }
+        },
+        "rerank_min_score": "0.0",
+        "reranker": "\"ms-marco-tinybert-l-2-v2\"",
+        "retrieval_level": "\"deep\""
+      }
+    }
+  },
+  "base_patch": {
+    "broker.session_dedupe": "false",
+    "broker.warm_start": "false",
+    "embedder.enabled": "true",
+    "embedder.model": "\"bge-small-en-v1.5\"",
+    "kimetsu.use_user_brain": "false"
+  },
+  "binary": "/workspace/fuse/e0s/bin/kimetsu-e0s",
+  "init_project_toml": "[kimetsu]\nproject_id = \"kimetsu-e0-config-qcivnqgf\"\nschema_version = 1\nuse_user_brain = false\nmcp_write_tools = true\n\n[model]\nprovider = \"anthropic\"\nmodel = \"claude-opus-4-7\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nmax_output_tokens = 8192\ntemperature = 0.2\nrequest_timeout_secs = 120\nregion_env = \"AWS_REGION\"\n\n[broker]\ndefault_budget_tokens = 6000\nmax_capsules = 8\nmin_semantic_score = -1.0\nmin_lexical_coverage = 0.5\nfusion = \"linear\"\nnormalization = \"per_kind\"\nabstain_min_score = -1.0\nrerank_min_score = 0.3\nexplicit_fact_guard = false\nbudget_floor_tokens = 1500\nbudget_run_cap_tokens = 8000\nambient = true\ncompress_capsules = true\nsession_dedupe = false\nwarm_start = false\nanswer_grade_min_score = 0.92\nproactive_prefetch = false\n\n[broker.weights]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\ndecay_half_life_days = 30.0\n\n[broker.weights.localization]\nrelevance = 0.7\nconfidence = 0.1\nfreshness = 0.1\nscope = 0.1\n\n[broker.weights.patch_plan]\nrelevance = 0.4\nconfidence = 0.3\nfreshness = 0.1\nscope = 0.2\n\n[broker.weights.verification]\nrelevance = 0.4\nconfidence = 0.1\nfreshness = 0.4\nscope = 0.1\n\n[broker.weights.review]\nrelevance = 0.5\nconfidence = 0.2\nfreshness = 0.2\nscope = 0.1\n\n[shell]\ndefault_timeout_secs = 60\nmax_timeout_secs = 600\nenv_allowlist_extra = [\n    \"RUSTFLAGS\",\n    \"CARGO_HOME\",\n]\nredact_secrets = true\n\n[ingestion]\nmax_file_bytes = 524288\nextra_skip_dirs = []\nmax_total_files = 50000\ndetect_conflicts = true\nresolve_conflicts = false\ninitial_importance_scoring = true\nquality_filter_enabled = true\nquality_filter_novelty_threshold = 0.9\nquality_filter_min_len = 10\nquality_filter_max_len = 500\ntransient_ttl_days = 7\n\n[run]\nmax_total_tool_calls = 60\nmax_total_model_turns = 30\nmax_total_cost_usd = 250.0\n\n[embedder]\nmodel = \"bge-small-en-v1.5\"\nenabled = true\ndaemon = true\nwarm_on_start = true\nreranker = \"ms-marco-tinybert-l-2-v2\"\n\n[learning]\nauto_harvest = true\nstore_queries = true\n\n[learning.distiller]\nenabled = false\nprovider = \"anthropic\"\nmodel = \"claude-haiku-4-5\"\napi_key_env = \"ANTHROPIC_API_KEY\"\nbase_url_env = \"ANTHROPIC_BASE_URL\"\nregion_env = \"AWS_REGION\"\n\n[storage]\nbackend = \"graph-lite\"\n\n[sync]\nmachine_id = \"\"\nauto = true\n\n[lifecycle]\nforget_enabled = false\nforget_min_age_days = 90\nforget_usefulness_floor = -0.1\nforget_protect_use_count = 10\nregret_flag_threshold = 5\nproposal_expiry_days = 30\nproposal_auto_accept_confidence = 1.1\n\n[retrieval]\nlevel = \"deep\"\n\n[decisions]\nprovider = \"disabled\"\n",
+  "mcp_args": {
+    "abstain_evidence": 0.0,
+    "budget_tokens": 16000,
+    "max_capsules": 8,
+    "min_lexical_coverage": 0.0,
+    "min_score": 0.0
+  },
+  "profile": "bench-sweep"
+}

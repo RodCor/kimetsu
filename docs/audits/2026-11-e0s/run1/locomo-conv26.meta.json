@@ -1,0 +1,14 @@
+{
+  "dataset": "locomo-conv26",
+  "questions": 199,
+  "rows": 1791,
+  "rows_scored": 1773,
+  "metrics_note": "recall/MRR are valid only over rows with scored=true; empty rate and capsules over all rows",
+  "exit": 0,
+  "wall_s": 4251.2,
+  "peak_child_rss_mib_rusage": 239.5,
+  "peak_self_rss_mib": 81.4,
+  "profile": "bench-sweep",
+  "seed": null,
+  "seed_note": "no component takes a seed; PYTHONHASHSEED pinned by runner"
+}

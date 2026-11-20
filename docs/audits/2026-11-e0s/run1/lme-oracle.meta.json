@@ -1,0 +1,14 @@
+{
+  "dataset": "lme-oracle",
+  "questions": 500,
+  "rows": 4500,
+  "rows_scored": 4311,
+  "metrics_note": "recall/MRR are valid only over rows with scored=true; empty rate and capsules over all rows",
+  "exit": 0,
+  "wall_s": 6316.1,
+  "peak_child_rss_mib_rusage": 274.4,
+  "peak_self_rss_mib": 60.1,
+  "profile": "bench-sweep",
+  "seed": null,
+  "seed_note": "no component takes a seed; PYTHONHASHSEED pinned by runner"
+}
