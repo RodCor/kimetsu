@@ -1,0 +1,90 @@
+--- run_e0s.sh	2026-11-17 20:03:28.481289713 -0300
++++ rerun_run2.sh	2026-11-20 13:51:02.037049456 -0300
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env bash
+-# E0+sweep runner (#68). Spec: gauge, ML room, 2026-11-13. Prepared by fuse.
++# E0+sweep run2 rerun (#68), gauge ML room 2026-11-20. Derived from run_e0s.sh (sha256 4b4155f1):
++# same eval env/commands/data/binary; run1 kept as-is; no rebuild (reuses bin/kimetsu-e0s, sha checked).
++# Original run2 died at conv-26 q198 (box reboot); its partial output is in results/run2.died-20261117.
+ # Based on /workspace/fuse/e0/run_e0.sh, WITHOUT the wait-for-llama-server gate
+ # (free RAM is logged only). Runs under memcap.py (5 GiB tree RSS cap) at nice 19.
+ # Exit: 0 done (see results/determinism-diff.md), 2 preflight, 3 build, 4 eval, 5 already running.
+@@ -40,10 +42,12 @@
+ 
+ exec 9>"$S/run_e0s.lock"; flock -n 9 || die 5 "another run_e0s.sh holds $S/run_e0s.lock"
+ log "E0+sweep runner pid $$, profile $PROFILE, nice $(nice)"
+-[[ "$(git -C "$WT" rev-parse HEAD)" == "$SHA" ]] || die 2 "worktree HEAD != $SHA"
++HEAD_SHA=$(git -C "$WT" rev-parse HEAD)
++git -C "$WT" diff --quiet "$SHA" HEAD -- . ":!scripts/experiments/e0s" || die 2 "worktree $HEAD_SHA differs from $SHA outside scripts/experiments/e0s"
++(cd "$S" && sha256sum -c --quiet <(grep -v "^#" wrapper-sha256.txt)) || die 2 "pinned hashes in wrapper-sha256.txt do not match"
+ [[ -z "$(git -C "$WT" status --porcelain)" ]] || die 2 "worktree has local changes"
+ git -C "$WT" diff --quiet "$MAIN_SHA" "$SHA" -- crates Cargo.toml Cargo.lock || die 2 "branch changes Rust vs main"
+-for f in "$DATA/locomo-conv26.json" "$DATA/lme-oracle.json" "$BENCH_E/zig-cxx" "$BENCH_E/lib/libc++.a" /workspace/fuse/model-cache; do
++for f in "$DATA/locomo-conv26.json" "$DATA/lme-oracle.json" "$CACHE" "$BIN"; do   # build toolchain not needed (no rebuild)
+   [[ -e "$f" ]] || die 2 "missing $f"
+ done
+ "$PY" "$WT/scripts/e0_eval.py" --self-test >/dev/null || die 2 "e0_eval --self-test failed"
+@@ -57,24 +61,16 @@
+ done
+ log "MemAvailable $(avail_mib) MiB (logged only; cap is the 5 GiB memcap watchdog)"
+ mkdir -p "$LOGS" "$RES"; START=$(ts)
+-( while :; do echo "$(date +%s) $(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"; sleep 30; done ) > "$LOGS/memavailable.log" & MEMLOG=$!
++( while :; do echo "$(date +%s) $(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"; sleep 30; done ) > "$LOGS/memavailable.rerun2.log" & MEMLOG=$!
+ trap 'kill $MEMLOG 2>/dev/null || true' EXIT
+ 
+-mkdir -p "$TC/bin" "$S/bin"
+-[[ -e $TC/zig-cxx ]] || cp "$BENCH_E/zig-cxx" "$TC/zig-cxx"
+-[[ -d $TC/lib ]] || cp -r "$BENCH_E/lib" "$TC/lib"
+-for c in c++ g++; do [[ -e $TC/bin/$c ]] || cp /home/box/.local/bin/$c "$TC/bin/$c"; done
+-[[ -d $CACHE ]] || cp -r /workspace/fuse/model-cache "$CACHE"
+-(cd "$CACHE" && find . -name '*.onnx' -o -name 'tokenizer.json' | sort | xargs -r sha256sum) > "$LOGS/model-sha256.before"
+-log "building release at $SHA (Rust == main $MAIN_SHA; nice 19, -j2) -> $LOGS/build.log"
+-( cd "$WT" && "${build_env[@]}" "${build_cmd[@]}" ) > "$LOGS/build.log" 2>&1 || die 3 "cargo build failed; tail $LOGS/build.log"
+-cp "$TARGET/release/kimetsu" "$BIN"
++EXPECT_BIN_SHA=262f17def1cfd67f07aaec325a2f2d23aa058d393adefc463d4bfc4c33391985   # run1 binary (run_e0s.log 2026-11-13 13:22)
+ VERSION=$("$BIN" --version); BIN_SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
+-log "built $VERSION sha256=$BIN_SHA"
+-grep -q embeddings <<<"$VERSION" || die 3 "binary is not an embeddings build: $VERSION"
+-[[ -z "$(git -C "$WT" status --porcelain)" ]] || die 3 "worktree dirty after build"
+-
+-for r in "${RUNS[@]}"; do
++[[ "$BIN_SHA" == "$EXPECT_BIN_SHA" ]] || die 3 "binary sha $BIN_SHA != run1 $EXPECT_BIN_SHA"
++log "reusing run1 binary $VERSION sha256=$BIN_SHA (no rebuild)"
++(cd "$CACHE" && find . -name '*.onnx' -o -name 'tokenizer.json' | sort | xargs -r sha256sum) > "$LOGS/model-sha256.rerun2.before"
++cmp -s "$LOGS/model-sha256.before" "$LOGS/model-sha256.rerun2.before" || die 2 "model files differ from run1's model-sha256.before"
++for r in run2; do
+   mkdir -p "$RES/$r" "$S/tmp/$r"
+   for ds in "${DATASETS[@]}"; do
+     meta=$RES/$r/$ds.meta.json
+@@ -89,8 +85,8 @@
+   "$PY" "$WT/scripts/experiments/e0/summarize_e0.py" summary "$RES/$r" > /dev/null
+   "$PY" "$S/sweep_hist.py" "$RES/$r"
+ done
+-(cd "$CACHE" && find . -name '*.onnx' -o -name 'tokenizer.json' | sort | xargs -r sha256sum) > "$LOGS/model-sha256.after"
+-cmp -s "$LOGS/model-sha256.before" "$LOGS/model-sha256.after" || log "WARNING: model files changed during the run"
++(cd "$CACHE" && find . -name '*.onnx' -o -name 'tokenizer.json' | sort | xargs -r sha256sum) > "$LOGS/model-sha256.rerun2.after"
++cmp -s "$LOGS/model-sha256.before" "$LOGS/model-sha256.rerun2.after" || log "WARNING: model files changed during the run"
+ 
+ set +e; "$PY" "$WT/scripts/experiments/e0/summarize_e0.py" diff "$RES/run1" "$RES/run2" "$RES/determinism-diff.md"; DET=$?; set -e
+ "$PY" - "$RES" <<'PYEOF'
+@@ -110,16 +106,16 @@
+ PYEOF
+ END=$(ts)
+ {
+-  echo "# E0+sweep manifest"; echo
++  echo "# E0+sweep manifest (run1 2026-11-13; run2 rerun 2026-11-20 via $S/rerun_run2.sh, worktree HEAD $HEAD_SHA)"; echo
+   echo "- spec: gauge, ML room 2026-11-13 (E0+sweep, #68). runner: $S/run_e0s.sh under $S/memcap.py (5 GiB tree RSS cap), nice 19"
+-  echo "- started: $START; finished: $END"
++  echo "- run2 rerun started: $START; finished: $END. run1 log: $S/run_e0s.log"
+   echo "- code: RodCor/kimetsu main @ $MAIN_SHA; worktree $WT @ $SHA (branch cursor/e0-sweep-profile, scripts-only diff, not pushed)"
+   echo "- binary: $BIN, $VERSION, sha256 $BIN_SHA; build log $LOGS/build.log"
+-  echo "- build: (cd $WT && ${build_env[*]} ${build_cmd[*]})"
++  echo "- build (run1 only; run2 reused the binary): (cd $WT && ${build_env[*]} ${build_cmd[*]})"
+   echo "- data: $DATA/locomo-conv26.json (199 q / 197 scored), $DATA/lme-oracle.json (500 q / 479 scored)"
+   echo "- scorer: $WT/scripts/retrieval_eval.py metrics via scripts/e0_eval.py --profile $PROFILE; retrieval only, no reader, NOT an official judge"
+   echo "- seed: none (deterministic); PYTHONHASHSEED=0. threads: 1 ONNX thread"
+-  echo "- latency/RSS: NOT comparable (run alongside two busy llama-servers); do not report"
++  echo "- latency/RSS: NOT comparable; do not report"
+   echo "- rrf: only k=60 (fusion.rs:188 Fusion::Rrf => rrf_fuse(lists, DEFAULT_RRF_K), DEFAULT_RRF_K=60.0 at fusion.rs:64; no config knob)"
+   echo "- eval env: ${eval_env[*]}"
+   echo "- eval commands:"
