@@ -1,0 +1,634 @@
+{
+  "scorer": "scripts/retrieval_eval.py rank_metrics via scripts/e0_eval.py; retrieval only, not an official judge",
+  "top_k": 8,
+  "scored_only": true,
+  "kill_rule": {
+    "rule": "if fewer than 20 conv-26 questions are affected, fusion is not the main loss",
+    "dataset": "locomo-conv26",
+    "other_arm": "tinybert_floor_0_fill_to_cap",
+    "threshold": 20,
+    "run1_affected_conv26_vs_fill_to_cap": 64,
+    "fires": false
+  },
+  "runs": {
+    "run1": {
+      "locomo-conv26": {
+        "dataset": "locomo-conv26",
+        "jsonl": "/workspace/fuse/e0s/results/run1/locomo-conv26.jsonl",
+        "gold": "/workspace/fuse/e0/data/locomo-conv26.json",
+        "n_questions": 199,
+        "n_scored": 197,
+        "vs_tinybert_floor_0_fill_to_cap": {
+          "other_arm": "tinybert_floor_0_fill_to_cap",
+          "n_scored": 197,
+          "questions_where_vector_has_ge1_gold_in_top8": 132,
+          "questions_where_other_has_ge1_gold_in_top8": 95,
+          "questions_vector_gold_missed_by_other": 64,
+          "lost_gold_items": 71,
+          "lost_breakdown": {
+            "vector_only_items": 57,
+            "vector_only_questions": 53,
+            "both_items": 14,
+            "both_questions": 14,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 24,
+            "gained_gold_items": 24
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 47,
+            "questions_with_more_lost_than_gained": 64,
+            "questions_with_more_gained_than_lost": 24
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 61,
+            "questions_vector_r8_0_other_r8_1": 24,
+            "net_r8_question_change": -37
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of tinybert_floor_0_fill_to_cap's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 53,
+            "other_capsule_count": {
+              "mean": 8.0,
+              "median": 8.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.150943396226415,
+              "median": 5.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 0,
+                "3": 6,
+                "4": 12,
+                "5": 11,
+                "6": 14,
+                "7": 5,
+                "8": 4
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 64,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 4.953125,
+              "median": 5.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 1,
+                "3": 9,
+                "4": 16,
+                "5": 12,
+                "6": 16,
+                "7": 5,
+                "8": 4
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        },
+        "vs_fused_defaults": {
+          "other_arm": "fused_defaults",
+          "n_scored": 197,
+          "questions_where_vector_has_ge1_gold_in_top8": 132,
+          "questions_where_other_has_ge1_gold_in_top8": 88,
+          "questions_vector_gold_missed_by_other": 65,
+          "lost_gold_items": 72,
+          "lost_breakdown": {
+            "vector_only_items": 57,
+            "vector_only_questions": 53,
+            "both_items": 15,
+            "both_questions": 15,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 17,
+            "gained_gold_items": 17
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 55,
+            "questions_with_more_lost_than_gained": 65,
+            "questions_with_more_gained_than_lost": 17
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 61,
+            "questions_vector_r8_0_other_r8_1": 17,
+            "net_r8_question_change": -44
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of fused_defaults's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 53,
+            "other_capsule_count": {
+              "mean": 3.660377358490566,
+              "median": 2.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 2.7169811320754715,
+              "median": 2.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 24,
+                "2": 10,
+                "3": 3,
+                "4": 5,
+                "5": 4,
+                "6": 1,
+                "7": 3,
+                "8": 3
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 65,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 2.6769230769230767,
+              "median": 2.0,
+              "distribution_0_to_8": {
+                "0": 1,
+                "1": 26,
+                "2": 12,
+                "3": 8,
+                "4": 6,
+                "5": 5,
+                "6": 1,
+                "7": 3,
+                "8": 3
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        }
+      },
+      "lme-oracle": {
+        "dataset": "lme-oracle",
+        "jsonl": "/workspace/fuse/e0s/results/run1/lme-oracle.jsonl",
+        "gold": "/workspace/fuse/e0/data/lme-oracle.json",
+        "n_questions": 500,
+        "n_scored": 479,
+        "vs_tinybert_floor_0_fill_to_cap": {
+          "other_arm": "tinybert_floor_0_fill_to_cap",
+          "n_scored": 479,
+          "questions_where_vector_has_ge1_gold_in_top8": 456,
+          "questions_where_other_has_ge1_gold_in_top8": 419,
+          "questions_vector_gold_missed_by_other": 146,
+          "lost_gold_items": 178,
+          "lost_breakdown": {
+            "vector_only_items": 148,
+            "vector_only_questions": 122,
+            "both_items": 30,
+            "both_questions": 30,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 82,
+            "gained_gold_items": 87
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 91,
+            "questions_with_more_lost_than_gained": 124,
+            "questions_with_more_gained_than_lost": 60
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 53,
+            "questions_vector_r8_0_other_r8_1": 16,
+            "net_r8_question_change": -37
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of tinybert_floor_0_fill_to_cap's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 122,
+            "other_capsule_count": {
+              "mean": 8.0,
+              "median": 8.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.532786885245901,
+              "median": 6.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 4,
+                "3": 10,
+                "4": 15,
+                "5": 18,
+                "6": 40,
+                "7": 26,
+                "8": 8
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 146,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.5,
+              "median": 6.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 6,
+                "3": 11,
+                "4": 16,
+                "5": 25,
+                "6": 49,
+                "7": 30,
+                "8": 8
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        },
+        "vs_fused_defaults": {
+          "other_arm": "fused_defaults",
+          "n_scored": 479,
+          "questions_where_vector_has_ge1_gold_in_top8": 456,
+          "questions_where_other_has_ge1_gold_in_top8": 392,
+          "questions_vector_gold_missed_by_other": 209,
+          "lost_gold_items": 253,
+          "lost_breakdown": {
+            "vector_only_items": 155,
+            "vector_only_questions": 129,
+            "both_items": 98,
+            "both_questions": 91,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 58,
+            "gained_gold_items": 61
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 192,
+            "questions_with_more_lost_than_gained": 189,
+            "questions_with_more_gained_than_lost": 38
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 76,
+            "questions_vector_r8_0_other_r8_1": 12,
+            "net_r8_question_change": -64
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of fused_defaults's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 129,
+            "other_capsule_count": {
+              "mean": 5.844961240310077,
+              "median": 8.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 4.155038759689923,
+              "median": 5.0,
+              "distribution_0_to_8": {
+                "0": 1,
+                "1": 26,
+                "2": 15,
+                "3": 10,
+                "4": 10,
+                "5": 15,
+                "6": 32,
+                "7": 17,
+                "8": 3
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 209,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 3.4976076555023923,
+              "median": 3.0,
+              "distribution_0_to_8": {
+                "0": 5,
+                "1": 58,
+                "2": 29,
+                "3": 20,
+                "4": 15,
+                "5": 23,
+                "6": 36,
+                "7": 20,
+                "8": 3
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        }
+      }
+    },
+    "run2": {
+      "locomo-conv26": {
+        "dataset": "locomo-conv26",
+        "jsonl": "/workspace/fuse/e0s/results/run2/locomo-conv26.jsonl",
+        "gold": "/workspace/fuse/e0/data/locomo-conv26.json",
+        "n_questions": 199,
+        "n_scored": 197,
+        "vs_tinybert_floor_0_fill_to_cap": {
+          "other_arm": "tinybert_floor_0_fill_to_cap",
+          "n_scored": 197,
+          "questions_where_vector_has_ge1_gold_in_top8": 132,
+          "questions_where_other_has_ge1_gold_in_top8": 95,
+          "questions_vector_gold_missed_by_other": 65,
+          "lost_gold_items": 72,
+          "lost_breakdown": {
+            "vector_only_items": 57,
+            "vector_only_questions": 53,
+            "both_items": 15,
+            "both_questions": 15,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 24,
+            "gained_gold_items": 24
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 48,
+            "questions_with_more_lost_than_gained": 65,
+            "questions_with_more_gained_than_lost": 24
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 61,
+            "questions_vector_r8_0_other_r8_1": 24,
+            "net_r8_question_change": -37
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of tinybert_floor_0_fill_to_cap's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 53,
+            "other_capsule_count": {
+              "mean": 8.0,
+              "median": 8.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.226415094339623,
+              "median": 5.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 0,
+                "3": 5,
+                "4": 11,
+                "5": 13,
+                "6": 14,
+                "7": 4,
+                "8": 5
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 65,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.015384615384615,
+              "median": 5.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 1,
+                "3": 8,
+                "4": 15,
+                "5": 15,
+                "6": 16,
+                "7": 4,
+                "8": 5
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        },
+        "vs_fused_defaults": {
+          "other_arm": "fused_defaults",
+          "n_scored": 197,
+          "questions_where_vector_has_ge1_gold_in_top8": 132,
+          "questions_where_other_has_ge1_gold_in_top8": 88,
+          "questions_vector_gold_missed_by_other": 65,
+          "lost_gold_items": 72,
+          "lost_breakdown": {
+            "vector_only_items": 57,
+            "vector_only_questions": 53,
+            "both_items": 15,
+            "both_questions": 15,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 17,
+            "gained_gold_items": 17
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 55,
+            "questions_with_more_lost_than_gained": 65,
+            "questions_with_more_gained_than_lost": 17
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 61,
+            "questions_vector_r8_0_other_r8_1": 17,
+            "net_r8_question_change": -44
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of fused_defaults's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 53,
+            "other_capsule_count": {
+              "mean": 3.7735849056603774,
+              "median": 2.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 2.830188679245283,
+              "median": 2.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 24,
+                "2": 9,
+                "3": 2,
+                "4": 5,
+                "5": 4,
+                "6": 4,
+                "7": 2,
+                "8": 3
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 65,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 2.7846153846153845,
+              "median": 2.0,
+              "distribution_0_to_8": {
+                "0": 1,
+                "1": 26,
+                "2": 11,
+                "3": 6,
+                "4": 7,
+                "5": 5,
+                "6": 4,
+                "7": 2,
+                "8": 3
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        }
+      },
+      "lme-oracle": {
+        "dataset": "lme-oracle",
+        "jsonl": "/workspace/fuse/e0s/results/run2/lme-oracle.jsonl",
+        "gold": "/workspace/fuse/e0/data/lme-oracle.json",
+        "n_questions": 500,
+        "n_scored": 479,
+        "vs_tinybert_floor_0_fill_to_cap": {
+          "other_arm": "tinybert_floor_0_fill_to_cap",
+          "n_scored": 479,
+          "questions_where_vector_has_ge1_gold_in_top8": 456,
+          "questions_where_other_has_ge1_gold_in_top8": 421,
+          "questions_vector_gold_missed_by_other": 146,
+          "lost_gold_items": 177,
+          "lost_breakdown": {
+            "vector_only_items": 147,
+            "vector_only_questions": 121,
+            "both_items": 30,
+            "both_questions": 30,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 82,
+            "gained_gold_items": 87
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 90,
+            "questions_with_more_lost_than_gained": 124,
+            "questions_with_more_gained_than_lost": 60
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 51,
+            "questions_vector_r8_0_other_r8_1": 16,
+            "net_r8_question_change": -35
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of tinybert_floor_0_fill_to_cap's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 121,
+            "other_capsule_count": {
+              "mean": 8.0,
+              "median": 8.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.537190082644628,
+              "median": 6.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 4,
+                "3": 9,
+                "4": 16,
+                "5": 18,
+                "6": 39,
+                "7": 26,
+                "8": 8
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 146,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 5.493150684931507,
+              "median": 6.0,
+              "distribution_0_to_8": {
+                "0": 0,
+                "1": 1,
+                "2": 6,
+                "3": 11,
+                "4": 17,
+                "5": 24,
+                "6": 49,
+                "7": 30,
+                "8": 8
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        },
+        "vs_fused_defaults": {
+          "other_arm": "fused_defaults",
+          "n_scored": 479,
+          "questions_where_vector_has_ge1_gold_in_top8": 456,
+          "questions_where_other_has_ge1_gold_in_top8": 394,
+          "questions_vector_gold_missed_by_other": 209,
+          "lost_gold_items": 252,
+          "lost_breakdown": {
+            "vector_only_items": 154,
+            "vector_only_questions": 128,
+            "both_items": 98,
+            "both_questions": 91,
+            "note": "vector-only: the lost gold item was in vector's top 8 and not in lexical's top 8. both: the lost gold item was also in lexical's top 8. a question can contribute to both counts if it lost one of each."
+          },
+          "reverse": {
+            "questions_other_gold_missed_by_vector": 59,
+            "gained_gold_items": 62
+          },
+          "net": {
+            "lost_minus_gained_gold_items": 190,
+            "questions_with_more_lost_than_gained": 189,
+            "questions_with_more_gained_than_lost": 39
+          },
+          "binary_recall_at_8_flips": {
+            "note": "binary R@8 is the official retrieval_eval recall (at least one gold in top 8). item counts above can change without a flip.",
+            "questions_vector_r8_1_other_r8_0": 74,
+            "questions_vector_r8_0_other_r8_1": 12,
+            "net_r8_question_change": -62
+          },
+          "crowding_on_vector_only_losses": {
+            "note": "for each scored question that lost at least one vector-only gold item, how many of fused_defaults's top-8 capsules also appear in lexical's top 8. high overlap is evidence that FTS/bm25 hits occupy slots that could have held the missing vector-only gold.",
+            "questions": 128,
+            "other_capsule_count": {
+              "mean": 5.796875,
+              "median": 8.0
+            },
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 4.1328125,
+              "median": 5.0,
+              "distribution_0_to_8": {
+                "0": 1,
+                "1": 27,
+                "2": 14,
+                "3": 8,
+                "4": 12,
+                "5": 16,
+                "6": 30,
+                "7": 18,
+                "8": 2
+              }
+            }
+          },
+          "crowding_on_all_losses": {
+            "questions": 209,
+            "other_capsules_also_in_lexical_top8": {
+              "mean": 3.5023923444976077,
+              "median": 3.0,
+              "distribution_0_to_8": {
+                "0": 5,
+                "1": 58,
+                "2": 28,
+                "3": 19,
+                "4": 17,
+                "5": 24,
+                "6": 35,
+                "7": 21,
+                "8": 2
+              }
+            }
+          },
+          "per_capsule_scores": "not available: jsonl rows have no per-capsule scores or ranks; only ordered labels and a first-hit rank"
+        }
+      }
+    }
+  },
+  "script": "/workspace/fuse/e0s/attribution/fusion_attribution.py",
+  "script_sha256": "c2fc141d9128eccccd69b670dd5fe2c54254a624020851d655a3d6a32fecbdcb",
+  "inputs_sha256": {
+    "/workspace/fuse/e0/data/lme-oracle.json": "1dcfd431b1a145d2a234e07d1a72f246fbc37019bb4e3409a6a191beb965b129",
+    "/workspace/fuse/e0/data/locomo-conv26.json": "a996cc78f35f78d24114800636e4a2425ddf60639254532bfacff35a2013dcd7",
+    "/workspace/fuse/e0s/results/run1/lme-oracle.jsonl": "e6287fb20b4c984d65e065d57aa7e63769f2ae95d96663269519d568f8434eab",
+    "/workspace/fuse/e0s/results/run1/locomo-conv26.jsonl": "37a370eef7b7b614070a8d25620cb06bf32affdbcfb3417ad2e55199d288a3af",
+    "/workspace/fuse/e0s/results/run2/lme-oracle.jsonl": "4d74e27d5241744d02c3bc982ae600ecf82a136a0955a94e1e2d89e3c60743e6",
+    "/workspace/fuse/e0s/results/run2/locomo-conv26.jsonl": "d095b04b7999f65dbd8ea1116e56679a538ed507eccecae63b416e482f5fffe8"
+  },
+  "command": "python3 /workspace/fuse/e0s/attribution/fusion_attribution.py --results /workspace/fuse/e0s/results --data /workspace/fuse/e0/data --out-dir /workspace/fuse/e0s/attribution"
+}
