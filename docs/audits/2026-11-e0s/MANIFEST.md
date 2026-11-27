@@ -7,7 +7,7 @@
 - build (run1 only; run2 reused the binary): (cd /workspace/fuse/e0s/kimetsu && env PATH=/home/box/.cargo/bin:/workspace/fuse/e0s/toolchain/bin:/usr/local/bin:/usr/bin:/bin CXX=/workspace/fuse/e0s/toolchain/zig-cxx OPENSSL_INCLUDE_DIR=/usr/include OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu LIBRARY_PATH=/workspace/fuse/e0s/toolchain/lib CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/workspace/fuse/e0s/target nice -n 19 /home/box/.cargo/bin/cargo rustc -p kimetsu-cli --bin kimetsu --release --locked --features embeddings -j 2 -- -C link-arg=-L/workspace/fuse/e0s/toolchain/lib -C link-arg=-lc++ -C link-arg=-lc++abi -C link-arg=-lunwind)
 - data: /workspace/fuse/e0/data/locomo-conv26.json (199 q / 197 scored), /workspace/fuse/e0/data/lme-oracle.json (500 q / 479 scored)
 - scorer: /workspace/fuse/e0s/kimetsu/scripts/retrieval_eval.py metrics via scripts/e0_eval.py --profile bench-sweep; retrieval only, no reader, NOT an official judge
-- seed: none (deterministic); PYTHONHASHSEED=0. threads: 1 ONNX thread
+- seed: none (expected deterministic; determinism-diff.md shows it is not: 1099/6291 rows changed); PYTHONHASHSEED=0. threads: 1 ONNX thread
 - latency/RSS: NOT comparable; do not report
 - rrf: only k=60 (fusion.rs:188 Fusion::Rrf => rrf_fuse(lists, DEFAULT_RRF_K), DEFAULT_RRF_K=60.0 at fusion.rs:64; no config knob)
 - eval env: env PYTHONHASHSEED=0 KIMETSU_INTRA_THREADS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 FASTEMBED_CACHE_DIR=/workspace/fuse/e0s/model-cache HF_HOME=/workspace/fuse/e0s/model-cache KIMETSU_USER_BRAIN=0 KIMETSU_BRAIN_AMBIENT=off KIMETSU_BRAIN_LOG_RETRIEVAL=0 PATH=/usr/local/bin:/usr/bin:/bin
@@ -230,3 +230,4 @@ scorer: scripts/retrieval_eval.py metrics (retrieval only, NOT an official judge
 
 - the MemAvailable trace is /workspace/fuse/e0s/logs/memavailable.rerun2.log and the memcap log is /workspace/fuse/e0s/memcap.rerun2.log (the lines above name the run1 files).
 - the original runner never wrote a manifest (run2 died first), so this file did not overwrite a run1 manifest.
+- seed line above edited in PR #80 to note that determinism-diff.md found 1099/6291 changed rows.

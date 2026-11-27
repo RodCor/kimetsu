@@ -81,6 +81,8 @@ jobs:
           python3 scripts/prepare_e0_data.py --self-test
           python3 scripts/experiments/e0s/memcap.py --self-test
           bash scripts/experiments/e0s/run_e0s.sh --self-test
+          python3 scripts/experiments/e0s/fusion_attribution.py --self-test
+          python3 scripts/experiments/e0s/summary_delta.py --self-test
 
   fmt:
     name: rustfmt

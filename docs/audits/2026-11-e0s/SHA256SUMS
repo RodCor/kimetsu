@@ -1,14 +1,17 @@
-# SHA-256 of committed artifacts and of omitted per-question JSONL (kept on the box).
-# Omitted files are marked OMITTED and were larger than ~2 MiB.
+# SHA-256 of committed artifacts in this directory.
+# Uncompressed lme-oracle.jsonl hashes (kept on the box; committed here as .jsonl.gz) are listed below as comments.
 
-21ae01f8fbbfa4ae07e8412b8bbb5b2d16c2222d415a0568059edc54c3730062  ./MANIFEST.md
+c07cc1e9bebb886950439fcc4870bafa0a9eac5c033822c8ecd2314d3e7e22c4  ./MANIFEST.md
 b60d4580528a4fdfa03609874a084843130575da35c56425d3e0ec5f879d5dd8  ./attribution-run1.json
 ca6de7f19f42809a58e4e828228036c96f6a841a3e58e7f101267d9641cd8b99  ./attribution-run1.md
 d79849a0ef977fa0faae82f954b29ae60f5e3ae74797afc83a817e9f0416a01b  ./attribution-run2.json
 ecbdbf2124f586ab6e45a76b9256165b246594ed37291bafd3f450e1bce0d724  ./determinism-diff.md
 14255708c55dcc6f1d15f4613aebfbed5ab198a5ffa36ed87963c9127589b710  ./resolved-config-per-arm.json
+81dd4051d9ac13b943d133da5ed3157153645c0e8b9c55f8d72a5de5685ef0f5  ./run1-run2-delta.json
+c901efdf77d731dd4e138abee69829f94b696aae5c4ac6779f7b9c86893ea030  ./run1-run2-delta.md
 1b6ac1e2dc828f48b7674a8d734bb3ceb9c21b90a8439c65bbee8aa8a3546aff  ./run1/capsule-hist.json
 80eb578edff39beb9b94099fc9b03473d718f3cd863f6849d729cbae3917fba5  ./run1/capsule-hist.md
+5efd3d28df17f65ea281e9b2139b5fbb93d2882183af90568b4ad08c686a18b6  ./run1/lme-oracle.jsonl.gz
 cd05ca18cb7f2e02d88817a0d9c7c4857d3a0671c1683c49ab0b8d3e2d597431  ./run1/lme-oracle.meta.json
 37a370eef7b7b614070a8d25620cb06bf32affdbcfb3417ad2e55199d288a3af  ./run1/locomo-conv26.jsonl
 5f7966b67955bd088061e7cde91f9f2b66ae16976773f2c8b24ccd98f5aa1482  ./run1/locomo-conv26.meta.json
@@ -18,6 +21,7 @@ be3d14fc19547cccc7f24aaea095ca15878f7a9588fb94e0b233be80f089503c  ./run1/summary
 7329b65c4f1854a469a9e8e9f9835a521f832d337ee37f77a762f70bb4d6e3e2  ./run1/summary.md
 c4f92614d59921778a09f030f3ff7f93f1b140e7f5f18921e40a1f66c3e3d18d  ./run2/capsule-hist.json
 588dfae7badf7fbc52e3c9718af0c8c3e374f2887a6a7ddd25af497f06c749da  ./run2/capsule-hist.md
+53825e10c795ce3b0b649286466733e093e63e0ca9613bb177a72767453c548b  ./run2/lme-oracle.jsonl.gz
 c0c1c3b854e71152414aab1e5235b2da935f4599f808958be42b4bc0845ab592  ./run2/lme-oracle.meta.json
 d095b04b7999f65dbd8ea1116e56679a538ed507eccecae63b416e482f5fffe8  ./run2/locomo-conv26.jsonl
 f931d791d9126219f7d4f21545743660924cd9159d991256a96ae8eb6c557317  ./run2/locomo-conv26.meta.json
@@ -27,6 +31,6 @@ f931d791d9126219f7d4f21545743660924cd9159d991256a96ae8eb6c557317  ./run2/locomo-
 d604317b8042e545e605a5d0ff47b0225a4de1e488c4ec09f123a74e23d54775  ./run2/summary.md
 c00b010d3cd7bc00fe88eef497cf00dc1689fc055c6267ede238d215860b0e37  ./wrapper-sha256.txt
 
-# omitted (live on the box at /workspace/fuse/e0s/results/...)
-# OMITTED e6287fb20b4c984d65e065d57aa7e63769f2ae95d96663269519d568f8434eab  run1/lme-oracle.jsonl  # omitted,2355878 bytes; /workspace/fuse/e0s/results/run1/lme-oracle.jsonl
-# OMITTED 4d74e27d5241744d02c3bc982ae600ecf82a136a0955a94e1e2d89e3c60743e6  run2/lme-oracle.jsonl  # omitted,2355648 bytes; /workspace/fuse/e0s/results/run2/lme-oracle.jsonl
+# uncompressed lme-oracle.jsonl (committed above as .jsonl.gz)
+# UNCOMPRESSED e6287fb20b4c984d65e065d57aa7e63769f2ae95d96663269519d568f8434eab  run1/lme-oracle.jsonl  # 2355878 bytes
+# UNCOMPRESSED 4d74e27d5241744d02c3bc982ae600ecf82a136a0955a94e1e2d89e3c60743e6  run2/lme-oracle.jsonl  # 2355648 bytes

@@ -8,16 +8,23 @@ A gold hit is a retrieved label that is in the question's evidence set, same
 definition as scripts/retrieval_eval.py:rank_metrics. Recall/MRR are valid
 only over scored questions (scripts/e0_eval.py). Top-8 is labels[:8].
 
-    python3 /workspace/fuse/e0s/attribution/fusion_attribution.py
+    python3 scripts/experiments/e0s/fusion_attribution.py \
+      --results docs/audits/2026-11-e0s \
+      --data /path/to/prepared/data \
+      --out-dir /tmp/attribution-rerun
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gzip
 import hashlib
+import io
 import json
 import statistics
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -30,10 +37,6 @@ DATASETS = ("locomo-conv26", "lme-oracle")
 KILL_THRESHOLD = 20  # conv-26 questions affected vs fill_to_cap
 KILL_DATASET = "locomo-conv26"
 
-DEFAULT_RESULTS = Path("/workspace/fuse/e0s/results")
-DEFAULT_DATA = Path("/workspace/fuse/e0/data")
-DEFAULT_OUT = Path("/workspace/fuse/e0s/attribution")
-
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -41,6 +44,36 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def is_gzip_jsonl(path: Path) -> bool:
+    return path.name.endswith(".jsonl.gz")
+
+
+def sha256_jsonl_payload(path: Path) -> str:
+    """Hash the jsonl bytes that are parsed (decompressed if the path is .gz)."""
+    digest = hashlib.sha256()
+    handle = gzip.open(path, "rb") if is_gzip_jsonl(path) else path.open("rb")
+    with handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def open_jsonl(path: Path):
+    if is_gzip_jsonl(path):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open(encoding="utf-8")
+
+
+def resolve_results_jsonl(results: Path, run_name: str, dataset: str) -> Path:
+    raw = results / run_name / f"{dataset}.jsonl"
+    gz = results / run_name / f"{dataset}.jsonl.gz"
+    if raw.is_file():
+        return raw
+    if gz.is_file():
+        return gz
+    raise SystemExit(f"missing {raw} or {gz}")
 
 
 def load_gold(path: Path) -> dict[str, dict]:
@@ -54,7 +87,7 @@ def load_gold(path: Path) -> dict[str, dict]:
 
 def load_jsonl(path: Path) -> dict[str, dict[str, dict]]:
     by_id: dict[str, dict[str, dict]] = {}
-    with path.open() as handle:
+    with open_jsonl(path) as handle:
         for line in handle:
             row = json.loads(line)
             by_id.setdefault(row["id"], {})[row["arm"]] = row
@@ -432,14 +465,206 @@ def render_markdown(payload: dict) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
-    return parser.parse_args(argv)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--results", type=Path)
+    parser.add_argument("--data", type=Path)
+    parser.add_argument("--out-dir", type=Path)
+    args = parser.parse_args(argv)
+    if not args.self_test:
+        missing = [
+            flag
+            for flag, value in (
+                ("--results", args.results),
+                ("--data", args.data),
+                ("--out-dir", args.out_dir),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error("the following arguments are required: " + ", ".join(missing))
+    return args
+
+
+def _fixture_gold() -> dict:
+    return {
+        "questions": [
+            {
+                "id": "q1",
+                "scored": True,
+                "chunks": [
+                    {"id": "g1", "evidence": True},
+                    {"id": "g2", "evidence": True},
+                    {"id": "x", "evidence": False},
+                ],
+            },
+            {
+                "id": "q2",
+                "scored": True,
+                "chunks": [
+                    {"id": "g3", "evidence": True},
+                    {"id": "y", "evidence": False},
+                ],
+            },
+        ]
+    }
+
+
+def _fixture_row(qid: str, arm: str, dataset: str, labels: list[str], gold: set[str], scored: bool) -> dict:
+    rank = first_hit_rank(labels, gold)
+    rec8 = int(rank is not None and rank <= TOP_K)
+    return {
+        "id": qid,
+        "arm": arm,
+        "dataset": dataset,
+        "scored": scored,
+        "n_evidence": len(gold),
+        "labels": labels,
+        "recall": {"@1": int(rank == 1), "@3": int(rank is not None and rank <= 3), "@8": rec8},
+        "rank": rank,
+    }
+
+
+def _write_fixture_jsonl(path: Path, dataset: str, golds: dict[str, dict], gzip_out: bool) -> Path:
+    rows = []
+    # q1: vector holds both golds; lexical has neither; fill misses both;
+    # defaults keeps g1 and loses g2 (vector-only).
+    # q2: vector misses g3; fill and defaults recover it; lexical also has it.
+    plans = {
+        "q1": {
+            VECTOR_ARM: ["g1", "g2", "x"],
+            LEXICAL_ARM: ["a", "b", "c"],
+            FILL_ARM: ["a", "b", "c", "d"],
+            DEFAULTS_ARM: ["g1", "a", "b"],
+        },
+        "q2": {
+            VECTOR_ARM: ["x", "y"],
+            LEXICAL_ARM: ["g3", "z"],
+            FILL_ARM: ["g3", "z"],
+            DEFAULTS_ARM: ["x", "y"],
+        },
+    }
+    for qid, arms in plans.items():
+        gold = golds[qid]["gold"]
+        scored = golds[qid]["scored"]
+        for arm, labels in arms.items():
+            rows.append(_fixture_row(qid, arm, dataset, labels, gold, scored))
+    payload = "".join(json.dumps(row) + "\n" for row in rows)
+    if gzip_out:
+        path = path.with_suffix(path.suffix + ".gz") if not is_gzip_jsonl(path) else path
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            handle.write(payload)
+    else:
+        path.write_text(payload)
+    return path
+
+
+def self_test() -> int:
+    gold_doc = _fixture_gold()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data = root / "data"
+        results = root / "results"
+        out = root / "out"
+        data.mkdir()
+        golds_by_id = None
+        for dataset in DATASETS:
+            gold_path = data / f"{dataset}.json"
+            gold_path.write_text(json.dumps(gold_doc))
+            if golds_by_id is None:
+                golds_by_id = load_gold(gold_path)
+        assert golds_by_id is not None
+        for run_name in ("run1", "run2"):
+            for dataset in DATASETS:
+                run_dir = results / run_name
+                run_dir.mkdir(parents=True, exist_ok=True)
+                raw = run_dir / f"{dataset}.jsonl"
+                # locomo stays raw; lme is gzipped, so a checkout-shaped tree works.
+                gzip_out = dataset == "lme-oracle"
+                written = _write_fixture_jsonl(raw, dataset, golds_by_id, gzip_out)
+                loaded = load_jsonl(written)
+                if set(loaded) != {"q1", "q2"}:
+                    raise SystemExit(f"self-test: load_jsonl ids {set(loaded)}")
+                if gzip_out:
+                    # same rows written raw must hash identically to the decompressed .gz
+                    raw.write_bytes(gzip.open(written, "rb").read())
+                    if sha256_jsonl_payload(written) != sha256_file(raw):
+                        raise SystemExit("self-test: gz payload sha != raw sha")
+                    resolved = resolve_results_jsonl(results, run_name, dataset)
+                    if resolved != raw:
+                        raise SystemExit(f"self-test: resolve should prefer raw, got {resolved}")
+                    raw.unlink()
+                    resolved = resolve_results_jsonl(results, run_name, dataset)
+                    if resolved != written:
+                        raise SystemExit(f"self-test: resolve should fall back to gz, got {resolved}")
+
+        block = analyze_dataset(
+            results / "run1" / "locomo-conv26.jsonl",
+            data / "locomo-conv26.json",
+            "locomo-conv26",
+        )
+        fill = block["vs_tinybert_floor_0_fill_to_cap"]
+        if fill["n_scored"] != 2:
+            raise SystemExit(f"self-test: n_scored {fill['n_scored']}")
+        if fill["questions_where_vector_has_ge1_gold_in_top8"] != 1:
+            raise SystemExit("self-test: vector gold questions")
+        if fill["questions_vector_gold_missed_by_other"] != 1:
+            raise SystemExit("self-test: affected questions")
+        if fill["lost_gold_items"] != 2:
+            raise SystemExit("self-test: lost items")
+        if fill["lost_breakdown"]["vector_only_items"] != 2:
+            raise SystemExit("self-test: vector-only items")
+        if fill["reverse"]["questions_other_gold_missed_by_vector"] != 1:
+            raise SystemExit("self-test: reverse questions")
+        if fill["reverse"]["gained_gold_items"] != 1:
+            raise SystemExit("self-test: gained items")
+        # q1 loses only g2 to defaults; q2's gold is missing from both vector and defaults.
+        defaults = block["vs_fused_defaults"]
+        if defaults["questions_vector_gold_missed_by_other"] != 1:
+            raise SystemExit(
+                f"self-test: defaults affected {defaults['questions_vector_gold_missed_by_other']}"
+            )
+        if defaults["lost_gold_items"] != 1:
+            raise SystemExit(f"self-test: defaults lost items {defaults['lost_gold_items']}")
+
+        rc = main(
+            [
+                "--results",
+                str(results),
+                "--data",
+                str(data),
+                "--out-dir",
+                str(out),
+            ]
+        )
+        if rc != 0:
+            raise SystemExit(f"self-test: main rc {rc}")
+        for name in ("attribution-run1.md", "attribution-run1.json", "attribution-run2.json"):
+            if not (out / name).is_file():
+                raise SystemExit(f"self-test: missing {name}")
+        payload = json.loads((out / "attribution-run1.json").read_text())
+        if payload["kill_rule"]["run1_affected_conv26_vs_fill_to_cap"] != 1:
+            raise SystemExit("self-test: kill-rule affected count")
+        # required-path gate: a bare run must fail (no /workspace/fuse defaults)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                parse_args([])
+            except SystemExit as exc:
+                if exc.code in (0, None):
+                    raise SystemExit("self-test: parse_args([]) should fail") from exc
+            else:
+                raise SystemExit("self-test: parse_args([]) should fail")
+        if "--results" not in buf.getvalue():
+            raise SystemExit("self-test: required-args error should mention --results")
+
+    print("fusion_attribution self-test ok")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    if args.self_test:
+        return self_test()
     script_path = Path(__file__).resolve()
     gold_paths = {name: args.data / f"{name}.json" for name in DATASETS}
     input_paths: dict[str, Path] = {str(path): path for path in gold_paths.values()}
@@ -447,10 +672,8 @@ def main(argv: list[str] | None = None) -> int:
     for run_name in ("run1", "run2"):
         runs[run_name] = {}
         for dataset in DATASETS:
-            jsonl = args.results / run_name / f"{dataset}.jsonl"
+            jsonl = resolve_results_jsonl(args.results, run_name, dataset)
             input_paths[str(jsonl)] = jsonl
-            if not jsonl.is_file():
-                raise SystemExit(f"missing {jsonl}")
             runs[run_name][dataset] = analyze_dataset(jsonl, gold_paths[dataset], dataset)
 
     affected = runs["run1"][KILL_DATASET]["vs_tinybert_floor_0_fill_to_cap"][
@@ -473,7 +696,10 @@ def main(argv: list[str] | None = None) -> int:
         "runs": runs,
         "script": str(script_path),
         "script_sha256": sha256_file(script_path),
-        "inputs_sha256": {path: sha256_file(handle) for path, handle in sorted(input_paths.items())},
+        "inputs_sha256": {
+            path: (sha256_jsonl_payload(handle) if handle.suffix == ".gz" or is_gzip_jsonl(handle) else sha256_file(handle))
+            for path, handle in sorted(input_paths.items())
+        },
         "command": (
             f"python3 {script_path} --results {args.results.resolve()} "
             f"--data {args.data.resolve()} --out-dir {args.out_dir.resolve()}"
